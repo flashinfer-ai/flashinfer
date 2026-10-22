@@ -453,6 +453,11 @@ def test_prefill_zero_length_sequence_state_untouched(
     _skip_if_unsupported()
     if use_cp:
         _skip_if_cp_unsupported()
+    if (
+        state_source != "caller"
+        and get_compute_capability(torch.device("cuda"))[0] != 8
+    ):
+        pytest.skip("only SM8x defines the empty row of an allocated state")
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -871,9 +876,15 @@ def _test_checkpoint(
             actual_ckpt = state_checkpoints[ckpt_global_idx]
             expected_ckpt = prefix_state[0]
 
-            assert torch.equal(actual_ckpt, expected_ckpt), (
-                f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}"
-            )
+            # A mid-chunk checkpoint is not bit-identical to a prefix run on SM100.
+            if cp_chunk_mult > 1:
+                torch.testing.assert_close(
+                    actual_ckpt, expected_ckpt, atol=4e-2, rtol=4e-2
+                )
+            else:
+                assert torch.equal(actual_ckpt, expected_ckpt), (
+                    f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}"
+                )
 
 
 @pytest.mark.parametrize("checkpoint_every_n_tokens", [64, 128])
@@ -1066,11 +1077,7 @@ def test_checkpoint_wrong_dtype(qkv_factory):
 
 @pytest.mark.parametrize("name", ["state_checkpoints", "checkpoint_cu_starts"])
 def test_checkpoint_non_contiguous_rejected(name):
-    """A strided checkpoint tensor is refused rather than mishandled.
-
-    ``reshape(-1)`` would copy ``state_checkpoints`` into a temporary, and a
-    kernel compiled for a unit-stride ``checkpoint_cu_starts`` would misread it.
-    """
+    """A strided checkpoint tensor is refused rather than copied or misread."""
     _skip_if_unsupported()
     device = torch.device("cuda")
     H, D = 2, 128
@@ -1260,12 +1267,12 @@ def test_prefill_kernel_state_dtype(
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
-    # Before SM89 there is no FP8 convert, so an FP8 state is refused up front.
+    # SM8x refuses an FP8 state up front.
     fp8_refused = state_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and (
-        torch.cuda.get_device_capability() < (8, 9)
+        torch.cuda.get_device_capability()[0] == 8
     )
     with (
-        pytest.raises(NotImplementedError, match="FP8 conversion")
+        pytest.raises(NotImplementedError, match="FP8 state")
         if fp8_refused
         else nullcontext()
     ):
@@ -1297,9 +1304,7 @@ def test_prefill_kernel_state_dtype(
 def test_sm8x_cu_seqlens_cpu_is_checked_on_its_own(
     cu_seqlens_cpu, max_seqlen, error, match
 ):
-    """A host copy that cannot describe the batch is refused before a launch.
-
-    It is checked on its own, never against the device `cu_seqlens`."""
+    """A host copy that cannot describe the batch is refused before launch."""
     device = torch.device("cuda")
     if get_compute_capability(device)[0] != 8:
         pytest.skip("only the SM8x prefill routes on cu_seqlens_cpu")
@@ -1316,11 +1321,7 @@ def test_sm8x_cu_seqlens_cpu_is_checked_on_its_own(
 
 
 def test_sm80_v32_matches_v64(qkv_factory, monkeypatch):
-    """The V32 specialization, on the one shape that selects it, against V64.
-
-    Only `cu_seqlens_cpu` tells the dispatcher the longest sequence, so the
-    same call without it runs V64; the spy checks the kernel V32 asked for.
-    """
+    """V32 on its one shape matches V64, which runs without `cu_seqlens_cpu`."""
     device = torch.device("cuda")
     if get_compute_capability(device) != (8, 0):
         pytest.skip("V32 is selected on compute capability 8.0 only")

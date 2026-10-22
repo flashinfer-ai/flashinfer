@@ -27,40 +27,16 @@ def _sm80_compile_options(device):
     return (cute.EnableTVMFFI(True),) + sm8x_compile_options(device)
 
 
-# Every thread in the block issues its share of a tile. TMA was one thread and
-# needed no such width; cp.async needs the block, because a thread can only
-# wait on copies it issued itself.
-# Warp groups in the block. Two is what this kernel has always launched: WG0
-# takes the KK GEMM and the chunk inverse, WG1 takes QK, and they exchange
-# through shared memory. One collapses that -- the same four warps run both
-# bodies in sequence -- and halves the block.
-#
-# One, and not a free choice. A split block does 61% of the work with half the
-# warps, so it pays only if a four-warp block runs at more than 61% of an
-# eight-warp block's rate. It does -- the split is worth 12-25% on the cells it
-# was built for -- but what that per-warp rate *is* has not been measured, only
-# inferred from a work model, so no number for it appears here. And the split
-# and the halved block are one change: `_BLK_V` below has to equal the warps' M
-# span, so this constant sets it.
+# One warp group runs the KK and QK bodies in sequence; it also sets `_BLK_V`.
 NUM_MMA_WARP_GROUPS = 1
 THREADS_PER_WARP_GROUP = 128
+# Every thread issues loads: a thread can only wait on cp.async it issued.
 LOAD_THREADS = NUM_MMA_WARP_GROUPS * THREADS_PER_WARP_GROUP
 NUM_MMA_WARPS = LOAD_THREADS // 32
-# Rows of C one m16n8k16 atom produces, so a mode partitioned across warps has
-# to be a multiple of it.
+# Rows of C one m16n8k16 atom produces.
 _MMA_ATOM_M = 16
-# V rows one block owns. The head size means one block per (sequence, head),
-# which is the grid this kernel has always launched; a smaller value splits the
-# state's V rows across blocks and multiplies the grid by the same factor.
-#
-# It is not free to choose. This kernel hands accumulators on as the next
-# GEMM's A operand, and that reinterpretation is only valid when the M mode is
-# exactly the warps' span -- with two M repeats per warp the fragment's M and N
-# strides interleave, and A's first atom reads two different M rows as one K
-# pair. Measured: at four warps and M = 128 the accumulator is
-# ((2,2),2,16):((1,2),4,8) and the operand ((2,2,2),2,8):((1,2,4),8,16), and
-# 94.6% of the output was wrong. So D_v is the warps' span, which ties the
-# split to the block width rather than leaving it a free knob.
+# V rows one block owns. It must be the warps' M span: an accumulator is only
+# a valid next A operand at one M repeat per warp.
 _BLK_V = NUM_MMA_WARPS * _MMA_ATOM_M
 # bf16 elements in one 16 B cp.async access.
 _LOAD_VEC_ELEMS = 8
@@ -68,46 +44,20 @@ _LOAD_ALIGN_BYTES = 16
 
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-# Converting to or from FP8 is a single instruction from SM89 on. Earlier SM8x
-# parts have no such instruction and no software path in this kernel, so the
-# state cannot be held in FP8 there.
-_FP8_MIN_CAPABILITY = (8, 9)
 
 
-def _check_state_dtype_supported(device: torch.device, **tensors) -> None:
-    """Reject an FP8 state on the SM8x parts that cannot convert to it.
-
-    Without this the request reaches the compiler and comes back as a bare
-    "NVVM backend compilation failed", which says nothing about which argument
-    caused it.
-    """
-    capability = torch.cuda.get_device_capability(device)
-    if capability >= _FP8_MIN_CAPABILITY:
-        return
+def _check_state_dtype_supported(**tensors) -> None:
+    """Reject an FP8 state, which the SM8x kernels fail to compile."""
     for name, tensor in tensors.items():
         if tensor is not None and tensor.dtype in _FP8_DTYPES:
             raise NotImplementedError(
-                f"{name} is {tensor.dtype}, which the GDN prefill kernel cannot "
-                f"produce on compute capability {capability[0]}.{capability[1]}: "
-                f"FP8 conversion instructions start at "
-                f"{_FP8_MIN_CAPABILITY[0]}.{_FP8_MIN_CAPABILITY[1]}"
+                f"{name} is {tensor.dtype}; the SM8x GDN prefill kernels do not "
+                "support an FP8 state"
             )
 
 
 def _check_load_alignment(**tensors: torch.Tensor) -> None:
-    """Reject inputs the vectorized loads would silently misread.
-
-    The loads take the widest cp.async there is, and the kernel states the
-    alignment the layout algebra cannot prove by rounding each partitioned
-    pointer up to 16 B. That rounding is identity only while the premise holds:
-    the base address on a 16 B boundary, and every stride the partition walks a
-    multiple of eight elements. A tensor that breaks either would be read from
-    the wrong address rather than rejected, so the premise is checked here.
-
-    It holds for anything this kernel is called with -- head_dim is 128 and the
-    packed layouts stride by whole heads -- so this is a guard against an
-    unusual view arriving, not a case that needs handling.
-    """
+    """Reject a base or stride that breaks the 16 B alignment `_aligned` assumes."""
     for name, t in tensors.items():
         if t is None:
             continue
@@ -139,11 +89,7 @@ class NamedBarrier(IntEnum):
     KK_SYNC = 13  # sync WG0's threads before collective_inverse
 
 
-# The sm_90 kernel also has a WarpGroupRole.LDST and a LoadStoreWarpRole
-# splitting that group four ways. Both are gone: handing a tile from a load
-# warp to a math warp needs an mbarrier this DSL will not emit for sm_80 (see
-# pipeline_sm80), so the whole block does both jobs and only the two math roles
-# below remain.
+# No load/store role: the DSL emits no mbarrier for sm_80, so the whole block loads.
 class MathWarpGroupRole(IntEnum):
     KK = 0
     QK = 1
@@ -159,10 +105,8 @@ class MathWarpGroupRole(IntEnum):
 
 
 class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
-    # The epilogue, masking, decay and alpha/beta loads are the SM120 kernel's
-    # and are inherited; the MMA, copies and pipeline here are sm_80's own.
-    # sm_80 has no setmaxnreg, so the inherited `get_register_requirements` is
-    # never called and the register count is ptxas's alone.
+    # Epilogue, masking, decay and alpha/beta loads are inherited from SM120.
+    # sm_80 has no setmaxnreg, so `get_register_requirements` is never called.
 
     def __init__(
         self,
@@ -204,44 +148,20 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         self.BLK_KV = 64
         self.D = 128
         self.q_stage = 1
-        # One stage, not the sm_90 kernel's two. A second buffer only pays if
-        # a load can run ahead of the math, and none can: PipelineCpAsyncSm80
-        # is constructed with prefetch left at zero everywhere, so the loads
-        # commit and the math drains them inside one iteration. The second
-        # buffer was read -- odd iterations used it -- but it never held a tile
-        # fetched ahead of the math, so it bought no overlap.
-        #
-        # Freeing it does not buy residency -- that is register-limited at one
-        # CTA either way -- so this is a 16 KiB reclaim with no measured
-        # regression, not a speedup. It is also the 16 KiB a later look-ahead
-        # would need back.
+        # One stage: loads never run ahead of the math (prefetch is zero), so a
+        # second buffer would give no overlap.
         self.k_stage = 1
         self.v_stage = 1
         self.o_stage = 1
         self.alpha_beta_stage = 2
 
-        # How many of the state's V rows one block owns.
-        #
-        # The grid was num_seqs * num_sab_heads, so a single long sequence with
-        # two heads occupied two SMs of this device and left 68 idle: the
-        # profile has the average SM busy for 2.9% of such a launch, while the
-        # per-block stall profile matches a launch that fills the device. Wall
-        # time tracks the block count almost exactly -- 1 to 2 blocks is 1.98x.
-        #
-        # Every V-dependent GEMM carries D_v as its M mode -- the state update,
-        # both O terms, U and S@K -- so a block can own a horizontal band of the
-        # state and only addressing changes. Q, K, beta and the chunk inverse do
-        # not depend on V, so each block recomputes them.
+        # State V rows one block owns. Q, K, beta and the chunk inverse do not
+        # depend on V, so each block of a split recomputes them.
         self.D_v = self.D if blk_v is None else int(blk_v)
         if self.D % self.D_v:
             raise ValueError(f"blk_v {self.D_v} must divide head_size {self.D}")
-        # A narrower V band than the warps' M span means the warps cannot all
-        # take M, so the V-dependent GEMMs split N instead and the chain that
-        # hands each accumulator on as the next GEMM's A operand has to go
-        # through shared memory. That is `v32`, and it is the only way a
-        # narrower band shortens anything: with M-only warps a smaller D_v
-        # leaves warps idle and every warp still does 16 rows of M, so the
-        # per-warp work -- and the chain -- is exactly what it was.
+        # v32: a band of half the warps' M span. The V GEMMs split N across
+        # warps and hand accumulators on through shared memory.
         self.v32 = bool(v32)
         if self.v32:
             if self.D_v * 2 != NUM_MMA_WARPS * _MMA_ATOM_M:
@@ -264,8 +184,6 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             )
         self.num_v_splits = self.D // self.D_v
 
-        # One store object for the kernel: the tile shape and the block width
-        # are both fixed at construction.
         self.o_writer = CollectiveStoreSm80(self.BLK_Q, self.D_v, LOAD_THREADS)
         self.manual_cache_key(
             "needs_alpha",
@@ -303,15 +221,9 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
     ) -> WorkDesc:
-        """Which (sequence, head, value slice) this block owns.
-
-        The value slice varies fastest, so blocks sharing a sequence and a
-        head are adjacent and likeliest to find each other's lines in L2."""
+        """Which (sequence, head, value slice) this block owns."""
         bx, _, _ = cute.arch.block_idx()
-        # The value slice varies fastest, so the blocks sharing a sequence and a
-        # head are adjacent. They read the same Q, K, alpha and beta, and
-        # adjacent blocks are the ones likeliest to find each other's lines
-        # still in L2.
+        # Value slice varies fastest: blocks sharing Q/K are adjacent, for L2 reuse.
         v_slice_idx = cutlass.Int32(0)
         if cutlass.const_expr(self.num_v_splits > 1):
             v_slice_idx = bx % cutlass.Int32(self.num_v_splits)
@@ -339,11 +251,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
 
     @cute.jit
     def _math_order_init(self, wg_idx: cutlass.Int32):
-        """Pre-arrive at WG0's barrier so WG0 is unblocked on the first wait.
-
-        Nothing to order when the block is one warp group: the two bodies run in
-        sequence on the same warps and the program order is the ordering.
-        """
+        """Pre-arrive at WG0's barrier; a no-op with one warp group."""
         if cutlass.const_expr(NUM_MMA_WARP_GROUPS == 1):
             return
         if wg_idx == MathWarpGroupRole.QK:
@@ -353,15 +261,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
 
     @cute.jit
     def _math_order_wait(self, wg_idx: cutlass.Int32):
-        """Arrive+wait on this WG's own ordered barrier.
-
-        With one warp group there is no other group to wait for, but the wait
-        is still what publishes the shared writes of the body before it -- sQK
-        is written by every warp and read by every warp -- so it becomes a
-        plain block barrier rather than nothing. Making it a no-op returned
-        wrong results; the figure once quoted here was the M-repeat failure's
-        and did not belong to it.
-        """
+        """Arrive+wait on this WG's barrier; with one WG, a block barrier for sQK."""
         if cutlass.const_expr(NUM_MMA_WARP_GROUPS == 1):
             cute.arch.barrier()
             return
@@ -403,10 +303,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         tKKcMkk: cute.Tensor,  # coordinate mapping for KK fragment
     ):
         """Store tKKrKK → sKK_inv, Inverse, optionally reload+beta."""
-        # stmatrix is sm_90. The thread-value map here comes from the MMA's C
-        # layout, not from the atom, so swapping in an ordinary register-to-
-        # shared copy leaves every element at the same address -- it just takes
-        # one store per element instead of one instruction per 8x8 tile.
+        # No stmatrix on sm_80; plain R2S on the C layout writes the same addresses.
         r2s_atom = cute.make_copy_atom(cute.nvgpu.CopyR2SOp(), self.inverse_dtype)
         tiled_store = cute.make_tiled_copy_C(r2s_atom, kk_tiled_mma)
         thr_store = tiled_store.get_slice(kk_thread_idx)
@@ -483,26 +380,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         tOcO: cute.Tensor,
         sO: cute.Tensor,
     ):
-        """Write the O accumulator to shared memory, one element at a time.
-
-        The sm_90 path does this with stmatrix.trans: eight elements a thread
-        per instruction, transposed on the way out. That instruction does not
-        exist before sm_90, and no ordinary copy transposes, so the fragment is
-        written by coordinate instead -- ``tOcO`` gives each register its
-        (d, token) place, which is exactly how sO is laid out.
-
-        The cost is instruction count, not bandwidth: the same bytes go to the
-        same banks, but as one store per element rather than one per 8x8 tile.
-        Indexing sO by logical coordinates keeps the swizzle applied, so the
-        bank pattern is the one the layout was chosen for.
-
-        No async-proxy fence either. The sm_90 path needs one because the
-        reader of these bytes is the TMA engine, which sees shared memory
-        through a different proxy than the stores that produced them. Nothing
-        on this path does: the O tile is read back by ordinary loads in the
-        store warp, so the barrier that warp already takes is what orders them,
-        and fence.proxy.async.shared is an sm_90 instruction anyway.
-        """
+        """Write O to sO by its (d, token) coordinates: sm_80 has no stmatrix.trans."""
         for i in cutlass.range_constexpr(cute.size(tOrO)):
             d_i, tok = tOcO[i]
             sO[d_i, tok] = self.dtype(tOrO[i])
@@ -518,31 +396,11 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
 
     @cute.jit
     def _aligned(self, t: cute.Tensor):
-        """State the 16 B alignment the layout algebra cannot derive.
-
-        Every offset folded into this pointer -- the lane's run of d, the token,
-        the head, and the repeat above -- is a multiple of ``elems_per_lane``,
-        so the address is always on a 16 B boundary. The token and head strides
-        are runtime values, though, so the algebra falls back to element
-        alignment and the atom is rejected for wanting 128 bits from a pointer
-        it is told holds 16. Rounding up to 16 B is identity on a pointer
-        already there, and it is what states the fact.
-
-        It has to happen after the slice, not before: slicing folds another
-        runtime stride into the address and drops the claim again.
-
-        The premise is the caller's to keep; ``_check_load_alignment`` rejects
-        inputs that break it before any of this runs.
-        """
+        """Restate 16 B alignment after slicing; `_check_load_alignment` checks it."""
         return cute.make_tensor(t.iterator.align(_LOAD_ALIGN_BYTES), t.layout)
 
     def load_tv_shape_dn(self, d: int):
-        """Thread-value shape for a (d, token) tile of the given width.
-
-        Q is (token, d) and keeps its own shape; K and V are (d, token), and a
-        split value dimension makes V's width differ from K's, so theirs is
-        derived rather than stored.
-        """
+        """Thread-value shape for a (d, token) tile; a split V is narrower than K."""
         lanes_along_d = d // self.elems_per_lane
         return (
             ((lanes_along_d, LOAD_THREADS // lanes_along_d), (1, lanes_along_d)),
@@ -560,16 +418,8 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         d_is_mode1: cutlass.Constexpr,
         d: cutlass.Constexpr = None,
     ):
-        """Issue one tile with cp.async, zero-filling rows past ``row_limit``.
-
-        TMA clamped at the tensor bound on its own. Here the bound is a
-        predicate, and a row the sequence does not own has to be zeroed rather
-        than skipped: the math reads the whole tile, and the delta rule's
-        masking assumes the padding contributes nothing.
-        """
-        # The tile's own d, not the kernel's: V is narrower than Q and K when
-        # the value dimension is split, and a lane run sized for the wide one
-        # would walk off the row.
+        """Issue one tile with cp.async, zero-filling rows past ``row_limit``."""
+        # The tile's own d: a split V is narrower than Q and K.
         tile_d = cutlass.const_expr(self.D if d is None else d)
         if cutlass.const_expr(d_is_mode1):
             tv_shape, val_shape = self.q_load_tv_shape, self.q_load_val_shape
@@ -584,18 +434,14 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         thr_copy = tiled_copy.get_slice(tid)
         tSrc = thr_copy.partition_S(gTile)
         tDst = thr_copy.partition_D(sTile)
-        # partition_S/D give (copy_atom_value, rest_m, rest_n): the lane's 16 B
-        # run, then how many times the tiled copy has to repeat to cover the
-        # tile. Only the row axis repeats here, so rest_n is one.
+        # partition_S/D give (atom value, rest_m, rest_n); only the row axis repeats.
         lanes_along_d = cutlass.const_expr(tile_d // self.elems_per_lane)
         rows_at_a_time = cutlass.Int32(LOAD_THREADS) // cutlass.Int32(lanes_along_d)
         lane_row = tid // cutlass.Int32(lanes_along_d)
         rep_mode = 1 if cutlass.const_expr(d_is_mode1) else 2
         for rep in cutlass.range_constexpr(cute.size(tSrc, mode=[rep_mode])):
             row = cutlass.Int32(rep) * rows_at_a_time + lane_row
-            # A row the sequence does not own is zeroed rather than skipped:
-            # the math reads the whole tile and the masking assumes the padding
-            # contributes nothing. TMA used to clamp this for free.
+            # Zero, not skip: the math reads the whole tile and masking needs zeros.
             if row < row_limit:
                 cute.copy(
                     load_atom,
@@ -631,8 +477,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
     ):
         """Issue this block's share of the Q, K and V tiles on `cp.async`."""
         blk_tok = tok_start + blk * cutlass.Int32(self.BLK_KV)
-        # Rows of this tile the sequence actually owns. A full tile clamps to
-        # the tile height, so the predicate costs nothing on the common path.
+        # Rows of this tile the sequence owns.
         rows_live = tok_end - blk_tok
 
         # K first, then Q, then V -- the order the math side waits in.
@@ -663,8 +508,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         q_producer_state.advance()
 
         sV = sV_DS[None, None, v_producer_state.index]
-        # V is the one input a block reads only part of: it owns D_v rows of the
-        # value dimension, starting here.
+        # A block reads only its D_v rows of V.
         mV = cute.domain_offset(
             (v_row_offset, blk_tok), gV_full[None, None, v_head_idx]
         )
@@ -715,19 +559,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         tid: cutlass.Int32,
         warp_idx: cutlass.Int32,
     ):
-        """Fetch everything one block needs, with the whole block issuing it.
-
-        The sm_90 kernel gives this to a warp group of its own and lets the
-        math warps wait on an mbarrier, which this DSL will not emit for an
-        sm_80 target -- and without one a thread can only wait on cp.async it
-        issued itself. So the block does its own fetching and the math follows
-        behind a barrier.
-
-        Q, K and V go through cp.async and land when the consumer drains the
-        group. Alpha and beta are scalar streams read with ordinary loads, so
-        they are already in shared memory when this returns; the same barrier
-        publishes them.
-        """
+        """Fetch one block's Q/K/V (cp.async) and alpha/beta (plain loads)."""
         (
             q_producer_state,
             k_producer_state,
@@ -755,13 +587,8 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             tid,
         )
 
-        # Alpha's scan reads and writes the same channel, so exactly one warp
-        # may run it; a second would race the first between its load and its
-        # store. Beta only writes, but it is kept to one warp for the same
-        # reason, and there is nothing to gain from the rest doing it too.
-        #
-        # Neither branch contains a barrier, so restricting them does not make
-        # the block's barrier participation uneven.
+        # One warp each for alpha's in-place scan (a second would race it) and
+        # beta. Neither branch has a barrier, so restricting them is safe.
         if cutlass.const_expr(self.needs_alpha):
             alpha_pipeline.producer_acquire(alpha_producer_state)
             if warp_idx == cutlass.Int32(0):
@@ -820,13 +647,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         tid: cutlass.Int32,
         warp_idx: cutlass.Int32,
     ):
-        """What the fifth stage carries for one block. Here that is beta.
-
-        The only part of the issuer `CPDeltaRulePrefillSm80` replaces: it puts
-        a T tile in this stage, which stage 1 has already folded beta into.
-        `t_block_start` and `tid` are on the signature for that override, the
-        way `sBeta` and `g_beta` are already carried when `needs_beta` is off.
-        """
+        """Load beta into stage five; `CPDeltaRulePrefillSm80` overrides it with T."""
         if cutlass.const_expr(self.needs_beta):
             beta_pipeline.producer_acquire(beta_producer_state)
             if warp_idx == cutlass.Int32(1):
@@ -845,14 +666,8 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         return beta_producer_state
 
     def _k_major_atom_kind(self, elems: int):
-        """The widest K-major swizzled atom a row of `elems` can carry.
-
-        `K_SW128` wants 128 B of contiguous elements -- 64 of them at bf16 --
-        and `tile_to_shape` does not narrow it: asked for a 32-wide tile it
-        returns a 64-wide one, silently, and every extent derived from that
-        tile is then wrong. The V tile is `D_v` wide, so a narrower band needs
-        a narrower atom.
-        """
+        """The widest K-major swizzle atom a row of `elems` can carry."""
+        # `tile_to_shape` does not narrow an atom wider than the tile.
         bytes_per_row = elems * self.dtype.width // 8
         if bytes_per_row >= 128:
             return warpgroup.SmemLayoutAtomKind.K_SW128
@@ -866,15 +681,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
 
     @cute.jit
     def _handoff_put(self, acc, producer_mma, thread_idx, sBuf):
-        """Publish an accumulator into the buffer its consumer reads A from.
-
-        The thread-value map comes from the producing MMA's C layout, so every
-        element lands at the coordinate it already has; what the copy chooses
-        is how many instructions that takes. `acc` may be the fp32
-        accumulator or an operand fragment already in Element -- both are
-        converted elementwise into an Element fragment first, which is a no-op
-        for the second.
-        """
+        """Store an accumulator, as Element, to the buffer its consumer reads A from."""
         r2s = cute.make_copy_atom(cute.nvgpu.CopyR2SOp(), self.dtype)
         tiled = cute.make_tiled_copy_C(r2s, producer_mma)
         thr = tiled.get_slice(thread_idx)
@@ -896,20 +703,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
     # ─── v32 handoff layouts ──────────────────────────────────────────────────
 
     def _handoff_layouts(self, atom):
-        """Layouts for the four buffers the v32 chain hands accumulators through.
-
-        With the V-dependent GEMMs splitting N across warps, a warp holds half
-        of each accumulator's N and the next GEMM wants the whole of it as its
-        A operand's K. So each producer publishes its accumulator to shared and
-        each consumer reads an A fragment back out. Every buffer is
-        (M = D_v, K = the producer's N) with K contiguous and the same swizzled
-        atom the Q/K/V tiles use, which is the shape an ldmatrix A read wants.
-
-        Four buffers, not three, because new V is consumed twice and the two
-        consumers want different values: O2 reads it as it is, and the state
-        update reads it after the per-token decay. One buffer would need two
-        more barriers to sequence the two reads around the rewrite.
-        """
+        """(state, block) layouts of the v32 handoff buffers: (D_v, K), K contiguous."""
         state = cute.coalesce(
             cute.tile_to_shape(atom, (self.D_v, self.D), order=(0, 1)),
             target_profile=(1, 1),
@@ -929,12 +723,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         gKV: cute.Tensor,
         kv_thr_mma,
     ):
-        """Read a state tile into the accumulator, by coordinate.
-
-        The accumulator's layout is the MMA's and the global state is (k, v),
-        so walking the coordinates is what pairs them without materializing a
-        transposed copy.
-        """
+        """Read a (k, v) state tile into the accumulator by coordinate."""
         c_kv = cute.make_identity_tensor((self.D_v, self.D))
         tKVcKV = kv_thr_mma.partition_C(c_kv)
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
@@ -970,11 +759,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         block_end: cutlass.Int32,
         seq_len: cutlass.Int32,
     ):
-        """Write a checkpoint when this block ends on a multiple of the period.
-
-        The condition is `block_end % checkpoint_every_n_tokens == 0`, so a
-        sequence whose length is not a multiple writes floor(length/period)
-        checkpoints and the tail is not one of them."""
+        """Checkpoint when the block ends on a period multiple; the tail is not one."""
         if cutlass.const_expr(self.needs_checkpointing):
             if (
                 block_end <= seq_len
@@ -986,7 +771,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                     - cutlass.Int32(1)
                 )
                 checkpoint_layout = cute.make_ordered_layout(
-                    (self.D, self.D, num_sab_heads, total_checkpoints),
+                    (self.D, self.D, cutlass.Int64(num_sab_heads), total_checkpoints),
                     order=(0, 1, 2, 3),
                 )
                 mCheckpoint = cute.make_tensor(
@@ -1039,19 +824,12 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         scale: cutlass.Float32,
         # WG role: MathWarpGroupRole.KK or MathWarpGroupRole.QK.
         wg_idx: cutlass.Int32,
-        # v32 only: (state, u, new V, new V decayed). Last, and defaulted,
-        # because the chunk-parallel kernels inherit this method and call it
-        # positionally -- an argument inserted in the middle silently shifts
-        # theirs, which is exactly what it did.
+        # v32 only: (state, u, new V, new V decayed). Last and defaulted: the
+        # chunk-parallel kernels call this method positionally.
         sHandoff=None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        # Index among the math threads. On sm_90 they start at 128, behind the
-        # load/store warp group; here there is no such group and they start at
-        # zero, so the block index is already the one the MMA layouts want.
-        # Subtracting 128 the way the sm_90 kernel does would hand the first
-        # warp group negative coordinates, and the shared reads guarded by
-        # `not is_first_block` would then address below the buffer.
+        # No load/store warp group, so math threads start at 0, not at 128.
         thread_idx = tidx
         kk_thread_idx = thread_idx % cutlass.Int32(128)
         qk_thread_idx = thread_idx % cutlass.Int32(128)
@@ -1060,9 +838,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         blk_q = cute.size(sQ_SD, mode=[0])
         blk_kv = cute.size(sK_SD, mode=[0])
         d = cute.size(sQ_SD, mode=[1])
-        # The value dimension this block owns, which is d itself unless the
-        # state's V rows are split across blocks. Every V-dependent GEMM below
-        # carries it as the M mode and nothing else changes.
+        # V rows this block owns: the M mode of every V-dependent GEMM.
         d_v = cute.size(sV_DS, mode=[0])
         tile_shape_qk = (blk_q, blk_kv, d)
         tile_shape_kk = tile_shape_qk
@@ -1077,8 +853,6 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         alpha_stage = alpha_consumer_state.index
         beta_stage = beta_consumer_state.index
 
-        # One atom for every GEMM here; the two names it used to carry claimed a
-        # difference in warp count that was never in the atom.
         mma_atom = warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16))
 
         # QK/KK: up to 4 warps × 16M = 64M, one warp group's worth
@@ -1093,17 +867,8 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             permutation_mnk=tile_shape_kk,
         )
 
-        # O1/O2/SK/NewV: NUM_MMA_WARPS × 16 rows of M, which is D_v
-        # M-only, always: each of these hands its accumulator on as the next
-        # GEMM's A operand, and an operand's K has to be whole within a warp.
-        #
-        # Under v32 the band is half that, so M takes two warps and N takes the
-        # other two. That halves each warp's work in every one of these GEMMs
-        # -- which M-only splitting does not, since a warp's M stays 16 rows
-        # however narrow the band is -- and it is what breaks the operand
-        # reinterpretation, because a warp then holds half of each
-        # accumulator's N and the next GEMM wants all of it as K. The handoff
-        # buffers are where that whole is assembled.
+        # O1/O2/SK/NewV: M-only warps, so each accumulator is the next A operand.
+        # v32 splits warps 2x2 in M and N and hands accumulators through smem.
         if cutlass.const_expr(self.v32):
             v_warps = cute.make_layout((2, 2, 1))
         else:
@@ -1217,41 +982,24 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         tOrQK_cv = o2_thr_copy_B.retile(tOrQK)
         tOsQK = o2_thr_copy_B.partition_S(sQK)
 
-        # ── O store ───────────────────────────────────────────────────────────
-        # The other two stores kept their thread-value map when the atom
-        # changed, because they were writing the accumulator's own orientation.
-        # This one was not: stmatrix.trans wrote the fragment out transposed,
-        # and no ordinary copy does that. The accumulator and sO are both
-        # (d, token), though, so the coordinates the MMA already hands out --
-        # tOcO -- name the destination directly, and o_store walks them. See
-        # o_store for what that costs.
-
         # ── Coordinate tensors for masking / alpha/beta indexing ──────────────
         cMqk = cute.make_identity_tensor((blk_q, blk_kv))
         tQKcMqk = qk_thr_mma.partition_C(cMqk)
         cMkk = cMqk  # same shape (BlkKV == BlkQ == 64)
         tKKcMkk = kk_thr_mma.partition_C(cMkk)
-        # Buffer reuse is ordered by the barrier that CollectiveStoreSm80
-        # takes after writing O out, which sits between the last read here and
-        # the next issue_block_loads. The consumer states below still advance,
-        # because they name the stage; there is just no separate release
-        # barrier for each of them.
+        # No per-stage release: the barrier CollectiveStoreSm80 takes after
+        # writing O orders buffer reuse before the next issue_block_loads.
         cO = cute.make_identity_tensor((d_v, blk_q))
         tOcO = o1_thr_mma.partition_C(cO)
         cSK = cute.make_identity_tensor((d_v, blk_kv))
         tSKcSK = sk_thr_mma.partition_C(cSK)
         cV = cute.make_identity_tensor((d_v, blk_kv))
         tKVcV = kv_thr_mma.partition_A(cV)
-        # v32 decays new V in the layout it was produced in, before it is
-        # published, rather than in the state GEMM's operand layout.
+        # v32 decays new V in its producer's C layout, before publishing it.
         tNewVcNewV = newv_thr_mma.partition_C(cV)
 
         # ── KK GEMM (WG0 only) ────────────────────────────────────────────────
-        # One wait for all five tensors, not one each. issue_block_loads has
-        # already committed Q, K, V and, through ordinary stores, alpha and
-        # beta, and prefetch is zero -- so this cp_async_wait_group(0) drains
-        # every outstanding group and its barrier publishes all of it to the
-        # block at once. A second wait would drain nothing and re-barrier.
+        # Prefetch is zero, so this wait drains and publishes all five inputs.
         k_pipeline.consumer_wait(k_consumer_state)
         # Match the C++ reject-non-role-first shape; ptxas keeps BRA.U around
         # the role body instead of predicating the HMMA/LDSM/STSM sequence.
@@ -1282,10 +1030,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         if cutlass.const_expr(self.needs_beta):
             beta_consumer_state.advance()
         if cutlass.const_expr(NUM_MMA_WARP_GROUPS == 1):
-            # Two warp groups run these two bodies at once on separate shared
-            # buffers. One warp group runs them in sequence on the same warps,
-            # and every warp writes part of each buffer, so the boundary needs
-            # a rendezvous that the two-group form got from its named barriers.
+            # One warp group runs both bodies in turn; every warp writes both buffers.
             cute.arch.barrier()
 
         # ── QK GEMM (WG1 only) ────────────────────────────────────────────────
@@ -1309,9 +1054,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             cute.arch.barrier()
 
         # ── The state handoff, read by both O1 and S@K ───────────────────────
-        # One publish serves the two consumers. Nothing needs a barrier before
-        # it: the buffer's previous readers are this block's predecessors, and
-        # the handoff barriers below them stand between.
+        # No barrier first: the previous block's handoff barriers fence its reads.
         if cutlass.const_expr(self.v32 and not is_first_block):
             self._handoff_put(tKVrKV, kv_tiled_mma, thread_idx, sHandoff[0])
             cute.arch.barrier()
@@ -1378,11 +1121,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         v_consumer_state.advance()
 
         # ── O2 = O1 + NewV @ QK  (ordered: WG0 first) ────────────────────────
-        # Two consumers want different values of new V: O2 wants it as it is
-        # and the state update wants it decayed per token, so v32 publishes it
-        # twice into two buffers rather than sequencing one buffer with extra
-        # barriers. The decayed copy is built here, next to the undecayed one,
-        # so both publishes share the barrier below.
+        # v32 publishes new V twice, one barrier: raw for O2, decayed for the state.
         if cutlass.const_expr(self.v32):
             tNewVrE = cute.make_fragment_like(tNewVrC, self.dtype)
             for i in cutlass.range_constexpr(cute.size(tNewVrC)):
@@ -1405,9 +1144,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         self._math_order_notify(wg_idx)
 
         # ── O store to smem ───────────────────────────────────────────────────
-        # No pipeline around this. With the store warp gone, the thread that
-        # writes sO is the thread that will copy it out, and the caller's store
-        # brackets that with the two barriers a handoff would have needed.
+        # No pipeline: the caller's store brackets the copy-out with barriers.
         self.o_store(tOrO, tOcO, sO[None, None, o_stage])
 
         # ── KV state update ───────────────────────────────────────────────────
@@ -1443,9 +1180,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         )
 
     # ─── Block entry point ───────────────────────────────────────────────────
-    # One path for the whole block. The C++ kernel splits into warp roles here,
-    # and that split needs an mbarrier this DSL will not emit for sm_80, so it
-    # does not survive here -- see pipeline_sm80 for the measurements.
+    # One path for the whole block: the DSL emits no mbarrier for sm_80 to split roles.
 
     @cute.jit
     def run_math_role(
@@ -1539,7 +1274,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         tKVrKV.fill(self.acc_dtype(0.0))
 
         packed_state_layout = cute.make_ordered_layout(
-            (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
+            (self.D, self.D, cutlass.Int64(num_sab_heads), num_seqs), order=(0, 1, 2, 3)
         )
         state_ref_shape = (g_state.shape[0], g_state.shape[1], self.D, self.D)
         state_ref_layout = cute.make_layout(state_ref_shape, stride=g_state.stride)
@@ -1552,9 +1287,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             state_layout = packed_state_layout
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         mState = cute.make_tensor(g_state.iterator, state_layout)
-        # (k, v): every K row of the band of V rows this block owns. Blocks of
-        # one sequence and head write disjoint bands, so the pool needs no
-        # coordination between them.
+        # (k, v) of this block's V band; bands are disjoint across blocks.
         v_row_offset = work_desc.v_row_offset(self.D_v)
         gStateKV = cute.domain_offset(
             (cutlass.Int32(0), v_row_offset),
@@ -2048,39 +1781,19 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             order=(1, 0, 2),
         )
 
-        # One cp.async atom serves every load: the tile geometry lives in the
-        # thread-value layout below rather than in a descriptor, so Q, K and V
-        # differ only in how the loader partitions them.
-        #
-        # 128 bits a lane is the widest cp.async does, and it is what keeps a
-        # tile down to one access per lane per row group. The value layout has
-        # to run along the contiguous axis or the access is a gather and the
-        # atom rejects it.
-        # The atom itself is built inside the trace, not here: making it in
-        # __init__ produces an IR value belonging to no kernel region, and the
-        # tiled copy that consumes it is then rejected for using a value from
-        # outside. Only the shape it implies is host state.
+        # 128-bit cp.async lanes along contiguous d. Only shapes are host state:
+        # a tiled copy rejects an atom or layout built outside the trace.
         elems_per_lane = 128 // self.dtype.width
         self.elems_per_lane = elems_per_lane
-        # Q is (token, d) with d contiguous; K and V are (d, token) with d
-        # contiguous. Both put d on the fast axis, so one tiled copy shape
-        # covers all three: lanes split d, and successive thread rows walk the
-        # other axis.
-        # A lane's 16 B has to sit on whichever mode is contiguous, and the two
-        # orientations disagree: Q is (token, d) so d is mode 1, while K and V
-        # are (d, token) so d is mode 0. One layout pair each.
+        # d is mode 1 of Q (token, d) and mode 0 of K and V (d, token).
         lanes_along_d = self.D // elems_per_lane
         rows_at_a_time = LOAD_THREADS // lanes_along_d
         self.lanes_along_d = lanes_along_d
         self.load_rows_at_a_time = rows_at_a_time
-        # Shapes only -- the layouts themselves are built inside the trace, for
-        # the same reason the atom is.
         # Q: lanes split d within a row, thread rows walk tokens.
         self.q_load_tv_shape = ((rows_at_a_time, lanes_along_d), (lanes_along_d, 1))
         self.q_load_val_shape = (1, elems_per_lane)
-        # K and V take the same split with the modes swapped, so the vector
-        # still runs along d -- built per width by `load_tv_shape_dn`, because a
-        # split value dimension makes V narrower than K.
+        # K and V use `load_tv_shape_dn` per width: a split V is narrower than K.
 
         qk_layout_atom = cute.make_layout((8, 8), stride=(8, 1))
         qk_storage_layout = cute.tile_to_shape(
@@ -2094,18 +1807,13 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         )
         beta_storage_layout = cute.make_layout((self.BLK_KV, self.alpha_beta_stage))
 
-        # Plain integers, not `cosize` of the swizzled layouts: the struct's
-        # member lengths have to be static Python values and a composed
-        # layout's cosize is not one inside the trace. The atom covers these
-        # tiles exactly, so the element counts are the tiles'.
+        # Plain ints: struct member lengths must be static; a composed cosize is not.
         handoff_state_elems = self.D_v * self.D
         handoff_blk_elems = self.D_v * self.BLK_KV
 
         @cute.struct
         class SharedStorage:
-            # The sm_90 path reserved two mbarriers a stage here, for the full
-            # and empty phases. The sm_80 pipelines count async groups instead,
-            # so that storage is gone and the stages have it back.
+            # No mbarrier storage: the sm_80 pipelines count cp.async groups.
             smem_q: cute.struct.Align[
                 cute.struct.MemRange[self.dtype, cute.cosize(q_storage_layout)],
                 128,
@@ -2143,18 +1851,11 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 16,
             ]
 
-        # The four v32 handoff buffers are appended rather than declared in
-        # the class body, because a zero-length MemRange is not an allocatable
-        # layout -- the allocator asserts on it -- so the shipped kernel
-        # cannot carry them at length zero. Appending keeps its allocation
-        # byte for byte what it was.
-        # Typed as `type` rather than as the class: the v32 branch replaces it
-        # with a struct built at trace time, and the subclasses that override
-        # this method assign their own storage to the same attribute.
+        # v32 appends its handoff buffers: a zero-length MemRange can't be allocated.
+        # `type`, not the class: v32 and the subclasses assign other structs.
         storage_cls: type = SharedStorage
         if cutlass.const_expr(self.v32):
-            # `cute.struct` records the members here; the attribute is not
-            # in its stubs, and ruff rejects `getattr` with a constant name.
+            # `_annotations` is not in the stubs; ruff rejects a constant getattr.
             annotations = dict(SharedStorage._annotations)  # type: ignore[attr-defined]
             for name, elems in (
                 ("smem_hstate", handoff_state_elems),
@@ -2197,12 +1898,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             block=(LOAD_THREADS, 1, 1),
             max_number_threads=(LOAD_THREADS, 1, 1),
             stream=stream,
-            # One. Asking for two costs 30% (1.751 -> 2.270 ms): the bound
-            # forces ptxas to 128 registers a thread, half what this kernel
-            # wants, and it reaches that by spilling. On the shapes where the
-            # extra residency would matter the grid is also smaller than the
-            # SM count -- num_seqs * num_sab_heads * the value splits -- so
-            # there is no second block to co-reside with in the first place.
+            # Two would cap ptxas at 128 registers a thread and force spills.
             min_blocks_per_mp=1,
         )
 
@@ -2233,9 +1929,6 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # The sm_90 path prefetched the four TMA descriptors here. cp.async has
-        # no descriptor to warm, so the block goes straight to work.
-
         work_desc = self.get_next_work(
             cu_seqlens,
             num_q_heads,
@@ -2247,8 +1940,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             work_desc.seq_len + cutlass.Int32(self.BLK_KV) - cutlass.Int32(1)
         ) // cutlass.Int32(self.BLK_KV)
 
-        # With the load/store warp group gone, every thread is a math thread,
-        # so its index within the math half is its index in the block.
+        # Every thread is a math thread, so its math index is its block index.
         math_tidx = tidx
         wg_idx = tidx // cutlass.Int32(THREADS_PER_WARP_GROUP)
 
@@ -2327,10 +2019,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         beta_layout = cute.make_layout((self.BLK_KV, self.alpha_beta_stage))
         sBeta = storage.smem_beta.get_tensor(beta_layout)
 
-        # v32 handoff buffers. Built unconditionally would cost nothing at
-        # runtime, but `get_tensor` on a zero-length MemRange is not a thing,
-        # so they are only made when the specialization is on. The tuple keeps
-        # compute_loop_body's signature one argument wider either way.
+        # v32 handoff buffers; without v32 there is no storage for them.
         sHandoff = None
         if cutlass.const_expr(self.v32):
             hstate_layout, hblk_layout = self._handoff_layouts(qkv_smem_layout_atom)
@@ -2354,9 +2043,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         v_pipeline = PipelineCpAsyncSm80(self.v_stage)
         alpha_pipeline = PipelineCpAsyncSm80(self.alpha_beta_stage)
         beta_pipeline = PipelineCpAsyncSm80(self.alpha_beta_stage)
-        # No mbarrier storage to fence: the stage pipelines are group
-        # counters. One barrier still has to line the block up before the
-        # first load.
+        # No mbarriers to fence; one barrier lines the block up before the first load.
         cute.arch.sync_threads()
 
         if work_desc.seq_len != cutlass.Int32(0):
@@ -2408,12 +2095,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
 # ─── Public API ──────────────────────────────────────────────────────────────
 
 
-#: Benchmark opt-in for the v32 specialization, and off. It is not how the
-#: public entry reaches v32 -- `gdn_prefill` offers the specialization from
-#: host-side data through the `enabled` argument below -- it is the override
-#: for a caller measuring v32 without that offer. Either way v32 is taken
-#: only on the one contract `_v32_applies` admits; everything else gets the
-#: shipped kernel.
+#: Benchmark override offering v32 without the dispatcher; `_v32_applies` gates it.
 _V32_PROTOTYPE = False
 
 
@@ -2430,19 +2112,7 @@ def _v32_applies(
     needs_checkpointing,
     use_state_indices,
 ) -> bool:
-    """Whether this call takes v32: the caller asked, and the contract holds.
-
-    The contract is deliberately exact rather than a region. Everything in it
-    was measured on `1x8192 gva4x16` in three independent processes, where
-    v32 runs 1.066x-1.093x of the shipped V64 path on all four items; see
-    `V32_SM80_MAX_SEQ_LEN` for how those readings sit against Triton. Nothing
-    outside the contract has been measured, so anything else falls back to the
-    shipped kernel rather than taking a path no measurement covers.
-
-    `enabled` is what the dispatcher decided from host-side data it has and
-    this function does not, chiefly the exact longest sequence and the compute
-    capability. `_V32_PROTOTYPE` is the benchmark override and is off.
-    """
+    """Whether v32 is offered and the call matches its one measured shape exactly."""
     if not (enabled or _V32_PROTOTYPE):
         return False
     return (
@@ -2477,11 +2147,7 @@ def _get_prefill_kernel(
     blk_v,
     v32=False,
 ):
-    """One kernel object per compile-time configuration.
-
-    Cached, because building it re-derives every layout; the arguments are
-    exactly the fields the compile key carries, so two calls that would
-    compile the same binary get the same object."""
+    """One cached kernel object per compile key; the arguments are its fields."""
     return _FullyFusedDeltaRuleSm80(
         needs_alpha,
         needs_beta,
@@ -2517,10 +2183,8 @@ def delta_rule_prefill_dsl(
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
     state_indices: torch.Tensor | None = None,
-    # Private. The dispatcher's decision to offer the V32 fused
-    # specialization, from host-side data this function does not have -- the
-    # exact longest sequence and the compute capability. Offered, not
-    # imposed: the contract below still has to hold.
+    # Private: the dispatcher's offer of v32, from host data this function lacks;
+    # `_v32_applies` still gates it.
     _v32: bool = False,
 ):
     import cuda.bindings.driver as cuda_driver
@@ -2603,18 +2267,9 @@ def delta_rule_prefill_dsl(
         ("alpha", alpha),
         ("beta", beta),
         ("state_indices", state_indices),
-        # state_checkpoints reaches the kernel as reshape(-1). On a tensor
-        # that is not contiguous that returns a copy, so the kernel writes its
-        # checkpoints into a temporary that is freed on return -- every
-        # checkpoint lost, nothing raised. Measured: a pool sliced as
-        # pool[::2] writes 0 of 4.
+        # Passed as reshape(-1), which copies a strided tensor and loses the writes.
         ("state_checkpoints", state_checkpoints),
-        # checkpoint_cu_starts is passed unreshaped, so that is not its
-        # failure. Its problem is the compile cache: mark_layout_dynamic bakes
-        # a unit stride whenever a dimension has one, and the cache key
-        # carries dtypes and tile config but no strides -- so a first
-        # contiguous call would bake stride 1 and a later strided one would
-        # reuse that kernel and misread every offset.
+        # The compile cache key has no strides; a baked unit stride would be reused.
         ("checkpoint_cu_starts", checkpoint_cu_starts),
     ):
         if tensor is not None and not tensor.is_contiguous():
@@ -2645,7 +2300,6 @@ def delta_rule_prefill_dsl(
     )
     _check_load_alignment(q=q_view, k=k_view, v=v_view, o=o_view)
     _check_state_dtype_supported(
-        device,
         state=state,
         initial_state=init_state if needs_init_state else None,
         state_checkpoints=state_checkpoints if needs_checkpointing else None,

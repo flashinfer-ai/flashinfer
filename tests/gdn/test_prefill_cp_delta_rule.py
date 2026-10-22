@@ -1114,11 +1114,7 @@ def test_cp_delta_rule_external_state_dtype(
 
 @torch.inference_mode()
 def test_cp_delta_rule_public_wrapper_refuses_a_misaligned_gate():
-    """A contiguous gate that starts off its 16-byte boundary is refused.
-
-    The stages promise the compiler that alignment, and the composition calls
-    them with `_skip_check=True`, so this is the check that has to survive it.
-    """
+    """A contiguous gate off its 16-byte boundary is refused despite `_skip_check`."""
     device = torch.device("cuda")
     if get_compute_capability(device)[0] != 8:
         pytest.skip("the SM8x CP stages check their pointer alignment")

@@ -651,11 +651,7 @@ def test_prefill_state_indices_none_is_default(backend, use_cp):
 
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_pools_of_different_sizes(use_cp):
-    """Separate initial and output pools each keep their own size and strides.
-
-    They differ in padding and inner stride as well: pools that differ only in
-    their leading dimension share element strides, so an address built from
-    the wrong one would still land."""
+    """Separate initial and output pools keep their own size, padding and strides."""
     _skip_if_not_supported("flashinfer", use_cp)
     device = torch.device("cuda")
     *inputs, init_state = _make_inputs([256, 512], 8, 128, torch.bfloat16, device, 0)
@@ -676,11 +672,7 @@ def test_prefill_state_indices_pools_of_different_sizes(use_cp):
 
 
 def _run_invalid_slot_child(use_cp):
-    """Launch the native prefill with a `state_indices` entry past the pool.
-
-    Runs in a child process: the bounds check is a device-side assert, which
-    poisons the CUDA context for everything that follows it.
-    """
+    """Launch with a slot past the pool, in a child: the device assert poisons CUDA."""
     device = torch.device("cuda")
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
         [128], 8, 128, torch.bfloat16, device, seed=0
@@ -693,12 +685,7 @@ def _run_invalid_slot_child(use_cp):
 
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(use_cp):
-    """An id past the pool must be caught, not read past it.
-
-    The overrun is otherwise silent: the caching allocator carves both pools out
-    of a much larger block, so an out-of-range slot lands in a neighbouring
-    tensor and neither the kernel nor compute-sanitizer reports anything.
-    """
+    """An id past the pool is caught; unchecked, it silently hits a neighbour tensor."""
     repo_root = Path(__file__).resolve().parents[2]
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
@@ -713,8 +700,7 @@ def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(use_cp):
         env=env,
     )
     combined = completed.stdout + completed.stderr
-    # Only a line that starts with the marker is a skip, so an unrelated failure
-    # that happens to print "SKIP" somewhere cannot disable the check.
+    # Only a line starting with the marker is a skip.
     skips = [ln for ln in combined.splitlines() if ln.startswith("SKIP:")]
     if skips:
         pytest.skip(skips[-1])
@@ -724,8 +710,7 @@ def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(use_cp):
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--invalid-slot":
-    # Report the skip on stdout rather than through pytest.skip: this runs as a
-    # plain script, and the parent turns the marker into the skip.
+    # A plain script: the parent turns this marker into the skip.
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
     elif get_compute_capability(torch.device("cuda"))[0] not in (8, 9, 10, 12):

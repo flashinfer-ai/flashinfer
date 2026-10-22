@@ -2611,9 +2611,11 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         if cutlass.const_expr(self.use_setmaxnreg):
             cute.arch.setmaxregister_increase(self.registers_per_thread)
         state_layout = cute.make_layout((self.rows_per_cta, self.D), stride=(self.D, 1))
+        # Int64: chunks * heads * D * D can exceed 2^31.
+        block_stride = self.D * self.D * cutlass.Int64(num_heads)
         out_layout = cute.make_layout(
             (self.D, self.D, num_heads, total_cp_chunks),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            stride=(self.D, 1, self.D * self.D, block_stride),
         )
         workspace_layout = out_layout
         allocator = cutlass.utils.SmemAllocator()
@@ -2625,7 +2627,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         gFixedState = cute.make_tensor(g_fixed_state_t.iterator.align(128), out_layout)
         fixed_state_layout = cute.make_layout(
             (self.D, self.D, num_heads, num_seqs),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            stride=(self.D, 1, self.D * self.D, block_stride),
         )
         state_idx = seq_idx
         if cutlass.const_expr(self.use_state_indices):

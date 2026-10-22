@@ -878,7 +878,7 @@ def _is_gdn_cp_sm100_supported_shape(
     )
 
 
-def _allocate_output_state(
+def _allocate_sm8x_output_state(
     num_seqs: int,
     num_sab_heads: int,
     head_size: int,
@@ -887,46 +887,21 @@ def _allocate_output_state(
     state_indices: Optional[torch.Tensor],
     returned: bool = True,
 ) -> torch.Tensor:
-    """Allocate the final-state buffer with every row already defined.
+    """The SM8x final-state buffer; a zero-length sequence never writes its row.
 
-    Every kernel here guards its body on the sequence being non-empty, so a
-    sequence of zero tokens never writes its row and that row keeps whatever the
-    buffer held. Allocated with `torch.empty`, that is uninitialised memory
-    returned as a state.
-
-    A caller who supplies `output_state` owns its contents and this does not
-    run: the row keeps what the caller put there, which is the documented
-    behaviour and what a state pool wants. It is only the buffer allocated here
-    that has to start from something, and the something is the batch's own
-    initial state where there is one and zero where there is not -- both of
-    which the kernel then overwrites for every sequence that has tokens.
-
-    No branch on whether the batch *has* an empty sequence. Asking that question
-    means `bool(...)` on a device tensor, which is a device-to-host
-    synchronisation on the hot path: removing it took a loop of single-token
-    calls from 256 us to 173 us, and moved every cell of the pinned baseline.
-    The buffer is initialised unconditionally instead, which costs one pass over
-    memory this branch had to allocate anyway.
-
-    The shape follows the initial state when the caller indexes a pool, because
-    the two are copied row for row and a batch-shaped buffer against a
-    pool-shaped source is a `copy_` that raises. It is computed here rather than
-    at each of the five call sites, two of which had it hardcoded to the batch.
-
-    A buffer that is not `returned` is scratch the kernel stores into and the
-    caller never reads, so it keeps that shape and is left uninitialised.
+    A returned buffer starts as the initial state, or zero without one, so that
+    row is h0 or zero. Scratch the caller never reads stays uninitialized.
     """
     shape = (
         initial_state.shape
         if state_indices is not None and initial_state is not None
         else (num_seqs, num_sab_heads, head_size, head_size)
     )
-    if not returned:
-        return torch.empty(shape, dtype=torch.float32, device=device)
-    if initial_state is None:
+    if returned and initial_state is None:
         return torch.zeros(shape, dtype=torch.float32, device=device)
     out = torch.empty(shape, dtype=torch.float32, device=device)
-    out.copy_(initial_state)
+    if returned:
+        out.copy_(initial_state)
     return out
 
 
@@ -949,13 +924,7 @@ def _cp_delta_rule_rejection_reason(
     state_indices: Optional[torch.Tensor],
     cp_chunk_len: Optional[int],
 ) -> Optional[str]:
-    """Why CP cannot serve this call, or ``None`` if it can.
-
-    A string rather than a raised error, so the caller decides: `use_cp=True`
-    turns it into the message of an exception, and `use_cp="auto"` reads it as
-    "take the fused path". Returning early on the first reason keeps the
-    message about the thing the caller is most likely to fix.
-    """
+    """Why CP cannot serve this call, or ``None`` if it can."""
     if arch_major == 8:
         if cp_delta_rule_dsl_sm80 is None:
             return "CP delta rule SM8x DSL kernel is unavailable"
@@ -1360,17 +1329,10 @@ def chunk_gated_delta_rule(
       Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
-    - On SM8x the state may not be FP8: converting to or from it is a single
-      instruction starting at SM89, and there is no software path here.  SM89
-      itself is unaffected.
-    - ``use_cp="auto"`` selects CP on compute capability 8.0 when the caller
-      passes the exact longest sequence and it is at least 8192 tokens, and
-      ``num_seqs * max(num_q_heads, num_v_heads)`` is at most 8 -- long
-      sequences whose head count leaves the non-CP grid too small to fill the
-      device.  Without the exact maximum it stays on the non-CP path: the only
-      other source for it is ``cu_seqlens``, which is on the device, and
-      reading it here would synchronize on every call.  SM86 and SM89 are not
-      in that rule until they are measured.
+    - On SM8x the state may not be FP8.
+    - ``use_cp="auto"`` selects CP on compute capability 8.0 when
+      ``cu_seqlens_cpu`` gives a longest sequence of at least 8192 tokens and
+      ``num_seqs * max(num_q_heads, num_v_heads)`` is at most 16.
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
@@ -1574,8 +1536,7 @@ def chunk_gated_delta_rule(
                 f"[*, {num_sab_heads}, {head_size}, {head_size}], "
                 f"got {list(state_checkpoints.shape)}"
             )
-        # Refused on every arch, as the SM8x entry already does: a strided
-        # state_checkpoints is written through a copy and lost.
+        # A strided state_checkpoints would be written through a copy and lost.
         for name, tensor in (
             ("state_checkpoints", state_checkpoints),
             ("checkpoint_cu_starts", checkpoint_cu_starts),
@@ -1606,8 +1567,7 @@ def chunk_gated_delta_rule(
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
     _parallel_work = num_seqs * num_sab_heads
-    # SM8x routes on the batch's exact longest sequence, which only the host
-    # copy of cu_seqlens carries; max_seqlen may be any safe upper bound.
+    # SM8x routes on the exact longest sequence; max_seqlen may be an upper bound.
     sm8x_max_seqlen = None
     if _arch_major == 8 and cu_seqlens_cpu is not None:
         offsets = _cake_gdn_prefill_host_offsets(
@@ -1627,10 +1587,6 @@ def chunk_gated_delta_rule(
             device_capability=_device_capability,
         )
     ) or should_use_cp_sm80_host(
-        # The exact longest sequence, or nothing. `cp_max_seqlen` can be a
-        # caller's upper bound or the packed length, and either would
-        # select CP for multi-sequence batches whose real maximum is short,
-        # which is where CP loses. So an unknown maximum means fused.
         sm8x_max_seqlen,
         _parallel_work,
         _device_capability,
@@ -1703,18 +1659,7 @@ def chunk_gated_delta_rule(
             "Cake GDN CP requires SM100/SM103/SM107 and supported head, state and "
             "checkpoint configurations"
         )
-    # The V32 fused specialization, offered only on the exact shape it was
-    # validated on and only when the caller is not asking for CP. Everything
-    # else about the contract -- the dtypes, the initial and final state, the
-    # absence of checkpointing and state indices -- is checked where those
-    # facts live, in the SM80 entry.
-    #
-    # The Cake backend is excluded explicitly rather than through
-    # `will_use_cp`: that term is false for it too, so deriving the offer from
-    # `not will_use_cp` alone would answer yes on a path that is not this
-    # kernel's. Cake returns before the architecture dispatch, so the value
-    # would go unread today -- which is exactly the kind of thing that stops
-    # being true quietly.
+    # The SM80 entry checks the rest of the V32 contract (dtypes, state, no checkpoints).
     offer_v32 = (
         backend != "cake_gdn"
         and not will_use_cp
@@ -1757,16 +1702,7 @@ def chunk_gated_delta_rule(
         # compact scratch state the SM90/SM120 kernels still store into.
         if initial_state is None and output_state is None:
             state_indices = None
-        # Bounds-check the slot ids against the pool they index. An id outside
-        # [0, N_pool) makes the kernel read or write past the pool, and the
-        # caching allocator normally hides that in a neighbouring
-        # sub-allocation rather than faulting, so nothing reports it. The check
-        # is a device-side assert with no host synchronization, opt-in through
-        # FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1 like the Cake one; uniqueness
-        # stays a documented caller precondition because checking it would
-        # need one. output_final_state does not gate the final-state
-        # write, so output_state is part of the check whenever it is given.
-        # The cake_gdn non-CP route checks the same ids itself.
+        # Opt-in slot bounds check (FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1), as Cake does.
         indexed_pools = tuple(
             tensor for tensor in (initial_state, output_state) if tensor is not None
         )
@@ -1822,14 +1758,20 @@ def chunk_gated_delta_rule(
                 stacklevel=2,
             )
         else:
-            if output_final_state and output_state is None:
-                output_state = _allocate_output_state(
+            if output_final_state and output_state is None and _arch_major == 8:
+                output_state = _allocate_sm8x_output_state(
                     num_seqs,
                     num_sab_heads,
                     head_size,
                     device,
                     initial_state,
                     state_indices,
+                )
+            if output_final_state and output_state is None:
+                output_state = torch.empty(
+                    (num_seqs, num_sab_heads, head_size, head_size),
+                    dtype=torch.float32,
+                    device=device,
                 )
             if use_gdn_cp_backend:
                 gdn_cp_backend = cast(
@@ -1954,13 +1896,10 @@ def chunk_gated_delta_rule(
         if not output_final_state:
             output_state = None
         elif output_state is None:
-            output_state = _allocate_output_state(
-                num_seqs,
-                num_sab_heads,
-                head_size,
-                device,
-                initial_state,
-                state_indices,
+            output_state = torch.empty(
+                (num_seqs, num_sab_heads, head_size, head_size),
+                dtype=torch.float32,
+                device=device,
             )
 
         _g = (
@@ -1995,13 +1934,11 @@ def chunk_gated_delta_rule(
             state_indices=state_indices,
         )
     elif _arch_major == 8:
-        # SM80 Ampere path (CuTe DSL kernel). Same kernel structure as SM120,
-        # with the loads on cp.async and the stores and barriers rebuilt out of
-        # what exists before SM90.
+        # SM80 Ampere path (CuTe DSL kernel)
         if chunk_gated_delta_rule_sm80 is None:
             raise NotImplementedError("SM80 GDN prefill DSL kernel is unavailable")
         if output_state is None:
-            output_state = _allocate_output_state(
+            output_state = _allocate_sm8x_output_state(
                 num_seqs,
                 num_sab_heads,
                 head_size,
@@ -2032,14 +1969,13 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm120 is None:
             raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
         if output_state is None:
-            output_state = _allocate_output_state(
-                num_seqs,
-                num_sab_heads,
-                head_size,
-                device,
-                initial_state,
-                state_indices,
-                returned=output_final_state,
+            output_state_shape = (
+                initial_state.shape
+                if state_indices is not None and initial_state is not None
+                else (num_seqs, num_sab_heads, head_size, head_size)
+            )
+            output_state = torch.empty(
+                output_state_shape, dtype=torch.float32, device=device
             )
         chunk_gated_delta_rule_sm120(
             output,
@@ -2066,14 +2002,14 @@ def chunk_gated_delta_rule(
         # output_state[state_indices[i]] when indexed, so scratch for a
         # read-only pool must span the pool, as on SM120.
         if output_state is None:
-            output_state = _allocate_output_state(
-                num_seqs,
-                num_sab_heads,
-                head_size,
-                device,
-                initial_state,
-                state_indices,
-                returned=output_final_state,
+            output_state = torch.empty(
+                (
+                    initial_state.shape
+                    if state_indices is not None and initial_state is not None
+                    else (num_seqs, num_sab_heads, head_size, head_size)
+                ),
+                dtype=torch.float32,
+                device=device,
             )
 
         chunk_gated_delta_rule_sm90(
