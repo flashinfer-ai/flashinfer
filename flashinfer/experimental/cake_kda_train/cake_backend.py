@@ -27,8 +27,9 @@ of 1 is optional on every operand and the outputs take the rank of the inputs.
 Every operand is contiguous; a strided view is refused, never copied.
 
 The host reads no tensor contents: the chunk tables are built on the device
-from ``cu_seqlens`` by the ``table`` program (and the segment block table by
-``seg_table``), the chunk-shaped programs launch at the host bound
+from ``cu_seqlens`` by the ``table`` program (the segmented route's block table
+too, by ``table_v3``, up to 256 documents; by ``seg_table`` above), the
+chunk-shaped programs launch at the host bound
 ``num_chunks_pad`` and treat ``chunk_len == 0`` as a no-op, and the persistent
 programs read the real chunk count from ``seq_chunk_start[num_docs]``.  Which
 variant of a stage runs and how large its grid is follow from the host
@@ -37,7 +38,8 @@ and the path of the call (:data:`cake_jit.PATHS`) through the rules of
 :mod:`.cake_jit`.  Every launch is ``cake_jit.run_module`` with a plan grid;
 nothing here synchronizes or reads device memory.
 
-Launch sequences.  Forward: table (+ seg_table), intra (``Aqk`` / ``Akk`` and
+Launch sequences.  Forward: table (+ seg_table above 256 documents on the
+segmented route), intra (``Aqk`` / ``Akk`` and
 the GLM prep's outputs: the gated keys / queries, the gate row and the
 ``v_new`` pads), then on the serial route (more than eight heads)
 the state recurrence, which forms the output itself and, from 32 heads, the
@@ -56,9 +58,8 @@ matching adjoint recurrence reads; the saved-state pass 2 of the segmented
 rows with at most 32 (document, head) chains does the same; the serial adjoint
 recurrence accumulates ``dv`` itself, so ``dav`` computes ``dAqk`` alone there
 and from 16 heads the fused gradient hosts even that (no ``dav`` launch); the
-segmented adjoint recurrence accumulates ``dv`` too, with ``dav`` (``dAqk``
-alone) on the few-chain rows and the fused gradient hosting ``dAqk`` above four
-chains (no ``dav`` launch).  The fused gradient and the GLM
+segmented adjoint recurrence accumulates ``dv`` too and the fused gradient
+hosts ``dAqk`` on every segmented row (no ``dav`` launch).  The fused gradient and the GLM
 intra kernel read the user's ``q`` / ``k`` / ``v`` token rows where they are;
 the backward programs of the saved-set paths read the saved ``Aqk`` / ``Akk``
 token rows and the user's ``dout``, the replay path's programs the internal
@@ -1262,8 +1263,10 @@ def _tables(
     """A fresh table buffer written by the table program (pad entries are written as zeros): the four table views
     and, on the segmented route, the block table ``seg_table`` (``[NSEG + 2 * num_docs + 1]``: the chains' first
     segments in the layout table's document order, then per chain its segment starts and end chunk; per-document
-    proportional segment counts under ``proportional``) the seg_table program derives from ``seq_chunk_start``,
-    ``seq_order`` and ``segments``."""
+    proportional segment counts under ``proportional``) derived from ``seq_chunk_start``, ``seq_order`` and
+    ``segments``: by the ``table_v3`` record in the same launch as the chunk tables up to 256 documents, by the
+    ``seg_table`` program after the table above (the table stage's rules pick the record; the block table is a
+    launch of its own only where the plan dispatches ``seg_table``)."""
     p = ws.plan
     buffer = _alloc((p.table_words(),), torch.int32, ws.device)
     tables = tuple(buffer[off : off + words] for _name, off, words in p.table_layout())
@@ -1276,7 +1279,7 @@ def _tables(
     }
     values.update(zip(TABLE_NAMES, tables, strict=False))
     ws.run("table", values, path=path)
-    if p.recur == "seg":
+    if p.recur == "seg" and p.dispatched("seg_table", path):
         ws.run("seg_table", values, path=path)
     return tables
 
@@ -1337,7 +1340,7 @@ def _forward_recurrence(
     size rule saves both, the tape forward saves ``seg_state``'s transfer half).  On the ``light_states`` path
     (the backward from a version-3 saved set carrying the states) only pass 2 runs, from the saved ``hseg``; pass
     2 never writes ``seg_state`` (``write_ht = 0``).  ``write_tapes`` is 1 where the ``h`` / ``v_new`` tapes are
-    needed (the backward, the tape forward).  On the forward's segmented rows whose pass-2 grid is at least 3.2
+    needed (the backward, the tape forward).  On the forward's segmented rows whose pass-2 grid is at least 3.0
     waves of the device (``sm_100a`` / ``sm_103a``) the carry and pass 2 are the overlap pair ``seg_carry_ov`` /
     ``fwdh_p3_o_ov`` (``_id`` above two heads): pass 2 is launched with the programmatic-stream-serialization
     attribute and waits on the carry's per-segment release flags instead of the stream order."""
@@ -1441,8 +1444,9 @@ def chunk_kda_fwd(
 
     Launches (``Plan.launch_count("fwd")``): the table, the intra-chunk program (which also writes the GLM prep's
     outputs), then on the serial route the state recurrence (which forms the output; ``wy_fwd`` before it below 32
-    heads: three or four launches), on the segmented route ``seg_table`` after the table, ``wy_fwd``, pass 1,
-    ``seg_carry`` and pass 2 (seven launches); saving the states moves two output pointers of the recurrence from the arena to the saved
+    heads: three or four launches), on the segmented route ``wy_fwd``, pass 1, ``seg_carry`` and pass 2 (six
+    launches up to 256 documents, where ``table_v3`` writes the block table with the chunk tables; seven above,
+    with ``seg_table`` after the table); saving the states moves two output pointers of the recurrence from the arena to the saved
     tensors and adds no launch.  The token-row ``Aqk`` / ``Akk`` are written only with ``save_for_backward``; the
     ``h`` / ``v_new`` tapes only in tape mode.  ``workspace`` (:class:`KdaWorkspace`, the forward layout at least)
     is reused; without one a workspace is allocated for this call.  ``save_mode=None`` takes the workspace's

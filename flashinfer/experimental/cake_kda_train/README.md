@@ -156,9 +156,11 @@ most `sm_count // H`, and at most 38 when `num_docs * H <= 4` (the "few-chain"
 rows, which also take proportional segment lengths: `seg_arg = -num_docs`);
 `cake_jit.SEGMENTS` holds the constants.
 
-Forward (`fwd`): `table_v2` (the chunk tables from `cu_seqlens`, one CTA per
-256 chunks) or `table` (one CTA, above 256 documents) and, on the segmented
-route, `seg_table` (the block table, one CTA); `fwd_intra` (the intra-chunk
+Forward (`fwd`): the chunk tables from `cu_seqlens` -- on the segmented route
+`table_v3` (one CTA per 256 chunks; its first CTA also writes the block table)
+up to 256 documents, else `table` (one CTA) followed by `seg_table` (the block
+table, one CTA); on the serial route `table_v2` (one CTA per 256 chunks) up to
+256 documents, else `table`; `fwd_intra` (the intra-chunk
 `Aqk` / `Akk` and, with `save_for_backward`, their token-row copies, and the
 gated keys / queries of the GLM contract on the chunk layout, the chunk-final
 gate row and the `v_new` pad rows: no separate prep launch); then the WY
@@ -176,8 +178,9 @@ representation and the recurrence, which also writes the output:
   into the carried initial state of every segment; two CTAs per document and
   head, TF32 tensor-core products with FP32 accumulation) and `fwdh_p3_o`
   (pass 2 from the carried states, writing the `h` / `v_new` tapes and `out`;
-  grid `NSEG * H`) (seven).  On `sm_100a` / `sm_103a` rows whose pass-2 grid
-  is at least 3.2 waves of the device (`NSEG * H >= 3.2 * sm_count`, and at
+  grid `NSEG * H`) (six; seven above 256 documents).  On `sm_100a` / `sm_103a`
+  rows whose pass-2 grid
+  is at least 3.0 waves of the device (`NSEG * H >= 3.0 * sm_count`, and at
   most 8192 segment-heads) the carry and pass 2 are the overlap pair:
   `seg_carry_ov` releases one flag per segment, head and carry half as each
   carried state is stored, and `fwdh_p3_o_ov` (`fwdh_p3_o_ov_id` above two
@@ -211,10 +214,9 @@ of `dout` on the internal rows), on the replay `fwd_intra` (the internal
 * `tape`: `wy_bwd` only (the tapes hold the states);
 
 then `dav_serial` (`dA_qk` alone; persistent grid over the chunk pairs) on
-the serial rows below 16 heads and on the few-chain segmented rows, and no
-`dav` launch elsewhere: the fused gradient hosts `dA_qk` (`dqkg_davq`) on the
-serial rows from 16 heads and on the segmented rows with more than four
-chains, whose adjoint recurrence accumulates `dv`; the adjoint recurrence
+the serial rows below 16 heads, and no `dav` launch elsewhere: the fused
+gradient hosts `dA_qk` (`dqkg_davq`) on the serial rows from 16 heads and on
+every segmented row, whose adjoint recurrence accumulates `dv`; the adjoint recurrence
 `dhu` (the state gradient `dh` and `dv2`: `dhu_v1` / `dhu_v1_wt` or `dhu_v2t`
 on the serial forms; on the segmented route two launches around a reverse
 `seg_carry`, every form accumulating `dv1` itself: on the few-chain rows
@@ -235,8 +237,8 @@ when the set carries no tables):
 |---|---|---|---|---|---|
 | 1 document, 16 heads (serial, 32-column form) | 4 | 7 | - | 6 | 9 |
 | 4 documents, 64 heads (serial, 64-column form; fused forward and recompute) | 3 | 6 | - | 6 | 8 |
-| 4 documents, 2 heads (segmented, 8 chains) | 7 | 11 | 8 | 8 | 14 |
-| 1 document, 4 heads (segmented, 4 chains) | 7 | 12 | 9 | 9 | 15 |
+| 4 documents, 2 heads (segmented, 8 chains) | 6 | 11 | 8 | 8 | 13 |
+| 1 document, 4 heads (segmented, 4 chains) | 6 | 11 | 8 | 8 | 13 |
 
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`) and are evaluated by `cake_jit.select_record` / `launch_grid` /
@@ -247,7 +249,7 @@ backward from the plan's own light saved set).
 
 ### Programs by stage
 
-49 records naming 48 programs from 29 kernels (`fwdh_v3` and `fwdh_p3` are
+50 records naming 49 programs from 30 kernels (`fwdh_v3` and `fwdh_p3` are
 one program, the two passes of the segmented walk; `fwdh_p3_o_ov` and
 `fwdh_p3_o_ov_id` are the only programs launched with the
 programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
@@ -256,18 +258,18 @@ programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 
 | stage | records | dispatch |
 |---|---|---|
-| `table` | `table_v2`, `table` | `table_v2` up to 256 documents (one CTA per 256 chunks), else `table` (one CTA); forward, replay, and a saved-set path whose set carries no tables |
-| `seg_table` | `seg_table` | segmented route, with the tables |
+| `table` | `table_v3`, `table_v2`, `table` | up to 256 documents one CTA per 256 chunks: `table_v3` on the segmented route (the block table too), `table_v2` on the serial route; above, `table` (one CTA); forward, replay, and a saved-set path whose set carries no tables |
+| `seg_table` | `seg_table` | segmented route above 256 documents, after `table` (below, `table_v3` writes the block table) |
 | `fwd_intra` | `fwd_intra` | forward (the GLM prep's outputs too: `write_prep = 1`), and the replay (the intra-chunk rows alone) |
 | `wy_fwd` | `wy_fwd` | forward, unless `fwdh_wy` runs |
 | `wy` | `wy_bwd`, `wy_bwd_replay` | backward (`_replay` on the replay), unless a fused recompute forms the WY representation (`fwdh_wy_bwd*`, `fwdh_p3_wy`) |
 | `fwdh` | `fwdh_wy`, `fwdh_o_v1`, `fwdh_o_v2`, `fwdh_v3`, `fwdh_wy_bwd`, `fwdh_wy_bwd_replay`, `fwdh_v1`, `fwdh_v1_sm107`, `fwdh_v2`, `fwdh_v2h` | forward: serial `fwdh_wy` from 32 heads (`sm_107a`: at 32 only), else `fwdh_o_v1` / `fwdh_o_v2` by form; segmented `fwdh_v3` pass 1 (forward, `light`, replay). Backward recompute (`light`, replay): `fwdh_wy_bwd*` on the 64-column form from 64 heads, `fwdh_v1` (`fwdh_v1_sm107` on `sm_107a`) below, `fwdh_v2` / `fwdh_v2h` (from 16 heads; `sm_107a`: at 16 only) on the 32-column form |
-| `seg_carry` | `seg_carry`, `seg_carry_ov` | segmented route: between the forward passes (where pass 1 runs) and, in reverse, between the adjoint passes; `seg_carry_ov` (the release flags) on the forward of the `sm_100a` / `sm_103a` rows with `NSEG * H >= 3.2 * sm_count` (at most 8192 segment-heads) |
+| `seg_carry` | `seg_carry`, `seg_carry_ov` | segmented route: between the forward passes (where pass 1 runs) and, in reverse, between the adjoint passes; `seg_carry_ov` (the release flags) on the forward of the `sm_100a` / `sm_103a` rows with `NSEG * H >= 3.0 * sm_count` (at most 8192 segment-heads) |
 | `fwdh_p3` | `fwdh_p3_o`, `fwdh_p3_o_ov`, `fwdh_p3_o_ov_id`, `fwdh_p3_wy`, `fwdh_p3` | segmented pass 2: `fwdh_p3_o` on the forward (the output fused), `fwdh_p3_o_ov` / `fwdh_p3_o_ov_id` (PDL launch; the release order up to 2 heads, the chain-major order above) where `seg_carry_ov` runs, `fwdh_p3_wy` on `light_states` with at most 32 chains (the WY representation fused), `fwdh_p3` otherwise (`light`, replay, `light_states` above 32 chains) |
 | `bwd_prep` | `bwd_prep_g8`, `bwd_prep_g8_replay` | backward; one CTA per chunk and head; the replay form keeps the internal `dout` copy |
-| `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads and few-chain segmented rows (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
+| `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
 | `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`), else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
-| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq` | backward; `_davq` from 16 serial heads and on the segmented rows above four chains (hosts `dA_qk`), `_int` on the replay; reads `q` / `k` / `v` on the token rows |
+| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; reads `q` / `k` / `v` on the token rows |
 | `glm_intra` | `glm_intra` | backward; reads `k` / `q` on the token rows |
 | `gate_epilogue` | `gate_epilogue` | backward |
 
@@ -283,7 +285,7 @@ programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
   `run_module(name, values, grid=, device_index=)`.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_<arch>` (48 programs x 3
+  `cake-build/1`): one entry per `<library>_<arch>` (49 programs x 3
   architectures) with its two translation units, digests, nvcc flags
   (`--use_fast_math`), closure digest and `aot/<name>.so` path.
   `cake_build.load_library(name)` loads the prebuilt library when `aot/` holds
@@ -296,14 +298,14 @@ programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include,
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` -- the generated device
-  and binding translation units of the 48 programs, shared by the three
+  and binding translation units of the 49 programs, shared by the three
   architectures (per-architecture lines under `#if __CUDA_ARCH__`) and
   compiled once per architecture.  The sources are identity-checked by the
   digests in `build.json`.
 
 ## Status
 
-The registry holds the 49 records (48 programs) for `sm_100a`, `sm_103a` and
+The registry holds the 50 records (49 programs) for `sm_100a`, `sm_103a` and
 `sm_107a`,
 exported from the kernel snapshot named in the pull request.
 

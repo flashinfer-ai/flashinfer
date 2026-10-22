@@ -44,7 +44,7 @@ with different grids and flags); every other library has one record.  Two
 records launch with the programmatic-stream-serialization attribute
 (``launch["use_pdl"]``: ``fwdh_p3_o_ov`` / ``fwdh_p3_o_ov_id``, the pass 2 of the
 forward's carry || pass-2 overlap pair with ``seg_carry_ov`` on the
-``sm_100a`` / ``sm_103a`` rows whose pass-2 grid is at least 3.2 waves of the
+``sm_100a`` / ``sm_103a`` rows whose pass-2 grid is at least 3.0 waves of the
 device; the pass-2 CTAs start while the carry runs and spin on the carry's
 per-segment release flags, ``flags`` / ``epoch``); every other record is a
 plain stream-ordered launch.
@@ -63,9 +63,11 @@ so the serial ``dav`` program computes ``dAqk`` alone (``dav_serial*``) and from
 16 heads the fused gradient hosts even that (``dqkg_davq`` / ``dqkg_int_davq``:
 no ``dav`` launch).  With at most ``max_heads`` heads the segmented route runs:
 every document is cut into ``segments`` chunk-aligned segments
-(:func:`segment_plan`; ``seg_table`` writes the block table, with per-document
-proportional segment counts for at most ``prop_max_chains`` (document, head)
-chains), the ``fwdh_v3`` launch walks every segment in parallel (pass 1: the
+(:func:`segment_plan`; the block table, with per-document proportional segment
+counts for at most ``prop_max_chains`` (document, head) chains, is written by
+``table_v3`` together with the chunk tables up to 256 documents and by
+``seg_table`` after ``table`` above), the ``fwdh_v3`` launch walks every
+segment in parallel (pass 1: the
 per-segment transfer and offset), ``seg_carry`` chains the segments' states
 within each document, and the ``fwdh_p3`` stage walks again from the carried
 states (pass 2; the forward's ``fwdh_p3_o`` forms the output, the saved-state
@@ -75,9 +77,9 @@ recurrence is two passes of one record around ``seg_carry`` in reverse, every
 form accumulating ``dv`` itself: the few-chain rows ``dhu_v3s_f*`` (two CTAs
 per segment and head), the other rows ``dhu_v3_f*`` / ``dhu_v3r_f*`` by the
 walk's wave count (one CTA; the ``_wt`` forms behind ``fwdh_p3_wy``, the
-``_replay`` forms on the replay); so ``dav_serial*`` runs on the few-chain rows
-alone and the fused gradient hosts ``dAqk`` above four chains (no ``dav``
-launch).  ``seg_carry`` is launched by the segmented recurrences between their
+``_replay`` forms on the replay); so the fused gradient hosts ``dAqk`` on every
+segmented row (no ``dav`` launch) and ``dav_serial*`` runs on the serial rows
+below 16 heads alone.  ``seg_carry`` is launched by the segmented recurrences between their
 passes; it is a stage of this registry for its record, not a step of the
 launch orders.
 
@@ -115,8 +117,9 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 # recomputed first).
 PATHS = ("fwd", "light", "light_states", "tape", "replay")
 
-# The launch orders.  The forward launches the table (the segmented route also
-# ``seg_table``), the intra-chunk program (which also writes the GLM prep's
+# The launch orders.  The forward launches the table (``table_v3`` writes the
+# segmented route's block table too up to 256 documents; above, the segmented
+# route also launches ``seg_table``), the intra-chunk program (which also writes the GLM prep's
 # outputs: the gated keys / queries, the gate row and the ``v_new`` pads; no
 # separate prep launch) and then either the
 # serial recurrence (with ``wy_fwd`` before it unless the recurrence forms the
@@ -381,9 +384,65 @@ MODULES: dict[str, dict[str, Any]] = {
             "seq_chunk_start": "seq_chunk_start",
             "seq_order": "seq_order",
         },
-        "select_rule": {"kind": "docs_at_most", "max": 256},
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "heads_above", "min": 8},
+                {"kind": "docs_at_most", "max": 256},
+            ],
+        },
         "stage": "table",
         "variant": "v2",
+    },
+    "table_v3": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "cu_seqlens"],
+            ["parameter", "num_seqs"],
+            ["parameter", "num_chunks_max"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "seq_order"],
+            ["parameter", "segments"],
+            ["parameter", "proportional"],
+            ["buffer", "seg_table"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunk_blocks", "per_cta": 256},
+        "kernel_symbol": "kernel_cake_kda_train_9f69ca35a631ae5e1b4c",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 5376,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_9f69ca35a631ae5e1b4c",
+        "logical": {
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "cu_seqlens": "cu_seqlens",
+            "num_chunks_max": "num_chunks_pad",
+            "num_seqs": "num_seqs",
+            "proportional": "proportional",
+            "seg_table": "seg_table",
+            "segments": "segments",
+            "seq_chunk_start": "seq_chunk_start",
+            "seq_order": "seq_order",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "heads_at_most", "max": 8},
+                {"kind": "docs_at_most", "max": 256},
+            ],
+        },
+        "stage": "table",
+        "variant": "v3",
     },
     "seg_table": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -417,7 +476,13 @@ MODULES: dict[str, dict[str, Any]] = {
             "seq_chunk_start": "seq_chunk_start",
             "seq_order": "seq_order",
         },
-        "select_rule": {"kind": "heads_at_most", "max": 8},
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "heads_at_most", "max": 8},
+                {"kind": "docs_above", "min": 256},
+            ],
+        },
         "stage": "seg_table",
         "variant": None,
     },
@@ -1365,7 +1430,7 @@ MODULES: dict[str, dict[str, Any]] = {
                             "paths": ["light", "light_states", "tape", "replay"],
                         },
                         {"kind": "arch_in", "arches": ["sm_107a"]},
-                        {"kind": "walk_ctas_below", "waves": 3.2},
+                        {"kind": "walk_ctas_below", "waves": 3.0},
                         {"kind": "segments_heads_above", "min": 8192},
                     ],
                 },
@@ -1418,7 +1483,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 {"kind": "heads_at_most", "max": 8},
                 {"kind": "path_in", "paths": ["fwd"]},
                 {"kind": "arch_in", "arches": ["sm_100a", "sm_103a"]},
-                {"kind": "walk_ctas_at_least", "waves": 3.2},
+                {"kind": "walk_ctas_at_least", "waves": 3.0},
                 {"kind": "segments_heads_at_most", "max": 8192},
             ],
         },
@@ -1502,7 +1567,7 @@ MODULES: dict[str, dict[str, Any]] = {
                             "paths": ["light", "light_states", "tape", "replay"],
                         },
                         {"kind": "arch_in", "arches": ["sm_107a"]},
-                        {"kind": "walk_ctas_below", "waves": 3.2},
+                        {"kind": "walk_ctas_below", "waves": 3.0},
                         {"kind": "segments_heads_above", "min": 8192},
                     ],
                 },
@@ -1586,7 +1651,7 @@ MODULES: dict[str, dict[str, Any]] = {
                         {"kind": "heads_at_most", "max": 8},
                         {"kind": "path_in", "paths": ["fwd"]},
                         {"kind": "arch_in", "arches": ["sm_100a", "sm_103a"]},
-                        {"kind": "walk_ctas_at_least", "waves": 3.2},
+                        {"kind": "walk_ctas_at_least", "waves": 3.0},
                         {"kind": "segments_heads_at_most", "max": 8192},
                     ],
                 },
@@ -1671,7 +1736,7 @@ MODULES: dict[str, dict[str, Any]] = {
                         {"kind": "heads_at_most", "max": 8},
                         {"kind": "path_in", "paths": ["fwd"]},
                         {"kind": "arch_in", "arches": ["sm_100a", "sm_103a"]},
-                        {"kind": "walk_ctas_at_least", "waves": 3.2},
+                        {"kind": "walk_ctas_at_least", "waves": 3.0},
                         {"kind": "segments_heads_at_most", "max": 8192},
                     ],
                 },
@@ -1982,25 +2047,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
-                {
-                    "kind": "any_of",
-                    "rules": [
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_above", "min": 8},
-                                {"kind": "heads_below", "max": 16},
-                            ],
-                        },
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_at_most", "max": 8},
-                                {"kind": "chains_at_most", "max": 4},
-                            ],
-                        },
-                    ],
-                },
+                {"kind": "heads_above", "min": 8},
+                {"kind": "heads_below", "max": 16},
             ],
         },
         "stage": "dav",
@@ -2046,25 +2094,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["replay"]},
-                {
-                    "kind": "any_of",
-                    "rules": [
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_above", "min": 8},
-                                {"kind": "heads_below", "max": 16},
-                            ],
-                        },
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_at_most", "max": 8},
-                                {"kind": "chains_at_most", "max": 4},
-                            ],
-                        },
-                    ],
-                },
+                {"kind": "heads_above", "min": 8},
+                {"kind": "heads_below", "max": 16},
             ],
         },
         "stage": "dav",
@@ -3287,25 +3318,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
-                {
-                    "kind": "any_of",
-                    "rules": [
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_above", "min": 8},
-                                {"kind": "heads_below", "max": 16},
-                            ],
-                        },
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_at_most", "max": 8},
-                                {"kind": "chains_at_most", "max": 4},
-                            ],
-                        },
-                    ],
-                },
+                {"kind": "heads_above", "min": 8},
+                {"kind": "heads_below", "max": 16},
             ],
         },
         "stage": "dqkg",
@@ -3383,25 +3397,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["replay"]},
-                {
-                    "kind": "any_of",
-                    "rules": [
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_above", "min": 8},
-                                {"kind": "heads_below", "max": 16},
-                            ],
-                        },
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_at_most", "max": 8},
-                                {"kind": "chains_at_most", "max": 4},
-                            ],
-                        },
-                    ],
-                },
+                {"kind": "heads_above", "min": 8},
+                {"kind": "heads_below", "max": 16},
             ],
         },
         "stage": "dqkg",
@@ -3489,13 +3486,7 @@ MODULES: dict[str, dict[str, Any]] = {
                                 {"kind": "heads_at_least", "min": 16},
                             ],
                         },
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_at_most", "max": 8},
-                                {"kind": "chains_above", "min": 4},
-                            ],
-                        },
+                        {"kind": "heads_at_most", "max": 8},
                     ],
                 },
             ],
@@ -3585,13 +3576,7 @@ MODULES: dict[str, dict[str, Any]] = {
                                 {"kind": "heads_at_least", "min": 16},
                             ],
                         },
-                        {
-                            "kind": "all_of",
-                            "rules": [
-                                {"kind": "heads_at_most", "max": 8},
-                                {"kind": "chains_above", "min": 4},
-                            ],
-                        },
+                        {"kind": "heads_at_most", "max": 8},
                     ],
                 },
             ],
@@ -3758,6 +3743,8 @@ def _admits(
         return int(rule["min"]) <= ctas < int(rule["max"])
     if kind == "docs_at_most":
         return num_seqs <= int(rule["max"])
+    if kind == "docs_above":
+        return num_seqs > int(rule["min"])
     if kind == "heads_at_most":
         return num_heads <= int(rule["max"])
     if kind == "heads_above":
@@ -3857,7 +3844,7 @@ def select_record(
 
     ``ctas = num_chunks_pad * num_heads`` is the chunk-shaped CTA count the
     preparation stages switch on (``ctas_at_least`` / ``ctas_below`` /
-    ``ctas_between``: ``min <= ctas < max``); ``docs_at_most`` reads the
+    ``ctas_between``: ``min <= ctas < max``); ``docs_at_most`` / ``docs_above`` read the
     document count; the recurrence stages switch on the head count
     (``heads_at_most`` / ``heads_above`` / ``heads_at_least`` / ``heads_below``:
     the segmented route at most ``SEGMENTS["max_heads"]`` heads, the serial
