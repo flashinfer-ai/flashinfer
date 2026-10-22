@@ -1959,10 +1959,11 @@ def test_nvfp4_quantize_tma_scale_stays_in_buffer(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    # Back the scale-factor allocation (the only 1-D uint8 buffer) with a
-    # sentinel-filled guard region that the kernel must leave untouched.
+    # Back the scale-factor allocation (the only 1-D uint8 buffer) with a guard
+    # region past it, both filled with 0xA5, a negative and so never valid scale:
+    # the kernel must overwrite every byte of the buffer and none of the guard.
     guard_bytes = n
-    guards = []
+    allocations = []
     empty = torch.empty
 
     def guarded_empty(*args, **kwargs):
@@ -1970,16 +1971,22 @@ def test_nvfp4_quantize_tma_scale_stays_in_buffer(
         if buffer.dtype != torch.uint8 or buffer.dim() != 1:
             return buffer
         backing = torch.full((buffer.numel() + guard_bytes,), 0xA5, dtype=torch.uint8)
-        guards.append(backing[buffer.numel() :])
-        return backing[: buffer.numel()]
+        allocations.append(backing.split([buffer.numel(), guard_bytes]))
+        return allocations[-1][0]
 
     with monkeypatch.context() as patch:
         patch.setattr(torch, "empty", guarded_empty)
         nvfp4_quantize(x, global_scale, sfLayout=sf_layout, backend="cuda")
     torch.cuda.synchronize()
 
-    assert len(guards) == 1
-    overwritten = (guards[0] != 0xA5).sum().item()
+    assert len(allocations) == 1
+    scales, guard = allocations[0]
+    unwritten = (scales == 0xA5).sum().item()
+    assert unwritten == 0, (
+        f"{unwritten} scale-factor bytes left unwritten "
+        f"(shape={shape}, layout={sf_layout.name})"
+    )
+    overwritten = (guard != 0xA5).sum().item()
     assert overwritten == 0, (
         f"{overwritten} bytes written past the scale-factor buffer "
         f"(shape={shape}, layout={sf_layout.name})"
