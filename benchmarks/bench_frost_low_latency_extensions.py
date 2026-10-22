@@ -62,6 +62,13 @@ def _fatal_cuda_error(exc):
     )
 
 
+def _check_named(name, output, reference):
+    try:
+        return check(output, reference)
+    except AssertionError as exc:
+        raise AssertionError(f"{name}: {exc}") from exc
+
+
 def _linear_scale(scale):
     e, rows, groups = scale.shape
     return (
@@ -565,7 +572,9 @@ def main():
         refs = {n: reference(n) for n in result["selected"]}
         result["checks"].append(
             {
-                n: check(rec[2], refs[n.removesuffix("_aa").removesuffix("_default")])
+                n: _check_named(
+                    n, rec[2], refs[n.removesuffix("_aa").removesuffix("_default")]
+                )
                 for n, rec in graphs.items()
             }
         )
@@ -582,7 +591,7 @@ def main():
                 graphs[n][0].replay()
             samples[n].extend(sample(graphs[n]) for _ in range(9))
     result["post_timing"] = {
-        n: check(rec[2], refs[n.removesuffix("_aa").removesuffix("_default")])
+        n: _check_named(n, rec[2], refs[n.removesuffix("_aa").removesuffix("_default")])
         for n, rec in graphs.items()
     }
     result["samples_us"] = samples
