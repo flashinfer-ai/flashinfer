@@ -1291,14 +1291,18 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 
-  if (head_dim >= 256) {
-    // NOTE (Yilong): optimize this code path
-    // constraint gridDim due to cooperative group
-    num_sm *= 1;
-  } else {
-    // NOTE(Zihao): two cta per sm
-    num_sm *= 2;
-  }
+  int max_smem_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
+                                              cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+
+  // The largest persistent task's SharedStorage is KTraits2
+  // (CTA_TILE_Q=16, CTA_TILE_KV=128): (16 + 128 + 128) * head_dim *
+  // sizeof(dtype). For 1-2 byte dtypes this is at most 544 * head_dim bytes
+  // per CTA. FP8/FP4 are over-estimated, which only makes the 1-CTA fallback
+  // more conservative.
+  const int64_t smem_per_cta = 544LL * head_dim;
+  const int ctas_per_sm = (head_dim >= 256 || max_smem_per_sm < 2 * smem_per_cta) ? 1 : 2;
+  num_sm *= ctas_per_sm;
 
   // step 0. determine the number of blocks in x and y dimensions
   std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec[NUM_TASKS];
