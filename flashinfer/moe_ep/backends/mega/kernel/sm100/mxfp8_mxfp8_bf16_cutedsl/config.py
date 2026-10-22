@@ -24,6 +24,10 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     ``knobs="auto"`` tunes collectively during warmup before graph capture.
     Auto layers own a single capacity and cannot call ``create_workspace()``;
     use fixed or offline-tuned knobs for additional capacity profiles.
+
+    ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"`` selects the standard
+    provider export for E4M3 or E5M2. Keep ``kernel_variant="inference"`` and
+    use default or fixed ``knobs`` with this backend.
     """
 
     intermediate_size: int

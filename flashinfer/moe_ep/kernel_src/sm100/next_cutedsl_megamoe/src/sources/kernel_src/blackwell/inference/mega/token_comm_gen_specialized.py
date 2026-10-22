@@ -309,6 +309,10 @@ class GenphaseTokenComm(KernelComponent):
             raise ValueError(
                 f"expert_count must be divisible by world_size, got {self.expert_count} and {self.world_size}."
             )
+        if self.world_size > TokenSrcMetadata.MAX_RANKS or self.topk > TokenSrcMetadata.MAX_TOPK:
+            raise ValueError("GenPhase rank and top-k counts exceed the routing metadata fields.")
+        if self.max_tokens_per_rank > TokenSrcMetadata.MAX_TOKENS:
+            raise ValueError("GenPhase token capacity exceeds the routing metadata field.")
         if self.expert_count > 16384:
             raise NotImplementedError("Genphase token comm supports at most 16384 global experts.")
         if self.topk > self.expert_count:

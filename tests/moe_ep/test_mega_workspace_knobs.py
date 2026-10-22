@@ -518,7 +518,7 @@ def test_blackwell_genphase_workspace_plan(world, tile_n, cluster_m, monkeypatch
     )
     kernel = pkg.Sm100GenphaseSymmBuffer._build_kernel(cfg)
     assert type(kernel).__module__.startswith(
-        "blackwell_genphase_sources.kernel_src.blackwell."
+        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.kernel_src.blackwell."
     )
     assert kernel.architecture == "sm_100"
     assert kernel._mainloop.architecture == "sm_100"
@@ -534,6 +534,90 @@ def test_blackwell_genphase_workspace_plan(world, tile_n, cluster_m, monkeypatch
     assert mainloop.num_gather_b_warps == (2 if tile_n == 64 and cluster_m == 4 else 4)
     assert not mainloop.dynamic_gather
     assert kernel.masks_invalid_combine_slots
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+def test_blackwell_standard_backend_is_opt_in(kind, monkeypatch):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    name = "nvfp4_nvfp4" if kind == "nvfp4" else "mxfp8_mxfp8"
+    config_type = (
+        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        if kind == "nvfp4"
+        else moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    )
+    kwargs = {} if kind == "nvfp4" else {"kind": kind}
+    original = config_type(intermediate_size=192, top_k=3, **kwargs)
+    selected = dataclasses.replace(
+        original, kernel_name=f"sm100_{name}_bf16_cutedsl_next"
+    )
+    backend = create_mega_kernel(selected)
+    backend.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    fleet = moe_ep.FleetParams(
+        num_experts=8, max_tokens_per_rank=129, token_hidden_size=384
+    )
+    cfg = backend._workspace_config(fleet)
+    assert cfg.quant_kind == kind and cfg.kernel_variant == "inference"
+    assert cfg.instruction_k == (64 if kind == "nvfp4" else 32)
+    assert type(create_mega_kernel(original)) is not type(backend)
+    assert hash(backend._workspace_pool_key(fleet))
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3"])
+def test_blackwell_standard_and_genphase_share_epilogue(kind, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    pytest.importorskip("cutlass")
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled._max_active_clusters",
+        lambda size: 32,
+    )
+    fields = dict(
+        num_total_experts=8,
+        max_tokens_per_rank=129,
+        num_topk=3,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=1,
+    )
+    standard = pkg.Sm100BlockScaledSymmBuffer._build_kernel(
+        pkg.Sm100BlockScaledMoeConfig(**fields, quant_kind=kind)
+    )
+    genphase = pkg.Sm100GenphaseSymmBuffer._build_kernel(
+        pkg.Sm100GenphaseMoeConfig(**fields)
+    )
+    assert type(standard.epilogue) is type(genphase.epilogue)
+    assert genphase.epilogue.fc2_tma_stages == 2
+    assert standard.masks_invalid_combine_slots
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"knobs": "auto"},
+        {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
+        {"do_finalize": False},
+        {"activation": "situ", "situ_beta": 7.0},
+    ],
+)
+def test_blackwell_standard_rejects_missing_provider_features(kwargs):
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    config = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=192,
+        top_k=3,
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+        **kwargs,
+    )
+    with pytest.raises(MoEEpConfigError):
+        create_mega_kernel(config)
 
 
 def test_blackwell_genphase_import_is_lazy():

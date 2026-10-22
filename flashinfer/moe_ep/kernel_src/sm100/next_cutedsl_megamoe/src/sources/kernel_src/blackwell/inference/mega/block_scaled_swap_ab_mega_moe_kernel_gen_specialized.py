@@ -57,7 +57,7 @@ from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGate
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop_gen_specialized import BlockScaledSwapAbFc12MainloopGenSpecialized
 from .token_comm_gen_specialized import GenphaseTokenComm, GenphaseTokenCommArgs
-from .topk_reduce import TopkReduce
+from .....helpers.topk_reduce import TopkReduce
 
 
 _aot_symbol_prefix = "blackwell_genphase_mega_moe_aot"

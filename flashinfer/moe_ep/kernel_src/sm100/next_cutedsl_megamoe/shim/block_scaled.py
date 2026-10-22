@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Workspace, descriptor construction, compilation and launch for Blackwell GenPhase.
+"""Workspace, descriptor construction, compilation and launch for Blackwell inference.
 
 The Blackwell frontend supplies native device checks and compiler targets.
 The private source package is imported only inside this shim; DSL imports stay lazy.
@@ -457,6 +457,9 @@ class BlockScaledSymmBuffer:
         self.device = torch.device("cuda", torch.cuda.current_device())
         cfg = config
 
+        # The driver occupancy query needs a current primary context.
+        torch.cuda.current_stream(self.device)
+
         kernel = self._build_kernel(cfg)
         self.kernel = kernel
 
@@ -505,6 +508,14 @@ class BlockScaledSymmBuffer:
             self.output_activation = torch.zeros(
                 (tokens, cfg.hidden), dtype=torch.bfloat16, device="cuda"
             )
+
+        self.fc1_activation_per_token_scale = (
+            comm.sym_zeros((tokens,), torch.float32)
+            if getattr(cfg, "enable_fc1_activation_per_token_scale", False)
+            else None
+        )
+        if self.fc1_activation_per_token_scale is not None:
+            self.fc1_activation_per_token_scale.fill_(1)
 
         self._allocate_kernel_workspace(kernel)
 
@@ -568,9 +579,12 @@ class BlockScaledSymmBuffer:
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
 
-        from blackwell_genphase_sources import BlackwellInferenceGenphaseMegaMoE
-        from blackwell_genphase_sources.api import ImplDesc, ProblemDesc
-        from blackwell_genphase_sources.quant_def import CombineFormat
+        from ..src.sources import (
+            BlackwellInferenceGenphaseMegaMoE,
+            BlackwellInferenceMegaMoE,
+        )
+        from ..src.sources.api import ImplDesc, ProblemDesc
+        from ..src.sources.quant_def import CombineFormat
 
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
@@ -657,13 +671,26 @@ class BlockScaledSymmBuffer:
         }
         if cfg.fc2_tma_stages is not None:
             impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
+        elif cfg.kernel_variant == "genphase":
+            impl_fields["fc2_tma_stages"] = min(2, tiler[1] // 64)
         if cfg.fallback_cluster_shape_mn is not None:
             impl_fields["fallback_cluster_shape_mn"] = tuple(
                 cfg.fallback_cluster_shape_mn
             )
             impl_fields["preferred_cluster_count"] = preferred_count
             impl_fields["fallback_cluster_count"] = fallback_count
-        return BlackwellInferenceGenphaseMegaMoE(problem_desc, ImplDesc(impl_fields))
+        if cfg.kernel_variant == "inference":
+            fields = dict(problem_desc)
+            fields["fc1_activation_per_token_scale"] = getattr(
+                cfg, "enable_fc1_activation_per_token_scale", False
+            )
+            problem_desc = ProblemDesc(fields)
+        kernel_cls = (
+            BlackwellInferenceGenphaseMegaMoE
+            if cfg.kernel_variant == "genphase"
+            else BlackwellInferenceMegaMoE
+        )
+        return kernel_cls(problem_desc, ImplDesc(impl_fields))
 
     def note_staged_tokens(self, num_tokens: int) -> None:
         self._staged_tokens = int(num_tokens)
@@ -672,7 +699,7 @@ class BlockScaledSymmBuffer:
         return self._staged_tokens
 
     def _peer_mapper(self):
-        from blackwell_genphase_sources.communication.nvlink_domain.symmetric_buffer import (
+        from ..src.sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
         )
 
@@ -867,7 +894,7 @@ def block_scaled_mega_moe(
         import warnings
 
         warnings.warn(
-            "fast_math=False is a no-op for the block-scaled block-scaled kernel.",
+            "fast_math=False is a no-op for the block-scaled kernel.",
             stacklevel=2,
         )
     cfg = symm_buffer.config

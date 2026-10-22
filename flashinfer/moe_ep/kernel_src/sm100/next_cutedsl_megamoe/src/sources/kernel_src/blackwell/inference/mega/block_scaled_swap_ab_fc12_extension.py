@@ -1,4 +1,4 @@
-"""Blackwell block-scaled SwapAB adapter between FC12 scheduling and kernel tensor views."""
+"""Block-scaled SwapAb adapter between FC12 scheduling and kernel tensor views."""
 
 import dataclasses
 from typing import ClassVar, List, Literal, Optional, Tuple
@@ -14,7 +14,7 @@ from .....helpers.dsl_helpers import spin_peek, spin_wait
 from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo, peek_ready_bit
 
 
-TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk"]
+TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk", "fc1_act_scale"]
 
 
 @cute.jit
@@ -32,8 +32,7 @@ class BlockScaledSwapAbFc12Extension:
     fc1_done_counter_pointer: Pointer
     fc2_spin_threshold: Int32
     fc1_ready_counter_pointer: Optional[Pointer] = None
-    # Which expert holds each slot the scheduler enumerates. Absent when the
-    # scheduler walks experts directly, in which case a slot is an expert.
+    # GenPhase schedules expert slots; other paths schedule experts directly.
     expert_remap: Optional[cute.Tensor] = None
 
     def __post_init__(self) -> None:
@@ -81,19 +80,10 @@ class BlockScaledSwapAbFc12Extension:
 
     @cute.jit
     def prepare_work_tile(self, work_tile: SwapAbFc12WorkTileInfo) -> SwapAbFc12WorkTileInfo:
-        """Pack kernel readiness observations into the published tile flags.
-
-        Also the one place the scheduler's slot becomes an expert index, when the
-        two differ. Translating here rather than at each use is what keeps the
-        remap invisible downstream: every consumer of a published tile -- the
-        weight and scale-factor views, the per-expert alphas, the per-expert
-        scale-factor gate -- addresses an expert. The row offsets the tile carries
-        were resolved in slot order and are already final.
-        """
+        """Pack kernel readiness observations into the published tile flags."""
         phase_and_flags = work_tile.phase_and_flags
         expert_idx = work_tile.expert_idx
         if work_tile.is_valid_tile:
-            # Inside the validity branch so a terminal tile keeps its sentinel.
             if cutlass.const_expr(self.expert_remap is not None):
                 expert_idx = self.expert_remap[work_tile.expert_idx]
             counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
@@ -119,10 +109,10 @@ class BlockScaledSwapAbFc12Extension:
             expert_idx=expert_idx,
             tile_m_idx=work_tile.tile_m_idx,
             tile_n_idx=work_tile.tile_n_idx,
-            cumulative_data_physical_row=work_tile.cumulative_data_physical_row,
-            cumulative_sf_physical_row=work_tile.cumulative_sf_physical_row,
-            cumulative_token_block_count=work_tile.cumulative_token_block_count,
-            valid_tokens_in_cta_tile=work_tile.valid_tokens_in_cta_tile,
+            cumulative_data_physical_row=(work_tile.cumulative_data_physical_row),
+            cumulative_sf_physical_row=(work_tile.cumulative_sf_physical_row),
+            cumulative_token_block_count=(work_tile.cumulative_token_block_count),
+            valid_tokens_in_cta_tile=(work_tile.valid_tokens_in_cta_tile),
             phase_and_flags=phase_and_flags,
         )
 
@@ -174,7 +164,8 @@ class BlockScaledSwapAbFc12Extension:
             result = cute.domain_offset((data_token_offset, 0, 0), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
-        if cutlass.const_expr(tensor_name == "topk"):
+        if cutlass.const_expr(tensor_name in ("topk", "fc1_act_scale")):
+            # Both follow the data-token pool (not the independently padded SF pool).
             return (cute.domain_offset((data_token_offset,), tensor), None)
 
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")
