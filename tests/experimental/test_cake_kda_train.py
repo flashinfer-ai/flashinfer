@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import hashlib
+import itertools
 import json
 import re
 from pathlib import Path
@@ -42,6 +43,7 @@ cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 ARCHES = tuple(cake_jit.ARCHES)
+PATHS = ("fwd", "fwd_nosave", "light", "light_states", "tape", "replay")
 BT, D, SCALE = cake_backend.BT, cake_backend.D, cake_backend.SCALE
 KdaChunkSaved = cake_backend.KdaChunkSaved
 KdaWorkspace = cake_backend.KdaWorkspace
@@ -53,18 +55,109 @@ ATOL = RTOL = 1e-2
 OUTPUT_NAMES = ("out",) + GRAD_NAMES
 
 # Dispatch constants the registry rules must reproduce (the kernels' validated regimes).
-FWD_BULK_MIN_CTAS = 256
-G8_MIN_CTAS = 256
-G8S_MIN_CTAS = 128
-FWDH_V2_CTAS_PER_SM = 4
-DHU_V2_CTAS_PER_SM = 1
+TABLE_V2_MAX_DOCS = 256  # the chunk-parallel layout table serves up to 256 documents
+RECUR_CTAS_PER_SM = (
+    4  # the 32-column serial forms fit when num_docs * H * 4 <= 4 * sm_count
+)
 RECUR_SLICES = {"v1": 2, "v2": 4}
+FUSED_FWD_MIN_H = 32  # the serial forward forms the WY representation itself from 32 heads (sm_107a: 32 only)
+FUSED_BWD_MIN_H = 64  # the 64-column serial recompute forms it from 64 heads
+# The forward's carry || pass-2 overlap pair on the segmented route: the rows whose pass-2 grid is at least
+# OV1_MIN_WAVES_BY_ARCH[arch] waves of the device and at most OV1_MAX_SEGMENT_HEADS segment-heads (the flag words of the
+# eye buffer); the pass-2 CTA order is the carry's release order up to OV1_ORDER_MAX_H heads, the chain-major order
+# above.  The saving forward launches the pair's token-row twins (the saved Aqk rows) and the saved-Akk WY program.
+OV1_MIN_WAVES_BY_ARCH = {"sm_100a": 3.0, "sm_103a": 3.0, "sm_107a": 2.3}
+OV1_ORDER_MAX_H = 2
+OV1_MAX_SEGMENT_HEADS = 8192
+PDL_RECORDS = (
+    "fwdh_p3_o_ov",
+    "fwdh_p3_o_ov_id",
+    "fwdh_p3_o_ov_rows",
+    "fwdh_p3_o_ov_id_rows",
+)
+# the saving forward's token-row records: where one runs, no program of the path reads the internal Aqk / Akk copies;
+# the forward without a saved set launches their internal-row twins instead (the paired serial rows -- the 32-column
+# form below the fused threshold -- launch wy_fwd_rows and fwdh_o_v2_rows; the 64-column form keeps the internal rows)
+TOKEN_ROW_RECORDS = (
+    "fwdh_wy_rows",
+    "wy_fwd_rows",
+    "fwdh_p3_o_ov_rows",
+    "fwdh_p3_o_ov_id_rows",
+    "fwdh_o_v2_rows",
+)
+INTERNAL_ROW_TWIN = {
+    "fwdh_wy_rows": "fwdh_wy",
+    "wy_fwd_rows": "wy_fwd",
+    "fwdh_p3_o_ov_rows": "fwdh_p3_o_ov",
+    "fwdh_p3_o_ov_id_rows": "fwdh_p3_o_ov_id",
+    "fwdh_o_v2_rows": "fwdh_o_v2",
+}
+DAVQ_MIN_H = 16  # the fused gradient hosts dAqk on the serial route from 16 heads
+FEW_CHAINS = 4  # at most four (document, head) chains: the few-chain segmented rows
+# the saved-state pass 2 forms the WY representation itself (no WY launch) up to 32 (document, head) chains; on
+# every segmented row the adjoint recurrence accumulates dv and the fused gradient hosts dAqk (no dav launch)
+FUSED_P3_MAX_CHAINS = 32
+DHU_TMA_WAVES = (
+    4  # the segmented adjoint recurrence stores its tapes by TMA below four CTAs per SM
+)
+# on sm_103a the segmented adjoint recurrence of the rows below two waves of CTA pairs (two per SM: four of one CTA)
+# prefetches the next chunk's tiles (dhu_v3p_f*); the plain TMA-tape form keeps the boundary rows there
+DHU_PREFETCH_WAVES_BY_ARCH = {"sm_103a": 4.0}
 # The segmented recurrences: at most SEG_MAX_H heads, clamp(ceil(SEG_SLOT_FACTOR * sm / (N * H)), 1, SEG_P_MAX)
-# segments per document.
+# segments per document, at most SEG_P_SMALL of them with N * H <= SEG_P_SMALL_MAX_NH (document, head) chains.
 SEG_MAX_H = 8
 SEG_SLOT_FACTOR = 4
 SEG_P_MAX = 64
-OPTIONAL_STAGES = ("seg_table", "seg_carry")
+SEG_P_SMALL = 38
+SEG_P_SMALL_BY_ARCH = {
+    "sm_100a": 37
+}  # the few-chain count of the architectures with one of their own
+SEG_P_SMALL_MAX_NH = 4
+# the table stage is optional too: on the forward and the replay of the segmented route up to 256 documents the
+# intra program writes the tables and no table record is selected
+OPTIONAL_STAGES = (
+    "table",
+    "seg_table",
+    "seg_carry",
+    "fwdh_p3",
+    "wy_fwd",
+    "wy",
+    "fwdh",
+    "dav",
+)
+# The stages of each path, in the registry's order (the forward's; the backward's with the tables, the intra
+# program on the replay path and seg_carry on the segmented route).
+_BWD = (
+    "table",
+    "seg_table",
+    "wy",
+    "fwdh",
+    "seg_carry",
+    "fwdh_p3",
+    "bwd_prep",
+    "dav",
+    "dhu",
+    "dqkg",
+    "glm_intra",
+    "gate_epilogue",
+)
+PATH_STAGES = {
+    "fwd": (
+        "table",
+        "seg_table",
+        "fwd_intra",
+        "wy_fwd",
+        "fwdh",
+        "seg_carry",
+        "fwdh_p3",
+    ),
+    "light": _BWD,
+    "light_states": _BWD,
+    "tape": _BWD,
+    "replay": tuple(s for s in cake_jit.STAGES if s in _BWD or s == "fwd_intra"),
+}
+# the forward without a saved set: the same stages, the internal-row records
+PATH_STAGES["fwd_nosave"] = PATH_STAGES["fwd"]
 
 # Small packings: single documents around the chunk length, packs with unaligned tails, a zero-length document
 # (a no-op that still counts in the chunk bound) and pad chunks.
@@ -81,6 +174,10 @@ SHAPES = [
     ((64, 64), 1),
     ((100, 0, 300), 2),
     ((100, 640, 77, 1000, 129), 2),
+    # the overlap pair's rows (148 SMs): four documents at 2 heads (256 segments: the release order), seven at 8
+    # (77 segments: the chain-major order)
+    ((63, 1, 65, 30), 2),
+    ((20, 20, 20, 20, 20, 20, 20), 8),
 ]
 
 
@@ -123,25 +220,92 @@ def manifest() -> dict:
 
 def _rule_kinds(rule: dict) -> list[str]:
     kinds = [rule["kind"]]
-    if rule["kind"] == "all_of":
+    if rule["kind"] in ("all_of", "any_of"):
         for sub_rule in rule["rules"]:
             kinds.extend(_rule_kinds(sub_rule))
     return kinds
 
 
+SELECT_KINDS = (
+    "always",
+    "otherwise",
+    "all_of",
+    "any_of",
+    "ctas_at_least",
+    "ctas_below",
+    "ctas_between",
+    "docs_at_most",
+    "docs_above",
+    "heads_at_most",
+    "heads_above",
+    "heads_at_least",
+    "heads_below",
+    "chains_at_most",
+    "chains_above",
+    "slots_at_most",
+    "slots_above",
+    "walk_ctas_below",
+    "walk_ctas_at_most",
+    "walk_ctas_at_least",
+    "walk_ctas_above",
+    "segments_heads_at_most",
+    "segments_heads_above",
+    "arch_in",
+    "path_in",
+)
+GRID_KINDS = (
+    "fixed",
+    "chunks",
+    "chunk_blocks",
+    "pairs_bounded",
+    "per_doc_head",
+    "sm_bounded",
+    "docs_heads",
+    "segments_heads",
+)
+# The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
+# forward recurrence's passes are two stages (fwdh, fwdh_p3).
+TWO_PASS_RECORDS = (
+    "dhu_v3_f",
+    "dhu_v3_f_wt",
+    "dhu_v3_f_replay",
+    "dhu_v3p_f",
+    "dhu_v3p_f_wt",
+    "dhu_v3p_f_replay",
+    "dhu_v3r_f",
+    "dhu_v3r_f_wt",
+    "dhu_v3r_f_replay",
+    "dhu_v3s_f",
+    "dhu_v3s_f_wt",
+    "dhu_v3s_f_replay",
+)
+
+
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.MODULES) == 21
+    assert len(cake_jit.MODULES) == 59
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 57
+    assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert cake_jit.SEGMENTS == {
         "max_heads": SEG_MAX_H,
         "slot_factor": SEG_SLOT_FACTOR,
         "max_segments": SEG_P_MAX,
+        "small_segments": SEG_P_SMALL,
+        "small_segments_by_arch": SEG_P_SMALL_BY_ARCH,
+        "small_max_chains": SEG_P_SMALL_MAX_NH,
+        "prop_max_chains": FEW_CHAINS,
     }
     stages = set()
     tensors, scalars = set(cake_jit.LOGICAL_TENSORS), set(cake_jit.LOGICAL_SCALARS)
     for name, record in cake_jit.MODULES.items():
         assert record["stage"] in cake_jit.STAGES, name
         stages.add(record["stage"])
+        expected_name = (
+            record["stage"]
+            if record["variant"] is None
+            else f"{record['stage']}_{record['variant']}"
+        )
+        assert name == expected_name, name
         assert list(record["arches"]) == list(ARCHES), name
         assert record["ffi_entry"] == "run", name
         assert record["kernel_symbol"] == f"kernel_{record['library']}", name
@@ -159,7 +323,9 @@ def test_registry_records_are_well_formed() -> None:
             1,
         ), name
         assert tuple(launch["cluster"]) == (1, 1, 1), name
-        assert launch["cooperative"] is False and launch["use_pdl"] is False, name
+        assert launch["cooperative"] is False, name
+        # the overlap pair's pass 2 launches with the programmatic-stream-serialization attribute, nothing else does
+        assert launch["use_pdl"] is (name in PDL_RECORDS), name
         assert (
             isinstance(launch["dynamic_smem_bytes"], int)
             and launch["dynamic_smem_bytes"] >= 0
@@ -180,89 +346,278 @@ def test_registry_records_are_well_formed() -> None:
                 logical,
             )
         for kind in _rule_kinds(record["select_rule"]):
-            assert kind in (
-                "always",
-                "otherwise",
-                "ctas_at_least",
-                "ctas_below",
-                "ctas_between",
-                "slots_at_most",
-                "heads_at_most",
-                "heads_above",
-                "all_of",
-            ), name
-        assert record["grid_rule"]["kind"] in (
-            "fixed",
-            "chunks",
-            "pairs",
-            "per_doc_head",
-            "sm_bounded",
-            "docs_heads",
-            "segments_heads",
+            assert kind in SELECT_KINDS, (name, kind)
+        assert record["grid_rule"]["kind"] in GRID_KINDS, name
+        # the records sharing one library: the segmented forward recurrence's two passes, and the WY program on
+        # the saved Akk rows (the backward's, launched by the saving forward on its overlap rows too)
+        twins = [
+            other
+            for other, rec in cake_jit.MODULES.items()
+            if rec["library"] == record["library"] and other != name
+        ]
+        assert twins == [] or {name, *twins} in (
+            {"fwdh_v3", "fwdh_p3"},
+            {"wy_bwd", "wy_fwd_rows"},
         ), name
-        if record["select_rule"]["kind"] == "heads_at_most":
-            assert record["select_rule"]["max"] == SEG_MAX_H, name
     assert stages == set(cake_jit.STAGES)
     for stage in cake_jit.STAGES:
         names = cake_jit.records_of_stage(stage)
         kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in names]
         if len(names) == 1 and stage in OPTIONAL_STAGES:
-            assert kinds == ["heads_at_most"], stage
+            assert kinds[0] not in ("always", "otherwise"), stage
         elif len(names) == 1:
             assert kinds == ["always"], stage
         else:
             assert "always" not in kinds and kinds.count("otherwise") <= 1, stage
-    # The segmented records launch twice per stage (the carry between the passes); every other record once.
-    assert cake_jit.launches("fwdh_v3") == cake_jit.launches("dhu_v3") == 2
-    assert all(
-        cake_jit.launches(name) == 1
-        for name in cake_jit.MODULES
-        if name not in ("fwdh_v3", "dhu_v3")
+    for name in cake_jit.MODULES:
+        assert cake_jit.launches(name) == (2 if name in TWO_PASS_RECORDS else 1), name
+    # the segmented records read the registry's one head bound; the carry's two records split the forward's
+    # overlap rows (the pair: the two device families, at least the wave threshold, at most the flag words)
+    # from their complement (every backward path, the third family, below the threshold, above the bound)
+    seg_rule = {"kind": "heads_at_most", "max": SEG_MAX_H}
+    # the table stage: on the segmented rows up to the document bound the intra program writes the tables on the
+    # forward and the replay (no table record) and the fused table program rebuilds them for a saved-set path; the
+    # chunk-parallel table on the serial rows up to the bound, the one-CTA table above; the block table is a launch
+    # of its own above only
+    docs_rule = {"kind": "docs_at_most", "max": TABLE_V2_MAX_DOCS}
+    above_rule = {"kind": "docs_above", "min": TABLE_V2_MAX_DOCS}
+    saved_paths = {"kind": "path_in", "paths": ["light", "light_states", "tape"]}
+    assert cake_jit.MODULES["table_v3"]["select_rule"] == {
+        "kind": "all_of",
+        "rules": [seg_rule, docs_rule, saved_paths],
+    }
+    assert cake_jit.MODULES["table_v2"]["select_rule"] == {
+        "kind": "all_of",
+        "rules": [{"kind": "heads_above", "min": SEG_MAX_H}, docs_rule],
+    }
+    assert cake_jit.MODULES["table"]["select_rule"] == above_rule
+    assert cake_jit.MODULES["fwd_intra_v14"]["select_rule"] == {
+        "kind": "all_of",
+        "rules": [seg_rule, docs_rule],
+    }
+    assert cake_jit.MODULES["fwd_intra"]["select_rule"] == {
+        "kind": "any_of",
+        "rules": [{"kind": "heads_above", "min": SEG_MAX_H}, above_rule],
+    }
+    assert cake_jit.MODULES["seg_table"]["select_rule"] == {
+        "kind": "all_of",
+        "rules": [seg_rule, {"kind": "docs_above", "min": TABLE_V2_MAX_DOCS}],
+    }
+
+    # the pair's wave threshold is a leaf per device family (3.0 on sm_100a / sm_103a, 2.3 on sm_107a)
+    def waves(kind: str) -> dict:
+        return {
+            "kind": "any_of",
+            "rules": [
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "arch_in", "arches": ["sm_100a", "sm_103a"]},
+                        {"kind": kind, "waves": OV1_MIN_WAVES_BY_ARCH["sm_100a"]},
+                    ],
+                },
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "arch_in", "arches": ["sm_107a"]},
+                        {"kind": kind, "waves": OV1_MIN_WAVES_BY_ARCH["sm_107a"]},
+                    ],
+                },
+            ],
+        }
+
+    assert OV1_MIN_WAVES_BY_ARCH["sm_103a"] == OV1_MIN_WAVES_BY_ARCH["sm_100a"]
+    assert cake_jit.MODULES["seg_carry_ov"]["select_rule"] == {
+        "kind": "all_of",
+        "rules": [
+            seg_rule,
+            {"kind": "path_in", "paths": ["fwd", "fwd_nosave"]},
+            waves("walk_ctas_at_least"),
+            {"kind": "segments_heads_at_most", "max": OV1_MAX_SEGMENT_HEADS},
+        ],
+    }
+    assert cake_jit.MODULES["seg_carry"]["select_rule"] == {
+        "kind": "all_of",
+        "rules": [
+            seg_rule,
+            {
+                "kind": "any_of",
+                "rules": [
+                    {
+                        "kind": "path_in",
+                        "paths": ["light", "light_states", "tape", "replay"],
+                    },
+                    waves("walk_ctas_below"),
+                    {"kind": "segments_heads_above", "min": OV1_MAX_SEGMENT_HEADS},
+                ],
+            },
+        ],
+    }
+    # the saving forward's token-row twins: the same stage, grid and rule leaves as the internal-row forms but the path
+    for internal, rows in (
+        ("fwdh_wy", "fwdh_wy_rows"),
+        ("fwdh_p3_o_ov", "fwdh_p3_o_ov_rows"),
+        ("fwdh_p3_o_ov_id", "fwdh_p3_o_ov_id_rows"),
+        ("fwdh_o_v2", "fwdh_o_v2_rows"),
+    ):
+        a, b = cake_jit.MODULES[internal], cake_jit.MODULES[rows]
+        assert (a["stage"], a["grid_rule"]) == (b["stage"], b["grid_rule"]), rows
+        assert a["library"] != b["library"]
+        assert str(a["select_rule"]).replace("'fwd_nosave'", "'fwd'") == str(
+            b["select_rule"]
+        ), rows
+    assert (
+        cake_jit.MODULES["wy_fwd_rows"]["library"]
+        == cake_jit.MODULES["wy_bwd"]["library"]
     )
 
 
-def _expected_segments(n: int, h: int, sm: int) -> tuple[str, int, int]:
+def _expected_segments(
+    n: int, h: int, sm: int, arch: str | None = None
+) -> tuple[str, int, int]:
     if h <= SEG_MAX_H:
         p = min(SEG_P_MAX, max(1, -(-SEG_SLOT_FACTOR * sm // (n * h))))
+        p = max(1, min(p, sm // h))  # one walk CTA per SM per document at most
+        if n * h <= SEG_P_SMALL_MAX_NH:
+            p = min(p, SEG_P_SMALL_BY_ARCH.get(arch, SEG_P_SMALL))
         return "seg", p, n * p
     return "serial", 1, 0
 
 
-def _expected_records(nc_pad: int, n: int, h: int, sm: int) -> dict[str, str | None]:
-    ctas = nc_pad * h
+def _query_arch() -> str | None:
+    """The architecture the byte queries take without an explicit one: the current CUDA device's when it is an
+    exported target, else None (the architecture-independent few-chain segment count)."""
+    if not torch.cuda.is_available():
+        return None
+    index = torch.cuda.current_device()
+    return cake_jit.arch_for_capability(tuple(torch.cuda.get_device_capability(index)))
+
+
+def _expected_records(
+    nc_pad: int, n: int, h: int, sm: int, arch: str, path: str
+) -> dict[str, str | None]:
+    """The record of every stage of ``path`` on (``nc_pad``, ``n``, ``h``, ``sm``, ``arch``): the dispatch of the
+    kernels' composition, spelled independently of the registry's rules."""
     seg = h <= SEG_MAX_H
-    return {
-        "table": "table",
-        "seg_table": "seg_table" if seg else None,
-        "fwd_prep": "fwd_prep_bulk" if ctas >= FWD_BULK_MIN_CTAS else "fwd_prep_split",
-        "fwd_intra": "fwd_intra",
-        "wy": "wy",
-        "fwdh": "fwdh_v3"
-        if seg
-        else (
-            "fwdh_v2"
-            if n * h * RECUR_SLICES["v2"] <= sm * FWDH_V2_CTAS_PER_SM
-            else "fwdh_v1"
-        ),
-        "seg_carry": "seg_carry" if seg else None,
-        "fwd_o": "fwd_o",
-        "bwd_prep": (
-            "bwd_prep_g8"
-            if ctas >= G8_MIN_CTAS
-            else ("bwd_prep_g8s" if ctas >= G8S_MIN_CTAS else "bwd_prep_v2")
-        ),
-        "dav": "dav",
-        "dhu": "dhu_v3"
-        if seg
-        else (
-            "dhu_v2"
-            if n * h * RECUR_SLICES["v2"] <= sm * DHU_V2_CTAS_PER_SM
-            else "dhu_v1"
-        ),
-        "dqkg": "dqkg",
+    _route, _p, nseg = _expected_segments(n, h, sm, arch)
+    v2 = n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
+    few = n * h <= FEW_CHAINS
+    fused_p3 = seg and n * h <= FUSED_P3_MAX_CHAINS
+    fused_fwd = (
+        not seg and h >= FUSED_FWD_MIN_H and (arch != "sm_107a" or h <= FUSED_FWD_MIN_H)
+    )
+    fused_bwd = not seg and not v2 and h >= FUSED_BWD_MIN_H
+    # the fused gradient hosts dAqk on the serial rows from 16 heads and on every segmented row (whose adjoint
+    # recurrence accumulates dv): no dav launch there
+    davq = (h >= DAVQ_MIN_H) if not seg else True
+    replay = path == "replay"
+    fwd = path in ("fwd", "fwd_nosave")
+    # the saving forward reads the saved token rows where a program for them ships
+    save = path == "fwd"
+    # the paired serial rows: the 32-column form below the fused threshold reads the saved token rows on the saving
+    # forward (wy_fwd_rows + fwdh_o_v2_rows); the 64-column form keeps the internal-row pair on both paths
+    paired = save and not seg and v2 and not fused_fwd
+    walk = nseg * h
+    prefetch = walk < DHU_PREFETCH_WAVES_BY_ARCH.get(arch, 0.0) * sm
+    tma = walk < DHU_TMA_WAVES * sm or (h <= 4 and walk <= DHU_TMA_WAVES * sm)
+    ov1 = (
+        seg
+        and fwd
+        and walk >= OV1_MIN_WAVES_BY_ARCH[arch] * sm
+        and walk <= OV1_MAX_SEGMENT_HEADS
+    )
+    # the chunk-parallel tables up to the document bound (the segmented route's fused form writes the block table
+    # too), the one-CTA table above, where the segmented route launches the block table on its own; on the segmented
+    # route up to the bound the intra program writes the tables itself on the forward and the replay (no table
+    # launch; the fused table program serves the saved-set paths whose set carries none)
+    small = n <= TABLE_V2_MAX_DOCS
+    intra_tables = seg and small
+    if intra_tables:
+        table = "table_v3" if path in ("light", "light_states", "tape") else None
+    else:
+        table = "table_v2" if small else "table"
+    out: dict[str, str | None] = {
+        "table": table,
+        "seg_table": "seg_table" if seg and not small else None,
+        "fwd_intra": "fwd_intra_v14" if intra_tables else "fwd_intra",
+        "wy_fwd": None
+        if fused_fwd
+        else ("wy_fwd_rows" if (ov1 and save) or paired else "wy_fwd"),
+        "seg_carry": None if not seg else ("seg_carry_ov" if ov1 else "seg_carry"),
         "glm_intra": "glm_intra",
         "gate_epilogue": "gate_epilogue",
     }
+    if path == "tape":
+        out["wy"] = "wy_bwd"
+    elif path == "light":
+        out["wy"] = None if fused_bwd else "wy_bwd"
+    elif path == "light_states":
+        out["wy"] = None if fused_p3 else "wy_bwd"
+    elif replay:
+        out["wy"] = None if fused_bwd else "wy_bwd_replay"
+    else:
+        out["wy"] = None
+    if fwd:
+        if seg:
+            out["fwdh"] = "fwdh_v3"
+        elif fused_fwd:
+            out["fwdh"] = "fwdh_wy_rows" if save else "fwdh_wy"
+        elif v2:
+            out["fwdh"] = "fwdh_o_v2_rows" if paired else "fwdh_o_v2"
+        else:
+            out["fwdh"] = "fwdh_o_v1"
+    elif path in ("light", "replay"):
+        if seg:
+            out["fwdh"] = "fwdh_v3"
+        elif fused_bwd:
+            out["fwdh"] = "fwdh_wy_bwd_replay" if replay else "fwdh_wy_bwd"
+        elif v2:
+            # the vh 32 build of the 32-column recompute from 16 heads; on sm_107a at 16 heads only
+            narrow_wide = h >= 16 and (arch != "sm_107a" or h <= 16)
+            out["fwdh"] = "fwdh_v2h" if narrow_wide else "fwdh_v2"
+        else:
+            out["fwdh"] = "fwdh_v1_sm107" if arch == "sm_107a" else "fwdh_v1"
+    else:
+        out["fwdh"] = None
+    if not seg or path == "tape":
+        out["fwdh_p3"] = None
+    elif fwd:
+        if ov1:
+            out["fwdh_p3"] = (
+                "fwdh_p3_o_ov" if h <= OV1_ORDER_MAX_H else "fwdh_p3_o_ov_id"
+            ) + ("_rows" if save else "")
+        else:
+            out["fwdh_p3"] = "fwdh_p3_o"
+    elif path == "light_states":
+        out["fwdh_p3"] = "fwdh_p3_wy" if fused_p3 else "fwdh_p3"
+    else:
+        out["fwdh_p3"] = "fwdh_p3"
+    out["bwd_prep"] = "bwd_prep_g8_replay" if replay else "bwd_prep_g8"
+    if davq:
+        out["dav"] = None
+    else:  # the serial route below 16 heads and the few-chain segmented rows: dAqk alone
+        out["dav"] = "dav_serial_replay" if replay else "dav_serial"
+    if seg and few:
+        if replay:
+            out["dhu"] = "dhu_v3s_f_replay"
+        else:
+            out["dhu"] = "dhu_v3s_f_wt" if path == "light_states" else "dhu_v3s_f"
+    elif seg:
+        # the dv-accumulating adjoint in the row's tape build (the prefetching form below the sm_103a bound); its
+        # w^T form behind the fused saved-state pass 2
+        base = "dhu_v3p_f" if prefetch else ("dhu_v3_f" if tma else "dhu_v3r_f")
+        if replay:
+            out["dhu"] = base + "_replay"
+        else:
+            out["dhu"] = base + ("_wt" if path == "light_states" and fused_p3 else "")
+    elif v2:
+        out["dhu"] = "dhu_v2t_replay" if replay else "dhu_v2t"
+    elif fused_bwd and path in ("light", "replay"):
+        out["dhu"] = "dhu_v1_wt_replay" if replay else "dhu_v1_wt"
+    else:
+        out["dhu"] = "dhu_v1_replay" if replay else "dhu_v1"
+    out["dqkg"] = ("dqkg_int" if replay else "dqkg") + ("_davq" if davq else "")
+    return {stage: out[stage] for stage in PATH_STAGES[path]}
 
 
 def _expected_grid(
@@ -271,28 +626,33 @@ def _expected_grid(
     ctas = nc_pad * h
     if name in ("table", "seg_table"):
         return (1, 1, 1)
-    if name in ("fwd_prep_split", "bwd_prep_g8s"):
-        return (2 * nc_pad, h, 1)
+    if name in ("table_v2", "table_v3"):
+        return (max(1, -(-nc_pad // 256)), 1, 1)
     if name in (
-        "fwd_prep_bulk",
         "fwd_intra",
-        "bwd_prep_v2",
+        "fwd_intra_v14",
         "bwd_prep_g8",
+        "bwd_prep_g8_replay",
         "glm_intra",
         "gate_epilogue",
     ):
         return (nc_pad, h, 1)
-    if name in ("wy", "dav"):
-        return (nc_pad // 2, h, 1)
+    if name.startswith(("wy_", "dav")):  # persistent over the (pair, head) items
+        return (max(1, min(nc_pad // 2 * h, sm)), 1, 1)
     if name == "fwdh_v3":
-        return ((2 if launch == 0 else 1) * nseg * h, 1, 1)
-    if name == "dhu_v3":
+        return (2 * nseg * h, 1, 1)
+    if name.startswith("fwdh_p3"):
         return (nseg * h, 1, 1)
-    if name == "seg_carry":
-        return (n * h, 1, 1)
-    if name.startswith(("fwdh_", "dhu_")):
-        return (n * h * RECUR_SLICES[name[-2:]], 1, 1)
-    if name in ("fwd_o", "dqkg"):
+    if name.startswith("dhu_v3s_f"):
+        return (2 * nseg * h, 1, 1)
+    if name.startswith(("dhu_v3_f", "dhu_v3p_f", "dhu_v3r_f")):
+        return (nseg * h, 1, 1)
+    if name.startswith("seg_carry"):  # two CTAs per (document, head) chain
+        return (2 * n * h, 1, 1)
+    if name.startswith("fwdh_") or name.startswith("dhu_"):
+        narrow = name.startswith(("fwdh_o_v2", "fwdh_v2", "dhu_v2t"))
+        return (n * h * (4 if narrow else 2), 1, 1)
+    if name.startswith("dqkg"):
         return (max(1, min(ctas, sm)), 1, 1)
     raise AssertionError(name)
 
@@ -300,43 +660,135 @@ def _expected_grid(
 PLAN_GRID = [
     (nc_pad, n, h, sm)
     for nc_pad in (2, 4, 6, 32, 64, 128, 256, 4096)
-    for n in (1, 3, 4, 7)
+    for n in (1, 3, 4, 7, 300)
     for h in (1, 2, 4, 8, 16, 32, 64)
-    for sm in (132, 148, 160)
+    for sm in (132, 148, 160, 212)
 ]
 
 
 def test_every_stage_selects_the_expected_record_and_grid() -> None:
     for nc_pad, n, h, sm in PLAN_GRID:
-        expected = _expected_records(nc_pad, n, h, sm)
-        route, segments, nseg = _expected_segments(n, h, sm)
-        assert cake_jit.segment_plan(n, h, sm) == (route, segments, nseg), (n, h, sm)
-        for stage in cake_jit.STAGES:
-            name = cake_jit.select_record(
-                stage, num_chunks_pad=nc_pad, num_seqs=n, num_heads=h, sm_count=sm
-            )
-            assert name == expected[stage], (stage, nc_pad, n, h, sm)
-            if name is None:
-                assert stage in OPTIONAL_STAGES
-                continue
-            for launch in range(cake_jit.launches(name)):
-                grid = cake_jit.launch_grid(
-                    name,
-                    num_chunks_pad=nc_pad,
-                    num_seqs=n,
-                    num_heads=h,
-                    sm_count=sm,
-                    num_segments=nseg,
-                    launch=launch,
-                )
-                assert grid == _expected_grid(name, nc_pad, n, h, sm, nseg, launch), (
-                    name,
-                    nc_pad,
-                    n,
-                    h,
-                    sm,
-                    launch,
-                )
+        assert cake_jit.segment_plan(n, h, sm) == _expected_segments(n, h, sm)
+        for arch in ARCHES:
+            route, segments, nseg = _expected_segments(n, h, sm, arch)
+            assert cake_jit.segment_plan(n, h, sm, arch) == (route, segments, nseg)
+            for path in PATHS:
+                if path == "light_states" and route == "serial":
+                    continue
+                expected = _expected_records(nc_pad, n, h, sm, arch, path)
+                for stage, want in expected.items():
+                    name = cake_jit.select_record(
+                        stage,
+                        num_chunks_pad=nc_pad,
+                        num_seqs=n,
+                        num_heads=h,
+                        sm_count=sm,
+                        arch=arch,
+                        path=path,
+                    )
+                    assert name == want, (stage, nc_pad, n, h, sm, arch, path)
+                    if name is None:
+                        assert stage in OPTIONAL_STAGES
+                        continue
+                    for launch in range(cake_jit.launches(name)):
+                        grid = cake_jit.launch_grid(
+                            name,
+                            num_chunks_pad=nc_pad,
+                            num_seqs=n,
+                            num_heads=h,
+                            sm_count=sm,
+                            num_segments=nseg,
+                            launch=launch,
+                        )
+                        assert grid == _expected_grid(
+                            name, nc_pad, n, h, sm, nseg, launch
+                        ), (name, nc_pad, n, h, sm, launch)
+
+
+def test_the_saving_forward_reads_the_token_rows_where_a_program_ships() -> None:
+    # The intra program writes the internal Aqk / Akk copies (write_int) iff a later program of the path reads them:
+    # never on the saving forward's fused serial rows, overlap rows and paired serial rows (the 32-column form below
+    # the fused threshold: their token-row records), always on the forward without a saved set and on the replay.
+    for n in (1, 3, 4, 7, 300):
+        for h in (1, 2, 4, 8, 16, 32, 64):
+            for sm in (132, 148, 160, 212):
+                for arch in ARCHES:
+                    p = cake_backend.plan(4096, n, h, sm, arch)
+                    records = _expected_records(p.NC_pad, n, h, sm, arch, "fwd")
+                    token = {
+                        name for name in records.values() if name in TOKEN_ROW_RECORDS
+                    }
+                    seg = h <= SEG_MAX_H
+                    walk = p.NSEG * h
+                    fused = (
+                        not seg
+                        and h >= FUSED_FWD_MIN_H
+                        and (arch != "sm_107a" or h <= FUSED_FWD_MIN_H)
+                    )
+                    ov1 = (
+                        seg
+                        and walk >= OV1_MIN_WAVES_BY_ARCH[arch] * sm
+                        and walk <= OV1_MAX_SEGMENT_HEADS
+                    )
+                    paired = (
+                        not seg
+                        and not fused
+                        and n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
+                    )
+                    assert bool(token) == (fused or ov1 or paired), (
+                        n,
+                        h,
+                        sm,
+                        arch,
+                        token,
+                    )
+                    if fused:
+                        assert token == {"fwdh_wy_rows"}
+                    if ov1:
+                        assert "wy_fwd_rows" in token and len(token) == 2
+                    if paired:
+                        assert token == {"wy_fwd_rows", "fwdh_o_v2_rows"}
+                    assert p.internal_rows("fwd") is (not token), (n, h, sm, arch)
+                    assert p.internal_rows("fwd_nosave") is True
+                    assert p.internal_rows("replay") is True
+                    assert not set(p.records["fwd_nosave"].values()) & set(
+                        TOKEN_ROW_RECORDS
+                    )
+                    assert p.launch_count("fwd") == p.launch_count("fwd_nosave")
+                    for stage, name in p.records["fwd"].items():
+                        other = p.records["fwd_nosave"][stage]
+                        if name in TOKEN_ROW_RECORDS:
+                            assert other == INTERNAL_ROW_TWIN[name], (stage, name)
+                        else:
+                            assert other == name, (stage, name)
+
+
+def test_select_record_checks_its_inputs() -> None:
+    kwargs = dict(num_chunks_pad=4, num_seqs=1, num_heads=4, sm_count=148)
+    with pytest.raises(ValueError, match="arch"):
+        cake_jit.select_record("table", **kwargs, arch="sm_90a", path="fwd")
+    with pytest.raises(ValueError, match="path"):
+        cake_jit.select_record("table", **kwargs, arch="sm_100a", path="bwd")
+    with pytest.raises(ValueError, match="unknown stage"):
+        cake_jit.select_record("fwd_o", **kwargs, arch="sm_100a", path="fwd")
+    # a stage no record of the path admits is not an optional stage: the registry refuses the question
+    with pytest.raises(ValueError, match="no record admits"):
+        cake_jit.select_record("dqkg", **kwargs, arch="sm_100a", path="fwd")
+
+
+def test_segment_args_follow_the_proportional_rule() -> None:
+    # at most four chains: a proportional block table and seg_arg = -num_docs; otherwise the uniform count
+    for sm in (132, 148, 152, 160):
+        assert cake_jit.segment_args(1, 4, sm) == (1, -1)
+        assert cake_jit.segment_args(4, 1, sm) == (1, -4)
+        assert cake_jit.segment_args(2, 2, sm) == (1, -2)
+        _route, segments, _nseg = cake_jit.segment_plan(3, 2, sm)
+        assert cake_jit.segment_args(3, 2, sm) == (0, segments)
+        assert cake_jit.segment_args(1, 16, sm) == (0, 1)  # the serial route
+    p = cake_backend.plan(1024, 4, 1, 148)
+    assert (p.proportional, p.seg_arg) == (1, -4)
+    p = cake_backend.plan(1024, 7, 8, 148)
+    assert (p.proportional, p.seg_arg) == (0, p.P)
 
 
 def test_segmented_grids_need_segments_and_a_known_launch() -> None:
@@ -344,9 +796,19 @@ def test_segmented_grids_need_segments_and_a_known_launch() -> None:
         cake_jit.launch_grid(
             "fwdh_v3", num_chunks_pad=4, num_seqs=1, num_heads=4, sm_count=148
         )
-    with pytest.raises(ValueError, match="launch 2 of 2"):
+    with pytest.raises(ValueError, match="launch 1 of 1"):
         cake_jit.launch_grid(
             "fwdh_v3",
+            num_chunks_pad=4,
+            num_seqs=1,
+            num_heads=4,
+            sm_count=148,
+            num_segments=64,
+            launch=1,
+        )
+    with pytest.raises(ValueError, match="launch 2 of 2"):
+        cake_jit.launch_grid(
+            "dhu_v3_f",
             num_chunks_pad=4,
             num_seqs=1,
             num_heads=4,
@@ -358,100 +820,531 @@ def test_segmented_grids_need_segments_and_a_known_launch() -> None:
         cake_jit.segment_plan(0, 4, 148)
 
 
+def test_few_chains_cap_the_segment_count() -> None:
+    # Four documents at H = 1 (four chains): 38 segments per document (NSEG = 152)
+    # instead of the clamp's 64, a 37-step carry chain instead of 63; eight chains
+    # keep the clamp.  A host-plan constant: no record changes with it.  sm_100a
+    # has a few-chain count of its own, 37 (SEGMENTS["small_segments_by_arch"]);
+    # arch=None is the architecture-independent 38.
+    for sm in (132, 148, 152, 160):
+        assert cake_jit.segment_plan(4, 1, sm) == ("seg", 38, 152)
+        assert cake_jit.segment_plan(4, 1, sm, "sm_103a") == ("seg", 38, 152)
+        assert cake_jit.segment_plan(4, 1, sm, "sm_107a") == ("seg", 38, 152)
+        assert cake_jit.segment_plan(4, 1, sm, "sm_100a") == ("seg", 37, 148)
+        # at H = 4 the per-SM cap sm // 4 (33, 37, 38, 40) applies before the few-chains cap of 38 (37 on sm_100a)
+        cap = sm // 4
+        assert cake_jit.segment_plan(1, 4, sm) == ("seg", min(38, cap), min(38, cap))
+        assert cake_jit.segment_plan(1, 4, sm, "sm_100a") == (
+            "seg",
+            min(37, cap),
+            min(37, cap),
+        )
+        assert cake_jit.segment_plan(8, 1, sm) == ("seg", 64, 512)
+        assert cake_jit.segment_plan(8, 1, sm, "sm_100a") == ("seg", 64, 512)
+        assert cake_jit.segment_plan(2, 4, sm) == ("seg", cap, 2 * cap)
+        for arch, small in (("sm_100a", 37), ("sm_103a", 38), ("sm_107a", 38)):
+            p = cake_backend.plan(1024, 4, 1, sm, arch)
+            assert (p.recur, p.P, p.NSEG) == ("seg", small, 4 * small)
+            assert cake_backend.plan(1024, 8, 1, sm, arch).P == 64
+        # plan(arch=None) is the first exported architecture's plan, segment count included
+        assert cake_backend.plan(1024, 4, 1, sm).P == 37
+    # below the clamp the cap is inert: four chains on a 32-SM device give 32
+    assert cake_jit.segment_plan(4, 1, 32) == ("seg", 32, 128)
+    assert cake_jit.segment_plan(4, 1, 32, "sm_100a") == ("seg", 32, 128)
+
+
+def test_segment_count_is_capped_at_one_walk_cta_per_sm() -> None:
+    # P * H <= sm_count: one document's pass-2 (and adjoint) walk CTAs fit one wave of the device and its first
+    # pass one round at two CTAs per SM.  152 SMs: 38 segments at H = 4 (four documents: the clamp gives the
+    # same), 19 at H = 8; at H = 2 the clamp of 64 binds first.
+    for n in (1, 2, 3, 4):
+        for h in (1, 2, 4, 8):
+            for sm in (132, 148, 152, 160):
+                route, p, nseg = cake_jit.segment_plan(n, h, sm)
+                assert route == "seg" and p >= 1 and p * h <= sm and nseg == n * p
+    assert cake_jit.segment_plan(3, 4, 152) == ("seg", 38, 114)
+    assert cake_jit.segment_plan(1, 8, 152) == ("seg", 19, 19)
+    assert cake_jit.segment_plan(3, 2, 152) == ("seg", 64, 192)
+    assert cake_jit.segment_plan(4, 8, 148) == ("seg", 18, 72)
+
+
 def test_pairs_grid_needs_an_even_chunk_bound() -> None:
     with pytest.raises(ValueError, match="not even"):
         cake_jit.launch_grid(
-            "wy", num_chunks_pad=3, num_seqs=1, num_heads=1, sm_count=148
+            "wy_bwd", num_chunks_pad=3, num_seqs=1, num_heads=1, sm_count=148
         )
+
+
+def test_pair_kernels_walk_the_pairs_on_a_persistent_grid() -> None:
+    # The WY and dA / dv programs: one CTA per SM at most, walking the (chunk pair, head) items; the pair count is
+    # a plan scalar.
+    for name in (
+        "wy_fwd",
+        "wy_bwd",
+        "wy_bwd_replay",
+        "dav_serial",
+        "dav_serial_replay",
+    ):
+        record = cake_jit.MODULES[name]
+        assert record["grid_rule"] == {"kind": "pairs_bounded", "ctas_per_sm": 1}
+        assert ["parameter", "num_pairs"] in [list(pair) for pair in record["arg_plan"]]
+        assert record["logical"]["num_pairs"] == "num_pairs"
+        for nc_pad, h, sm in (
+            (2, 1, 148),
+            (64, 4, 148),
+            (4096, 64, 132),
+            (4096, 1, 160),
+        ):
+            grid = cake_jit.launch_grid(
+                name, num_chunks_pad=nc_pad, num_seqs=1, num_heads=h, sm_count=sm
+            )
+            assert grid == (max(1, min(nc_pad // 2 * h, sm)), 1, 1)
+
+
+def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None:
+    # The fused gradient and the GLM intra kernel read q / k / v where they are (TMA boxes on the token rows), so
+    # the backward prep ships its copy-free forms alone and the backward layouts hold no slot for such copies.
+    for name in ("dqkg", "dqkg_int", "dqkg_davq", "dqkg_int_davq"):
+        logical = cake_jit.MODULES[name]["logical"]
+        assert (logical["v_tma"], logical["k_tma"], logical["q_tma"]) == ("v", "k", "q")
+    logical = cake_jit.MODULES["glm_intra"]["logical"]
+    assert (logical["k_e"], logical["q_e"]) == ("k", "q")
+    assert cake_jit.records_of_stage("bwd_prep") == (
+        "bwd_prep_g8",
+        "bwd_prep_g8_replay",
+    )
+    for name in ("bwd_prep_g8", "bwd_prep_g8_replay"):
+        prep = cake_jit.MODULES[name]
+        assert prep["select_rule"]["kind"] == "path_in"
+        assert not {"ke_out", "qe_out", "v_int", "vb_out"} & set(prep["logical"])
+    # the saved-set paths' prep copies nothing of dout either; the replay's keeps the internal copy
+    assert "do_int" in cake_jit.MODULES["bwd_prep_g8_replay"]["logical"].values()
+    assert "do_int" not in cake_jit.MODULES["bwd_prep_g8"]["logical"].values()
+    assert not {"ke", "qe", "v_int", "vb"} & set(cake_jit.LOGICAL_TENSORS)
+    for mode, slots in cake_backend.SLOTS.items():
+        names = {name for occupants in slots for name, *_ in occupants}
+        assert not names & {"ke", "qe", "v_int", "vb"}, mode
+        assert ("akk_int" in names) == (mode.startswith(("fwd", "replay"))), mode
+
+
+def test_the_saved_set_paths_read_the_token_rows_and_the_replay_the_internal_rows() -> (
+    None
+):
+    # Operand sources: the records of the saved-set paths bind the saved Aqk / Akk token rows and the user's
+    # dout; their replay twins bind the arena's internal rows (aqk_int / akk_int / do_int).
+    pairs = {
+        "wy_bwd": "wy_bwd_replay",
+        "fwdh_wy_bwd": "fwdh_wy_bwd_replay",
+        "dav_serial": "dav_serial_replay",
+        "dhu_v3_f": "dhu_v3_f_replay",
+        "dhu_v3p_f": "dhu_v3p_f_replay",
+        "dhu_v3r_f": "dhu_v3r_f_replay",
+        "dhu_v2t": "dhu_v2t_replay",
+        "dhu_v1": "dhu_v1_replay",
+        "dhu_v1_wt": "dhu_v1_wt_replay",
+        "dhu_v3s_f": "dhu_v3s_f_replay",
+        "dqkg": "dqkg_int",
+        "dqkg_davq": "dqkg_int_davq",
+    }
+    token = {"aqk_src", "akk_src", "dout"}
+    internal = {"aqk_int", "akk_int", "do_int"}
+    for saved_name, replay_name in pairs.items():
+        saved_values = set(cake_jit.MODULES[saved_name]["logical"].values())
+        replay_values = set(cake_jit.MODULES[replay_name]["logical"].values())
+        assert saved_values & token and not saved_values & internal, saved_name
+        assert replay_values & internal and not replay_values & token, replay_name
+        assert (
+            cake_jit.MODULES[saved_name]["library"]
+            != cake_jit.MODULES[replay_name]["library"]
+        )
+    # the segmented adjoint recurrences of the many-chain rows read dout on the saved-set paths (their w^T forms too)
+    for name in (
+        "dhu_v3_f",
+        "dhu_v3_f_wt",
+        "dhu_v3p_f",
+        "dhu_v3p_f_wt",
+        "dhu_v3r_f",
+        "dhu_v3r_f_wt",
+    ):
+        assert "dout" in cake_jit.MODULES[name]["logical"].values(), name
+    # the saving forward's token-row twins bind the saved Aqk / Akk where the internal-row forms bind the arena's copies
+    saved_rows = {"aqk_ext", "akk_ext"}
+    for rows_name, internal_name in INTERNAL_ROW_TWIN.items():
+        internal_values = set(cake_jit.MODULES[internal_name]["logical"].values())
+        rows_values = set(cake_jit.MODULES[rows_name]["logical"].values())
+        assert internal_values & internal and not internal_values & saved_rows, (
+            internal_name
+        )
+        assert rows_values & saved_rows and not rows_values & internal, rows_name
+        assert (
+            cake_jit.MODULES[internal_name]["library"]
+            != cake_jit.MODULES[rows_name]["library"]
+        )
+        assert set(cake_jit.MODULES[internal_name]["logical"]) == set(
+            cake_jit.MODULES[rows_name]["logical"]
+        ), rows_name  # the same kernel parameters
+    # the transposed w tile: the serial fused recompute writes w_t and its adjoint reads it, the segmented
+    # saved-state pass 2 writes w_tk and its adjoint reads it
+    assert cake_jit.MODULES["fwdh_wy_bwd"]["logical"]["w_out"] == "w_t"
+    assert cake_jit.MODULES["dhu_v1_wt"]["logical"]["w_tma"] == "w_t"
+    assert cake_jit.MODULES["fwdh_p3_wy"]["logical"]["w_t_out"] == "w_tk"
+    assert cake_jit.MODULES["dhu_v3s_f_wt"]["logical"]["w_tma"] == "w_tk"
+    for name in ("fwdh_v1", "dhu_v1", "dhu_v3s_f", "fwdh_p3"):
+        assert cake_jit.MODULES[name]["logical"]["w_tma"] == "w", name
+
+
+def test_the_forward_wy_forms_the_gated_values_from_the_token_rows() -> None:
+    # The WY programs read the user's v and beta through the chunk table and form the gated values in shared
+    # memory: no prep writes them and no layout holds a slot for them.
+    fwd, bwd = cake_jit.MODULES["wy_fwd"], cake_jit.MODULES["wy_bwd"]
+    assert fwd["library"] != bwd["library"]
+    assert (fwd["stage"], bwd["stage"]) == ("wy_fwd", "wy")
+    assert fwd["grid_rule"] == bwd["grid_rule"]
+    for record in (fwd, bwd):
+        assert (record["logical"]["v_tma"], record["logical"]["beta"]) == ("v", "beta")
+        assert {"chunk_bos", "chunk_len"} <= set(record["logical"].values())
+    assert (
+        fwd["logical"]["akk_tma"] == "akk_int"
+        and bwd["logical"]["akk_tma"] == "akk_src"
+    )
+    # the forward intra programs write the prep's outputs themselves (no prep launch) and read no v either
+    for name in ("fwd_intra", "fwd_intra_v14"):
+        intra = set(cake_jit.MODULES[name]["logical"].values())
+        assert not intra & {"v", "vb"}, name
+        assert {"gk", "kb", "kg", "qg", "v_new", "write_prep"} <= intra, name
+    # the segmented route's intra program computes the chunk layout from cu_seqlens and writes the five tables
+    v14 = set(cake_jit.MODULES["fwd_intra_v14"]["logical"].values())
+    tables = set(cake_backend.TABLE_NAMES)
+    assert {
+        "cu_seqlens",
+        "num_seqs",
+        "segments",
+        "proportional",
+    } <= v14 and tables <= v14
+    assert "cu_seqlens" not in cake_jit.MODULES["fwd_intra"]["logical"].values()
+    assert "fwd_prep" not in cake_jit.STAGES
+    assert "wy_fwd" in cake_jit.STAGES_FWD and "wy_fwd" not in cake_jit.STAGES_BWD
+    assert "wy" in cake_jit.STAGES_BWD and "wy" not in cake_jit.STAGES_FWD
+    for mode, slots in cake_backend.SLOTS.items():
+        names = {name for occupants in slots for name, *_ in occupants}
+        assert "vb" not in names and "kb" in names, mode
+    # the fused forward recurrence takes the WY operands itself: no wy_fwd record on its rows (the saving forward's
+    # form from the saved Akk / Aqk token rows)
+    fused = cake_jit.MODULES["fwdh_wy"]["logical"]
+    assert {"akk_int", "kb", "v", "beta", "out"} <= set(fused.values())
+    rows = cake_jit.MODULES["fwdh_wy_rows"]["logical"]
+    assert {"akk_ext", "aqk_ext", "kb", "v", "beta", "out"} <= set(rows.values())
+    assert not {"akk_int", "aqk_int"} & set(rows.values())
+    # the saving forward's overlap rows launch the backward's saved-Akk WY program under the forward stage
+    rows_wy = cake_jit.MODULES["wy_fwd_rows"]
+    assert rows_wy["stage"] == "wy_fwd" and rows_wy["library"] == bwd["library"]
+    assert (
+        rows_wy["logical"][next(k for k, v in bwd["logical"].items() if v == "akk_src")]
+        == "akk_ext"
+    )
+
+
+def test_the_serial_walk_orders_the_documents_and_the_carry_splits_the_chain() -> None:
+    # The serial recurrences take the layout table's longest-first document order (seq_order, a table of every
+    # call); seg_carry runs two CTAs per (document, head) chain and reads the block table's chain geometry.
+    for name in (
+        "fwdh_v1",
+        "fwdh_v1_sm107",
+        "fwdh_v2",
+        "fwdh_v2h",
+        "fwdh_o_v1",
+        "fwdh_o_v2",
+        "fwdh_o_v2_rows",
+        "fwdh_wy",
+        "fwdh_wy_rows",
+        "fwdh_wy_bwd",
+        "dhu_v2t",
+    ):
+        record = cake_jit.MODULES[name]
+        assert record["logical"]["seq_order"] == "seq_order", name
+        assert ["buffer", "seq_order"] in [list(pair) for pair in record["arg_plan"]]
+    assert "seq_order" in cake_backend.TABLE_NAMES
+    carry = cake_jit.MODULES["seg_carry"]
+    assert carry["grid_rule"] == {"kind": "docs_heads", "ctas_per_chain": 2}
+    assert carry["logical"]["chain_seg_start"] == "seg_table"
+    for n, h, sm in ((1, 1, 148), (4, 4, 152), (7, 8, 132)):
+        grid = cake_jit.launch_grid(
+            "seg_carry", num_chunks_pad=4, num_seqs=n, num_heads=h, sm_count=sm
+        )
+        assert grid == (2 * n * h, 1, 1)
+    # the segmented programs read the block table and the walk programs' segment scalar
+    for name in (
+        "fwdh_v3",
+        "fwdh_p3",
+        "fwdh_p3_o",
+        "fwdh_p3_wy",
+        "fwdh_p3_o_ov_rows",
+        "dhu_v3_f",
+        "dhu_v3p_f",
+        "dhu_v3r_f_wt",
+        "dhu_v3s_f",
+    ):
+        logical = cake_jit.MODULES[name]["logical"]
+        assert logical["seq_chunk_start"] == "seg_table", name
+        assert logical["segments"] == "seg_arg", name
+    assert cake_jit.MODULES["seg_table"]["logical"]["proportional"] == "proportional"
+
+
+def _expected_launch_count(
+    records: dict[str, str | None], seg: bool, path: str, tables: bool
+) -> int:
+    count = 0
+    for stage, name in records.items():
+        if name is None:
+            continue
+        if stage in ("table", "seg_table"):
+            count += int((not tables) or path in ("fwd", "fwd_nosave", "replay"))
+        elif stage == "seg_carry":
+            count += int(records.get("fwdh") is not None) + int(
+                path not in ("fwd", "fwd_nosave")
+            )
+        elif name in TWO_PASS_RECORDS:
+            count += 2
+        else:
+            count += 1
+    return count
 
 
 def test_plan_follows_the_chunk_bound_formulas() -> None:
     for lengths, heads in SHAPES:
         S, N = sum(lengths), len(lengths)
         for sm in (132, 148):
-            p = cake_backend.plan(S, N, heads, sm)
-            nc_max = -(-S // BT) + N
-            assert (p.NC_max, p.NC_pad, p.R) == (
-                nc_max,
-                nc_max + nc_max % 2,
-                64 * (nc_max + nc_max % 2),
-            )
-            assert p.records == _expected_records(p.NC_pad, N, heads, sm)
-            assert (p.recur, p.P, p.NSEG) == _expected_segments(N, heads, sm)
-            for stage in cake_jit.STAGES:
-                if not p.dispatched(stage):
-                    assert stage in OPTIONAL_STAGES and p.recur == "serial"
-                    with pytest.raises(ValueError, match="not launched"):
-                        p.record(stage)
-                    continue
-                for launch in range(p.launches(stage)):
-                    assert p.grid(stage, launch) == _expected_grid(
-                        p.record(stage), p.NC_pad, N, heads, sm, p.NSEG, launch
-                    )
-            seg = p.recur == "seg"
-            assert p.launch_count("fwd") == (9 if seg else 6)
-            assert p.launch_count("bwd") == (12 if seg else 8)
-            assert p.launch_count("bwd", tables=False) == (14 if seg else 9)
-            assert p.launch_count("bwd", tape=True) == (9 if seg else 7)
-            assert p.launch_count("replay") == (15 if seg else 10)
-            assert set(p.stages()) == {s for s, r in p.records.items() if r}
-            assert set(p.stages(backward=False)) == {
-                s
-                for s in p.stages()
-                if s not in cake_jit.STAGES_BWD or s in ("wy", "fwdh")
-            }
+            for arch in ARCHES:
+                p = cake_backend.plan(S, N, heads, sm, arch)
+                nc_max = -(-S // BT) + N
+                assert (p.NC_max, p.NC_pad, p.R) == (
+                    nc_max,
+                    nc_max + nc_max % 2,
+                    64 * (nc_max + nc_max % 2),
+                )
+                assert (p.recur, p.P, p.NSEG) == _expected_segments(N, heads, sm, arch)
+                seg = p.recur == "seg"
+                assert set(p.records) == {
+                    path for path in PATHS if seg or path != "light_states"
+                }
+                for path in p.records:
+                    expected = _expected_records(p.NC_pad, N, heads, sm, arch, path)
+                    assert p.records[path] == expected, (path, lengths, heads, sm, arch)
+                    for stage in cake_jit.STAGES:
+                        if stage not in expected:
+                            with pytest.raises(ValueError, match="not a stage of"):
+                                p.record(stage, path)
+                            continue
+                        if not p.dispatched(stage, path):
+                            assert stage in OPTIONAL_STAGES
+                            with pytest.raises(ValueError, match="not launched"):
+                                p.record(stage, path)
+                            continue
+                        for launch in range(p.launches(stage, path)):
+                            assert p.grid(stage, path, launch) == _expected_grid(
+                                p.record(stage, path),
+                                p.NC_pad,
+                                N,
+                                heads,
+                                sm,
+                                p.NSEG,
+                                launch,
+                            )
+                    assert set(p.stages(path)) == {s for s, r in expected.items() if r}
+                    for tables in (True, False):
+                        assert p.launch_count(path, tables=tables) == (
+                            _expected_launch_count(expected, seg, path, tables)
+                        ), (path, tables)
+                # These packs are far below the size rule (S < 384 * NSEG): the light forward saves no segment
+                # states and the backward recomputes them.
+                assert p.seg_save is False and p.light_path == "light"
+                assert p.launch_count("bwd") == p.launch_count("light")
+                if not seg:
+                    with pytest.raises(ValueError, match="segmented route only"):
+                        p.record("dhu", "light_states")
     assert cake_backend.plan(1, 1, 1, 1).NC_pad == 2
     for bad in ((0, 1, 1, 148), (1, 0, 1, 148), (1, 1, 0, 148), (1, 1, 1, 0)):
         with pytest.raises(ValueError):
             cake_backend.plan(*bad)
     with pytest.raises(ValueError, match="int32"):
         cake_backend.plan(64, 1, 2**31 // (D * BT), 148)
+    with pytest.raises(ValueError, match="arch"):
+        cake_backend.plan(64, 1, 1, 148, "sm_90a")
+
+
+def test_launch_counts_of_the_paths() -> None:
+    # 148 SMs.  Serial rows: 16 heads in the 32-column form (no dav: the fused gradient hosts dAqk; on the saving
+    # forward the token-row pair wy_fwd_rows + fwdh_o_v2_rows, the same count), 64 heads in
+    # the 64-column form (the fused recompute: no WY launch on the light and replay paths).  Segmented rows: four
+    # documents at 2 heads (eight chains: the dv-accumulating adjoint, the fused saved-state pass 2) and one
+    # document at 4 heads (four chains: the two-CTA adjoint); no dav launch on either (the fused gradient hosts
+    # dAqk), no table launch on the forward and the replay (the intra program writes the chunk tables and the block
+    # table itself).  The forward has no prep launch.
+    counts = {}
+    for n, h in ((1, 16), (4, 64), (4, 2), (1, 4)):
+        p = cake_backend.plan(4096, n, h, 148)
+        counts[(n, h)] = {path: p.launch_count(path) for path in p.records}
+    # the saving forward and the forward without a saved set launch the same number of programs (the token-row
+    # records replace the internal-row ones)
+    assert counts[(1, 16)] == {
+        "fwd": 4,
+        "fwd_nosave": 4,
+        "light": 7,
+        "tape": 6,
+        "replay": 9,
+    }
+    assert counts[(4, 64)] == {
+        "fwd": 3,
+        "fwd_nosave": 3,
+        "light": 6,
+        "tape": 6,
+        "replay": 8,
+    }
+    assert counts[(4, 2)] == {
+        "fwd": 5,
+        "fwd_nosave": 5,
+        "light": 11,
+        "light_states": 8,
+        "tape": 8,
+        "replay": 12,
+    }
+    assert counts[(1, 4)] == {
+        "fwd": 5,
+        "fwd_nosave": 5,
+        "light": 11,
+        "light_states": 8,
+        "tape": 8,
+        "replay": 12,
+    }
+    # a saved set whose tables the caller dropped adds the table launch to the saved-set paths (the fused table
+    # program); the forward and the replay select no table record and the table-writing intra program
+    p = cake_backend.plan(4096, 4, 2, 148)
+    assert p.launch_count("light", tables=False) == 12
+    assert p.launch_count("tape", tables=False) == 9
+    assert p.launch_count("replay") == p.launch_count("replay", tables=False) == 12
+    for path in ("fwd", "fwd_nosave", "replay"):
+        assert p.records[path]["table"] is None and not p.dispatched("table", path)
+        assert p.records[path]["fwd_intra"] == "fwd_intra_v14"
+    for path in ("light", "light_states", "tape"):
+        assert p.records[path]["table"] == "table_v3"
+    assert (
+        cake_backend.plan(4096, 1, 16, 148).records["fwd"]["fwd_intra"] == "fwd_intra"
+    )
+    # above the layout-table document bound the segmented route launches the block table on its own
+    wide = cake_backend.plan(4096, 300, 2, 148)
+    assert wide.records["fwd"]["table"] == "table" and wide.dispatched(
+        "seg_table", "fwd"
+    )
+    assert wide.launch_count("fwd") == wide.launch_count("fwd_nosave") == 7
+    assert wide.launch_count("replay") == 14
+    # the backward from this plan's own light set: the states-saved path above the size rule
+    assert p.launch_count("bwd") == p.launch_count("light") == 11
+    tall = cake_backend.plan(384 * p.NSEG, 4, 2, 148)
+    assert tall.light_path == "light_states" and tall.NSEG == p.NSEG
+    assert tall.launch_count("bwd") == 8 and tall.launch_count("bwd", tables=False) == 9
+    with pytest.raises(ValueError, match="path must be one of"):
+        p.launch_count("sideways")
+
+
+def test_seg_state_rule_is_a_pure_function_of_the_scalars() -> None:
+    rule, k = cake_backend.seg_states_saved, cake_backend.SEG_SAVE_MIN_TOKENS_PER_SEG
+    assert k == 384
+    assert cake_backend.SAVED_VERSION == 3 and cake_backend.SAVED_VERSION_TAPE == 2
+    for nseg in (1, 64, 153, 256):
+        assert rule(k * nseg, nseg) is True and rule(k * nseg - 1, nseg) is False
+    assert rule(10**9, 0) is False  # the serial route has no segment states
+    for n, h, sm in ((1, 1, 148), (4, 4, 152), (3, 8, 148), (4, 1, 152)):
+        nseg = cake_backend.plan(1, n, h, sm).NSEG  # independent of S
+        assert (  # a plan without an architecture is the sm_100a plan
+            nseg
+            == cake_backend.plan(k * nseg, n, h, sm).NSEG
+            == _expected_segments(n, h, sm, cake_jit.ARCHES[0])[2]
+        )
+        assert cake_backend.plan(k * nseg, n, h, sm).seg_save is True
+        assert cake_backend.plan(k * nseg - 1, n, h, sm).seg_save is False
+    assert cake_backend.plan(10**6, 1, 16, 148).seg_save is False  # the serial route
 
 
 def test_byte_queries_follow_the_arena_layout() -> None:
     GiB = 2**30
-    for lengths, heads in SHAPES + [((239718 // 3,) * 3, 4), ((261393 // 4,) * 4, 64)]:
+    rows = SHAPES + [((239718 // 3,) * 3, 4), ((261393 // 4,) * 4, 64)]
+    for (lengths, heads), arch in itertools.product(rows, ARCHES):
         S, N = sum(lengths), len(lengths)
-        p = cake_backend.plan(S, N, heads, 148)
+        p = cake_backend.plan(S, N, heads, 148, arch)
+        q = {"sm_count": 148, "arch": arch}  # the queries of this architecture
+        assert tuple(cake_backend.MODES) == (
+            "fwd",
+            "fwd_tape",
+            "bwd",
+            "bwd_tape",
+            "replay",
+            "replay_tape",
+        )
         for mode in cake_backend.MODES:
             regions = p.layout(mode)
             assert all(r.offset % cake_backend.ALIGN == 0 for r in regions), mode
             assert p.workspace_bytes(mode) == max(r.offset + r.nbytes for r in regions)
             names = {r.name for r in regions}
             seg_names = {"seg_b", "seg_m", "hseg"} | (
-                {"dseg", "dhseg"}
-                if mode.startswith("bwd") or mode == "replay"
-                else set()
+                {"dseg", "dhseg"} if not mode.startswith("fwd") else set()
             )
             assert (seg_names <= names) if p.recur == "seg" else not (seg_names & names)
+            assert ("akk_int" in names) == (not mode.startswith("bwd")), mode
+        # the saved-set paths' layouts drop the akk_int buffer: never larger than the replay's
+        assert p.workspace_bytes("bwd") <= p.workspace_bytes("replay")
+        assert p.workspace_bytes("bwd_tape") <= p.workspace_bytes("replay_tape")
         for backward in (False, True):
             for save_mode in cake_backend.SAVE_MODES:
                 tape = save_mode == "tape"
-                mode = (
-                    ("bwd_tape" if tape else "bwd")
-                    if backward
-                    else ("fwd_tape" if tape else "fwd")
+                if backward:
+                    want = max(
+                        p.workspace_bytes("bwd_tape" if tape else "bwd"),
+                        p.workspace_bytes("replay_tape" if tape else "replay"),
+                    )
+                else:
+                    want = p.workspace_bytes("fwd_tape" if tape else "fwd")
+                assert (
+                    cake_backend.workspace_bytes(
+                        S,
+                        N,
+                        heads,
+                        backward=backward,
+                        save_mode=save_mode,
+                        **q,
+                    )
+                    == want
+                    == p.arena_bytes(backward=backward, save_mode=save_mode)
                 )
-                assert cake_backend.workspace_bytes(
-                    S, N, heads, backward=backward, save_mode=save_mode, sm_count=148
-                ) == p.workspace_bytes(mode)
         assert cake_backend.workspace_bytes(
-            S, N, heads, backward=False, sm_count=148
-        ) <= cake_backend.workspace_bytes(S, N, heads, sm_count=148)
+            S, N, heads, backward=False, **q
+        ) <= cake_backend.workspace_bytes(S, N, heads, **q)
         assert (
             cake_backend.saved_bytes(S, heads)
             == 2 * S * heads * BT * 2
             == 256 * S * heads
         )
-        tables = cake_backend.tables_bytes(S, N, heads, sm_count=148)
+        tables = cake_backend.tables_bytes(S, N, heads, **q)
         assert tables == p.table_words() * 4 and tables % cake_backend.ALIGN == 0
+        layout = p.table_layout()
+        assert [name for name, _off, _words in layout] == list(
+            cake_backend.TABLE_NAMES[: 5 if p.recur == "seg" else 4]
+        )
+        if p.recur == "seg":
+            assert layout[-1][2] == p.NSEG + 2 * N + 1
+        # light (version 3): the segment-boundary states (three FP32 state blocks) join the set when the size
+        # rule holds: of these rows only the large segmented one (H = 4), not the small packs or the serial H = 64
+        states = (
+            3 * p.NSEG * heads * D * D * 4
+            if cake_backend.seg_states_saved(S, p.NSEG)
+            else 0
+        )
+        assert p.seg_save == (S >= 384 * p.NSEG > 0)
+        assert (states > 0) == (S > 200_000 and heads == 4)
         assert (
-            cake_backend.saved_bytes(S, heads, N, sm_count=148)
-            == 256 * S * heads + tables
+            cake_backend.saved_bytes(S, heads, N, **q)
+            == 256 * S * heads + tables + states
         )
-        tape_bytes = cake_backend.saved_bytes(
-            S, heads, N, save_mode="tape", sm_count=148
-        )
+        tape_bytes = cake_backend.saved_bytes(S, heads, N, save_mode="tape", **q)
         assert tape_bytes == (
             256 * S * heads
             + tables
@@ -463,17 +1356,32 @@ def test_byte_queries_follow_the_arena_layout() -> None:
         assert cake_backend.output_bytes(S, heads, backward=True) == S * heads * (
             3 * D * 2 + 2 + D * 4
         )
-        report = cake_backend.memory_report(S, N, heads, sm_count=148)
+        report = cake_backend.memory_report(S, N, heads, **q)
         assert (report["recur"], report["segments"], report["num_segments"]) == (
             p.recur,
             p.P,
             p.NSEG,
         )
-        assert (
-            report["arena_bwd"] == p.workspace_bytes("bwd")
-            and report["saved"] == 256 * S * heads + tables
+        assert report["arena_bwd"] == max(
+            p.workspace_bytes("bwd"), p.workspace_bytes("replay")
         )
+        assert report["arena_bwd_layout_saved_path"] == p.workspace_bytes("bwd")
+        assert report["arena_bwd_layout_replay_path"] == p.workspace_bytes("replay")
+        assert report["saved"] == 256 * S * heads + tables + states
+        assert report["seg_states_saved"] == (states > 0)
+        assert report["saved_seg_state_bytes"] == states
+        tape_report = cake_backend.memory_report(S, N, heads, "tape", **q)
+        assert tape_report["saved"] == tape_bytes
+        assert tape_report["saved_seg_state_bytes"] == 2 * p.NSEG * heads * D * D * 4
         assert report["bwd_total"] == report["arena_bwd"] + report["out_bwd"]
+        assert report["arch"] == arch
+        # without an architecture the queries take the current device's (None without a device): the bytes of
+        # the explicit query of that architecture
+        host = _query_arch()
+        assert cake_backend.workspace_bytes(S, N, heads, sm_count=148) == (
+            cake_backend.workspace_bytes(S, N, heads, sm_count=148, arch=host)
+        )
+        assert cake_backend.memory_report(S, N, heads, sm_count=148)["arch"] == host
         if (
             S > 200_000
         ):  # the largest contract rows fit one 283 GiB device with room for two arenas (parity)
@@ -481,9 +1389,13 @@ def test_byte_queries_follow_the_arena_layout() -> None:
     with pytest.raises(ValueError, match="needs num_docs"):
         cake_backend.saved_bytes(64, 1, save_mode="tape")
     with pytest.raises(ValueError, match="save_mode"):
+        cake_backend.saved_bytes(64, 1, save_mode="full")
+    with pytest.raises(ValueError, match="save_mode"):
         cake_backend.workspace_bytes(64, 1, 1, save_mode="full", sm_count=148)
     with pytest.raises(ValueError, match="layout mode"):
         cake_backend._layout(128, 1, 2, 0, "sideways")
+    with pytest.raises(ValueError, match="layout mode"):
+        cake_backend.lifetime_table("sideways")
 
 
 def test_lifetime_table_lists_every_occupant() -> None:
@@ -507,10 +1419,10 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 21 programs of cake_jit.MODULES plus the KCP programs of cake_kcp_jit.MODULES (its test-only
+    # The 57 programs of cake_jit.MODULES plus the KCP programs of cake_kcp_jit.MODULES (its test-only
     # TEST_MODULES live in build.test.json, never here).
     kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
-    assert len(names) == len(set(names)) == (21 + len(kcp_libraries)) * len(ARCHES)
+    assert len(names) == len(set(names)) == (57 + len(kcp_libraries)) * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -561,6 +1473,59 @@ def test_run_module_names_a_missing_logical_argument() -> None:
 
 
 # --------------------------------------------------------------------------- kernels (device)
+
+
+def _expected_launches(p, path: str, *, saved_tables: bool = True) -> list[str]:
+    """The launch order of ``path`` on plan ``p`` (the records by name), spelled from the composition's rules:
+    the tables (on the forward and the replay where the plan dispatches a table program; on a saved-set path only
+    when the set carries none, ``saved_tables=False``), the intra program (the forward: the prep folded in; the
+    segmented route's writes the tables itself up to 256 documents), the backward prep (and the intra program on
+    the replay: before the prep where it writes the tables), WY where
+    a fused program does not form the representation, the recurrence (the segmented passes around the carry),
+    dA / dv where the fused gradient does not host it, the adjoint recurrence, the fused gradient, GLM intra and
+    the gate epilogue."""
+    seg = p.recur == "seg"
+    seq: list[str] = []
+    # the table programs where the plan dispatches them (the segmented route's intra program writes the tables
+    # itself up to 256 documents on the forward and the replay: no table launch there)
+    tables_here = (not saved_tables) or path in ("fwd", "fwd_nosave", "replay")
+    if tables_here and p.dispatched("table", path):
+        seq.append(p.record("table", path))
+        if seg and p.dispatched(
+            "seg_table", path
+        ):  # above 256 documents: the block table on its own
+            seq.append("seg_table")
+    if path in ("fwd", "fwd_nosave"):
+        seq.append(p.record("fwd_intra", path))
+        if p.dispatched("wy_fwd", path):
+            seq.append(p.record("wy_fwd", path))
+        seq.append(p.record("fwdh", path))
+        if (
+            seg
+        ):  # the carry record of the row (the overlap pair's on its rows), then pass 2
+            seq += [p.record("seg_carry", path), p.record("fwdh_p3", path)]
+        return seq
+    # the replay's intra program: before the prep where it writes the tables the prep reads, after it otherwise
+    intra_first = path == "replay" and not p.dispatched("table", path)
+    if intra_first:
+        seq.append(p.record("fwd_intra", path))
+    seq.append(p.record("bwd_prep", path))
+    if path == "replay" and not intra_first:
+        seq.append(p.record("fwd_intra", path))
+    if p.dispatched("wy", path):
+        seq.append(p.record("wy", path))
+    if p.dispatched("fwdh", path):
+        seq.append(p.record("fwdh", path))
+        if seg:
+            seq.append("seg_carry")
+    if p.dispatched("fwdh_p3", path):
+        seq.append(p.record("fwdh_p3", path))
+    if p.dispatched("dav", path):
+        seq.append(p.record("dav", path))
+    dhu = p.record("dhu", path)
+    seq += [dhu, "seg_carry", dhu] if seg else [dhu]
+    seq += [p.record("dqkg", path), "glm_intra", "gate_epilogue"]
+    return seq
 
 
 def _run_fwd_bwd(inputs, *, scale=SCALE, workspace=None, save=True, save_mode=None):
@@ -782,11 +1747,21 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
     inputs = make_inputs(lengths, heads, device)
     ws = KdaWorkspace.for_problem(S, N, heads, device)
     sm = ws.plan.sm_count
+    # the byte queries without an architecture take the device's: with its SM count given or taken from it, the
+    # same bytes as the workspace (a few-chain row: 37 segments per document on sm_100a, 38 elsewhere)
+    expected_segments = 37 if ws.plan.arch == "sm_100a" else 38
+    assert expected_segments == ws.plan.P
     assert (
         ws.bytes
         == cake_backend.workspace_bytes(S, N, heads, sm_count=sm)
+        == cake_backend.workspace_bytes(S, N, heads)
+        == cake_backend.workspace_bytes(S, N, heads, sm_count=sm, arch=ws.plan.arch)
         == ws.arena.numel()
     )
+    assert cake_backend.saved_bytes(
+        S, heads, N, sm_count=sm
+    ) == cake_backend.saved_bytes(S, heads, N)
+    assert cake_backend.memory_report(S, N, heads)["arch"] == ws.plan.arch
     fwd_only = KdaWorkspace.for_problem(S, N, heads, device, backward=False)
     assert fwd_only.bytes == cake_backend.workspace_bytes(
         S, N, heads, backward=False, sm_count=sm
@@ -821,9 +1796,16 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
         cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=other)
     with pytest.raises(ValueError, match="save_mode"):
         cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws, save_mode="full")
-    assert ws.records() == {stage: ws.plan.record(stage) for stage in ws.plan.stages()}
+    assert set(ws.paths()) == {"fwd", "fwd_nosave", "light", "tape", "replay"} | (
+        {"light_states"} if ws.plan.recur == "seg" else set()
+    )
+    assert ws.records() == {
+        path: {stage: ws.plan.record(stage, path) for stage in ws.plan.stages(path)}
+        for path in ws.paths()
+    }
+    assert fwd_only.paths() == ("fwd", "fwd_nosave")
     assert fwd_only.records() == {
-        stage: ws.plan.record(stage) for stage in ws.plan.stages(backward=False)
+        path: ws.records()[path] for path in ("fwd", "fwd_nosave")
     }
     ws.load()
     # A light workspace serves the tape forward (its layout is the smaller one); the tape backward needs a tape
@@ -843,7 +1825,20 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
 
 
 def test_launch_sequences_follow_the_plan(device, manifest) -> None:
-    for lengths, heads in (((63, 1, 65), 2), ((129,), 16)):
+    # Seven rows: the segmented route with six chains, the 32-column serial form at 16 heads (the fused gradient
+    # hosts dAqk), the 64-column serial form at 64 heads (the fused forward and the fused backward recompute), the
+    # few-chain segmented rows (the two-CTA adjoint; the fused gradient hosts dAqk) and, on a 148-SM device, the
+    # overlap pair's rows (the release-order pass 2 at 2 heads, the chain-major pass 2 at 8 heads, and three
+    # documents at 4 heads: one walk CTA per SM per document, exactly the 3.0-wave threshold).
+    for lengths, heads in (
+        ((63, 1, 65), 2),
+        ((129,), 16),
+        ((63, 1, 65), 64),
+        ((129,), 2),
+        ((63, 1, 65, 30), 2),
+        ((20, 20, 20, 20, 20, 20, 20), 8),
+        ((63, 1, 65), 4),
+    ):
         S, N = sum(lengths), len(lengths)
         inputs = make_inputs(lengths, heads, device)
         launched: list[str] = []
@@ -855,51 +1850,53 @@ def test_launch_sequences_follow_the_plan(device, manifest) -> None:
         ws = KdaWorkspace.for_problem(S, N, heads, device, launcher=recording)
         p = ws.plan
         assert p.recur == ("seg" if heads <= SEG_MAX_H else "serial")
+        assert p.seg_save is False and p.light_path == "light"
         q, k, v, g, beta, cu, dout = (
             inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
         )
-        _, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
-        fwd = list(launched)
-        recurrence = (
-            ["fwdh_v3", "seg_carry", "fwdh_v3"]
-            if p.recur == "seg"
-            else [p.record("fwdh")]
+        out, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
+        assert launched == _expected_launches(p, "fwd")
+        assert len(launched) == p.launch_count("fwd")
+        launched.clear()
+        # the forward without a saved set: the internal-row programs, the same launch count, the same output
+        out_nosave, none = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=ws, save_for_backward=False
         )
-        adjoint = (
-            ["dhu_v3", "seg_carry", "dhu_v3"] if p.recur == "seg" else [p.record("dhu")]
+        assert none is None and torch.equal(out_nosave, out)
+        assert launched == _expected_launches(p, "fwd_nosave")
+        assert len(launched) == p.launch_count("fwd_nosave") == p.launch_count("fwd")
+        assert (launched != _expected_launches(p, "fwd")) is (
+            not p.internal_rows("fwd")
         )
-        tables = ["table", "seg_table"] if p.recur == "seg" else ["table"]
-        assert fwd == [
-            *tables,
-            p.record("fwd_prep"),
-            "fwd_intra",
-            "wy",
-            *recurrence,
-            "fwd_o",
-        ]
-        assert len(fwd) == p.launch_count("fwd")
         launched.clear()
         cake_backend.chunk_kda_bwd(
             q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
         )
-        tail = ["dav", *adjoint, "dqkg", "glm_intra", "gate_epilogue"]
-        assert launched == [p.record("bwd_prep"), "wy", *recurrence, *tail]
-        assert len(launched) == p.launch_count("bwd")
+        assert launched == _expected_launches(p, "light")
+        assert len(launched) == p.launch_count("light") == p.launch_count("bwd")
+        launched.clear()
+        bare = KdaChunkSaved(
+            saved.version,
+            saved.Aqk,
+            saved.Akk,
+            None,
+            saved.S,
+            saved.H,
+            saved.num_docs,
+            saved.scale,
+        )
+        cake_backend.chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=bare, workspace=ws)
+        assert launched == _expected_launches(p, "light", saved_tables=False)
+        assert len(launched) == p.launch_count("light", tables=False)
         launched.clear()
         cake_backend.chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=None, workspace=ws)
-        assert launched == [
-            *tables,
-            p.record("bwd_prep"),
-            "fwd_intra",
-            "wy",
-            *recurrence,
-            *tail,
-        ]
+        assert launched == _expected_launches(p, "replay")
         assert len(launched) == p.launch_count("replay")
         launched.clear()
         _, saved_t = cake_backend.chunk_kda_fwd(
             q, k, v, g, beta, cu, workspace=ws, save_mode="tape"
         )
+        assert launched == _expected_launches(p, "fwd")
         launched.clear()
         tape_ws = KdaWorkspace.for_problem(
             S, N, heads, device, save_mode="tape", launcher=recording
@@ -907,8 +1904,15 @@ def test_launch_sequences_follow_the_plan(device, manifest) -> None:
         cake_backend.chunk_kda_bwd(
             q, k, v, g, beta, cu, dout, saved=saved_t, workspace=tape_ws
         )
-        assert launched == [p.record("bwd_prep"), "wy", *tail]
-        assert len(launched) == p.launch_count("bwd", tape=True)
+        assert launched == _expected_launches(p, "tape")
+        assert len(launched) == p.launch_count("tape")
+        # the records of every path the workspace serves name the programs these sequences launched
+        records = ws.records()
+        assert set(records) == set(ws.paths())
+        for path in ("fwd", "fwd_nosave", "light", "tape", "replay"):
+            # the tables are the path's records too: launched when the saved set carries none
+            expected = set(_expected_launches(p, path, saved_tables=False))
+            assert expected == set(records[path].values()), path
 
 
 def test_operand_checks(device, manifest) -> None:
@@ -934,6 +1938,8 @@ def test_operand_checks(device, manifest) -> None:
     with pytest.raises(ValueError, match="cu_seqlens"):
         cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu.to(torch.int64))
     _, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu)
+    assert saved.version == cake_backend.SAVED_VERSION == 3
+    # version 1 (the light set without the segment states) is no longer accepted
     with pytest.raises(ValueError, match="version"):
         cake_backend.chunk_kda_bwd(
             q,
@@ -943,7 +1949,51 @@ def test_operand_checks(device, manifest) -> None:
             beta,
             cu,
             dout,
-            saved=KdaChunkSaved(3, saved.Aqk, saved.Akk, None, 65, heads, 1, SCALE),
+            saved=KdaChunkSaved(1, saved.Aqk, saved.Akk, None, 65, heads, 1, SCALE),
+        )
+    # a version-3 set carries hseg and seg_state together, with the plan's shapes
+    nseg = cake_backend.plan(
+        65,
+        1,
+        heads,
+        cake_jit.sm_count(device.index),
+        cake_jit.device_arch(device.index),
+    ).NSEG
+    block = torch.zeros((nseg, heads, D, D), dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="together or neither"):
+        cake_backend.chunk_kda_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=KdaChunkSaved(
+                3, saved.Aqk, saved.Akk, None, 65, heads, 1, SCALE, hseg=block
+            ),
+        )
+    with pytest.raises(ValueError, match="saved.seg_state"):
+        cake_backend.chunk_kda_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=KdaChunkSaved(
+                3,
+                saved.Aqk,
+                saved.Akk,
+                None,
+                65,
+                heads,
+                1,
+                SCALE,
+                hseg=block,
+                seg_state=block,
+            ),
         )
     with pytest.raises(ValueError, match="needs h and v_new"):
         cake_backend.chunk_kda_bwd(
@@ -966,7 +2016,7 @@ def test_operand_checks(device, manifest) -> None:
             cu,
             dout,
             saved=KdaChunkSaved(
-                1, saved.Aqk, saved.Akk, saved.tables[:2], 65, heads, 1, SCALE
+                3, saved.Aqk, saved.Akk, saved.tables[:2], 65, heads, 1, SCALE
             ),
         )
     with pytest.raises(ValueError, match="saved: for"):
@@ -978,11 +2028,159 @@ def test_operand_checks(device, manifest) -> None:
             beta,
             cu,
             dout,
-            saved=KdaChunkSaved(1, saved.Aqk, saved.Akk, None, 64, heads, 1, SCALE),
+            saved=KdaChunkSaved(3, saved.Aqk, saved.Akk, None, 64, heads, 1, SCALE),
         )
     out, _ = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, save_for_backward=False)
     assert out.shape == (65, heads, D)
     assert cake_backend.is_supported(device)
+
+
+# The size rule's smallest instances: one document at H = 1 and two documents at H = 2 have at most four chains,
+# so P = SEG_P_SMALL (37 on sm_100a) on any device with at least 38 SMs, NSEG = P * num_docs and the threshold is
+# 384 * NSEG tokens (14592 and 29184; 14208 and 28416 on sm_100a).
+STATE_SHAPES = [(1, 1), (2, 2)]
+
+
+def _split(S: int, num_docs: int) -> tuple[int, ...]:
+    base = S // num_docs
+    return tuple(base + (1 if i < S % num_docs else 0) for i in range(num_docs))
+
+
+@pytest.mark.parametrize(("num_docs", "heads"), STATE_SHAPES, ids=["n1-h1", "n2-h2"])
+def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
+    device, manifest, num_docs, heads
+) -> None:
+    from torch.utils.checkpoint import checkpoint
+
+    sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    nseg = cake_backend.plan(1, num_docs, heads, sm, arch).NSEG  # independent of S
+    assert nseg == SEG_P_SMALL_BY_ARCH.get(arch, SEG_P_SMALL) * num_docs
+    threshold = cake_backend.SEG_SAVE_MIN_TOKENS_PER_SEG * nseg
+    block = nseg * heads * D * D * 4
+
+    def run(S: int, saves: bool) -> None:
+        lengths = _split(S, num_docs)
+        inputs = make_inputs(lengths, heads, device)
+        q, k, v, g, beta, cu, dout = (
+            inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+        )
+        launched: list[str] = []
+
+        def recording(name, values, *, grid, device_index):
+            launched.append(name)
+            cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+
+        ws = KdaWorkspace.for_problem(S, num_docs, heads, device, launcher=recording)
+        p = ws.plan
+        assert p.recur == "seg" and nseg == p.NSEG and p.seg_save is saves
+        assert cake_backend.seg_states_saved(S, nseg) is saves
+        # (a) the saved set: the states present exactly at and above the threshold, the bytes as the query says
+        out, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
+        # saving the states adds no launch
+        assert launched == _expected_launches(p, "fwd")
+        assert len(launched) == p.launch_count("fwd") == 5
+        assert saved.version == cake_backend.SAVED_VERSION
+        tables = p.table_words() * 4
+        expected_bytes = 256 * S * heads + tables + (3 * block if saves else 0)
+        assert (
+            cake_backend.saved_bytes(S, heads, num_docs, sm_count=sm) == expected_bytes
+        )
+        report = cake_backend.memory_report(S, num_docs, heads, sm_count=sm)
+        assert report["seg_states_saved"] is saves
+        assert report["saved_seg_state_bytes"] == (3 * block if saves else 0)
+        assert report["saved"] == expected_bytes
+        if not saves:
+            assert saved.hseg is None and saved.seg_state is None
+        else:
+            assert saved.hseg.shape == (nseg, heads, D, D)
+            assert saved.seg_state.shape == (2, nseg, heads, D, D)
+            assert saved.hseg.dtype == saved.seg_state.dtype == torch.float32
+            arena_lo, arena_hi = ws.arena.data_ptr(), ws.arena.data_ptr() + ws.bytes
+            for t in (saved.hseg, saved.seg_state):
+                assert not (arena_lo <= t.data_ptr() < arena_hi)
+            owned = (saved.Aqk, saved.Akk, saved.hseg, saved.seg_state)
+            assert (
+                sum(t.numel() * t.element_size() for t in owned) + tables
+                == expected_bytes
+            )
+            states_before = (saved.hseg.clone(), saved.seg_state.clone())
+        # the backward from the set: the recurrence as pass 2 alone with the states, the full recompute without
+        launched.clear()
+        grads = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
+        )
+        grads = [t.clone() for t in grads]
+        # the few-chain rows: with the states the fused pass 2 forms the WY representation (no WY launch) and
+        # the adjoint recurrence reads its transposed w tile; without them the full recompute
+        path = "light_states" if saves else "light"
+        assert p.light_path == path
+        assert launched == _expected_launches(p, path)
+        assert len(launched) == p.launch_count("bwd") == (8 if saves else 11)
+        assert launched[1:3] == (
+            ["fwdh_p3_wy", "dhu_v3s_f_wt"] if saves else ["wy_bwd", "fwdh_v3"]
+        )
+        assert ("dhu_v3s_f_wt" if saves else "dhu_v3s_f") in launched
+        # (b) the gradients from the saved states equal the checkpoint replay's bitwise, and those from the same
+        # set stripped of its states (the recompute path) and from a tape-mode workspace
+        replay = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=None, workspace=ws
+        )
+        stripped = KdaChunkSaved(
+            saved.version,
+            saved.Aqk,
+            saved.Akk,
+            saved.tables,
+            saved.S,
+            saved.H,
+            saved.num_docs,
+            saved.scale,
+        )
+        from_stripped = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=stripped, workspace=ws
+        )
+        tape_ws = KdaWorkspace.for_problem(S, num_docs, heads, device, save_mode="tape")
+        from_tape_ws = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=tape_ws
+        )
+        for other in (replay, from_stripped, from_tape_ws):
+            for mine, theirs in zip(grads, other, strict=True):
+                assert torch.equal(mine, theirs)
+        if saves:  # the backward writes nothing into the saved set
+            assert torch.equal(saved.hseg, states_before[0])
+            assert torch.equal(saved.seg_state, states_before[1])
+        # the tape set is unchanged by the rule: version 2 with seg_m, without the version-3 fields
+        _, saved_t = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=ws, save_mode="tape"
+        )
+        assert saved_t.version == cake_backend.SAVED_VERSION_TAPE
+        assert (
+            saved_t.seg_m is not None
+            and saved_t.hseg is None
+            and saved_t.seg_state is None
+        )
+        # (c) the autograd node packs and unpacks the states (or their absence); the checkpoint path re-runs the
+        # forward and gives the same gradients
+        expected = (grads[0], grads[1], grads[2], grads[4], grads[3])
+        for wrap in (False, True):
+            leaves = [
+                inputs[n].detach().clone().requires_grad_(True)
+                for n in ("q", "k", "v", "g", "beta")
+            ]
+            if wrap:
+                o = checkpoint(
+                    lambda *a: cake_backend.chunk_kda(*a, cu, workspace=ws),
+                    *leaves,
+                    use_reentrant=False,
+                )
+            else:
+                o = cake_backend.chunk_kda(*leaves, cu, workspace=ws)
+            assert torch.equal(o, out)
+            o.backward(dout)
+            for leaf, want in zip(leaves, expected, strict=True):
+                assert torch.equal(leaf.grad, want)
+
+    run(threshold - 1, False)  # the longest pack that recomputes the states
+    run(threshold, True)  # the shortest pack that saves them
 
 
 def test_plan_limits_cover_the_kernels_int32_offsets() -> None:

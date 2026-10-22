@@ -26,6 +26,7 @@ from .cake_backend import (
     SAVED_VERSION,
     SAVED_VERSION_TAPE,
     SCALE,
+    SEG_SAVE_MIN_TOKENS_PER_SEG,
     ChunkKDAFunction,
     KdaChunkSaved,
     KdaWorkspace,
@@ -38,6 +39,7 @@ from .cake_backend import (
     output_bytes,
     plan,
     saved_bytes,
+    seg_states_saved,
     workspace_bytes,
 )
 from .cake_jit import ARCH_BY_CAPABILITY, ARCHES
@@ -49,6 +51,7 @@ __all__ = [
     "SAVED_VERSION",
     "SAVED_VERSION_TAPE",
     "SCALE",
+    "SEG_SAVE_MIN_TOKENS_PER_SEG",
     "ChunkKDAFunction",
     "KdaChunkSaved",
     "KdaWorkspace",
@@ -61,5 +64,6 @@ __all__ = [
     "output_bytes",
     "plan",
     "saved_bytes",
+    "seg_states_saved",
     "workspace_bytes",
 ]
