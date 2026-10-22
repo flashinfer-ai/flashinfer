@@ -2125,7 +2125,7 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_0), "r"(tmem_x_split + 128), "r"(0));
+                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_0), "r"(tmem_x_split + 128), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_1 = (((wf_addr) >> 4) & 0x7FFF) + (fs_1) * 2048;
 #else
@@ -2207,7 +2207,7 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_1), "r"(tmem_x_split), "r"(1));
+                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_1), "r"(tmem_x_split), "r"(1) : "memory");
                     tcgen05_commit(vp_ready_addr);
                     mbarrier_wait(bv_ready_addr, _phase_bv_ready_0);
                     _phase_bv_ready_0 ^= 1;
@@ -2261,7 +2261,7 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_x_split + (128))), "r"(_smem_desc_lo_2), "r"(tmem_b_lo), "r"(0));
+                    :: "r"((tmem_x_split + (128))), "r"(_smem_desc_lo_2), "r"(tmem_b_lo), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_3 = (((kgf_addr) >> 4) & 0x7FFF) + (fs_1) * 2048;
 #else
@@ -2311,7 +2311,7 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_x_split + (128))), "r"(_smem_desc_lo_3), "r"(tmem_b_hi), "r"(1));
+                    :: "r"((tmem_x_split + (128))), "r"(_smem_desc_lo_3), "r"(tmem_b_hi), "r"(1) : "memory");
                     tcgen05_commit(h_ready_addr);
                     tcgen05_commit(f32_empty_addr + (fs_1) * 8);
                     fs_1 += 1;

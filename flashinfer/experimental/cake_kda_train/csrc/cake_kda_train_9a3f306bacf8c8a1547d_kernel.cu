@@ -1191,7 +1191,7 @@ kernel_cake_kda_train_9a3f306bacf8c8a1547d(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc_vp), "r"(0));
+                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc_vp), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_2 = (((w_op_addr) >> 4) & 0x7FFF) + (stage_1) * 1024;
                     int _smem_desc_lo_3 = (((hs_mn1_addr) >> 4) & 0x7FFF) | 0x4000000;
@@ -1252,7 +1252,7 @@ kernel_cake_kda_train_9a3f306bacf8c8a1547d(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_acc_vp), "r"(1));
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_acc_vp), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_4 = (((w_op_addr) >> 4) & 0x7FFF) + (stage_1) * 1024;
                     int _smem_desc_lo_5 = (((hs_mn0_addr) >> 4) & 0x7FFF) | 0x4000000;
@@ -1313,7 +1313,7 @@ kernel_cake_kda_train_9a3f306bacf8c8a1547d(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc_vp), "r"(1));
+                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc_vp), "r"(1) : "memory");
                     tcgen05_commit(vp_ready_addr);
                     mbarrier_wait(bv_ready_addr, _phase_bv_ready_0);
                     _phase_bv_ready_0 ^= 1;
@@ -1358,7 +1358,7 @@ kernel_cake_kda_train_9a3f306bacf8c8a1547d(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"(tmem_acc_dx), "r"(0));
+                    :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"(tmem_acc_dx), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_8 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;
                     int _smem_desc_lo_9 = (((bv_mn1_addr) >> 4) & 0x7FFF) | 0x2000000;
@@ -1399,7 +1399,7 @@ kernel_cake_kda_train_9a3f306bacf8c8a1547d(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"(tmem_acc_dx), "r"(1));
+                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"(tmem_acc_dx), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_10 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;
                     int _smem_desc_lo_11 = (((bv_mn0_addr) >> 4) & 0x7FFF) | 0x2000000;
@@ -1440,7 +1440,7 @@ kernel_cake_kda_train_9a3f306bacf8c8a1547d(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_acc_dx), "r"(1));
+                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_acc_dx), "r"(1) : "memory");
                     tcgen05_commit(h_ready_addr);
                     tcgen05_commit(tiles_empty_addr + (stage_1) * 8);
                     _phase_tiles_full ^= 1;

@@ -2095,7 +2095,7 @@ kernel_cake_kda_train_64ba2583f28f7d4c0102(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_0), "r"(tmem_x_split), "r"(0));
+                    :: "r"(tmem_b_hi), "r"(_smem_desc_lo_0), "r"(tmem_x_split), "r"(0) : "memory");
                     tcgen05_commit(vp_ready_addr);
                     mbarrier_wait(bv_ready_addr, _phase_bv_ready_0);
                     _phase_bv_ready_0 ^= 1;
@@ -2149,7 +2149,7 @@ kernel_cake_kda_train_64ba2583f28f7d4c0102(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_x_split + (128))), "r"(_smem_desc_lo_1), "r"(tmem_b_hi), "r"(0));
+                    :: "r"((tmem_x_split + (128))), "r"(_smem_desc_lo_1), "r"(tmem_b_hi), "r"(0) : "memory");
                     tcgen05_commit(h_ready_addr);
                     tcgen05_commit(f32_empty_addr + (fs_1) * 8);
                     fs_1 += 1;
