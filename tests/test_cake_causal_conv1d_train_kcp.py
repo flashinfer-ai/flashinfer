@@ -466,3 +466,64 @@ def test_rejects_mismatched_context():
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     with pytest.raises(ValueError):
         cake_causal_conv1d_kcp_forward(p.x_local[:-1].contiguous(), p.w, p.ctx)
+
+
+@pytest.mark.parametrize("form", ["knob", "keyword"])
+def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
+    """The graph-replay option: under ``_set_test_knobs({"graph": "replay"})`` (form ``knob``) or the public keyword
+    ``graph="replay"`` (form ``keyword``) the first call of a key runs eagerly,
+    the second is captured and replayed once, later calls replay the graph; ``y`` / ``hist`` / ``dx`` / ``dweight``
+    are bitwise the knob-off results on every call.  The backward's key holds the forward's ``hist`` pointer, so
+    its capture follows the forward's by one call.  Another input pointer is another key (eager, still bitwise)."""
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+    x, w, ctx = p.x_local, p.w, p.ctx
+    dy = torch.randn(x.shape, device=device).to(torch.bfloat16)
+    y0, hist0 = cake_causal_conv1d_kcp_forward(x, w, ctx)
+    dx0, dw0 = cake_causal_conv1d_kcp_backward(x, w, ctx, dy, hist0)
+    kw = {}
+    if form == "knob":
+        monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+        conv_kcp._set_test_knobs({"graph": "replay"})
+    else:
+        kw = {"graph": "replay"}  # the public keyword, no environment gate
+    try:
+        events = []
+        for _ in range(4):
+            y, hist = cake_causal_conv1d_kcp_forward(x, w, ctx, **kw)
+            events.append(conv_kcp.LAST_CALL["fwd"]["graph_event"])
+            assert torch.equal(y, y0) and torch.equal(hist, hist0)
+            dx, dw = cake_causal_conv1d_kcp_backward(x, w, ctx, dy, hist, **kw)
+            events.append(conv_kcp.LAST_CALL["bwd"]["graph_event"])
+            assert torch.equal(dx, dx0) and torch.equal(dw, dw0)
+        assert events == [
+            "eager",
+            "eager",
+            "capture",
+            "eager",
+            "replay",
+            "capture",
+            "replay",
+            "replay",
+        ], events
+        assert conv_kcp.GRAPH_STATS["fallback"] == 0
+        y, hist = cake_causal_conv1d_kcp_forward(x.clone(), w, ctx, **kw)
+        assert conv_kcp.LAST_CALL["fwd"]["graph_event"] == "eager"
+        assert torch.equal(y, y0) and torch.equal(hist, hist0)
+        if (
+            form == "keyword"
+        ):  # the autograd entry carries the keyword to the forward and to the backward
+            xg = x.clone().requires_grad_(True)
+            y = conv_kcp.cake_causal_conv1d_kcp(xg, w, ctx, graph="replay")
+            assert conv_kcp.LAST_CALL["fwd"]["graph"] == "replay"
+            assert torch.equal(y.detach(), y0)
+            y.backward(dy)
+            assert conv_kcp.LAST_CALL["bwd"]["graph"] == "replay"
+            assert torch.equal(xg.grad, dx0)
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp._GRAPHS.clear()
+    y, hist = cake_causal_conv1d_kcp_forward(x, w, ctx)
+    assert torch.equal(y, y0) and torch.equal(hist, hist0)

@@ -22,7 +22,7 @@ derivative back to the predecessor fragments, which fold it into their last
 rows' ``dx`` before the one BF16 rounding.  ``cake_causal_conv1d_kcp(x_local,
 weight, ctx)`` is the autograd entry; the stable, ``@flashinfer_api``-decorated
 facade is :mod:`flashinfer.cake_causal_conv1d_train`.  This module imports
-only torch, torch.distributed, tvm_ffi and its own package.
+only ``os``, torch, torch.distributed, tvm_ffi and its own package.
 
 Registry contract (``kcp_jit``, the KCP records beside the zero-history
 registry ``cake_jit``, whose tables stay untouched): kinds ``kcp_fwd`` (one
@@ -55,6 +55,7 @@ within ``5e-2 + 1e-4 |dw|`` of an FP64 oracle, not bitwise the no-CP partial.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
@@ -80,6 +81,14 @@ HEAD_SLOTS = HALO  # send slots per head row (a head token is consumed by at mos
 KCP_FWD = "kcp_fwd"
 KCP_BWD = "kcp_bwd"
 KCP_BWD_HEAD = "kcp_bwd_head"
+TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"  # the KCP route's private test-hook gate (the variable the KDA host module reads too)
+GRAPH_MODES = (
+    "off",
+    "replay",
+)  # graph replay: keyed CUDA-graph capture / replay of the halo calls; public keyword graph= since this revision
+GRAPH_DEFAULT = (
+    "off"  # shipped: the eager path; the public keyword graph="replay" opts in per call
+)
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -193,12 +202,188 @@ def _context(ctx: Any, *, device: torch.device, T_r: int) -> tuple[torch.Tensor,
     return cu, n_frag
 
 
+# ----------------------------------------------------------------------------------------------------------------
+# CUDA-graph replay of a call and the test knobs.
+#
+# The public keyword ``graph="replay"`` of :func:`cake_causal_conv1d_kcp` and of the forward / backward below (shipped
+# ``GRAPH_DEFAULT = "off"``) -- or, for the A/B record, the private ``_set_test_knobs({"graph": "replay"})`` (accepted
+# only with ``CAKE_KCP_TEST_KNOBS=1``; a keyword contradicting an active knob is a ``ValueError``) -- makes
+# :func:`cake_causal_conv1d_kcp_forward` / :func:`cake_causal_conv1d_kcp_backward` run their first call of a
+# validity key (kind, the context object, its world size, and the shape / stride / dtype / data pointer of every
+# operand and caller-owned output) eagerly, capture the second call into a ``torch.cuda.CUDAGraph`` (replayed once)
+# and replay the graph on every later call of the key: the halo gather, the ``all_to_all_single``, its wait and the
+# kernels with the same arguments in the same order (bitwise the eager result) and no host work between them.  Any
+# other key runs eagerly (silent fallback); a rank without tokens is never captured.  A replayed call returns the
+# graph's static tensors (detached): the next replay of the key overwrites them, so a framework must keep its inputs
+# pointer-stable and consume the outputs before the next call of the same layer.  This module keeps its own cache
+# (no import of the KDA host module); ``GRAPH_STATS`` counts the events and ``LAST_CALL[kind]`` says how the last
+# forward / backward ran (keyword or knob).  Every captured graph keeps its fresh tensors in a private pool (one per
+# cached key; at most GRAPH_CACHE_MAX keys, the oldest dropped first); ``graph_cache_clear()`` releases them and must run
+# before ``torch.distributed.destroy_process_group()`` (a graph holding the NCCL collective blocks ``ncclCommDestroy``).
+
+_TEST_KNOBS: dict[str, Any] = {"graph": "off"}
+GRAPH_STATS: dict[str, int] = {"eager": 0, "capture": 0, "replay": 0, "fallback": 0}
+GRAPH_CACHE_MAX = 64
+LAST_CALL: dict[str, dict[str, Any]] = {}
+
+
+def _set_test_knobs(knobs: Optional[dict]) -> dict:
+    """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``); ``None`` restores the
+    defaults.  Refused without ``CAKE_KCP_TEST_KNOBS=1`` in the environment.  Returns the active knobs."""
+    if knobs is None:
+        _TEST_KNOBS["graph"] = "off"
+        return dict(_TEST_KNOBS)
+    if os.environ.get(TEST_KNOBS_ENV) != "1":
+        raise ValueError(
+            f"_set_test_knobs is a private test hook: it is accepted only with {TEST_KNOBS_ENV}=1 in the environment"
+        )
+    if not isinstance(knobs, dict):
+        raise TypeError(f"_set_test_knobs expects a dict, got {type(knobs).__name__}")
+    unknown = sorted(set(knobs) - {"graph"})
+    if unknown:
+        raise ValueError(
+            f"_set_test_knobs: unknown knob(s) {unknown}; known: ['graph']"
+        )
+    graph = str(knobs.get("graph", "off"))
+    if graph not in GRAPH_MODES:
+        raise ValueError(
+            f"_set_test_knobs: graph must be one of {GRAPH_MODES}, got {graph!r}"
+        )
+    _TEST_KNOBS["graph"] = graph
+    return dict(_TEST_KNOBS)
+
+
+def _graph_mode(graph: Optional[str]) -> str:
+    """The effective graph mode of a call: the public keyword when given, else the module's test knob (shipped
+    ``"off"``); validated against ``GRAPH_MODES``; a keyword contradicting an active knob is a ``ValueError``."""
+    knob = _TEST_KNOBS["graph"]
+    if graph is None:
+        return knob
+    mode = str(graph)
+    if mode not in GRAPH_MODES:
+        raise ValueError(f"graph must be one of {GRAPH_MODES}, got {graph!r}")
+    if knob != "off" and mode != knob:
+        raise ValueError(
+            f"graph given twice with different values: keyword {mode!r}, _set_test_knobs {knob!r}"
+        )
+    return mode
+
+
+class _GraphEntry:
+    """One validity key: its graph (after the capture) and the static results."""
+
+    __slots__ = ("key", "pins", "seen", "graph", "result", "disabled", "digest")
+
+    def __init__(self, key: tuple, pins: tuple) -> None:
+        self.key, self.pins = (
+            key,
+            pins,
+        )  # the pins keep the keyed objects alive so their ids cannot be reused
+        self.seen = 0
+        self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.result: Optional[tuple] = None
+        self.disabled: Optional[str] = None
+        self.digest = f"{key[0]}:{hash(key) & 0xFFFFFFFFFFFF:012x}"
+
+
+_GRAPHS: dict[tuple, _GraphEntry] = {}
+
+
+def _sig(t: Any) -> tuple:
+    return (
+        (t.data_ptr(), tuple(t.shape), tuple(t.stride()), str(t.dtype), t.device.index)
+        if isinstance(t, torch.Tensor)
+        else ("none",)
+    )
+
+
+def _graph_entry(
+    kind: str, ctx: Any, tensors: tuple, mode: Optional[str] = None
+) -> Optional[_GraphEntry]:
+    """The cache entry of this call's validity key, or ``None`` when the call is never captured (mode off, no tokens);
+    ``mode`` = the effective graph mode (:func:`_graph_mode`), ``None`` = the knob."""
+    if (
+        (_TEST_KNOBS["graph"] if mode is None else mode) == "off"
+        or int(getattr(ctx, "T_r", 0)) == 0
+        or int(getattr(ctx, "n_frag", 0)) == 0
+    ):
+        return None
+    key = (kind, id(ctx), int(ctx.world_size), tuple(_sig(t) for t in tensors))
+    e = _GRAPHS.get(key)
+    if e is None:
+        while len(_GRAPHS) >= GRAPH_CACHE_MAX:
+            del _GRAPHS[next(iter(_GRAPHS))]
+        e = _GRAPHS[key] = _GraphEntry(key, (ctx,))
+    return e
+
+
+def graph_cache_clear() -> int:
+    """Drop every cached graph with its static buffers and private memory pool; returns the number of entries dropped.
+
+    A graph that captured a NCCL collective (the halo ``all_to_all_single`` here) must be destroyed before the process group
+    it used is destroyed (``ncclCommDestroy`` waits for graph-captured work; ``torch.distributed.destroy_process_group()``
+    hangs while such a graph is alive).  Call this before destroying the process group when ``graph="replay"`` (keyword or test knob) was used, and
+    whenever the operands of a key are gone for good to release its pool.  The knob and ``GRAPH_STATS`` are left as they are."""
+    n = len(_GRAPHS)
+    _GRAPHS.clear()
+    return n
+
+
+def _graph_run(
+    kind: str, entry: Optional[_GraphEntry], body: Any, mode: Optional[str] = None
+) -> tuple:
+    """Run ``body()`` under the graph mode (keyword or knob): replay the key's graph, or capture this call (the key's second), or run eagerly
+    (the key's first call, a key whose capture failed, or a call that is never captured).  Returns the results."""
+    if entry is not None and entry.graph is not None:
+        entry.graph.replay()
+        GRAPH_STATS["replay"] += 1
+        LAST_CALL[kind] = {
+            "graph": "replay",
+            "graph_event": "replay",
+            "graph_key": entry.digest,
+            "graph_fallback": None,
+        }
+        return entry.result
+    if entry is not None and entry.seen > 0 and entry.disabled is None:
+        g = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(g, capture_error_mode="thread_local"):
+                result = body()
+        except Exception as exc:  # noqa: BLE001 - the failure is recorded; the call runs eagerly below
+            entry.disabled = f"{type(exc).__name__}: {str(exc)[:200]}"
+            GRAPH_STATS["fallback"] += 1
+        else:
+            g.replay()
+            entry.graph, entry.result = g, result
+            entry.seen += 1
+            GRAPH_STATS["capture"] += 1
+            LAST_CALL[kind] = {
+                "graph": "replay",
+                "graph_event": "capture",
+                "graph_key": entry.digest,
+                "graph_fallback": None,
+            }
+            return result
+    result = body()
+    GRAPH_STATS["eager"] += 1
+    if entry is not None:
+        entry.seen += 1
+    LAST_CALL[kind] = {
+        "graph": _TEST_KNOBS["graph"] if mode is None else mode,
+        "graph_event": "eager",
+        "graph_key": None if entry is None else entry.digest,
+        "graph_fallback": None if entry is None else entry.disabled,
+    }
+    return result
+
+
 def cake_causal_conv1d_kcp_forward(
     x_local: torch.Tensor,
     weight: torch.Tensor,
     ctx: Any,
     *,
     out: Optional[torch.Tensor] = None,
+    graph: Optional[str] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""The KCP forward: ``y`` of the rank's fragments, and the history pool ``hist`` it used (saved for the backward).
 
@@ -207,8 +392,29 @@ def cake_causal_conv1d_kcp_forward(
     device tables ``ctx.halo_tables`` and the process group ``ctx.group``).  Every rank of the group calls this
     function once per layer, in the same order: the forward halo exchange is a collective (a rank without tokens
     joins it with empty splits and returns empty outputs).  ``hist`` is a fresh ``[n_hist_rows, C]`` BF16 tensor
-    (``[1, C]`` when the rank receives no row).
+    (``[1, C]`` when the rank receives no row).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
+    ``"replay"``): keyed CUDA-graph capture / replay of this call (the graph-replay option; see the section comment
+    above: pointer-stable operands, private pools, eager fallback, :func:`graph_cache_clear`).
     """
+
+    mode = _graph_mode(graph)
+    if mode == "off":
+        return _kcp_forward(x_local, weight, ctx, out=out)
+    entry = _graph_entry("fwd", ctx, (x_local, weight, out), mode)
+    y, hist = _graph_run(
+        "fwd", entry, lambda: _kcp_forward(x_local, weight, ctx, out=out), mode
+    )
+    return (y if out is not None else y.detach()), hist
+
+
+def _kcp_forward(
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The forward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_kcp_forward`."""
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
@@ -274,6 +480,7 @@ def cake_causal_conv1d_kcp_backward(
     *,
     dx: Optional[torch.Tensor] = None,
     dweight: Optional[torch.Tensor] = None,
+    graph: Optional[str] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""The KCP backward: ``dx`` of the rank's fragments (the halo contributions of the successor fragments folded in
     before the one BF16 rounding) and the rank's FP32 ``dweight`` partial (fixed order; its sum over the ranks is the
@@ -281,8 +488,37 @@ def cake_causal_conv1d_kcp_backward(
 
     ``hist`` is the forward's pool.  The head program writes the derivative rows of every continuing fragment's first
     tokens into the backward exchange's send layout, the exchange delivers them to the predecessors as ``dpre_tail``,
-    and the main program folds them.  Every rank calls this function once per layer, in the same order.
+    and the main program folds them.  Every rank calls this function once per layer, in the same order.  ``graph`` as
+    in the forward (the backward's key holds the forward's ``hist`` pointer, so its capture follows the forward's by
+    one call).
     """
+
+    mode = _graph_mode(graph)
+    if mode == "off":
+        return _kcp_backward(x_local, weight, ctx, dy, hist, dx=dx, dweight=dweight)
+    entry = _graph_entry("bwd", ctx, (x_local, weight, dy, hist, dx, dweight), mode)
+    dx_out, dw_out = _graph_run(
+        "bwd",
+        entry,
+        lambda: _kcp_backward(x_local, weight, ctx, dy, hist, dx=dx, dweight=dweight),
+        mode,
+    )
+    return (dx_out if dx is not None else dx_out.detach()), (
+        dw_out if dweight is not None else dw_out.detach()
+    )
+
+
+def _kcp_backward(
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    dy: torch.Tensor,
+    hist: torch.Tensor,
+    *,
+    dx: Optional[torch.Tensor] = None,
+    dweight: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The backward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_kcp_backward`."""
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
@@ -403,10 +639,11 @@ class CakeCausalConv1dKcpFunction(torch.autograd.Function):
     the backward); the backward runs the head program, the backward halo exchange and the main backward program."""
 
     @staticmethod
-    def forward(fn_ctx, x_local, weight, ctx):
-        y, hist = cake_causal_conv1d_kcp_forward(x_local, weight, ctx)
+    def forward(fn_ctx, x_local, weight, ctx, graph=None):
+        y, hist = cake_causal_conv1d_kcp_forward(x_local, weight, ctx, graph=graph)
         fn_ctx.save_for_backward(x_local, weight, hist)
         fn_ctx.kcp = ctx
+        fn_ctx.graph = graph  # the backward runs under the same graph mode
         return y
 
     @staticmethod
@@ -416,13 +653,17 @@ class CakeCausalConv1dKcpFunction(torch.autograd.Function):
             grad_y = torch.zeros_like(x_local)
         dy = grad_y.to(torch.bfloat16).contiguous()
         dx, dweight = cake_causal_conv1d_kcp_backward(
-            x_local, weight, fn_ctx.kcp, dy, hist
+            x_local, weight, fn_ctx.kcp, dy, hist, graph=fn_ctx.graph
         )
-        return dx, dweight, None
+        return dx, dweight, None, None
 
 
 def cake_causal_conv1d_kcp(
-    x_local: torch.Tensor, weight: torch.Tensor, ctx: Any
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    *,
+    graph: Optional[str] = None,
 ) -> torch.Tensor:
     """Autograd-enabled KCP packed width-4 depthwise causal convolution + SiLU of the rank's fragments.
 
@@ -436,6 +677,15 @@ def cake_causal_conv1d_kcp(
     ctx : KcpContext
         The rank's context (``flashinfer.experimental.cake_kda_train.build_kcp_context``): fragment table, halo
         plan, process group.  Every rank of the group calls this function once per layer, in the same order.
+    graph : str, optional
+        ``None`` (the shipped default ``GRAPH_DEFAULT`` = ``"off"``, the eager path) or ``"replay"``: keyed CUDA-graph
+        capture / replay of this call.  The first call of a validity key (this
+        context, its world size, and the shape / stride / dtype / data pointer of ``x_local`` and ``weight``) runs
+        eagerly, the second is captured, every later one replays the graph (bitwise the eager result).  Requirements:
+        pointer-stable operands and the same ``KcpContext`` per layer, outputs consumed before the next call of the
+        same layer (a replay overwrites the graph's static tensors); any other key runs eagerly (``GRAPH_STATS``,
+        ``LAST_CALL``).  Each cached key pins a private memory pool (at most ``GRAPH_CACHE_MAX`` keys); call
+        :func:`graph_cache_clear` before ``torch.distributed.destroy_process_group()``.
 
     Returns
     -------
@@ -445,10 +695,16 @@ def cake_causal_conv1d_kcp(
         contributions folded in before the one rounding) and the rank's FP32 ``dweight`` partial.
     """
 
-    return CakeCausalConv1dKcpFunction.apply(x_local, weight, ctx)
+    _graph_mode(graph)  # validate on the caller's frame
+    return CakeCausalConv1dKcpFunction.apply(x_local, weight, ctx, graph)
 
 
 __all__ = [
+    "GRAPH_MODES",
+    "GRAPH_DEFAULT",
+    "GRAPH_STATS",
+    "LAST_CALL",
+    "graph_cache_clear",
     "CakeCausalConv1dKcpFunction",
     "cake_causal_conv1d_kcp",
     "cake_causal_conv1d_kcp_backward",
