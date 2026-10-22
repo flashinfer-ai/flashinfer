@@ -29,8 +29,9 @@ zero-allocation workspace path, and the ``build.json`` contract of the package.
 
 The suite calls the package's host entry directly; the public route
 ``flashinfer.sparse.qsa_sparse_paged_attention(..., backend="cake")`` is covered by
-``test_cake_qsa_nvfp4_api.py``.  Besides the package it imports FlashInfer's NVFP4 paged
-writer, which fills the cache the kernel reads.
+``test_cake_qsa_nvfp4_api.py``.  Besides the package it imports nothing of flashinfer: the
+cache the kernel reads is filled by ``tests.test_helpers.cake_qsa_nvfp4_reference``, a torch
+port of FlashInfer's NVFP4 paged writer (the API file compares the two).
 """
 
 import hashlib
@@ -42,12 +43,12 @@ from pathlib import Path
 import pytest
 import torch
 
-import flashinfer
 from flashinfer.experimental.cake_qsa_nvfp4 import cake_backend, cake_jit
 from flashinfer.experimental.cake_qsa_nvfp4.cake_backend import (
     SPLIT_OVERRIDES,
     num_splits,
 )
+from tests.test_helpers.cake_qsa_nvfp4_reference import write_slots
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
@@ -150,9 +151,10 @@ def _dequant(data, sf, scale):
 
 
 def _make_cache(num_kv_heads, layout, seed):
-    """Quantize random K/V into every slot with the NVFP4 writer, using one buffer of
-    [data | scales] rows per side like a packed vLLM page. Returns the kernel's
-    [blocks, tokens, heads, *] views, the global scales and the dequantized cache."""
+    """Quantize random K/V into every slot in the NVFP4 writer's format (the torch port of
+    ``tests.test_helpers.cake_qsa_nvfp4_reference``), using one buffer of [data | scales]
+    rows per side like a packed vLLM page. Returns the kernel's [blocks, tokens, heads, *]
+    views, the global scales and the dequantized cache."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     slots = NUM_BLOCKS * PAGE_SIZE
     k, v = (
@@ -168,9 +170,7 @@ def _make_cache(num_kv_heads, layout, seed):
         kv[:, i, ..., HEAD_DIM // 2 :].view(torch.float8_e4m3fn) for i in range(2)
     )
     scales = tuple(x.abs().max().item() / (6 * 448) for x in (k, v))
-    flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
-        k, v, torch.arange(slots, device="cuda"), data, sf, *scales, kv_layout=layout
-    )
+    write_slots(k, v, data, sf, *scales, kv_layout=layout)
     if layout == "HND":
         data, sf = (tuple(x.transpose(1, 2) for x in pair) for pair in (data, sf))
     deq = tuple(_dequant(*args) for args in zip(data, sf, scales, strict=True))
@@ -521,6 +521,29 @@ def test_rejects_invalid_inputs():
     ):
         with pytest.raises(ValueError):
             cake_backend.qsa_sparse_paged_attention(**{**args, **change})
+    # A workspace is checked at every split count, one included (a selection of one tile
+    # takes one split on every device), so a buffer's verdict does not depend on the
+    # device's SM count.
+    one_tile = torch.full((4, TILE + 1), -1, dtype=torch.int32, device="cuda")
+    one_tile[:, -1] = 0
+    assert num_splits(4, 2, TILE, _sm_count(q.device)) == 1
+    nbytes = cake_backend.qsa_workspace_bytes(4, 24, 2, 1)
+    for buffer in (
+        torch.zeros(nbytes, dtype=torch.uint8),
+        torch.zeros(nbytes // 4, dtype=torch.float32, device="cuda"),
+        torch.empty(8, dtype=torch.uint8, device="cuda"),
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.qsa_sparse_paged_attention(
+                **{**args, "logical_indices": one_tile, "workspace_buffer": buffer}
+            )
+    cake_backend.qsa_sparse_paged_attention(
+        **{
+            **args,
+            "logical_indices": one_tile,
+            "workspace_buffer": torch.zeros(nbytes, dtype=torch.uint8, device="cuda"),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

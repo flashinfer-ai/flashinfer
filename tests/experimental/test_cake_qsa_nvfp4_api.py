@@ -20,7 +20,8 @@ The backend suite ``test_cake_qsa_nvfp4.py`` exercises the package.  This file c
 what needs flashinfer itself: the ``backend`` keyword of
 ``flashinfer.sparse.qsa_sparse_paged_attention`` -- ``backend="cake"`` reaches the
 package with every operand, the default keeps the existing implementation, an unknown
-value is refused -- and one device run of the route against the package, bit for bit.
+value is refused -- one device run of the route against the package, bit for bit, and
+the NVFP4 paged writer against the torch port the backend suite fills its caches with.
 """
 
 import contextlib
@@ -31,10 +32,12 @@ from pathlib import Path
 import pytest
 import torch
 
+import flashinfer
 import flashinfer.experimental.qsa_nvfp4.backend as existing_backend
 import flashinfer.sparse as public_api
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake_qsa_nvfp4 import cake_backend, cake_jit
+from tests.test_helpers.cake_qsa_nvfp4_reference import write_slots
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 HEAD_DIM = 256
@@ -238,3 +241,104 @@ def test_cake_route_runs_the_package():
         )
     assert result is out
     assert torch.equal(out, want)
+
+
+def test_writer_format_is_the_port_the_backend_suite_uses():
+    """The production NVFP4 paged writer and the backend suite's torch port of it write the
+    same format: equal block-scale bytes, equal signs, and codes that agree or differ by
+    one ladder step.  The writer's reciprocal of the scale is nvcc's fast-math one (a unit
+    low at times), so a product exactly at a ladder midpoint rounds down in the writer
+    where the port rounds to even; a layout, nibble-order or scale mismatch would move
+    most codes by more than one step.  The writer's cache then runs through the Cake
+    route."""
+    device = _device_or_skip()
+    blocks, page, num_kv_heads = 40, 16, 2
+    slots = blocks * page
+    gen = torch.Generator(device=device).manual_seed(7)
+    k, v = (
+        torch.randn(slots, num_kv_heads, HEAD_DIM, device=device, generator=gen)
+        .mul(scale)
+        .bfloat16()
+        for scale in (1.0, 3.0)
+    )
+    scales = tuple(x.abs().max().item() / (6 * 448) for x in (k, v))
+    caches = []
+    for layout in ("NHD", "HND"):
+        dims = (num_kv_heads, page) if layout == "HND" else (page, num_kv_heads)
+        for writer in ("flashinfer", "port"):
+            data = tuple(
+                torch.zeros(
+                    blocks, *dims, HEAD_DIM // 2, dtype=torch.uint8, device=device
+                )
+                for _ in range(2)
+            )
+            sf = tuple(
+                torch.zeros(
+                    blocks,
+                    *dims,
+                    HEAD_DIM // 16,
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+                for _ in range(2)
+            )
+            if writer == "flashinfer":
+                flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+                    k,
+                    v,
+                    torch.arange(slots, device=device),
+                    data,
+                    sf,
+                    *scales,
+                    kv_layout=layout,
+                )
+            else:
+                write_slots(k, v, data, sf, *scales, kv_layout=layout)
+            caches.append((layout, writer, data, sf))
+        (_, _, data_fi, sf_fi), (_, _, data_port, sf_port) = caches[-2:]
+        torch.cuda.synchronize()
+        for side in range(2):
+            sf_bytes = tuple(x[side].view(torch.uint8) for x in (sf_fi, sf_port))
+            assert torch.equal(*sf_bytes), (layout, side, "block scales")
+            for shift in (0, 4):
+                code_fi = (data_fi[side] >> shift) & 15
+                code_port = (data_port[side] >> shift) & 15
+                assert torch.equal(code_fi >> 3, code_port >> 3), (layout, side, "sign")
+                step = ((code_fi & 7).int() - (code_port & 7).int()).abs()
+                assert step.max().item() <= 1, (layout, side, shift, step.max().item())
+                differing = (step != 0).sum().item()
+                assert differing <= step.numel() * 1e-2, (layout, side, differing)
+    # The writer's bytes through the Cake route, in the NHD layout.
+    _, _, data, sf = caches[0]
+    rows, num_qo_heads, width, table_width = 4, 24, 200, 16
+    q, gate = (
+        torch.randn(
+            rows, num_qo_heads, HEAD_DIM, device=device, generator=gen
+        ).bfloat16()
+        for _ in range(2)
+    )
+    table = torch.randperm(blocks, device=device, generator=gen)[: 2 * table_width]
+    table = table.view(2, table_width).int()
+    indices = torch.full((rows, width + 1), -1, dtype=torch.int32, device=device)
+    for row in range(rows):
+        tokens = torch.randperm(table_width * page, device=device, generator=gen)
+        indices[row, :width] = tokens[:width].int()
+    indices[:, width] = width
+    with _quiet():
+        out = public_api.qsa_sparse_paged_attention(
+            q,
+            data[0],
+            data[1],
+            indices,
+            table,
+            torch.tensor([0, 1, 1, 0], dtype=torch.int32, device=device),
+            False,
+            None,
+            *scales,
+            output_gate=gate,
+            k_sf=sf[0],
+            v_sf=sf[1],
+            backend="cake",
+        )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all() and out.any()
