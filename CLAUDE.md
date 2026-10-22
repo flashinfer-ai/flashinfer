@@ -585,6 +585,55 @@ gated: `backend="auto"` skips backends marked `@experimental_backend` unless
 [`flashinfer/experimental/CLAUDE.md`](flashinfer/experimental/CLAUDE.md); the
 full policy is [`flashinfer/experimental/README.md`](flashinfer/experimental/README.md).**
 
+### Experimental DeepSeek V4.1 Prims-TS decode
+
+`flashinfer/deepseek_v41.py` adds explicit `backend="prims-ts"`, with deferred
+experimental imports, JIT-only compilation and no automatic selector, AOT or trace
+registration. The existing default `cute-dsl` backend retains its original
+arguments, plan and `(out,lse,plan)` return. The new caller-workspace contract
+below applies only to Prims-TS; it does not replace generic sparse MLA.
+
+Native scope is SM100 / E4M3 Q `[B,1,64,512]` / typed E4M3 SWA width512 /
+optional packed FP4 main width288 / page64 / fixed128 SWA / K=0,64,...,512.
+CuTe-DSL >=4.8 and its bundled CUDA13 compiler are required. There is no BF16-Q
+adapter or fallback. The fixed Keep-AB/M64/BK128/retained-KV8/split1/nonpersistent
+path is one joint finalizing attention with inline metadata and optional sinks,
+not per-source states or a merge. Keep producer/metadata hooks private and
+default-off so generic attention arithmetic remains independent.
+
+Caller int8/uint8 workspace is contiguous and32-byte aligned. The pure
+`deepseek_v41_decode_workspace_size(B,K)` helper defaults to and accepts only
+`backend="prims-ts"`; native scratch holds private natural-log, sink-exclusive
+FP32 LSE and the K0 dummy. Return only BF16 output; supplied `out` is returned
+by identity. Required combined int32 indices `[B,128+K]`, topk lengths `[B]`
+including fixed128 SWA positions, and seq lengths `[B]` are read live on every
+call/replay. Main visibility is `clamp(topk-128,0,K)`; SWA visibility is
+`[0,clamp(seq_lens,0,128))`. Mask invalid IDs safely and preserve holes/duplicates.
+
+Both native caches use common units. Runtime Python-scalar BMM1 is positive finite
+FP32; BMM2 is finite FP32. For Q descale q_s, common KV descale s>0 and attention
+factor alpha, pass `bmm1_scale=alpha*q_s*s,bmm2_scale=s`. Main staging directly
+rounds/saturates exact E2M1*group16-E4M3 to E4M3 (intentional +/-448 saturation),
+without request amax/scales/division. Defaults are1.0/1.0; explicitly pass512**-0.5
+for the former attention factor with unit descales. Native decode defaults HND
+`[pages,1,64,width]`; explicit NHD is `[pages,64,1,width]`, with identical bytes.
+The shared cache writer keeps its original NHD default; HND native callers must
+request HND explicitly for both caches. Packed formats retain separate page planes.
+Native final normalization retains ordinary-range arithmetic and uses two factors
+for extreme BMM2/sink combinations to avoid losing recoverable output to intermediate
+underflow. Preserve natural-domain RN/non-FTZ sink FMA and non-FTZ output multiplies;
+this private factoring must not change LSE or generic normalization branches.
+
+Capture requires caller out/workspace and eager warmup; keep addresses alive/fixed
+and update values in place. Concurrent calls need separate buffers or synchronization;
+writable buffers cannot alias inputs or each other. Changing captured Python scalars
+requires recapture. Preserve the native independent FP64 oracle, componentwise output
+bound, LSE gate (`rtol=0,atol=1e-5`), exact-empty/nonfinite checks and bitwise replay/
+layout parity. The generic TVM-FFI launcher passes the final output-quantizer slot
+positionally, including `None`; exported callables have no Python defaults/keywords.
+See [`examples/deepseek_v41/README.md`](examples/deepseek_v41/README.md) and
+[`SPARSE.md`](flashinfer/attention/prims_ts/kernels/mla_decode/SPARSE.md).
+
 ## Key Architectural Patterns
 
 ### Module Caching

@@ -82,6 +82,7 @@ class TmemPResource(MlaResource):
     )
     inst_id: cutlass.Constexpr[int] = 0
     scale_softmax_log2: Float32 = None
+    raw_softmax_scale: Float32 = None
     tmem_alias_ref: Optional[MlaResource] = None
     p_stage_idx: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
@@ -141,11 +142,14 @@ class TmemPResource(MlaResource):
             Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
         )
         for idx in cutlass.range_constexpr(num_scale_groups):
-            new_max = new_max_arr[idx]
-            safe_new_max = new_max
-            if safe_new_max == neg_max_f32():
-                safe_new_max = Float32(0.0)
-            neg_scaled_max[idx] = -self.scale_softmax_log2 * safe_new_max
+            if cutlass.const_expr(cfg.sparse_split_softmax_scale):
+                neg_scaled_max[idx] = Float32(0.0)
+            else:
+                new_max = new_max_arr[idx]
+                safe_new_max = new_max
+                if safe_new_max == neg_max_f32():
+                    safe_new_max = Float32(0.0)
+                neg_scaled_max[idx] = -self.scale_softmax_log2 * safe_new_max
             local_sums[idx] = Float32(0.0)
 
         sums = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
@@ -171,36 +175,70 @@ class TmemPResource(MlaResource):
                 p2 = Float32(0.0)
                 p3 = Float32(0.0)
                 if has_finite_max:
-                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-                        scaled01 = ffma2(
-                            (s_arr[s_base + 0], s_arr[s_base + 1]),
-                            log2_scale_pair,
-                            neg_scaled_pair,
+                    if cutlass.const_expr(cfg.sparse_split_softmax_scale):
+                        # Keep raw maxima: (S - max) * BMM1 cannot overflow
+                        # positively for finite E4M3 inputs. Explicit RN/non-FTZ
+                        # operations preserve subnormal BMM1 and their ordering.
+                        neg_max_pair = (-new_max_arr[0], -new_max_arr[0])
+                        raw_scale_pair = (
+                            self.raw_softmax_scale,
+                            self.raw_softmax_scale,
                         )
+                        quant_pair = (fp8_log2_quant_scale(), fp8_log2_quant_scale())
+                        delta01 = fadd2(
+                            (s_arr[s_base + 0], s_arr[s_base + 1]), neg_max_pair
+                        )
+                        delta23 = fadd2(
+                            (s_arr[s_base + 2], s_arr[s_base + 3]), neg_max_pair
+                        )
+                        natural01 = fmul2(delta01, raw_scale_pair)
+                        natural23 = fmul2(delta23, raw_scale_pair)
+                        scaled01 = ffma2(natural01, log2_scale_pair, quant_pair)
+                        scaled23 = ffma2(natural23, log2_scale_pair, quant_pair)
                     else:
-                        scaled01 = fadd2(
-                            fmul2(
-                                (s_arr[s_base + 0], s_arr[s_base + 1]), log2_scale_pair
-                            ),
-                            neg_scaled_pair,
-                        )
-                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-                        scaled23 = ffma2(
-                            (s_arr[s_base + 2], s_arr[s_base + 3]),
-                            log2_scale_pair,
-                            neg_scaled_pair,
-                        )
-                    else:
-                        scaled23 = fadd2(
-                            fmul2(
-                                (s_arr[s_base + 2], s_arr[s_base + 3]), log2_scale_pair
-                            ),
-                            neg_scaled_pair,
-                        )
+                        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                            scaled01 = ffma2(
+                                (s_arr[s_base + 0], s_arr[s_base + 1]),
+                                log2_scale_pair,
+                                neg_scaled_pair,
+                            )
+                        else:
+                            scaled01 = fadd2(
+                                fmul2(
+                                    (s_arr[s_base + 0], s_arr[s_base + 1]),
+                                    log2_scale_pair,
+                                ),
+                                neg_scaled_pair,
+                            )
+                        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                            scaled23 = ffma2(
+                                (s_arr[s_base + 2], s_arr[s_base + 3]),
+                                log2_scale_pair,
+                                neg_scaled_pair,
+                            )
+                        else:
+                            scaled23 = fadd2(
+                                fmul2(
+                                    (s_arr[s_base + 2], s_arr[s_base + 3]),
+                                    log2_scale_pair,
+                                ),
+                                neg_scaled_pair,
+                            )
                     p0 = cute.math.exp2(scaled01[0], fastmath=True)
                     p1 = cute.math.exp2(scaled01[1], fastmath=True)
                     p2 = cute.math.exp2(scaled23[0], fastmath=True)
                     p3 = cute.math.exp2(scaled23[1], fastmath=True)
+                    if cutlass.const_expr(cfg.sparse_split_softmax_scale):
+                        # A finite mask sentinel alone is not an exponent mask
+                        # for tiny BMM1. Zero the exact P used by sum AND pack.
+                        if s_arr[s_base + 0] == neg_max_f32():
+                            p0 = Float32(0.0)
+                        if s_arr[s_base + 1] == neg_max_f32():
+                            p1 = Float32(0.0)
+                        if s_arr[s_base + 2] == neg_max_f32():
+                            p2 = Float32(0.0)
+                        if s_arr[s_base + 3] == neg_max_f32():
+                            p3 = Float32(0.0)
                 if cutlass.const_expr(cfg.num_tokens_per_page == 1):
                     sums[0], sums[1] = fadd2((sums[0], sums[1]), (p0, p1))
                     sums[2], sums[3] = fadd2((sums[2], sums[3]), (p2, p3))

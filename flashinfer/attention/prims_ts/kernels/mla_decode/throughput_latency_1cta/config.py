@@ -174,6 +174,8 @@ class MlaConfig:
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
     sparse_static_scales: bool = False
+    # DS4.1 joint finalizer only: retain raw runtime BMM1 separately from LOG2_E.
+    sparse_split_softmax_scale: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     page_offsets_num_warps: int = 1
@@ -1718,6 +1720,66 @@ def make_throughput_latency_mla_config(
     return cfg
 
 
+def validate_split_softmax_scale_config(cfg: MlaConfig) -> None:
+    """Restrict ordered runtime BMM1 arithmetic to the joint DS4.1 topology."""
+    if not cfg.sparse_split_softmax_scale:
+        return
+    if (
+        cfg.kernel_variant != "keeps_mma_ab"
+        or cfg.qkv_dtype != "e4m3"
+        or cfg.o_dtype != "bf16"
+        or not cfg.use_bf16_output
+        or cfg.use_fp8_output
+        or cfg.head_dim_qk != 512
+        or cfg.head_dim_v != 512
+        or cfg.rope_dim != 0
+        or cfg.logical_num_heads_q != 64
+        or cfg.logical_seq_len_q != 1
+        or cfg.num_heads_q != 64
+        or cfg.seq_len_q != 1
+        or cfg.tile_size_q != 64
+        or cfg.tile_size_kv != 128
+        or cfg.head_dim_per_stage_kv != 128
+        or cfg.head_dim_per_stage_v != 128
+        or cfg.head_dim_per_cta_v != 512
+        or cfg.num_insts_kv != 1
+        or not cfg.single_kv_pipe
+        or cfg.num_ctas_per_seq_q != 1
+        or cfg.num_ctas_for_all_heads != 1
+        or cfg.num_ctas_per_seq_kv != 1
+        or cfg.num_ctas_per_head_dim != 1
+        or cfg.num_tokens_per_page != 1
+        or cfg.use_multi_ctas_kv
+        or cfg.use_cluster_reduction
+        or cfg.use_persistent_scheduler
+        or cfg.use_clc_dynamic_persistent_scheduler
+        or cfg.mask_type != MaskType.DENSE.value
+        or not cfg.sparse_direct
+        or not cfg.sparse_static_scales
+        or not cfg.sparse_reuse_kv
+        or cfg.cache_uniform_sparse_quads
+        or cfg.kv_stages != 8
+        or cfg.q_stages != 1
+        or cfg.load_num_warps != 4
+        or cfg.page_offsets_stages != 1
+        or cfg.defer_sparse_max_update
+        or cfg.paired_sparse_correction
+        or not cfg.fuse_sparse_epilogue
+        or cfg.fuse_sparse_cluster_epilogue
+        or cfg.fuse_sparse_reduction
+        or len(cfg.sparse_direct_capacities) != 2
+        or cfg.sparse_direct_capacities[0] != 128
+        or cfg.sparse_direct_capacities[1] not in range(0, 513, 64)
+        or cfg.seq_len_kv
+        != max(256, 128 + ((cfg.sparse_direct_capacities[1] + 127) // 128) * 128)
+    ):
+        raise ValueError(
+            "split softmax scales require joint DS4.1 direct/static E4M3 "
+            "Keep-AB/M64/BK128/KV8, D512/H64/Sq1, split1/nonpersistent "
+            "final BF16 output with capacities (128,K)"
+        )
+
+
 def configure_sparse_mla(
     cfg: MlaConfig,
     profile,
@@ -1726,6 +1788,7 @@ def configure_sparse_mla(
     direct_inputs=False,
     assume_valid_prefix=False,
     static_scales=False,
+    split_softmax_scale=False,
     source_capacities=(0, 0),
 ) -> MlaConfig:
     """Resolve one selected sparse profile without order-dependent overrides.
@@ -1803,6 +1866,7 @@ def configure_sparse_mla(
         defer_sparse_max_update=profile.defer_max_update,
         sparse_direct=direct_inputs,
         sparse_static_scales=static_scales,
+        sparse_split_softmax_scale=split_softmax_scale,
         sparse_valid_prefix=assume_valid_prefix,
         sparse_direct_capacities=source_capacities if direct_inputs else (0, 0),
         fuse_sparse_epilogue=direct_finish,
@@ -1904,10 +1968,12 @@ def configure_sparse_mla(
             if balanced
             else cfg.scheduler_regs,
         )
-    return dataclass_replace(
+    cfg = dataclass_replace(
         cfg,
         **roles,
         kv_stages=kv_stages,
         page_offsets_stages=page_stages,
         q_stages=1 if single or (reuse and profile.reuse_kv_stages) else cfg.q_stages,
     )
+    validate_split_softmax_scale_config(cfg)
+    return cfg

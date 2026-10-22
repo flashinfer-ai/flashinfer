@@ -847,6 +847,54 @@ def test_large_query_native_graph(dtype):
     test_native_graph(dtype, 1, 8 * sms, 32, 513, True, False, True)
 
 
+@pytest.mark.parametrize("scheduler", ["static", "clc"])
+def test_keep_ab_runtime_task_cache(scheduler, monkeypatch):
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    # Pin the affected task and scheduler independently of dispatch policy.
+    profile = SparseMlaProfile(
+        family="keep",
+        tile_size_q=64,
+        split_kv=1,
+        scheduler=scheduler,
+        head_dim_ctas=1,
+        gather_issue_warps=4,
+        reuse_kv=True,
+        reuse_kv_stages=8,
+        kv_tile_size=64,
+        page_pipeline_stages=1,
+    )
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    compile_kernel = mla_decode._get_compiled_mla_decode
+    configs = []
+
+    def checked_compile(spec):
+        cfg = spec.kernel._make_config()
+        assert cfg.kernel_variant == "keeps_mma_ab"
+        assert cfg.num_insts_kv == 1
+        assert cfg.tile_size_q == cfg.tile_size_kv == 64
+        assert cfg.seq_len_kv == 768
+        assert cfg.num_ctas_per_seq_kv == cfg.num_ctas_per_head_dim == 1
+        assert cfg.fixed_sparse_kv_tiles == 0
+        assert cfg.kv_stages == 8
+        assert cfg.batch_size == sms + 1
+        assert cfg.use_persistent_scheduler == 1
+        assert cfg.use_clc_dynamic_persistent_scheduler == int(scheduler == "clc")
+        configs.append(cfg)
+        return compile_kernel(spec)
+
+    monkeypatch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+    # Keep the independent oracle and changed-metadata replay gates unchanged.
+    test_native_graph(torch.bfloat16, sms + 1, 1, 64, 513, True, False, True)
+    assert configs
+
+
 def test_caller_workspace_single_source_and_eager_api():
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device="cuda", dtype=torch.bfloat16)
