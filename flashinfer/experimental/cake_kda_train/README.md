@@ -158,8 +158,73 @@ are evaluated by `cake_jit.select_record` / `launch_grid` / `segment_plan`;
 `cake_backend.plan(S, num_docs, H, sm_count)` resolves them once per problem,
 and `Plan.launch_count(boundary)` is the launch count of each boundary.
 
+## Context-parallel training (KCP)
+
+The packed batch of one training step may be split over the ranks of a
+`torch.distributed` process group.  `kcp_partition` cuts the documents into
+per-rank fragments (`"contiguous"`, `"zigzag"` or `"zigzag_per_document"`
+layouts, or explicit cut points); `build_kcp_context` gives every rank the
+device tables of its fragments, the collectives that carry the per-document
+state recurrences and the convolution's history rows across the rank
+boundaries, and the segment plan of its fragment walks.  The per-rank entry
+points take the rank's shard of the operands (the tokens of its fragments, in
+the partition's order) and return that shard's outputs and gradients:
+
+```python
+from flashinfer.kda_train import (kcp_partition, build_kcp_context, chunk_kda_kcp,
+                                  chunk_kda_kcp_fwd, chunk_kda_kcp_bwd,
+                                  kcp_workspace_bytes, kcp_saved_bytes, kcp_comm_bytes)
+from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
+
+part = kcp_partition(cu_seqlens_global_cpu, world_size)          # the same object on every rank
+ctx = build_kcp_context(part, group, rank, device)               # this rank's tables and collectives
+y_local = cake_causal_conv1d_kcp(x_local, conv_weight, ctx)      # the convolution before the KDA step
+out_local = chunk_kda_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
+out_local, saved = chunk_kda_kcp_fwd(q_local, k_local, v_local, g_local, beta_local, ctx,
+                                     save_mode="light", boundary_mode="saved")
+dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, beta_local, ctx,
+                                          dout_local, saved=saved)
+```
+
+Limits of a partition: at most 65536 fragments per rank (the layout table's
+document search), at most 64 segments per fragment and no walk chain longer
+than 256 chunk steps (the segment plan's bounds); the byte queries
+`kcp_workspace_bytes(ctx, H=...)`, `kcp_saved_bytes(ctx, H=...)` and
+`kcp_comm_bytes(ctx, H=..., C=...)` size the rank's workspace, saved set and
+one step's traffic before any allocation.  Every rank of the group calls the
+same entry points in the same order; the collectives are issued inside them.
+
+The KCP kernels live beside the single-rank programs:
+
+* `cake_kcp_jit.py` -- the `MODULES` registry of the seven KCP programs (the
+  fragment walks of the forward and backward state recurrences in their
+  `offset` and `tape` forms, the TF32 hi/lo transfer walk and the affine
+  merge at `cols_per_cta` 8 and 16; selection by `always` or by `columns` on
+  the merge's `ncols`, grids by `kcp_segments_heads` or `kcp_chains`), the
+  logical vocabulary of the KCP arguments, and `run_program(name, args,
+  device_index=)`, the lowering of the host backend's walk and merge requests
+  to the registry's launches.  Its `TEST_MODULES` are test-only programs of
+  `build.test.json` (below).
+* `cake_kcp_plan.py` -- the partition, the segment plan and the context's
+  tables and collectives, with the byte queries.
+* `cake_kcp.py` -- the per-rank launch sequences, the saved set and workspace
+  of a rank, the autograd `Function` and the three entry points.
+* `build.test.json` -- a `cake-build/1` manifest of the same form as
+  `build.json` holding the test-only programs of `cake_kcp_jit.TEST_MODULES`
+  (the transfer walk's static `precision_mode` 1 and 2 forms and the BF16x3
+  candidate at both value widths).  `build.json` never lists them and the
+  shipped route never loads them: `cake_kcp_jit.load_test` JIT-builds an
+  entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
+  also admits the test knobs (`precision_mode`, `transfer_walk`) of the
+  package's own tests; without the file those tests skip.
+* `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the eleven KCP
+  programs, rendered like the single-rank ones (digests in `build.json` and
+  `build.test.json`).
+
 ## Layout of this package
 
+* `cake_kcp_jit.py`, `cake_kcp_plan.py`, `cake_kcp.py` and `build.test.json`
+  -- the context-parallel training path (see above).
 * `cake_jit.py` -- the `MODULES` registry (one record per program: its
   `library` stem in `build.json`, the stage it fills and its variant, the
   selection and grid rules, the kernel-parameter -> logical-argument map and
@@ -193,10 +258,18 @@ and `Plan.launch_count(boundary)` is the launch count of each boundary.
 The registry holds the 21 programs for `sm_100a`, `sm_103a` and `sm_107a`,
 exported from the kernel snapshot named in the pull request.
 
+The KCP path adds seven shipped programs (`cake_kcp_jit.MODULES`) to
+`build.json` for the same three architectures and four test-only programs to
+`build.test.json`.
+
 Tests: `tests/experimental/test_cake_kda_train.py` (the backend suite: imports
 only this package through `tests/test_helpers/cake_package`; the registry and
 plan tests run everywhere, the kernel tests skip without a compute capability
 10.0 / 10.3 / 10.7 device) against the exact FP64 per-document recurrence of
 `tests/test_helpers/cake_kda_train_reference.py`, and
 `tests/experimental/test_cake_kda_train_api.py` (the public entry points).
-Benchmark: `benchmarks/bench_cake_kda_train.py`.
+Benchmark: `benchmarks/bench_cake_kda_train.py`.  KCP:
+`tests/experimental/test_cake_kda_train_kcp_build.py` (the KCP registries and
+manifests, no device needed) and `tests/experimental/test_cake_kda_train_kcp.py`
+(the per-rank path); benchmark `benchmarks/bench_cake_kda_train_kcp.py`
+(`torchrun`, one process per rank).
