@@ -66,11 +66,15 @@ Usage::
     # caller-owned backward workspace (per-CTA FP32 partials, no zeroing needed)
     ws = cake_causal_conv1d_train_backward_workspace(S, C, x.device)
     dx, dweight = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy, workspace=ws)
+
+    # context-parallel training: this rank's fragments of the packed batch, with the
+    # history rows of the preceding fragments exchanged through the KCP context
+    y_local = cake_causal_conv1d_kcp(x_local, weight, ctx)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -214,11 +218,44 @@ def cake_causal_conv1d(
     return _backend.cake_causal_conv1d(x, weight, cu_seqlens)
 
 
+@flashinfer_api
+def cake_causal_conv1d_kcp(
+    x_local: torch.Tensor, weight: torch.Tensor, ctx: Any
+) -> torch.Tensor:
+    """Autograd-enabled context-parallel packed width-4 depthwise causal convolution + SiLU of this rank's fragments.
+
+    The first tokens of a fragment that continues a document read the history rows of the preceding fragment
+    (exchanged through the context's halo collective) instead of zeros, so the result equals the single-rank
+    :func:`cake_causal_conv1d` of the whole batch on this rank's tokens.
+
+    Parameters
+    ----------
+    x_local : torch.Tensor
+        BF16 ``[S_local, C]`` or ``[1, S_local, C]`` contiguous packed activations of this rank's fragments, in the
+        partition's order; ``C`` is a multiple of 8.
+    weight : torch.Tensor
+        FP32 ``[C, 4]`` contiguous taps.
+    ctx : KcpContext
+        From ``flashinfer.kda_train.build_kcp_context`` (the same context the KDA step of the rank uses).
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 ``y`` of ``x_local``'s shape.  The backward runs the head program, the backward halo exchange and the
+        fused ``dx`` + deterministic FP32 ``dweight`` kernel of this rank's fragments.
+    """
+
+    from .cake_causal_conv1d_train_backend import kcp as _kcp
+
+    return _kcp.cake_causal_conv1d_kcp(x_local, weight, ctx)
+
+
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeCausalConv1dFunction",
     "cake_causal_conv1d",
+    "cake_causal_conv1d_kcp",
     "cake_causal_conv1d_train_backward",
     "cake_causal_conv1d_train_backward_workspace",
     "cake_causal_conv1d_train_backward_workspace_bytes",

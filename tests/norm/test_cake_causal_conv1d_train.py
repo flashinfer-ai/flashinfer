@@ -54,6 +54,7 @@ from tests.test_helpers.cake_package import cake_package
 pkg = cake_package("cake_causal_conv1d_train")
 cake_build = cake_package("cake_causal_conv1d_train", "cake_build")
 loader = cake_package("cake_causal_conv1d_train", "cake_jit")
+kcp_loader = cake_package("cake_causal_conv1d_train", "kcp_jit")
 cake_causal_conv1d = pkg.cake_causal_conv1d
 cake_causal_conv1d_train_backward = pkg.cake_causal_conv1d_train_backward
 cake_causal_conv1d_train_backward_workspace = (
@@ -867,6 +868,20 @@ def test_registry_records_reference_the_build_manifest() -> None:
             for source in entry["sources"]:
                 assert (package / source).is_file(), source
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert "--use_fast_math" not in entry["nvcc_flags"]
+            assert "--prec-div=true" in entry["nvcc_flags"]
+    # The KCP registry (kcp_jit.MODULES) adds its programs to the same build.json.
+    for name, record in kcp_loader.MODULES.items():
+        assert record["library"] == record["kernel"] == name
+        for arch in record["arches"]:
+            library = kcp_loader.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["sources"] == [
+                f"csrc/{name}_kernel.cu",
+                f"csrc/{name}_binding.cu",
+            ]
             assert "--use_fast_math" not in entry["nvcc_flags"]
             assert "--prec-div=true" in entry["nvcc_flags"]
     assert referenced == set(libraries)

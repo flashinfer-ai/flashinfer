@@ -43,6 +43,19 @@ Usage::
     out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)
     ws = kda_train_workspace(S, num_docs, H, device, save_mode="tape")   # saved set v2: the backward
     out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)  # skips its recurrence recompute
+
+Context-parallel training (KCP): the packed batch is split over the ranks
+of a process group (``kcp_partition``), every rank holds its fragments of the
+documents, and the per-document state recurrences cross the rank boundaries
+through the plan's collectives (``build_kcp_context``)::
+
+    from flashinfer.kda_train import kcp_partition, build_kcp_context, chunk_kda_kcp
+
+    part = kcp_partition(cu_seqlens_global_cpu, world_size)            # once per batch layout
+    ctx = build_kcp_context(part, group, rank, device)                 # tables and collectives of this rank
+    out_local = chunk_kda_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
+    out_local, saved = chunk_kda_kcp_fwd(q_local, k_local, v_local, g_local, beta_local, ctx)
+    grads = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved)
 """
 
 from __future__ import annotations
@@ -253,6 +266,304 @@ def kda_train_saved_bytes(
     )
 
 
+# --------------------------------------------------------------------------- context-parallel training (KCP)
+#
+# The KCP entry points forward to ``flashinfer.experimental.cake_kda_train.cake_kcp`` (the per-rank launch
+# sequences over the kernels of the ``cake_kcp_jit`` registry) and ``cake_kcp_plan`` (the partition, the context's
+# tables and collectives, the byte queries).  Every keyword is forwarded; nothing is validated here.
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def kcp_partition(
+    cu_seqlens_global_cpu: Any,
+    world_size: int,
+    layout: str = "contiguous",
+    fragments: Optional[Any] = None,
+    *,
+    cut_points: Optional[Any] = None,
+) -> Any:
+    r"""The context-parallel partition of one packed batch over ``world_size`` ranks.
+
+    Parameters
+    ----------
+    cu_seqlens_global_cpu
+        int32 ``[num_docs + 1]`` document offsets of the whole batch, on the host (a tensor or a sequence).
+    world_size : int
+        The number of ranks of the context-parallel group.
+    layout : str
+        ``"contiguous"`` (equal token shares in order), ``"zigzag"`` or ``"zigzag_per_document"`` (the load-balanced
+        layouts); ``fragments`` or ``cut_points`` give an explicit layout instead.
+
+    Returns
+    -------
+    ``KcpPartition``: per rank its fragments (document, token range) of the batch; the input of
+    :func:`build_kcp_context` on every rank.
+    """
+    from .experimental.cake_kda_train import cake_kcp_plan
+
+    return cake_kcp_plan.kcp_partition(
+        cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def build_kcp_context(
+    part: Any,
+    group: Any,
+    rank: int,
+    device: Any,
+    conv_kernel_size: int = 4,
+    *,
+    sm_count: Optional[int] = None,
+) -> Any:
+    r"""This rank's context of a partition: its device tables, the collectives of the state and halo exchanges and
+    the segment plan of its fragments.
+
+    Parameters
+    ----------
+    part : KcpPartition
+        From :func:`kcp_partition`, the same object on every rank.
+    group
+        The ``torch.distributed`` process group of the context-parallel ranks.
+    rank : int
+        This process's rank in ``group``.
+    device
+        The CUDA device of this rank's operands.
+    conv_kernel_size : int
+        The width of the causal convolution whose history rows the context exchanges (4).
+    sm_count : int, optional
+        The device's SM count when it should not be queried.
+
+    Returns
+    -------
+    ``KcpContext``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
+    """
+    from .experimental.cake_kda_train import cake_kcp_plan
+
+    return cake_kcp_plan.build_kcp_context(
+        part, group, rank, device, conv_kernel_size, sm_count=sm_count
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def chunk_kda_kcp_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ctx: Any,
+    *,
+    scale: Optional[float] = None,
+    save_for_backward: bool = True,
+    save_mode: str = "light",
+    boundary_mode: str = "saved",
+    workspace: Optional[Any] = None,
+    **options: Any,
+) -> tuple[torch.Tensor, Optional[Any]]:
+    r"""Context-parallel packed KDA chunked training forward of this rank's fragments.
+
+    Parameters
+    ----------
+    q, k, v, g, beta : torch.Tensor
+        This rank's shard of the operands of :func:`chunk_kda_fwd` (the tokens of its fragments, in the
+        partition's order): BF16 ``[1, S_local, H, 128]`` ``q, k, v``, FP32 ``g``, BF16 ``[1, S_local, H]`` ``beta``.
+    ctx : KcpContext
+        From :func:`build_kcp_context`.
+    scale : float, optional
+        Output scale; ``128 ** -0.5`` when ``None``.
+    save_for_backward : bool
+        Write the saved set (the local saved set of :func:`chunk_kda_fwd` plus the boundary states the backward
+        starts from).
+    save_mode : str
+        ``"light"`` or ``"tape"`` as for :func:`chunk_kda_fwd`.
+    boundary_mode : str
+        ``"saved"`` keeps the received boundary states in the saved set; ``"replay"`` saves nothing and lets the
+        backward replay the forward's exchanges.
+    workspace : KcpWorkspace, optional
+        A reused workspace of this rank; without one the call allocates its own.
+    **options
+        Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``), forwarded.
+
+    Returns
+    -------
+    ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` a ``KcpSaved`` or ``None``.
+    """
+    from .experimental.cake_kda_train import cake_kcp
+
+    return cake_kcp.chunk_kda_kcp_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale=scale,
+        save_for_backward=save_for_backward,
+        save_mode=save_mode,
+        boundary_mode=boundary_mode,
+        workspace=workspace,
+        **options,
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def chunk_kda_kcp_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ctx: Any,
+    dout: torch.Tensor,
+    *,
+    saved: Optional[Any] = None,
+    scale: Optional[float] = None,
+    save_mode: str = "light",
+    workspace: Optional[Any] = None,
+    **options: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Context-parallel packed KDA chunked training backward of this rank's fragments.
+
+    Parameters
+    ----------
+    q, k, v, g, beta, ctx
+        The forward's inputs (same contracts as :func:`chunk_kda_kcp_fwd`).
+    dout : torch.Tensor
+        BF16 gradient of this rank's ``out``.
+    saved : KcpSaved, optional
+        The forward's saved set; without one the forward is replayed (checkpointing).
+    scale, save_mode, workspace, **options
+        As for :func:`chunk_kda_kcp_fwd`.
+
+    Returns
+    -------
+    ``(dq, dk, dv, dbeta, dg)`` of this rank's tokens: BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.
+    """
+    from .experimental.cake_kda_train import cake_kcp
+
+    return cake_kcp.chunk_kda_kcp_bwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        dout,
+        saved=saved,
+        scale=scale,
+        save_mode=save_mode,
+        workspace=workspace,
+        **options,
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def chunk_kda_kcp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ctx: Any,
+    scale: Optional[float] = None,
+    save_mode: str = "light",
+    boundary_mode: str = "saved",
+    workspace: Optional[Any] = None,
+    **options: Any,
+) -> torch.Tensor:
+    r"""Autograd-enabled context-parallel packed KDA chunked training step of this rank's fragments (the forward of
+    :func:`chunk_kda_kcp_fwd`; the backward of :func:`chunk_kda_kcp_bwd` from its saved set).
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 ``out`` like ``v`` (this rank's tokens).
+    """
+    from .experimental.cake_kda_train import cake_kcp
+
+    return cake_kcp.chunk_kda_kcp(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale=scale,
+        save_mode=save_mode,
+        boundary_mode=boundary_mode,
+        workspace=workspace,
+        **options,
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def kcp_workspace_bytes(
+    ctx: Any,
+    *,
+    H: int = 64,
+    save_mode: str = "light",
+    backward: bool = True,
+    save_transfer: bool = False,
+    C: int = 8192,
+) -> int:
+    """Bytes of this rank's KCP workspace for ``H`` heads (the local arena of :func:`kda_train_workspace_bytes` plus
+    the boundary pools of the context's collectives; ``C`` channels of the convolution's halo rows)."""
+    from .experimental.cake_kda_train import cake_kcp_plan
+
+    return cake_kcp_plan.kcp_workspace_bytes(
+        ctx,
+        H=H,
+        save_mode=save_mode,
+        backward=backward,
+        save_transfer=save_transfer,
+        C=C,
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def kcp_saved_bytes(
+    ctx: Any,
+    *,
+    H: int = 64,
+    save_mode: str = "light",
+    save_transfer: bool = False,
+    with_conv: bool = True,
+    C: int = 8192,
+) -> int:
+    """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`kda_train_saved_bytes`), the
+    boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels."""
+    from .experimental.cake_kda_train import cake_kcp_plan
+
+    return cake_kcp_plan.kcp_saved_bytes(
+        ctx,
+        H=H,
+        save_mode=save_mode,
+        save_transfer=save_transfer,
+        with_conv=with_conv,
+        C=C,
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def kcp_comm_bytes(
+    ctx: Any,
+    *,
+    H: int = 64,
+    C: int = 8192,
+    save_transfer: bool = False,
+    boundary_mode: str = "saved",
+) -> dict:
+    """Bytes this rank sends and receives in one training step (forward and backward) for ``H`` heads and ``C``
+    convolution channels: the state summaries, the boundary states and the halo rows of the context's collectives,
+    as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``)."""
+    from .experimental.cake_kda_train import cake_kcp_plan
+
+    return cake_kcp_plan.kcp_comm_bytes(
+        ctx, H=H, C=C, save_transfer=save_transfer, boundary_mode=boundary_mode
+    )
+
+
 def is_kda_train_supported(device: torch.device | str | int | None = None) -> bool:
     """Whether ``device`` (the current CUDA device by default) is a target of the Cake kernels
     (compute capability 10.0, 10.3 or 10.7)."""
@@ -263,10 +574,18 @@ def is_kda_train_supported(device: torch.device | str | int | None = None) -> bo
 
 __all__ = [
     "DEFAULT_SCALE",
+    "build_kcp_context",
     "chunk_kda",
     "chunk_kda_bwd",
     "chunk_kda_fwd",
+    "chunk_kda_kcp",
+    "chunk_kda_kcp_bwd",
+    "chunk_kda_kcp_fwd",
     "is_kda_train_supported",
+    "kcp_comm_bytes",
+    "kcp_partition",
+    "kcp_saved_bytes",
+    "kcp_workspace_bytes",
     "kda_train_saved_bytes",
     "kda_train_workspace",
     "kda_train_workspace_bytes",
