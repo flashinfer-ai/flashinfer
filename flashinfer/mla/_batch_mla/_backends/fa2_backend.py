@@ -74,6 +74,7 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAPagedAttentionFaBackendBase):
         scale_mode: str,
         use_profiler: bool,
     ) -> None:
+        sm89_schedule = self._sm89_schedule
         _validate_generated_fa_plan(
             backend="fa2",
             device=self.device,
@@ -87,7 +88,7 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAPagedAttentionFaBackendBase):
             kv_data_type=kv_data_type,
             output_dtype=output_dtype,
             scale_mode=scale_mode,
-            sm89_schedule=getattr(self, "_sm89_schedule", None),
+            sm89_schedule=sm89_schedule,
         )
         self._plan_generated_fa(
             module_loader=lambda: get_batch_mla_module(
@@ -99,16 +100,8 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAPagedAttentionFaBackendBase):
                 head_dim_ckv,
                 head_dim_kpe,
                 use_profiler,
-                sm89_q_tile=(
-                    self._sm89_schedule[0]
-                    if getattr(self, "_sm89_schedule", None)
-                    else 0
-                ),
-                sm89_chunk_quantum=(
-                    self._sm89_schedule[1]
-                    if getattr(self, "_sm89_schedule", None)
-                    else 0
-                ),
+                sm89_q_tile=sm89_schedule[0] if sm89_schedule is not None else 0,
+                sm89_chunk_quantum=sm89_schedule[1] if sm89_schedule is not None else 0,
             ),
             qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,

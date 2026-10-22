@@ -984,6 +984,8 @@ class _BatchMLAPagedAttentionFaBackendBase(
         )
         self._query_split_widths = query_split_widths
         self._kv_split_widths = kv_split_widths
+        self._sm89_schedule: Optional[tuple[int, int]] = None
+        self._graph_plan_state: Optional[_Sm89GraphPlanState] = None
 
     def plan(
         self,
