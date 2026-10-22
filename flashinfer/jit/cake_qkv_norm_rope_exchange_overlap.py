@@ -17,9 +17,11 @@ JIT loader of the Cake fused QKV projection + norm + RoPE + head-exchange
 programs (SM90 / SM100 / SM103).
 
 ``PROGRAMS`` records every delivered program: its device and binding
-translation units, the architectures it compiles for, its compile flags, the
-launch block, the cluster shape, the dynamic shared memory and the positional
-argument names of its ``run`` launcher.  ``ROUTES`` maps, per architecture, the
+translation units, the architectures it compiles for, its compile flags (and,
+where a program is built from another program's sources, the compile
+definitions naming its kernel symbol and host namespace), the launch block,
+the cluster shape, the dynamic shared memory and the positional argument
+names of its ``run`` launcher.  ``ROUTES`` maps, per architecture, the
 logical stage keys to programs: ``barrier_p0``, ``barrier_p1`` and ``wait`` on
 every architecture, ``producer_bn<bn>[_pair][_<variant>]`` for the producer of
 a tile width (``_pair``: the 2-CTA pair tile; ``<variant>``: a producer build
@@ -102,11 +104,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_binding.cu",
         ],
         "arches": ["sm_90a"],
         "compile_flags": [],
+        "defines": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a417cf321e06ca27",
+        ],
         "args": [
             "device_index",
             "pg_world",
@@ -122,11 +128,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_binding.cu",
         ],
         "arches": ["sm_90a"],
         "compile_flags": [],
+        "defines": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_66e5f8bc245a7df8",
+        ],
         "args": [
             "device_index",
             "pg_world",
@@ -573,11 +583,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312_binding.cu",
         ],
         "arches": ["sm_90a"],
         "compile_flags": [],
+        "defines": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a7ef2527018941cd",
+        ],
         "args": [
             "ready",
             "num_words_total",
@@ -2108,7 +2122,13 @@ def spec(program: str, arch: str) -> JitSpec:
     return gen_jit_spec(
         name=f"{SOURCE_PACKAGE}_{arch}_{program}",
         sources=[_source_path(relative) for relative in record["sources"]],
-        extra_cuda_cflags=[*ARCH_FLAGS[arch], *record["compile_flags"]],
+        # ``defines``: the compile definitions of a program built from another
+        # program's sources (its kernel symbol and host-shim namespace).
+        extra_cuda_cflags=[
+            *ARCH_FLAGS[arch],
+            *record["compile_flags"],
+            *record.get("defines", []),
+        ],
         extra_include_paths=_include_paths(),
         # The source build carries its own math flags in ``compile_flags``
         # (no fast math); the default ``-use_fast_math`` would change them.
