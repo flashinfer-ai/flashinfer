@@ -21,7 +21,11 @@ the same explicit configuration structure and output-reduction contract.
 from dataclasses import dataclass
 from typing import Tuple
 
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import (
+    MAX_MLA_SPLITS_KV,
+    SUPPORTED_MLA_PAGE_SIZES,
+    WARP_LANES,
+)
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
@@ -569,6 +573,17 @@ def make_mla_decode_config(
             "page_size must partition each CTA's K tile unless both CTAs share "
             "one full-tile page: "
             f"tokens_per_k_cta={cfg.tokens_per_k_cta}, page_size={cfg.page_size}"
+        )
+    if (
+        cfg.use_fp8_split_mma_schedule
+        and cfg.page_size > 1
+        and WARP_LANES % cfg.pages_per_k_tile != 0
+    ):
+        # Dense FP8 K/V loaders read page IDs from a one-entry-per-lane window
+        # that must hold whole K tiles.
+        raise ValueError(
+            f"FP8 dense MLA needs pages_per_k_tile to divide {WARP_LANES}: "
+            f"pages_per_k_tile={cfg.pages_per_k_tile}"
         )
     _require_divisible(
         "mma_pv_tiler_mn[0]", cfg.mma_pv_tiler[0], "num_mma_ctas", num_mma_ctas

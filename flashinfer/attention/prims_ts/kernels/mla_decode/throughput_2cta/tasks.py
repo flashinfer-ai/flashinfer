@@ -512,6 +512,7 @@ def create_load_k_task(
     smem_q: SmemQResource,
     smem_k: SmemKResource,
     page_offsets=None,
+    page_window=None,
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
     **task_kwargs,
@@ -520,14 +521,21 @@ def create_load_k_task(
 
     Q is loaded once before the loop. K uses one whole-tile pipeline stage per
     logical K tile. Sparse indices are prefetched through the shared offset
-    ring; ordinary paged inputs read page offsets directly from GMEM.
+    ring (``page_offsets``); ordinary paged inputs take page IDs from the
+    prefetched register window of ``page_window``. Pass exactly one of them.
     """
+    if (page_offsets is None) == (page_window is None):
+        raise ValueError("pass exactly one of page_offsets or page_window")
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
 
-    def load_k_body(smem_q, smem_k, page_offsets=None, work_queue=None):
+    def load_k_body(
+        smem_q, smem_k, page_offsets=None, page_window=None, work_queue=None
+    ):
         """Load Q once and then publish one K stage per loop tile."""
         smem_q.init_load_state()
         smem_k.init_load_state()
+        if page_offsets is None:
+            k_pages, window_page, next_window_page = page_window.init_dense_k_window()
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
@@ -543,24 +551,33 @@ def create_load_k_task(
                 # may the metadata producer overwrite this shared ring slot.
                 page_offsets.release()
             else:
+                # Read the page IDs before waiting for the free slot so the
+                # window refresh overlaps the wait instead of following it.
+                k_pages, window_page, next_window_page = (
+                    page_window.read_dense_k_window(
+                        cached_k_pages=k_pages,
+                        cached_window_page=window_page,
+                        cached_next_window_page=next_window_page,
+                    )
+                )
                 smem_k.acquire()
-                smem_k.tma_load_paged()
+                smem_k.tma_load_paged(cached_page_ids=k_pages)
                 smem_k.commit()
         work_queue_tail(work_queue, advance_label="advance_tile")
 
     @schedule
     def load_k_schedule(smem_q, smem_k, page_offsets, work_queue=None):
-        load_k_body(smem_q, smem_k, page_offsets, work_queue)
+        load_k_body(smem_q, smem_k, page_offsets, None, work_queue)
 
     @schedule
-    def load_k_dense_schedule(smem_q, smem_k, work_queue=None):
-        load_k_body(smem_q, smem_k, None, work_queue)
+    def load_k_dense_schedule(smem_q, smem_k, page_window, work_queue=None):
+        load_k_body(smem_q, smem_k, None, page_window, work_queue)
 
     if page_offsets is None:
         schedule_result = (
-            load_k_dense_schedule(smem_q, smem_k)
+            load_k_dense_schedule(smem_q, smem_k, page_window)
             if work_queue is None
-            else load_k_dense_schedule(smem_q, smem_k, work_queue)
+            else load_k_dense_schedule(smem_q, smem_k, page_window, work_queue)
         )
     else:
         schedule_result = (
@@ -569,7 +586,7 @@ def create_load_k_task(
             else load_k_schedule(smem_q, smem_k, page_offsets, work_queue)
         )
 
-    src = ([page_offsets] if page_offsets is not None else []) + (
+    src = [page_offsets if page_offsets is not None else page_window] + (
         [work_queue] if work_queue is not None else []
     )
     return task_class(
@@ -586,16 +603,25 @@ def create_load_k_task(
 def create_load_v_task(
     smem_v: SmemVResource,
     page_offsets=None,
+    page_window=None,
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
     **task_kwargs,
 ) -> Task:
-    """Create the FP8 V TMA task on its configured loader warps."""
+    """Create the FP8 V TMA task on its configured loader warps.
+
+    Sparse indices come from the shared offset ring (``page_offsets``); ordinary
+    paged inputs take page IDs from ``page_window``. Pass exactly one of them.
+    """
+    if (page_offsets is None) == (page_window is None):
+        raise ValueError("pass exactly one of page_offsets or page_window")
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
 
-    def load_v_body(smem_v, page_offsets=None, work_queue=None):
+    def load_v_body(smem_v, page_offsets=None, page_window=None, work_queue=None):
         """Publish one V stage per logical K tile."""
         smem_v.init_load_state()
+        if page_offsets is None:
+            v_pages, window_page, next_window_page = page_window.init_dense_v_window()
         with domain_loop(loop_start, loop_end, loop_step):
             if page_offsets is not None:
                 page_offsets.wait()
@@ -606,24 +632,31 @@ def create_load_v_task(
                 # Keep the ring slot protected through every shared read.
                 page_offsets.release()
             else:
+                v_pages, window_page, next_window_page = (
+                    page_window.read_dense_v_window(
+                        cached_v_pages=v_pages,
+                        cached_window_page=window_page,
+                        cached_next_window_page=next_window_page,
+                    )
+                )
                 smem_v.acquire()
-                smem_v.tma_load_paged()
+                smem_v.tma_load_paged(cached_page_ids=v_pages)
                 smem_v.commit()
         work_queue_tail(work_queue, advance_label="advance_tile")
 
     @schedule
     def load_v_schedule(smem_v, page_offsets, work_queue=None):
-        load_v_body(smem_v, page_offsets, work_queue)
+        load_v_body(smem_v, page_offsets, None, work_queue)
 
     @schedule
-    def load_v_dense_schedule(smem_v, work_queue=None):
-        load_v_body(smem_v, None, work_queue)
+    def load_v_dense_schedule(smem_v, page_window, work_queue=None):
+        load_v_body(smem_v, None, page_window, work_queue)
 
     if page_offsets is None:
         schedule_result = (
-            load_v_dense_schedule(smem_v)
+            load_v_dense_schedule(smem_v, page_window)
             if work_queue is None
-            else load_v_dense_schedule(smem_v, work_queue)
+            else load_v_dense_schedule(smem_v, page_window, work_queue)
         )
     else:
         schedule_result = (
@@ -632,7 +665,7 @@ def create_load_v_task(
             else load_v_schedule(smem_v, page_offsets, work_queue)
         )
 
-    src = ([page_offsets] if page_offsets is not None else []) + (
+    src = [page_offsets if page_offsets is not None else page_window] + (
         [work_queue] if work_queue is not None else []
     )
     return task_class(

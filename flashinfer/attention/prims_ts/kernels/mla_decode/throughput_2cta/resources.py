@@ -664,6 +664,9 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     cached_window_page: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    cached_next_window_page: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
     cached_mask_low: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -702,6 +705,12 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             Int32,
             Int32(0),
             "Per-lane page id retained across one 32-entry page-table window.",
+        ),
+        (
+            "cached_next_window_page",
+            Int32,
+            Int32(0),
+            "Per-lane page id of the prefetched next 32-entry window.",
         ),
     )
 
@@ -1019,6 +1028,159 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
                 )
             )
         return cached_k, cached_v, cached_next_v, cached_window_page
+
+    @cute.jit
+    def _refresh_dense_window(
+        self, stage_info: StageInfo, cached_window_page, cached_next_window_page
+    ):
+        """Advance the FP8 dense loader's prefetched page-ID window.
+
+        A window is one page ID per lane (32 per warp). Each lane holds its ID
+        of the current window and of the next. The next window's load is
+        issued at the start of the current window (``32 / pages_per_k_tile`` K
+        tiles before it is used); ptxas copies the loop-carried register at the
+        next K tile, so the load has at least one K tile to land. Either way
+        the page-table read no longer sits between a freed K/V slot and its
+        TMA. Only the first window of a work tile is loaded synchronously.
+        Indices clamp to the last table column; fragments past the sequence
+        are masked by the runtime length as before.
+        """
+        cfg = self.cfg
+        pages_per_tile = cutlass.const_expr(cfg.pages_per_k_tile)
+        window_tiles = cutlass.const_expr(WARP_LANES // pages_per_tile)
+        work_tile = stage_info.work_tile
+        local_k_index = Int32(stage_info.loop_offset)
+        global_k_index = work_tile.k_index_base + local_k_index
+        page_offsets_batch = self.page_offsets[None, work_tile.tile_idx[2]]
+        last_page_col = Int32(page_offsets_batch.shape[0] - 1)
+        lane_idx = cute.arch.thread_idx()[0] & Int32(31)
+        window_pos = local_k_index & Int32(window_tiles - 1)
+        if local_k_index == Int32(0):
+            cached_window_page = Int32(
+                page_offsets_batch[
+                    cute.math.min(
+                        global_k_index * Int32(pages_per_tile) + lane_idx,
+                        last_page_col,
+                    )
+                ]
+            )
+        if window_pos == Int32(0):
+            if local_k_index != Int32(0):
+                cached_window_page = cached_next_window_page
+            # Short split-KV work tiles fit in one window; skip a dead prefetch.
+            if local_k_index + Int32(window_tiles) < Int32(work_tile.k_tile_count):
+                cached_next_window_page = Int32(
+                    page_offsets_batch[
+                        cute.math.min(
+                            (global_k_index + Int32(window_tiles))
+                            * Int32(pages_per_tile)
+                            + lane_idx,
+                            last_page_col,
+                        )
+                    ]
+                )
+        return cached_window_page, cached_next_window_page, window_pos
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(cached_k_pages, cached_window_page, cached_next_window_page),
+    )
+    @cute.jit
+    def init_dense_k_window(self, stage_info: StageInfo):
+        """Create the FP8 dense K loader's page-ID window state."""
+        del stage_info
+        return (
+            cutlass.Array(
+                Int32, self.cfg.pages_per_k_cta, space=cutlass.AddressSpace.rmem
+            ),
+            Int32(0),
+            Int32(0),
+        )
+
+    @consumer_work(
+        returns=(cached_k_pages, cached_window_page, cached_next_window_page)
+    )
+    @cute.jit
+    def read_dense_k_window(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_k_pages,
+        cached_window_page,
+        cached_next_window_page,
+    ):
+        """Return this CTA's K page IDs for the current tile from the window."""
+        cfg = self.cfg
+        cached_window_page, cached_next_window_page, window_pos = (
+            self._refresh_dense_window(
+                stage_info, cached_window_page, cached_next_window_page
+            )
+        )
+        cta_v = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        for pk in cutlass.range_constexpr(cfg.pages_per_k_cta):
+            # Same logical page order as ``SmemKResource.tma_load_paged``.
+            source_lane = window_pos * Int32(cfg.pages_per_k_tile) + (
+                cta_v * Int32(cfg.pages_per_k_cta) + Int32(pk)
+                if cfg.pages_per_k_tile > 1
+                else Int32(0)
+            )
+            cached_k_pages[pk] = Int32(
+                prims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=cached_window_page,
+                    offset=source_lane,
+                    mask_and_clamp=0x1F,
+                    kind=prims.Shfl.IDX,
+                )
+            )
+        return cached_k_pages, cached_window_page, cached_next_window_page
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(cached_v_pages, cached_window_page, cached_next_window_page),
+    )
+    @cute.jit
+    def init_dense_v_window(self, stage_info: StageInfo):
+        """Create the FP8 dense V loader's page-ID window state."""
+        del stage_info
+        return (
+            cutlass.Array(
+                Int32, self.cfg.pages_per_v_tile, space=cutlass.AddressSpace.rmem
+            ),
+            Int32(0),
+            Int32(0),
+        )
+
+    @consumer_work(
+        returns=(cached_v_pages, cached_window_page, cached_next_window_page)
+    )
+    @cute.jit
+    def read_dense_v_window(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_v_pages,
+        cached_window_page,
+        cached_next_window_page,
+    ):
+        """Return the V page IDs of the current tile from the window."""
+        cfg = self.cfg
+        cached_window_page, cached_next_window_page, window_pos = (
+            self._refresh_dense_window(
+                stage_info, cached_window_page, cached_next_window_page
+            )
+        )
+        for pk in cutlass.range_constexpr(cfg.pages_per_v_tile):
+            cached_v_pages[pk] = Int32(
+                prims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=cached_window_page,
+                    offset=window_pos * Int32(cfg.pages_per_v_tile) + Int32(pk),
+                    mask_and_clamp=0x1F,
+                    kind=prims.Shfl.IDX,
+                )
+            )
+        return cached_v_pages, cached_window_page, cached_next_window_page
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
@@ -1659,7 +1821,6 @@ class SmemKResource(HighThroughputMlaResource):
 
     smem_k: Any = None
     smem_sparse_offsets: Any = None
-    page_offsets: Any = None
     tma_desc_c_latent: Any = None
     tma_desc_c_rope: Any = None
     logical_seq_len_q: cutlass.Constexpr[int] = 1
@@ -1713,17 +1874,16 @@ class SmemKResource(HighThroughputMlaResource):
 
     @producer_work
     @cute.jit
-    def tma_load_paged(self, stage_info: StageInfo) -> None:
-        """Load a paged K tile; page-size-one inputs use the offset ring."""
+    def tma_load_paged(self, stage_info: StageInfo, *, cached_page_ids) -> None:
+        """Load a paged K tile with this CTA's page IDs from the page window.
+
+        ``PageOffsetWindowResource.read_dense_k_window`` supplies the IDs in
+        the logical order ``k_index * pages_per_k_tile + cta * pages_per_k_cta
+        + pk`` (or ``k_index`` when one page spans the tile).
+        """
         cfg = self.cfg
         stage_idx = stage_info.stage_idx
         stage_base = stage_idx * cfg.smem_k_stage_elems
-        work_tile = stage_info.work_tile
-        blk_coord = work_tile.tile_idx
-        k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
-
-        page_row_idx = blk_coord[2]
-        page_offsets_batch = self.page_offsets[None, page_row_idx]
         kv_mbar_arr = cutlass.Array(stage_info.barrier.data_ptr(), dtype=Int64)
         pages_per_k_cta = cfg.pages_per_k_cta
         kc_page_smem_elems = cfg.kc_page_tile_size * cfg.mma_qk_tiler_k
@@ -1735,24 +1895,14 @@ class SmemKResource(HighThroughputMlaResource):
         k_latent_subtile_elems = cutlass.const_expr(
             cfg.mma_qk_tiler[1] // cfg.num_mma_ctas * cfg.mma_qk_tiler_k
         )
-        # Use page 0 for masked fragments beyond a compact page table. A direct
-        # bounds predicate avoids carrying runtime K-length division or a full
-        # page-ID register array through this producer warp.
+        # Fragments past the page table use the window's clamped last column;
+        # the runtime sequence length masks them.
 
         for k_call in cutlass.range_constexpr(cfg.iterations_qk_latent):
             coord_kcl = cutlass.Int32(k_call * cfg.mma_qk_tiler_k)
             subtile_base = stage_base + k_call * k_latent_subtile_elems
             for pk in cutlass.range_constexpr(pages_per_k_cta):
-                logical_page_idx = (
-                    k_index
-                    if cfg.pages_per_k_tile == 1
-                    else (k_index * Int32(cfg.num_mma_ctas) + cta_v)
-                    * Int32(pages_per_k_cta)
-                    + Int32(pk)
-                )
-                page_idx = Int32(0)
-                if cute.elem_less(logical_page_idx, page_offsets_batch.shape[0]):
-                    page_idx = page_offsets_batch[logical_page_idx]
+                page_idx = Int32(cached_page_ids[pk])
                 if prims.elect_sync():
                     kcl_smem = cutlass.Array(
                         self.smem_k.data_ptr(subtile_base + pk * kc_page_smem_elems),
@@ -1777,16 +1927,7 @@ class SmemKResource(HighThroughputMlaResource):
             coord_kcr = cutlass.Int32(rope_idx * cfg.mma_qk_rope_tiler[2])
             subtile_base = rope_stage_base + rope_idx * k_rope_subtile_elems
             for pk in cutlass.range_constexpr(pages_per_k_cta):
-                logical_page_idx = (
-                    k_index
-                    if cfg.pages_per_k_tile == 1
-                    else (k_index * Int32(cfg.num_mma_ctas) + cta_v)
-                    * Int32(pages_per_k_cta)
-                    + Int32(pk)
-                )
-                page_idx = Int32(0)
-                if cute.elem_less(logical_page_idx, page_offsets_batch.shape[0]):
-                    page_idx = page_offsets_batch[logical_page_idx]
+                page_idx = Int32(cached_page_ids[pk])
                 if prims.elect_sync():
                     kcr_smem = cutlass.Array(
                         self.smem_k.data_ptr(subtile_base + pk * rope_page_smem_elems),
@@ -1868,7 +2009,6 @@ class SmemVResource(HighThroughputMlaResource):
 
     smem_v: Any = None
     smem_sparse_offsets: Any = None
-    page_offsets: Any = None
     tma_desc_c_transpose: Any = None
     tma_desc_extra_v: Any = None
     logical_seq_len_q: cutlass.Constexpr[int] = 1
@@ -1923,17 +2063,15 @@ class SmemVResource(HighThroughputMlaResource):
 
     @producer_work
     @cute.jit
-    def tma_load_paged(self, stage_info: StageInfo) -> None:
-        """Load a paged V tile; page-size-one inputs use the offset ring."""
+    def tma_load_paged(self, stage_info: StageInfo, *, cached_page_ids) -> None:
+        """Load a paged V tile with the tile's page IDs from the page window.
+
+        ``PageOffsetWindowResource.read_dense_v_window`` supplies the IDs in
+        the logical order ``k_index * pages_per_v_tile + page_offset``.
+        """
         cfg = self.cfg
         stage_idx = stage_info.stage_idx
         stage_base = stage_idx * cfg.smem_v_stage_elems
-        work_tile = stage_info.work_tile
-        blk_coord = work_tile.tile_idx
-        k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
-
-        page_row_idx = blk_coord[2]
-        page_offsets_batch = self.page_offsets[None, page_row_idx]
 
         v_mbar_arr = cutlass.Array(stage_info.barrier.data_ptr(), dtype=Int64)
         cta_v = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1946,8 +2084,9 @@ class SmemVResource(HighThroughputMlaResource):
         svc_copy_elems = cutlass.const_expr(
             cfg.mma_pv_tiler[1] // cfg.num_mma_ctas * cfg.mma_pv_tiler[2]
         )
-        # As for K, out-of-table fragments use page 0 and are masked by the
-        # runtime sequence length. p128 still shares one page ID across CTAs.
+        # As for K, out-of-table fragments use the clamped last column and are
+        # masked by the runtime sequence length. p128 shares one page ID across
+        # CTAs.
 
         for v_call in cutlass.range_constexpr(
             cfg.iterations_pv_k * cfg.iterations_pv_n
@@ -1965,14 +2104,9 @@ class SmemVResource(HighThroughputMlaResource):
                 tile_token_offset = pv_i * cfg.mma_pv_tiler[2] + local_token_offset
                 page_offset = tile_token_offset // cfg.page_size
                 coord_k_v = Int32(tile_token_offset % cfg.page_size)
-                logical_page_idx = (
-                    k_index
-                    if pages_per_v_tile == 1
-                    else k_index * Int32(pages_per_v_tile) + Int32(page_offset)
+                page_idx = Int32(
+                    cached_page_ids[page_offset if pages_per_v_tile > 1 else 0]
                 )
-                page_idx = Int32(0)
-                if cute.elem_less(logical_page_idx, page_offsets_batch.shape[0]):
-                    page_idx = page_offsets_batch[logical_page_idx]
                 if prims.elect_sync():
                     smem_k_block_idx = local_token_offset // V_SMEM_K_BLOCK_TOKENS
                     token_offset_in_k_block = local_token_offset % V_SMEM_K_BLOCK_TOKENS
