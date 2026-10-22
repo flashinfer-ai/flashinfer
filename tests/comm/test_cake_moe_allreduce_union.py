@@ -42,7 +42,7 @@ def _route_keys(arch: str, world_size: int) -> set[tuple[str, int, str, bool, st
 
 
 def _kernel_names(route: union.Route) -> tuple[str, ...]:
-    return (route.kernel,) if isinstance(route.kernel, str) else tuple(route.kernel)
+    return (route.kernel,)
 
 
 def test_every_route_names_a_kernel_of_its_world_size_and_dtype() -> None:
@@ -54,9 +54,6 @@ def test_every_route_names_a_kernel_of_its_world_size_and_dtype() -> None:
     for (arch, world_size, dtype, pdl, _spec), route in union.ROUTES.items():
         assert arch in _ARCHES and dtype in _DTYPES and pdl in _PDL
         names = _kernel_names(route)
-        if isinstance(route.kernel, tuple):
-            # Rank-specialised routes carry one kernel per rank.
-            assert len(names) == world_size and len(set(names)) == world_size
         for name in names:
             kernel = union.KERNELS[name]
             assert kernel.dtype == dtype and kernel.world_size == world_size
@@ -175,7 +172,7 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
     assert {
         capability: arch for arch, capability in _ARCHES.items()
     } == union.ARCH_BY_CAPABILITY
-    assert set(union.exported_arches()) == set(_ARCHES)
+    assert {key[0] for key in union.ROUTES} == set(_ARCHES)
     for arch, capability in _ARCHES.items():
         assert union.arch_for_capability(capability) == arch
     assert union.arch_for_capability(_SM120) is None

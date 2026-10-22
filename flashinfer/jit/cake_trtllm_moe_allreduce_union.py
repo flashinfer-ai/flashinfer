@@ -27,18 +27,17 @@ translation unit, with the record's ``defines`` selecting its program text.
 
 ``KERNELS`` lists the kernels; ``ROUTES`` maps one route key
 ``(arch, world_size, dtype, launch_with_pdl, specialization)`` to the kernel
-(or the per-rank kernels of a rank-specialised route) and its residency
-parameters; ``_SPECIALIZATION_RULES`` selects a specialization for the
-reviewed ``num_experts`` and token ranges, and ``_WIDE_MLP_CLASSES`` names the
-classes whose program outside those ranges is ``wide_mlp`` (``generic``
-otherwise).
+and its residency parameters; ``_SPECIALIZATION_RULES`` selects a
+specialization for the reviewed ``num_experts`` and token ranges, and
+``_WIDE_MLP_CLASSES`` names the classes whose program outside those ranges is
+``wide_mlp`` (``generic`` otherwise).
 """
 
 from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional, Sequence, Union
+from typing import Literal, NamedTuple, Optional, Sequence
 
 import torch
 
@@ -85,15 +84,15 @@ class Kernel(NamedTuple):
 
 
 class Route(NamedTuple):
-    """The kernel(s) and residency of one route.
+    """The kernel and residency of one route.
 
-    ``kernel`` is one kernel name, or one name per rank for the rank-specialised
-    routes.  ``persistent_ctas_per_sm`` and ``max_persistent_clusters`` size the
-    persistent cluster grid (see :func:`launch_grid_x`); ``cooperative`` launches
-    one co-resident cluster per token.
+    ``kernel`` is the kernel name.  ``persistent_ctas_per_sm`` and
+    ``max_persistent_clusters`` size the persistent cluster grid (see
+    :func:`launch_grid_x`); ``cooperative`` launches one co-resident cluster per
+    token.
     """
 
-    kernel: Union[str, tuple[str, ...]]
+    kernel: str
     persistent_ctas_per_sm: int
     max_persistent_clusters: Optional[int]
     cooperative: bool
@@ -417,10 +416,6 @@ def arch_for_capability(device_capability: Sequence[int]) -> Optional[str]:
     )
 
 
-def exported_arches() -> tuple[str, ...]:
-    return tuple(sorted({key[0] for key in ROUTES}))
-
-
 def select_specialization(
     arch: str,
     world_size: int,
@@ -544,11 +539,7 @@ def route_kernel(route: Route, world_rank: int, world_size: int) -> str:
 
     if not 0 <= int(world_rank) < int(world_size):
         raise ValueError(f"world_rank must be in [0, {world_size}), got {world_rank}")
-    if isinstance(route.kernel, str):
-        return route.kernel
-    if len(route.kernel) != int(world_size):
-        raise RuntimeError("rank-specialised route does not carry one kernel per rank")
-    return route.kernel[int(world_rank)]
+    return route.kernel
 
 
 def launch_grid_x(
@@ -782,7 +773,6 @@ __all__ = [
     "Route",
     "arch_for_capability",
     "compile_flags",
-    "exported_arches",
     "kernel_defines",
     "kernel_source",
     "kernel_symbol",
