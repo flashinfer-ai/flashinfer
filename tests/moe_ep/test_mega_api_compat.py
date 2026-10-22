@@ -111,6 +111,7 @@ def test_finalize_alias_and_old_positional_slot(dtype):
             None,
             None,
             None,
+            False,  # enable_fc1_activation_per_token_scale
             None,
             None,
             None,
@@ -121,6 +122,7 @@ def test_finalize_alias_and_old_positional_slot(dtype):
     assert config.finalize_mode is FinalizeMode.NONE
     if dtype == "nvfp4_nvfp4_bf16":
         assert config.input_norm_const == 2.5
+        assert config.enable_fc1_activation_per_token_scale is False
         assert config.num_valid_tokens_tensor is None
 
 
