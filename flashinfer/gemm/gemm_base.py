@@ -52,6 +52,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..autotuner.initializers import autotuner_initializer_empty
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
@@ -9384,6 +9385,10 @@ def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
+    tensor_initializers=(
+        (6, autotuner_initializer_empty),
+        (9, autotuner_initializer_empty),
+    ),
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -9415,6 +9420,10 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
 _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
+    tensor_initializers=(
+        (6, autotuner_initializer_empty),
+        (9, autotuner_initializer_empty),
+    ),
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index

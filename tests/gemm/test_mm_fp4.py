@@ -20,7 +20,13 @@ from flashinfer.utils import (
     version_at_least,
     LibraryError,
 )
-from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.autotuner import AutoTuner
+from flashinfer.gemm.gemm_base import (
+    CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR,
+    DEFAULT_WORKSPACE_SIZE,
+    _MM_FP4_TUNING_CONFIG_8x4,
+    _MM_FP4_TUNING_CONFIG_128x4,
+)
 
 
 def _test_mm_fp4(
@@ -184,6 +190,38 @@ def test_mm_fp4(
     _test_mm_fp4(
         m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
     )
+
+
+@pytest.mark.parametrize("use_8x4_sf_layout", [False, True])
+def test_mm_fp4_autotune_profile_memory(use_8x4_sf_layout):
+    config = (
+        _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
+    )
+    inputs = [
+        torch.empty((1, 64), dtype=torch.uint8, device="cuda"),
+        torch.empty((128, 64), dtype=torch.uint8, device="cuda").T,
+        torch.empty((128, 8), dtype=torch.uint8, device="cuda"),
+        torch.empty((128, 8), dtype=torch.uint8, device="cuda").T,
+        torch.ones((), device="cuda"),
+        torch.bfloat16,
+        torch.empty((1, 128), dtype=torch.bfloat16, device="cuda"),
+        16,
+        True,
+        torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda"),
+    ]
+    tuner = AutoTuner.get()
+    profile = tuner._generate_optimization_profiles(config, inputs)[0]
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    prepared = tuner._prepare_input_tensors(profile, inputs)
+    torch.cuda.synchronize()
+    peak_extra = torch.cuda.max_memory_allocated() - before
+    assert prepared[6].shape == inputs[6].shape
+    assert prepared[9].shape == inputs[9].shape
+    # A one-token profile needs one scratch buffer and tiny activations,
+    # without large FP32 intermediates for its output or workspace.
+    assert peak_extra < 2 * DEFAULT_WORKSPACE_SIZE
 
 
 # Auto backend: one case per fp4_type, autotune on/off and boundary M covered.
