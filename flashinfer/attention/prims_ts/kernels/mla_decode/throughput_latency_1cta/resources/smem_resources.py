@@ -2360,6 +2360,15 @@ class SmemRawKvResource(SmemKvResource):
         lane_active = quad < Int32(num_quads)
         words = self._smem_words
         last_valid = cute.math.max(seq_len_kv - Int32(1), Int32(0))
+        # Split-KV: this CTA's tile range starts at global tile ``tile_base``.
+        # Row addressing and the KV-length test use global tiles; the index,
+        # scale and mask rings stay indexed by the local tile.
+        tile_base = global_kv_tile_idx(
+            cfg,
+            Int32(0),
+            seq_len_kv,
+            cta_idx_kv_for_stage(self.cta_idx_kv, stage_info),
+        )
         page_offsets_batch = self.page_offsets[None, batch_idx]
         page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
         scratch_lane_base = Int32(self._ldidx_scratch_word_base) + (
@@ -2372,7 +2381,7 @@ class SmemRawKvResource(SmemKvResource):
             ) * Int32(4)
 
         def prefetch_rows(tile):
-            base = tile * Int32(cfg.tile_size_kv) + quad * Int32(4)
+            base = (tile_base + tile) * Int32(cfg.tile_size_kv) + quad * Int32(4)
             for j in cutlass.range_constexpr(4):
                 logical_idx = cute.math.min(base + Int32(j), last_valid)
                 gmem_ptr = page_offsets_flat[None, logical_idx].iterator.llvm_ptr
@@ -2489,7 +2498,7 @@ class SmemRawKvResource(SmemKvResource):
         # Tokens at or beyond the KV length (the clamped duplicates of the last
         # valid index) are invalid too, so the softmax needs no per-score tail
         # test.
-        tok0 = tile * Int32(cfg.tile_size_kv) + quad * Int32(4)
+        tok0 = (tile_base + tile) * Int32(cfg.tile_size_kv) + quad * Int32(4)
         nibble = nibble & (
             (Int32(1) if tok0 < seq_len_kv else Int32(0))
             | ((Int32(1) if tok0 + Int32(1) < seq_len_kv else Int32(0)) << Int32(1))

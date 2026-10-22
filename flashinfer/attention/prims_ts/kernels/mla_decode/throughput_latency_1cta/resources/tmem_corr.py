@@ -1660,12 +1660,14 @@ class TmemCorrResource(MlaResource):
         row-major buffer (272-byte pitch).  Phase 2: lane ``l`` stores 16-byte
         chunk ``l & 15`` of rows ``2 i + (l >> 4)``: every store instruction
         writes two full 256-byte row segments instead of 32 scattered ones.
-        BF16 direct output only (no fp8 output, no split-KV partials).
+        BF16 output: the final O, or under split-KV this CTA's normalized partial
+        O in the reducer workspace (no fp8 output).
         """
         cfg = self.cfg
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         head_base_idx = head_idx_for_stage(self.head_idx, cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
         warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         pitch = 272
@@ -1703,7 +1705,12 @@ class TmemCorrResource(MlaResource):
         # Phase 2: coalesced 256-byte row segments.
         q = lane_idx & Int32(15)
         rsel = lane_idx >> Int32(4)
-        o_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
+        if cutlass.const_expr(self.acc_o_tensor is not None):
+            o_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
+            element_bytes = cfg.partial_o_dtype_bytes
+        else:
+            o_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
+            element_bytes = cfg.o_dtype_bytes
         for i in cutlass.range_constexpr(8):
             row = Int32(2 * i) + rsel
             w0, w1, w2, w3 = ld_shared_v4(buf + row * Int32(pitch) + q * Int32(16))
@@ -1719,19 +1726,29 @@ class TmemCorrResource(MlaResource):
                 batch_idx=batch_idx,
             )
             if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-                output_query_row = public_query_flat_row(
-                    cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
-                )
                 store_col_offset = (
                     head_dim_offset
                     + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
                     + q * Int32(8)
                 )
-                base_elem_offset = Int64(output_query_row) * Int64(
-                    cfg.head_dim_v
-                ) + Int64(store_col_offset)
+                if cutlass.const_expr(self.acc_o_tensor is not None):
+                    base_elem_offset = split_o_element_offset(
+                        cfg,
+                        batch_idx,
+                        cta_idx_q,
+                        global_head_idx,
+                        cta_idx_kv,
+                        store_col_offset,
+                    )
+                else:
+                    output_query_row = public_query_flat_row(
+                        cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
+                    )
+                    base_elem_offset = Int64(output_query_row) * Int64(
+                        cfg.head_dim_v
+                    ) + Int64(store_col_offset)
                 dst_ptr = cutlass.inttoptr(
-                    o_ptr + base_elem_offset * Int64(cfg.o_dtype_bytes),
+                    o_ptr + Int64(base_elem_offset) * Int64(element_bytes),
                     mem_space=1,
                     dtype=Int32,
                 )

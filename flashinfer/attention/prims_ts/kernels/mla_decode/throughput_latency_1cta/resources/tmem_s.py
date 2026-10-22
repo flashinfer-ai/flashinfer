@@ -804,11 +804,13 @@ class TmemSResource(MlaResource):
                     if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
                         # Loader-owned indices: one byte per quad (bit = token & 3),
                         # 32 bytes = 8 words per tile slot; this thread's row span
-                        # is words (local_col_base >> 4) + {0 .. words - 1}.
+                        # is words (local_col_base >> 4) + {0 .. words - 1}.  The
+                        # loader rotates the slots by this CTA's local tile (the
+                        # global tile differs under split-KV).
                         words_per_thread = num_s_regs_per_thread(cfg) // 16
                         mask_base = (
                             Int32(self.page_offsets_kv.sparse_mask_word_base)
-                            + (tile_idx % Int32(SPARSE_MASK_SLOTS)) * Int32(8)
+                            + (local_tile_idx % Int32(SPARSE_MASK_SLOTS)) * Int32(8)
                             + (local_col_base >> Int32(4))
                         )
                         mask_sel = []

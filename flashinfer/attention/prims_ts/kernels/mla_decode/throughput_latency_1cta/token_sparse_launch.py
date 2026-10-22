@@ -155,18 +155,42 @@ def compile_dsa_sparse_kernel(
     nvfp4: bool = False,
     residual_dim: int = 64,
     dequant_prefetch: bool = False,
+    split_kv: int = 1,
 ):
-    """Compile one token-sparse 1CTA specialization (JIT key = the argument list)."""
+    """Compile one token-sparse 1CTA specialization (JIT key = the argument list).
+
+    ``split_kv > 1`` splits every token's top-k list into that many contiguous
+    tile ranges, one CTA each; the CTAs write BF16 partial O / LSE to the
+    caller's workspace (:func:`dsa_split_workspace_bytes`) and the kernel's
+    standalone reducer (launched with PDL) merges them into ``out`` / ``lse``.
+    """
 
     import cutlass
     import cutlass.cute as cute
 
+    from .config import MlaProfile
     from .kernel import ThroughputLatencyMlaDecodeTs
 
     # The q64 keeps-MMA-AB schedule tiles 64 flat query rows per CTA; H=128
     # runs as two physical "query positions" of 64 heads over the same token.
     phys_heads = 64
     phys_sq = num_heads // phys_heads
+    profile = _PROFILE
+    if split_kv > 1:
+        # Explicit profile: the generic split profile would also split the V
+        # head dimension from the compile-time batch (1 here, one batch per
+        # token at run time), which the token-sparse schedules do not support.
+        profile = MlaProfile(
+            name=f"h64_keeps_mma_ab_splitkv{split_kv}_gmem",
+            num_ctas_per_seq_kv=split_kv,
+            num_ctas_per_head_dim=1,
+            use_persistent_scheduler=0,
+            use_clc_dynamic_persistent_scheduler=0,
+            use_multi_ctas_kv=1,
+            use_cluster_reduction=0,
+            kernel_variant="keeps_mma_ab",
+            tile_size_q=64,
+        )
     kernel = ThroughputLatencyMlaDecodeTs(
         batch_size=1,
         num_heads=phys_heads,
@@ -180,8 +204,8 @@ def compile_dsa_sparse_kernel(
         lse_dtype=cutlass.Float32,
         qkv_dtype="e4m3",
         out_dtype="bf16",
-        profile=_PROFILE,
-        reduction_mode=None,
+        profile=profile,
+        reduction_mode=None if split_kv == 1 else "gmem_separate",
         logical_num_heads=num_heads,
         logical_seq_len_q=1,
         tile_size_q=64,
@@ -195,8 +219,16 @@ def compile_dsa_sparse_kernel(
         nvfp4_dequant_prefetch=dequant_prefetch,
     )
     cfg = kernel._make_config()
-    if int(cfg.num_ctas_per_seq_kv) != 1:
-        raise NotImplementedError("token-sparse 1CTA MLA does not support split-KV yet")
+    if (
+        int(cfg.num_ctas_per_seq_kv) != split_kv
+        or int(cfg.num_ctas_per_head_dim) != 1
+        or int(cfg.use_cluster_reduction) != 0
+    ):
+        raise NotImplementedError(
+            f"token-sparse 1CTA MLA expects {split_kv} KV CTAs per token, one V "
+            f"head-dim CTA and GMEM reduction; got {cfg.num_ctas_per_seq_kv}, "
+            f"{cfg.num_ctas_per_head_dim}, cluster={cfg.use_cluster_reduction}"
+        )
 
     total_q = cute.sym_int()
     pool_rows = cute.sym_int()
@@ -261,6 +293,11 @@ def compile_dsa_sparse_kernel(
         scale_pool_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Uint8, (scale_bytes,), stride_order=(0,), assumed_align=8
         )
+    workspace_fake = None
+    if split_kv > 1:
+        workspace_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int8, (cute.sym_int(),), stride_order=(0,), assumed_align=32
+        )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     with torch.cuda.device(device_index):
         compiled = cute.compile[cute.FrontendNext](
@@ -272,8 +309,8 @@ def compile_dsa_sparse_kernel(
             page_offsets_fake,
             out_fake,
             lse_fake,
-            None,  # workspace
-            cutlass.Int32(1),  # split_kv
+            workspace_fake,
+            cutlass.Int32(split_kv),
             cache_seqs_fake,
             None,  # cu_seqlens_q
             None,  # block_split_kvs
@@ -287,6 +324,14 @@ def compile_dsa_sparse_kernel(
             options=_COMPILE_OPTIONS,
         )
     return compiled
+
+
+def dsa_split_workspace_bytes(total_q: int, num_heads: int, split_kv: int) -> int:
+    """GMEM bytes of the split-KV partials: BF16 O ``[T, SQ, 64, S, 512]`` + FP32 LSE."""
+    if split_kv <= 1:
+        return 0
+    rows = total_q * num_heads * split_kv
+    return rows * (V_DIM * 2 + 4)
 
 
 def launch_dsa_sparse_kernel(
@@ -304,6 +349,8 @@ def launch_dsa_sparse_kernel(
     nvfp4_data_pool: torch.Tensor | None = None,
     nvfp4_scale_pool: torch.Tensor | None = None,
     nvfp4_dequant_scale: float = 1.0,
+    workspace: torch.Tensor | None = None,
+    split_kv: int = 1,
 ) -> None:
     """Bind ``[T, H, 576]`` packed inputs to the one-token-per-batch 1CTA ABI and launch."""
 
@@ -329,8 +376,8 @@ def launch_dsa_sparse_kernel(
         page_offsets,
         out_kernel,
         lse_kernel,
-        None,
-        1,
+        workspace,
+        split_kv,
         top_k_lens,
         None,
         None,

@@ -58,6 +58,7 @@ from .kernels.mla_decode.throughput_latency_1cta.token_sparse_launch import (
     HEAD_DIM as _HEAD_DIM,
     V_DIM as _V_DIM,
     compile_dsa_sparse_kernel,
+    dsa_split_workspace_bytes,
     launch_dsa_sparse_kernel,
 )
 
@@ -71,6 +72,46 @@ _NVFP4_RESIDUAL_DIM = 64
 # -1% at 96, neutral from 128 on, so the prefetch variant is only compiled and used
 # below the crossover.
 NVFP4_DEQUANT_PREFETCH_MAX_CTAS = 64
+
+# Split-KV: below this many CTAs (query tokens x 64-head groups) most SMs would idle,
+# so every token's top-k list is split into S contiguous tile ranges (one CTA each)
+# and a standalone reducer merges the partials.  S is the largest choice that keeps
+# the split grid within one wave and leaves each CTA at least one 128-key tile.
+# Measured on B200 (K=2048, sc8, NVFP4 / FP8): B1 35.6 -> 13.1 / 52.0 -> 11.4 us
+# (S=16), B16 36.2 -> 15.9 / 52.1 -> 14.9 (S=8), B32 36.2 -> 19.4 (S=4), B64 37.4 ->
+# 27.6 / 52.8 -> 33.1 (S=2); a split grid beyond one wave is slower than S=1.
+SPLIT_KV_MIN_CTAS = 96
+SPLIT_KV_CHOICES = (16, 8, 4, 2)
+_SPLIT_KV_MIN_TILES = 1
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_split_kv(num_ctas: int, sparse_mla_top_k: int, sm_count: int) -> int:
+    """Return the per-token KV split count for a launch of ``num_ctas`` CTAs."""
+    if num_ctas >= SPLIT_KV_MIN_CTAS:
+        return 1
+    tiles = -(-sparse_mla_top_k // 128)
+    for split in SPLIT_KV_CHOICES:
+        if num_ctas * split <= sm_count and tiles >= split * _SPLIT_KV_MIN_TILES:
+            return split
+    return 1
+
+
+def _split_workspace(
+    device: torch.device, total_q: int, num_heads: int, split_kv: int
+) -> Optional[torch.Tensor]:
+    """Partial O / LSE scratch for a split launch (``None`` without split-KV)."""
+    if split_kv <= 1:
+        return None
+    return torch.empty(
+        dsa_split_workspace_bytes(total_q, num_heads, split_kv),
+        dtype=torch.int8,
+        device=device,
+    )
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -306,11 +347,14 @@ def prims_ts_dsa_sparse_mla_fp8(
             sparse_mla_top_k=sparse_mla_top_k,
         )
     num_heads = query.shape[1]
+    num_ctas = query.shape[0] * (num_heads // 64)
+    split_kv = _select_split_kv(num_ctas, sparse_mla_top_k, _sm_count(device_index))
     compiled = compile_dsa_sparse_kernel(
         device_index,
         num_heads=num_heads,
         sparse_mla_top_k=sparse_mla_top_k,
         enable_skip_correction=skip_corr_threshold > 0.0,
+        split_kv=split_kv,
     )
     launch_dsa_sparse_kernel(
         compiled,
@@ -323,6 +367,8 @@ def prims_ts_dsa_sparse_mla_fp8(
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
         skip_corr_threshold=skip_corr_threshold,
+        workspace=_split_workspace(query.device, query.shape[0], num_heads, split_kv),
+        split_kv=split_kv,
     )
     return out
 
@@ -447,6 +493,8 @@ def prims_ts_dsa_sparse_mla_nvfp4(
             sparse_mla_top_k=sparse_mla_top_k,
         )
     num_heads = query.shape[1]
+    num_ctas = query.shape[0] * (num_heads // 64)
+    split_kv = _select_split_kv(num_ctas, sparse_mla_top_k, _sm_count(device_index))
     compiled = compile_dsa_sparse_kernel(
         device_index,
         num_heads=num_heads,
@@ -454,8 +502,8 @@ def prims_ts_dsa_sparse_mla_nvfp4(
         enable_skip_correction=skip_corr_threshold > 0.0,
         nvfp4=True,
         residual_dim=residual_dim,
-        dequant_prefetch=query.shape[0] * (num_heads // 64)
-        <= NVFP4_DEQUANT_PREFETCH_MAX_CTAS,
+        dequant_prefetch=num_ctas * split_kv <= NVFP4_DEQUANT_PREFETCH_MAX_CTAS,
+        split_kv=split_kv,
     )
     # s = m * 2**e with m in [1, 2): the exponent folds exactly into the E4M3
     # block scales of the V dequantization; m goes through the PV scale.  QK
@@ -478,6 +526,8 @@ def prims_ts_dsa_sparse_mla_nvfp4(
         nvfp4_data_pool=data_pool,
         nvfp4_scale_pool=scale_pool,
         nvfp4_dequant_scale=pow2_scale,
+        workspace=_split_workspace(device, query.shape[0], num_heads, split_kv),
+        split_kv=split_kv,
     )
     return out
 

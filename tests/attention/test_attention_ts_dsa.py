@@ -528,24 +528,85 @@ def test_prims_ts_dsa_rejects_invalid_arguments(kernel: str, name: str, mutate) 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts() -> None:
-    """The JIT key is (heads, top-k, skip-correction, cache format, dequant prefetch); T is a runtime extent.
+    """The JIT key is (heads, top-k, skip-correction, cache format, dequant prefetch,
+    split-KV count); T is a runtime extent.
 
-    Token counts on one side of ``NVFP4_DEQUANT_PREFETCH_MAX_CTAS`` share a kernel; the
-    NVFP4 cache compiles one extra variant above it.
+    Token counts that select the same split count (and, for NVFP4, the same side of
+    ``NVFP4_DEQUANT_PREFETCH_MAX_CTAS``) share one kernel.
     """
     device = torch.device("cuda")
     limit = dsa_module.NVFP4_DEQUANT_PREFETCH_MAX_CTAS
-    before = compile_dsa_sparse_kernel.cache_info()
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    top_k = 256
     totals = (1, 7, limit, limit + 1, 150)
+    variants = set()
     for total_q in totals:
-        fx = build_fixture(Case("shared", total_q=total_q, top_k=256), device)
+        split = dsa_module._select_split_kv(total_q, top_k, sm_count)
+        variants.add(("fp8", split))
+        variants.add(("nvfp4", split, total_q * split <= limit))
+    before = compile_dsa_sparse_kernel.cache_info()
+    for total_q in totals:
+        fx = build_fixture(Case("shared", total_q=total_q, top_k=top_k), device)
         _run_nvfp4(fx)
         _run_fp8(fx)
     torch.cuda.synchronize()
     after = compile_dsa_sparse_kernel.cache_info()
-    # fp8, nvfp4 with the prefetch schedule (T <= limit), nvfp4 without it.
-    assert after.misses - before.misses <= 3
-    assert after.hits - before.hits >= 2 * len(totals) - 3
+    assert after.misses - before.misses <= len(variants)
+    assert after.hits - before.hits >= 2 * len(totals) - len(variants)
+
+
+def test_prims_ts_dsa_split_kv_policy() -> None:
+    """Split only below one wave of CTAs, as far as the grid fits one wave and each
+    CTA keeps at least one 128-key tile."""
+    select = dsa_module._select_split_kv
+    assert [select(t, 2048, 148) for t in (1, 9, 16, 18, 19, 37, 38, 74, 75, 96)] == [
+        16,
+        16,
+        8,
+        8,
+        4,
+        4,
+        2,
+        2,
+        1,
+        1,
+    ]
+    assert select(8, 512, 148) == 4  # four tiles at most
+    assert select(3, 128, 148) == 1  # a single tile
+    assert select(48, 2048, 148) == 2  # e.g. 24 tokens with 128 heads
+
+
+_SPLIT_CASES = [
+    Case("ragged-neg30", total_q=6, ragged=True, neg=0.3),
+    Case("lens-zero", total_q=4, ragged=True, zero_len_token=True),
+    Case("topk1028", total_q=3, top_k=1028),
+]
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kernel", ("fp8", "nvfp4"))
+@pytest.mark.parametrize("split", (1, 2, 16))
+@pytest.mark.parametrize("case", _SPLIT_CASES, ids=lambda c: c.name)
+def test_prims_ts_dsa_split_kv_matches_reference(
+    kernel: str, split: int, case: Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forced split counts (incl. empty and one-tile splits) match the reference."""
+    monkeypatch.setattr(
+        dsa_module, "_select_split_kv", lambda num_ctas, top_k, sm_count: split
+    )
+    device = torch.device("cuda")
+    fx = build_fixture(case, device)
+    lse = torch.empty((case.total_q, case.heads), dtype=torch.float32, device=device)
+    run, reference = (
+        (_run_nvfp4, _nvfp4_reference)
+        if kernel == "nvfp4"
+        else (_run_fp8, _fp8_reference)
+    )
+    out = run(fx, lse=lse)
+    torch.cuda.synchronize()
+    expected, expected_lse = reference(fx)
+    _check_against(out, lse, expected, expected_lse)
 
 
 @_REQUIRES_PRIMTS_GPU

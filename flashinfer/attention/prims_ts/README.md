@@ -116,10 +116,13 @@ the scanned prefix per token).  The argument names and the `seq_lens` /
 `trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k > 0)`; the kernel does
 not read the placeholders.  Both entries return BF16 `[T, H, 512]` (optional
 caller-owned `out` and base-2 `lse`), accept `skip_corr_threshold` in `[0, 8]`,
-and use one CTA per query token (64 heads = 64 query rows; 128 heads run as
-two row tiles of the same token), so a decode step with `T` tokens takes
-`ceil(T / 148)` waves on B200 (`ceil(2 T / 148)` with 128 heads) and no
-split-KV.  Both need SM100 / SM103; the NVFP4 entry additionally needs
+and run one CTA per query token and 64 heads (128 heads run as two row tiles
+of the same token).  Below 96 such CTAs the entries split every token's top-k
+list into S in {16, 8, 4, 2} contiguous 128-key tile ranges (the largest S
+that keeps the grid within one wave of SMs and at least one tile per CTA);
+the CTAs write BF16 partial O / LSE to a per-call workspace and a reducer
+kernel merges them, so S > 1 is not bitwise equal to S = 1.  Both need
+SM100 / SM103; the NVFP4 entry additionally needs
 CUDA 13.4+ / `nvidia-cutlass-dsl` 4.8+ (PTX ISA 9.4 packed E2M1 x E4M3
 multiply).  The kernel trusts the routing values: `block_tables` entries must
 be `-1` or address a pool row and `sparse_mla_top_k_lens` must lie in
