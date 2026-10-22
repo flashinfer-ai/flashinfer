@@ -340,7 +340,7 @@ class MixedFp8KvProducer(Fp4Fp8KvProducer):
 
 @dataclass(kw_only=True)
 class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
-    swa_cache: object = None
+    swa_cache: cute.Tensor = None
 
     @cute.jit
     def _load_swa_stage(
