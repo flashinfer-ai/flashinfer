@@ -237,6 +237,13 @@ _R2_SMALL_M_FAST_MATH_CELLS = _by_arch_sm(
 _R2_SMALL_M_WRITE_FAST_MATH_CELLS = _by_arch_sm(
     ROUTES["R2_SMALL_M_WRITE_FAST_MATH_CELLS"], _cell_set
 )
+# Round-5 write cells: the dense key of the program a snapshot-write cell's variant derives from,
+# consulted before the derivation (the derived write program holds the release and adds in bf16
+# without the early release); ``_persistent_plan_exact`` appends ``_write``.
+_WRITE_PERSISTENT_KEY_CELLS = _by_arch_sm(
+    ROUTES["WRITE_PERSISTENT_KEY_CELLS"],
+    lambda t: {c: str(v) for c, v in _cells(t).items()},
+)
 
 
 def _r2(table: dict[str, dict[int, Any]], arch: str, num_sms: Optional[int]) -> Any:
@@ -540,10 +547,22 @@ def _small_m_plan(
     )
 
 
+def _cell_pinned_write_keys(arch: Optional[str]) -> frozenset[str]:
+    """The write programs that ``WRITE_PERSISTENT_KEY_CELLS`` pins to cells on ``arch``.  They
+    serve those cells only: an unregistered derived write key never resolves to one of them, so
+    pinning a write cell changes no other route."""
+    return frozenset(
+        f"{key}_write"
+        for by_cell in (_WRITE_PERSISTENT_KEY_CELLS.get(arch) or {}).values()
+        for key in by_cell.values()
+    )
+
+
 def _persistent_fallback(
     plan: RoutePlan, table: dict[str, str], num_sms: int, M: int, K: int, exact_key: str
 ) -> Optional[RoutePlan]:
-    """The registered persistent variant of block count ``K`` closest to the exact plan."""
+    """The registered persistent variant of block count ``K`` closest to the exact plan
+    (never a cell-pinned write program)."""
     exact = (
         _PERSISTENT_KEY.match(plan.kernel_key) if plan.kind == "persistent" else None
     )
@@ -555,10 +574,14 @@ def _persistent_fallback(
     want_write = bool(exact and exact.group(7)) or plan.kernel_key.endswith("_write")
     want_fm = bool(exact and exact.group(5)) or "_fm" in plan.kernel_key
     want_authored = bool(exact and exact.group(6)) or "_crfnone" in plan.kernel_key
+    pinned = _cell_pinned_write_keys(plan.arch)
     candidates = []
     for key in table:
         match = _PERSISTENT_KEY.match(key)
         if match is None or int(match.group(1)) != K:
+            continue
+        if key in pinned:
+            # a write-cell program serves its table cells only
             continue
         if bool(match.group(7)) != want_write:
             # the snapshot store exists only in the write variants: never cross that line
@@ -895,6 +918,11 @@ def _persistent_plan_exact(
         if cell is not None:
             key = cell[int(use_pdl)] if isinstance(cell, tuple) else cell
             return _persistent_plan_for_key(arch, num_sms, M, K, use_pdl, key)
+    else:
+        # A round-5 write cell: the dense key its snapshot-write variant derives from.
+        cell = _r2(_WRITE_PERSISTENT_KEY_CELLS, arch, num_sms).get((M, K))
+        if cell is not None:
+            return _persistent_plan_for_key(arch, num_sms, M, K, use_pdl, cell)
     defer = _wait_policy(arch)
     nc, depth = _schedule(arch, M, K, write)
     grid_x, grid_policy = _grid(M, num_sms, nc)
