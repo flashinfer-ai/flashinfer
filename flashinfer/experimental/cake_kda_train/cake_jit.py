@@ -43,7 +43,8 @@ Two records may share one library (``fwdh_v3`` and ``fwdh_p3``: the segmented
 recurrence's first pass and its unfused third pass are launches of one kernel
 with different grids and flags; ``wy_bwd`` and ``wy_fwd_rows``: the backward's
 WY program on the saved ``Akk`` token rows, which the saving forward launches
-too on its overlap rows); every other library has one record.  Four records
+too on its overlap rows and its paired serial rows); every other library has
+one record.  Four records
 launch with the programmatic-stream-serialization attribute
 (``launch["use_pdl"]``: ``fwdh_p3_o_ov`` / ``fwdh_p3_o_ov_id`` and their
 token-row twins ``fwdh_p3_o_ov_rows`` / ``fwdh_p3_o_ov_id_rows``, the pass 2 of
@@ -55,12 +56,14 @@ carry runs and spin on the carry's per-segment release flags, ``flags`` /
 
 The forward has two paths.  ``fwd`` saves the set for the backward (the
 token-row ``Aqk`` / ``Akk`` are written) and its consumers read those rows
-where a program for them ships -- the fused serial recurrence ``fwdh_wy_rows``
-and, on the overlap rows, ``wy_fwd_rows`` and ``fwdh_p3_o_ov_rows`` /
-``fwdh_p3_o_ov_id_rows`` -- so the intra program writes no internal copies
-there; ``fwd_nosave`` (no saved set) launches the internal-row forms
-``fwdh_wy`` / ``wy_fwd`` / ``fwdh_p3_o_ov`` / ``fwdh_p3_o_ov_id`` and the intra
-program writes the internal copies they read.
+where a program for them ships -- the fused serial recurrence ``fwdh_wy_rows``,
+on the overlap rows ``wy_fwd_rows`` and ``fwdh_p3_o_ov_rows`` /
+``fwdh_p3_o_ov_id_rows``, and on the paired serial rows (the 32-column form
+below the fused threshold) ``wy_fwd_rows`` and ``fwdh_o_v2_rows`` -- so the
+intra program writes no internal copies there; ``fwd_nosave`` (no saved set)
+launches the internal-row forms ``fwdh_wy`` / ``wy_fwd`` / ``fwdh_p3_o_ov`` /
+``fwdh_p3_o_ov_id`` / ``fwdh_o_v2`` and the intra program writes the internal
+copies they read (the 64-column serial form keeps them on both paths).
 
 The state recurrences have two routes.  With more than ``SEGMENTS["max_heads"]``
 heads the serial walk over each document's chunk chain runs, in two forms
@@ -153,9 +156,9 @@ PATHS = ("fwd", "fwd_nosave", "light", "light_states", "tape", "replay")
 # launches the record its ``select_rule`` admits; an optional stage launches
 # nothing when no record admits.  The WY representation is two stages:
 # ``wy_fwd`` (the forward's program, on the user's ``v`` / ``beta`` token rows;
-# on the saving forward's overlap rows ``wy_fwd_rows``, the backward's program
-# on the saved ``Akk`` rows) and ``wy`` (the backward's, on the saved or
-# recomputed ``Akk`` rows).
+# on the saving forward's overlap rows and paired serial rows ``wy_fwd_rows``,
+# the backward's program on the saved ``Akk`` rows) and ``wy`` (the backward's,
+# on the saved or recomputed ``Akk`` rows).
 STAGES_FWD = (
     "table",
     "seg_table",
@@ -780,6 +783,14 @@ MODULES: dict[str, dict[str, Any]] = {
                         {"kind": "segments_heads_above", "min": 8192},
                     ],
                 },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "path_in", "paths": ["fwd_nosave"]},
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "slots_above", "slices": 4, "ctas_per_sm": 4},
+                    ],
+                },
             ],
         },
         "stage": "wy_fwd",
@@ -826,30 +837,59 @@ MODULES: dict[str, dict[str, Any]] = {
             "w_out": "w",
         },
         "select_rule": {
-            "kind": "all_of",
+            "kind": "any_of",
             "rules": [
-                {"kind": "heads_at_most", "max": 8},
-                {"kind": "path_in", "paths": ["fwd"]},
                 {
-                    "kind": "any_of",
+                    "kind": "all_of",
                     "rules": [
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "path_in", "paths": ["fwd"]},
                         {
-                            "kind": "all_of",
+                            "kind": "any_of",
                             "rules": [
-                                {"kind": "arch_in", "arches": ["sm_100a", "sm_103a"]},
-                                {"kind": "walk_ctas_at_least", "waves": 3.0},
+                                {
+                                    "kind": "all_of",
+                                    "rules": [
+                                        {
+                                            "kind": "arch_in",
+                                            "arches": ["sm_100a", "sm_103a"],
+                                        },
+                                        {"kind": "walk_ctas_at_least", "waves": 3.0},
+                                    ],
+                                },
+                                {
+                                    "kind": "all_of",
+                                    "rules": [
+                                        {"kind": "arch_in", "arches": ["sm_107a"]},
+                                        {"kind": "walk_ctas_at_least", "waves": 2.3},
+                                    ],
+                                },
                             ],
                         },
+                        {"kind": "segments_heads_at_most", "max": 8192},
+                    ],
+                },
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "path_in", "paths": ["fwd"]},
+                        {"kind": "heads_above", "min": 8},
+                        {"kind": "slots_at_most", "slices": 4, "ctas_per_sm": 4},
                         {
-                            "kind": "all_of",
+                            "kind": "any_of",
                             "rules": [
-                                {"kind": "arch_in", "arches": ["sm_107a"]},
-                                {"kind": "walk_ctas_at_least", "waves": 2.3},
+                                {"kind": "heads_below", "max": 32},
+                                {
+                                    "kind": "all_of",
+                                    "rules": [
+                                        {"kind": "arch_in", "arches": ["sm_107a"]},
+                                        {"kind": "heads_above", "min": 32},
+                                    ],
+                                },
                             ],
                         },
                     ],
                 },
-                {"kind": "segments_heads_at_most", "max": 8192},
             ],
         },
         "stage": "wy_fwd",
@@ -1115,7 +1155,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "all_of",
             "rules": [
-                {"kind": "path_in", "paths": ["fwd", "fwd_nosave"]},
+                {"kind": "path_in", "paths": ["fwd_nosave"]},
                 {"kind": "heads_above", "min": 8},
                 {"kind": "slots_at_most", "slices": 4, "ctas_per_sm": 4},
                 {
@@ -1135,6 +1175,82 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "stage": "fwdh",
         "variant": "o_v2",
+    },
+    "fwdh_o_v2_rows": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "w_tma"],
+            ["buffer", "kg_tma"],
+            ["buffer", "u"],
+            ["buffer", "gk"],
+            ["buffer", "h_out"],
+            ["buffer", "v_new"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "seq_order"],
+            ["buffer", "qg_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["parameter", "write_tapes"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "per_doc_head", "slices": 4},
+        "kernel_symbol": "kernel_cake_kda_train_3f4b037a0a1f8dcc314b",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 103424,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_3f4b037a0a1f8dcc314b",
+        "logical": {
+            "aqk_tma": "aqk_ext",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "gk": "gk",
+            "h_out": "h",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "o_out": "out",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "seq_order": "seq_order",
+            "u": "u",
+            "v_new": "v_new",
+            "w_tma": "w",
+            "write_tapes": "write_tapes",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["fwd"]},
+                {"kind": "heads_above", "min": 8},
+                {"kind": "slots_at_most", "slices": 4, "ctas_per_sm": 4},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "heads_below", "max": 32},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "arch_in", "arches": ["sm_107a"]},
+                                {"kind": "heads_above", "min": 32},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        "stage": "fwdh",
+        "variant": "o_v2_rows",
     },
     "fwdh_wy": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],

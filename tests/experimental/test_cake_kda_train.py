@@ -75,18 +75,21 @@ PDL_RECORDS = (
     "fwdh_p3_o_ov_id_rows",
 )
 # the saving forward's token-row records: where one runs, no program of the path reads the internal Aqk / Akk copies;
-# the forward without a saved set launches their internal-row twins instead
+# the forward without a saved set launches their internal-row twins instead (the paired serial rows -- the 32-column
+# form below the fused threshold -- launch wy_fwd_rows and fwdh_o_v2_rows; the 64-column form keeps the internal rows)
 TOKEN_ROW_RECORDS = (
     "fwdh_wy_rows",
     "wy_fwd_rows",
     "fwdh_p3_o_ov_rows",
     "fwdh_p3_o_ov_id_rows",
+    "fwdh_o_v2_rows",
 )
 INTERNAL_ROW_TWIN = {
     "fwdh_wy_rows": "fwdh_wy",
     "wy_fwd_rows": "wy_fwd",
     "fwdh_p3_o_ov_rows": "fwdh_p3_o_ov",
     "fwdh_p3_o_ov_id_rows": "fwdh_p3_o_ov_id",
+    "fwdh_o_v2_rows": "fwdh_o_v2",
 }
 DAVQ_MIN_H = 16  # the fused gradient hosts dAqk on the serial route from 16 heads
 FEW_CHAINS = 4  # at most four (document, head) chains: the few-chain segmented rows
@@ -278,8 +281,8 @@ TWO_PASS_RECORDS = (
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.MODULES) == 58
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 56
+    assert len(cake_jit.MODULES) == 59
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 57
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert cake_jit.SEGMENTS == {
@@ -454,6 +457,7 @@ def test_registry_records_are_well_formed() -> None:
         ("fwdh_wy", "fwdh_wy_rows"),
         ("fwdh_p3_o_ov", "fwdh_p3_o_ov_rows"),
         ("fwdh_p3_o_ov_id", "fwdh_p3_o_ov_id_rows"),
+        ("fwdh_o_v2", "fwdh_o_v2_rows"),
     ):
         a, b = cake_jit.MODULES[internal], cake_jit.MODULES[rows]
         assert (a["stage"], a["grid_rule"]) == (b["stage"], b["grid_rule"]), rows
@@ -509,6 +513,9 @@ def _expected_records(
     fwd = path in ("fwd", "fwd_nosave")
     # the saving forward reads the saved token rows where a program for them ships
     save = path == "fwd"
+    # the paired serial rows: the 32-column form below the fused threshold reads the saved token rows on the saving
+    # forward (wy_fwd_rows + fwdh_o_v2_rows); the 64-column form keeps the internal-row pair on both paths
+    paired = save and not seg and v2 and not fused_fwd
     walk = nseg * h
     prefetch = walk < DHU_PREFETCH_WAVES_BY_ARCH.get(arch, 0.0) * sm
     tma = walk < DHU_TMA_WAVES * sm or (h <= 4 and walk <= DHU_TMA_WAVES * sm)
@@ -532,7 +539,9 @@ def _expected_records(
         "table": table,
         "seg_table": "seg_table" if seg and not small else None,
         "fwd_intra": "fwd_intra_v14" if intra_tables else "fwd_intra",
-        "wy_fwd": None if fused_fwd else ("wy_fwd_rows" if ov1 and save else "wy_fwd"),
+        "wy_fwd": None
+        if fused_fwd
+        else ("wy_fwd_rows" if (ov1 and save) or paired else "wy_fwd"),
         "seg_carry": None if not seg else ("seg_carry_ov" if ov1 else "seg_carry"),
         "glm_intra": "glm_intra",
         "gate_epilogue": "gate_epilogue",
@@ -552,8 +561,10 @@ def _expected_records(
             out["fwdh"] = "fwdh_v3"
         elif fused_fwd:
             out["fwdh"] = "fwdh_wy_rows" if save else "fwdh_wy"
+        elif v2:
+            out["fwdh"] = "fwdh_o_v2_rows" if paired else "fwdh_o_v2"
         else:
-            out["fwdh"] = "fwdh_o_v2" if v2 else "fwdh_o_v1"
+            out["fwdh"] = "fwdh_o_v1"
     elif path in ("light", "replay"):
         if seg:
             out["fwdh"] = "fwdh_v3"
@@ -695,8 +706,8 @@ def test_every_stage_selects_the_expected_record_and_grid() -> None:
 
 def test_the_saving_forward_reads_the_token_rows_where_a_program_ships() -> None:
     # The intra program writes the internal Aqk / Akk copies (write_int) iff a later program of the path reads them:
-    # never on the saving forward's fused serial rows and overlap rows (their token-row records), always on the
-    # forward without a saved set and on the replay.
+    # never on the saving forward's fused serial rows, overlap rows and paired serial rows (the 32-column form below
+    # the fused threshold: their token-row records), always on the forward without a saved set and on the replay.
     for n in (1, 3, 4, 7, 300):
         for h in (1, 2, 4, 8, 16, 32, 64):
             for sm in (132, 148, 160, 212):
@@ -718,11 +729,24 @@ def test_the_saving_forward_reads_the_token_rows_where_a_program_ships() -> None
                         and walk >= OV1_MIN_WAVES_BY_ARCH[arch] * sm
                         and walk <= OV1_MAX_SEGMENT_HEADS
                     )
-                    assert bool(token) == (fused or ov1), (n, h, sm, arch, token)
+                    paired = (
+                        not seg
+                        and not fused
+                        and n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
+                    )
+                    assert bool(token) == (fused or ov1 or paired), (
+                        n,
+                        h,
+                        sm,
+                        arch,
+                        token,
+                    )
                     if fused:
                         assert token == {"fwdh_wy_rows"}
                     if ov1:
                         assert "wy_fwd_rows" in token and len(token) == 2
+                    if paired:
+                        assert token == {"wy_fwd_rows", "fwdh_o_v2_rows"}
                     assert p.internal_rows("fwd") is (not token), (n, h, sm, arch)
                     assert p.internal_rows("fwd_nosave") is True
                     assert p.internal_rows("replay") is True
@@ -1029,6 +1053,7 @@ def test_the_serial_walk_orders_the_documents_and_the_carry_splits_the_chain() -
         "fwdh_v2h",
         "fwdh_o_v1",
         "fwdh_o_v2",
+        "fwdh_o_v2_rows",
         "fwdh_wy",
         "fwdh_wy_rows",
         "fwdh_wy_bwd",
@@ -1147,7 +1172,8 @@ def test_plan_follows_the_chunk_bound_formulas() -> None:
 
 
 def test_launch_counts_of_the_paths() -> None:
-    # 148 SMs.  Serial rows: 16 heads in the 32-column form (no dav: the fused gradient hosts dAqk), 64 heads in
+    # 148 SMs.  Serial rows: 16 heads in the 32-column form (no dav: the fused gradient hosts dAqk; on the saving
+    # forward the token-row pair wy_fwd_rows + fwdh_o_v2_rows, the same count), 64 heads in
     # the 64-column form (the fused recompute: no WY launch on the light and replay paths).  Segmented rows: four
     # documents at 2 heads (eight chains: the dv-accumulating adjoint, the fused saved-state pass 2) and one
     # document at 4 heads (four chains: the two-CTA adjoint); no dav launch on either (the fused gradient hosts
@@ -1392,7 +1418,7 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    assert len(names) == len(set(names)) == 56 * len(ARCHES)
+    assert len(names) == len(set(names)) == 57 * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"

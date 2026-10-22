@@ -285,10 +285,11 @@ class Plan:
     def internal_rows(self, path: str) -> bool:
         """Whether the intra program writes the internal-layout ``Aqk`` / ``Akk`` copies on ``path`` (its
         ``write_int``): a record of the path other than the intra program itself binds ``aqk_int`` or ``akk_int``.
-        On the saving forward (``"fwd"``) the fused serial recurrence (``fwdh_wy_rows``) and the overlap rows' WY and
-        pass-2 programs (``wy_fwd_rows``, ``fwdh_p3_o_ov_rows`` / ``fwdh_p3_o_ov_id_rows``) read the saved token rows
-        instead, so no copy is written there; the forward without a saved set (``"fwd_nosave"``) and the replay keep
-        the internal-row forms and the copies."""
+        On the saving forward (``"fwd"``) the fused serial recurrence (``fwdh_wy_rows``), the overlap rows' WY and
+        pass-2 programs (``wy_fwd_rows``, ``fwdh_p3_o_ov_rows`` / ``fwdh_p3_o_ov_id_rows``) and the paired serial rows'
+        WY program and 32-column recurrence (``wy_fwd_rows``, ``fwdh_o_v2_rows``) read the saved token rows instead, so
+        no copy is written there; the forward without a saved set (``"fwd_nosave"``), the 64-column serial rows and the
+        replay keep the internal-row forms and the copies."""
         return any(
             {"aqk_int", "akk_int"} & set(cake_jit.MODULES[name]["logical"].values())
             for stage, name in self._records(path).items()
@@ -1449,7 +1450,9 @@ def _forward_recurrence(
     ``seg_carry_ov`` / ``fwdh_p3_o_ov`` (``_id`` above two heads; on the saving forward the ``_rows`` twins, reading
     the saved ``Aqk`` token rows): pass 2 is launched with the programmatic-stream-serialization attribute and
     waits on the carry's per-segment release flags instead of the stream order.  The saving forward's fused serial
-    recurrence is ``fwdh_wy_rows`` (the saved ``Akk`` / ``Aqk`` token rows), the other forward's ``fwdh_wy``."""
+    recurrence is ``fwdh_wy_rows`` (the saved ``Akk`` / ``Aqk`` token rows), the other forward's ``fwdh_wy``; below
+    the fused threshold its 32-column fused-output recurrence is ``fwdh_o_v2_rows`` (the saved ``Aqk`` rows), the
+    other forward's ``fwdh_o_v2`` (the 64-column form keeps ``fwdh_o_v1`` on both)."""
     p = ws.plan
     if p.recur != "seg":
         ws.run("fwdh", {**values, "write_tapes": int(write_tapes)}, path=path)
@@ -1555,10 +1558,11 @@ def chunk_kda_fwd(
     first and writes the chunk tables and the block table itself, no table launch; seven above, with ``table`` and
     ``seg_table`` before it); saving the states moves two output pointers of the recurrence from the arena to the
     saved tensors and adds no launch.  The token-row ``Aqk`` / ``Akk`` are written only with ``save_for_backward``
-    (the ``fwd`` path; ``fwd_nosave`` without it): there the fused serial recurrence (``fwdh_wy_rows``) and the overlap
-    rows' WY and pass-2 programs (``wy_fwd_rows``, ``fwdh_p3_o_ov_rows`` / ``_id_rows``) read those rows and the intra
-    program writes no internal copies (``write_int = 0``, :meth:`Plan.internal_rows`); every other forward keeps the
-    internal-row programs and the copies.  The ``h`` / ``v_new`` tapes are written only in tape mode.  ``workspace``
+    (the ``fwd`` path; ``fwd_nosave`` without it): there the fused serial recurrence (``fwdh_wy_rows``), the overlap
+    rows' WY and pass-2 programs (``wy_fwd_rows``, ``fwdh_p3_o_ov_rows`` / ``_id_rows``) and the paired serial rows' WY
+    program and 32-column recurrence (``wy_fwd_rows``, ``fwdh_o_v2_rows``) read those rows and the intra program writes
+    no internal copies (``write_int = 0``, :meth:`Plan.internal_rows`); every other forward keeps the internal-row
+    programs and the copies.  The ``h`` / ``v_new`` tapes are written only in tape mode.  ``workspace``
     (:class:`KdaWorkspace`, the forward layout at least)
     is reused; without one a workspace is allocated for this call.  ``save_mode=None`` takes the workspace's
     default.
