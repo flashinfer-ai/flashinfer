@@ -39,6 +39,7 @@ from tests.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake_kda_train", "cake_backend")
 cake_build = cake_package("cake_kda_train", "cake_build")
 cake_jit = cake_package("cake_kda_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 ARCHES = tuple(cake_jit.ARCHES)
@@ -1418,7 +1419,10 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    assert len(names) == len(set(names)) == 57 * len(ARCHES)
+    # The 57 programs of cake_jit.MODULES plus the KCP programs of cake_kcp_jit.MODULES (its test-only
+    # TEST_MODULES live in build.test.json, never here).
+    kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
+    assert len(names) == len(set(names)) == (57 + len(kcp_libraries)) * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -1438,8 +1442,18 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
         cake_jit.library_name(name, arch)
         for name in cake_jit.MODULES
         for arch in ARCHES
+    } | {
+        cake_kcp_jit.library_name(name, arch)
+        for name in cake_kcp_jit.MODULES
+        for arch in ARCHES
     }
     assert set(names) == expected
+    test_only = {
+        cake_kcp_jit.test_library_name(name, arch)
+        for name in cake_kcp_jit.TEST_MODULES
+        for arch in ARCHES
+    }
+    assert not test_only & set(names), "test-only programs never enter build.json"
 
 
 def test_library_name_refuses_an_undelivered_architecture() -> None:

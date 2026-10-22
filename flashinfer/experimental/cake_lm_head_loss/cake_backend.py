@@ -196,8 +196,8 @@ GEOMETRY_DEFAULTS: dict[str, Any] = dict(
     hidden_multiple=256,  # H % hidden_multiple == 0
     ld_multiple=8,  # row stride of X in elements (16 B TMA pitch)
     labels_dtype="int64",  # element type the row kernels read (``int32`` = one host cast per call)
-    hidden=None,  # a record pinned to one H (None = any multiple of hidden_multiple: the kernels take H as a launch scalar)
-    vocab=None,  # ... and one V (None = any multiple of vocab_multiple)
+    hidden=None,  # accepted in a record's geometry table and not read: the kernels take H as a launch scalar
+    vocab=None,  # ... and V
     # CTAs per thread-block cluster of each GEMM (the cluster takes adjacent row tiles, so ``m_tiles`` rounds up to it;
     # 2 = the CTA pair, 4 = two pairs sharing the B operand by multicast).  Checked against the module's launch cluster:
     # a module launched with a preferred cluster dimension (two pairs sharing the A operand where the GPC topology allows,
@@ -776,8 +776,6 @@ class Geometry:
     hidden_multiple: int
     ld_multiple: int
     labels_dtype: torch.dtype
-    hidden: Optional[int] = None
-    vocab: Optional[int] = None
     logits_cluster_ctas: int = 2
     dx_cluster_ctas: int = 2
     dw_cluster_ctas: int = 2
@@ -817,8 +815,6 @@ class Geometry:
                 if name != "labels_dtype" and name not in _GEOMETRY_OPTIONAL
             },
             labels_dtype=LABEL_DTYPES[raw["labels_dtype"]],
-            hidden=None if raw["hidden"] is None else int(raw["hidden"]),
-            vocab=None if raw["vocab"] is None else int(raw["vocab"]),
         )
 
     def row_tiles(self, rows: int, cluster_ctas: Optional[int] = None) -> int:
@@ -862,19 +858,15 @@ def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
     return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
 
 
-def record_for(
-    device: Optional[torch.device] = None,
-    hidden: Optional[int] = None,
-    vocab: Optional[int] = None,
-) -> tuple[str, dict[str, Any]]:
-    """``(module_name, record)`` registered for ``device`` and the ``(hidden, vocab)`` geometry (when given; else the
-    architecture's default-geometry record, see :func:`cake_jit.select_module`); raises when absent."""
+def record_for(device: Optional[torch.device] = None) -> tuple[str, dict[str, Any]]:
+    """``(module_name, record)`` registered for ``device`` (the architecture's sole record, see
+    :func:`cake_jit.select_module`); raises when absent."""
     arch = arch_for(device)
     if arch is None:
         raise ValueError(
             "the chunked LM-head + loss kernels require compute capability 10.0 or 10.3"
         )
-    name = select_module(arch, hidden, vocab)
+    name = select_module(arch)
     return name, MODULES[name]
 
 
@@ -1050,94 +1042,18 @@ def recommended_k_slices(
     return best
 
 
-# --------------------------------------------------------------------------- co-resident clusters
-
-_PROBE_KERNEL = "cake_lm_head_loss_cluster_probe"
-_PROBE_SOURCE = f'extern "C" __global__ void {_PROBE_KERNEL}() {{}}\n'
-
-
-@functools.lru_cache(maxsize=None)
-def _probe_cluster_capacity(device_index: int, cluster_ctas: int) -> int:
-    """``cuOccupancyMaxActiveClusters`` of an empty probe kernel launched with the device's maximum opt-in dynamic shared
-    memory (one CTA per SM) in ``cluster_ctas``-wide clusters.  The part's GPC topology after floorsweeping decides the
-    answer, not ``SMs // cluster_ctas`` (a 148-SM B200 holds 33 four-CTA clusters, a 152-SM GB300 36)."""
-    from ...cuda_utils import checkCudaErrors, driver, nvrtc
-
-    with torch.cuda.device(device_index):
-        torch.empty(1, device="cuda")  # primary context
-        major, minor = torch.cuda.get_device_capability(device_index)
-        prog = checkCudaErrors(
-            nvrtc.nvrtcCreateProgram(_PROBE_SOURCE.encode(), b"probe.cu", 0, [], [])
-        )
-        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
-        checkCudaErrors(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
-        size = checkCudaErrors(nvrtc.nvrtcGetCUBINSize(prog))
-        cubin = b" " * size
-        checkCudaErrors(nvrtc.nvrtcGetCUBIN(prog, cubin))
-        checkCudaErrors(nvrtc.nvrtcDestroyProgram(prog))
-        ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(device_index))
-        try:
-            checkCudaErrors(driver.cuCtxSetCurrent(ctx))
-            module = checkCudaErrors(driver.cuModuleLoadData(cubin))
-            try:
-                func = checkCudaErrors(
-                    driver.cuModuleGetFunction(module, _PROBE_KERNEL.encode())
-                )
-                smem = checkCudaErrors(
-                    driver.cuDeviceGetAttribute(
-                        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-                        device_index,
-                    )
-                )
-                checkCudaErrors(
-                    driver.cuFuncSetAttribute(
-                        func,
-                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        smem,
-                    )
-                )
-                attr = driver.CUlaunchAttribute()
-                attr.id = (
-                    driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
-                )
-                attr.value.clusterDim.x = int(cluster_ctas)
-                attr.value.clusterDim.y = 1
-                attr.value.clusterDim.z = 1
-                config = driver.CUlaunchConfig()
-                config.gridDimX = int(cluster_ctas)
-                config.gridDimY = 1
-                config.gridDimZ = 1
-                config.blockDimX = 128
-                config.blockDimY = 1
-                config.blockDimZ = 1
-                config.sharedMemBytes = smem
-                config.attrs = [attr]
-                config.numAttrs = 1
-                count = int(
-                    checkCudaErrors(driver.cuOccupancyMaxActiveClusters(func, config))
-                )
-            finally:
-                checkCudaErrors(driver.cuModuleUnload(module))
-        finally:
-            checkCudaErrors(driver.cuDevicePrimaryCtxRelease(device_index))
-    return max(1, count)
-
-
 def cluster_resident(
     device: Optional[torch.device], cluster_ctas: int, num_sms: int
 ) -> int:
     """Co-resident clusters of ``cluster_ctas`` CTAs at one CTA per SM on ``device``: the SM pairs for the two-CTA
-    cluster (the source launcher's rule), the driver's occupancy answer (:func:`_probe_cluster_capacity`) for wider
-    clusters.  The persistent GEMM grids and the dX slice rule take it as ``resident``."""
+    cluster (the source launcher's rule).  Every registered launch is one or two CTAs wide; a wider cluster is
+    rejected.  The dX slice rule takes it as ``resident``."""
     cluster_ctas = int(cluster_ctas)
     if cluster_ctas <= 2:
         return max(1, int(num_sms) // max(1, cluster_ctas))
-    if device is None or device.type != "cuda":
-        raise ValueError(
-            f"the co-resident count of {cluster_ctas}-CTA clusters needs a CUDA device"
-        )
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return _probe_cluster_capacity(int(index), cluster_ctas)
+    raise ValueError(
+        f"the co-resident count of {cluster_ctas}-CTA clusters is not supported: every registered launch is one or two CTAs wide"
+    )
 
 
 def _dx_reduce(values: dict[str, Any]) -> None:
@@ -1636,18 +1552,16 @@ def generated_program_available(
     device: Optional[torch.device] = None,
     *,
     entry: str = "loss",
-    hidden: Optional[int] = None,
-    vocab: Optional[int] = None,
 ) -> bool:
-    """True when this checkout registers a contract program for ``device`` (and the ``(hidden, vocab)`` geometry when
-    given) with every stage the entry point needs -- the base stages plus every variant the per-chunk instance rules
-    can select for the record's geometry and architecture (:func:`reachable_variants`)."""
+    """True when this checkout registers a contract program for ``device`` with every stage the entry point needs --
+    the base stages plus every variant the per-chunk instance rules can select for the record's geometry and
+    architecture (:func:`reachable_variants`)."""
     arch = arch_for(device)
     if arch is None:
         return False
     try:
-        name = select_module(arch, hidden, vocab)
-    except (NotImplementedError, ValueError):
+        name = select_module(arch)
+    except NotImplementedError:
         return False
     record = MODULES[name]
     if str(record.get("abi", ABI_CONTRACT)) != ABI_CONTRACT:
@@ -1764,14 +1678,6 @@ def validate_lm_head_inputs(
     if vocab % geometry.logits_item_cols:
         raise ValueError(
             f"V must be a multiple of the {geometry.logits_item_cols}-column logits work item, got {vocab}"
-        )
-    if geometry.hidden is not None and hidden != geometry.hidden:
-        raise ValueError(
-            f"the registered program is specialized to H = {geometry.hidden}, got {hidden}"
-        )
-    if geometry.vocab is not None and vocab != geometry.vocab:
-        raise ValueError(
-            f"the registered program is specialized to V = {geometry.vocab}, got {vocab}"
         )
     if X.stride(1) != 1:
         raise ValueError("X rows must be contiguous (stride(1) == 1)")
@@ -2392,8 +2298,8 @@ def lm_head_loss_workspace_size(
     need_dx: bool = True,
     compact_rows: bool = False,
 ) -> int:
-    """Workspace bytes :func:`prepare_lm_head_loss` needs for ``(T, V, C)`` on ``device`` (``hidden`` = ``H``;
-    defaults to the registered program's pinned hidden size).  ``compact_rows`` adds the gather buffer of the
+    """Workspace bytes :func:`prepare_lm_head_loss` needs for ``(T, V, C)`` on ``device`` (``hidden`` = ``H``,
+    required for the compacted path and for a program with K-sliced dX stages).  ``compact_rows`` adds the gather buffer of the
     compacted path; sized for ``T`` rows it bounds every valid-row count -- including the K-slice slabs of a
     compacted plan, whose tail chunk (the valid-row count modulo ``C``) may take more slices than any full-``T``
     chunk (the slab count is taken over every possible tail row count as well)."""
@@ -2412,10 +2318,10 @@ def lm_head_loss_workspace_size(
                 compact=compact_rows,
             )["total"]
         )
-    name, record = record_for(device, hidden, int(vocab))
+    name, record = record_for(device)
     stages = registered_stages(name)
     geometry = Geometry.from_record(record)
-    hidden = geometry.hidden if hidden is None else int(hidden)
+    hidden = None if hidden is None else int(hidden)
     slabs = 0
     if need_dx and dx_max_slices(stages) > 1:
         if hidden is None:
@@ -2486,21 +2392,15 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
 _GRID_FUNCTIONS = {"min": min, "max": max}
 
 
-def grid_dims(
-    rule, scalars: dict[str, Any], num_sms: int, resident: Optional[int] = None
-) -> tuple[int, int, int]:
+def grid_dims(rule, scalars: dict[str, Any], num_sms: int) -> tuple[int, int, int]:
     """Evaluate a registry grid rule.
 
     Each of the three entries is an integer or an integer expression over the
     scalar names of the stage's host values (``rows_c``, ``m_tiles``, ``V``,
-    ``num_vecs``, ...), ``sms`` (the SM count) and ``resident`` (the co-resident
-    clusters of the stage's cluster width, :func:`cluster_resident`; only a
-    clustered stage provides it) with ``+``, ``-``, ``*``, ``/`` (rounds up),
-    ``//`` (rounds down), parentheses and ``min`` / ``max``: ``"rows_c/8"`` (one
-    CTA per eight rows), ``"max(1, min(m_tiles//4*24, resident))*4"`` (a
-    persistent four-CTA cluster grid capped by the co-resident clusters),
-    ``"max(1, m_tiles//2*605)*2"`` (the whole work-item domain of a dynamically
-    scheduled kernel).
+    ``num_vecs``, ...) and ``sms`` (the SM count) with ``+``, ``-``, ``*``,
+    ``/`` (rounds up), ``//`` (rounds down), parentheses and ``min`` / ``max``:
+    ``"rows_c/8"`` (one CTA per eight rows), ``"max(1, m_tiles//2*605)*2"`` (the
+    whole work-item domain of a dynamically scheduled kernel).
     """
     if len(rule) != 3:
         raise ValueError("grid rule must have three entries")
@@ -2513,8 +2413,6 @@ def grid_dims(
         if isinstance(value, int) and not isinstance(value, bool)
     }
     names["sms"] = int(num_sms)
-    if resident is not None:
-        names["resident"] = int(resident)
     x, y, z = (_grid_term(value, names) for value in rule)
     return max(1, x), max(1, y), max(1, z)
 
@@ -3540,16 +3438,10 @@ def _bind_all(
             raise ValueError(
                 f"stage {stage!r}: the record's geometry declares {declared}-CTA clusters, its module launches {tuple(cluster)}"
             )
-        resident = (
-            cluster_resident(device, cluster_ctas, num_sms)
-            if cluster_ctas > 1
-            else None
-        )
         grid = grid_dims(
             physical.get("grid", ["rows_c", 1, 1]),
             values[key],
             num_sms,
-            resident=resident,
         )
         if cluster_ctas > 1 and any(g % c for g, c in zip(grid, cluster, strict=True)):
             raise ValueError(
@@ -3644,11 +3536,7 @@ def prepare_lm_head_loss(
     if backend == "cake":
         if not X.is_cuda:
             raise ValueError("the cake backend needs CUDA tensors")
-        module_name, record = record_for(
-            device,
-            int(X.shape[-1]) if X.ndim == 2 else None,
-            int(W.shape[0]) if W.ndim == 2 else None,
-        )
+        module_name, record = record_for(device)
         record_abi(record)
     geometry = Geometry.from_record(record)
     problem = validate_lm_head_inputs(
@@ -4509,7 +4397,7 @@ def _hidden_count(
     :func:`valid_rows` path."""
     if not (compact and backend == "cake" and hidden_count):
         return None
-    module_name, record = record_for(X.device, problem.hidden, problem.vocab)
+    module_name, record = record_for(X.device)
     if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
         return None
     return _hidden_count_begin(
@@ -4985,7 +4873,7 @@ def dw_cast(
         acc = product if dw_acc is None else dw_acc + product
         out.copy_(acc * g)
         return out
-    module_name, record = record_for(device, H, int(V))
+    module_name, record = record_for(device)
     record_abi(record)
     # the last chunk's form and scalars: the raster / block rules of the record's architecture on this chunk's rows, or
     # the explicit knobs (the block rule and knob apply to the fp32 cast only; the bf16 cast keeps the 1-D raster)

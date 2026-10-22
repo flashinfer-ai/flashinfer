@@ -96,10 +96,8 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
 
 
 
-// Source-faithful plain CTA wait: no .sem/.scope qualifier, which PTX reads as
-// .acquire.cta, for a typed protocol whose source spells none (FA4's interior
-// P-ready edge).
-__device__ __forceinline__ void mbarrier_wait_plain(int mbar_addr, int phase) {
+
+__device__ __forceinline__ void mbarrier_wait_plain_nonuniform(int mbar_addr, int phase) {
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
@@ -326,7 +324,7 @@ kernel_cake_kimi_k3_attn_res_24cdf95cfa946fb4eca2(__nv_bfloat16* __restrict__ ou
                 for (int token = bid; token < M; token += num_bids) {
                     #pragma unroll
                     for (int chunk = 0; chunk < 3; chunk++) {
-                        mbarrier_wait_plain(consumed_addr + (stage) * 8, phase_flipped);
+                        mbarrier_wait_plain_nonuniform(consumed_addr + (stage) * 8, phase_flipped);
                         mbarrier_arrive_expect_tx(ready_addr + (stage) * 8, ((chunk < 2) ? 3 : 2) * 7168 * 2);
                         #pragma unroll
                         for (int row = 0; row < ((chunk < 2) ? 3 : 1); row++) {
@@ -453,7 +451,7 @@ kernel_cake_kimi_k3_attn_res_24cdf95cfa946fb4eca2(__nv_bfloat16* __restrict__ ou
                 float sum_running = 0.0f;
                 #pragma unroll
                 for (int chunk_1 = 0; chunk_1 < 3; chunk_1++) {
-                    mbarrier_wait_plain(ready_addr + (cstage) * 8, cphase);
+                    mbarrier_wait_plain_nonuniform(ready_addr + (cstage) * 8, cphase);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float2 sq[3];
                     float2 dot[3];
@@ -776,7 +774,7 @@ kernel_cake_kimi_k3_attn_res_24cdf95cfa946fb4eca2(__nv_bfloat16* __restrict__ ou
                     output_sq_pair = fma_f32x2_rn_noftz(v_8, v_8, output_sq_pair);
                 }
                 if (token_1 == bid) {
-                    mbarrier_wait_plain(norm_ready_addr, 0);
+                    mbarrier_wait_plain_nonuniform(norm_ready_addr, 0);
                 }
                 float output_sq = output_sq_pair.x + output_sq_pair.y;
                 float _shfl_xor_sync_17 = __shfl_xor_sync(0xFFFFFFFF, output_sq, 16);

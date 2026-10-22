@@ -1075,11 +1075,12 @@ def test_every_record_resolves_on_the_running_architecture():
     for name, record in cake_jit.MODULES.items():
         assert arch in record["arches"]
         assert cake_jit.library_name(name, arch) in libraries
-        # The exporter filled the derived leaves: the argument plan names every kernel parameter in order and
-        # the three grid arguments; the launch record is a real one.
+        # The exporter filled the derived leaves: the argument plan names every kernel parameter in order, the
+        # per-call PDL switch of a decode or merge record right before the grid (none for the quantizer) and the
+        # three grid arguments; the launch record is a real one.
         assert record["kernel_symbol"]
         plan = record["arg_plan"]
-        assert [key for kind, key in plan if kind != "grid"] == list(
+        assert [key for kind, key in plan if kind not in ("grid", "launch")] == list(
             parameters[record["stage"]]
         )
         assert [key for kind, key in plan if kind == "grid"] == [
@@ -1088,9 +1089,15 @@ def test_every_record_resolves_on_the_running_architecture():
             "grid_z",
         ]
         launch = record["launch"]
+        launches = [i for i, (kind, _) in enumerate(plan) if kind == "launch"]
+        if launch["use_pdl"] == "runtime":
+            assert launches == [len(plan) - 4]
+            assert plan[len(plan) - 4][1] == cake_jit.LAUNCH_ARGUMENT
+        else:
+            assert launches == [] and launch["use_pdl"] is False
         assert len(launch["block"]) == 3 and launch["block"][0] > 0
         assert len(launch["cluster"]) == 3 and all(c >= 1 for c in launch["cluster"])
-        assert launch["dynamic_smem_bytes"] >= 0 and isinstance(launch["use_pdl"], bool)
+        assert launch["dynamic_smem_bytes"] >= 0
     # The decode launches clusters (a required cluster of two, a preferred one of four); the others are plain CTAs.
     assert cake_jit.MODULES["decode"]["launch"]["cluster"][0] > 1
     assert cake_jit.MODULES["decode_full"]["launch"]["cluster"][0] > 1
@@ -1130,6 +1137,10 @@ def test_registry_records_follow_the_plan_vocabulary():
         params = parameters[record["stage"]]
         assert set(record["logical"]) == set(params), name
         assert all(k == v for k, v in record["logical"].items()), name
+        # The decode and the merge take the per-call PDL switch; the quantizer launches plain.
+        assert record["launch"]["use_pdl"] == (
+            "runtime" if record["stage"] in ("decode", "merge") else False
+        ), name
         for key in params:
             assert key in cake_jit.LOGICAL_TENSORS or key in cake_jit.LOGICAL_SCALARS, (
                 key
@@ -1375,6 +1386,29 @@ def test_plan_invariants(sm_count):
             pairs=pairs,
             split=(1, 40),
         )
+
+
+def test_pdl_follows_the_plan():
+    """The decode and the merge launch with programmatic dependent launch when the plan has a split merge and its
+    decode is one wave of clusters (``items <= units``); the switch is a pure function of the plan."""
+    import dataclasses
+
+    units, pairs = cake_backend.units_pairs_for_sm_count(208)
+    p = cake_backend.plan(
+        seq_lens_host=[65536], num_heads=96, q_len=1, units=units, pairs=pairs
+    )
+    assert cake_backend.pdl_for(p) is (p.max_splits > 1 and p.items <= p.units)
+    one_wave = dataclasses.replace(p, max_splits=2, items=units)
+    assert cake_backend.pdl_for(one_wave) is True
+    # A second wave of clusters: the early-launched merge would take its SMs.
+    assert cake_backend.pdl_for(dataclasses.replace(one_wave, items=units + 1)) is False
+    # No merge: nothing behind the decode to overlap.
+    assert cake_backend.pdl_for(dataclasses.replace(one_wave, max_splits=1)) is False
+    # The owner's largest row (Q8, B64) has more items than clusters on every board: plain launches.
+    wide = cake_backend.plan(
+        seq_lens_host=[65536] * 64, num_heads=96, q_len=8, units=units, pairs=pairs
+    )
+    assert wide.items > wide.units and cake_backend.pdl_for(wide) is False
 
 
 def test_plan_rejects_malformed_problems():

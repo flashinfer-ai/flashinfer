@@ -24,7 +24,12 @@ record carries the host plan only: the program's ``library`` stem (its
 delivered for, the ``stage`` of the launch order it fills and its ``variant``,
 the ``select_rule`` that picks one variant of a stage from the host-known
 plan scalars, the ``grid_rule`` that shapes its launch, the kernel-parameter
--> logical-argument map and the argument plan of its ``run`` entry.  What to
+-> logical-argument map and the argument plan of its ``run`` entry.  The
+decode and merge records launch under ``launch.use_pdl = "runtime"``: their
+plans carry the ``launch`` argument ``enable_pdl`` (0 or 1) right before the
+grid, and the host sets it per plan (``cake_backend.pdl_for``: on when a split
+merge exists and the decode is one wave of clusters, off otherwise; the
+quantizer launches without the attribute and triggers its dependents).  What to
 compile -- sources, digests, nvcc flags -- is recorded once in ``build.json``
 next to this file; :mod:`.cake_build` serves the library from a prebuilt
 ``aot/`` file when a builder compiled it and otherwise through FlashInfer's
@@ -70,6 +75,10 @@ STAGES = ("quantize", "decode", "merge")
 # The merge's split-slot bound: a row has at most this many partials (two per
 # lane of the merge's statistics pass).
 MAX_SPLITS = 64
+# The ``launch`` argument of a record whose ``launch.use_pdl`` is ``"runtime"``
+# (the decode and the merge): ``run`` takes it right before the grid, 1 adds
+# the programmatic-dependent-launch attribute to the call, 0 launches plain.
+LAUNCH_ARGUMENT = "enable_pdl"
 
 # Logical argument names the host backend binds: the kernels' own parameter
 # names (``record["logical"]`` is the identity map).  Decode: ``QN`` / ``QS`` /
@@ -233,6 +242,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "O_T16"],
             ["buffer", "PO_T16"],
             ["parameter", "n_full"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -245,7 +255,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (2, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 323584,
-            "use_pdl": False,
+            "use_pdl": "runtime",
         },
         "library": "cake_rubin_mla_nvfp4_decode_211b49b794a7df09262e",
         "logical": {
@@ -319,6 +329,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "O_T16"],
             ["buffer", "PO_T16"],
             ["parameter", "n_full"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -331,7 +342,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (2, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 323584,
-            "use_pdl": False,
+            "use_pdl": "runtime",
         },
         "library": "cake_rubin_mla_nvfp4_decode_8d0e1f24232434e74d49",
         "logical": {
@@ -381,6 +392,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "rows"],
             ["parameter", "num_split"],
             ["parameter", "has_lse"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -393,7 +405,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 2048,
-            "use_pdl": True,
+            "use_pdl": "runtime",
         },
         "library": "cake_rubin_mla_nvfp4_decode_3a007c4be08b7b22f587",
         "logical": {
@@ -419,6 +431,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "rows"],
             ["parameter", "num_split"],
             ["parameter", "has_lse"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -431,7 +444,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 2048,
-            "use_pdl": True,
+            "use_pdl": "runtime",
         },
         "library": "cake_rubin_mla_nvfp4_decode_6fd468e4645fbef52b7e",
         "logical": {
@@ -457,6 +470,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "rows"],
             ["parameter", "num_split"],
             ["parameter", "has_lse"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -469,7 +483,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 2048,
-            "use_pdl": True,
+            "use_pdl": "runtime",
         },
         "library": "cake_rubin_mla_nvfp4_decode_66cbdc7d0d294087c5da",
         "logical": {
@@ -682,10 +696,11 @@ def specs_for_arch(arch: str) -> list[Any]:
 
 
 @functools.cache
-def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
-    """The record's plan as ``(logical name, -1)`` per kernel parameter (buffers,
-    TMA operands and scalars alike) and ``(None, axis)`` per grid argument, in
-    ``run`` order; computed once."""
+def _argument_plan(name: str) -> tuple[tuple[str, Any], ...]:
+    """The record's plan in ``run`` order, computed once: ``("value", logical
+    name)`` per kernel parameter (buffers, TMA operands and scalars alike),
+    ``("launch", None)`` for the per-call PDL switch of a record under
+    ``use_pdl = "runtime"`` and ``("grid", axis)`` per grid argument."""
     record = MODULES[name]
     logical = record["logical"]
     if not record["arg_plan"]:
@@ -693,16 +708,22 @@ def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
             f"record {name} has no argument plan: the package was not exported "
             "(the exporter writes the derived leaves of cake_jit.MODULES)"
         )
-    plan: list[tuple[str | None, int]] = []
+    plan: list[tuple[str, Any]] = []
     for kind, key in record["arg_plan"]:
         if kind == "grid":
-            plan.append((None, "xyz".index(key[-1])))
+            plan.append(("grid", "xyz".index(key[-1])))
+        elif kind == "launch":
+            if key != LAUNCH_ARGUMENT:
+                raise ValueError(
+                    f"record {name}: launch argument {key!r} is not {LAUNCH_ARGUMENT!r}"
+                )
+            plan.append(("launch", None))
         else:
             if key not in logical:
                 raise ValueError(
                     f"record {name}: kernel parameter {key!r} has no logical name"
                 )
-            plan.append((logical[key], -1))
+            plan.append(("value", logical[key]))
     return tuple(plan)
 
 
@@ -712,25 +733,39 @@ def run_module(
     *,
     grid: tuple[int, int, int],
     device_index: int,
+    enable_pdl: int = 0,
 ) -> None:
     """Launch record ``name`` with logical argument ``values`` on ``grid``.
 
     ``values`` maps the names of ``LOGICAL_TENSORS`` / ``LOGICAL_SCALARS`` to
     tensors and Python scalars; the record maps its kernel parameters onto that
     vocabulary and ``grid`` is the plan's launch grid (:func:`launch_grid`).
-    The kernel runs on the current torch stream of the device.
+    ``enable_pdl`` (0 or 1) is the per-call programmatic-dependent-launch
+    switch of a record under ``launch.use_pdl = "runtime"`` (the decode and the
+    merge; the host sets it from the plan, ``cake_backend.pdl_for``); a record
+    launched with a fixed attribute (the quantizer) takes none, so a truthy
+    ``enable_pdl`` for it is refused.  The kernel runs on the current torch
+    stream of the device.
     """
     record = MODULES[name]
+    plan = _argument_plan(name)
+    if enable_pdl and ("launch", None) not in plan:
+        raise ValueError(
+            f"record {name} takes no per-call launch switch (launch.use_pdl is "
+            f"{record['launch']['use_pdl']!r}); enable_pdl must be 0"
+        )
     args = []
-    for logical_name, axis in _argument_plan(name):
-        if logical_name is None:
-            args.append(int(grid[axis]))
+    for kind, key in plan:
+        if kind == "grid":
+            args.append(int(grid[key]))
+        elif kind == "launch":
+            args.append(int(bool(enable_pdl)))
         else:
             try:
-                args.append(values[logical_name])
+                args.append(values[key])
             except KeyError:
                 raise ValueError(
-                    f"record {name} needs logical argument {logical_name!r}"
+                    f"record {name} needs logical argument {key!r}"
                 ) from None
     module = load(name, device_arch(device_index))
     with tvm_ffi.use_torch_stream():
@@ -741,6 +776,7 @@ __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "DECODE_PARAMETERS",
+    "LAUNCH_ARGUMENT",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MAX_SPLITS",

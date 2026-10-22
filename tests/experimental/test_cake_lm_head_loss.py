@@ -269,6 +269,42 @@ def _same(a, b) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_KERNEL_SOURCE_RE = re.compile(
+    r"^csrc/cake_lm_head_loss/cake_lm_head_loss_([0-9a-f]{20})_kernel\.cu$"
+)
+_PROGRAM_KERNEL_DEFINITION_RE = re.compile(
+    r"^-DCAKE_PROGRAM_KERNEL=(kernel_cake_lm_head_loss_[0-9a-f]{20})$"
+)
+_PROGRAM_KERNEL_DEFAULT_RE = re.compile(
+    r"^#ifndef CAKE_PROGRAM_KERNEL\n"
+    r"#define CAKE_PROGRAM_KERNEL (kernel_cake_lm_head_loss_[0-9a-f]{20})\n"
+    r"#endif$",
+    re.MULTILINE,
+)
+
+
+def _kernel_source_symbol(entry, package):
+    """The unit whose kernel translation unit a library compiles and the kernel symbol
+    that source defines for it: the library's own unit spelling its symbol literally, or a
+    shared unit whose source defaults ``CAKE_PROGRAM_KERNEL`` to its own symbol and takes
+    a sibling form's symbol from the library's compile definitions."""
+    kernel_unit = _KERNEL_SOURCE_RE.match(entry["sources"][0]).group(1)
+    text = (package / entry["sources"][0]).read_text()
+    own = f"kernel_cake_lm_head_loss_{kernel_unit}"
+    defaults = _PROGRAM_KERNEL_DEFAULT_RE.findall(text)
+    carried = [
+        m.group(1)
+        for m in map(_PROGRAM_KERNEL_DEFINITION_RE.match, entry["nvcc_flags"])
+        if m is not None
+    ]
+    assert len(defaults) <= 1 and len(carried) <= 1, entry["name"]
+    if not defaults:  # a unit of its own: the source spells its symbol
+        assert not carried and own in text, entry["name"]
+        return kernel_unit, own
+    assert defaults[0] == own and "CAKE_PROGRAM_KERNEL(" in text, entry["name"]
+    return kernel_unit, carried[0] if carried else own
+
+
 def test_registry_records_are_well_formed():
     assert cake_jit.STAGES == (
         "gather_rows_bf16",
@@ -316,16 +352,9 @@ def test_registry_records_are_well_formed():
         assert record["arch"] in SUPPORTED_COMPUTE_CAPABILITIES.values()
         assert record_abi(record) in SUPPORTED_ABIS
         assert (
-            cake_jit.select_module(record["arch"], *cake_jit.record_geometry(record))
-            == name
-        )
-        if name == cake_jit.PRIMARY_RECORD.format(arch=record["arch"]):
-            assert cake_jit.select_module(record["arch"]) == name
+            cake_jit.select_module(record["arch"]) == name
+        )  # one record per architecture
         geometry = Geometry.from_record(record)
-        assert (
-            geometry.hidden is None or geometry.hidden % geometry.hidden_multiple == 0
-        )
-        assert geometry.vocab is None or geometry.vocab % geometry.vocab_multiple == 0
         for op in (
             "logits",
             "dx",
@@ -366,13 +395,19 @@ def test_registry_records_are_well_formed():
             assert int(physical.get("tma_workspace_bytes", 0)) >= 0
             assert int(physical.get("workspace_bytes", 0)) >= 0
             kernel, launch = (s.removeprefix("csrc/") for s in entry["sources"])
-            # one architecture-neutral translation unit per kernel (no architecture directory)
-            assert kernel == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_kernel.cu"
+            # one architecture-neutral translation unit per kernel (no architecture directory);
+            # a sibling form's library compiles the shared unit's file and names its own
+            # kernel through CAKE_PROGRAM_KERNEL in its compile definitions
+            kernel_unit, defined = _kernel_source_symbol(entry, package)
+            assert (
+                kernel == f"cake_lm_head_loss/cake_lm_head_loss_{kernel_unit}_kernel.cu"
+            )
+            assert kernel_unit == unit or defined == f"kernel_cake_lm_head_loss_{unit}"
             assert launch == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_launch.cu"
             csrc = package / "csrc"
             assert (csrc / kernel).is_file() and (csrc / launch).is_file()
             symbol = f"kernel_{physical['module']}"
-            assert symbol in (csrc / kernel).read_text()
+            assert defined == symbol
             stub = (csrc / launch).read_text()
             assert f"#define CAKE_KERNEL_SYMBOL {symbol}\n" in stub
             shim = re.search(
@@ -696,16 +731,6 @@ def _cuda_scalar():
             NotImplementedError,
             "deterministic",
         ),
-        (
-            lambda kw: dict(
-                kw,
-                geometry=Geometry.from_record(
-                    {"geometry": {"hidden": DEFAULT_H, "vocab": DEFAULT_V}}
-                ),
-            ),
-            ValueError,
-            "specialized",
-        ),
     ],
     ids=[
         "x_fp32",
@@ -731,7 +756,6 @@ def _cuda_scalar():
         "unknown_objective",
         "logprob_with_objective_args",
         "nondeterministic",
-        "pinned_geometry",
     ],
 )
 def test_validate_rejects(mutate, exc, match):
@@ -865,11 +889,8 @@ def test_grid_dims_holds_no_reference_to_the_host_values():
             "out": None,
         }
         assert grid_dims(
-            ["max(1, min(m_tiles//4*24, resident))*4", "rows_c/8", "num_vecs"],
-            scalars,
-            148,
-            resident=30,
-        ) == (120, 513, 9)
+            ["max(1, m_tiles//4*24)*4", "rows_c/8", "num_vecs"], scalars, 148
+        ) == (768, 513, 9)
         del scalars, acc
         assert ref() is None, (
             "grid_dims left a reference cycle over the host values (freed only by the cyclic GC)"
@@ -925,19 +946,6 @@ def test_grid_dims():
 
 def test_grid_dims_resident():
     scalars = {"m_tiles": 32}
-    # a persistent four-CTA cluster grid is capped by the co-resident clusters (the occupancy answer, not sms // 4)
-    assert grid_dims(
-        ["max(1, min(m_tiles//4*24, resident))*4", 1, 1], scalars, 148, resident=33
-    ) == (132, 1, 1)
-    assert grid_dims(
-        ["max(1, min(m_tiles//4*24, resident))*4", 1, 1],
-        {"m_tiles": 4},
-        148,
-        resident=33,
-    ) == (96, 1, 1)
-    assert grid_dims(
-        ["max(1, min(m_tiles//2*24, resident))*2", 1, 1], scalars, 148, resident=74
-    ) == (148, 1, 1)
     # a dynamically scheduled kernel launches its whole work-item domain
     assert grid_dims(["max(1, m_tiles//2*605)*2", 1, 1], scalars, 148) == (19360, 1, 1)
     with pytest.raises(
@@ -2012,65 +2020,25 @@ def test_toolchain_runs_hidden_count(monkeypatch):
         assert cake_jit.toolchain_runs_hidden_count("sm_100a") is True, version
 
 
-def test_select_module_by_geometry(monkeypatch):
-    def rec(arch, H, V):
-        return {
-            "arch": arch,
-            "abi": ABI_CONTRACT,
-            "geometry": {"hidden": H, "vocab": V},
-            "stages": [],
-        }
+def test_select_module_one_record_per_arch(monkeypatch):
+    def rec(arch):
+        return {"arch": arch, "abi": ABI_CONTRACT, "geometry": {}, "stages": []}
 
     monkeypatch.setattr(
         cake_jit,
         "MODULES",
         {
-            "cake_lm_head_loss_sm_100a": rec("sm_100a", 6144, 154880),
-            "cake_lm_head_loss_sm_100a_h7168_v129280": rec("sm_100a", 7168, 129280),
-            "cake_lm_head_loss_sm_103a_h8192_v128256": rec("sm_103a", 8192, 128256),
+            "cake_lm_head_loss_sm_100a": rec("sm_100a"),
+            "cake_lm_head_loss_sm_103a": rec("sm_103a"),
         },
     )
-    assert (
-        cake_jit.select_module("sm_100a") == "cake_lm_head_loss_sm_100a"
-    )  # the default-geometry record
-    assert (
-        cake_jit.select_module("sm_100a", 6144, 154880) == "cake_lm_head_loss_sm_100a"
-    )
-    assert (
-        cake_jit.select_module("sm_100a", 7168, 129280)
-        == "cake_lm_head_loss_sm_100a_h7168_v129280"
-    )
-    assert (
-        cake_jit.select_module("sm_103a") == "cake_lm_head_loss_sm_103a_h8192_v128256"
-    )  # the sole record
-    assert (
-        cake_jit.select_module("sm_103a", hidden=8192)
-        == "cake_lm_head_loss_sm_103a_h8192_v128256"
-    )
-    with pytest.raises(ValueError, match="specialized"):
-        cake_jit.select_module("sm_100a", 8192, 128256)
-    with pytest.raises(ValueError, match="specialized"):
-        cake_jit.select_module("sm_103a", 6144, 154880)
+    assert cake_jit.select_module("sm_100a") == "cake_lm_head_loss_sm_100a"
+    assert cake_jit.select_module("sm_103a") == "cake_lm_head_loss_sm_103a"
     with pytest.raises(NotImplementedError):
         cake_jit.select_module("sm_90a")
-    monkeypatch.setattr(
-        cake_jit,
-        "MODULES",
-        {"a": rec("sm_100a", 6144, 154880), "b": rec("sm_100a", 7168, 129280)},
-    )
-    with pytest.raises(NotImplementedError, match="default-geometry"):
-        cake_jit.select_module("sm_100a")
-    assert cake_jit.select_module("sm_100a", 7168, 129280) == "b"
-    monkeypatch.setattr(
-        cake_jit,
-        "MODULES",
-        {"a": rec("sm_100a", None, None), "b": rec("sm_100a", 7168, 129280)},
-    )
+    monkeypatch.setattr(cake_jit, "MODULES", {"a": rec("sm_100a"), "b": rec("sm_100a")})
     with pytest.raises(NotImplementedError, match="more than one"):
-        cake_jit.select_module(
-            "sm_100a", 7168, 129280
-        )  # an unpinned record accepts every geometry
-    assert cake_jit.record_geometry(rec("sm_100a", None, 4)) == (None, 4)
+        cake_jit.select_module("sm_100a")
 
 
 def test_reachable_variants_complete_the_rule_closure():
@@ -2123,7 +2091,7 @@ def test_cluster_resident_rule():
         and cluster_resident(None, 2, 152) == 76
         and cluster_resident(None, 1, 5) == 5
     )
-    with pytest.raises(ValueError):  # wider clusters take the device's occupancy answer
+    with pytest.raises(ValueError):  # only one- and two-CTA clusters are supported
         cluster_resident(None, 4, 148)
     with pytest.raises(ValueError):
         cluster_resident(torch.device("cpu"), 4, 148)
@@ -2143,23 +2111,6 @@ def test_wave_efficiency_uses_the_dx_cluster():
     assert recommended_k_slices(4096, 6144, 148, 4, g2) == recommended_k_slices(
         4096, 6144, 148, 4, g2, resident=74
     )
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="the cluster occupancy probe needs a CUDA device",
-)
-def test_device_cluster_resident_probe():
-    device = torch.device("cuda", torch.cuda.current_device())
-    if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
-        pytest.skip(
-            "thread-block clusters of four CTAs are probed on the supported parts only"
-        )
-    sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
-    four = cluster_resident(device, 4, sms)
-    assert 1 <= four <= sms // 4
-    assert cluster_resident(device, 4, sms) == four  # cached per (device, width)
-    assert cluster_resident(device, 2, sms) == sms // 2
 
 
 def test_stage_values_names():
@@ -5627,7 +5578,7 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
     zeros after the count), and the logits and row statistics of the counted rows are bitwise the host-bound form's."""
     _require_program(entry="logprob")
     _require_hidden_count()
-    name, record = cake_backend.record_for(CUDA, DEFAULT_H, DEFAULT_V)
+    name, record = cake_backend.record_for(CUDA)
     # calls of three chunks and more (the chunk rule): some rows ignored, none, most (a count below the buffer
     # extent), five chunks at half, all ignored
     cases = (

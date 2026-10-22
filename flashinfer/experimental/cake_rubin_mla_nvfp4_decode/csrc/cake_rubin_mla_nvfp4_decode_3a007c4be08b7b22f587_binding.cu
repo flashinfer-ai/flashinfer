@@ -42,8 +42,8 @@ void CheckCuda(cudaError_t status, const char* what) {
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
 void Run(TensorView a_partial_o, TensorView a_partial_lse, TensorView a_O, TensorView a_lse,
-         int64_t a_rows, int64_t a_num_split, int64_t a_has_lse, int64_t grid_x, int64_t grid_y,
-         int64_t grid_z) {
+         int64_t a_rows, int64_t a_num_split, int64_t a_has_lse, int64_t a_enable_pdl,
+         int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_partial_o.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_partial_o, "partial_o");
@@ -70,6 +70,8 @@ void Run(TensorView a_partial_o, TensorView a_partial_lse, TensorView a_O, Tenso
   check_same_device(a_O, a_partial_o, "O", "partial_o");
   check_contiguous(a_lse, "lse");
   check_same_device(a_lse, a_partial_o, "lse", "partial_o");
+  TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
+      << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z
       << ") must be positive";
@@ -94,10 +96,14 @@ void Run(TensorView a_partial_o, TensorView a_partial_lse, TensorView a_O, Tenso
   config.dynamicSmemBytes = 2048;
   config.stream = stream;
   cudaLaunchAttribute attrs[1] = {};
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  int n = 0;
+  if (a_enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   config.attrs = attrs;
-  config.numAttrs = 1;
+  config.numAttrs = n;
   CheckCuda(cudaLaunchKernelExC(&config,
                                 reinterpret_cast<const void*>(
                                     kernel_cake_rubin_mla_nvfp4_decode_3a007c4be08b7b22f587),

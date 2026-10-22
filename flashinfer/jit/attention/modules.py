@@ -1052,7 +1052,9 @@ def _gen_batch_prefill_module(
     )
 
     if backend == "fa2":
-        assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
+        assert not fp8_enabled or dtype_q == dtype_kv == torch.float8_e4m3fn, (
+            "fa2 takes an fp8 query only as e4m3 over an e4m3 KV cache"
+        )
         additional_tensor_names = [
             "maybe_custom_mask",
             "maybe_mask_indptr",
