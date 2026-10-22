@@ -808,7 +808,7 @@ def main():
             )
             for r, t, p in zip(args.rates, row, pcts, strict=True)
         ]
-    if args.json:
+    if args.json and not args.single_call:  # single-call rows carry no timing (NaN)
         import json
 
         path = Path(args.json)
@@ -823,7 +823,7 @@ def main():
             d.get("hist", "full"),
             d.get("localized", False),
             d.get("ugpu", False),
-            d.get("persistent", False),
+            d.get("persistent", "auto"),
         )
         new = {key(d) for d in recs}
         path.write_text(

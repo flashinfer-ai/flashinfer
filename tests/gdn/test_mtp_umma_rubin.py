@@ -897,3 +897,39 @@ def test_dispatcher_routes_rubin_build(monkeypatch):
             restart_hist_on_flush=False,
             backend="hmma",
         )
+
+
+def test_dispatcher_ugpu_cursor_checks():
+    """gated_delta_rule_mtp_ucache_flush checks the ring cursors of a standalone call
+    (restart_hist_on_flush=True) before handing uGPU buffers to the Rubin build, as for 4-D buffers:
+    an out-of-range hist_len raises instead of reaching the kernel."""
+    _skip_if_no_rubin_build()
+    mod = _base._flashinfer_fp16_state()
+    case, fm = _pz_case(4, 131, "FVVPF")
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = [
+        x.clone() for x in case
+    ]
+    bufs = [_ugpu_split(x, 2, "parts") for x in (pool, kc, uc, gc)]
+    hl[1] = W + 4  # beyond the 16-slot window
+    for ugpu in (False, True):
+        b4 = bufs if ugpu else [pool, kc, uc, gc]
+        with pytest.raises(AssertionError, match="hist_len out of legal range"):
+            mod.gated_delta_rule_mtp_ucache_flush(
+                A_log,
+                a,
+                dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=b4[0],
+                initial_state_indices=idx,
+                k_cache=b4[1],
+                u_cache=b4[2],
+                g_cache=b4[3],
+                hist_len=hl,
+                cache_base=cb,
+                scale=SCALE,
+                flush_min=fm,
+                restart_hist_on_flush=True,
+            )
