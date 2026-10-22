@@ -21,11 +21,14 @@ NOTE (Zihao): The following modules are intentionally excluded from the AOT buil
 """
 
 import argparse
+import fnmatch
+import json
 import os
 import shutil
+from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from packaging.version import Version
@@ -1319,7 +1322,8 @@ def compile_and_package_modules(
     config: dict = None,
     verbose: bool = False,
     skip_prebuilt: bool = True,
-) -> None:
+    selection: Optional["ModuleSelection"] = None,
+) -> List[str]:
     """
     Compile and package modules based on the provided configuration.
 
@@ -1330,6 +1334,11 @@ def compile_and_package_modules(
         config: Configuration dictionary to override defaults (optional)
         verbose: Whether to print verbose build output
         skip_prebuilt: Whether to skip pre-built modules
+        selection: Keep only these modules of the configured set (optional);
+            used to build minimal custom jit-cache providers.
+
+    Returns:
+        Names of the modules that were built.
     """
     # Start with default config and override with user config
     final_config = get_default_config()
@@ -1341,22 +1350,7 @@ def compile_and_package_modules(
         raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
 
     sm_capabilities = detect_sm_capabilities()
-
-    # Update data dir
-    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
-    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
-    jit_env.CUTLASS_INCLUDE_DIRS = [
-        project_root / "3rdparty" / "cutlass" / "include",
-        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
-    ]
-    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
-
-    # Update workdir
-    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
-    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
-    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
-    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
-    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+    configure_aot_build_env(project_root, build_dir)
 
     # Print summary
     if verbose:
@@ -1389,7 +1383,59 @@ def compile_and_package_modules(
     # Generate JIT specs
     if verbose:
         print("Generating JIT specs...")
-    jit_specs = gen_all_modules(
+    jit_specs = gen_modules_from_config(config, sm_capabilities)
+    if verbose:
+        print("Total ops:", len(jit_specs))
+    if selection is not None:
+        result = select_modules(jit_specs, selection)
+        if verbose:
+            print(f"Module selection {selection.name!r}:")
+            print(f"  selected: {len(result.selected)} of {len(jit_specs)}")
+            for name in result.missing_modules:
+                print(f"  WARNING: module not built for this target: {name}")
+            for pattern in result.unmatched_patterns:
+                print(f"  WARNING: include pattern matched nothing: {pattern}")
+        if not result.selected:
+            raise RuntimeError(
+                f"Module selection {selection.name!r} matched no AOT modules "
+                f"for FLASHINFER_CUDA_ARCH_LIST="
+                f"{os.environ['FLASHINFER_CUDA_ARCH_LIST']!r}"
+            )
+        jit_specs = result.selected
+
+    # Build
+    build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)
+
+    # Copy built kernels
+    if out_dir is not None:
+        copy_built_kernels(jit_specs, out_dir)
+    if verbose:
+        print("AOT kernels saved to:", out_dir)
+    return [jit_spec.name for jit_spec in jit_specs]
+
+
+def configure_aot_build_env(project_root: Path, build_dir: Path) -> None:
+    """Point the JIT environment at a source checkout and an AOT build dir."""
+    # Update data dir
+    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
+    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
+    jit_env.CUTLASS_INCLUDE_DIRS = [
+        project_root / "3rdparty" / "cutlass" / "include",
+        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+    ]
+    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
+
+    # Update workdir
+    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
+    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
+    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
+    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
+    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def gen_modules_from_config(config: dict, sm_capabilities: dict) -> List[JitSpec]:
+    """Generate the AOT module list for a config from `get_default_config`."""
+    return gen_all_modules(
         config["f16_dtype"],
         config["f8_dtype"],
         config["fa2_head_dim"],
@@ -1405,17 +1451,106 @@ def compile_and_package_modules(
         config["add_misc"],
         config["add_xqa"],
     )
-    if verbose:
-        print("Total ops:", len(jit_specs))
 
-    # Build
-    build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)
 
-    # Copy built kernels
-    if out_dir is not None:
-        copy_built_kernels(jit_specs, out_dir)
-    if verbose:
-        print("AOT kernels saved to:", out_dir)
+@dataclass(frozen=True)
+class ModuleSelection:
+    """Subset of AOT modules for a custom jit-cache provider.
+
+    A module is selected when its name is listed in ``modules`` or matches one
+    of the ``include`` glob patterns, and matches none of the ``exclude``
+    patterns. ``aot_config`` overrides `get_default_config` keys before the
+    candidate list is generated (see `parse_aot_config_overrides`).
+    """
+
+    name: str
+    modules: Tuple[str, ...] = ()
+    include: Tuple[str, ...] = ()
+    exclude: Tuple[str, ...] = ()
+    aot_config: Optional[Mapping[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ModuleSelection":
+        unknown = set(data) - {"name", "modules", "include", "exclude", "aot_config"}
+        if unknown:
+            raise ValueError(f"Unknown module selection keys: {sorted(unknown)}")
+        return cls(
+            name=str(data.get("name", "custom")),
+            modules=tuple(str(m) for m in data.get("modules", ())),
+            include=tuple(str(p) for p in data.get("include", ())),
+            exclude=tuple(str(p) for p in data.get("exclude", ())),
+            aot_config=data.get("aot_config"),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "modules": list(self.modules),
+            "include": list(self.include),
+            "exclude": list(self.exclude),
+            "aot_config": dict(self.aot_config or {}),
+        }
+
+
+@dataclass(frozen=True)
+class ModuleSelectionResult:
+    selected: List[JitSpec]
+    # Explicitly listed modules that the configured AOT set does not contain
+    # for this target (wrong architecture, or never built ahead of time).
+    missing_modules: List[str]
+    unmatched_patterns: List[str]
+
+
+def select_modules(
+    jit_specs: Sequence[JitSpec], selection: ModuleSelection
+) -> ModuleSelectionResult:
+    """Filter generated AOT specs down to a `ModuleSelection`."""
+    explicit = set(selection.modules)
+    matched_patterns = set()
+    selected = []
+    for jit_spec in jit_specs:
+        name = jit_spec.name
+        if any(fnmatch.fnmatchcase(name, p) for p in selection.exclude):
+            continue
+        hits = [p for p in selection.include if fnmatch.fnmatchcase(name, p)]
+        matched_patterns.update(hits)
+        if name in explicit or hits:
+            selected.append(jit_spec)
+    available = {jit_spec.name for jit_spec in jit_specs}
+    return ModuleSelectionResult(
+        selected=selected,
+        missing_modules=sorted(explicit - available),
+        unmatched_patterns=[p for p in selection.include if p not in matched_patterns],
+    )
+
+
+_DTYPE_CONFIG_KEYS = ("f16_dtype", "f8_dtype")
+_HEAD_DIM_CONFIG_KEYS = ("fa2_head_dim", "fa3_head_dim")
+
+
+def parse_aot_config_overrides(overrides: Optional[Mapping[str, Any]]) -> dict:
+    """Convert JSON-friendly AOT config overrides into `get_default_config` form.
+
+    Dtypes are spelled as torch attribute names (``"bfloat16"``) and head dims
+    as ``[qk, vo]`` pairs.
+    """
+    if not overrides:
+        return {}
+    default_config = get_default_config()
+    config = {}
+    for key, value in overrides.items():
+        if key not in default_config:
+            raise ValueError(
+                f"Unknown aot_config key {key!r}; expected one of "
+                f"{sorted(default_config)}"
+            )
+        if key in _DTYPE_CONFIG_KEYS:
+            config[key] = [getattr(torch, dtype) for dtype in value]
+        elif key in _HEAD_DIM_CONFIG_KEYS:
+            config[key] = [(int(qk), int(vo)) for qk, vo in value]
+        else:
+            config[key] = value
+    return config
 
 
 def parse_bool(s: str) -> bool:
@@ -1580,22 +1715,7 @@ def register_default_modules() -> int:
     config = get_default_config()
     sm_capabilities = detect_sm_capabilities()
 
-    jit_specs = gen_all_modules(
-        config["f16_dtype"],
-        config["f8_dtype"],
-        config["fa2_head_dim"],
-        config["fa3_head_dim"],
-        config["use_sliding_window"],
-        config["use_logits_soft_cap"],
-        sm_capabilities,
-        config["add_comm"],
-        config["add_gemma"],
-        config["add_oai_oss"],
-        config["add_moe"],
-        config["add_act"],
-        config["add_misc"],
-        config["add_xqa"],
-    )
+    jit_specs = gen_modules_from_config(config, sm_capabilities)
     return len(jit_specs)
 
 
@@ -1652,6 +1772,11 @@ def main():
     parser.add_argument(
         "--add-xqa", type=parse_bool, help="Add XQA (Cross-Query Attention) kernels"
     )
+    parser.add_argument(
+        "--selection",
+        type=Path,
+        help="JSON module selection (see ModuleSelection); builds only those modules",
+    )
     args = parser.parse_args()
 
     # Start with default configuration
@@ -1693,6 +1818,11 @@ def main():
         if arg_value is not None:
             config[key] = arg_value
 
+    selection = None
+    if args.selection:
+        selection = ModuleSelection.from_dict(json.loads(args.selection.read_text()))
+        config.update(parse_aot_config_overrides(selection.aot_config))
+
     # Use the reusable compile_and_package_modules function
     compile_and_package_modules(
         out_dir=out_dir,
@@ -1701,6 +1831,7 @@ def main():
         config=config,
         verbose=True,
         skip_prebuilt=False,
+        selection=selection,
     )
 
 

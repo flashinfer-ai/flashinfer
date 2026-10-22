@@ -29,6 +29,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Set API log destination | `export FLASHINFER_LOGDEST=mylog.txt` |
 | Enable verbose JIT logging | `export FLASHINFER_JIT_VERBOSE=1` |
 | Enable debug build | `export FLASHINFER_JIT_DEBUG=1` |
+| Record the JIT modules a workload loads | `export FLASHINFER_JIT_USAGE_LOG=usage.jsonl` |
+| Build a minimal custom jit-cache wheel | `python scripts/custom_jit_cache.py build recipe.json` (see `docs/custom_jit_cache.rst`) |
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
 | Limit parallel ninja jobs | `export MAX_JOBS=4` |
@@ -726,6 +728,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` extends each CuTe-DSL disk-cache key from the caller's `extra_key_files` to their in-package import closure, so editing an imported helper invalidates the kernel. Changes every key, so the first run after enabling recompiles. Set by CI's persistent compile cache. |
+| `FLASHINFER_JIT_USAGE_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`name`, `toolchain`, `aot`, `cuda_archs`, `flashinfer_version`) for the first load of each module per process through `JitSpec.build_and_load()`, whether served by a jit-cache provider or compiled. Input to `scripts/custom_jit_cache.py` for minimal custom jit-cache wheels (`docs/custom_jit_cache.rst`). |
 | `FLASHINFER_JIT_BUILD_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`toolchain`, `name`, `seconds`) per build made through `JitSpec.build_and_load()` or a bulk `build_jit_specs()` prebuild: nvcc modules (ninja no-ops included), CuTe-DSL kernels and TIRx modules. Triton, cuTile and the cake nvcc/NVRTC side paths are not recorded. Summarize with `scripts/summarize_jit_builds.py`. |
 | `FLASHINFER_CUDNN_FROST_PTXAS` | unset | `flashinfer/fused_moe/backends/cudnn_frost/compiler.py` | Select an external PTXAS executable path for all Frost dtypes; unset or empty uses the bundled assembler. The executable path, version, and SHA-256 participate in compiler and tactic cache identities. MoE engines snapshot this configuration at build time; call `layer.refresh_backends()` or reconstruct the layer to adopt changes. |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the check that pins flashinfer-cubin and flashinfer-jit-cache to the installed flashinfer-python. Without it, mismatched kernel wheels (typically left behind by an upgrade) are ignored with a warning at import, falling back to on-demand cubin downloads and JIT compilation until `flashinfer download-kernels` installs matching ones. Set it only when you intentionally mix versions. |
@@ -752,6 +755,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/chunked_lm_head.py` | Capacity of that binding cache (a positive integer), read once at the same import and applied through `configure`. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
+| `FLASHINFER_JIT_CACHE_PROVIDER_SELECTION` | unset | `flashinfer-jit-cache-provider/build_backend.py` | Path of a JSON module selection (`flashinfer.aot.ModuleSelection`: `name`, `modules`, `include`/`exclude` globs, `aot_config`); the provider wheel then ships only the selected modules. Written by `scripts/custom_jit_cache.py build`. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
 wrap the complete wheel build with a no-output watchdog. After 90 minutes with
