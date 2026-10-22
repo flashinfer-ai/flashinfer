@@ -67,6 +67,8 @@ void Run(TensorView a_in_ptr, TensorView a_expert_weights, TensorView a_out_ptr,
   check_same_device(a_out_ptr, a_in_ptr, "out_ptr", "in_ptr");
   check_contiguous(a_expanded_idx_to_permuted_idx, "expanded_idx_to_permuted_idx");
   check_same_device(a_expanded_idx_to_permuted_idx, a_in_ptr, "expanded_idx_to_permuted_idx", "in_ptr");
+  TVM_FFI_CHECK((a_top_k <= 64), ValueError)
+      << KERNEL_NAME << ": requires (top_k <= 64)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

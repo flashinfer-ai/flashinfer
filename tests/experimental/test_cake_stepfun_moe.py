@@ -71,9 +71,9 @@ pytestmark = pytest.mark.long_running
 H, I, E, K = ref.HIDDEN_SIZE, ref.INTERMEDIATE_SIZE, ref.NUM_EXPERTS, ref.TOP_K
 PRECISIONS = tuple(ref.PRECISION_FAMILY)
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
-STAGE_TABLE_SIZES = {"routing": 50, "fc1": 26, "requant": 2, "fc2": 27, "finalize": 4}
-ROUTE_COUNT = 135
-ARG_PLAN_COUNT = 20
+STAGE_TABLE_SIZES = {"routing": 50, "fc1": 27, "requant": 2, "fc2": 28, "finalize": 4}
+ROUTE_COUNT = 138
+ARG_PLAN_COUNT = 21
 # The export's measurement catalogue (``ROUTES``), delivered with the tests.
 ROUTES_PATH = (
     Path(__file__).resolve().parents[1]
@@ -285,7 +285,7 @@ def _defines_kernel(text: str, symbol: str) -> bool:
 
 
 def test_manifest_entries_are_the_registry_programs_on_both_architectures():
-    """Every program is built once per architecture: ``build.json`` holds exactly the 222 entries
+    """Every program is built once per architecture: ``build.json`` holds exactly the 226 entries
     ``cake_jit.library_name`` resolves, each naming a delivered kernel translation unit that defines
     the record's kernel symbol and a delivered binding translation unit exporting ``run``, digests
     keyed by exactly those sources, a 64-hex closure digest, string flags without fast math and the
@@ -294,7 +294,7 @@ def test_manifest_entries_are_the_registry_programs_on_both_architectures():
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == pkg.__name__
     libraries = cake_build.libraries_by_name()
-    assert len(loader.PROGRAMS) == 111
+    assert len(loader.PROGRAMS) == 113
     assert loader.ARCHES == ("sm_100a", "sm_103a")
     expected = {
         loader.library_name(program, arch)
@@ -332,7 +332,7 @@ def test_manifest_entries_are_the_registry_programs_on_both_architectures():
 
 def test_stage_tables_and_routes_cover_every_program_once():
     """The five dispatcher tables hold program names only, in the production order and counts (50 /
-    26 / 2 / 27 / 4); with the two histogram pre units of the cooperative rows they name every
+    27 / 2 / 28 / 4); with the two histogram pre units of the cooperative rows they name every
     program exactly once.  Every program is reachable from a route of the export's measurement
     catalogue (``tests/test_helpers/cake_stepfun_moe_routes.json``) and every route stage names a
     registered program delivered for the route's architectures."""
@@ -489,7 +489,7 @@ def test_unit_blocks_carry_the_stage_facts():
                 )
                 == program
             )
-    assert len(keys) == 111
+    assert len(keys) == 113
     for stage, family in (("fc1", "nvfp4"), ("fc2", "bf16")):
         tiles = cb.exported_tiles(stage, family)
         assert tiles == tuple(sorted(tiles)) and tiles
@@ -611,7 +611,7 @@ def test_package_sources_carry_no_target_minor_and_no_fast_math():
 
 def test_program_rows_expand_over_the_shared_argument_plans():
     """Every ``PROGRAMS`` record is expanded from a compact row: its argument plan is one of the
-    shared ``ARG_PLANS`` (20 distinct ``[kind, name]`` sequences, each serving at least one
+    shared ``ARG_PLANS`` (21 distinct ``[kind, name]`` sequences, each serving at least one
     program), the tensor-map operands of that plan are exactly the keys of ``unit["tma_ranks"]``,
     and the derived fields hold -- ``library`` is the program name, ``ffi_entry`` is ``run``,
     ``arches`` is ``ARCHES``, ``kernel`` is ``kernel_<program>`` unless ``_KERNEL_OVERRIDES`` names

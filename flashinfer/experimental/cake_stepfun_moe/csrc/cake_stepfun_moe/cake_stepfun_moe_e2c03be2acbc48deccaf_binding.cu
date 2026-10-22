@@ -177,6 +177,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_route_map,
   check_same_device(a_num_non_exiting_ctas, a_A, "num_non_exiting_ctas", "A");
   check_contiguous(a_clamp_limit, "clamp_limit");
   check_same_device(a_clamp_limit, a_A, "clamp_limit", "A");
+  TVM_FFI_CHECK((a_K_tiles >= 1), ValueError)
+      << KERNEL_NAME << ": requires (K_tiles >= 1)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

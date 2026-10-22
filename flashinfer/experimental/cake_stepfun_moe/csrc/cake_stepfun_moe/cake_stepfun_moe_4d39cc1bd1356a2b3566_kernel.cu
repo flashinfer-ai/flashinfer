@@ -50,6 +50,13 @@
 #define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
 
+
+__device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
+    float r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
@@ -161,9 +168,6 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
-
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
     if (warp >= 4 && warp <= 7) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -216,18 +220,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                         int token = base_token;
-                        float _mul_0;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_tmem_load_0[0]), "f"(sc));
-                        converted[0] = _mul_0;
-                        float _mul_1;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_tmem_load_0[2]), "f"(sc));
-                        converted[1] = _mul_1;
-                        float _mul_2;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_tmem_load_1[0]), "f"(sc));
-                        converted[2] = _mul_2;
-                        float _mul_3;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_tmem_load_1[2]), "f"(sc));
-                        converted[3] = _mul_3;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[0], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[2], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[0], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[2], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -241,18 +237,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token * 64 + (base_feature - 64 ^ swizzle_feature)) / 4] = packed_word;
                         }
                         int token_0 = base_token + 1;
-                        float _mul_4;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_tmem_load_0[1]), "f"(sc));
-                        converted[0] = _mul_4;
-                        float _mul_5;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_tmem_load_0[3]), "f"(sc));
-                        converted[1] = _mul_5;
-                        float _mul_6;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_tmem_load_1[1]), "f"(sc));
-                        converted[2] = _mul_6;
-                        float _mul_7;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_tmem_load_1[3]), "f"(sc));
-                        converted[3] = _mul_7;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[1], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[3], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[1], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[3], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -266,18 +254,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_0 * 64 + (base_feature - 64 ^ swizzle_feature_1)) / 4] = packed_word;
                         }
                         int token_2 = base_token + 8;
-                        float _mul_8;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_8) : "f"(_tmem_load_0[4]), "f"(sc));
-                        converted[0] = _mul_8;
-                        float _mul_9;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_9) : "f"(_tmem_load_0[6]), "f"(sc));
-                        converted[1] = _mul_9;
-                        float _mul_10;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_10) : "f"(_tmem_load_1[4]), "f"(sc));
-                        converted[2] = _mul_10;
-                        float _mul_11;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_11) : "f"(_tmem_load_1[6]), "f"(sc));
-                        converted[3] = _mul_11;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[4], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[6], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[4], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[6], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -291,18 +271,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_2 * 64 + (base_feature - 64 ^ swizzle_feature_3)) / 4] = packed_word;
                         }
                         int token_4 = base_token + 8 + 1;
-                        float _mul_12;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_12) : "f"(_tmem_load_0[5]), "f"(sc));
-                        converted[0] = _mul_12;
-                        float _mul_13;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_13) : "f"(_tmem_load_0[7]), "f"(sc));
-                        converted[1] = _mul_13;
-                        float _mul_14;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_14) : "f"(_tmem_load_1[5]), "f"(sc));
-                        converted[2] = _mul_14;
-                        float _mul_15;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_15) : "f"(_tmem_load_1[7]), "f"(sc));
-                        converted[3] = _mul_15;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[5], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[7], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[5], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[7], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -316,18 +288,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_4 * 64 + (base_feature - 64 ^ swizzle_feature_5)) / 4] = packed_word;
                         }
                         int token_6 = base_token + 16;
-                        float _mul_16;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_16) : "f"(_tmem_load_0[8]), "f"(sc));
-                        converted[0] = _mul_16;
-                        float _mul_17;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_17) : "f"(_tmem_load_0[10]), "f"(sc));
-                        converted[1] = _mul_17;
-                        float _mul_18;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_18) : "f"(_tmem_load_1[8]), "f"(sc));
-                        converted[2] = _mul_18;
-                        float _mul_19;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_19) : "f"(_tmem_load_1[10]), "f"(sc));
-                        converted[3] = _mul_19;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[8], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[10], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[8], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[10], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -341,18 +305,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_6 * 64 + (base_feature - 64 ^ swizzle_feature_7)) / 4] = packed_word;
                         }
                         int token_8 = base_token + 16 + 1;
-                        float _mul_20;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_20) : "f"(_tmem_load_0[9]), "f"(sc));
-                        converted[0] = _mul_20;
-                        float _mul_21;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_21) : "f"(_tmem_load_0[11]), "f"(sc));
-                        converted[1] = _mul_21;
-                        float _mul_22;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_22) : "f"(_tmem_load_1[9]), "f"(sc));
-                        converted[2] = _mul_22;
-                        float _mul_23;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_23) : "f"(_tmem_load_1[11]), "f"(sc));
-                        converted[3] = _mul_23;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[9], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[11], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[9], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[11], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -366,18 +322,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_8 * 64 + (base_feature - 64 ^ swizzle_feature_9)) / 4] = packed_word;
                         }
                         int token_10 = base_token + 24;
-                        float _mul_24;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_24) : "f"(_tmem_load_0[12]), "f"(sc));
-                        converted[0] = _mul_24;
-                        float _mul_25;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_25) : "f"(_tmem_load_0[14]), "f"(sc));
-                        converted[1] = _mul_25;
-                        float _mul_26;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_26) : "f"(_tmem_load_1[12]), "f"(sc));
-                        converted[2] = _mul_26;
-                        float _mul_27;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_27) : "f"(_tmem_load_1[14]), "f"(sc));
-                        converted[3] = _mul_27;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[12], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[14], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[12], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[14], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -391,18 +339,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_10 * 64 + (base_feature - 64 ^ swizzle_feature_11)) / 4] = packed_word;
                         }
                         int token_12 = base_token + 24 + 1;
-                        float _mul_28;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_28) : "f"(_tmem_load_0[13]), "f"(sc));
-                        converted[0] = _mul_28;
-                        float _mul_29;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_29) : "f"(_tmem_load_0[15]), "f"(sc));
-                        converted[1] = _mul_29;
-                        float _mul_30;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_30) : "f"(_tmem_load_1[13]), "f"(sc));
-                        converted[2] = _mul_30;
-                        float _mul_31;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_31) : "f"(_tmem_load_1[15]), "f"(sc));
-                        converted[3] = _mul_31;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_0[13], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_0[15], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_1[13], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_1[15], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -446,18 +386,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                         int token_15 = base_token;
-                        float _mul_32;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_32) : "f"(_tmem_load_2[0]), "f"(sc));
-                        converted[0] = _mul_32;
-                        float _mul_33;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_33) : "f"(_tmem_load_2[2]), "f"(sc));
-                        converted[1] = _mul_33;
-                        float _mul_34;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_34) : "f"(_tmem_load_3[0]), "f"(sc));
-                        converted[2] = _mul_34;
-                        float _mul_35;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_35) : "f"(_tmem_load_3[2]), "f"(sc));
-                        converted[3] = _mul_35;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[0], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[2], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[0], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[2], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -471,18 +403,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_15 * 64 + (base_feature - 64 ^ swizzle_feature_16)) / 4] = packed_word;
                         }
                         int token_17 = base_token + 1;
-                        float _mul_36;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_36) : "f"(_tmem_load_2[1]), "f"(sc));
-                        converted[0] = _mul_36;
-                        float _mul_37;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_37) : "f"(_tmem_load_2[3]), "f"(sc));
-                        converted[1] = _mul_37;
-                        float _mul_38;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_38) : "f"(_tmem_load_3[1]), "f"(sc));
-                        converted[2] = _mul_38;
-                        float _mul_39;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_39) : "f"(_tmem_load_3[3]), "f"(sc));
-                        converted[3] = _mul_39;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[1], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[3], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[1], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[3], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -496,18 +420,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_17 * 64 + (base_feature - 64 ^ swizzle_feature_18)) / 4] = packed_word;
                         }
                         int token_19 = base_token + 8;
-                        float _mul_40;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_40) : "f"(_tmem_load_2[4]), "f"(sc));
-                        converted[0] = _mul_40;
-                        float _mul_41;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_41) : "f"(_tmem_load_2[6]), "f"(sc));
-                        converted[1] = _mul_41;
-                        float _mul_42;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_42) : "f"(_tmem_load_3[4]), "f"(sc));
-                        converted[2] = _mul_42;
-                        float _mul_43;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_43) : "f"(_tmem_load_3[6]), "f"(sc));
-                        converted[3] = _mul_43;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[4], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[6], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[4], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[6], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -521,18 +437,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_19 * 64 + (base_feature - 64 ^ swizzle_feature_20)) / 4] = packed_word;
                         }
                         int token_21 = base_token + 8 + 1;
-                        float _mul_44;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_44) : "f"(_tmem_load_2[5]), "f"(sc));
-                        converted[0] = _mul_44;
-                        float _mul_45;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_45) : "f"(_tmem_load_2[7]), "f"(sc));
-                        converted[1] = _mul_45;
-                        float _mul_46;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_46) : "f"(_tmem_load_3[5]), "f"(sc));
-                        converted[2] = _mul_46;
-                        float _mul_47;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_47) : "f"(_tmem_load_3[7]), "f"(sc));
-                        converted[3] = _mul_47;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[5], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[7], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[5], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[7], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -546,18 +454,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_21 * 64 + (base_feature - 64 ^ swizzle_feature_22)) / 4] = packed_word;
                         }
                         int token_23 = base_token + 16;
-                        float _mul_48;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_48) : "f"(_tmem_load_2[8]), "f"(sc));
-                        converted[0] = _mul_48;
-                        float _mul_49;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_49) : "f"(_tmem_load_2[10]), "f"(sc));
-                        converted[1] = _mul_49;
-                        float _mul_50;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_50) : "f"(_tmem_load_3[8]), "f"(sc));
-                        converted[2] = _mul_50;
-                        float _mul_51;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_51) : "f"(_tmem_load_3[10]), "f"(sc));
-                        converted[3] = _mul_51;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[8], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[10], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[8], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[10], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -571,18 +471,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_23 * 64 + (base_feature - 64 ^ swizzle_feature_24)) / 4] = packed_word;
                         }
                         int token_25 = base_token + 16 + 1;
-                        float _mul_52;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_52) : "f"(_tmem_load_2[9]), "f"(sc));
-                        converted[0] = _mul_52;
-                        float _mul_53;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_53) : "f"(_tmem_load_2[11]), "f"(sc));
-                        converted[1] = _mul_53;
-                        float _mul_54;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_54) : "f"(_tmem_load_3[9]), "f"(sc));
-                        converted[2] = _mul_54;
-                        float _mul_55;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_55) : "f"(_tmem_load_3[11]), "f"(sc));
-                        converted[3] = _mul_55;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[9], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[11], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[9], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[11], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -596,18 +488,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_25 * 64 + (base_feature - 64 ^ swizzle_feature_26)) / 4] = packed_word;
                         }
                         int token_27 = base_token + 24;
-                        float _mul_56;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_56) : "f"(_tmem_load_2[12]), "f"(sc));
-                        converted[0] = _mul_56;
-                        float _mul_57;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_57) : "f"(_tmem_load_2[14]), "f"(sc));
-                        converted[1] = _mul_57;
-                        float _mul_58;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_58) : "f"(_tmem_load_3[12]), "f"(sc));
-                        converted[2] = _mul_58;
-                        float _mul_59;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_59) : "f"(_tmem_load_3[14]), "f"(sc));
-                        converted[3] = _mul_59;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[12], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[14], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[12], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[14], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -621,18 +505,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_27 * 64 + (base_feature - 64 ^ swizzle_feature_28)) / 4] = packed_word;
                         }
                         int token_29 = base_token + 24 + 1;
-                        float _mul_60;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_60) : "f"(_tmem_load_2[13]), "f"(sc));
-                        converted[0] = _mul_60;
-                        float _mul_61;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_61) : "f"(_tmem_load_2[15]), "f"(sc));
-                        converted[1] = _mul_61;
-                        float _mul_62;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_62) : "f"(_tmem_load_3[13]), "f"(sc));
-                        converted[2] = _mul_62;
-                        float _mul_63;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_63) : "f"(_tmem_load_3[15]), "f"(sc));
-                        converted[3] = _mul_63;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_2[13], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_2[15], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_3[13], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_3[15], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -676,18 +552,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                         int token_32 = base_token;
-                        float _mul_64;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_64) : "f"(_tmem_load_4[0]), "f"(sc));
-                        converted[0] = _mul_64;
-                        float _mul_65;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_65) : "f"(_tmem_load_4[2]), "f"(sc));
-                        converted[1] = _mul_65;
-                        float _mul_66;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_66) : "f"(_tmem_load_5[0]), "f"(sc));
-                        converted[2] = _mul_66;
-                        float _mul_67;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_67) : "f"(_tmem_load_5[2]), "f"(sc));
-                        converted[3] = _mul_67;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[0], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[2], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[0], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[2], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -701,18 +569,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_32 * 64 + (base_feature - 64 ^ swizzle_feature_33)) / 4] = packed_word;
                         }
                         int token_34 = base_token + 1;
-                        float _mul_68;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_68) : "f"(_tmem_load_4[1]), "f"(sc));
-                        converted[0] = _mul_68;
-                        float _mul_69;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_69) : "f"(_tmem_load_4[3]), "f"(sc));
-                        converted[1] = _mul_69;
-                        float _mul_70;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_70) : "f"(_tmem_load_5[1]), "f"(sc));
-                        converted[2] = _mul_70;
-                        float _mul_71;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_71) : "f"(_tmem_load_5[3]), "f"(sc));
-                        converted[3] = _mul_71;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[1], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[3], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[1], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[3], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -726,18 +586,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_34 * 64 + (base_feature - 64 ^ swizzle_feature_35)) / 4] = packed_word;
                         }
                         int token_36 = base_token + 8;
-                        float _mul_72;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_72) : "f"(_tmem_load_4[4]), "f"(sc));
-                        converted[0] = _mul_72;
-                        float _mul_73;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_73) : "f"(_tmem_load_4[6]), "f"(sc));
-                        converted[1] = _mul_73;
-                        float _mul_74;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_74) : "f"(_tmem_load_5[4]), "f"(sc));
-                        converted[2] = _mul_74;
-                        float _mul_75;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_75) : "f"(_tmem_load_5[6]), "f"(sc));
-                        converted[3] = _mul_75;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[4], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[6], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[4], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[6], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -751,18 +603,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_36 * 64 + (base_feature - 64 ^ swizzle_feature_37)) / 4] = packed_word;
                         }
                         int token_38 = base_token + 8 + 1;
-                        float _mul_76;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_76) : "f"(_tmem_load_4[5]), "f"(sc));
-                        converted[0] = _mul_76;
-                        float _mul_77;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_77) : "f"(_tmem_load_4[7]), "f"(sc));
-                        converted[1] = _mul_77;
-                        float _mul_78;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_78) : "f"(_tmem_load_5[5]), "f"(sc));
-                        converted[2] = _mul_78;
-                        float _mul_79;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_79) : "f"(_tmem_load_5[7]), "f"(sc));
-                        converted[3] = _mul_79;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[5], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[7], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[5], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[7], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -776,18 +620,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_38 * 64 + (base_feature - 64 ^ swizzle_feature_39)) / 4] = packed_word;
                         }
                         int token_40 = base_token + 16;
-                        float _mul_80;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_80) : "f"(_tmem_load_4[8]), "f"(sc));
-                        converted[0] = _mul_80;
-                        float _mul_81;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_81) : "f"(_tmem_load_4[10]), "f"(sc));
-                        converted[1] = _mul_81;
-                        float _mul_82;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_82) : "f"(_tmem_load_5[8]), "f"(sc));
-                        converted[2] = _mul_82;
-                        float _mul_83;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_83) : "f"(_tmem_load_5[10]), "f"(sc));
-                        converted[3] = _mul_83;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[8], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[10], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[8], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[10], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -801,18 +637,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_40 * 64 + (base_feature - 64 ^ swizzle_feature_41)) / 4] = packed_word;
                         }
                         int token_42 = base_token + 16 + 1;
-                        float _mul_84;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_84) : "f"(_tmem_load_4[9]), "f"(sc));
-                        converted[0] = _mul_84;
-                        float _mul_85;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_85) : "f"(_tmem_load_4[11]), "f"(sc));
-                        converted[1] = _mul_85;
-                        float _mul_86;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_86) : "f"(_tmem_load_5[9]), "f"(sc));
-                        converted[2] = _mul_86;
-                        float _mul_87;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_87) : "f"(_tmem_load_5[11]), "f"(sc));
-                        converted[3] = _mul_87;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[9], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[11], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[9], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[11], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -826,18 +654,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_42 * 64 + (base_feature - 64 ^ swizzle_feature_43)) / 4] = packed_word;
                         }
                         int token_44 = base_token + 24;
-                        float _mul_88;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_88) : "f"(_tmem_load_4[12]), "f"(sc));
-                        converted[0] = _mul_88;
-                        float _mul_89;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_89) : "f"(_tmem_load_4[14]), "f"(sc));
-                        converted[1] = _mul_89;
-                        float _mul_90;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_90) : "f"(_tmem_load_5[12]), "f"(sc));
-                        converted[2] = _mul_90;
-                        float _mul_91;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_91) : "f"(_tmem_load_5[14]), "f"(sc));
-                        converted[3] = _mul_91;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[12], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[14], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[12], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[14], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -851,18 +671,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_44 * 64 + (base_feature - 64 ^ swizzle_feature_45)) / 4] = packed_word;
                         }
                         int token_46 = base_token + 24 + 1;
-                        float _mul_92;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_92) : "f"(_tmem_load_4[13]), "f"(sc));
-                        converted[0] = _mul_92;
-                        float _mul_93;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_93) : "f"(_tmem_load_4[15]), "f"(sc));
-                        converted[1] = _mul_93;
-                        float _mul_94;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_94) : "f"(_tmem_load_5[13]), "f"(sc));
-                        converted[2] = _mul_94;
-                        float _mul_95;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_95) : "f"(_tmem_load_5[15]), "f"(sc));
-                        converted[3] = _mul_95;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_4[13], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_4[15], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_5[13], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_5[15], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -906,18 +718,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                         int token_49 = base_token;
-                        float _mul_96;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_96) : "f"(_tmem_load_6[0]), "f"(sc));
-                        converted[0] = _mul_96;
-                        float _mul_97;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_97) : "f"(_tmem_load_6[2]), "f"(sc));
-                        converted[1] = _mul_97;
-                        float _mul_98;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_98) : "f"(_tmem_load_7[0]), "f"(sc));
-                        converted[2] = _mul_98;
-                        float _mul_99;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_99) : "f"(_tmem_load_7[2]), "f"(sc));
-                        converted[3] = _mul_99;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[0], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[2], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[0], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[2], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -931,18 +735,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_49 * 64 + (base_feature - 64 ^ swizzle_feature_50)) / 4] = packed_word;
                         }
                         int token_51 = base_token + 1;
-                        float _mul_100;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_100) : "f"(_tmem_load_6[1]), "f"(sc));
-                        converted[0] = _mul_100;
-                        float _mul_101;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_101) : "f"(_tmem_load_6[3]), "f"(sc));
-                        converted[1] = _mul_101;
-                        float _mul_102;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_102) : "f"(_tmem_load_7[1]), "f"(sc));
-                        converted[2] = _mul_102;
-                        float _mul_103;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_103) : "f"(_tmem_load_7[3]), "f"(sc));
-                        converted[3] = _mul_103;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[1], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[3], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[1], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[3], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -956,18 +752,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_51 * 64 + (base_feature - 64 ^ swizzle_feature_52)) / 4] = packed_word;
                         }
                         int token_53 = base_token + 8;
-                        float _mul_104;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_104) : "f"(_tmem_load_6[4]), "f"(sc));
-                        converted[0] = _mul_104;
-                        float _mul_105;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_105) : "f"(_tmem_load_6[6]), "f"(sc));
-                        converted[1] = _mul_105;
-                        float _mul_106;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_106) : "f"(_tmem_load_7[4]), "f"(sc));
-                        converted[2] = _mul_106;
-                        float _mul_107;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_107) : "f"(_tmem_load_7[6]), "f"(sc));
-                        converted[3] = _mul_107;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[4], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[6], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[4], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[6], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -981,18 +769,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_53 * 64 + (base_feature - 64 ^ swizzle_feature_54)) / 4] = packed_word;
                         }
                         int token_55 = base_token + 8 + 1;
-                        float _mul_108;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_108) : "f"(_tmem_load_6[5]), "f"(sc));
-                        converted[0] = _mul_108;
-                        float _mul_109;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_109) : "f"(_tmem_load_6[7]), "f"(sc));
-                        converted[1] = _mul_109;
-                        float _mul_110;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_110) : "f"(_tmem_load_7[5]), "f"(sc));
-                        converted[2] = _mul_110;
-                        float _mul_111;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_111) : "f"(_tmem_load_7[7]), "f"(sc));
-                        converted[3] = _mul_111;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[5], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[7], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[5], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[7], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1006,18 +786,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_55 * 64 + (base_feature - 64 ^ swizzle_feature_56)) / 4] = packed_word;
                         }
                         int token_57 = base_token + 16;
-                        float _mul_112;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_112) : "f"(_tmem_load_6[8]), "f"(sc));
-                        converted[0] = _mul_112;
-                        float _mul_113;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_113) : "f"(_tmem_load_6[10]), "f"(sc));
-                        converted[1] = _mul_113;
-                        float _mul_114;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_114) : "f"(_tmem_load_7[8]), "f"(sc));
-                        converted[2] = _mul_114;
-                        float _mul_115;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_115) : "f"(_tmem_load_7[10]), "f"(sc));
-                        converted[3] = _mul_115;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[8], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[10], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[8], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[10], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1031,18 +803,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_57 * 64 + (base_feature - 64 ^ swizzle_feature_58)) / 4] = packed_word;
                         }
                         int token_59 = base_token + 16 + 1;
-                        float _mul_116;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_116) : "f"(_tmem_load_6[9]), "f"(sc));
-                        converted[0] = _mul_116;
-                        float _mul_117;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_117) : "f"(_tmem_load_6[11]), "f"(sc));
-                        converted[1] = _mul_117;
-                        float _mul_118;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_118) : "f"(_tmem_load_7[9]), "f"(sc));
-                        converted[2] = _mul_118;
-                        float _mul_119;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_119) : "f"(_tmem_load_7[11]), "f"(sc));
-                        converted[3] = _mul_119;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[9], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[11], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[9], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[11], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1056,18 +820,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_59 * 64 + (base_feature - 64 ^ swizzle_feature_60)) / 4] = packed_word;
                         }
                         int token_61 = base_token + 24;
-                        float _mul_120;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_120) : "f"(_tmem_load_6[12]), "f"(sc));
-                        converted[0] = _mul_120;
-                        float _mul_121;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_121) : "f"(_tmem_load_6[14]), "f"(sc));
-                        converted[1] = _mul_121;
-                        float _mul_122;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_122) : "f"(_tmem_load_7[12]), "f"(sc));
-                        converted[2] = _mul_122;
-                        float _mul_123;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_123) : "f"(_tmem_load_7[14]), "f"(sc));
-                        converted[3] = _mul_123;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[12], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[14], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[12], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[14], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1081,18 +837,10 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                             epi_staging_u64[(2048 + token_61 * 64 + (base_feature - 64 ^ swizzle_feature_62)) / 4] = packed_word;
                         }
                         int token_63 = base_token + 24 + 1;
-                        float _mul_124;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_124) : "f"(_tmem_load_6[13]), "f"(sc));
-                        converted[0] = _mul_124;
-                        float _mul_125;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_125) : "f"(_tmem_load_6[15]), "f"(sc));
-                        converted[1] = _mul_125;
-                        float _mul_126;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_126) : "f"(_tmem_load_7[13]), "f"(sc));
-                        converted[2] = _mul_126;
-                        float _mul_127;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_127) : "f"(_tmem_load_7[15]), "f"(sc));
-                        converted[3] = _mul_127;
+                        converted[0] = mul_f32_rn_noftz(_tmem_load_6[13], sc);
+                        converted[1] = mul_f32_rn_noftz(_tmem_load_6[15], sc);
+                        converted[2] = mul_f32_rn_noftz(_tmem_load_7[13], sc);
+                        converted[3] = mul_f32_rn_noftz(_tmem_load_7[15], sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1198,8 +946,7 @@ kernel_cake_stepfun_moe_4d39cc1bd1356a2b3566(const __grid_constant__ CUtensorMap
                         :: "r"(exit_bar_addr), "r"(0) : "memory");
                     mbarrier_wait(exit_bar_addr, 0);
                 }
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-                asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(256));
+                asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
             }
         }
     }
