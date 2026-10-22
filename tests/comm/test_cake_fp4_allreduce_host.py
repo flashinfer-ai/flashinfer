@@ -58,6 +58,24 @@ REGISTER_STORE_VARIANTS = set().union(*REGISTER_STORE_FORMS.values())
 # The targets whose NVFP4-input fused-norm programs probe the peer row's six pairs at once ("_pa"), from
 # their own measurement; the others (sm_107a, and every BF16-input program) poll in two-pair groups.
 PROBE_ALL_TARGETS = ("sm_100a", "sm_103a")
+# The one-shot BF16 kernel's form per target, from each target's own measurement: sm_103a reads the peer's
+# row scale beside the data probe ("_rso"), sm_107a re-arms with register stores ("_rst"), sm_100a ships
+# the baseline's forms; the NVFP4 one-shot kernel ships one text for all three.
+ONESHOT_BF16_FORMS = {"sm_100a": "", "sm_103a": "_rso", "sm_107a": "_rst"}
+# The targets whose BF16-input fused-norm programs with NVFP4 / MXFP8 output build the packed quantizing
+# pass 2 ("_qp"), from their own measurement; sm_107a and every other build use the FP32 tree.
+PACKED_QUANT_TARGETS = ("sm_100a", "sm_103a")
+# The (input format, output format) fused-norm programs each target builds with the permuted pass-1 sum of
+# squares ("_sop": the lane's loaded chunk order), from its own measurement: every build of sm_107a, every
+# build but nvfp4 -> bf16 of sm_103a and sm_100a; the others accumulate in the row's chunk order
+# ("natural").  The reference sums in the order of the selected program's record.
+PERMUTED_SS_FORMS = {
+    "sm_100a": {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
+    - {("nvfp4", "bf16")},
+    "sm_103a": {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
+    - {("nvfp4", "bf16")},
+    "sm_107a": {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS},
+}
 CAPACITIES = (4, 1024, 4096, 16384, 100000)
 SOURCE_DIR = "csrc/cake_fp4_allreduce"
 MAX_DYNAMIC_SMEM_BYTES = 232448  # the opt-in limit of SM100 / SM103 / SM107
@@ -67,14 +85,41 @@ VALUE_BYTES, SCALE_BYTES, RECORD_BYTES, ROW_SCALE_BYTES = 3072, 384, 3456, 16
 ROTATION = 3
 
 
+def _fused_norm_suffix(
+    target: str, input_format: str, output_format: str, prefetch: bool
+) -> str:
+    """The name suffix of the fused-norm program ``target`` builds for one (input format, output format,
+    prefetch form): "_pa" for the probe-all poll, "_qp" for the packed quantizing pass 2, "_sop" for the
+    permuted sum of squares, "_pf" for the residual prefetch, in that order."""
+    probe_all = input_format == "nvfp4" and target in PROBE_ALL_TARGETS
+    packed = (
+        input_format == "bf16"
+        and output_format != "bf16"
+        and target in PACKED_QUANT_TARGETS
+    )
+    permuted = (input_format, output_format) in PERMUTED_SS_FORMS[target]
+    return (
+        ("_pa" if probe_all else "")
+        + ("_qp" if packed else "")
+        + ("_sop" if permuted else "")
+        + ("_pf" if prefetch else "")
+    )
+
+
 def _expected_program_ids() -> set[str]:
-    ids = {f"tp2_oneshot_{fmt}" for fmt in INPUT_FORMATS}
+    ids = {"tp2_oneshot_nvfp4"}
+    ids |= {f"tp2_oneshot_bf16{form}" for form in ONESHOT_BF16_FORMS.values()}
     ids |= {f"tp4_twoshot_{fmt}_bv{bv}" for fmt in INPUT_FORMATS for bv in BVS}
     ids |= {f"tp4_twoshot_{fmt}_bv{bv}_rst" for fmt, bv in REGISTER_STORE_VARIANTS}
-    ids |= {f"tp2_rmsnorm_{i}_{o}" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
-    ids |= {f"tp2_rmsnorm_{i}_{o}_pf" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
-    ids |= {f"tp2_rmsnorm_nvfp4_{o}_pa" for o in OUTPUT_FORMATS}
-    ids |= {f"tp2_rmsnorm_nvfp4_{o}_pa_pf" for o in OUTPUT_FORMATS}
+    # One fused-norm program per (target, input format, output format, prefetch form), named by the forms
+    # that target measured; targets whose forms agree share the name (and the program).
+    ids |= {
+        f"tp2_rmsnorm_{i}_{o}{_fused_norm_suffix(t, i, o, pf)}"
+        for t in TARGETS
+        for i in INPUT_FORMATS
+        for o in OUTPUT_FORMATS
+        for pf in (False, True)
+    }
     return ids
 
 
@@ -117,7 +162,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 31
+    assert len(PROGRAMS) == 37
     keys = {
         "family",
         "world_size",
@@ -125,7 +170,10 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         "output_format",
         "bv",
         "reset",
+        "rs_poll",
         "poll",
+        "quant",
+        "ss_order",
         "prefetch",
         "targets",
         "kernel_symbol",
@@ -167,19 +215,44 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         assert tuple(record["targets"]) and set(record["targets"]) <= set(TARGETS)
         if world_size == 4:
             assert record["bv"] in BVS
-            assert record["reset"] in ("bulk", "st")
+            assert record["reset"] in ("bulk", "st") and record["rs_poll"] is None
             assert program.endswith("_rst") == (record["reset"] == "st")
             assert program.startswith(f"tp4_twoshot_{input_format}_bv{record['bv']}")
+        elif family == "allreduce":
+            # The one-shot kernel's lever forms: "_rso" for the overlapped row-scale poll, then "_rst" for a
+            # register-store re-arm off the BF16 baseline (the NVFP4 kernel re-arms with register stores).
+            assert record["bv"] is None
+            assert record["rs_poll"] in ("first", "overlap")
+            assert record["reset"] in ("bulk", "st")
+            baseline_reset = {"bf16": "bulk", "nvfp4": "st"}[input_format]
+            suffix = ("_rso" if record["rs_poll"] == "overlap" else "") + (
+                "" if record["reset"] == baseline_reset else "_rst"
+            )
+            assert program == f"tp2_oneshot_{input_format}{suffix}", program
         else:
             assert record["bv"] is None and record["reset"] is None
+            assert record["rs_poll"] is None
         if family == "rmsnorm":
             assert record["prefetch"] in (False, True)
             assert program.endswith("_pf") == record["prefetch"], program
-            assert record["poll"] in ("grouped", "all")
             stem = program[: -len("_pf")] if record["prefetch"] else program
+            # The pass-1 sum-of-squares order: "_sop" for the lane's loaded chunk order, before "_pf".
+            assert record["ss_order"] in ("natural", "perm"), program
+            assert stem.endswith("_sop") == (record["ss_order"] == "perm"), program
+            stem = stem[: -len("_sop")] if record["ss_order"] == "perm" else stem
+            # The quantizing pass-2 form exists for the NVFP4 / MXFP8 outputs only ("_qp" for the packed form).
+            assert (record["quant"] is None) == (output_format == "bf16"), program
+            assert record["quant"] in (None, "f32", "packed"), program
+            assert stem.endswith("_qp") == (record["quant"] == "packed"), program
+            stem = stem[: -len("_qp")] if record["quant"] == "packed" else stem
+            assert record["poll"] in ("grouped", "all")
             assert stem.endswith("_pa") == (record["poll"] == "all"), program
+            assert stem == f"tp2_rmsnorm_{input_format}_{output_format}" + (
+                "_pa" if record["poll"] == "all" else ""
+            ), program
         else:
             assert record["prefetch"] is None and record["poll"] is None
+            assert record["quant"] is None and record["ss_order"] is None
     assert {
         target for record in PROGRAMS.values() for target in record["targets"]
     } == set(TARGETS)
@@ -223,16 +296,37 @@ def test_two_shot_programs_cover_every_variant_once_per_target() -> None:
                 assert f"{bulk}_rst" not in PROGRAMS
 
 
-def test_one_shot_programs_serve_every_target() -> None:
-    for program, record in PROGRAMS.items():
-        if record["family"] == "allreduce" and record["world_size"] == 2:
-            assert set(record["targets"]) == set(TARGETS), program
+def test_one_shot_programs_serve_every_target_once() -> None:
+    """On each target one one-shot program serves each input format: the NVFP4 kernel's single text, and for
+    BF16 input the form that target measured ("_rso" on sm_103a, "_rst" on sm_107a, the baseline on sm_100a)."""
+    for target in TARGETS:
+        for input_format in INPUT_FORMATS:
+            matching = [
+                program
+                for program, record in PROGRAMS.items()
+                if record["family"] == "allreduce"
+                and record["world_size"] == 2
+                and record["input_format"] == input_format
+                and target in record["targets"]
+            ]
+            form = ONESHOT_BF16_FORMS[target] if input_format == "bf16" else ""
+            assert matching == [f"tp2_oneshot_{input_format}{form}"], (
+                target,
+                input_format,
+                matching,
+            )
+    assert PROGRAMS["tp2_oneshot_nvfp4"]["targets"] == TARGETS
+    for target, form in ONESHOT_BF16_FORMS.items():
+        assert PROGRAMS[f"tp2_oneshot_bf16{form}"]["targets"] == (target,)
 
 
 def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
-    """On each target one program serves each (input format, output format, prefetch form), in the poll form
-    that target measured: the probe-all poll ("_pa") for NVFP4 input on sm_100a / sm_103a, the two-pair groups
-    otherwise."""
+    """On each target one program serves each (input format, output format, prefetch form), in the poll,
+    quantizing and sum-of-squares forms that target measured: the probe-all poll ("_pa") for NVFP4 input on
+    sm_100a / sm_103a and the two-pair groups otherwise; the packed quantizing pass 2 ("_qp") for BF16 input with
+    NVFP4 / MXFP8 output on sm_100a / sm_103a and the FP32 tree otherwise; the permuted pass-1 sum of squares
+    ("_sop") for every build of sm_107a and every build but nvfp4 -> bf16 of sm_103a and sm_100a, the row's
+    chunk order otherwise."""
     for target in TARGETS:
         for input_format in INPUT_FORMATS:
             for output_format in OUTPUT_FORMATS:
@@ -258,25 +352,78 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
                     assert PROGRAMS[program]["poll"] == (
                         "all" if probe_all else "grouped"
                     )
-                    suffix = ("_pa" if probe_all else "") + ("_pf" if prefetch else "")
+                    packed = (
+                        input_format == "bf16"
+                        and output_format != "bf16"
+                        and target in PACKED_QUANT_TARGETS
+                    )
+                    assert PROGRAMS[program]["quant"] == (
+                        None
+                        if output_format == "bf16"
+                        else ("packed" if packed else "f32")
+                    )
+                    permuted = (input_format, output_format) in PERMUTED_SS_FORMS[
+                        target
+                    ]
+                    assert PROGRAMS[program]["ss_order"] == (
+                        "perm" if permuted else "natural"
+                    )
+                    suffix = _fused_norm_suffix(
+                        target, input_format, output_format, prefetch
+                    )
                     assert (
                         program == f"tp2_rmsnorm_{input_format}_{output_format}{suffix}"
                     )
-    # The probe-all form ships for the targets that measured it, the grouped form for the others; the BF16-input
-    # programs have one form for all three targets.
-    for output_format in OUTPUT_FORMATS:
-        for pf in ("", "_pf"):
-            assert (
-                PROGRAMS[f"tp2_rmsnorm_nvfp4_{output_format}_pa{pf}"]["targets"]
-                == PROBE_ALL_TARGETS
+    # A program ships for exactly the targets whose measured forms spell its name: the probe-all,
+    # packed-quantizing and permuted-sum forms split an (input format, output format) between names, and a
+    # plain name survives only where a target keeps every baseline form.
+    for program, record in PROGRAMS.items():
+        if record["family"] != "rmsnorm":
+            continue
+        i, o, pf = record["input_format"], record["output_format"], record["prefetch"]
+        assert record["targets"] == tuple(
+            t
+            for t in TARGETS
+            if program == f"tp2_rmsnorm_{i}_{o}{_fused_norm_suffix(t, i, o, pf)}"
+        ), program
+    for pf in ("", "_pf"):
+        assert f"tp2_rmsnorm_bf16_bf16{pf}" not in PROGRAMS
+        assert PROGRAMS[f"tp2_rmsnorm_bf16_bf16_sop{pf}"]["targets"] == TARGETS
+        assert (
+            PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_pa{pf}"]["targets"] == PROBE_ALL_TARGETS
+        )
+        assert PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_sop{pf}"]["targets"] == ("sm_107a",)
+        for output_format in ("nvfp4", "mxfp8"):
+            quantized = f"tp2_rmsnorm_bf16_{output_format}"
+            assert f"{quantized}_qp{pf}" not in PROGRAMS
+            assert PROGRAMS[f"{quantized}_qp_sop{pf}"]["targets"] == (
+                "sm_100a",
+                "sm_103a",
             )
-            assert PROGRAMS[f"tp2_rmsnorm_nvfp4_{output_format}{pf}"][
-                "targets"
-            ] == tuple(t for t in TARGETS if t not in PROBE_ALL_TARGETS)
-            assert (
-                PROGRAMS[f"tp2_rmsnorm_bf16_{output_format}{pf}"]["targets"] == TARGETS
+            assert PROGRAMS[f"{quantized}_sop{pf}"]["targets"] == ("sm_107a",)
+            records = f"tp2_rmsnorm_nvfp4_{output_format}"
+            assert f"{records}_pa{pf}" not in PROGRAMS
+            assert PROGRAMS[f"{records}_pa_sop{pf}"]["targets"] == (
+                "sm_100a",
+                "sm_103a",
             )
+            assert PROGRAMS[f"{records}_sop{pf}"]["targets"] == ("sm_107a",)
+            assert f"{quantized}{pf}" not in PROGRAMS
+            assert f"{records}{pf}" not in PROGRAMS
+        for output_format in OUTPUT_FORMATS:
             assert f"tp2_rmsnorm_bf16_{output_format}_pa{pf}" not in PROGRAMS
+            assert f"tp2_rmsnorm_nvfp4_{output_format}_qp{pf}" not in PROGRAMS
+            assert f"tp2_rmsnorm_nvfp4_{output_format}_pa_qp{pf}" not in PROGRAMS
+        assert f"tp2_rmsnorm_bf16_bf16_qp{pf}" not in PROGRAMS
+        assert f"tp2_rmsnorm_nvfp4_bf16{pf}" not in PROGRAMS
+        assert f"tp2_rmsnorm_nvfp4_bf16_pa_sop{pf}" not in PROGRAMS
+    # The natural order survives on one build only: nvfp4 -> bf16 on sm_100a / sm_103a.
+    natural = {
+        program
+        for program, record in PROGRAMS.items()
+        if record["ss_order"] == "natural"
+    }
+    assert natural == {"tp2_rmsnorm_nvfp4_bf16_pa", "tp2_rmsnorm_nvfp4_bf16_pa_pf"}
 
 
 def _checkout_source_dir() -> Path:
@@ -647,6 +794,7 @@ def test_program_for_two_shot_picks_the_targets_re_arm_form(
 @pytest.mark.parametrize("target", TARGETS)
 def test_program_for_one_shot_and_fused_norm(target: str) -> None:
     for input_format in INPUT_FORMATS:
+        form = ONESHOT_BF16_FORMS[target] if input_format == "bf16" else ""
         for rows in (3, 1031, 2048, 2664, 4096, 4291, 4292, 16384):
             suffix = "_pf" if loader.select_prefetch(rows, 148) else ""
             assert (rows in (2664, 4096, 4291)) == bool(suffix)
@@ -660,23 +808,26 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                     grid=148,
                     target=target,
                 )
-                == f"tp2_oneshot_{input_format}"
-            )
-            poll = (
-                "_pa" if input_format == "nvfp4" and target in PROBE_ALL_TARGETS else ""
+                == f"tp2_oneshot_{input_format}{form}"
             )
             for output_format in OUTPUT_FORMATS:
-                assert (
-                    loader.program_for(
-                        family="rmsnorm",
-                        world_size=2,
-                        input_format=input_format,
-                        output_format=output_format,
-                        rows=rows,
-                        grid=148,
-                        target=target,
-                    )
-                    == f"tp2_rmsnorm_{input_format}_{output_format}{poll}{suffix}"
+                program = loader.program_for(
+                    family="rmsnorm",
+                    world_size=2,
+                    input_format=input_format,
+                    output_format=output_format,
+                    rows=rows,
+                    grid=148,
+                    target=target,
+                )
+                forms = _fused_norm_suffix(
+                    target, input_format, output_format, bool(suffix)
+                )
+                assert program == f"tp2_rmsnorm_{input_format}_{output_format}{forms}"
+                # The selected record carries the sum-of-squares order the reference uses on this target.
+                permuted = (input_format, output_format) in PERMUTED_SS_FORMS[target]
+                assert PROGRAMS[program]["ss_order"] == (
+                    "perm" if permuted else "natural"
                 )
     with pytest.raises(ValueError):
         loader.program_for(
@@ -1033,6 +1184,7 @@ def test_fused_norm_reference_on_cpu() -> None:
     )
     assert reference.residual_out.dtype == torch.bfloat16
     assert reference.eps == ref.EPS and reference.weight_bias == ref.WEIGHT_BIAS
+    assert reference.ss_order == "natural"
     acc = ref.oneshot_sum(ref.sources_bf16(xs))
     z = ref.f32_add_rn(acc, residual.float())
     assert torch.equal(reference.residual_out, z.to(torch.bfloat16))
@@ -1041,6 +1193,16 @@ def test_fused_norm_reference_on_cpu() -> None:
     assert torch.allclose(reference.ss.double(), exact, rtol=1e-6, atol=0.0)
     rinv = 1.0 / torch.sqrt(exact / ref.HIDDEN + ref.EPS)
     assert torch.allclose(reference.rinv.double(), rinv, rtol=1e-6, atol=0.0)
+    # The permuted sum-of-squares order (the ss_order of the programs that measured it faster) moves ss and
+    # rinv by at most an ulp: residual_out is bitwise the same, y stays within the tolerance.
+    permuted = ref.reference_fused_rmsnorm(xs, residual, weight, ss_order="perm")
+    assert permuted.ss_order == "perm"
+    assert torch.equal(permuted.residual_out, reference.residual_out)
+    assert torch.allclose(permuted.ss.double(), exact, rtol=1e-6, atol=0.0)
+    assert ref.max_bf16_ulp(permuted.y, reference.y) <= 1
+    assert ref.tolerance_violations(permuted.y, reference.y) == 0
+    with pytest.raises(ValueError):
+        ref.reference_fused_rmsnorm(xs, residual, weight, ss_order="reversed")
     # y = bf16(z) * rinv * (1 + w): the plain formula agrees within the test tolerance.
     plain = (reference.residual_out.float() * rinv.float().reshape(rows, 1)) * (
         1.0 + weight.float()
@@ -1101,6 +1263,33 @@ def test_sum_of_squares_follows_the_lane_order() -> None:
     )
     assert chains.numel() == z.numel()
     assert torch.equal(ref.sum_of_squares(z * 1.0), ss)
+    # The permuted order sums the same squares in the lane's loaded chunk order: as close to the exact sum,
+    # deterministic, and bitwise equal to the natural order when no partial sum rounds.
+    permuted = ref.sum_of_squares(z, order="perm")
+    assert torch.allclose(permuted.double(), exact, rtol=1e-6, atol=0.0)
+    assert torch.equal(ref.sum_of_squares(z, order="perm"), permuted)
+    small = torch.randint(
+        -8, 9, (2, ref.HIDDEN), generator=torch.Generator().manual_seed(4)
+    ).float()
+    assert torch.equal(
+        ref.sum_of_squares(small), ref.sum_of_squares(small, order="perm")
+    )
+    # The orders differ where a rounding depends on the chunk order: lane 2 (f = 1) sums chunk 1 before
+    # chunk 0 in the permuted order, so its four ones survive beside 2^24 in the even chain (the natural
+    # order loses them: 2^24 + 1 rounds to 2^24); the odd chain adds four more in both orders.
+    probe = torch.zeros((1, ref.HIDDEN))
+    probe[0, 64] = 4096.0  # lane 2, pair 0, chunk 0, word 0, even element
+    probe[0, 72:80] = 1.0  # lane 2, pair 0, chunk 1
+    assert ref.sum_of_squares(probe).item() == 2.0**24 + 4
+    assert ref.sum_of_squares(probe, order="perm").item() == 2.0**24 + 8
+    # Lane 0 (f = 0) loads the chunks in the row's order: both orders agree on the same pattern there.
+    probe0 = torch.zeros((1, ref.HIDDEN))
+    probe0[0, 0] = 4096.0
+    probe0[0, 8:16] = 1.0
+    assert ref.sum_of_squares(probe0).item() == 2.0**24 + 4
+    assert ref.sum_of_squares(probe0, order="perm").item() == 2.0**24 + 4
+    with pytest.raises(ValueError):
+        ref.sum_of_squares(z, order="reversed")
 
 
 def test_nvfp4_quantiser_hand_case_and_tie_mask() -> None:

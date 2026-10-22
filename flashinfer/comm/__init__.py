@@ -130,6 +130,7 @@ from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
+from .allreduce import is_mnnvl_cutedsl_supported as is_mnnvl_cutedsl_supported
 
 with contextlib.suppress(ImportError, AttributeError):
     from .tp_moe_finalize_rmsnorm import (
@@ -141,21 +142,6 @@ with contextlib.suppress(ImportError, AttributeError):
     from .tp_moe_finalize_rmsnorm import (
         tp_moe_finalize_rmsnorm as tp_moe_finalize_rmsnorm,
     )
-
-# MNNVL A2A (Throughput Backend)
-from .trtllm_moe_alltoall import moe_a2a_active_rank_mask as moe_a2a_active_rank_mask
-from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
-from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
-from .trtllm_moe_alltoall import moe_a2a_initialize as moe_a2a_initialize
-from .trtllm_moe_alltoall import (
-    moe_a2a_get_workspace_size_per_rank as moe_a2a_get_workspace_size_per_rank,
-)
-from .trtllm_moe_alltoall import (
-    moe_a2a_sanitize_expert_ids as moe_a2a_sanitize_expert_ids,
-)
-from .trtllm_moe_alltoall import (
-    moe_a2a_wrap_payload_tensor_in_workspace as moe_a2a_wrap_payload_tensor_in_workspace,
-)
 
 # DCP A2A (Decode Context Parallel Attention Reduction)
 from .dcp_alltoall import decode_cp_a2a_alltoall as decode_cp_a2a_alltoall
@@ -176,6 +162,12 @@ from .all_gather_matmul import all_gather_matmul as all_gather_matmul
 from .all_gather_matmul import (
     prepare_all_gather_matmul as prepare_all_gather_matmul,
 )
+from .fp8_rowwise_gemm_allreduce import (
+    fp8_rowwise_gemm_allreduce as fp8_rowwise_gemm_allreduce,
+)
+from .fp8_rowwise_gemm_allreduce import (
+    prepare_fp8_rowwise_gemm_allreduce as prepare_fp8_rowwise_gemm_allreduce,
+)
 from .cake_fused_norm_combine import (
     CakeFusedNormCombineWorkspace as CakeFusedNormCombineWorkspace,
 )
@@ -190,6 +182,16 @@ from .cake_fused_norm_combine import (
 )
 from .cake_fused_norm_combine import (
     cake_fused_norm_combine_workspace_bytes as cake_fused_norm_combine_workspace_bytes,
+)
+
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce as cake_gemm_allreduce,
+)
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce_select_route as cake_gemm_allreduce_select_route,
+)
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce_workspace_bytes as cake_gemm_allreduce_workspace_bytes,
 )
 
 

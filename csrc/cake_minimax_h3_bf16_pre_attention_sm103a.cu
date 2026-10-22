@@ -139,13 +139,6 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
 }
 
 #define MINIMAX_H3_PRE_ATTENTION_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_SMEM_PARTIALS_OFF 0
-#define SMEM_SMEM_PARTIALS_STAGE_BYTES 32
-#define SMEM_SMEM_PARTIALS_STRIDE 32
-#define SMEM_SMEM_RSTD_OFF 64
-#define SMEM_SMEM_RSTD_STAGE_BYTES 16
-#define SMEM_SMEM_RSTD_STRIDE 16
 #define SMEM_TOTAL 128
 #define HIDDEN 5376
 #define ROWS_PER_CTA 4
@@ -400,45 +393,19 @@ kernel_minimax_h3_pre_attention_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, _
 
 #undef HIDDEN
 #undef MINIMAX_H3_PRE_ATTENTION_INF
-#undef NUM_MAIN_STAGES
 #undef ROWS_PER_CTA
-#undef SMEM_SMEM_PARTIALS_OFF
-#undef SMEM_SMEM_PARTIALS_STAGE_BYTES
-#undef SMEM_SMEM_PARTIALS_STRIDE
-#undef SMEM_SMEM_RSTD_OFF
-#undef SMEM_SMEM_RSTD_STAGE_BYTES
-#undef SMEM_SMEM_RSTD_STRIDE
 #undef SMEM_TOTAL
 #undef smem_partials_addr
 #undef smem_rstd_addr
 
 #define MINIMAX_H3_PRE_ATTENTION_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 7
-#define NUM_MAINLOOP_PIPE_STAGES 2
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 32768
-#define SMEM_WORK_RESPONSE_OFF 230400
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
 #define SMEM_TOTAL 230528
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define B_HALF_N 128
 #define BLOCK_K 64
-#define MMA_K 16
 #define CTA_GROUP 2
-#define NUM_STAGES 7
-#define NUM_EPILOGUE_WARPS 4
 #define GROUP_M 32
-#define WORK_STAGES 4
-#define WORK_CONSUMERS 290
 #define NUM_K_ITERS 84
 #define N_TILES 84
 #define NUM_HEADS 56
@@ -657,6 +624,12 @@ kernel_minimax_h3_bf16_pre_attention_gemm(const __grid_constant__ CUtensorMap ac
                         break;
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                }
+                #pragma unroll 1
+                for (int _ = 0; _ < 7; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
         }
@@ -1135,32 +1108,13 @@ kernel_minimax_h3_bf16_pre_attention_gemm(const __grid_constant__ CUtensorMap ac
 #undef GROUP_M
 #undef HEAD_DIM
 #undef MINIMAX_H3_PRE_ATTENTION_INF
-#undef MMA_K
-#undef NUM_EPILOGUE_WARPS
 #undef NUM_HEADS
 #undef NUM_K_ITERS
-#undef NUM_MAINLOOP_PIPE_STAGES
-#undef NUM_STAGES
-#undef NUM_TMA_PIPE_STAGES
-#undef NUM_WORK_PIPE_STAGES
 #undef N_TILES
 #undef QKV_KINDS
 #undef ROPE_DIM
 #undef ROPE_HALF
-#undef SMEM_SMEM_A_OFF
-#undef SMEM_SMEM_A_STAGE_BYTES
-#undef SMEM_SMEM_A_STRIDE
-#undef SMEM_SMEM_B_OFF
-#undef SMEM_SMEM_B_STAGE_BYTES
-#undef SMEM_SMEM_B_STRIDE
 #undef SMEM_TOTAL
-#undef SMEM_WORK_RESPONSE_OFF
-#undef SMEM_WORK_RESPONSE_STAGE_BYTES
-#undef SMEM_WORK_RESPONSE_STRIDE
-#undef TMEM_ACCUM_OFFSET
-#undef TMEM_NCOLS
-#undef WORK_CONSUMERS
-#undef WORK_STAGES
 #undef epilogue_done_addr
 #undef mainloop_done_addr
 #undef mma_done_addr

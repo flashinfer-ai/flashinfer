@@ -59,10 +59,18 @@ cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
 is_cake_rmsnorm_train_supported = pkg.is_cake_rmsnorm_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-WIDTHS = ((6144, 1e-5), (2048, 1e-6), (512, 1e-6))
+WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
 HIDDEN_SIZES = tuple(hidden for hidden, _eps in WIDTHS)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
+# Widths whose contract names both eps values: every case runs at each.
+EPS_VARIANTS = {4096: (1e-5, 1e-6), 1536: (1e-5, 1e-6)}
 ROWS = (1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 257, 16172, 16231)
+# Further row counts of the H=1536 / H=4096 contract: the program-window edges, the 2^n +- 1 counts and the
+# representative training shapes (GLM-5.3-Flash CP16 among them).
+CONTRACT_ROWS = {
+    4096: (1023, 1025, 4097, 14928, 16263, 16384, 32769, 65536),
+    1536: (1023, 1025, 4097, 14928, 16263, 16384, 32769, 65536),
+}
 STRIDE_PADS = (0, 64, "2H")
 SCALES = (1.0, 1e-3, 1e3)
 ATOL = 1e-2
@@ -256,8 +264,9 @@ def _check_case(
     zeros: bool = False,
     residual: bool = False,
     spike: bool = False,
+    eps: float | None = None,
 ) -> None:
-    eps = EPS[hidden]
+    eps = EPS[hidden] if eps is None else eps
     pad_key = hidden if x_pad == "2H" else int(x_pad)
     generator = _generator(
         hidden, rows, pad_key, int(scale * 1e6) % 9973, zeros, residual, spike
@@ -279,7 +288,7 @@ def _check_case(
     y, rstd = outputs[0], outputs[1]
     assert tuple(y.shape) == (rows, hidden) and y.is_contiguous()
     assert rstd.dtype == torch.float32 and tuple(rstd.shape) == (rows,)
-    label = f"hidden={hidden} rows={rows} pad={x_pad} scale={scale} zeros={zeros} residual={residual}"
+    label = f"hidden={hidden} rows={rows} eps={eps} pad={x_pad} scale={scale} zeros={zeros} residual={residual}"
     _assert_bf16_close(y, y_ref, f"y {label}")
     assert torch.isfinite(rstd).all(), f"rstd {label}"
     assert _rel_l2(rstd, rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
@@ -307,11 +316,11 @@ def test_forward_backward_match_fp64(hidden: int, rows: int) -> None:
     _check_case(hidden, rows)
 
 
-def _forward_switch_rows(arch: str, hidden: int, residual: bool) -> tuple[int, ...]:
-    """Row counts on both sides of every forward program switch point of one route (and a single row)."""
+def _switch_rows(arch: str, hidden: int, kind: str, residual: bool) -> tuple[int, ...]:
+    """Row counts on both sides of every program switch point of one route (and a single row)."""
 
     switches = set()
-    for name in loader.route_modules(arch, hidden, "fwd", residual):
+    for name in loader.route_modules(arch, hidden, kind, residual):
         rule = loader.MODULES[name]["select_rule"]
         if rule is None:
             continue
@@ -319,6 +328,26 @@ def _forward_switch_rows(arch: str, hidden: int, residual: bool) -> tuple[int, .
             int(bound) for bound in (rule["above"], rule["at_most"]) if bound
         )
     return tuple(sorted({1, *switches, *(rows + 1 for rows in switches)}))
+
+
+@pytest.mark.parametrize(
+    ("hidden", "rows"),
+    [(hidden, rows) for hidden, counts in CONTRACT_ROWS.items() for rows in counts],
+)
+def test_contract_rows_match_fp64(hidden: int, rows: int) -> None:
+    _skip_unless_hidden(hidden)
+    _check_case(hidden, rows)
+
+
+@pytest.mark.parametrize(
+    ("hidden", "eps"),
+    [(hidden, eps) for hidden, variants in EPS_VARIANTS.items() for eps in variants],
+)
+@pytest.mark.parametrize("rows", (7, 16231))
+@pytest.mark.parametrize("scale", SCALES)
+def test_eps_variants(hidden: int, eps: float, rows: int, scale: float) -> None:
+    _skip_unless_hidden(hidden)
+    _check_case(hidden, rows, scale=scale, eps=eps)
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
@@ -332,7 +361,7 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
     names = loader.route_modules(arch, hidden, "fwd", residual)
     eps = EPS[hidden]
     launched = set()
-    for rows in _forward_switch_rows(arch, hidden, residual):
+    for rows in _switch_rows(arch, hidden, "fwd", residual):
         selected = loader.selected_modules(arch, hidden, "fwd", residual, rows=rows)
         assert len(selected) == 1, (
             f"hidden={hidden} residual={residual} rows={rows}: {selected}"
@@ -351,6 +380,26 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
             assert torch.equal(outputs[2], h_new_ref), f"h_new {label}"
     assert launched == set(names), (
         f"hidden={hidden} residual={residual}: never launched {set(names) - launched}"
+    )
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_backward_programs_switch_on_row_count(hidden: int) -> None:
+    """Exactly one backward program runs per call, every exported backward program
+    runs for some row count, and forward + backward match the FP64 reference on
+    both sides of each switch point."""
+
+    _skip_unless_hidden(hidden)
+    arch = loader.arch_for_capability(_capability())
+    names = loader.route_modules(arch, hidden, "bwd", False)
+    launched = set()
+    for rows in _switch_rows(arch, hidden, "bwd", False):
+        selected = loader.selected_modules(arch, hidden, "bwd", False, rows=rows)
+        assert len(selected) == 1, f"hidden={hidden} rows={rows}: {selected}"
+        launched.add(selected[0])
+        _check_case(hidden, rows)
+    assert launched == set(names), (
+        f"hidden={hidden}: never launched {set(names) - launched}"
     )
 
 
@@ -490,6 +539,45 @@ def test_misaligned_layouts_are_materialized(
     )
     assert dx_again is dx_user and torch.equal(dx_user, dx), f"dx copy-back {label}"
     assert torch.equal(dw_again, dw), f"dw bitwise across layouts {label}"
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_half_vector_aligned_weight_is_materialized(hidden: int) -> None:
+    """A contiguous ``w`` whose storage base is 16 bytes past a 32-byte boundary.
+
+    The backward kernels load the weight with 16-byte vectors and read this view
+    in place; the forward kernels load it with 32-byte vectors, so the forward
+    must copy it (an in-place read would be a misaligned vector load).  Both
+    match the FP64 reference and the aligned weight's results bitwise.
+    """
+
+    _skip_unless_hidden(hidden)
+    eps = EPS[hidden]
+    rows = 129
+    generator = _generator(hidden, rows, 47)
+    x = _rows(rows, hidden, generator=generator)
+    w_aligned = _weight(hidden, generator)
+    storage = torch.empty(hidden + 16, dtype=torch.bfloat16, device=_device())
+    offset = ((16 - storage.data_ptr() % 32) % 32) // storage.element_size()
+    w = storage[offset : offset + hidden]
+    w.copy_(w_aligned)
+    assert w.is_contiguous() and w.data_ptr() % 32 == 16, "test layout"
+    label = f"hidden={hidden} 16-byte aligned w"
+
+    y, rstd = cake_rmsnorm_train_forward(x, w, eps)
+    y_ref, rstd_ref, _ = _reference_forward(x, w, eps)
+    _assert_bf16_close(y, y_ref, f"y {label}")
+    assert _rel_l2(rstd, rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
+    y_aligned, rstd_aligned = cake_rmsnorm_train_forward(x, w_aligned, eps)
+    assert torch.equal(y, y_aligned) and torch.equal(rstd, rstd_aligned), label
+
+    g = _rows(rows, hidden, generator=generator)
+    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)
+    dx_ref, dw_ref = _reference_backward(g, x, w, eps)
+    _assert_bf16_close(dx, dx_ref, f"dx {label}")
+    _assert_dw(dw, dw_ref, g, x, rstd, f"dw {label}")
+    dx_aligned, dw_aligned = cake_rmsnorm_train_backward(g, x, w_aligned, rstd)
+    assert torch.equal(dx, dx_aligned) and torch.equal(dw, dw_aligned), label
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)

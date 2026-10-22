@@ -99,7 +99,11 @@ def test_plan_writes_every_destination_element_once(
     geometry = plans.Geometry(
         world_size=world_size, batch=batch, s_local=s_local, hidden=hidden
     )
-    for arch in ("sm_90a", "sm_100a"):
+    # Every delivered architecture; SM107 has no 8-rank sessions (4-GPU nodes),
+    # so that geometry is skipped there instead of asserted.
+    for arch in sorted(set(loader.CAPABILITY_ARCH.values())):
+        if world_size not in loader.supported_world_sizes(arch):
+            continue
         for rank in range(world_size):
             _policy, plan = plans.plan_for(geometry, layout, rank, arch=arch)
             counts = _destination_writes(plan)
@@ -153,6 +157,12 @@ def test_plan_policy_rules():
     assert hopper.order == "grouped" and not hopper.pair
     assert hopper.group_m_scale == 1
     assert hopper == plans.plan_policy(large, arch="sm_90a", group_m_scale=1)
+    # SM107 follows the tcgen05 policy (pair tile) on the world sizes it supports.
+    rubin = plans.plan_policy(
+        plans.Geometry(world_size=4, batch=1, s_local=1024, hidden=4096), arch="sm_107a"
+    )
+    assert rubin.pair is True and rubin.bn == 256
+    assert "sm_107a" in plans.PAIR_ARCHES and "sm_90a" not in plans.PAIR_ARCHES
 
 
 def test_geometry_rejects_heads_not_divisible_by_world_size():
@@ -209,14 +219,31 @@ def test_barrier_flag_words():
         assert loader.barrier_flag_words(world_size) == 2 + 4 * world_size
 
 
+def test_supported_world_sizes_per_architecture():
+    assert (
+        set(loader.SUPPORTED_WORLD_SIZES_BY_ARCH)
+        == set(loader.ARCH_FLAGS)
+        == set(loader.CAPABILITY_ARCH.values())
+    )
+    for arch, sizes in loader.SUPPORTED_WORLD_SIZES_BY_ARCH.items():
+        assert loader.supported_world_sizes(arch) == sizes
+        assert set(sizes) <= set(loader.SUPPORTED_WORLD_SIZES)
+    assert loader.supported_world_sizes("sm_107a") == (2, 4)
+    assert loader.supported_world_sizes("sm_100a") == (2, 4, 8)
+    with pytest.raises(ValueError, match="no fused QKV exchange programs"):
+        loader.supported_world_sizes("sm_120a")
+
+
 def test_fold_barrier_default_table():
-    """The default launch path per architecture: the folded rendezvous on SM90, SM100 and SM103 alike; the
-    separate barrier kernel is the explicit ``fold_barrier=False`` path."""
+    """The default launch path per architecture: the folded rendezvous on SM90, SM100, SM103
+    and SM107 (Rubin, after its own measurement); the separate barrier kernel as
+    the explicit ``fold_barrier=False`` path everywhere."""
 
     assert loader.FOLD_BARRIER_DEFAULT_BY_ARCH == {
         "sm_90a": True,
         "sm_100a": True,
         "sm_103a": True,
+        "sm_107a": True,
     }
     assert set(loader.FOLD_BARRIER_DEFAULT_BY_ARCH) == set(loader.ARCH_FLAGS)
     for arch, fold in loader.FOLD_BARRIER_DEFAULT_BY_ARCH.items():
@@ -230,35 +257,52 @@ def test_fold_barrier_default_table():
 
 
 def test_fold_barrier_resolution(monkeypatch):
-    """Keyword over environment over architecture default; every delivered architecture folds by default and
-    delivers the folded producers; ``True`` fails closed on a route table without them."""
+    """Keyword over environment over architecture default; every delivered architecture folds
+    by default and delivers the folded producers (SM107 included); ``True`` fails closed on a
+    route table without them (modelled below by stripping one table)."""
 
     if not loader.ROUTES:
         pytest.skip("program tables are filled by the exporter")
     env = backend.FOLD_BARRIER_ENV
     for arch in loader.ROUTES:
-        assert loader.default_fold_barrier(arch) is True
-        assert loader.fold_producers_delivered(arch)
+        default = loader.default_fold_barrier(arch)
+        assert loader.fold_producers_delivered(arch) is default
         monkeypatch.delenv(env, raising=False)
-        assert backend.resolve_fold_barrier(arch) == (True, "default")
+        assert backend.resolve_fold_barrier(arch) == (default, "default")
         assert backend.resolve_fold_barrier(arch, False) == (False, "keyword")
         monkeypatch.setenv(env, "auto")
-        assert backend.resolve_fold_barrier(arch) == (True, "default")
+        assert backend.resolve_fold_barrier(arch) == (default, "default")
         monkeypatch.setenv(env, "0")
         assert backend.resolve_fold_barrier(arch) == (False, "env")
         monkeypatch.setenv(env, "1")
-        assert backend.resolve_fold_barrier(arch) == (True, "env")
+        if default:
+            assert backend.resolve_fold_barrier(arch) == (True, "env")
+        else:
+            with pytest.raises(
+                ValueError, match="no producer program with the folded rendezvous"
+            ):
+                backend.resolve_fold_barrier(arch)
         monkeypatch.setenv(env, "0")
-        assert backend.resolve_fold_barrier(arch, True) == (True, "keyword")
+        if default:
+            assert backend.resolve_fold_barrier(arch, True) == (True, "keyword")
+        else:
+            with pytest.raises(
+                ValueError,
+                match="pass fold_barrier=False to select the separate barrier kernel",
+            ):
+                backend.resolve_fold_barrier(arch, True)
         monkeypatch.setenv(env, "yes")
         with pytest.raises(ValueError, match=env):
             backend.resolve_fold_barrier(arch)
         monkeypatch.delenv(env, raising=False)
         with pytest.raises(ValueError, match="bool or None"):
             backend.resolve_fold_barrier(arch, 1)  # type: ignore[arg-type]
-    # A route table without folded producers (none delivered; a patched table): the default and the explicit
-    # ``True`` fail closed naming the opt-out, ``False`` resolves.
-    arch = next(iter(loader.ROUTES))
+    # A route table without folded producers (a patched table of a fold-default architecture):
+    # the default and the explicit ``True`` fail closed naming the opt-out, ``False`` resolves.
+    fold_arches = [arch for arch in loader.ROUTES if loader.default_fold_barrier(arch)]
+    if not fold_arches:
+        pytest.skip("no fold-default architecture in the delivered route tables")
+    arch = fold_arches[0]
     stripped = {
         key: value for key, value in loader.ROUTES[arch].items() if "_fold" not in key
     }
@@ -277,66 +321,129 @@ def test_fold_barrier_resolution(monkeypatch):
 
 
 def test_shape_gate_default_table():
-    """The row-count gates per architecture: one readiness word per destination for calls of at most 4096 rows and one
-    producer launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 the persistent
-    producer grid over every SM (no reserved SMs) for calls of at least 16384 rows and the other two gates off."""
+    """The row-count gates per architecture and world size, read from the tables themselves (no verbatim copy): the
+    per-architecture table -- one readiness word per destination for calls of at most 4096 rows and one producer
+    launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 one readiness word per
+    destination for calls of at most 4096 rows, the persistent producer grid over every SM (no reserved SMs) for
+    calls of at least 16384 rows, and the per-destination launch gate off; on SM107 every gate off -- plus the one
+    (architecture, world size) cell that differs from it: the small-row word gate on every row for 8 ranks on SM90."""
 
     assert plans.SHAPE_GATE_NAMES == (
         "words_capacity_small_m",
         "reserved_sms_large_m",
         "per_dest_large_m",
+        "pair_off_large_m",
+    )
+    assert (
+        plans.SHAPE_GATE_BN
+        == {"pair_off_large_m": plans.PAIR_BN}
+        == {"pair_off_large_m": 256}
     )
     assert plans.SHAPE_GATE_OFF == 0 and plans.RESERVED_SMS == 2
-    assert plans.SHAPE_GATE_DEFAULT_BY_ARCH == {
-        "sm_90a": {
-            "words_capacity_small_m": 0,
-            "reserved_sms_large_m": 16384,
-            "per_dest_large_m": 0,
-        },
-        "sm_100a": {
-            "words_capacity_small_m": 4096,
-            "reserved_sms_large_m": 0,
-            "per_dest_large_m": 16384,
-        },
-        "sm_103a": {
-            "words_capacity_small_m": 4096,
-            "reserved_sms_large_m": 0,
-            "per_dest_large_m": 16384,
-        },
+    assert plans.SHAPE_GATE_ALL_ROWS == 2**31 - 1 > 10**9
+    assert plans.SHAPE_GATE_ALL_ROWS_NAMES == ("words_capacity_small_m",)
+    table = plans.SHAPE_GATE_DEFAULT_BY_ARCH
+    assert set(table) == set(loader.ARCH_FLAGS)
+    for arch, row in table.items():
+        assert tuple(row) == plans.SHAPE_GATE_NAMES
+        assert plans.check_shape_gates(row) == row
+        # The per-architecture semantics (the pair-tile gate is off in every per-architecture row).
+        assert row["pair_off_large_m"] == plans.SHAPE_GATE_OFF
+        if arch == "sm_107a":
+            assert not any(row.values())
+        else:
+            assert row["words_capacity_small_m"] == 4096
+            assert row["reserved_sms_large_m"] == (16384 if arch == "sm_90a" else 0)
+            assert row["per_dest_large_m"] == (0 if arch == "sm_90a" else 16384)
+    # The (architecture, world size) cells: exactly the one new (architecture, world size) default, differing from
+    # its row.
+    overrides = plans.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD
+    assert set(overrides) == {("sm_90a", 8)}
+    assert overrides[("sm_90a", 8)] == {
+        "words_capacity_small_m": plans.SHAPE_GATE_ALL_ROWS
     }
-    assert set(plans.SHAPE_GATE_DEFAULT_BY_ARCH) == set(loader.ARCH_FLAGS)
-    for arch, table in plans.SHAPE_GATE_DEFAULT_BY_ARCH.items():
-        assert tuple(table) == plans.SHAPE_GATE_NAMES
-        assert (
-            plans.default_shape_gates(arch) == table
-            and plans.default_shape_gates(arch) is not table
+    for (arch, world_size), cell in overrides.items():
+        assert world_size in plans.SUPPORTED_WORLD_SIZES and set(cell) <= set(
+            plans.SHAPE_GATE_NAMES
         )
-        assert plans.check_shape_gates(table) == table
+        for name, value in cell.items():
+            assert value != table[arch][name], "a cell equal to its row is refused"
+    # ``default_shape_gates`` merges the two and never hands out the row alone.
+    for arch in table:
+        for world_size in plans.SUPPORTED_WORLD_SIZES:
+            merged = plans.default_shape_gates(arch, world_size=world_size)
+            assert tuple(merged) == plans.SHAPE_GATE_NAMES
+            assert merged == {**table[arch], **overrides.get((arch, world_size), {})}
+            assert (
+                merged is not table[arch] and plans.check_shape_gates(merged) == merged
+            )
+            if (arch, world_size) not in overrides:
+                assert merged == table[arch]
+    assert plans.default_shape_gates("sm_90a", world_size=8) == {
+        **table["sm_90a"],
+        "words_capacity_small_m": plans.SHAPE_GATE_ALL_ROWS,
+    }
+    assert (
+        plans.spell_shape_gates(plans.default_shape_gates("sm_90a", world_size=8))[
+            "words_capacity_small_m"
+        ]
+        == "all"
+    )
+    assert plans.spell_shape_gates(table["sm_90a"]) == table["sm_90a"]
+    with pytest.raises(TypeError):
+        plans.default_shape_gates("sm_90a")  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="no shape gates"):
-        plans.default_shape_gates("sm_120a")
+        plans.default_shape_gates("sm_120a", world_size=8)
+    with pytest.raises(ValueError, match="world_size=16"):
+        plans.default_shape_gates("sm_100a", world_size=16)
+    # ``all`` round-trips through the table check (the small-row word gate only).
+    assert plans.check_shape_gates(
+        {**table["sm_90a"], "words_capacity_small_m": "all"}
+    ) == (plans.default_shape_gates("sm_90a", world_size=8))
     for bad in (
+        {**table["sm_90a"], "reserved_sms_large_m": "all"},
+        {**table["sm_90a"], "per_dest_large_m": plans.SHAPE_GATE_ALL_ROWS},
         {"words_capacity_small_m": 1},
         {"words_capacity_small_m": 0, "per_dest_large_m": 0},
+        {
+            "words_capacity_small_m": 0,
+            "reserved_sms_large_m": 0,
+            "per_dest_large_m": 0,
+        },
         {
             "words_capacity_small_m": -1,
             "reserved_sms_large_m": 0,
             "per_dest_large_m": 0,
+            "pair_off_large_m": 0,
         },
         {
             "words_capacity_small_m": True,
             "reserved_sms_large_m": 0,
             "per_dest_large_m": 0,
+            "pair_off_large_m": 0,
         },
         {
             "words_capacity_small_m": 0,
             "reserved_sms_large_m": 2.0,
             "per_dest_large_m": 0,
+            "pair_off_large_m": 0,
         },
+        {
+            "words_capacity_small_m": 0,
+            "reserved_sms_large_m": 0,
+            "per_dest_large_m": 0,
+            "pair_off_large_m": -8192,
+        },
+        # Above ``SHAPE_GATE_ALL_ROWS`` no row count is reached: ``all`` (every row, the small-row gate) and ``0``
+        # (never) are the only spellings, on the word gate and on a large-row gate alike.
+        {**table["sm_90a"], "words_capacity_small_m": plans.SHAPE_GATE_ALL_ROWS + 1},
+        {**table["sm_90a"], "reserved_sms_large_m": 2**31},
+        {**table["sm_100a"], "pair_off_large_m": 3_000_000_000},
     ):
         with pytest.raises(ValueError):
             plans.check_shape_gates(bad)
     # Inclusive thresholds; a gate at 0 never fires.
-    blackwell = plans.default_shape_gates("sm_100a")
+    blackwell = plans.default_shape_gates("sm_100a", world_size=8)
     assert plans.gate_rows(blackwell, 4096).fired == ("words_capacity_small_m",)
     assert plans.gate_rows(blackwell, 4096).words_capacity_per_dest == 1
     assert (
@@ -348,12 +455,17 @@ def test_shape_gate_default_table():
     assert plans.gate_rows(blackwell, 16384).producer_launches == "per_dest"
     assert plans.gate_rows(blackwell, 16384).words_capacity_per_dest is None
     assert plans.gate_rows(blackwell, 16384).reserved_sms is None
-    hopper = plans.default_shape_gates("sm_90a")
-    for rows in (128, 4096, 16383):
+    hopper = plans.default_shape_gates("sm_90a", world_size=4)
+    # SM90 ships the small-row word gate too (one readiness word per destination).
+    for rows in (128, 4096):
         verdict = plans.gate_rows(hopper, rows)
-        assert verdict.fired == () and verdict.producer_launches == "persistent"
-        assert verdict.words_capacity_per_dest is None and verdict.reserved_sms is None
+        assert verdict.fired == ("words_capacity_small_m",)
+        assert verdict.producer_launches == "persistent"
+        assert verdict.words_capacity_per_dest == 1 and verdict.reserved_sms is None
         assert verdict.summary()["rows"] == rows
+    verdict = plans.gate_rows(hopper, 16383)
+    assert verdict.fired == () and verdict.producer_launches == "persistent"
+    assert verdict.words_capacity_per_dest is None and verdict.reserved_sms is None
     for rows in (16384, 65536):
         verdict = plans.gate_rows(hopper, rows)
         assert verdict.fired == ("reserved_sms_large_m",)
@@ -361,16 +473,190 @@ def test_shape_gate_default_table():
         assert verdict.words_capacity_per_dest is None
         assert verdict.summary()["reserved_sms"] == 0
         assert verdict.summary()["fired"] == ["reserved_sms_large_m"]
+    # SM90 with 8 ranks: the small-row word gate covers every row count (one readiness word per destination on
+    # every call), beside the large-row reserved-SM gate; the verdict spells the threshold ``all``.
+    hopper8 = plans.default_shape_gates("sm_90a", world_size=8)
+    for rows in (1, 128, 4096, 4097, 16383, 16384, 65536, 10**8):
+        verdict = plans.gate_rows(hopper8, rows)
+        assert verdict.words_capacity_per_dest == 1
+        assert (
+            "words_capacity_small_m" in verdict.fired
+        ) and verdict.producer_launches == "persistent"
+        assert (verdict.reserved_sms == 0) is (rows >= 16384)
+        assert verdict.summary()["gates"]["words_capacity_small_m"] == "all"
+    assert plans.gate_rows(hopper8, 16384).fired == (
+        "words_capacity_small_m",
+        "reserved_sms_large_m",
+    )
     # ``fired`` lists the gates in table order whatever fired.
     every = {
         "words_capacity_small_m": 20000,
         "reserved_sms_large_m": 16384,
         "per_dest_large_m": 16384,
+        "pair_off_large_m": 16384,
     }
-    assert plans.gate_rows(every, 16384).fired == plans.SHAPE_GATE_NAMES
-    assert plans.gate_rows(every, 16384).reserved_sms == 0
+    assert plans.gate_rows(every, 16384, bn=256).fired == plans.SHAPE_GATE_NAMES
+    assert plans.gate_rows(every, 16384, bn=256).reserved_sms == 0
+    assert plans.gate_rows(every, 16384, bn=256).pair is False
     with pytest.raises(ValueError, match="positive int"):
         plans.gate_rows(blackwell, 0)
+    # The pair-tile gate: inclusive at its threshold, 256-column calls only, needs the
+    # tile width while it is on; off, the tile width is optional and nothing fires.
+    opted = {**blackwell, "pair_off_large_m": 8192}
+    for rows, bn, fires in (
+        (8191, 256, False),
+        (8192, 256, True),
+        (65536, 256, True),
+        (8192, 128, False),
+        (65536, 128, False),
+    ):
+        verdict = plans.gate_rows(opted, rows, bn=bn)
+        assert (verdict.pair is False) is fires and verdict.bn == bn
+        assert ("pair_off_large_m" in verdict.fired) is fires
+        assert verdict.summary()["pair"] == verdict.pair
+        assert verdict.summary()["bn"] == bn
+    assert plans.gate_rows(opted, 16384, bn=256).fired == (
+        "per_dest_large_m",
+        "pair_off_large_m",
+    )
+    with pytest.raises(ValueError, match="pair_off_large_m=8192 fires on bn == 256"):
+        plans.gate_rows(opted, 8192)
+    with pytest.raises(ValueError, match="bn must be one of"):
+        plans.gate_rows(opted, 8192, bn=64)
+    assert plans.gate_rows(blackwell, 65536).pair is None
+    assert plans.gate_rows(blackwell, 65536, bn=256).pair is None
+    assert plans.gate_rows(blackwell, 65536, bn=256).summary()["fired"] == [
+        "per_dest_large_m"
+    ]
+
+
+def test_pair_tile_gate_selects_the_single_cta_plan_on_wide_large_rows():
+    """A fired pair-tile gate runs a 256-column row of at least the threshold on the single-CTA producer with the
+    pair policy's tile order and ``group_m`` (the plan is the pair plan with ``pair`` off: no lockstep pads);
+    128-column rows and rows below the threshold keep the pair tile.  The fourth-gate plan equals the plan of the
+    explicit ``pair=False`` override, so the opt-in path and the override path are one path."""
+
+    gates = {
+        **plans.default_shape_gates("sm_100a", world_size=2),
+        "pair_off_large_m": 8192,
+    }
+    # The SM100 2-rank default is the opt-in form (the pair-tile gate ships off on every cell).
+    assert plans.default_shape_gates("sm_100a", world_size=2) == {
+        **gates,
+        "pair_off_large_m": 0,
+    }
+    # (world_size, hidden, s_local) -> the pair policy's (order, group_m) on SM100 and SM103.
+    wide_rows = {
+        (4, 6144, 8192): ("grouped", 20),
+        (2, 8192, 65536): ("grouped", 16),
+    }
+    for arch in ("sm_100a", "sm_103a"):
+        for (world_size, hidden, s_local), (order, group_m) in wide_rows.items():
+            geometry = plans.Geometry(
+                world_size=world_size, batch=1, s_local=s_local, hidden=hidden
+            )
+            assert plans.block_n_for(geometry) == 256 and geometry.rows >= 8192
+            verdict = plans.gate_rows(gates, geometry.rows, bn=256)
+            assert verdict.pair is False and "pair_off_large_m" in verdict.fired
+            policy, plan = plans.plan_for(geometry, "bshd", 0, arch=arch)
+            gated_policy, gated = plans.plan_for(
+                geometry, "bshd", 0, arch=arch, pair=verdict.pair
+            )
+            assert (policy.pair, policy.order, policy.group_m) == (True, order, group_m)
+            assert (gated_policy.pair, gated_policy.order, gated_policy.group_m) == (
+                False,
+                order,
+                group_m,
+            )
+            assert (plan.pair, plan.lockstep) == (True, 2)
+            assert (gated.pair, gated.lockstep, gated.num_pad_rows) == (False, 1, 0)
+            assert (gated.order, gated.group_m, gated.bn) == (order, group_m, 256)
+            assert gated.num_words == plan.num_words
+            assert gated_policy.reasons[:-1] == policy.reasons
+            assert "pair override True -> False" in gated_policy.reasons[-1]
+            # ``pair=None`` keeps the policy; an override equal to the policy adds nothing.
+            same_policy, same = plans.plan_for(
+                geometry, "bshd", 0, arch=arch, pair=True
+            )
+            assert same_policy == policy and torch.equal(same.tiles, plan.tiles)
+        # Controls: a 128-column row at any size and a 256-column row below the threshold.
+        narrow = plans.Geometry(world_size=8, batch=1, s_local=16384, hidden=3072)
+        assert plans.block_n_for(narrow) == 128
+        assert plans.gate_rows(gates, narrow.rows, bn=128).pair is None
+        small = plans.Geometry(world_size=4, batch=1, s_local=1024, hidden=4096)
+        assert plans.block_n_for(small) == 256
+        assert plans.gate_rows(gates, small.rows, bn=256).pair is None
+        for geometry in (narrow, small):
+            _policy, plan = plans.plan_for(geometry, "bshd", 0, arch=arch)
+            assert plan.pair is True
+    # SM90 builds no pair tile: the plan is the single-CTA plan with the gate off.
+    hopper = plans.Geometry(world_size=8, batch=1, s_local=16384, hidden=8192)
+    policy, plan = plans.plan_for(
+        hopper, "bshd", 0, arch="sm_90a", pair_available=False
+    )
+    assert (policy.pair, plan.pair, plan.lockstep) == (False, False, 1)
+    assert (
+        plans.gate_rows(
+            plans.default_shape_gates("sm_90a", world_size=8), hopper.rows
+        ).pair
+        is None
+    )
+
+
+def test_pair_tile_gate_reaches_the_single_cta_producer_and_names_itself(monkeypatch):
+    """With the pair-tile gate on, a 256-column session must load the single-CTA producer as well as the pair
+    producer (``reachable_pairs``), and a delivery without that producer refuses at construction naming the gate --
+    not the producer-variant variable.  Off, or below ``max_tokens``, or on a 128-column session, nothing changes."""
+
+    if not loader.ROUTES:
+        pytest.skip("program tables are filled by the exporter")
+    arches = [arch for arch in loader.ROUTES if arch in plans.PAIR_ARCHES]
+    if not arches:
+        pytest.skip("no pair architecture in the delivered route tables")
+    for arch in arches:
+        default = plans.default_shape_gates(arch, world_size=4)
+        gated = {**default, "pair_off_large_m": 8192}
+        assert backend.reachable_pairs(arch, 256, True, default, 65536) == (True,)
+        assert backend.reachable_pairs(arch, 256, True, gated, 65536) == (False, True)
+        assert backend.reachable_pairs(arch, 256, True, gated, 8192) == (False, True)
+        assert backend.reachable_pairs(arch, 256, True, gated, 8191) == (True,)
+        assert backend.reachable_pairs(arch, 256, False, gated, 65536) == (False,)
+        for max_tokens in (512, 4096, 65536):
+            assert backend.reachable_pairs(
+                arch, 128, True, gated, max_tokens
+            ) == backend.reachable_pairs(arch, 128, True, default, max_tokens)
+        # A table without the single-CTA 256-column producer (the delivered Blackwell routes ship the pair
+        # producer only): the refusal names the gate, the delivered builds and the opt-out.
+        stripped = {
+            key: value
+            for key, value in loader.ROUTES[arch].items()
+            if not (
+                key.startswith("producer_bn")
+                and loader.parse_producer_key(key).block_n == 256
+                and not loader.parse_producer_key(key).pair
+            )
+        }
+        with monkeypatch.context() as patched:
+            patched.setattr(loader, "ROUTES", {**loader.ROUTES, arch: stripped})
+            assert not loader.has_producer(arch, 256, False)
+            message = backend.undelivered_producer_error(
+                arch, 256, False, "", "default", gated
+            )
+            assert "pair_off_large_m=8192" in message and "single-CTA" in message
+            assert "block_n=256" in message and arch in message
+            assert backend.PRODUCER_VARIANT_ENV not in message
+            assert backend.SHAPE_GATES_ENV in message
+            plain = backend.undelivered_producer_error(
+                arch, 256, False, "", "default", default
+            )
+            assert (
+                "pair_off_large_m" not in plain
+                and backend.PRODUCER_VARIANT_ENV in plain
+            )
+    # SM90 builds no pair tile: every table reaches the single-CTA producer only.
+    assert backend.reachable_pairs(
+        "sm_90a", 256, False, plans.default_shape_gates("sm_90a", world_size=8), 65536
+    ) == (False,)
 
 
 def test_shape_gates_resolution(monkeypatch):
@@ -378,73 +664,120 @@ def test_shape_gates_resolution(monkeypatch):
     ``gate=value`` list overrides only the named gates; malformed values are errors."""
 
     env = backend.SHAPE_GATES_ENV
-    for arch in plans.SHAPE_GATE_DEFAULT_BY_ARCH:
+    cells = [
+        (arch, world_size)
+        for arch in plans.SHAPE_GATE_DEFAULT_BY_ARCH
+        for world_size in plans.SUPPORTED_WORLD_SIZES
+    ]
+    for arch, world_size in cells:
         monkeypatch.delenv(env, raising=False)
-        assert backend.resolve_shape_gates(arch) == (
-            plans.default_shape_gates(arch),
+        assert backend.resolve_shape_gates(arch, world_size) == (
+            plans.default_shape_gates(arch, world_size=world_size),
             "default",
         )
         monkeypatch.setenv(env, "auto")
-        assert backend.resolve_shape_gates(arch) == (
-            plans.default_shape_gates(arch),
+        assert backend.resolve_shape_gates(arch, world_size) == (
+            plans.default_shape_gates(arch, world_size=world_size),
             "default",
         )
         monkeypatch.setenv(env, "off")
-        assert backend.resolve_shape_gates(arch) == (
+        assert backend.resolve_shape_gates(arch, world_size) == (
             {
                 "words_capacity_small_m": 0,
                 "reserved_sms_large_m": 0,
                 "per_dest_large_m": 0,
+                "pair_off_large_m": 0,
             },
             "env",
         )
         monkeypatch.setenv(env, "per_dest_large_m=0")
-        gates, source = backend.resolve_shape_gates(arch)
+        gates, source = backend.resolve_shape_gates(arch, world_size)
+        defaults = plans.default_shape_gates(arch, world_size=world_size)
         assert source == "env" and gates["per_dest_large_m"] == 0
-        assert (
-            gates["words_capacity_small_m"]
-            == plans.default_shape_gates(arch)["words_capacity_small_m"]
-        )
-        assert (
-            gates["reserved_sms_large_m"]
-            == plans.default_shape_gates(arch)["reserved_sms_large_m"]
-        )
+        assert gates["words_capacity_small_m"] == defaults["words_capacity_small_m"]
+        assert gates["reserved_sms_large_m"] == defaults["reserved_sms_large_m"]
         monkeypatch.setenv(env, "words_capacity_small_m=2048; per_dest_large_m=auto")
-        gates, source = backend.resolve_shape_gates(arch)
-        defaults = plans.default_shape_gates(arch)
+        gates, source = backend.resolve_shape_gates(arch, world_size)
         assert source == "env" and gates == {
             "words_capacity_small_m": 2048,
             "reserved_sms_large_m": defaults["reserved_sms_large_m"],
             "per_dest_large_m": defaults["per_dest_large_m"],
+            "pair_off_large_m": defaults["pair_off_large_m"],
         }
+        # The small-row word gate on every row (``all``) in either direction: the SM90 8-rank default, an opt-in
+        # elsewhere; the previous SM90 8-rank plan is the explicit threshold 4096.
+        monkeypatch.setenv(env, "words_capacity_small_m=all")
+        gates, source = backend.resolve_shape_gates(arch, world_size)
+        assert (
+            source == "env"
+            and gates["words_capacity_small_m"] == plans.SHAPE_GATE_ALL_ROWS
+        )
+        assert (
+            plans.gate_rows(gates, 10**6, bn=plans.PAIR_BN).words_capacity_per_dest == 1
+        )
+        assert gates == {
+            **defaults,
+            "words_capacity_small_m": plans.SHAPE_GATE_ALL_ROWS,
+        }
+        if (arch, world_size) == ("sm_90a", 8):
+            assert gates == defaults
+            monkeypatch.setenv(env, "words_capacity_small_m=4096")
+            gates, source = backend.resolve_shape_gates(arch, world_size)
+            assert source == "env" and gates == plans.default_shape_gates(
+                arch, world_size=4
+            )
+            assert plans.gate_rows(gates, 4097).words_capacity_per_dest is None
+        # The pair-tile gate: an opt-in on the pair architectures, refused where no
+        # pair tile is built (nothing to switch off); its opt-out resolves everywhere.
+        monkeypatch.setenv(env, "pair_off_large_m=8192")
+        if arch in plans.PAIR_ARCHES:
+            gates, source = backend.resolve_shape_gates(arch, world_size)
+            assert source == "env" and gates["pair_off_large_m"] == 8192
+            assert gates["words_capacity_small_m"] == defaults["words_capacity_small_m"]
+            assert plans.gate_rows(gates, 8192, bn=256).pair is False
+            assert plans.gate_rows(gates, 8192, bn=128).pair is None
+        else:
+            with pytest.raises(ValueError, match="pair_off_large_m=8192 is refused on"):
+                backend.resolve_shape_gates(arch, world_size)
+        monkeypatch.setenv(env, "pair_off_large_m=0")
+        gates, source = backend.resolve_shape_gates(arch, world_size)
+        assert source == "env" and gates == {**defaults, "pair_off_large_m": 0}
+        monkeypatch.setenv(env, "pair_off_large_m=auto")
+        assert backend.resolve_shape_gates(arch, world_size) == (defaults, "env")
         # The large-row reserved-SM gate in either direction: armed at any row count, or switched off.
         monkeypatch.setenv(env, "reserved_sms_large_m=1")
-        gates, source = backend.resolve_shape_gates(arch)
+        gates, source = backend.resolve_shape_gates(arch, world_size)
         assert source == "env" and gates["reserved_sms_large_m"] == 1
-        assert plans.gate_rows(gates, 1).reserved_sms == 0
+        assert plans.gate_rows(gates, 1, bn=plans.PAIR_BN).reserved_sms == 0
         monkeypatch.setenv(env, "reserved_sms_large_m=0")
-        gates, source = backend.resolve_shape_gates(arch)
+        gates, source = backend.resolve_shape_gates(arch, world_size)
         assert source == "env" and gates["reserved_sms_large_m"] == 0
-        assert plans.gate_rows(gates, 65536).reserved_sms is None
+        assert plans.gate_rows(gates, 65536, bn=plans.PAIR_BN).reserved_sms is None
         for bad in (
             "yes",
             "words_capacity_small_m",
             "grid_small_m=1",
             "per_dest_large_m=-3",
+            "pair_off_large_m=-1",
+            "pair_off_large_m=x",
             "per_dest_large_m=x",
             "reserved_sms_large_m=on",
+            "reserved_sms_large_m=all",
+            "per_dest_large_m=all",
+            "pair_off_large_m=all",
         ):
             monkeypatch.setenv(env, bad)
             with pytest.raises(ValueError, match=env):
-                backend.resolve_shape_gates(arch)
+                backend.resolve_shape_gates(arch, world_size)
     monkeypatch.delenv(env, raising=False)
     assert backend.shape_gates_from_env() is None
 
 
 def test_group_m_scale_default_table():
     """The group scaling per architecture and world size: the token-tile group of a grouped row with a hidden size of
-    at least 6144 is doubled on SM100 groups of 4 and 2 ranks and on SM103, kept on SM100 groups of 8 ranks and on
-    SM90; ``plan_policy`` without an explicit scale resolves the geometry's world size against the table."""
+    at least 6144 is doubled on SM100 groups of 4 and 2 ranks and on SM103, kept on SM100 groups of 8 ranks, on
+    SM90 and on SM107; ``plan_policy`` without an explicit scale resolves the geometry's world size against the
+    table."""
 
     assert plans.SUPPORTED_WORLD_SIZES == loader.SUPPORTED_WORLD_SIZES == (2, 4, 8)
     assert plans.GROUP_M_SCALES == (1, 2, 4) and plans.GROUP_M_SCALE_MIN_K == 6144
@@ -452,6 +785,8 @@ def test_group_m_scale_default_table():
         "sm_90a": {2: 1, 4: 1, 8: 1},
         "sm_100a": {2: 2, 4: 2, 8: 1},
         "sm_103a": {2: 2, 4: 2, 8: 2},
+        # the baseline plan on SM107 (not measured there)
+        "sm_107a": {2: 1, 4: 1, 8: 1},
     }
     assert set(plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD) == set(loader.ARCH_FLAGS)
     for arch, row in plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD.items():
@@ -494,7 +829,13 @@ def test_group_m_scale_default_table():
     for arch in plans.PAIR_ARCHES:
         scaled = plans.plan_policy(small_k, arch=arch)
         baseline = plans.plan_policy(small_k, arch=arch, group_m_scale=1)
-        assert scaled.group_m_scale == 2 and scaled.order == "grouped"
+        # SM100 / SM103 ship scale 2 at W = 2; SM107 keeps the baseline scale 1 on every W.
+        assert (
+            scaled.group_m_scale
+            == plans.default_group_m_scale(arch, 2)
+            == (1 if arch == "sm_107a" else 2)
+        )
+        assert scaled.order == "grouped"
         assert scaled.group_m == baseline.group_m
 
 
@@ -530,18 +871,20 @@ def test_producer_key_grammar():
     """Producer route keys: ``producer_bn<bn>[_pair][_<variant>][_fold<phase>]``; ``parse_producer_key`` is the
     inverse and refuses every other spelling."""
 
-    assert loader.PRODUCER_VARIANTS == ("", "ow256", "bulk_ow256")
+    assert loader.PRODUCER_VARIANTS == ("", "ow256", "bulk_ow256", "bulk")
     assert loader.SHIPPED_VARIANT == ""
     assert loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH == {
         "": 128,
         "ow256": 256,
         "bulk_ow256": 256,
+        "bulk": 128,
     }
     assert loader.producer_key(256, True) == "producer_bn256_pair"
     assert loader.producer_key(128, False) == "producer_bn128"
     assert (
         loader.producer_key(256, True, "bulk_ow256") == "producer_bn256_pair_bulk_ow256"
     )
+    assert loader.producer_key(256, True, "bulk") == "producer_bn256_pair_bulk"
     assert loader.producer_key(128, False, "ow256") == "producer_bn128_ow256"
     assert loader.fold_producer_key(128, True, 1) == "producer_bn128_pair_fold1"
     assert loader.fold_producer_key(256, False, 0) == "producer_bn256_fold0"
@@ -552,6 +895,10 @@ def test_producer_key_grammar():
     assert (
         loader.fold_producer_key(256, True, 0, "bulk_ow256")
         == "producer_bn256_pair_bulk_ow256_fold0"
+    )
+    assert (
+        loader.fold_producer_key(256, True, 1, "bulk")
+        == "producer_bn256_pair_bulk_fold1"
     )
     parse = loader.parse_producer_key
     for block_n in plans.BLOCK_N_CHOICES:
@@ -597,6 +944,8 @@ def test_producer_variant_default_table():
         "sm_90a": {2: "", 4: "", 8: ""},
         "sm_100a": {2: "", 4: "ow256", 8: "bulk_ow256"},
         "sm_103a": {2: "", 4: "ow256", 8: "ow256"},
+        # SM107: groups of 4 ranks run the bulk-row-store build (measured there); 2 ranks the baseline build
+        "sm_107a": {2: "", 4: "bulk", 8: ""},
     }
     assert set(table) == set(loader.ARCH_FLAGS) == set(loader.ROUTES)
     for arch, row in table.items():
@@ -685,7 +1034,7 @@ def test_producer_variant_resolution(monkeypatch):
                             resolve(arch, world_size, block_n)
                 monkeypatch.setenv(env, "shipped")
                 assert resolve(arch, world_size, block_n) == ("", "env")
-                for name in ("ow256", "bulk_ow256"):
+                for name in ("ow256", "bulk_ow256", "bulk"):
                     monkeypatch.setenv(env, name)
                     if name in delivered:
                         assert resolve(arch, world_size, block_n) == (name, "env")
@@ -749,8 +1098,11 @@ def test_dest_parts_cover_the_table_once_per_destination_run():
                 -1
             }
             assert len(dests) == 1
-        # The verdict of this row on each architecture.
-        verdict = plans.gate_rows(plans.default_shape_gates(arch), geometry.rows)
+        # The verdict of this row on each architecture (at its world size).
+        verdict = plans.gate_rows(
+            plans.default_shape_gates(arch, world_size=geometry.world_size),
+            geometry.rows,
+        )
         assert verdict.producer_launches == (
             "per_dest" if arch in ("sm_100a", "sm_103a") else "persistent"
         )
@@ -804,8 +1156,9 @@ def test_loader_tables_are_consistent():
                 assert record["args"][0] == "device_index"
             else:
                 assert record["args"][0] == "ready"
-        # Folded producers: both rendezvous phases of every delivered producer build on every architecture (the
-        # default launch path folds the rendezvous everywhere).
+        # Folded producers: both rendezvous phases of every delivered producer build where the
+        # architecture folds by default (every delivered architecture, SM107
+        # included); the ``else`` branch covers a table whose default is the barrier kernel.
         plain_keys = {
             key for key in table if key.startswith("producer_bn") and "_fold" not in key
         }
@@ -813,17 +1166,23 @@ def test_loader_tables_are_consistent():
             f"{key}_fold{phase}" for key in plain_keys for phase in loader.FOLD_PHASES
         }
         fold_keys = {key for key in table if "_fold" in key}
-        assert loader.default_fold_barrier(arch) and fold_keys == complete
-        assert loader.fold_producers_delivered(arch)
+        if loader.default_fold_barrier(arch):
+            assert fold_keys == complete and loader.fold_producers_delivered(arch)
+        else:
+            assert not fold_keys and not loader.fold_producers_delivered(arch)
         # The policy never selects a producer the architecture does not deliver -- in the default build of the
-        # row's world size, with the baseline build delivered beside a variant.
+        # row's world size (for the world sizes the architecture supports), with the baseline build delivered
+        # beside a variant.
         for hidden, world_size, rows in (
             (3072, 8, 512),
             (3072, 8, 8192),
             (4096, 8, 512),
+            (3072, 4, 1024),
             (4096, 4, 512),
             (8192, 2, 65536),
         ):
+            if world_size not in loader.supported_world_sizes(arch):
+                continue
             geometry = plans.Geometry(
                 world_size=world_size, batch=1, s_local=rows, hidden=hidden
             )
@@ -1264,9 +1623,11 @@ def _run_worker(rank, world_size, port):
         finally:
             nccl.close()
 
-        # 5. Launch paths: the architecture default (the folded rendezvous on every architecture) against the
-        #    explicit barrier path -- bitwise-equal outputs, two versus three launches per call.
+        # 5. Launch paths: the architecture default (the folded rendezvous on every delivered
+        #    architecture, SM107 included) against the explicit barrier path --
+        #    bitwise-equal outputs; two versus three launches per call where the default folds.
         arch = loader.device_facts(device.index).arch
+        fold_default = loader.default_fold_barrier(arch)
         default_path = QkvNormRopeExchangeOverlap(
             group,
             hidden=hidden,
@@ -1289,17 +1650,22 @@ def _run_worker(rank, world_size, port):
         try:
             default_info = default_path.describe()
             barrier_info = barrier_path.describe()
-            assert (
-                default_info["fold_barrier"]
-                is loader.default_fold_barrier(arch)
-                is True
-            )
+            assert default_info["fold_barrier"] is fold_default
             assert default_info["fold_barrier_requested"] == "auto"
-            assert default_info["launches_per_call"] == 2
-            assert default_info["launch_sequence"] == ["producer_fold<phase>", "wait"]
+            assert default_info["launches_per_call"] == (2 if fold_default else 3)
+            assert default_info["launch_sequence"] == (
+                ["producer_fold<phase>", "wait"]
+                if fold_default
+                else ["barrier_p<phase>", "producer", "wait"]
+            )
             assert barrier_info["fold_barrier"] is False
             assert barrier_info["fold_barrier_requested"] is False
             assert barrier_info["launches_per_call"] == 3
+            assert barrier_info["launch_sequence"] == [
+                "barrier_p<phase>",
+                "producer",
+                "wait",
+            ]
             # The producer build and the group scaling of the architecture default for this world size.
             variant = loader.default_producer_variant(arch, world_size)
             assert default_info["producer_variant"] == {
@@ -1317,11 +1683,14 @@ def _run_worker(rank, world_size, port):
             assert default_info["reserved_sms"] == plans.RESERVED_SMS
             bound = default_path.bound_programs(batch, s_local)
             assert bound == barrier_path.bound_programs(batch, s_local)
-            assert "producer_fold0" in bound and "producer_fold1" in bound
             assert "barrier_p0" in bound and "producer" in bound
-            # Six delivered stages on a baseline-build row, nine where the default build is a variant (the baseline
-            # build's three programs ride along as the ``shipped`` opt-out).
-            assert len(bound) == (6 if variant == "" else 9)
+            if fold_default:
+                assert "producer_fold0" in bound and "producer_fold1" in bound
+                # Six delivered stages on a baseline-build row, nine where the default build is a variant (the
+                # baseline build's three programs ride along as the ``shipped`` opt-out).
+                assert len(bound) == (6 if variant == "" else 9)
+            else:
+                assert not any("_fold" in key for key in bound) and len(bound) == 4
             block_n = default_info["block_n"]
             row_policy = plans.plan_policy(
                 plans.Geometry(
@@ -1333,7 +1702,7 @@ def _run_worker(rank, world_size, port):
             assert bound["producer"] == loader.producer_program(
                 arch, block_n, row_policy.pair, variant
             )
-            for phase in loader.FOLD_PHASES:
+            for phase in loader.FOLD_PHASES if fold_default else ():
                 assert bound[f"producer_fold{phase}"] == loader.fold_producer_program(
                     arch, block_n, row_policy.pair, phase, variant
                 )
@@ -1342,7 +1711,7 @@ def _run_worker(rank, world_size, port):
                     arch, block_n, row_policy.pair
                 )
                 assert bound["producer_shipped"] != bound["producer"]
-                for phase in loader.FOLD_PHASES:
+                for phase in loader.FOLD_PHASES if fold_default else ():
                     shipped_fold = loader.fold_producer_program(
                         arch, block_n, row_policy.pair, phase
                     )
@@ -1353,12 +1722,16 @@ def _run_worker(rank, world_size, port):
             # resolved table, its source and the prepared row's verdict agree with the plan module.
             gates = default_path.describe()["shape_gates"]
             assert (
-                gates["values"] == plans.default_shape_gates(arch) == gates["default"]
+                gates["values"]
+                == plans.spell_shape_gates(
+                    plans.default_shape_gates(arch, world_size=world_size)
+                )
+                == gates["default"]
             )
             assert (
                 gates["source"] == "default" and gates["env"] == backend.SHAPE_GATES_ENV
             )
-            verdict = plans.gate_rows(gates["values"], batch * s_local)
+            verdict = plans.gate_rows(gates["values"], batch * s_local, bn=block_n)
             row_plan = default_path.describe()["prepared_row_plans"][
                 f"{batch}x{s_local}"
             ]
@@ -1372,9 +1745,9 @@ def _run_worker(rank, world_size, port):
                 row_plan["words_capacity_per_dest"] == verdict.words_capacity_per_dest
             )
             assert row_plan["reserved_sms"] is None and verdict.reserved_sms is None
-            assert (
-                row_plan["producer_parts"] == 1 and row_plan["launches_per_call"] == 2
-            )
+            assert row_plan["producer_parts"] == 1 and row_plan[
+                "launches_per_call"
+            ] == (2 if fold_default else 3)
             assert (
                 max(row_plan["part_grids"])
                 <= default_info["sm_count"] - plans.RESERVED_SMS
@@ -1413,7 +1786,8 @@ def _run_worker(rank, world_size, port):
         #    (the architecture default on SM100 / SM103, the explicit environment override elsewhere; on SM90 the
         #    default large-row reserved-SM gate fires beside it) against the persistent launch (every gate off)
         #    -- bitwise-equal outputs, one producer launch per destination run; on SM90 also against the explicit
-        #    ``reserved_sms_large_m=0`` opt-out.
+        #    ``reserved_sms_large_m=0,words_capacity_small_m=0`` opt-out (the reserved-off session switches the word
+        #    gate off too, so the 8-rank ``all`` default does not fire on this row and nothing fires on that session).
         batch, s_local = 1, 16384
         x, w_qkv, q_scale, k_scale, cos_sin = _operands(
             device, batch=batch, s_local=s_local, hidden=hidden, seed=31 + rank
@@ -1421,9 +1795,25 @@ def _run_worker(rank, world_size, port):
         expected = _expected(
             x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank
         )
-        default_gates = plans.default_shape_gates(arch)
-        default_verdict = plans.gate_rows(default_gates, batch * s_local)
+        default_gates = plans.default_shape_gates(arch, world_size=world_size)
+        # The verdict is read with the row's tile width, as the backend reads it: the pair-tile gate of the
+        # (architecture, world size) table fires on 256-column rows only.
+        block_n = plans.block_n_for(
+            plans.Geometry(
+                world_size=world_size, batch=batch, s_local=s_local, hidden=hidden
+            )
+        )
+        default_verdict = plans.gate_rows(default_gates, batch * s_local, bn=block_n)
         default_is_per_dest = default_verdict.producer_launches == "per_dest"
+        # A fired pair-tile gate selects the single-CTA producer (no delivered cell ships the gate: the table
+        # decides, the verdict reports it).
+        pair_gate = default_gates["pair_off_large_m"]
+        default_pair_off = bool(
+            pair_gate
+            and block_n == plans.SHAPE_GATE_BN["pair_off_large_m"]
+            and batch * s_local >= pair_gate
+        )
+        assert (default_verdict.pair is False) is default_pair_off
         default_reserves_none = default_verdict.reserved_sms == 0
         gated_env = (
             None
@@ -1457,7 +1847,13 @@ def _run_worker(rank, world_size, port):
         )
         persistent_path = _session_with({backend.SHAPE_GATES_ENV: "off"})
         reserved_off_path = (
-            _session_with({backend.SHAPE_GATES_ENV: "reserved_sms_large_m=0"})
+            _session_with(
+                {
+                    backend.SHAPE_GATES_ENV: (
+                        "reserved_sms_large_m=0,words_capacity_small_m=0"
+                    )
+                }
+            )
             if default_reserves_none
             else None
         )
@@ -1469,9 +1865,7 @@ def _run_worker(rank, world_size, port):
             )
             assert plain_info["shape_gates"]["source"] == "env"
             assert plain_info["shape_gates"]["values"] == {
-                "words_capacity_small_m": 0,
-                "reserved_sms_large_m": 0,
-                "per_dest_large_m": 0,
+                name: plans.SHAPE_GATE_OFF for name in plans.SHAPE_GATE_NAMES
             }
             per_dest_path.bound_programs(batch, s_local)
             persistent_path.bound_programs(batch, s_local)
@@ -1486,11 +1880,17 @@ def _run_worker(rank, world_size, port):
                 and "per_dest_large_m" in gated_row["fired"]
             )
             # The large-row reserved-SM gate keeps its architecture default beside the per-destination override:
-            # it fires on SM90 (every SM runs the producer), stays off on SM100 / SM103.
-            assert gated_row["fired"] == (
-                ["reserved_sms_large_m", "per_dest_large_m"]
-                if default_reserves_none
-                else ["per_dest_large_m"]
+            # it fires on SM90 (every SM runs the producer), stays off on SM100 / SM103; the pair-tile gate fires
+            # beside the per-destination gate where the (architecture, world size) table says so (no delivered
+            # cell does today; the default path -- ``gated_env`` None -- reads the table).
+            expected_fired = (
+                ["reserved_sms_large_m"] if default_reserves_none else []
+            ) + ["per_dest_large_m"]
+            if gated_env is None and default_pair_off:
+                expected_fired.append("pair_off_large_m")
+            assert gated_row["fired"] == expected_fired
+            assert gated_row["pair"] == (
+                default_verdict.pair if gated_env is None else None
             )
             assert gated_row["reserved_sms"] == (0 if default_reserves_none else None)
             assert (
@@ -1512,13 +1912,17 @@ def _run_worker(rank, world_size, port):
             geometry = plans.Geometry(
                 world_size=world_size, batch=batch, s_local=s_local, hidden=hidden
             )
-            block_n = gated_info["block_n"]
+            assert block_n == gated_info["block_n"]
             _policy, plan = plans.plan_for(
                 geometry,
                 "bshd",
                 rank,
                 arch=arch,
                 pair_available=gated_info["pair_available"][block_n],
+                pair=default_verdict.pair if gated_env is None else None,
+            )
+            assert plan.pair is (
+                False if (gated_env is None and default_pair_off) else _policy.pair
             )
             parts = plans.dest_parts(plan)
             assert gated_row["producer_parts"] == len(parts) >= world_size
@@ -1538,6 +1942,7 @@ def _run_worker(rank, world_size, port):
                 reserved_off_gates = reserved_off_info["shape_gates"]
                 assert reserved_off_gates["source"] == "env"
                 assert reserved_off_gates["values"]["reserved_sms_large_m"] == 0
+                assert reserved_off_gates["values"]["words_capacity_small_m"] == 0
                 assert reserved_off_row["fired"] == []
                 assert reserved_off_row["reserved_sms"] is None
                 assert (
@@ -1574,7 +1979,8 @@ def _run_worker(rank, world_size, port):
         # 8. The two opt-outs -- the baseline producer build (``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT=shipped``)
         #    and the baseline group scaling (``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE=1``) -- against the
         #    (architecture, world size) defaults: bitwise-equal outputs; the bound producer programs differ exactly
-        #    where the default build is a variant, whose wide operand loads refuse a misaligned ``cos_sin`` view.
+        #    where the default build is a variant; a wide-load default (operand load width 256) additionally refuses a
+        #    misaligned ``cos_sin`` view.
         batch, s_local = 1, 512
         x, w_qkv, q_scale, k_scale, cos_sin = _operands(
             device, batch=batch, s_local=s_local, hidden=hidden, seed=41 + rank
@@ -1710,7 +2116,10 @@ def test_qkv_norm_rope_exchange_overlap_multi_gpu(world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} GPUs")
     if not _supported_device():
-        pytest.skip("requires SM90, SM100 or SM103 devices")
+        pytest.skip("requires SM90, SM100, SM103 or SM107 devices")
+    arch = loader.device_facts(0).arch
+    if world_size not in loader.supported_world_sizes(arch):
+        pytest.skip(f"world size {world_size} is not supported on {arch}")
     _spawn(world_size)
 
 
