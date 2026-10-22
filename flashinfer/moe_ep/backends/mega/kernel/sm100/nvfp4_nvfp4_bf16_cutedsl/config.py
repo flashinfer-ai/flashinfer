@@ -26,6 +26,11 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     Set ``swiglu_alpha=1.702`` and ``swiglu_beta=1.0`` for MiniMax-M3:
     ``(up + beta) * gate * sigmoid(alpha * gate)``, after ``gate_up_clamp``.
     These are scalar activation constants, distinct from ``fc1_alpha``.
+
+    ``kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next"`` selects the standard
+    provider export. It accepts default or fixed ``knobs``; parameterized
+    SwiGLU, deferred finalization and online autotuning are unavailable there.
+    SiTU on this backend requires both ``situ_beta`` and ``situ_linear_beta``.
     """
 
     intermediate_size: int
