@@ -66,7 +66,12 @@ dependencies = { file = ["requirements.txt"] }
 [tool.setuptools.packages.find]
 where = [".", "flashinfer/experimental/b12x/_compat"]
 include = ["flashinfer*", "b12x"]
-exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimental.b12x._compat*"]
+exclude = [
+  "flashinfer-jit-cache*",
+  "flashinfer-cubin*",
+  "flashinfer.experimental.b12x._compat*",
+  "flashinfer.prims_ts.moe.tools*",
+]
 
 [tool.setuptools.package-dir]
 "b12x" = "flashinfer/experimental/b12x/_compat/b12x"
@@ -120,7 +125,10 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
-"flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
+"flashinfer.prims_ts.moe" = [
+  "prims_ts_moe_configs.json",
+  "prims_ts_moe_configs_sm107.json",
+]
 # Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
 # importlib.resources.
 "flashinfer.msa_ops" = ["*.json"]

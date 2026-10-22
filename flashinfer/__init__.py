@@ -152,12 +152,16 @@ from .fused_moe import (
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "prims_ts_bf16_moe",
+        "prims_ts_bf16_moe_partitioned",
         "prims_ts_bf16_routed_moe",
         "prims_ts_fp4_block_scale_moe",
+        "prims_ts_fp4_block_scale_moe_partitioned",
         "prims_ts_fp4_block_scale_routed_moe",
         "prims_ts_fp8_block_scale_moe",
+        "prims_ts_fp8_block_scale_moe_partitioned",
         "prims_ts_fp8_block_scale_routed_moe",
         "prims_ts_fp8_per_tensor_scale_moe",
+        "prims_ts_fp8_per_tensor_scale_moe_partitioned",
     }
 )
 

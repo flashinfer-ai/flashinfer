@@ -309,6 +309,8 @@ def assert_template_axes_covered(
     3. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
     4. A parameter of *func* matching the axis name (scalar-kwarg fallback for
        integer function arguments like ``top_k``, ``n_group``, ``block_size``).
+    5. A custom ``TraceTemplate`` axis extractor declares the name in
+       ``derived_axes``.
     """
     tensor_dim_names: set = set()
     scalar_keys: set = set()
@@ -330,6 +332,7 @@ def assert_template_axes_covered(
         if isinstance(marker, Const)
         and marker.value is None
         and marker.extract is None
+        and name not in getattr(template, "derived_axes", ())
         and name not in tensor_dim_names
         and name not in scalar_keys
         and name not in func_param_names

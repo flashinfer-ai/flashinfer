@@ -252,8 +252,9 @@ class WeightLayout(IntEnum):
     MajorK = 0
     # M-major for A and N-major for B. [K, Mn]
     MajorMn = 1
-    # Layout is blocked along the K dimension. [K / blockK, Mn, blockK]
-    # where blockK is fixed at 128B
+    # Layout is blocked along the K dimension. [K / blockK, Mn, blockK].
+    # The physical block width is encoded by the prepared tensor (normally
+    # 128B, with 64B also supported by MXFP4 Prims-TS kernels).
     BlockMajorK = 2
 
 

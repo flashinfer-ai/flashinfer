@@ -22,6 +22,7 @@ from flashinfer.prims_ts.moe.config_mapper import (
     SUPPORTED_MXFP4_MXFP8_TILE_N,
     _expanded_prims_ts_json_configs,
     _expanded_trtllm_gen_json_configs,
+    _json_config_kwargs,
     _selected_tile_ns,
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
@@ -29,6 +30,7 @@ from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_mxfp4_bf16_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
+    valid_prims_ts_nvfp4_moe_tactics,
 )
 from flashinfer.prims_ts.moe import support
 from flashinfer.prims_ts.moe.runner import (
@@ -36,6 +38,9 @@ from flashinfer.prims_ts.moe.runner import (
     _routed_token_capacity,
 )
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+    BatchMode,
+    CtaRasterOrder,
+    DType,
     SfLayout,
     SfSmemToTmemCopy,
     TileScheduler,
@@ -116,12 +121,44 @@ def test_config_mapper_uses_local_json_for_bf16_tactic():
     )
 
     assert pair.tile_n == 8
-    assert 0 <= pair.fc1.trtllm_gemm_config_index < num_configs
-    assert 0 <= pair.fc2.trtllm_gemm_config_index < num_configs
+    assert 0 <= pair.fc1.prims_ts_gemm_config_index < num_configs
+    assert 0 <= pair.fc2.prims_ts_gemm_config_index < num_configs
     assert pair.fc1.cfg.kwargs["transpose_mma_output"] == 1
     assert pair.fc2.cfg.kwargs["transpose_mma_output"] == 1
     assert pair.fc1.cfg.kwargs["use_clc_fast_drain"] == 0
     assert pair.fc1.cfg.kwargs["use_tma_store"] == 1
+
+
+@pytest.mark.parametrize("sm_arch", [100, 107])
+def test_config_mapper_materializes_bf16_batch_m_rows(sm_arch):
+    rows = [
+        cfg
+        for cfg in _expanded_prims_ts_json_configs(sm_arch)
+        if cfg.comment.endswith("_HighThroughput_BatchM")
+    ]
+    assert len(rows) == 4
+    assert {int(cfg.options["tile_n"]) for cfg in rows} == {128, 256}
+
+    for row in rows:
+        fc = "fc1" if "_FC1_" in row.comment else "fc2"
+        kwargs = _json_config_kwargs(
+            row,
+            sm_arch=sm_arch,
+            fc=fc,
+            activation_type=int(ActivationType.Swiglu),
+            has_bias=False,
+            default_dtype_a=int(DType.BF16),
+            default_dtype_b=int(DType.BF16),
+            default_dtype_c=int(DType.BF16),
+        )
+        cfg = make_config(**kwargs)
+        validate_config(cfg)
+        assert cfg.batch_mode == int(BatchMode.BATCH_M)
+        assert cfg.use_shuffled_matrix == 1
+        assert cfg.epi_tile_n == 128
+        assert cfg.num_stages_tmem_acc == 2
+        assert cfg.use_max_tmem_overlap == 0
+        assert cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N)
 
 
 def test_config_mapper_materializes_block_major_k_layout():
@@ -178,8 +215,8 @@ def test_config_mapper_supports_nvfp4_per_token_sfb_e2m1_fc1():
 
     fc1 = pair.fc1.cfg.build()
     fc2 = pair.fc2.cfg.build()
-    assert fc1.dtype_c_kind == int(DType.E2M1)
-    assert fc1.has_epilogue_quant
+    assert fc1.dtype_c == int(DType.E2M1)
+    assert fc1.has_output_block_scaling
     assert fc1.route_act == int(RouteImpl.LDGSTS)
     assert fc1.route_sfs_act == int(RouteImpl.LDGSTS)
     assert fc1.use_per_token_sf_b == 1
@@ -187,13 +224,14 @@ def test_config_mapper_supports_nvfp4_per_token_sfb_e2m1_fc1():
     assert fc2.use_per_token_sf_b == 0
 
 
-def test_nvfp4_tile32_packed_gather_uses_two_warps():
+@pytest.mark.parametrize("sm_arch", (100, 107))
+def test_nvfp4_tile32_packed_gather_uses_two_warps(sm_arch):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         compute_warp_layout,
     )
 
-    pair = map_trtllm_nvfp4_moe_tactic(
-        [32, 9],
+    kwargs = dict(
+        sm_arch=sm_arch,
         activation_type=int(ActivationType.Swiglu),
         num_tokens=512,
         top_k=4,
@@ -201,12 +239,18 @@ def test_nvfp4_tile32_packed_gather_uses_two_warps():
         fc1_has_bias=True,
         fc2_has_bias=True,
     )
-    fc1 = pair.fc1.cfg.build()
-    compute_warp_layout(fc1)
+    for tactic in valid_prims_ts_nvfp4_moe_tactics(**kwargs):
+        if tactic[0] != 32:
+            continue
+        pair = map_trtllm_nvfp4_moe_tactic(tactic, **kwargs)
+        fc1 = pair.fc1.cfg.build()
+        if not (fc1.has_gather and fc1.is_swap_ab and not fc1.fuse_operand_sf_loads):
+            continue
+        compute_warp_layout(fc1)
+        assert fc1.warp_layout.num_load_b_warps == 2
+        return
 
-    assert fc1.tile_n == 32
-    assert fc1.num_gather_warps == 2
-    assert fc1.threads_per_cta == 512
+    pytest.fail(f"no packed NVFP4 tile-32 gather tactic found for SM{sm_arch}")
 
 
 def test_config_mapper_mxfp4_mxfp8_uses_local_json_config_pair():
@@ -220,8 +264,8 @@ def test_config_mapper_mxfp4_mxfp8_uses_local_json_config_pair():
         num_local_experts=32,
     )
 
-    assert 0 <= pair.fc1.trtllm_gemm_config_index < num_configs
-    assert 0 <= pair.fc2.trtllm_gemm_config_index < num_configs
+    assert 0 <= pair.fc1.prims_ts_gemm_config_index < num_configs
+    assert 0 <= pair.fc2.prims_ts_gemm_config_index < num_configs
     assert "num_stages_a" in pair.fc1.cfg.kwargs
     assert "num_stages_a" in pair.fc2.cfg.kwargs
     assert pair.fc1.cfg.build().tile_n == 64
@@ -253,9 +297,11 @@ def test_kimi_k3_tile_selection_keeps_128_and_adds_192(num_tokens):
     ) == (128, 192, 256)
 
 
-def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies():
+@pytest.mark.parametrize("sm_arch", (100, 107))
+def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies(sm_arch):
     pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
         [192, 0],
+        sm_arch=sm_arch,
         activation_type=int(ActivationType.Situ),
         num_tokens=8192,
         top_k=16,
@@ -266,21 +312,25 @@ def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies():
 
     fc1 = pair.fc1.cfg.build()
     fc2 = pair.fc2.cfg.build()
-    assert (fc1.mma_n, fc1.tile_n, fc1.tile_k, fc1.cluster_m) == (192, 192, 256, 2)
+    # One MX scale byte per 32 K elements; R128c4 pads the 192 SFB rows to 256.
+    assert (fc1.mma_n, fc1.tile_n, fc1.umma_cta_count) == (192, 192, 2)
     assert fc1.sf_layout_c == int(SfLayout.R8c4)
     assert fc1.smem_sfb_layout == int(SfLayout.R128c4)
-    assert fc1.num_bytes_sfb_per_stage == 2048
+    assert fc1.num_bytes_sfb_per_stage == 256 * fc1.tile_k // 32
     assert fc1.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
 
-    assert (fc2.mma_n, fc2.tile_n, fc2.tile_k, fc2.cluster_m) == (192, 192, 256, 2)
+    assert (fc2.mma_n, fc2.tile_n, fc2.umma_cta_count) == (192, 192, 2)
     assert fc2.sf_layout_b == int(SfLayout.R8c4)
     assert fc2.smem_sfb_layout == int(SfLayout.R8c4)
-    assert fc2.num_bytes_sfb_per_stage == 1536
+    assert fc2.num_bytes_sfb_per_stage == 192 * fc2.tile_k // 32
     assert fc2.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
 
+    # R128c4 SFB switches to the combined SFA+SFB copy, which needs equal TMEM
+    # stage counts; equalize them so only the tile_n constraint is violated.
     invalid_fc2 = {
         **pair.fc2.cfg.kwargs,
         "sf_layout_b": int(SfLayout.R128c4),
+        "num_stages_tmem_sfb": pair.fc2.cfg.kwargs["num_stages_tmem_sfa"],
     }
     with pytest.raises(ValueError, match="multiple of 128"):
         validate_config(make_config(**invalid_fc2))
@@ -288,7 +338,9 @@ def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies():
 
 def test_kimi_k3_n192_fc1_k128_s5_no_unroll_is_buildable():
     comment = "MxFp4xMxFp8_FC1_HighThroughput_tileN_192_K128S5NoUnroll"
-    configs_by_comment = {cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs()}
+    configs_by_comment = {
+        cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs(sm_arch=100)
+    }
     baseline = configs_by_comment["MxFp4xMxFp8_FC1_HighThroughput_tileN_192"]
     target = configs_by_comment[comment]
     actual_changes = {
@@ -307,6 +359,7 @@ def test_kimi_k3_n192_fc1_k128_s5_no_unroll_is_buildable():
         "use_unroll_loop_2x_for_mma": (True, False),
     }
     kwargs = dict(
+        sm_arch=100,
         activation_type=int(ActivationType.Situ),
         num_tokens=8192,
         top_k=16,
@@ -368,7 +421,9 @@ def test_kimi_k3_ep_capacity_uses_local_experts():
 
 
 def test_kimi_k3_low_latency_fast_drain_fc2_config_is_buildable():
+    # This assertion describes an SM100 menu row, independent of the host GPU.
     kwargs = dict(
+        sm_arch=100,
         activation_type=int(ActivationType.Situ),
         num_tokens=32,
         top_k=16,
@@ -410,7 +465,9 @@ def test_kimi_k3_low_latency_fast_drain_fc2_config_is_buildable():
 
 
 def test_kimi_k3_high_throughput_fast_drain_fc2_config_is_buildable():
+    # This assertion describes an SM100 menu row, independent of the host GPU.
     kwargs = dict(
+        sm_arch=100,
         activation_type=int(ActivationType.Situ),
         num_tokens=256,
         top_k=16,
@@ -434,7 +491,7 @@ def test_kimi_k3_high_throughput_fast_drain_fc2_config_is_buildable():
         if not (
             fc2["mma_m"] == 256
             and fc2["mma_n"] == 128
-            and fc2["cluster_m"] == 2
+            and fc2["umma_cta_count"] == 2
             and fc2["tile_n"] == 128
             and fc2["epi_tile_n"] == 64
             and fc2["tile_k"] == 256
@@ -459,7 +516,9 @@ def test_kimi_k3_high_throughput_fast_drain_fc2_config_is_buildable():
 
 
 def test_kimi_k3_high_throughput_tma_oob_fc1_is_buildable():
-    configs_by_comment = {cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs()}
+    configs_by_comment = {
+        cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs(sm_arch=100)
+    }
     baseline = configs_by_comment["MxFp4xMxFp8_FC1_HighThroughputFusedLdgsts"]
     winner = configs_by_comment["MxFp4xMxFp8_FC1_KimiK3HighThroughputTmaOob"]
     actual_changes = {
@@ -473,6 +532,7 @@ def test_kimi_k3_high_throughput_tma_oob_fc1_is_buildable():
     }
 
     kwargs = dict(
+        sm_arch=100,
         activation_type=int(ActivationType.Situ),
         num_tokens=256,
         top_k=16,
@@ -531,7 +591,9 @@ def test_config_mapper_exposes_gpt_oss_low_latency_fc1():
 
 @pytest.mark.parametrize("num_tokens", [256, 1024])
 def test_mxfp4_mxfp8_fast_drain_fc1_is_a_generic_autotune_candidate(num_tokens):
+    # This assertion describes an SM100 menu row, independent of the host GPU.
     kwargs = dict(
+        sm_arch=100,
         activation_type=int(ActivationType.Swiglu),
         num_tokens=num_tokens,
         top_k=4,
@@ -547,7 +609,7 @@ def test_mxfp4_mxfp8_fast_drain_fc1_is_a_generic_autotune_candidate(num_tokens):
         fc1 = pair.fc1.cfg.kwargs
         if (
             fc1["tile_k"] == 256
-            and fc1["cluster_m"] == 2
+            and fc1["umma_cta_count"] == 2
             and fc1["route_act"] == 1
             and fc1["use_clc_fast_drain"]
             and not fc1["use_work_throttle"]
@@ -558,8 +620,9 @@ def test_mxfp4_mxfp8_fast_drain_fc1_is_a_generic_autotune_candidate(num_tokens):
     assert len({pair.fc2.prims_ts_gemm_config_index for pair in fast_drain_pairs}) > 1
 
 
-def _gpt_oss_high_throughput_pair():
+def _gpt_oss_high_throughput_pair(sm_arch=None):
     kwargs = dict(
+        sm_arch=sm_arch,
         activation_type=int(ActivationType.Swiglu),
         num_tokens=8192,
         top_k=4,
@@ -591,7 +654,7 @@ def _gpt_oss_high_throughput_pair():
 
 
 def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
-    pair = _gpt_oss_high_throughput_pair()
+    pair = _gpt_oss_high_throughput_pair(sm_arch=100)
     fc1 = pair.fc1.cfg.kwargs
     fc2 = pair.fc2.cfg.kwargs
     assert fc1["route_sfs_act"] == 2
@@ -796,6 +859,7 @@ def test_support_rejects_oa_params_for_non_swiglu(monkeypatch):
     [
         ActivationType.Swiglu,
         ActivationType.Relu2,
+        ActivationType.Silu,
         ActivationType.Identity,
     ],
 )
@@ -818,16 +882,8 @@ def test_support_accepts_locally_configured_activations(
     assert reason == ""
 
 
-@pytest.mark.parametrize(
-    "activation_type",
-    [
-        ActivationType.Geglu,
-        ActivationType.Silu,
-    ],
-)
-def test_support_rejects_activations_without_local_config(
-    monkeypatch, activation_type: ActivationType
-):
+def test_support_rejects_activation_without_local_config(monkeypatch):
+    activation_type = ActivationType.Geglu
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
 

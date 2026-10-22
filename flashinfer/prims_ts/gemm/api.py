@@ -29,6 +29,7 @@ from flashinfer.utils import (
     supported_compute_capability,
 )
 
+from ..utils import is_prims_ts_arch_available
 from .config import PrimsTsGemmConfig
 from .support import nvfp4_128x4_numel as _nvfp4_128x4_numel
 from .support import validate_dense_gemm
@@ -57,7 +58,7 @@ def _check_gemm(
     operand = a if a is not None else a_packed
     if not isinstance(operand, torch.Tensor) or not operand.is_cuda:
         raise ValueError("PrimsTS GEMM inputs must be CUDA tensors")
-    return True
+    return is_prims_ts_arch_available(*get_compute_capability(operand.device))
 
 
 def _validate_cuda_tensors(*tensors: Optional[torch.Tensor]) -> torch.device:
@@ -77,6 +78,11 @@ def _validate_cuda_tensors(*tensors: Optional[torch.Tensor]) -> torch.device:
     if arch not in _SUPPORTED_ARCHES:
         raise RuntimeError(
             f"PrimsTS dense GEMM supports SM100, SM103, and SM107, got SM{arch}"
+        )
+    if not is_prims_ts_arch_available(*cc):
+        hint = "; on SM107, install a Rubin-capable DSL" if cc == (10, 7) else ""
+        raise RuntimeError(
+            f"the installed CuTe DSL cannot natively target SM{arch}{hint}"
         )
     return device
 

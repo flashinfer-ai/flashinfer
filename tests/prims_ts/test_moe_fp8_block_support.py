@@ -89,7 +89,7 @@ def test_mxfp8_mxfp8_mapper_supports_tile256():
     assert fc1.tile_n == 256
     assert fc2.tile_n == 256
     assert fc1.uses_mxfp8_output_quant
-    assert not fc2.has_epilogue_quant
+    assert not fc2.has_output_block_scaling
 
 
 def test_mxfp8_mxfp8_mapper_supports_geglu_tile8():
@@ -123,10 +123,10 @@ def test_deepseek_fp8_mapper_supports_trtllm_tile_ladder(tile_n):
     assert pair.tile_n == tile_n
     assert fc1.tile_n == tile_n
     assert fc2.tile_n == tile_n
-    assert fc1.has_deepseek_fp8
-    assert fc2.has_deepseek_fp8
+    assert fc1.use_deepseek_fp8
+    assert fc2.use_deepseek_fp8
     assert fc1.uses_fp8_output
-    assert fc2.dtype_c_kind != fc1.dtype_c_kind
+    assert fc2.dtype_c != fc1.dtype_c
     assert fc2.num_stages_c_smem == 1
 
 
