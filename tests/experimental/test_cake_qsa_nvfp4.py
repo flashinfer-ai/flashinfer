@@ -383,9 +383,10 @@ def test_thirty_three_splits(layout):
 
 @pytest.mark.parametrize("rows", [1, 8, 64])
 def test_repeated_calls_are_bitwise_equal(rows):
-    """The same inputs give the same bits call after call, through fresh per-call scratch
-    and through one caller-owned workspace launched three times in a row (the group
-    counters of the in-launch merge alternate generations and end where they started)."""
+    """The same inputs give the same bits call after call, through the per-call partials
+    and the stream's cached counters, and through one caller-owned workspace launched
+    three times in a row (the group counters of the in-launch merge alternate
+    generations and end where they started)."""
     device = _device_or_skip()
     q, cache, selection, gate = _inputs(rows, 24, 2, "NHD", 100 + rows)
     first = _run(q, cache, selection, gate)
@@ -403,6 +404,50 @@ def test_repeated_calls_are_bitwise_equal(rows):
         assert torch.equal(out, first)
         out.fill_(math.nan)
     assert torch.equal(_run(q, cache, selection, gate), first)
+
+
+def test_stream_counters_are_cached_per_stream():
+    """Without a workspace the fused form's counters come from one idle buffer per
+    (device, stream): the same call reuses it, a call needing more counters replaces it
+    with a larger zeroed one, another stream gets its own, and every call gives the same
+    bits."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 1, 24, 2
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    splits = _splits(rows, num_kv_heads, device)
+    if (
+        splits == 1
+        or cake_backend.select_form(rows, num_kv_heads, splits, index) != "fused"
+    ):
+        pytest.skip("the fused form is not selected on this device")
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 61)
+    expected = _run(q, cache, selection, gate)
+    key = (index, torch.cuda.current_stream(index).cuda_stream)
+    cake_backend._stream_counters.pop(key, None)
+    assert torch.equal(_run(q, cache, selection, gate), expected)
+    buffer = cake_backend._stream_counters[key]
+    assert buffer.dtype == torch.uint32 and buffer.numel() >= rows * num_kv_heads
+    assert torch.equal(_run(q, cache, selection, gate), expected)
+    assert cake_backend._stream_counters[key] is buffer
+    # Too small for the call: replaced by a zeroed buffer that holds the counters.
+    cake_backend._stream_counters[key] = torch.zeros(
+        1, dtype=torch.uint32, device=device
+    )
+    assert torch.equal(_run(q, cache, selection, gate), expected)
+    grown = cake_backend._stream_counters[key]
+    assert grown.numel() >= rows * num_kv_heads
+    # Another stream gets its own buffer and the same bits.
+    stream = torch.cuda.Stream(device)
+    with torch.cuda.stream(stream):
+        other = _run(q, cache, selection, gate)
+    stream.synchronize()
+    other_key = (index, stream.cuda_stream)
+    assert other_key in cake_backend._stream_counters
+    assert (
+        cake_backend._stream_counters[other_key]
+        is not cake_backend._stream_counters[key]
+    )
+    assert torch.equal(other, expected)
 
 
 def test_caller_workspace_allocates_nothing():
