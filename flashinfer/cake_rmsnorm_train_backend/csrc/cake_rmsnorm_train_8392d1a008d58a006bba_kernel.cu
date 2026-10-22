@@ -87,7 +87,7 @@ kernel_cake_rmsnorm_train_8392d1a008d58a006bba(__nv_bfloat16* __restrict__ x, __
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;
@@ -175,7 +175,7 @@ kernel_cake_rmsnorm_train_8392d1a008d58a006bba(__nv_bfloat16* __restrict__ x, __
             total += partials[par + group * 8 + k];
         }
         it += 1;
-        float mean = total * 0.000244140625f;
+        float mean = total * 0.00024414062f;
         float _sqrt_3;
         asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_3) : "f"(mean + eps));
         float rstd = __frcp_rn(_sqrt_3);

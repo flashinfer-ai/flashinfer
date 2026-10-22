@@ -192,7 +192,7 @@ kernel_cake_rmsnorm_train_77e21049cf03a3c171bc(__nv_bfloat16* __restrict__ g, __
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     long long g_stride = g_stride_p0;
     long long x_stride = x_stride_p0;
     long long gh_stride = g_h_stride_p0;
