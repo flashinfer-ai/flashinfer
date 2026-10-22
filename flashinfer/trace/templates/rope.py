@@ -698,6 +698,10 @@ def _rope_quantize_fp8_reference(
     quantize_dtype=None,
     quant_scale_q: float = 1.0,
     quant_scale_kv: float = 1.0,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
     **_unused,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference RoPE + FP8 quantize.
@@ -708,7 +712,15 @@ def _rope_quantize_fp8_reference(
     quantization scale. Matches ``flashinfer.rope_quantize_fp8`` and its
     MLA wrapper ``mla_rope_quantize_fp8``.
     """
-    quantize_dtype = quantize_dtype or torch.float8_e4m3fn
+    # Infer quantize_dtype from the output tensors the same way the API
+    # does, defaulting to float8_e4m3fn.
+    if quantize_dtype is None:
+        for out in (q_rope_out, k_rope_out, q_nope_out, k_nope_out):
+            if out is not None:
+                quantize_dtype = out.dtype
+                break
+        else:
+            quantize_dtype = torch.float8_e4m3fn
     rotary_dim = cos_sin_cache.shape[-1]
     cos_cache = cos_sin_cache[:, : rotary_dim // 2]
     sin_cache = cos_sin_cache[:, rotary_dim // 2 :]
@@ -1004,6 +1016,8 @@ def _rope_quantize_fp8_append_paged_kv_cache_reference(
     quant_scale_kv: float = 1.0,
     page_size: int = 16,
     kv_layout: str = "NHD",
+    q_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
     **_unused,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference for rope_quantize_fp8_append_paged_kv_cache.
@@ -1020,7 +1034,15 @@ def _rope_quantize_fp8_append_paged_kv_cache_reference(
     append side for the GQA/MHA case — the MLA stack is covered by
     ``append_paged_mla_kv_cache_trace`` on the storage side.
     """
-    quantize_dtype = quantize_dtype or torch.float8_e4m3fn
+    # Infer quantize_dtype from the output tensors the same way the API
+    # does, then from the paged cache, defaulting to float8_e4m3fn.
+    if quantize_dtype is None:
+        if q_rope_out is not None:
+            quantize_dtype = q_rope_out.dtype
+        elif q_nope_out is not None:
+            quantize_dtype = q_nope_out.dtype
+        else:
+            quantize_dtype = paged_kv_cache[0].dtype
     # Step 1+2: RoPE then FP8 quantize.
     q_rope_q, k_rope_q, q_nope_q, k_nope_q = _rope_quantize_fp8_reference(
         q_rope,
