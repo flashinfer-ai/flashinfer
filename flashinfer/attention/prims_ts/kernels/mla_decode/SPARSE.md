@@ -98,12 +98,9 @@ inputs or each other. The existing default backend keeps its original plan ABI.
 The native decode/cache tests under `tests/experimental/` retain independent
 represented-input FP64 references, the componentwise FP8 output bound,
 `rtol=0, atol=1e-5` sink-exclusive LSE, exact empty/nonfinite checks and bitwise
-layout/replay parity. Host contract files cover routing, task control, defaults,
-conversion lifetime and workspace ownership. The generic launcher ABI regressions
-cover fixed/packed queries and absent/present output quantizers: the final slot
-is always positional, including `None`, because exported TVM-FFI callables do not
-restore defaults or accept keywords. Static/CLC task-cache graph coverage remains
-in `tests/attention/test_attention_ts_sparse_mla.py`.
+layout/replay parity. Host contract files cover routing, task control, defaults
+and workspace ownership. Static/CLC task-cache graph coverage remains in
+`tests/attention/test_attention_ts_sparse_mla.py`.
 
 New regressions cover strong sinks with large signed BMM2, signed zero,
 analytic BF16-subnormal output and live metadata/layout/replay parity. After
@@ -111,8 +108,9 @@ backend cleanup and finalizer changes, native-only frozen-source verification
 on B200 (SM100) passed 197 host-contract and 100 GPU cases, with no failures or
 skips. The run used PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0 and bundled CUDA 13.4;
 JSON/JUnit results agreed and source fingerprints remained unchanged throughout.
-The Frost decoder, examples and benchmarks were not run. The generic sparse MLA
-suite, complete integration, full-model equivalence and performance remain
-unqualified by this run. See
+These historical counts predate the rebase and host-test cleanup; tests were not
+rerun for those changes. The Frost decoder, examples and benchmarks were not run.
+The generic sparse MLA suite, complete integration, full-model equivalence and
+performance remain unqualified by this run. See
 [the example README](../../../../../examples/deepseek_v41/README.md) for the
 public API, cache formats and example commands.
