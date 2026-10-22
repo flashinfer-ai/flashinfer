@@ -96,7 +96,7 @@ _NVFP4_COMPILE_IDENTITY = (
     NVFP4_FC1_SCHEDULE_VERSION,
 )
 
-# Encode the Humming weight/activation layout in the cache dtype so
+# Encode the packed weight/activation layout in the cache dtype so
 # incompatible layouts cannot share winners. Tactic geometry remains in
 # the cached value and problem geometry in the key.
 _NVFP4_TUNING_DTYPE_ID = (

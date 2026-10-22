@@ -167,7 +167,7 @@ def hopper_nvfp4_default_profile(
     )
     if any(value != NVFP4_DEFAULT_DOMAIN[name] for name, value in context.items()):
         return None
-    profile = NVFP4_DEFAULT_TACTICS_BY_TOKENS.get(max_tokens)
+    profile: dict[str, Any] | None = NVFP4_DEFAULT_TACTICS_BY_TOKENS.get(max_tokens)
     if profile is None:
         return None
     return dict(

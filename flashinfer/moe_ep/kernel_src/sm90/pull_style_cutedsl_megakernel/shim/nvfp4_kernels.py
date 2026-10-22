@@ -1873,11 +1873,11 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluFp8Fc12Kernel):
                 ]
                 math_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
                 epi_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-                sched_storage: SchedStorage
+                sched_storage: SchedStorage  # type: ignore[valid-type]
         else:
 
             @cute.struct
-            class SharedStorage:
+            class SharedStorage:  # type: ignore[no-redef]
                 ab_full_mbar_ptr: cute.struct.MemRange[
                     cutlass.Int64, self.num_ab_stage * 2
                 ]
@@ -1893,7 +1893,7 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluFp8Fc12Kernel):
                 fc1_offload_mbox: cute.struct.MemRange[
                     cutlass.Int64, self.num_c_stage * 5
                 ]
-                sched_storage: SchedStorage
+                sched_storage: SchedStorage  # type: ignore[valid-type]
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)

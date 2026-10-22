@@ -80,7 +80,7 @@ def autotune_hopper_nvfp4_mega_moe(
             raise RuntimeError(
                 "NVFP4 autotune requires the matching initialized EP group"
             )
-        all_contexts = [None] * cfg.world_size
+        all_contexts: list[Any] = [None] * cfg.world_size
         dist.all_gather_object(all_contexts, context, group=process_group)
         stable = (
             "max_tokens",

@@ -362,7 +362,7 @@ def preprocess_mega_weights(
         legs.append(result)
     if legs[0][0].device != legs[1][0].device:
         raise ValueError("both NVFP4 weight legs must share one CUDA device")
-    return tuple(legs)
+    return legs[0], legs[1]
 
 
 def validate_transformed_mega_weights(
