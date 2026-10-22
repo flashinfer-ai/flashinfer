@@ -14,8 +14,38 @@
  * limitations under the License.
  */
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_rmsnorm_train_device_common.cuh"
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -24,10 +54,12 @@
 #define GROUP_THREADS 32
 #define LAUNCH_BOUNDS_THREADS 64
 
+#include <math_constants.h>
+
 extern "C" {
 
 __global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
-kernel_cake_rmsnorm_train_3430e5d9c053309b0323(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, long long x_stride, long long u_stride, float eps)
+kernel_cake_rmsnorm_train_3430e5d9c053309b0323(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -39,7 +71,7 @@ kernel_cake_rmsnorm_train_3430e5d9c053309b0323(__nv_bfloat16* __restrict__ x, __
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;
@@ -49,7 +81,7 @@ kernel_cake_rmsnorm_train_3430e5d9c053309b0323(__nv_bfloat16* __restrict__ x, __
     for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
         int row = row0 + group;
         long long row64 = (long long)row;
-        long long xbase = row64 * x_stride;
+        long long xbase = row64 * x_stride_p0;
         long long obase = row64 * 512;
         float x_cache[16];
         float w_cache[16];
@@ -107,21 +139,20 @@ kernel_cake_rmsnorm_train_3430e5d9c053309b0323(__nv_bfloat16* __restrict__ x, __
             for (int v_2 = 0; v_2 < 2; v_2++) {
                 #pragma unroll
                 for (int j_2 = 0; j_2 < 8; j_2++) {
-                    sum_sq += x_cache[v_2 * 8 + j_2] * x_cache[v_2 * 8 + j_2];
+                    sum_sq = __fmaf_rn(x_cache[v_2 * 8 + j_2], x_cache[v_2 * 8 + j_2], sum_sq);
                 }
             }
         }
-        float _warp_reduce_0 = sum_sq;
+        float _warp_reduce_2 = sum_sq;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-        sum_sq = _warp_reduce_0;
+            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
+        sum_sq = _warp_reduce_2;
         float total = sum_sq;
         float mean = total * 0.001953125f;
-        float _sqrt_0;
-        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(mean + eps));
-        float _rcp_0 = __frcp_rn(_sqrt_0);
-        float rstd = _rcp_0;
+        float _sqrt_3;
+        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_3) : "f"(mean + eps));
+        float rstd = __frcp_rn(_sqrt_3);
         if (row < T) {
             if (gtid == 0) {
                 r[row] = rstd;

@@ -187,7 +187,10 @@ class TmemCorrResource(DecodeGenResourceBase):
         """Create placeholder SMEM views for correction and split reduction."""
         o_stage_dtype_bytes = self.get_o_stage_dtype_bytes()
         o_entries = max(
-            self.cfg.tile_size_q * self.cfg.headdim * o_stage_dtype_bytes // 4,
+            self.cfg.tile_size_q
+            * self.cfg.swaps_output_head_dim
+            * o_stage_dtype_bytes
+            // 4,
             1,
         )
         # Keeps reduces each row's denominator in registers (plus the q64
@@ -259,7 +262,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         # draining the final O staging path. Keep O staging separate from SmemP
         # there so the next tile's P producer cannot overwrite the copy source.
         o_stage_dtype_bytes = self.get_o_stage_dtype_bytes()
-        required_o_bytes = self.cfg.tile_size_q * self.cfg.headdim * o_stage_dtype_bytes
+        required_o_bytes = (
+            self.cfg.tile_size_q * self.cfg.swaps_output_head_dim * o_stage_dtype_bytes
+        )
         available_p_bytes = 2 * self.cfg.smem_p_tile_bytes
         return (
             self.smem_p0_ref is not None
@@ -280,7 +285,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
                 size_bytes=self.cfg.tile_size_q
-                * self.cfg.headdim
+                * self.cfg.swaps_output_head_dim
                 * o_stage_dtype_bytes,
                 alignment=self.cfg.stensor_align,
             )
@@ -1247,7 +1252,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                 + (alias_offset if alias_offset is not None else self._alloc.offset),
                 dtype=Int32,
                 shape=(
-                    self.cfg.tile_size_q * self.cfg.headdim * o_stage_dtype_bytes // 4,
+                    self.cfg.tile_size_q
+                    * self.cfg.swaps_output_head_dim
+                    * o_stage_dtype_bytes
+                    // 4,
                 ),
                 addrspace=3,
             )
@@ -1991,7 +1999,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     dst_row_idx,
                     self.seq_len_q,
                 )
-                if valid_partial_row:
+                if valid_partial_row and dst_col_offset < Int32(cfg.headdim * 2):
                     smem_src = self._smem_base_o_i32.subview(
                         load_smem_offset >> Int32(2)
                     ).data_ptr()
@@ -2049,7 +2057,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     logical_q_group_idx,
                     dst_row_idx,
                     self.seq_len_q,
-                ):
+                ) and dst_col_offset < Int32(cfg.headdim * cfg.o_dtype_bytes):
                     smem_src = self._smem_base_o_i32.subview(
                         load_smem_offset >> Int32(2)
                     ).data_ptr()
@@ -4087,7 +4095,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
                 warp_grp_thread_idx,
                 cfg.tile_size_q,
-                cfg.headdim,
+                cfg.swaps_output_head_dim,
                 cfg.num_fp8_output_regs,
             )
             cute.arch.fence_view_async_shared()
@@ -4314,7 +4322,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
         output_pair_regs = cfg.num_fp16_output_regs
         output_f32_regs = output_pair_regs * 2
-        num_o_chunks = cfg.headdim // 64
+        num_o_chunks = cfg.swaps_output_head_dim // 64
         if cutlass.const_expr(cfg.num_insts_kv == 1):
             o0_vals = self._swaps_load_o_stage_chunks(
                 base_addr0,
@@ -4572,7 +4580,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
                 warp_grp_thread_idx,
                 cfg.tile_size_q,
-                cfg.headdim,
+                cfg.swaps_output_head_dim,
                 cfg.num_fp8_output_regs,
             )
             cute.arch.fence_view_async_shared()
@@ -4739,7 +4747,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             num_scale_groups = cfg.num_softmax_scale_groups
             output_pair_regs = cfg.num_fp16_output_regs
             output_f32_regs = output_pair_regs * 2
-            num_o_chunks = cfg.headdim // 64
+            num_o_chunks = cfg.swaps_output_head_dim // 64
             scale_vals = cutlass.Array(
                 Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
             )
@@ -4795,7 +4803,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             num_scale_groups = cfg.num_softmax_scale_groups
             output_pair_regs = cfg.num_fp16_output_regs
             output_f32_regs = output_pair_regs * 2
-            num_o_chunks = cfg.headdim // 64
+            num_o_chunks = cfg.swaps_output_head_dim // 64
             scale_vals = cutlass.Array(
                 Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
             )
@@ -4857,7 +4865,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
         output_pair_regs = cfg.num_fp16_output_regs
         output_f32_regs = output_pair_regs * 2
-        num_o_chunks = cfg.headdim // 64
+        num_o_chunks = cfg.swaps_output_head_dim // 64
         self._swaps_rescale_o_stage_in_tmem(
             base_addr,
             scale_vals,
@@ -4960,7 +4968,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             num_scale_groups = cfg.num_softmax_scale_groups
             output_pair_regs = cfg.num_fp16_output_regs
             output_f32_regs = output_pair_regs * 2
-            num_o_chunks = cfg.headdim // 64
+            num_o_chunks = cfg.swaps_output_head_dim // 64
             self._swaps_wide_tail_epilogue(
                 stage_info,
                 tail_o_stage_idx_0=tail_o_stage_idx_0,

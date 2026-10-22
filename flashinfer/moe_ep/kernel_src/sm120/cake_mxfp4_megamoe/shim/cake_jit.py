@@ -43,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -77,17 +78,51 @@ _NVCC_FLAGS = (
     "--generate-code=arch=compute_120a,code=sm_120a",
     "-std=c++17",
     "-O3",
+    # Skip libcu++'s automatic-storage test in cuda::atomic_ref (CUDA >= 13.3 headers): NCCL's
+    # device-API atomics never target automatic storage.  The source defines it too, right
+    # before nccl_device.h; the flag keeps it in force should a libcu++ header ever be
+    # included earlier.
+    "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE",
 )
 EXPECTED_NCCL_VERSION_INTEGER = 23007  # NCCL 2.30.7: GIN device API
+# NCCL GIN backends a device module can be built for, keyed by name, with the session's
+# ``gin_type`` (``ncclGinType_t``) and the NCCL Device API macros that compile out the other
+# two.  Every GIN call otherwise inlines all three backends behind a runtime switch, which
+# costs the persistent kernel 10-20 registers; a workspace only ever uses its communicator's
+# backend.
+GIN_BACKENDS: dict[str, tuple[int, tuple[str, ...]]] = {
+    "proxy": (2, ("-DNCCL_GIN_GDAKI_ENABLE=0", "-DNCCL_GIN_GPI_ENABLE=0")),
+    "gdaki": (3, ("-DNCCL_GIN_PROXY_ENABLE=0", "-DNCCL_GIN_GPI_ENABLE=0")),
+    "gpi": (4, ("-DNCCL_GIN_PROXY_ENABLE=0", "-DNCCL_GIN_GDAKI_ENABLE=0")),
+}
 
 # Device modules packaged by ``flashinfer/aot.py``: DeepSeek-V4-Flash routed experts
 # (E256 / H4096 / I2048 / top-k 6) with the in-kernel FP8 shared expert and the SwiGLU
 # clamp, 4096 tokens per rank, default ``all_gin`` transport (copier-free flavor), EP4 and
-# EP8.  Other parameter sets compile on first use.
+# EP8, for every GIN backend.  Other parameter sets compile on first use.
 AOT_DEVICE_PARAMETERS: tuple[tuple[int, ...], ...] = (
     (4, 256, 6, 4096, 4096, 2048, 1, 10, 16, 1),
     (8, 256, 6, 4096, 4096, 2048, 1, 10, 16, 1),
 )
+
+
+def gin_backend_name(gin_type: int) -> str:
+    """The :data:`GIN_BACKENDS` name of a session's ``gin_type`` (fail closed on others)."""
+
+    for name, (value, _) in GIN_BACKENDS.items():
+        if value == int(gin_type):
+            return name
+    raise RuntimeError(
+        f"Cake SM120 MegaMoE has no device build for NCCL GIN type {gin_type}"
+    )
+
+
+def _gin_backend_defines(gin_backend: str) -> tuple[str, ...]:
+    if gin_backend not in GIN_BACKENDS:
+        raise ValueError(
+            f"unknown GIN backend {gin_backend!r}; expected one of {sorted(GIN_BACKENDS)}"
+        )
+    return GIN_BACKENDS[gin_backend][1]
 
 
 def _sha256(path: Path) -> str:
@@ -234,6 +269,31 @@ def _nvcc() -> str:
     return os.environ.get("NVCC", "nvcc")
 
 
+@functools.cache
+def nvcc_version() -> str:
+    """Release of the nvcc that compiles the device instances, e.g. ``"13.0.88"``.
+
+    Register allocation of the device instances depends on it (``"unknown"`` when
+    ``nvcc --version`` does not run or reports no release).
+    """
+
+    try:
+        completed = subprocess.run(
+            [_nvcc(), "--version"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return "unknown"
+    match = re.search(r"\bV(\d+\.\d+\.\d+)\b", completed.stdout)
+    return match.group(1) if match else "unknown"
+
+
+def cuobjdump_path() -> str | None:
+    """``cuobjdump`` next to the JIT's nvcc, else on ``PATH`` (``None`` without a CUDA toolkit)."""
+
+    cuobjdump = Path(_nvcc()).with_name("cuobjdump")
+    return str(cuobjdump) if cuobjdump.is_file() else shutil.which("cuobjdump")
+
+
 def _flavor_instances(copiers: bool) -> dict[int, dict[str, Any]]:
     """Manifest records of the flavor's instances, keyed by row-schedule height (128, 64)."""
 
@@ -245,7 +305,7 @@ def _flavor_instances(copiers: bool) -> dict[int, dict[str, Any]]:
 
 
 def _compile_cubins(
-    build_dir: Path, *, parameters: tuple[int, ...], copiers: bool
+    build_dir: Path, *, parameters: tuple[int, ...], copiers: bool, gin_backend: str
 ) -> Mapping[str, Path]:
     """``embedded_cubin_factory``: compile the flavor's M128 / M64 cubins into ``build_dir``.
 
@@ -258,7 +318,7 @@ def _compile_cubins(
     manifest = read_manifest()
     nccl_include, _ = nccl_installation()
     nvcc = _nvcc()
-    defines = device_defines(parameters)
+    defines = [*device_defines(parameters), *_gin_backend_defines(gin_backend)]
     newest_source = max(
         (_SOURCE_DIR / name).stat().st_mtime
         for name in (*manifest["device"]["sources"], _MANIFEST)
@@ -307,17 +367,18 @@ def _compile_cubins(
 
 @functools.cache
 def gen_cake_sm120_megamoe_kernel_module(
-    parameters: tuple[int, ...], copiers: bool
+    parameters: tuple[int, ...], copiers: bool, gin_backend: str
 ) -> JitSpec:
-    """JIT spec of the device instances of one parameter set and transport flavor.
+    """JIT spec of the device instances of one parameter set, transport flavor and GIN backend.
 
     ``parameters`` follows :data:`DEVICE_PARAMETERS`; ``copiers`` selects the instances
     with LSA copier CTAs (``m128_copier`` / ``m64_copier``) or without
-    (``m128_nocopier`` / ``m64_nocopier``).  The module exports ``cubin_image(task_m)``.
+    (``m128_nocopier`` / ``m64_nocopier``); ``gin_backend`` (a :data:`GIN_BACKENDS` name) is
+    the only NCCL GIN backend compiled in.  The module exports ``cubin_image(task_m)``.
     """
 
     manifest = read_manifest()
-    defines = device_defines(parameters)
+    defines = [*device_defines(parameters), *_gin_backend_defines(gin_backend)]
     identity = hashlib.sha256(
         json.dumps(
             {
@@ -334,31 +395,37 @@ def gen_cake_sm120_megamoe_kernel_module(
     ).hexdigest()
     flavor = "copier" if copiers else "nocopier"
     return gen_jit_spec(
-        name=f"cake_sm120_megamoe_{flavor}_{identity[:20]}",
+        name=f"cake_sm120_megamoe_{flavor}_{gin_backend}_{identity[:20]}",
         sources=[_SOURCE_DIR / _CUBIN_CARRIER],
         extra_cuda_cflags=[*sm120a_nvcc_flags],
         extra_ldflags=["-lcuda"],
         embedded_cubin_factory=functools.partial(
-            _compile_cubins, parameters=tuple(parameters), copiers=copiers
+            _compile_cubins,
+            parameters=tuple(parameters),
+            copiers=copiers,
+            gin_backend=gin_backend,
         ),
     )
 
 
 def gen_cake_sm120_megamoe_aot_modules() -> list[JitSpec]:
-    """The binding and the :data:`AOT_DEVICE_PARAMETERS` device modules (all-GIN flavor)."""
+    """The binding and the :data:`AOT_DEVICE_PARAMETERS` device modules (all-GIN flavor,
+    every GIN backend)."""
 
     return [
         gen_cake_sm120_megamoe_module(),
         *(
-            gen_cake_sm120_megamoe_kernel_module(parameters, False)
+            gen_cake_sm120_megamoe_kernel_module(parameters, False, gin_backend)
             for parameters in AOT_DEVICE_PARAMETERS
+            for gin_backend in GIN_BACKENDS
         ),
     ]
 
 
 @functools.cache
-def device_cubin(parameters: tuple[int, ...], instance: int) -> bytes:
-    """The cubin of one device instance (``instance`` indexes :data:`INSTANCE_NAMES`).
+def device_cubin(parameters: tuple[int, ...], instance: int, gin_backend: str) -> bytes:
+    """The cubin of one device instance (``instance`` indexes :data:`INSTANCE_NAMES`) built
+    for one GIN backend.
 
     Loaded from the packaged AOT module or the JIT cache, compiled on first use otherwise.
     Only the instances a deployment launches are built (the two row schedules of the
@@ -369,13 +436,13 @@ def device_cubin(parameters: tuple[int, ...], instance: int) -> bytes:
         w for w in read_manifest()["device"]["instances"] if w["instance"] == instance
     )
     module = gen_cake_sm120_megamoe_kernel_module(
-        tuple(parameters), bool(wrapper["copiers_active"])
+        tuple(parameters), bool(wrapper["copiers_active"]), gin_backend
     ).build_and_load()
     return bytes(module.cubin_image(int(wrapper["task_m"])))
 
 
 def device_cubin_resource_usage(
-    parameters: tuple[int, ...], instance: int
+    parameters: tuple[int, ...], instance: int, gin_backend: str
 ) -> dict[str, int]:
     """Per-thread resources of one compiled device instance (no GPU needed).
 
@@ -386,9 +453,8 @@ def device_cubin_resource_usage(
 
     import tempfile
 
-    cubin = device_cubin(parameters, instance)
-    cuobjdump = Path(_nvcc()).with_name("cuobjdump")
-    tool = str(cuobjdump) if cuobjdump.is_file() else "cuobjdump"
+    cubin = device_cubin(parameters, instance, gin_backend)
+    tool = cuobjdump_path() or "cuobjdump"
     with tempfile.NamedTemporaryFile(suffix=".cubin") as handle:
         handle.write(cubin)
         handle.flush()
@@ -451,17 +517,21 @@ __all__ = [
     "AOT_DEVICE_PARAMETERS",
     "DEVICE_PARAMETERS",
     "EXPECTED_NCCL_VERSION_INTEGER",
+    "GIN_BACKENDS",
     "INSTANCE_NAMES",
     "cake_sm120_megamoe_available",
     "check_exact_sm120",
+    "cuobjdump_path",
     "device_cubin",
     "device_cubin_resource_usage",
     "device_defines",
     "gen_cake_sm120_megamoe_aot_modules",
     "gen_cake_sm120_megamoe_kernel_module",
     "gen_cake_sm120_megamoe_module",
+    "gin_backend_name",
     "load_cake_sm120_megamoe_module",
     "nccl_installation",
+    "nvcc_version",
     "read_geometry",
     "read_manifest",
 ]

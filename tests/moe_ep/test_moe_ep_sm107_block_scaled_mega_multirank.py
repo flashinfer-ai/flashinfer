@@ -541,7 +541,8 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
-def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
+@pytest.mark.parametrize("variant", ["standard", "genphase"])
+def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind, variant):
     import torch.distributed as dist
 
     rank, world = _launcher_ranks()
@@ -552,7 +553,14 @@ def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
     w13, w2, x, ids, scores = _global_problem(world)
     local_experts = NUM_EXPERTS // world
     local = slice(rank * local_experts, (rank + 1) * local_experts)
-    cfg = _megakernel_config(kind)
+    cfg = _megakernel_config(
+        kind,
+        **(
+            dict(kernel_variant="genphase", cluster_shape_mn=(4, 1), fc2_use_bulk=True)
+            if variant == "genphase"
+            else {}
+        ),
+    )
     kernel = create_mega_kernel(cfg)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, kernel.runtime_requirements(bootstrap)

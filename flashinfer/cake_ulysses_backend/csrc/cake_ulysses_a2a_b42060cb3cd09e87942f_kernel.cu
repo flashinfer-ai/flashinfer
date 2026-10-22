@@ -1,0 +1,1548 @@
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+template <typename T, int Capacity = 8>
+struct __align__(16) CakePeerPointerTable { T* ptrs[Capacity]; };
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 512
+#define LAUNCH_MIN_BLOCKS 1
+
+#include <math_constants.h>
+
+__device__ __forceinline__ uint32_t elect_sync() {
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred %%px;\n\t"
+        "elect.sync _|%%px, %1;\n\t"
+        "@%%px mov.s32 %0, 1;\n\t"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xFFFFFFFF));
+    return pred;
+}
+
+extern "C" {
+
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+kernel_cake_ulysses_a2a_b42060cb3cd09e87942f(__nv_bfloat16* __restrict__ inp, __nv_bfloat16* __restrict__ out, CakePeerPointerTable<__nv_bfloat16> staging_peers, CakePeerPointerTable<unsigned int> signals_peers, unsigned int* signals_self, int32_t pg_rank, int B, int S_local, int H_local, int D)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    unsigned int rank = (unsigned int)pg_rank;
+    unsigned int tid_0 = (unsigned int)tid;
+    unsigned int bid_1 = (unsigned int)bid;
+    unsigned int warp_1 = tid_0 / 32;
+    unsigned int sequences = (unsigned int)S_local;
+    unsigned int block_len = (unsigned int)H_local * (unsigned int)D;
+    unsigned int rows = (unsigned int)B * sequences;
+    uint32_t _relaxed_ld_0;
+    asm volatile("ld.relaxed.gpu.u32 %0, [%1];" : "=r"(_relaxed_ld_0) : "l"(signals_self) : "memory");
+    unsigned int epoch = _relaxed_ld_0 + 1;
+    int vector = (int)(block_len % 8 == 0 && (unsigned long long)inp % 16 == 0 && (unsigned long long)out % 16 == 0);
+    if ((unsigned long long)staging_peers.ptrs[0] % 16 != 0) {
+        vector = 0;
+    }
+    if ((unsigned long long)staging_peers.ptrs[1] % 16 != 0) {
+        vector = 0;
+    }
+    if ((unsigned long long)staging_peers.ptrs[2] % 16 != 0) {
+        vector = 0;
+    }
+    if ((unsigned long long)staging_peers.ptrs[3] % 16 != 0) {
+        vector = 0;
+    }
+    if ((unsigned long long)staging_peers.ptrs[4] % 16 != 0) {
+        vector = 0;
+    }
+    if ((unsigned long long)staging_peers.ptrs[5] % 16 != 0) {
+        vector = 0;
+    }
+    unsigned int block_units = block_len;
+    if (vector != 0) {
+        block_units = block_len / 8;
+    }
+    unsigned int units = rows * block_units;
+    unsigned int pitch_units = block_units * 6;
+    unsigned int units_magic = (unsigned int)4294967295 / block_units;
+    unsigned int sequences_magic = (unsigned int)4294967295 / sequences;
+    unsigned int* inp_words = reinterpret_cast<unsigned int*>(inp);
+    unsigned int* out_words = reinterpret_cast<unsigned int*>(out);
+    unsigned int* staging_words = reinterpret_cast<unsigned int*>(staging_peers.ptrs[rank]);
+    __nv_bfloat16* staging_elements = staging_peers.ptrs[rank];
+    unsigned int other = bid_1 / 30;
+    unsigned int sub = bid_1 - other * 30;
+    unsigned int parts = 30;
+    if (bid_1 >= 90) {
+        other = 3 + (bid_1 - 90) / 29;
+        sub = bid_1 - 90 - (other - 3) * 29;
+        parts = 29;
+    }
+    unsigned int destination = (rank + other + 1) % 6;
+    unsigned int source = (rank + 5 - other) % 6;
+    unsigned int quotient = units / parts;
+    unsigned int remainder = units % parts;
+    unsigned int lo = sub * quotient + sub * remainder / parts;
+    unsigned int hi = (sub + 1) * quotient + (sub + 1) * remainder / parts;
+    unsigned int count = (hi - lo + 7679) / 7680;
+    if (count < 2) {
+        count = 2;
+    }
+    if (hi == lo) {
+        count = 0;
+    }
+    unsigned int out_chunks = count;
+    if (vector != 0) {
+        unsigned int stripes = (units + 7679) / 7680;
+        unsigned int count_0 = 0;
+        if (sub < stripes) {
+            count_0 = (stripes - sub + (parts - 1)) / parts;
+        }
+        out_chunks = count_0;
+    }
+    unsigned int quotient_2 = units / 148;
+    unsigned int remainder_3 = units % 148;
+    unsigned int lo_4 = bid_1 * quotient_2 + bid_1 * remainder_3 / 148;
+    unsigned int hi_5 = (bid_1 + 1) * quotient_2 + (bid_1 + 1) * remainder_3 / 148;
+    unsigned int count_6 = (hi_5 - lo_4 + 7679) / 7680;
+    if (count_6 < 2) {
+        count_6 = 2;
+    }
+    if (hi_5 == lo_4) {
+        count_6 = 0;
+    }
+    unsigned int total = out_chunks + 1;
+    if (count_6 > total) {
+        total = count_6;
+    }
+    if (bid_1 == 0) {
+        if (tid_0 < 6) {
+            if (tid_0 != rank) {
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(signals_peers.ptrs[tid_0]) + (8 + rank))), "r"(static_cast<unsigned int>(epoch)) : "memory");
+            }
+        }
+    }
+    unsigned int* peer_words = reinterpret_cast<unsigned int*>(staging_peers.ptrs[destination]);
+    __nv_bfloat16* peer_elements = staging_peers.ptrs[destination];
+    unsigned int* progress = signals_peers.ptrs[destination] + (16 + bid_1);
+    #pragma unroll 1
+    for (unsigned int k = 0; k < total; k++) {
+        if (count_6 > k) {
+            if (warp_1 < 15) {
+                unsigned int tail_lo = lo_4 + (count_6 - 2) * 7680;
+                unsigned int split = hi_5 - (hi_5 - tail_lo >> 2);
+                unsigned int clo = lo_4 + k * 7680;
+                unsigned int chi = clo + 7680;
+                if (k == count_6 - 2) {
+                    clo = tail_lo;
+                    chi = split;
+                }
+                if (k == count_6 - 1) {
+                    clo = split;
+                    chi = hi_5;
+                }
+                if (vector != 0) {
+                    unsigned int last = chi - 1;
+                    #pragma unroll 1
+                    for (unsigned int base = clo + tid_0; base < chi; base += 7680) {
+                        unsigned int unit = base;
+                        unsigned int clamped = ((unit < chi) ? unit : last);
+                        unsigned int quotient_0 = (unsigned int)((unsigned long long)clamped * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_1 = clamped - quotient_0 * block_units;
+                        unsigned int correction = (unsigned int)(remainder_1 >= block_units);
+                        quotient_0 = quotient_0 + correction;
+                        remainder_1 = remainder_1 - correction * block_units;
+                        unsigned int quotient_3 = (unsigned int)((unsigned long long)quotient_0 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_4 = quotient_0 - quotient_3 * sequences;
+                        unsigned int correction_5 = (unsigned int)(remainder_4 >= sequences);
+                        quotient_3 = quotient_3 + correction_5;
+                        remainder_4 = remainder_4 - correction_5 * sequences;
+                        unsigned int src = (quotient_0 + (quotient_3 * 5 + rank) * sequences) * block_units + remainder_1;
+                        unsigned int dst = quotient_0 * pitch_units + rank * block_units + remainder_1;
+                        unsigned int _vec_load_0[4];
+                        {
+                            uint4 _uv4_0 = *reinterpret_cast<const uint4*>(inp_words + (src * 4) + 0);
+                            _vec_load_0[0 + 0] = _uv4_0.x;
+                            _vec_load_0[0 + 1] = _uv4_0.y;
+                            _vec_load_0[0 + 2] = _uv4_0.z;
+                            _vec_load_0[0 + 3] = _uv4_0.w;
+                        }
+                        unsigned int unit_6 = base + 480;
+                        unsigned int clamped_7 = ((unit_6 < chi) ? unit_6 : last);
+                        unsigned int quotient_8 = (unsigned int)((unsigned long long)clamped_7 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_9 = clamped_7 - quotient_8 * block_units;
+                        unsigned int correction_10 = (unsigned int)(remainder_9 >= block_units);
+                        quotient_8 = quotient_8 + correction_10;
+                        remainder_9 = remainder_9 - correction_10 * block_units;
+                        unsigned int quotient_11 = (unsigned int)((unsigned long long)quotient_8 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_12 = quotient_8 - quotient_11 * sequences;
+                        unsigned int correction_13 = (unsigned int)(remainder_12 >= sequences);
+                        quotient_11 = quotient_11 + correction_13;
+                        remainder_12 = remainder_12 - correction_13 * sequences;
+                        unsigned int src_14 = (quotient_8 + (quotient_11 * 5 + rank) * sequences) * block_units + remainder_9;
+                        unsigned int dst_15 = quotient_8 * pitch_units + rank * block_units + remainder_9;
+                        unsigned int _vec_load_1[4];
+                        {
+                            uint4 _uv4_1 = *reinterpret_cast<const uint4*>(inp_words + (src_14 * 4) + 0);
+                            _vec_load_1[0 + 0] = _uv4_1.x;
+                            _vec_load_1[0 + 1] = _uv4_1.y;
+                            _vec_load_1[0 + 2] = _uv4_1.z;
+                            _vec_load_1[0 + 3] = _uv4_1.w;
+                        }
+                        unsigned int unit_16 = base + 960;
+                        unsigned int clamped_17 = ((unit_16 < chi) ? unit_16 : last);
+                        unsigned int quotient_18 = (unsigned int)((unsigned long long)clamped_17 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_19 = clamped_17 - quotient_18 * block_units;
+                        unsigned int correction_20 = (unsigned int)(remainder_19 >= block_units);
+                        quotient_18 = quotient_18 + correction_20;
+                        remainder_19 = remainder_19 - correction_20 * block_units;
+                        unsigned int quotient_21 = (unsigned int)((unsigned long long)quotient_18 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_22 = quotient_18 - quotient_21 * sequences;
+                        unsigned int correction_23 = (unsigned int)(remainder_22 >= sequences);
+                        quotient_21 = quotient_21 + correction_23;
+                        remainder_22 = remainder_22 - correction_23 * sequences;
+                        unsigned int src_24 = (quotient_18 + (quotient_21 * 5 + rank) * sequences) * block_units + remainder_19;
+                        unsigned int dst_25 = quotient_18 * pitch_units + rank * block_units + remainder_19;
+                        unsigned int _vec_load_2[4];
+                        {
+                            uint4 _uv4_2 = *reinterpret_cast<const uint4*>(inp_words + (src_24 * 4) + 0);
+                            _vec_load_2[0 + 0] = _uv4_2.x;
+                            _vec_load_2[0 + 1] = _uv4_2.y;
+                            _vec_load_2[0 + 2] = _uv4_2.z;
+                            _vec_load_2[0 + 3] = _uv4_2.w;
+                        }
+                        unsigned int unit_26 = base + 1440;
+                        unsigned int clamped_27 = ((unit_26 < chi) ? unit_26 : last);
+                        unsigned int quotient_28 = (unsigned int)((unsigned long long)clamped_27 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_29 = clamped_27 - quotient_28 * block_units;
+                        unsigned int correction_30 = (unsigned int)(remainder_29 >= block_units);
+                        quotient_28 = quotient_28 + correction_30;
+                        remainder_29 = remainder_29 - correction_30 * block_units;
+                        unsigned int quotient_31 = (unsigned int)((unsigned long long)quotient_28 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_32 = quotient_28 - quotient_31 * sequences;
+                        unsigned int correction_33 = (unsigned int)(remainder_32 >= sequences);
+                        quotient_31 = quotient_31 + correction_33;
+                        remainder_32 = remainder_32 - correction_33 * sequences;
+                        unsigned int src_34 = (quotient_28 + (quotient_31 * 5 + rank) * sequences) * block_units + remainder_29;
+                        unsigned int dst_35 = quotient_28 * pitch_units + rank * block_units + remainder_29;
+                        unsigned int _vec_load_3[4];
+                        {
+                            uint4 _uv4_3 = *reinterpret_cast<const uint4*>(inp_words + (src_34 * 4) + 0);
+                            _vec_load_3[0 + 0] = _uv4_3.x;
+                            _vec_load_3[0 + 1] = _uv4_3.y;
+                            _vec_load_3[0 + 2] = _uv4_3.z;
+                            _vec_load_3[0 + 3] = _uv4_3.w;
+                        }
+                        unsigned int unit_36 = base + 1920;
+                        unsigned int clamped_37 = ((unit_36 < chi) ? unit_36 : last);
+                        unsigned int quotient_38 = (unsigned int)((unsigned long long)clamped_37 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_39 = clamped_37 - quotient_38 * block_units;
+                        unsigned int correction_40 = (unsigned int)(remainder_39 >= block_units);
+                        quotient_38 = quotient_38 + correction_40;
+                        remainder_39 = remainder_39 - correction_40 * block_units;
+                        unsigned int quotient_41 = (unsigned int)((unsigned long long)quotient_38 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_42 = quotient_38 - quotient_41 * sequences;
+                        unsigned int correction_43 = (unsigned int)(remainder_42 >= sequences);
+                        quotient_41 = quotient_41 + correction_43;
+                        remainder_42 = remainder_42 - correction_43 * sequences;
+                        unsigned int src_44 = (quotient_38 + (quotient_41 * 5 + rank) * sequences) * block_units + remainder_39;
+                        unsigned int dst_45 = quotient_38 * pitch_units + rank * block_units + remainder_39;
+                        unsigned int _vec_load_4[4];
+                        {
+                            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(inp_words + (src_44 * 4) + 0);
+                            _vec_load_4[0 + 0] = _uv4_4.x;
+                            _vec_load_4[0 + 1] = _uv4_4.y;
+                            _vec_load_4[0 + 2] = _uv4_4.z;
+                            _vec_load_4[0 + 3] = _uv4_4.w;
+                        }
+                        unsigned int unit_46 = base + 1920 + 480;
+                        unsigned int clamped_47 = ((unit_46 < chi) ? unit_46 : last);
+                        unsigned int quotient_48 = (unsigned int)((unsigned long long)clamped_47 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_49 = clamped_47 - quotient_48 * block_units;
+                        unsigned int correction_50 = (unsigned int)(remainder_49 >= block_units);
+                        quotient_48 = quotient_48 + correction_50;
+                        remainder_49 = remainder_49 - correction_50 * block_units;
+                        unsigned int quotient_51 = (unsigned int)((unsigned long long)quotient_48 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_52 = quotient_48 - quotient_51 * sequences;
+                        unsigned int correction_53 = (unsigned int)(remainder_52 >= sequences);
+                        quotient_51 = quotient_51 + correction_53;
+                        remainder_52 = remainder_52 - correction_53 * sequences;
+                        unsigned int src_54 = (quotient_48 + (quotient_51 * 5 + rank) * sequences) * block_units + remainder_49;
+                        unsigned int dst_55 = quotient_48 * pitch_units + rank * block_units + remainder_49;
+                        unsigned int _vec_load_5[4];
+                        {
+                            uint4 _uv4_5 = *reinterpret_cast<const uint4*>(inp_words + (src_54 * 4) + 0);
+                            _vec_load_5[0 + 0] = _uv4_5.x;
+                            _vec_load_5[0 + 1] = _uv4_5.y;
+                            _vec_load_5[0 + 2] = _uv4_5.z;
+                            _vec_load_5[0 + 3] = _uv4_5.w;
+                        }
+                        unsigned int unit_56 = base + 1920 + 960;
+                        unsigned int clamped_57 = ((unit_56 < chi) ? unit_56 : last);
+                        unsigned int quotient_58 = (unsigned int)((unsigned long long)clamped_57 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_59 = clamped_57 - quotient_58 * block_units;
+                        unsigned int correction_60 = (unsigned int)(remainder_59 >= block_units);
+                        quotient_58 = quotient_58 + correction_60;
+                        remainder_59 = remainder_59 - correction_60 * block_units;
+                        unsigned int quotient_61 = (unsigned int)((unsigned long long)quotient_58 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_62 = quotient_58 - quotient_61 * sequences;
+                        unsigned int correction_63 = (unsigned int)(remainder_62 >= sequences);
+                        quotient_61 = quotient_61 + correction_63;
+                        remainder_62 = remainder_62 - correction_63 * sequences;
+                        unsigned int src_64 = (quotient_58 + (quotient_61 * 5 + rank) * sequences) * block_units + remainder_59;
+                        unsigned int dst_65 = quotient_58 * pitch_units + rank * block_units + remainder_59;
+                        unsigned int _vec_load_6[4];
+                        {
+                            uint4 _uv4_6 = *reinterpret_cast<const uint4*>(inp_words + (src_64 * 4) + 0);
+                            _vec_load_6[0 + 0] = _uv4_6.x;
+                            _vec_load_6[0 + 1] = _uv4_6.y;
+                            _vec_load_6[0 + 2] = _uv4_6.z;
+                            _vec_load_6[0 + 3] = _uv4_6.w;
+                        }
+                        unsigned int unit_66 = base + 1920 + 1440;
+                        unsigned int clamped_67 = ((unit_66 < chi) ? unit_66 : last);
+                        unsigned int quotient_68 = (unsigned int)((unsigned long long)clamped_67 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_69 = clamped_67 - quotient_68 * block_units;
+                        unsigned int correction_70 = (unsigned int)(remainder_69 >= block_units);
+                        quotient_68 = quotient_68 + correction_70;
+                        remainder_69 = remainder_69 - correction_70 * block_units;
+                        unsigned int quotient_71 = (unsigned int)((unsigned long long)quotient_68 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_72 = quotient_68 - quotient_71 * sequences;
+                        unsigned int correction_73 = (unsigned int)(remainder_72 >= sequences);
+                        quotient_71 = quotient_71 + correction_73;
+                        remainder_72 = remainder_72 - correction_73 * sequences;
+                        unsigned int src_74 = (quotient_68 + (quotient_71 * 5 + rank) * sequences) * block_units + remainder_69;
+                        unsigned int dst_75 = quotient_68 * pitch_units + rank * block_units + remainder_69;
+                        unsigned int _vec_load_7[4];
+                        {
+                            uint4 _uv4_7 = *reinterpret_cast<const uint4*>(inp_words + (src_74 * 4) + 0);
+                            _vec_load_7[0 + 0] = _uv4_7.x;
+                            _vec_load_7[0 + 1] = _uv4_7.y;
+                            _vec_load_7[0 + 2] = _uv4_7.z;
+                            _vec_load_7[0 + 3] = _uv4_7.w;
+                        }
+                        if (unit < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst * 4) + (0)), "r"(_vec_load_0[(0) + 0]), "r"(_vec_load_0[(0) + 1]), "r"(_vec_load_0[(0) + 2]), "r"(_vec_load_0[(0) + 3]) : "memory");
+                        }
+                        if (unit_6 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_15 * 4) + (0)), "r"(_vec_load_1[(0) + 0]), "r"(_vec_load_1[(0) + 1]), "r"(_vec_load_1[(0) + 2]), "r"(_vec_load_1[(0) + 3]) : "memory");
+                        }
+                        if (unit_16 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_25 * 4) + (0)), "r"(_vec_load_2[(0) + 0]), "r"(_vec_load_2[(0) + 1]), "r"(_vec_load_2[(0) + 2]), "r"(_vec_load_2[(0) + 3]) : "memory");
+                        }
+                        if (unit_26 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_35 * 4) + (0)), "r"(_vec_load_3[(0) + 0]), "r"(_vec_load_3[(0) + 1]), "r"(_vec_load_3[(0) + 2]), "r"(_vec_load_3[(0) + 3]) : "memory");
+                        }
+                        unsigned int unit_76 = base + 3840;
+                        unsigned int clamped_77 = ((unit_76 < chi) ? unit_76 : last);
+                        unsigned int quotient_78 = (unsigned int)((unsigned long long)clamped_77 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_79 = clamped_77 - quotient_78 * block_units;
+                        unsigned int correction_80 = (unsigned int)(remainder_79 >= block_units);
+                        quotient_78 = quotient_78 + correction_80;
+                        remainder_79 = remainder_79 - correction_80 * block_units;
+                        unsigned int quotient_81 = (unsigned int)((unsigned long long)quotient_78 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_82 = quotient_78 - quotient_81 * sequences;
+                        unsigned int correction_83 = (unsigned int)(remainder_82 >= sequences);
+                        quotient_81 = quotient_81 + correction_83;
+                        remainder_82 = remainder_82 - correction_83 * sequences;
+                        unsigned int src_84 = (quotient_78 + (quotient_81 * 5 + rank) * sequences) * block_units + remainder_79;
+                        unsigned int dst_85 = quotient_78 * pitch_units + rank * block_units + remainder_79;
+                        unsigned int _vec_load_8[4];
+                        {
+                            uint4 _uv4_8 = *reinterpret_cast<const uint4*>(inp_words + (src_84 * 4) + 0);
+                            _vec_load_8[0 + 0] = _uv4_8.x;
+                            _vec_load_8[0 + 1] = _uv4_8.y;
+                            _vec_load_8[0 + 2] = _uv4_8.z;
+                            _vec_load_8[0 + 3] = _uv4_8.w;
+                        }
+                        unsigned int unit_86 = base + 3840 + 480;
+                        unsigned int clamped_87 = ((unit_86 < chi) ? unit_86 : last);
+                        unsigned int quotient_88 = (unsigned int)((unsigned long long)clamped_87 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_89 = clamped_87 - quotient_88 * block_units;
+                        unsigned int correction_90 = (unsigned int)(remainder_89 >= block_units);
+                        quotient_88 = quotient_88 + correction_90;
+                        remainder_89 = remainder_89 - correction_90 * block_units;
+                        unsigned int quotient_91 = (unsigned int)((unsigned long long)quotient_88 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_92 = quotient_88 - quotient_91 * sequences;
+                        unsigned int correction_93 = (unsigned int)(remainder_92 >= sequences);
+                        quotient_91 = quotient_91 + correction_93;
+                        remainder_92 = remainder_92 - correction_93 * sequences;
+                        unsigned int src_94 = (quotient_88 + (quotient_91 * 5 + rank) * sequences) * block_units + remainder_89;
+                        unsigned int dst_95 = quotient_88 * pitch_units + rank * block_units + remainder_89;
+                        unsigned int _vec_load_9[4];
+                        {
+                            uint4 _uv4_9 = *reinterpret_cast<const uint4*>(inp_words + (src_94 * 4) + 0);
+                            _vec_load_9[0 + 0] = _uv4_9.x;
+                            _vec_load_9[0 + 1] = _uv4_9.y;
+                            _vec_load_9[0 + 2] = _uv4_9.z;
+                            _vec_load_9[0 + 3] = _uv4_9.w;
+                        }
+                        unsigned int unit_96 = base + 3840 + 960;
+                        unsigned int clamped_97 = ((unit_96 < chi) ? unit_96 : last);
+                        unsigned int quotient_98 = (unsigned int)((unsigned long long)clamped_97 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_99 = clamped_97 - quotient_98 * block_units;
+                        unsigned int correction_100 = (unsigned int)(remainder_99 >= block_units);
+                        quotient_98 = quotient_98 + correction_100;
+                        remainder_99 = remainder_99 - correction_100 * block_units;
+                        unsigned int quotient_101 = (unsigned int)((unsigned long long)quotient_98 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_102 = quotient_98 - quotient_101 * sequences;
+                        unsigned int correction_103 = (unsigned int)(remainder_102 >= sequences);
+                        quotient_101 = quotient_101 + correction_103;
+                        remainder_102 = remainder_102 - correction_103 * sequences;
+                        unsigned int src_104 = (quotient_98 + (quotient_101 * 5 + rank) * sequences) * block_units + remainder_99;
+                        unsigned int dst_105 = quotient_98 * pitch_units + rank * block_units + remainder_99;
+                        unsigned int _vec_load_10[4];
+                        {
+                            uint4 _uv4_10 = *reinterpret_cast<const uint4*>(inp_words + (src_104 * 4) + 0);
+                            _vec_load_10[0 + 0] = _uv4_10.x;
+                            _vec_load_10[0 + 1] = _uv4_10.y;
+                            _vec_load_10[0 + 2] = _uv4_10.z;
+                            _vec_load_10[0 + 3] = _uv4_10.w;
+                        }
+                        unsigned int unit_106 = base + 3840 + 1440;
+                        unsigned int clamped_107 = ((unit_106 < chi) ? unit_106 : last);
+                        unsigned int quotient_108 = (unsigned int)((unsigned long long)clamped_107 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_109 = clamped_107 - quotient_108 * block_units;
+                        unsigned int correction_110 = (unsigned int)(remainder_109 >= block_units);
+                        quotient_108 = quotient_108 + correction_110;
+                        remainder_109 = remainder_109 - correction_110 * block_units;
+                        unsigned int quotient_111 = (unsigned int)((unsigned long long)quotient_108 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_112 = quotient_108 - quotient_111 * sequences;
+                        unsigned int correction_113 = (unsigned int)(remainder_112 >= sequences);
+                        quotient_111 = quotient_111 + correction_113;
+                        remainder_112 = remainder_112 - correction_113 * sequences;
+                        unsigned int src_114 = (quotient_108 + (quotient_111 * 5 + rank) * sequences) * block_units + remainder_109;
+                        unsigned int dst_115 = quotient_108 * pitch_units + rank * block_units + remainder_109;
+                        unsigned int _vec_load_11[4];
+                        {
+                            uint4 _uv4_11 = *reinterpret_cast<const uint4*>(inp_words + (src_114 * 4) + 0);
+                            _vec_load_11[0 + 0] = _uv4_11.x;
+                            _vec_load_11[0 + 1] = _uv4_11.y;
+                            _vec_load_11[0 + 2] = _uv4_11.z;
+                            _vec_load_11[0 + 3] = _uv4_11.w;
+                        }
+                        if (unit_36 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_45 * 4) + (0)), "r"(_vec_load_4[(0) + 0]), "r"(_vec_load_4[(0) + 1]), "r"(_vec_load_4[(0) + 2]), "r"(_vec_load_4[(0) + 3]) : "memory");
+                        }
+                        if (unit_46 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_55 * 4) + (0)), "r"(_vec_load_5[(0) + 0]), "r"(_vec_load_5[(0) + 1]), "r"(_vec_load_5[(0) + 2]), "r"(_vec_load_5[(0) + 3]) : "memory");
+                        }
+                        if (unit_56 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_65 * 4) + (0)), "r"(_vec_load_6[(0) + 0]), "r"(_vec_load_6[(0) + 1]), "r"(_vec_load_6[(0) + 2]), "r"(_vec_load_6[(0) + 3]) : "memory");
+                        }
+                        if (unit_66 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_75 * 4) + (0)), "r"(_vec_load_7[(0) + 0]), "r"(_vec_load_7[(0) + 1]), "r"(_vec_load_7[(0) + 2]), "r"(_vec_load_7[(0) + 3]) : "memory");
+                        }
+                        unsigned int unit_116 = base + 5760;
+                        unsigned int clamped_117 = ((unit_116 < chi) ? unit_116 : last);
+                        unsigned int quotient_118 = (unsigned int)((unsigned long long)clamped_117 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_119 = clamped_117 - quotient_118 * block_units;
+                        unsigned int correction_120 = (unsigned int)(remainder_119 >= block_units);
+                        quotient_118 = quotient_118 + correction_120;
+                        remainder_119 = remainder_119 - correction_120 * block_units;
+                        unsigned int quotient_121 = (unsigned int)((unsigned long long)quotient_118 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_122 = quotient_118 - quotient_121 * sequences;
+                        unsigned int correction_123 = (unsigned int)(remainder_122 >= sequences);
+                        quotient_121 = quotient_121 + correction_123;
+                        remainder_122 = remainder_122 - correction_123 * sequences;
+                        unsigned int src_124 = (quotient_118 + (quotient_121 * 5 + rank) * sequences) * block_units + remainder_119;
+                        unsigned int dst_125 = quotient_118 * pitch_units + rank * block_units + remainder_119;
+                        unsigned int _vec_load_12[4];
+                        {
+                            uint4 _uv4_12 = *reinterpret_cast<const uint4*>(inp_words + (src_124 * 4) + 0);
+                            _vec_load_12[0 + 0] = _uv4_12.x;
+                            _vec_load_12[0 + 1] = _uv4_12.y;
+                            _vec_load_12[0 + 2] = _uv4_12.z;
+                            _vec_load_12[0 + 3] = _uv4_12.w;
+                        }
+                        unsigned int unit_126 = base + 5760 + 480;
+                        unsigned int clamped_127 = ((unit_126 < chi) ? unit_126 : last);
+                        unsigned int quotient_128 = (unsigned int)((unsigned long long)clamped_127 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_129 = clamped_127 - quotient_128 * block_units;
+                        unsigned int correction_130 = (unsigned int)(remainder_129 >= block_units);
+                        quotient_128 = quotient_128 + correction_130;
+                        remainder_129 = remainder_129 - correction_130 * block_units;
+                        unsigned int quotient_131 = (unsigned int)((unsigned long long)quotient_128 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_132 = quotient_128 - quotient_131 * sequences;
+                        unsigned int correction_133 = (unsigned int)(remainder_132 >= sequences);
+                        quotient_131 = quotient_131 + correction_133;
+                        remainder_132 = remainder_132 - correction_133 * sequences;
+                        unsigned int src_134 = (quotient_128 + (quotient_131 * 5 + rank) * sequences) * block_units + remainder_129;
+                        unsigned int dst_135 = quotient_128 * pitch_units + rank * block_units + remainder_129;
+                        unsigned int _vec_load_13[4];
+                        {
+                            uint4 _uv4_13 = *reinterpret_cast<const uint4*>(inp_words + (src_134 * 4) + 0);
+                            _vec_load_13[0 + 0] = _uv4_13.x;
+                            _vec_load_13[0 + 1] = _uv4_13.y;
+                            _vec_load_13[0 + 2] = _uv4_13.z;
+                            _vec_load_13[0 + 3] = _uv4_13.w;
+                        }
+                        unsigned int unit_136 = base + 5760 + 960;
+                        unsigned int clamped_137 = ((unit_136 < chi) ? unit_136 : last);
+                        unsigned int quotient_138 = (unsigned int)((unsigned long long)clamped_137 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_139 = clamped_137 - quotient_138 * block_units;
+                        unsigned int correction_140 = (unsigned int)(remainder_139 >= block_units);
+                        quotient_138 = quotient_138 + correction_140;
+                        remainder_139 = remainder_139 - correction_140 * block_units;
+                        unsigned int quotient_141 = (unsigned int)((unsigned long long)quotient_138 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_142 = quotient_138 - quotient_141 * sequences;
+                        unsigned int correction_143 = (unsigned int)(remainder_142 >= sequences);
+                        quotient_141 = quotient_141 + correction_143;
+                        remainder_142 = remainder_142 - correction_143 * sequences;
+                        unsigned int src_144 = (quotient_138 + (quotient_141 * 5 + rank) * sequences) * block_units + remainder_139;
+                        unsigned int dst_145 = quotient_138 * pitch_units + rank * block_units + remainder_139;
+                        unsigned int _vec_load_14[4];
+                        {
+                            uint4 _uv4_14 = *reinterpret_cast<const uint4*>(inp_words + (src_144 * 4) + 0);
+                            _vec_load_14[0 + 0] = _uv4_14.x;
+                            _vec_load_14[0 + 1] = _uv4_14.y;
+                            _vec_load_14[0 + 2] = _uv4_14.z;
+                            _vec_load_14[0 + 3] = _uv4_14.w;
+                        }
+                        unsigned int unit_146 = base + 5760 + 1440;
+                        unsigned int clamped_147 = ((unit_146 < chi) ? unit_146 : last);
+                        unsigned int quotient_148 = (unsigned int)((unsigned long long)clamped_147 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_149 = clamped_147 - quotient_148 * block_units;
+                        unsigned int correction_150 = (unsigned int)(remainder_149 >= block_units);
+                        quotient_148 = quotient_148 + correction_150;
+                        remainder_149 = remainder_149 - correction_150 * block_units;
+                        unsigned int quotient_151 = (unsigned int)((unsigned long long)quotient_148 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_152 = quotient_148 - quotient_151 * sequences;
+                        unsigned int correction_153 = (unsigned int)(remainder_152 >= sequences);
+                        quotient_151 = quotient_151 + correction_153;
+                        remainder_152 = remainder_152 - correction_153 * sequences;
+                        unsigned int src_154 = (quotient_148 + (quotient_151 * 5 + rank) * sequences) * block_units + remainder_149;
+                        unsigned int dst_155 = quotient_148 * pitch_units + rank * block_units + remainder_149;
+                        unsigned int _vec_load_15[4];
+                        {
+                            uint4 _uv4_15 = *reinterpret_cast<const uint4*>(inp_words + (src_154 * 4) + 0);
+                            _vec_load_15[0 + 0] = _uv4_15.x;
+                            _vec_load_15[0 + 1] = _uv4_15.y;
+                            _vec_load_15[0 + 2] = _uv4_15.z;
+                            _vec_load_15[0 + 3] = _uv4_15.w;
+                        }
+                        if (unit_76 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_85 * 4) + (0)), "r"(_vec_load_8[(0) + 0]), "r"(_vec_load_8[(0) + 1]), "r"(_vec_load_8[(0) + 2]), "r"(_vec_load_8[(0) + 3]) : "memory");
+                        }
+                        if (unit_86 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_95 * 4) + (0)), "r"(_vec_load_9[(0) + 0]), "r"(_vec_load_9[(0) + 1]), "r"(_vec_load_9[(0) + 2]), "r"(_vec_load_9[(0) + 3]) : "memory");
+                        }
+                        if (unit_96 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_105 * 4) + (0)), "r"(_vec_load_10[(0) + 0]), "r"(_vec_load_10[(0) + 1]), "r"(_vec_load_10[(0) + 2]), "r"(_vec_load_10[(0) + 3]) : "memory");
+                        }
+                        if (unit_106 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_115 * 4) + (0)), "r"(_vec_load_11[(0) + 0]), "r"(_vec_load_11[(0) + 1]), "r"(_vec_load_11[(0) + 2]), "r"(_vec_load_11[(0) + 3]) : "memory");
+                        }
+                        if (unit_116 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_125 * 4) + (0)), "r"(_vec_load_12[(0) + 0]), "r"(_vec_load_12[(0) + 1]), "r"(_vec_load_12[(0) + 2]), "r"(_vec_load_12[(0) + 3]) : "memory");
+                        }
+                        if (unit_126 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_135 * 4) + (0)), "r"(_vec_load_13[(0) + 0]), "r"(_vec_load_13[(0) + 1]), "r"(_vec_load_13[(0) + 2]), "r"(_vec_load_13[(0) + 3]) : "memory");
+                        }
+                        if (unit_136 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_145 * 4) + (0)), "r"(_vec_load_14[(0) + 0]), "r"(_vec_load_14[(0) + 1]), "r"(_vec_load_14[(0) + 2]), "r"(_vec_load_14[(0) + 3]) : "memory");
+                        }
+                        if (unit_146 < chi) {
+                            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_155 * 4) + (0)), "r"(_vec_load_15[(0) + 0]), "r"(_vec_load_15[(0) + 1]), "r"(_vec_load_15[(0) + 2]), "r"(_vec_load_15[(0) + 3]) : "memory");
+                        }
+                    }
+                } else {
+                    #pragma unroll 1
+                    for (unsigned int u = clo + tid_0; u < chi; u += 480) {
+                        unsigned int quotient_0_1 = (unsigned int)((unsigned long long)u * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_1_1 = u - quotient_0_1 * block_units;
+                        unsigned int correction_1 = (unsigned int)(remainder_1_1 >= block_units);
+                        quotient_0_1 = quotient_0_1 + correction_1;
+                        remainder_1_1 = remainder_1_1 - correction_1 * block_units;
+                        unsigned int quotient_3_1 = (unsigned int)((unsigned long long)quotient_0_1 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_4_1 = quotient_0_1 - quotient_3_1 * sequences;
+                        unsigned int correction_5_1 = (unsigned int)(remainder_4_1 >= sequences);
+                        quotient_3_1 = quotient_3_1 + correction_5_1;
+                        remainder_4_1 = remainder_4_1 - correction_5_1 * sequences;
+                        unsigned int src_1 = (quotient_0_1 + (quotient_3_1 * 5 + rank) * sequences) * block_units + remainder_1_1;
+                        unsigned int dst_1 = quotient_0_1 * pitch_units + rank * block_units + remainder_1_1;
+                        out[dst_1] = inp[src_1];
+                    }
+                }
+            }
+        }
+        if (out_chunks > k) {
+            if (k == 0) {
+                if (tid_0 == 0) {
+                    {
+                    unsigned int _acquire_observed;
+                    do {
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (8 + destination))) : "memory");
+                    } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
+                    }
+                }
+                __syncthreads();
+            }
+            if (warp_1 < 15) {
+                if (vector != 0) {
+                    unsigned int last_1 = units - 1;
+                    unsigned int stripe = (sub + k * parts) * 7680;
+                    unsigned int unit_1 = stripe + tid_0;
+                    unsigned int clamped_1 = ((unit_1 < units) ? unit_1 : last_1);
+                    unsigned int quotient_0_2 = (unsigned int)((unsigned long long)clamped_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_1_2 = clamped_1 - quotient_0_2 * block_units;
+                    unsigned int correction_2 = (unsigned int)(remainder_1_2 >= block_units);
+                    quotient_0_2 = quotient_0_2 + correction_2;
+                    remainder_1_2 = remainder_1_2 - correction_2 * block_units;
+                    unsigned int quotient_3_2 = (unsigned int)((unsigned long long)quotient_0_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_4_2 = quotient_0_2 - quotient_3_2 * sequences;
+                    unsigned int correction_5_2 = (unsigned int)(remainder_4_2 >= sequences);
+                    quotient_3_2 = quotient_3_2 + correction_5_2;
+                    remainder_4_2 = remainder_4_2 - correction_5_2 * sequences;
+                    unsigned int src_2 = (quotient_0_2 + (quotient_3_2 * 5 + destination) * sequences) * block_units + remainder_1_2;
+                    unsigned int dst_2 = quotient_0_2 * pitch_units + rank * block_units + remainder_1_2;
+                    unsigned int _vec_load_16[4];
+                    {
+                        uint4 _uv4_16 = *reinterpret_cast<const uint4*>(inp_words + (src_2 * 4) + 0);
+                        _vec_load_16[0 + 0] = _uv4_16.x;
+                        _vec_load_16[0 + 1] = _uv4_16.y;
+                        _vec_load_16[0 + 2] = _uv4_16.z;
+                        _vec_load_16[0 + 3] = _uv4_16.w;
+                    }
+                    unsigned int unit_6_1 = stripe + (480 + tid_0);
+                    unsigned int clamped_7_1 = ((unit_6_1 < units) ? unit_6_1 : last_1);
+                    unsigned int quotient_8_1 = (unsigned int)((unsigned long long)clamped_7_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_9_1 = clamped_7_1 - quotient_8_1 * block_units;
+                    unsigned int correction_10_1 = (unsigned int)(remainder_9_1 >= block_units);
+                    quotient_8_1 = quotient_8_1 + correction_10_1;
+                    remainder_9_1 = remainder_9_1 - correction_10_1 * block_units;
+                    unsigned int quotient_11_1 = (unsigned int)((unsigned long long)quotient_8_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_12_1 = quotient_8_1 - quotient_11_1 * sequences;
+                    unsigned int correction_13_1 = (unsigned int)(remainder_12_1 >= sequences);
+                    quotient_11_1 = quotient_11_1 + correction_13_1;
+                    remainder_12_1 = remainder_12_1 - correction_13_1 * sequences;
+                    unsigned int src_14_1 = (quotient_8_1 + (quotient_11_1 * 5 + destination) * sequences) * block_units + remainder_9_1;
+                    unsigned int dst_15_1 = quotient_8_1 * pitch_units + rank * block_units + remainder_9_1;
+                    unsigned int _vec_load_17[4];
+                    {
+                        uint4 _uv4_17 = *reinterpret_cast<const uint4*>(inp_words + (src_14_1 * 4) + 0);
+                        _vec_load_17[0 + 0] = _uv4_17.x;
+                        _vec_load_17[0 + 1] = _uv4_17.y;
+                        _vec_load_17[0 + 2] = _uv4_17.z;
+                        _vec_load_17[0 + 3] = _uv4_17.w;
+                    }
+                    unsigned int unit_16_1 = stripe + (960 + tid_0);
+                    unsigned int clamped_17_1 = ((unit_16_1 < units) ? unit_16_1 : last_1);
+                    unsigned int quotient_18_1 = (unsigned int)((unsigned long long)clamped_17_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_19_1 = clamped_17_1 - quotient_18_1 * block_units;
+                    unsigned int correction_20_1 = (unsigned int)(remainder_19_1 >= block_units);
+                    quotient_18_1 = quotient_18_1 + correction_20_1;
+                    remainder_19_1 = remainder_19_1 - correction_20_1 * block_units;
+                    unsigned int quotient_21_1 = (unsigned int)((unsigned long long)quotient_18_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_22_1 = quotient_18_1 - quotient_21_1 * sequences;
+                    unsigned int correction_23_1 = (unsigned int)(remainder_22_1 >= sequences);
+                    quotient_21_1 = quotient_21_1 + correction_23_1;
+                    remainder_22_1 = remainder_22_1 - correction_23_1 * sequences;
+                    unsigned int src_24_1 = (quotient_18_1 + (quotient_21_1 * 5 + destination) * sequences) * block_units + remainder_19_1;
+                    unsigned int dst_25_1 = quotient_18_1 * pitch_units + rank * block_units + remainder_19_1;
+                    unsigned int _vec_load_18[4];
+                    {
+                        uint4 _uv4_18 = *reinterpret_cast<const uint4*>(inp_words + (src_24_1 * 4) + 0);
+                        _vec_load_18[0 + 0] = _uv4_18.x;
+                        _vec_load_18[0 + 1] = _uv4_18.y;
+                        _vec_load_18[0 + 2] = _uv4_18.z;
+                        _vec_load_18[0 + 3] = _uv4_18.w;
+                    }
+                    unsigned int unit_26_1 = stripe + (1440 + tid_0);
+                    unsigned int clamped_27_1 = ((unit_26_1 < units) ? unit_26_1 : last_1);
+                    unsigned int quotient_28_1 = (unsigned int)((unsigned long long)clamped_27_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_29_1 = clamped_27_1 - quotient_28_1 * block_units;
+                    unsigned int correction_30_1 = (unsigned int)(remainder_29_1 >= block_units);
+                    quotient_28_1 = quotient_28_1 + correction_30_1;
+                    remainder_29_1 = remainder_29_1 - correction_30_1 * block_units;
+                    unsigned int quotient_31_1 = (unsigned int)((unsigned long long)quotient_28_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_32_1 = quotient_28_1 - quotient_31_1 * sequences;
+                    unsigned int correction_33_1 = (unsigned int)(remainder_32_1 >= sequences);
+                    quotient_31_1 = quotient_31_1 + correction_33_1;
+                    remainder_32_1 = remainder_32_1 - correction_33_1 * sequences;
+                    unsigned int src_34_1 = (quotient_28_1 + (quotient_31_1 * 5 + destination) * sequences) * block_units + remainder_29_1;
+                    unsigned int dst_35_1 = quotient_28_1 * pitch_units + rank * block_units + remainder_29_1;
+                    unsigned int _vec_load_19[4];
+                    {
+                        uint4 _uv4_19 = *reinterpret_cast<const uint4*>(inp_words + (src_34_1 * 4) + 0);
+                        _vec_load_19[0 + 0] = _uv4_19.x;
+                        _vec_load_19[0 + 1] = _uv4_19.y;
+                        _vec_load_19[0 + 2] = _uv4_19.z;
+                        _vec_load_19[0 + 3] = _uv4_19.w;
+                    }
+                    unsigned int unit_36_1 = stripe + (1920 + tid_0);
+                    unsigned int clamped_37_1 = ((unit_36_1 < units) ? unit_36_1 : last_1);
+                    unsigned int quotient_38_1 = (unsigned int)((unsigned long long)clamped_37_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_39_1 = clamped_37_1 - quotient_38_1 * block_units;
+                    unsigned int correction_40_1 = (unsigned int)(remainder_39_1 >= block_units);
+                    quotient_38_1 = quotient_38_1 + correction_40_1;
+                    remainder_39_1 = remainder_39_1 - correction_40_1 * block_units;
+                    unsigned int quotient_41_1 = (unsigned int)((unsigned long long)quotient_38_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_42_1 = quotient_38_1 - quotient_41_1 * sequences;
+                    unsigned int correction_43_1 = (unsigned int)(remainder_42_1 >= sequences);
+                    quotient_41_1 = quotient_41_1 + correction_43_1;
+                    remainder_42_1 = remainder_42_1 - correction_43_1 * sequences;
+                    unsigned int src_44_1 = (quotient_38_1 + (quotient_41_1 * 5 + destination) * sequences) * block_units + remainder_39_1;
+                    unsigned int dst_45_1 = quotient_38_1 * pitch_units + rank * block_units + remainder_39_1;
+                    unsigned int _vec_load_20[4];
+                    {
+                        uint4 _uv4_20 = *reinterpret_cast<const uint4*>(inp_words + (src_44_1 * 4) + 0);
+                        _vec_load_20[0 + 0] = _uv4_20.x;
+                        _vec_load_20[0 + 1] = _uv4_20.y;
+                        _vec_load_20[0 + 2] = _uv4_20.z;
+                        _vec_load_20[0 + 3] = _uv4_20.w;
+                    }
+                    unsigned int unit_46_1 = stripe + (2400 + tid_0);
+                    unsigned int clamped_47_1 = ((unit_46_1 < units) ? unit_46_1 : last_1);
+                    unsigned int quotient_48_1 = (unsigned int)((unsigned long long)clamped_47_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_49_1 = clamped_47_1 - quotient_48_1 * block_units;
+                    unsigned int correction_50_1 = (unsigned int)(remainder_49_1 >= block_units);
+                    quotient_48_1 = quotient_48_1 + correction_50_1;
+                    remainder_49_1 = remainder_49_1 - correction_50_1 * block_units;
+                    unsigned int quotient_51_1 = (unsigned int)((unsigned long long)quotient_48_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_52_1 = quotient_48_1 - quotient_51_1 * sequences;
+                    unsigned int correction_53_1 = (unsigned int)(remainder_52_1 >= sequences);
+                    quotient_51_1 = quotient_51_1 + correction_53_1;
+                    remainder_52_1 = remainder_52_1 - correction_53_1 * sequences;
+                    unsigned int src_54_1 = (quotient_48_1 + (quotient_51_1 * 5 + destination) * sequences) * block_units + remainder_49_1;
+                    unsigned int dst_55_1 = quotient_48_1 * pitch_units + rank * block_units + remainder_49_1;
+                    unsigned int _vec_load_21[4];
+                    {
+                        uint4 _uv4_21 = *reinterpret_cast<const uint4*>(inp_words + (src_54_1 * 4) + 0);
+                        _vec_load_21[0 + 0] = _uv4_21.x;
+                        _vec_load_21[0 + 1] = _uv4_21.y;
+                        _vec_load_21[0 + 2] = _uv4_21.z;
+                        _vec_load_21[0 + 3] = _uv4_21.w;
+                    }
+                    unsigned int unit_56_1 = stripe + (2880 + tid_0);
+                    unsigned int clamped_57_1 = ((unit_56_1 < units) ? unit_56_1 : last_1);
+                    unsigned int quotient_58_1 = (unsigned int)((unsigned long long)clamped_57_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_59_1 = clamped_57_1 - quotient_58_1 * block_units;
+                    unsigned int correction_60_1 = (unsigned int)(remainder_59_1 >= block_units);
+                    quotient_58_1 = quotient_58_1 + correction_60_1;
+                    remainder_59_1 = remainder_59_1 - correction_60_1 * block_units;
+                    unsigned int quotient_61_1 = (unsigned int)((unsigned long long)quotient_58_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_62_1 = quotient_58_1 - quotient_61_1 * sequences;
+                    unsigned int correction_63_1 = (unsigned int)(remainder_62_1 >= sequences);
+                    quotient_61_1 = quotient_61_1 + correction_63_1;
+                    remainder_62_1 = remainder_62_1 - correction_63_1 * sequences;
+                    unsigned int src_64_1 = (quotient_58_1 + (quotient_61_1 * 5 + destination) * sequences) * block_units + remainder_59_1;
+                    unsigned int dst_65_1 = quotient_58_1 * pitch_units + rank * block_units + remainder_59_1;
+                    unsigned int _vec_load_22[4];
+                    {
+                        uint4 _uv4_22 = *reinterpret_cast<const uint4*>(inp_words + (src_64_1 * 4) + 0);
+                        _vec_load_22[0 + 0] = _uv4_22.x;
+                        _vec_load_22[0 + 1] = _uv4_22.y;
+                        _vec_load_22[0 + 2] = _uv4_22.z;
+                        _vec_load_22[0 + 3] = _uv4_22.w;
+                    }
+                    unsigned int unit_66_1 = stripe + (3360 + tid_0);
+                    unsigned int clamped_67_1 = ((unit_66_1 < units) ? unit_66_1 : last_1);
+                    unsigned int quotient_68_1 = (unsigned int)((unsigned long long)clamped_67_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_69_1 = clamped_67_1 - quotient_68_1 * block_units;
+                    unsigned int correction_70_1 = (unsigned int)(remainder_69_1 >= block_units);
+                    quotient_68_1 = quotient_68_1 + correction_70_1;
+                    remainder_69_1 = remainder_69_1 - correction_70_1 * block_units;
+                    unsigned int quotient_71_1 = (unsigned int)((unsigned long long)quotient_68_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_72_1 = quotient_68_1 - quotient_71_1 * sequences;
+                    unsigned int correction_73_1 = (unsigned int)(remainder_72_1 >= sequences);
+                    quotient_71_1 = quotient_71_1 + correction_73_1;
+                    remainder_72_1 = remainder_72_1 - correction_73_1 * sequences;
+                    unsigned int src_74_1 = (quotient_68_1 + (quotient_71_1 * 5 + destination) * sequences) * block_units + remainder_69_1;
+                    unsigned int dst_75_1 = quotient_68_1 * pitch_units + rank * block_units + remainder_69_1;
+                    unsigned int _vec_load_23[4];
+                    {
+                        uint4 _uv4_23 = *reinterpret_cast<const uint4*>(inp_words + (src_74_1 * 4) + 0);
+                        _vec_load_23[0 + 0] = _uv4_23.x;
+                        _vec_load_23[0 + 1] = _uv4_23.y;
+                        _vec_load_23[0 + 2] = _uv4_23.z;
+                        _vec_load_23[0 + 3] = _uv4_23.w;
+                    }
+                    if (unit_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_2 * 4) + (0)), "r"(_vec_load_16[(0) + 0]), "r"(_vec_load_16[(0) + 1]), "r"(_vec_load_16[(0) + 2]), "r"(_vec_load_16[(0) + 3]) : "memory");
+                    }
+                    if (unit_6_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_15_1 * 4) + (0)), "r"(_vec_load_17[(0) + 0]), "r"(_vec_load_17[(0) + 1]), "r"(_vec_load_17[(0) + 2]), "r"(_vec_load_17[(0) + 3]) : "memory");
+                    }
+                    if (unit_16_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_25_1 * 4) + (0)), "r"(_vec_load_18[(0) + 0]), "r"(_vec_load_18[(0) + 1]), "r"(_vec_load_18[(0) + 2]), "r"(_vec_load_18[(0) + 3]) : "memory");
+                    }
+                    if (unit_26_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_35_1 * 4) + (0)), "r"(_vec_load_19[(0) + 0]), "r"(_vec_load_19[(0) + 1]), "r"(_vec_load_19[(0) + 2]), "r"(_vec_load_19[(0) + 3]) : "memory");
+                    }
+                    unsigned int unit_76_1 = stripe + (3840 + tid_0);
+                    unsigned int clamped_77_1 = ((unit_76_1 < units) ? unit_76_1 : last_1);
+                    unsigned int quotient_78_1 = (unsigned int)((unsigned long long)clamped_77_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_79_1 = clamped_77_1 - quotient_78_1 * block_units;
+                    unsigned int correction_80_1 = (unsigned int)(remainder_79_1 >= block_units);
+                    quotient_78_1 = quotient_78_1 + correction_80_1;
+                    remainder_79_1 = remainder_79_1 - correction_80_1 * block_units;
+                    unsigned int quotient_81_1 = (unsigned int)((unsigned long long)quotient_78_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_82_1 = quotient_78_1 - quotient_81_1 * sequences;
+                    unsigned int correction_83_1 = (unsigned int)(remainder_82_1 >= sequences);
+                    quotient_81_1 = quotient_81_1 + correction_83_1;
+                    remainder_82_1 = remainder_82_1 - correction_83_1 * sequences;
+                    unsigned int src_84_1 = (quotient_78_1 + (quotient_81_1 * 5 + destination) * sequences) * block_units + remainder_79_1;
+                    unsigned int dst_85_1 = quotient_78_1 * pitch_units + rank * block_units + remainder_79_1;
+                    unsigned int _vec_load_24[4];
+                    {
+                        uint4 _uv4_24 = *reinterpret_cast<const uint4*>(inp_words + (src_84_1 * 4) + 0);
+                        _vec_load_24[0 + 0] = _uv4_24.x;
+                        _vec_load_24[0 + 1] = _uv4_24.y;
+                        _vec_load_24[0 + 2] = _uv4_24.z;
+                        _vec_load_24[0 + 3] = _uv4_24.w;
+                    }
+                    unsigned int unit_86_1 = stripe + (4320 + tid_0);
+                    unsigned int clamped_87_1 = ((unit_86_1 < units) ? unit_86_1 : last_1);
+                    unsigned int quotient_88_1 = (unsigned int)((unsigned long long)clamped_87_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_89_1 = clamped_87_1 - quotient_88_1 * block_units;
+                    unsigned int correction_90_1 = (unsigned int)(remainder_89_1 >= block_units);
+                    quotient_88_1 = quotient_88_1 + correction_90_1;
+                    remainder_89_1 = remainder_89_1 - correction_90_1 * block_units;
+                    unsigned int quotient_91_1 = (unsigned int)((unsigned long long)quotient_88_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_92_1 = quotient_88_1 - quotient_91_1 * sequences;
+                    unsigned int correction_93_1 = (unsigned int)(remainder_92_1 >= sequences);
+                    quotient_91_1 = quotient_91_1 + correction_93_1;
+                    remainder_92_1 = remainder_92_1 - correction_93_1 * sequences;
+                    unsigned int src_94_1 = (quotient_88_1 + (quotient_91_1 * 5 + destination) * sequences) * block_units + remainder_89_1;
+                    unsigned int dst_95_1 = quotient_88_1 * pitch_units + rank * block_units + remainder_89_1;
+                    unsigned int _vec_load_25[4];
+                    {
+                        uint4 _uv4_25 = *reinterpret_cast<const uint4*>(inp_words + (src_94_1 * 4) + 0);
+                        _vec_load_25[0 + 0] = _uv4_25.x;
+                        _vec_load_25[0 + 1] = _uv4_25.y;
+                        _vec_load_25[0 + 2] = _uv4_25.z;
+                        _vec_load_25[0 + 3] = _uv4_25.w;
+                    }
+                    unsigned int unit_96_1 = stripe + (4800 + tid_0);
+                    unsigned int clamped_97_1 = ((unit_96_1 < units) ? unit_96_1 : last_1);
+                    unsigned int quotient_98_1 = (unsigned int)((unsigned long long)clamped_97_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_99_1 = clamped_97_1 - quotient_98_1 * block_units;
+                    unsigned int correction_100_1 = (unsigned int)(remainder_99_1 >= block_units);
+                    quotient_98_1 = quotient_98_1 + correction_100_1;
+                    remainder_99_1 = remainder_99_1 - correction_100_1 * block_units;
+                    unsigned int quotient_101_1 = (unsigned int)((unsigned long long)quotient_98_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_102_1 = quotient_98_1 - quotient_101_1 * sequences;
+                    unsigned int correction_103_1 = (unsigned int)(remainder_102_1 >= sequences);
+                    quotient_101_1 = quotient_101_1 + correction_103_1;
+                    remainder_102_1 = remainder_102_1 - correction_103_1 * sequences;
+                    unsigned int src_104_1 = (quotient_98_1 + (quotient_101_1 * 5 + destination) * sequences) * block_units + remainder_99_1;
+                    unsigned int dst_105_1 = quotient_98_1 * pitch_units + rank * block_units + remainder_99_1;
+                    unsigned int _vec_load_26[4];
+                    {
+                        uint4 _uv4_26 = *reinterpret_cast<const uint4*>(inp_words + (src_104_1 * 4) + 0);
+                        _vec_load_26[0 + 0] = _uv4_26.x;
+                        _vec_load_26[0 + 1] = _uv4_26.y;
+                        _vec_load_26[0 + 2] = _uv4_26.z;
+                        _vec_load_26[0 + 3] = _uv4_26.w;
+                    }
+                    unsigned int unit_106_1 = stripe + (5280 + tid_0);
+                    unsigned int clamped_107_1 = ((unit_106_1 < units) ? unit_106_1 : last_1);
+                    unsigned int quotient_108_1 = (unsigned int)((unsigned long long)clamped_107_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_109_1 = clamped_107_1 - quotient_108_1 * block_units;
+                    unsigned int correction_110_1 = (unsigned int)(remainder_109_1 >= block_units);
+                    quotient_108_1 = quotient_108_1 + correction_110_1;
+                    remainder_109_1 = remainder_109_1 - correction_110_1 * block_units;
+                    unsigned int quotient_111_1 = (unsigned int)((unsigned long long)quotient_108_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_112_1 = quotient_108_1 - quotient_111_1 * sequences;
+                    unsigned int correction_113_1 = (unsigned int)(remainder_112_1 >= sequences);
+                    quotient_111_1 = quotient_111_1 + correction_113_1;
+                    remainder_112_1 = remainder_112_1 - correction_113_1 * sequences;
+                    unsigned int src_114_1 = (quotient_108_1 + (quotient_111_1 * 5 + destination) * sequences) * block_units + remainder_109_1;
+                    unsigned int dst_115_1 = quotient_108_1 * pitch_units + rank * block_units + remainder_109_1;
+                    unsigned int _vec_load_27[4];
+                    {
+                        uint4 _uv4_27 = *reinterpret_cast<const uint4*>(inp_words + (src_114_1 * 4) + 0);
+                        _vec_load_27[0 + 0] = _uv4_27.x;
+                        _vec_load_27[0 + 1] = _uv4_27.y;
+                        _vec_load_27[0 + 2] = _uv4_27.z;
+                        _vec_load_27[0 + 3] = _uv4_27.w;
+                    }
+                    if (unit_36_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_45_1 * 4) + (0)), "r"(_vec_load_20[(0) + 0]), "r"(_vec_load_20[(0) + 1]), "r"(_vec_load_20[(0) + 2]), "r"(_vec_load_20[(0) + 3]) : "memory");
+                    }
+                    if (unit_46_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_55_1 * 4) + (0)), "r"(_vec_load_21[(0) + 0]), "r"(_vec_load_21[(0) + 1]), "r"(_vec_load_21[(0) + 2]), "r"(_vec_load_21[(0) + 3]) : "memory");
+                    }
+                    if (unit_56_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_65_1 * 4) + (0)), "r"(_vec_load_22[(0) + 0]), "r"(_vec_load_22[(0) + 1]), "r"(_vec_load_22[(0) + 2]), "r"(_vec_load_22[(0) + 3]) : "memory");
+                    }
+                    if (unit_66_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_75_1 * 4) + (0)), "r"(_vec_load_23[(0) + 0]), "r"(_vec_load_23[(0) + 1]), "r"(_vec_load_23[(0) + 2]), "r"(_vec_load_23[(0) + 3]) : "memory");
+                    }
+                    unsigned int unit_116_1 = stripe + (5760 + tid_0);
+                    unsigned int clamped_117_1 = ((unit_116_1 < units) ? unit_116_1 : last_1);
+                    unsigned int quotient_118_1 = (unsigned int)((unsigned long long)clamped_117_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_119_1 = clamped_117_1 - quotient_118_1 * block_units;
+                    unsigned int correction_120_1 = (unsigned int)(remainder_119_1 >= block_units);
+                    quotient_118_1 = quotient_118_1 + correction_120_1;
+                    remainder_119_1 = remainder_119_1 - correction_120_1 * block_units;
+                    unsigned int quotient_121_1 = (unsigned int)((unsigned long long)quotient_118_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_122_1 = quotient_118_1 - quotient_121_1 * sequences;
+                    unsigned int correction_123_1 = (unsigned int)(remainder_122_1 >= sequences);
+                    quotient_121_1 = quotient_121_1 + correction_123_1;
+                    remainder_122_1 = remainder_122_1 - correction_123_1 * sequences;
+                    unsigned int src_124_1 = (quotient_118_1 + (quotient_121_1 * 5 + destination) * sequences) * block_units + remainder_119_1;
+                    unsigned int dst_125_1 = quotient_118_1 * pitch_units + rank * block_units + remainder_119_1;
+                    unsigned int _vec_load_28[4];
+                    {
+                        uint4 _uv4_28 = *reinterpret_cast<const uint4*>(inp_words + (src_124_1 * 4) + 0);
+                        _vec_load_28[0 + 0] = _uv4_28.x;
+                        _vec_load_28[0 + 1] = _uv4_28.y;
+                        _vec_load_28[0 + 2] = _uv4_28.z;
+                        _vec_load_28[0 + 3] = _uv4_28.w;
+                    }
+                    unsigned int unit_126_1 = stripe + (6240 + tid_0);
+                    unsigned int clamped_127_1 = ((unit_126_1 < units) ? unit_126_1 : last_1);
+                    unsigned int quotient_128_1 = (unsigned int)((unsigned long long)clamped_127_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_129_1 = clamped_127_1 - quotient_128_1 * block_units;
+                    unsigned int correction_130_1 = (unsigned int)(remainder_129_1 >= block_units);
+                    quotient_128_1 = quotient_128_1 + correction_130_1;
+                    remainder_129_1 = remainder_129_1 - correction_130_1 * block_units;
+                    unsigned int quotient_131_1 = (unsigned int)((unsigned long long)quotient_128_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_132_1 = quotient_128_1 - quotient_131_1 * sequences;
+                    unsigned int correction_133_1 = (unsigned int)(remainder_132_1 >= sequences);
+                    quotient_131_1 = quotient_131_1 + correction_133_1;
+                    remainder_132_1 = remainder_132_1 - correction_133_1 * sequences;
+                    unsigned int src_134_1 = (quotient_128_1 + (quotient_131_1 * 5 + destination) * sequences) * block_units + remainder_129_1;
+                    unsigned int dst_135_1 = quotient_128_1 * pitch_units + rank * block_units + remainder_129_1;
+                    unsigned int _vec_load_29[4];
+                    {
+                        uint4 _uv4_29 = *reinterpret_cast<const uint4*>(inp_words + (src_134_1 * 4) + 0);
+                        _vec_load_29[0 + 0] = _uv4_29.x;
+                        _vec_load_29[0 + 1] = _uv4_29.y;
+                        _vec_load_29[0 + 2] = _uv4_29.z;
+                        _vec_load_29[0 + 3] = _uv4_29.w;
+                    }
+                    unsigned int unit_136_1 = stripe + (6720 + tid_0);
+                    unsigned int clamped_137_1 = ((unit_136_1 < units) ? unit_136_1 : last_1);
+                    unsigned int quotient_138_1 = (unsigned int)((unsigned long long)clamped_137_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_139_1 = clamped_137_1 - quotient_138_1 * block_units;
+                    unsigned int correction_140_1 = (unsigned int)(remainder_139_1 >= block_units);
+                    quotient_138_1 = quotient_138_1 + correction_140_1;
+                    remainder_139_1 = remainder_139_1 - correction_140_1 * block_units;
+                    unsigned int quotient_141_1 = (unsigned int)((unsigned long long)quotient_138_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_142_1 = quotient_138_1 - quotient_141_1 * sequences;
+                    unsigned int correction_143_1 = (unsigned int)(remainder_142_1 >= sequences);
+                    quotient_141_1 = quotient_141_1 + correction_143_1;
+                    remainder_142_1 = remainder_142_1 - correction_143_1 * sequences;
+                    unsigned int src_144_1 = (quotient_138_1 + (quotient_141_1 * 5 + destination) * sequences) * block_units + remainder_139_1;
+                    unsigned int dst_145_1 = quotient_138_1 * pitch_units + rank * block_units + remainder_139_1;
+                    unsigned int _vec_load_30[4];
+                    {
+                        uint4 _uv4_30 = *reinterpret_cast<const uint4*>(inp_words + (src_144_1 * 4) + 0);
+                        _vec_load_30[0 + 0] = _uv4_30.x;
+                        _vec_load_30[0 + 1] = _uv4_30.y;
+                        _vec_load_30[0 + 2] = _uv4_30.z;
+                        _vec_load_30[0 + 3] = _uv4_30.w;
+                    }
+                    unsigned int unit_146_1 = stripe + (7200 + tid_0);
+                    unsigned int clamped_147_1 = ((unit_146_1 < units) ? unit_146_1 : last_1);
+                    unsigned int quotient_148_1 = (unsigned int)((unsigned long long)clamped_147_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_149_1 = clamped_147_1 - quotient_148_1 * block_units;
+                    unsigned int correction_150_1 = (unsigned int)(remainder_149_1 >= block_units);
+                    quotient_148_1 = quotient_148_1 + correction_150_1;
+                    remainder_149_1 = remainder_149_1 - correction_150_1 * block_units;
+                    unsigned int quotient_151_1 = (unsigned int)((unsigned long long)quotient_148_1 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_152_1 = quotient_148_1 - quotient_151_1 * sequences;
+                    unsigned int correction_153_1 = (unsigned int)(remainder_152_1 >= sequences);
+                    quotient_151_1 = quotient_151_1 + correction_153_1;
+                    remainder_152_1 = remainder_152_1 - correction_153_1 * sequences;
+                    unsigned int src_154_1 = (quotient_148_1 + (quotient_151_1 * 5 + destination) * sequences) * block_units + remainder_149_1;
+                    unsigned int dst_155_1 = quotient_148_1 * pitch_units + rank * block_units + remainder_149_1;
+                    unsigned int _vec_load_31[4];
+                    {
+                        uint4 _uv4_31 = *reinterpret_cast<const uint4*>(inp_words + (src_154_1 * 4) + 0);
+                        _vec_load_31[0 + 0] = _uv4_31.x;
+                        _vec_load_31[0 + 1] = _uv4_31.y;
+                        _vec_load_31[0 + 2] = _uv4_31.z;
+                        _vec_load_31[0 + 3] = _uv4_31.w;
+                    }
+                    if (unit_76_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_85_1 * 4) + (0)), "r"(_vec_load_24[(0) + 0]), "r"(_vec_load_24[(0) + 1]), "r"(_vec_load_24[(0) + 2]), "r"(_vec_load_24[(0) + 3]) : "memory");
+                    }
+                    if (unit_86_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_95_1 * 4) + (0)), "r"(_vec_load_25[(0) + 0]), "r"(_vec_load_25[(0) + 1]), "r"(_vec_load_25[(0) + 2]), "r"(_vec_load_25[(0) + 3]) : "memory");
+                    }
+                    if (unit_96_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_105_1 * 4) + (0)), "r"(_vec_load_26[(0) + 0]), "r"(_vec_load_26[(0) + 1]), "r"(_vec_load_26[(0) + 2]), "r"(_vec_load_26[(0) + 3]) : "memory");
+                    }
+                    if (unit_106_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_115_1 * 4) + (0)), "r"(_vec_load_27[(0) + 0]), "r"(_vec_load_27[(0) + 1]), "r"(_vec_load_27[(0) + 2]), "r"(_vec_load_27[(0) + 3]) : "memory");
+                    }
+                    if (unit_116_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_125_1 * 4) + (0)), "r"(_vec_load_28[(0) + 0]), "r"(_vec_load_28[(0) + 1]), "r"(_vec_load_28[(0) + 2]), "r"(_vec_load_28[(0) + 3]) : "memory");
+                    }
+                    if (unit_126_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_135_1 * 4) + (0)), "r"(_vec_load_29[(0) + 0]), "r"(_vec_load_29[(0) + 1]), "r"(_vec_load_29[(0) + 2]), "r"(_vec_load_29[(0) + 3]) : "memory");
+                    }
+                    if (unit_136_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_145_1 * 4) + (0)), "r"(_vec_load_30[(0) + 0]), "r"(_vec_load_30[(0) + 1]), "r"(_vec_load_30[(0) + 2]), "r"(_vec_load_30[(0) + 3]) : "memory");
+                    }
+                    if (unit_146_1 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_words + (dst_155_1 * 4) + (0)), "r"(_vec_load_31[(0) + 0]), "r"(_vec_load_31[(0) + 1]), "r"(_vec_load_31[(0) + 2]), "r"(_vec_load_31[(0) + 3]) : "memory");
+                    }
+                } else {
+                    unsigned int tail_lo_1 = lo + (out_chunks - 2) * 7680;
+                    unsigned int split_1 = hi - (hi - tail_lo_1 >> 2);
+                    unsigned int clo_1 = lo + k * 7680;
+                    unsigned int chi_1 = clo_1 + 7680;
+                    if (k == out_chunks - 2) {
+                        clo_1 = tail_lo_1;
+                        chi_1 = split_1;
+                    }
+                    if (k == out_chunks - 1) {
+                        clo_1 = split_1;
+                        chi_1 = hi;
+                    }
+                    #pragma unroll 1
+                    for (unsigned int u_1 = clo_1 + tid_0; u_1 < chi_1; u_1 += 480) {
+                        unsigned int quotient_0_3 = (unsigned int)((unsigned long long)u_1 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_1_3 = u_1 - quotient_0_3 * block_units;
+                        unsigned int correction_3 = (unsigned int)(remainder_1_3 >= block_units);
+                        quotient_0_3 = quotient_0_3 + correction_3;
+                        remainder_1_3 = remainder_1_3 - correction_3 * block_units;
+                        unsigned int quotient_3_3 = (unsigned int)((unsigned long long)quotient_0_3 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_4_3 = quotient_0_3 - quotient_3_3 * sequences;
+                        unsigned int correction_5_3 = (unsigned int)(remainder_4_3 >= sequences);
+                        quotient_3_3 = quotient_3_3 + correction_5_3;
+                        remainder_4_3 = remainder_4_3 - correction_5_3 * sequences;
+                        unsigned int src_3 = (quotient_0_3 + (quotient_3_3 * 5 + destination) * sequences) * block_units + remainder_1_3;
+                        unsigned int dst_3 = quotient_0_3 * pitch_units + rank * block_units + remainder_1_3;
+                        peer_elements[dst_3] = inp[src_3];
+                    }
+                }
+            }
+        }
+        if (k >= 1 && out_chunks > k - 1) {
+            if (tid_0 == 0) {
+                {
+                unsigned int _acquire_observed;
+                do {
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (16 + bid_1))) : "memory");
+                } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(k)) >= static_cast<unsigned int>(2147483648u));
+                }
+            }
+        }
+        __syncthreads();
+        if (out_chunks > k) {
+            if (warp == 15) {
+                if (elect_sync()) {
+                    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(progress), "r"(k + 1) : "memory");
+                }
+            }
+        }
+        if (k >= 1 && out_chunks > k - 1) {
+            if (warp_1 < 15) {
+                if (vector != 0) {
+                    unsigned int last_2 = units - 1;
+                    unsigned int stripe_1 = (sub + (k - 1) * parts) * 7680;
+                    unsigned int unit_2 = stripe_1 + tid_0;
+                    unsigned int clamped_2 = ((unit_2 < units) ? unit_2 : last_2);
+                    unsigned int quotient_0_4 = (unsigned int)((unsigned long long)clamped_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_1_4 = clamped_2 - quotient_0_4 * block_units;
+                    unsigned int correction_4 = (unsigned int)(remainder_1_4 >= block_units);
+                    quotient_0_4 = quotient_0_4 + correction_4;
+                    remainder_1_4 = remainder_1_4 - correction_4 * block_units;
+                    unsigned int quotient_3_4 = (unsigned int)((unsigned long long)quotient_0_4 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_4_4 = quotient_0_4 - quotient_3_4 * sequences;
+                    unsigned int correction_5_4 = (unsigned int)(remainder_4_4 >= sequences);
+                    quotient_3_4 = quotient_3_4 + correction_5_4;
+                    remainder_4_4 = remainder_4_4 - correction_5_4 * sequences;
+                    unsigned int src_4 = (quotient_0_4 + (quotient_3_4 * 5 + rank) * sequences) * block_units + remainder_1_4;
+                    unsigned int dst_4 = quotient_0_4 * pitch_units + source * block_units + remainder_1_4;
+                    unsigned int _vec_load_32[4];
+                    {
+                        uint4 _uv4_32 = *reinterpret_cast<const uint4*>(staging_words + (dst_4 * 4) + 0);
+                        _vec_load_32[0 + 0] = _uv4_32.x;
+                        _vec_load_32[0 + 1] = _uv4_32.y;
+                        _vec_load_32[0 + 2] = _uv4_32.z;
+                        _vec_load_32[0 + 3] = _uv4_32.w;
+                    }
+                    unsigned int unit_6_2 = stripe_1 + (480 + tid_0);
+                    unsigned int clamped_7_2 = ((unit_6_2 < units) ? unit_6_2 : last_2);
+                    unsigned int quotient_8_2 = (unsigned int)((unsigned long long)clamped_7_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_9_2 = clamped_7_2 - quotient_8_2 * block_units;
+                    unsigned int correction_10_2 = (unsigned int)(remainder_9_2 >= block_units);
+                    quotient_8_2 = quotient_8_2 + correction_10_2;
+                    remainder_9_2 = remainder_9_2 - correction_10_2 * block_units;
+                    unsigned int quotient_11_2 = (unsigned int)((unsigned long long)quotient_8_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_12_2 = quotient_8_2 - quotient_11_2 * sequences;
+                    unsigned int correction_13_2 = (unsigned int)(remainder_12_2 >= sequences);
+                    quotient_11_2 = quotient_11_2 + correction_13_2;
+                    remainder_12_2 = remainder_12_2 - correction_13_2 * sequences;
+                    unsigned int src_14_2 = (quotient_8_2 + (quotient_11_2 * 5 + rank) * sequences) * block_units + remainder_9_2;
+                    unsigned int dst_15_2 = quotient_8_2 * pitch_units + source * block_units + remainder_9_2;
+                    unsigned int _vec_load_33[4];
+                    {
+                        uint4 _uv4_33 = *reinterpret_cast<const uint4*>(staging_words + (dst_15_2 * 4) + 0);
+                        _vec_load_33[0 + 0] = _uv4_33.x;
+                        _vec_load_33[0 + 1] = _uv4_33.y;
+                        _vec_load_33[0 + 2] = _uv4_33.z;
+                        _vec_load_33[0 + 3] = _uv4_33.w;
+                    }
+                    unsigned int unit_16_2 = stripe_1 + (960 + tid_0);
+                    unsigned int clamped_17_2 = ((unit_16_2 < units) ? unit_16_2 : last_2);
+                    unsigned int quotient_18_2 = (unsigned int)((unsigned long long)clamped_17_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_19_2 = clamped_17_2 - quotient_18_2 * block_units;
+                    unsigned int correction_20_2 = (unsigned int)(remainder_19_2 >= block_units);
+                    quotient_18_2 = quotient_18_2 + correction_20_2;
+                    remainder_19_2 = remainder_19_2 - correction_20_2 * block_units;
+                    unsigned int quotient_21_2 = (unsigned int)((unsigned long long)quotient_18_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_22_2 = quotient_18_2 - quotient_21_2 * sequences;
+                    unsigned int correction_23_2 = (unsigned int)(remainder_22_2 >= sequences);
+                    quotient_21_2 = quotient_21_2 + correction_23_2;
+                    remainder_22_2 = remainder_22_2 - correction_23_2 * sequences;
+                    unsigned int src_24_2 = (quotient_18_2 + (quotient_21_2 * 5 + rank) * sequences) * block_units + remainder_19_2;
+                    unsigned int dst_25_2 = quotient_18_2 * pitch_units + source * block_units + remainder_19_2;
+                    unsigned int _vec_load_34[4];
+                    {
+                        uint4 _uv4_34 = *reinterpret_cast<const uint4*>(staging_words + (dst_25_2 * 4) + 0);
+                        _vec_load_34[0 + 0] = _uv4_34.x;
+                        _vec_load_34[0 + 1] = _uv4_34.y;
+                        _vec_load_34[0 + 2] = _uv4_34.z;
+                        _vec_load_34[0 + 3] = _uv4_34.w;
+                    }
+                    unsigned int unit_26_2 = stripe_1 + (1440 + tid_0);
+                    unsigned int clamped_27_2 = ((unit_26_2 < units) ? unit_26_2 : last_2);
+                    unsigned int quotient_28_2 = (unsigned int)((unsigned long long)clamped_27_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_29_2 = clamped_27_2 - quotient_28_2 * block_units;
+                    unsigned int correction_30_2 = (unsigned int)(remainder_29_2 >= block_units);
+                    quotient_28_2 = quotient_28_2 + correction_30_2;
+                    remainder_29_2 = remainder_29_2 - correction_30_2 * block_units;
+                    unsigned int quotient_31_2 = (unsigned int)((unsigned long long)quotient_28_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_32_2 = quotient_28_2 - quotient_31_2 * sequences;
+                    unsigned int correction_33_2 = (unsigned int)(remainder_32_2 >= sequences);
+                    quotient_31_2 = quotient_31_2 + correction_33_2;
+                    remainder_32_2 = remainder_32_2 - correction_33_2 * sequences;
+                    unsigned int src_34_2 = (quotient_28_2 + (quotient_31_2 * 5 + rank) * sequences) * block_units + remainder_29_2;
+                    unsigned int dst_35_2 = quotient_28_2 * pitch_units + source * block_units + remainder_29_2;
+                    unsigned int _vec_load_35[4];
+                    {
+                        uint4 _uv4_35 = *reinterpret_cast<const uint4*>(staging_words + (dst_35_2 * 4) + 0);
+                        _vec_load_35[0 + 0] = _uv4_35.x;
+                        _vec_load_35[0 + 1] = _uv4_35.y;
+                        _vec_load_35[0 + 2] = _uv4_35.z;
+                        _vec_load_35[0 + 3] = _uv4_35.w;
+                    }
+                    unsigned int unit_36_2 = stripe_1 + (1920 + tid_0);
+                    unsigned int clamped_37_2 = ((unit_36_2 < units) ? unit_36_2 : last_2);
+                    unsigned int quotient_38_2 = (unsigned int)((unsigned long long)clamped_37_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_39_2 = clamped_37_2 - quotient_38_2 * block_units;
+                    unsigned int correction_40_2 = (unsigned int)(remainder_39_2 >= block_units);
+                    quotient_38_2 = quotient_38_2 + correction_40_2;
+                    remainder_39_2 = remainder_39_2 - correction_40_2 * block_units;
+                    unsigned int quotient_41_2 = (unsigned int)((unsigned long long)quotient_38_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_42_2 = quotient_38_2 - quotient_41_2 * sequences;
+                    unsigned int correction_43_2 = (unsigned int)(remainder_42_2 >= sequences);
+                    quotient_41_2 = quotient_41_2 + correction_43_2;
+                    remainder_42_2 = remainder_42_2 - correction_43_2 * sequences;
+                    unsigned int src_44_2 = (quotient_38_2 + (quotient_41_2 * 5 + rank) * sequences) * block_units + remainder_39_2;
+                    unsigned int dst_45_2 = quotient_38_2 * pitch_units + source * block_units + remainder_39_2;
+                    unsigned int _vec_load_36[4];
+                    {
+                        uint4 _uv4_36 = *reinterpret_cast<const uint4*>(staging_words + (dst_45_2 * 4) + 0);
+                        _vec_load_36[0 + 0] = _uv4_36.x;
+                        _vec_load_36[0 + 1] = _uv4_36.y;
+                        _vec_load_36[0 + 2] = _uv4_36.z;
+                        _vec_load_36[0 + 3] = _uv4_36.w;
+                    }
+                    unsigned int unit_46_2 = stripe_1 + (2400 + tid_0);
+                    unsigned int clamped_47_2 = ((unit_46_2 < units) ? unit_46_2 : last_2);
+                    unsigned int quotient_48_2 = (unsigned int)((unsigned long long)clamped_47_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_49_2 = clamped_47_2 - quotient_48_2 * block_units;
+                    unsigned int correction_50_2 = (unsigned int)(remainder_49_2 >= block_units);
+                    quotient_48_2 = quotient_48_2 + correction_50_2;
+                    remainder_49_2 = remainder_49_2 - correction_50_2 * block_units;
+                    unsigned int quotient_51_2 = (unsigned int)((unsigned long long)quotient_48_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_52_2 = quotient_48_2 - quotient_51_2 * sequences;
+                    unsigned int correction_53_2 = (unsigned int)(remainder_52_2 >= sequences);
+                    quotient_51_2 = quotient_51_2 + correction_53_2;
+                    remainder_52_2 = remainder_52_2 - correction_53_2 * sequences;
+                    unsigned int src_54_2 = (quotient_48_2 + (quotient_51_2 * 5 + rank) * sequences) * block_units + remainder_49_2;
+                    unsigned int dst_55_2 = quotient_48_2 * pitch_units + source * block_units + remainder_49_2;
+                    unsigned int _vec_load_37[4];
+                    {
+                        uint4 _uv4_37 = *reinterpret_cast<const uint4*>(staging_words + (dst_55_2 * 4) + 0);
+                        _vec_load_37[0 + 0] = _uv4_37.x;
+                        _vec_load_37[0 + 1] = _uv4_37.y;
+                        _vec_load_37[0 + 2] = _uv4_37.z;
+                        _vec_load_37[0 + 3] = _uv4_37.w;
+                    }
+                    unsigned int unit_56_2 = stripe_1 + (2880 + tid_0);
+                    unsigned int clamped_57_2 = ((unit_56_2 < units) ? unit_56_2 : last_2);
+                    unsigned int quotient_58_2 = (unsigned int)((unsigned long long)clamped_57_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_59_2 = clamped_57_2 - quotient_58_2 * block_units;
+                    unsigned int correction_60_2 = (unsigned int)(remainder_59_2 >= block_units);
+                    quotient_58_2 = quotient_58_2 + correction_60_2;
+                    remainder_59_2 = remainder_59_2 - correction_60_2 * block_units;
+                    unsigned int quotient_61_2 = (unsigned int)((unsigned long long)quotient_58_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_62_2 = quotient_58_2 - quotient_61_2 * sequences;
+                    unsigned int correction_63_2 = (unsigned int)(remainder_62_2 >= sequences);
+                    quotient_61_2 = quotient_61_2 + correction_63_2;
+                    remainder_62_2 = remainder_62_2 - correction_63_2 * sequences;
+                    unsigned int src_64_2 = (quotient_58_2 + (quotient_61_2 * 5 + rank) * sequences) * block_units + remainder_59_2;
+                    unsigned int dst_65_2 = quotient_58_2 * pitch_units + source * block_units + remainder_59_2;
+                    unsigned int _vec_load_38[4];
+                    {
+                        uint4 _uv4_38 = *reinterpret_cast<const uint4*>(staging_words + (dst_65_2 * 4) + 0);
+                        _vec_load_38[0 + 0] = _uv4_38.x;
+                        _vec_load_38[0 + 1] = _uv4_38.y;
+                        _vec_load_38[0 + 2] = _uv4_38.z;
+                        _vec_load_38[0 + 3] = _uv4_38.w;
+                    }
+                    unsigned int unit_66_2 = stripe_1 + (3360 + tid_0);
+                    unsigned int clamped_67_2 = ((unit_66_2 < units) ? unit_66_2 : last_2);
+                    unsigned int quotient_68_2 = (unsigned int)((unsigned long long)clamped_67_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_69_2 = clamped_67_2 - quotient_68_2 * block_units;
+                    unsigned int correction_70_2 = (unsigned int)(remainder_69_2 >= block_units);
+                    quotient_68_2 = quotient_68_2 + correction_70_2;
+                    remainder_69_2 = remainder_69_2 - correction_70_2 * block_units;
+                    unsigned int quotient_71_2 = (unsigned int)((unsigned long long)quotient_68_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_72_2 = quotient_68_2 - quotient_71_2 * sequences;
+                    unsigned int correction_73_2 = (unsigned int)(remainder_72_2 >= sequences);
+                    quotient_71_2 = quotient_71_2 + correction_73_2;
+                    remainder_72_2 = remainder_72_2 - correction_73_2 * sequences;
+                    unsigned int src_74_2 = (quotient_68_2 + (quotient_71_2 * 5 + rank) * sequences) * block_units + remainder_69_2;
+                    unsigned int dst_75_2 = quotient_68_2 * pitch_units + source * block_units + remainder_69_2;
+                    unsigned int _vec_load_39[4];
+                    {
+                        uint4 _uv4_39 = *reinterpret_cast<const uint4*>(staging_words + (dst_75_2 * 4) + 0);
+                        _vec_load_39[0 + 0] = _uv4_39.x;
+                        _vec_load_39[0 + 1] = _uv4_39.y;
+                        _vec_load_39[0 + 2] = _uv4_39.z;
+                        _vec_load_39[0 + 3] = _uv4_39.w;
+                    }
+                    if (unit_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_4 * 4) + (0)), "r"(_vec_load_32[(0) + 0]), "r"(_vec_load_32[(0) + 1]), "r"(_vec_load_32[(0) + 2]), "r"(_vec_load_32[(0) + 3]) : "memory");
+                    }
+                    if (unit_6_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_15_2 * 4) + (0)), "r"(_vec_load_33[(0) + 0]), "r"(_vec_load_33[(0) + 1]), "r"(_vec_load_33[(0) + 2]), "r"(_vec_load_33[(0) + 3]) : "memory");
+                    }
+                    if (unit_16_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_25_2 * 4) + (0)), "r"(_vec_load_34[(0) + 0]), "r"(_vec_load_34[(0) + 1]), "r"(_vec_load_34[(0) + 2]), "r"(_vec_load_34[(0) + 3]) : "memory");
+                    }
+                    if (unit_26_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_35_2 * 4) + (0)), "r"(_vec_load_35[(0) + 0]), "r"(_vec_load_35[(0) + 1]), "r"(_vec_load_35[(0) + 2]), "r"(_vec_load_35[(0) + 3]) : "memory");
+                    }
+                    unsigned int unit_76_2 = stripe_1 + (3840 + tid_0);
+                    unsigned int clamped_77_2 = ((unit_76_2 < units) ? unit_76_2 : last_2);
+                    unsigned int quotient_78_2 = (unsigned int)((unsigned long long)clamped_77_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_79_2 = clamped_77_2 - quotient_78_2 * block_units;
+                    unsigned int correction_80_2 = (unsigned int)(remainder_79_2 >= block_units);
+                    quotient_78_2 = quotient_78_2 + correction_80_2;
+                    remainder_79_2 = remainder_79_2 - correction_80_2 * block_units;
+                    unsigned int quotient_81_2 = (unsigned int)((unsigned long long)quotient_78_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_82_2 = quotient_78_2 - quotient_81_2 * sequences;
+                    unsigned int correction_83_2 = (unsigned int)(remainder_82_2 >= sequences);
+                    quotient_81_2 = quotient_81_2 + correction_83_2;
+                    remainder_82_2 = remainder_82_2 - correction_83_2 * sequences;
+                    unsigned int src_84_2 = (quotient_78_2 + (quotient_81_2 * 5 + rank) * sequences) * block_units + remainder_79_2;
+                    unsigned int dst_85_2 = quotient_78_2 * pitch_units + source * block_units + remainder_79_2;
+                    unsigned int _vec_load_40[4];
+                    {
+                        uint4 _uv4_40 = *reinterpret_cast<const uint4*>(staging_words + (dst_85_2 * 4) + 0);
+                        _vec_load_40[0 + 0] = _uv4_40.x;
+                        _vec_load_40[0 + 1] = _uv4_40.y;
+                        _vec_load_40[0 + 2] = _uv4_40.z;
+                        _vec_load_40[0 + 3] = _uv4_40.w;
+                    }
+                    unsigned int unit_86_2 = stripe_1 + (4320 + tid_0);
+                    unsigned int clamped_87_2 = ((unit_86_2 < units) ? unit_86_2 : last_2);
+                    unsigned int quotient_88_2 = (unsigned int)((unsigned long long)clamped_87_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_89_2 = clamped_87_2 - quotient_88_2 * block_units;
+                    unsigned int correction_90_2 = (unsigned int)(remainder_89_2 >= block_units);
+                    quotient_88_2 = quotient_88_2 + correction_90_2;
+                    remainder_89_2 = remainder_89_2 - correction_90_2 * block_units;
+                    unsigned int quotient_91_2 = (unsigned int)((unsigned long long)quotient_88_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_92_2 = quotient_88_2 - quotient_91_2 * sequences;
+                    unsigned int correction_93_2 = (unsigned int)(remainder_92_2 >= sequences);
+                    quotient_91_2 = quotient_91_2 + correction_93_2;
+                    remainder_92_2 = remainder_92_2 - correction_93_2 * sequences;
+                    unsigned int src_94_2 = (quotient_88_2 + (quotient_91_2 * 5 + rank) * sequences) * block_units + remainder_89_2;
+                    unsigned int dst_95_2 = quotient_88_2 * pitch_units + source * block_units + remainder_89_2;
+                    unsigned int _vec_load_41[4];
+                    {
+                        uint4 _uv4_41 = *reinterpret_cast<const uint4*>(staging_words + (dst_95_2 * 4) + 0);
+                        _vec_load_41[0 + 0] = _uv4_41.x;
+                        _vec_load_41[0 + 1] = _uv4_41.y;
+                        _vec_load_41[0 + 2] = _uv4_41.z;
+                        _vec_load_41[0 + 3] = _uv4_41.w;
+                    }
+                    unsigned int unit_96_2 = stripe_1 + (4800 + tid_0);
+                    unsigned int clamped_97_2 = ((unit_96_2 < units) ? unit_96_2 : last_2);
+                    unsigned int quotient_98_2 = (unsigned int)((unsigned long long)clamped_97_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_99_2 = clamped_97_2 - quotient_98_2 * block_units;
+                    unsigned int correction_100_2 = (unsigned int)(remainder_99_2 >= block_units);
+                    quotient_98_2 = quotient_98_2 + correction_100_2;
+                    remainder_99_2 = remainder_99_2 - correction_100_2 * block_units;
+                    unsigned int quotient_101_2 = (unsigned int)((unsigned long long)quotient_98_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_102_2 = quotient_98_2 - quotient_101_2 * sequences;
+                    unsigned int correction_103_2 = (unsigned int)(remainder_102_2 >= sequences);
+                    quotient_101_2 = quotient_101_2 + correction_103_2;
+                    remainder_102_2 = remainder_102_2 - correction_103_2 * sequences;
+                    unsigned int src_104_2 = (quotient_98_2 + (quotient_101_2 * 5 + rank) * sequences) * block_units + remainder_99_2;
+                    unsigned int dst_105_2 = quotient_98_2 * pitch_units + source * block_units + remainder_99_2;
+                    unsigned int _vec_load_42[4];
+                    {
+                        uint4 _uv4_42 = *reinterpret_cast<const uint4*>(staging_words + (dst_105_2 * 4) + 0);
+                        _vec_load_42[0 + 0] = _uv4_42.x;
+                        _vec_load_42[0 + 1] = _uv4_42.y;
+                        _vec_load_42[0 + 2] = _uv4_42.z;
+                        _vec_load_42[0 + 3] = _uv4_42.w;
+                    }
+                    unsigned int unit_106_2 = stripe_1 + (5280 + tid_0);
+                    unsigned int clamped_107_2 = ((unit_106_2 < units) ? unit_106_2 : last_2);
+                    unsigned int quotient_108_2 = (unsigned int)((unsigned long long)clamped_107_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_109_2 = clamped_107_2 - quotient_108_2 * block_units;
+                    unsigned int correction_110_2 = (unsigned int)(remainder_109_2 >= block_units);
+                    quotient_108_2 = quotient_108_2 + correction_110_2;
+                    remainder_109_2 = remainder_109_2 - correction_110_2 * block_units;
+                    unsigned int quotient_111_2 = (unsigned int)((unsigned long long)quotient_108_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_112_2 = quotient_108_2 - quotient_111_2 * sequences;
+                    unsigned int correction_113_2 = (unsigned int)(remainder_112_2 >= sequences);
+                    quotient_111_2 = quotient_111_2 + correction_113_2;
+                    remainder_112_2 = remainder_112_2 - correction_113_2 * sequences;
+                    unsigned int src_114_2 = (quotient_108_2 + (quotient_111_2 * 5 + rank) * sequences) * block_units + remainder_109_2;
+                    unsigned int dst_115_2 = quotient_108_2 * pitch_units + source * block_units + remainder_109_2;
+                    unsigned int _vec_load_43[4];
+                    {
+                        uint4 _uv4_43 = *reinterpret_cast<const uint4*>(staging_words + (dst_115_2 * 4) + 0);
+                        _vec_load_43[0 + 0] = _uv4_43.x;
+                        _vec_load_43[0 + 1] = _uv4_43.y;
+                        _vec_load_43[0 + 2] = _uv4_43.z;
+                        _vec_load_43[0 + 3] = _uv4_43.w;
+                    }
+                    if (unit_36_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_45_2 * 4) + (0)), "r"(_vec_load_36[(0) + 0]), "r"(_vec_load_36[(0) + 1]), "r"(_vec_load_36[(0) + 2]), "r"(_vec_load_36[(0) + 3]) : "memory");
+                    }
+                    if (unit_46_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_55_2 * 4) + (0)), "r"(_vec_load_37[(0) + 0]), "r"(_vec_load_37[(0) + 1]), "r"(_vec_load_37[(0) + 2]), "r"(_vec_load_37[(0) + 3]) : "memory");
+                    }
+                    if (unit_56_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_65_2 * 4) + (0)), "r"(_vec_load_38[(0) + 0]), "r"(_vec_load_38[(0) + 1]), "r"(_vec_load_38[(0) + 2]), "r"(_vec_load_38[(0) + 3]) : "memory");
+                    }
+                    if (unit_66_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_75_2 * 4) + (0)), "r"(_vec_load_39[(0) + 0]), "r"(_vec_load_39[(0) + 1]), "r"(_vec_load_39[(0) + 2]), "r"(_vec_load_39[(0) + 3]) : "memory");
+                    }
+                    unsigned int unit_116_2 = stripe_1 + (5760 + tid_0);
+                    unsigned int clamped_117_2 = ((unit_116_2 < units) ? unit_116_2 : last_2);
+                    unsigned int quotient_118_2 = (unsigned int)((unsigned long long)clamped_117_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_119_2 = clamped_117_2 - quotient_118_2 * block_units;
+                    unsigned int correction_120_2 = (unsigned int)(remainder_119_2 >= block_units);
+                    quotient_118_2 = quotient_118_2 + correction_120_2;
+                    remainder_119_2 = remainder_119_2 - correction_120_2 * block_units;
+                    unsigned int quotient_121_2 = (unsigned int)((unsigned long long)quotient_118_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_122_2 = quotient_118_2 - quotient_121_2 * sequences;
+                    unsigned int correction_123_2 = (unsigned int)(remainder_122_2 >= sequences);
+                    quotient_121_2 = quotient_121_2 + correction_123_2;
+                    remainder_122_2 = remainder_122_2 - correction_123_2 * sequences;
+                    unsigned int src_124_2 = (quotient_118_2 + (quotient_121_2 * 5 + rank) * sequences) * block_units + remainder_119_2;
+                    unsigned int dst_125_2 = quotient_118_2 * pitch_units + source * block_units + remainder_119_2;
+                    unsigned int _vec_load_44[4];
+                    {
+                        uint4 _uv4_44 = *reinterpret_cast<const uint4*>(staging_words + (dst_125_2 * 4) + 0);
+                        _vec_load_44[0 + 0] = _uv4_44.x;
+                        _vec_load_44[0 + 1] = _uv4_44.y;
+                        _vec_load_44[0 + 2] = _uv4_44.z;
+                        _vec_load_44[0 + 3] = _uv4_44.w;
+                    }
+                    unsigned int unit_126_2 = stripe_1 + (6240 + tid_0);
+                    unsigned int clamped_127_2 = ((unit_126_2 < units) ? unit_126_2 : last_2);
+                    unsigned int quotient_128_2 = (unsigned int)((unsigned long long)clamped_127_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_129_2 = clamped_127_2 - quotient_128_2 * block_units;
+                    unsigned int correction_130_2 = (unsigned int)(remainder_129_2 >= block_units);
+                    quotient_128_2 = quotient_128_2 + correction_130_2;
+                    remainder_129_2 = remainder_129_2 - correction_130_2 * block_units;
+                    unsigned int quotient_131_2 = (unsigned int)((unsigned long long)quotient_128_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_132_2 = quotient_128_2 - quotient_131_2 * sequences;
+                    unsigned int correction_133_2 = (unsigned int)(remainder_132_2 >= sequences);
+                    quotient_131_2 = quotient_131_2 + correction_133_2;
+                    remainder_132_2 = remainder_132_2 - correction_133_2 * sequences;
+                    unsigned int src_134_2 = (quotient_128_2 + (quotient_131_2 * 5 + rank) * sequences) * block_units + remainder_129_2;
+                    unsigned int dst_135_2 = quotient_128_2 * pitch_units + source * block_units + remainder_129_2;
+                    unsigned int _vec_load_45[4];
+                    {
+                        uint4 _uv4_45 = *reinterpret_cast<const uint4*>(staging_words + (dst_135_2 * 4) + 0);
+                        _vec_load_45[0 + 0] = _uv4_45.x;
+                        _vec_load_45[0 + 1] = _uv4_45.y;
+                        _vec_load_45[0 + 2] = _uv4_45.z;
+                        _vec_load_45[0 + 3] = _uv4_45.w;
+                    }
+                    unsigned int unit_136_2 = stripe_1 + (6720 + tid_0);
+                    unsigned int clamped_137_2 = ((unit_136_2 < units) ? unit_136_2 : last_2);
+                    unsigned int quotient_138_2 = (unsigned int)((unsigned long long)clamped_137_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_139_2 = clamped_137_2 - quotient_138_2 * block_units;
+                    unsigned int correction_140_2 = (unsigned int)(remainder_139_2 >= block_units);
+                    quotient_138_2 = quotient_138_2 + correction_140_2;
+                    remainder_139_2 = remainder_139_2 - correction_140_2 * block_units;
+                    unsigned int quotient_141_2 = (unsigned int)((unsigned long long)quotient_138_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_142_2 = quotient_138_2 - quotient_141_2 * sequences;
+                    unsigned int correction_143_2 = (unsigned int)(remainder_142_2 >= sequences);
+                    quotient_141_2 = quotient_141_2 + correction_143_2;
+                    remainder_142_2 = remainder_142_2 - correction_143_2 * sequences;
+                    unsigned int src_144_2 = (quotient_138_2 + (quotient_141_2 * 5 + rank) * sequences) * block_units + remainder_139_2;
+                    unsigned int dst_145_2 = quotient_138_2 * pitch_units + source * block_units + remainder_139_2;
+                    unsigned int _vec_load_46[4];
+                    {
+                        uint4 _uv4_46 = *reinterpret_cast<const uint4*>(staging_words + (dst_145_2 * 4) + 0);
+                        _vec_load_46[0 + 0] = _uv4_46.x;
+                        _vec_load_46[0 + 1] = _uv4_46.y;
+                        _vec_load_46[0 + 2] = _uv4_46.z;
+                        _vec_load_46[0 + 3] = _uv4_46.w;
+                    }
+                    unsigned int unit_146_2 = stripe_1 + (7200 + tid_0);
+                    unsigned int clamped_147_2 = ((unit_146_2 < units) ? unit_146_2 : last_2);
+                    unsigned int quotient_148_2 = (unsigned int)((unsigned long long)clamped_147_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_149_2 = clamped_147_2 - quotient_148_2 * block_units;
+                    unsigned int correction_150_2 = (unsigned int)(remainder_149_2 >= block_units);
+                    quotient_148_2 = quotient_148_2 + correction_150_2;
+                    remainder_149_2 = remainder_149_2 - correction_150_2 * block_units;
+                    unsigned int quotient_151_2 = (unsigned int)((unsigned long long)quotient_148_2 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int remainder_152_2 = quotient_148_2 - quotient_151_2 * sequences;
+                    unsigned int correction_153_2 = (unsigned int)(remainder_152_2 >= sequences);
+                    quotient_151_2 = quotient_151_2 + correction_153_2;
+                    remainder_152_2 = remainder_152_2 - correction_153_2 * sequences;
+                    unsigned int src_154_2 = (quotient_148_2 + (quotient_151_2 * 5 + rank) * sequences) * block_units + remainder_149_2;
+                    unsigned int dst_155_2 = quotient_148_2 * pitch_units + source * block_units + remainder_149_2;
+                    unsigned int _vec_load_47[4];
+                    {
+                        uint4 _uv4_47 = *reinterpret_cast<const uint4*>(staging_words + (dst_155_2 * 4) + 0);
+                        _vec_load_47[0 + 0] = _uv4_47.x;
+                        _vec_load_47[0 + 1] = _uv4_47.y;
+                        _vec_load_47[0 + 2] = _uv4_47.z;
+                        _vec_load_47[0 + 3] = _uv4_47.w;
+                    }
+                    if (unit_76_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_85_2 * 4) + (0)), "r"(_vec_load_40[(0) + 0]), "r"(_vec_load_40[(0) + 1]), "r"(_vec_load_40[(0) + 2]), "r"(_vec_load_40[(0) + 3]) : "memory");
+                    }
+                    if (unit_86_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_95_2 * 4) + (0)), "r"(_vec_load_41[(0) + 0]), "r"(_vec_load_41[(0) + 1]), "r"(_vec_load_41[(0) + 2]), "r"(_vec_load_41[(0) + 3]) : "memory");
+                    }
+                    if (unit_96_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_105_2 * 4) + (0)), "r"(_vec_load_42[(0) + 0]), "r"(_vec_load_42[(0) + 1]), "r"(_vec_load_42[(0) + 2]), "r"(_vec_load_42[(0) + 3]) : "memory");
+                    }
+                    if (unit_106_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_115_2 * 4) + (0)), "r"(_vec_load_43[(0) + 0]), "r"(_vec_load_43[(0) + 1]), "r"(_vec_load_43[(0) + 2]), "r"(_vec_load_43[(0) + 3]) : "memory");
+                    }
+                    if (unit_116_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_125_2 * 4) + (0)), "r"(_vec_load_44[(0) + 0]), "r"(_vec_load_44[(0) + 1]), "r"(_vec_load_44[(0) + 2]), "r"(_vec_load_44[(0) + 3]) : "memory");
+                    }
+                    if (unit_126_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_135_2 * 4) + (0)), "r"(_vec_load_45[(0) + 0]), "r"(_vec_load_45[(0) + 1]), "r"(_vec_load_45[(0) + 2]), "r"(_vec_load_45[(0) + 3]) : "memory");
+                    }
+                    if (unit_136_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_145_2 * 4) + (0)), "r"(_vec_load_46[(0) + 0]), "r"(_vec_load_46[(0) + 1]), "r"(_vec_load_46[(0) + 2]), "r"(_vec_load_46[(0) + 3]) : "memory");
+                    }
+                    if (unit_146_2 < units) {
+                        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(out_words + (dst_155_2 * 4) + (0)), "r"(_vec_load_47[(0) + 0]), "r"(_vec_load_47[(0) + 1]), "r"(_vec_load_47[(0) + 2]), "r"(_vec_load_47[(0) + 3]) : "memory");
+                    }
+                } else {
+                    unsigned int tail_lo_2 = lo + (out_chunks - 2) * 7680;
+                    unsigned int split_2 = hi - (hi - tail_lo_2 >> 2);
+                    unsigned int clo_2 = lo + (k - 1) * 7680;
+                    unsigned int chi_2 = clo_2 + 7680;
+                    if (k - 1 == out_chunks - 2) {
+                        clo_2 = tail_lo_2;
+                        chi_2 = split_2;
+                    }
+                    if (k - 1 == out_chunks - 1) {
+                        clo_2 = split_2;
+                        chi_2 = hi;
+                    }
+                    #pragma unroll 1
+                    for (unsigned int u_2 = clo_2 + tid_0; u_2 < chi_2; u_2 += 480) {
+                        unsigned int quotient_0_5 = (unsigned int)((unsigned long long)u_2 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_1_5 = u_2 - quotient_0_5 * block_units;
+                        unsigned int correction_6 = (unsigned int)(remainder_1_5 >= block_units);
+                        quotient_0_5 = quotient_0_5 + correction_6;
+                        remainder_1_5 = remainder_1_5 - correction_6 * block_units;
+                        unsigned int quotient_3_5 = (unsigned int)((unsigned long long)quotient_0_5 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int remainder_4_5 = quotient_0_5 - quotient_3_5 * sequences;
+                        unsigned int correction_5_5 = (unsigned int)(remainder_4_5 >= sequences);
+                        quotient_3_5 = quotient_3_5 + correction_5_5;
+                        remainder_4_5 = remainder_4_5 - correction_5_5 * sequences;
+                        unsigned int src_5 = (quotient_0_5 + (quotient_3_5 * 5 + rank) * sequences) * block_units + remainder_1_5;
+                        unsigned int dst_5 = quotient_0_5 * pitch_units + source * block_units + remainder_1_5;
+                        out[dst_5] = staging_elements[dst_5];
+                    }
+                }
+            }
+        }
+    }
+    if (tid_0 == 0) {
+        if (out_chunks > 0) {
+            asm volatile("st.relaxed.gpu.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(signals_self) + (16 + bid_1))), "r"(static_cast<unsigned int>(0)) : "memory");
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        if (elect_sync()) {
+            uint32_t _atomic_inc_old_0;
+            asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                : "=r"(_atomic_inc_old_0) : "l"(&signals_self[1]), "r"(static_cast<uint32_t>(147)) : "memory");
+            if (_atomic_inc_old_0 == 147) {
+                asm volatile("st.relaxed.gpu.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(signals_self) + (0))), "r"(static_cast<unsigned int>(epoch)) : "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+

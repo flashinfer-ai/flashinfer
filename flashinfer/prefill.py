@@ -297,6 +297,7 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_token_head_sf: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
 ):
@@ -320,6 +321,7 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        use_token_head_sf,
         paged_kv_stride_mode=paged_kv_stride_mode,
         module_surface=module_surface,
     ).build_and_load()
@@ -404,8 +406,11 @@ def get_trtllm_gen_prefill_module():
             0,  # o_sf_start_index
             batch_size,
             window_left,
+            0 if (is_causal and window_left >= 0) else -1,
             cum_seq_lens_q,
             cum_seq_lens_kv,
+            None,
+            None,
             sm_count,
             enable_pdl,
             workspace_size,
@@ -1421,12 +1426,21 @@ def single_prefill_with_kv_cache(
     return_lse : bool
         Whether to return the log sum exp value of the attention logits.
     kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]]
-        Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
-        When provided, ``k`` and ``v`` are expected to be packed uint8 FP4 tensors with last
-        dimension ``head_dim // 2``, and the scale factors dequantize them before attention.
-        Both ``k_scales`` and ``v_scales`` use a linear (row-major) layout, and both have dtype ``torch.float8_e4m3fn``.
+        Scale factors for a quantized KV cache, as a tuple of ``(k_scales, v_scales)``.
 
-        Currently, NVFP4 KV only supports `fa2` backend.
+        * **NVFP4 KV**: ``k``/``v`` are packed uint8 FP4 tensors with last dimension
+          ``head_dim // 2``; the scale factors dequantize them before attention. Both
+          ``k_scales`` and ``v_scales`` use a linear (row-major) layout with dtype
+          ``torch.float8_e4m3fn``.
+        * **FP8 per-(token, head) scale**: ``k``/``v`` are FP8 (``e4m3``/``e5m2``) tensors
+          with the standard layout (last dim ``head_dim``), and the scale is a separate
+          float32 tensor mirroring the KV layout minus head_dim: NHD
+          ``[kv_len, num_kv_heads]`` / HND ``[num_kv_heads, kv_len]``. The scale strides
+          must mirror the KV strides divided by head_dim (the kernel derives the scale
+          strides from the KV strides, as the NVFP4 path does); inline-slot views are
+          supported by the paged path only.
+
+        Both quantized-KV paths only support the ``fa2`` backend.
     k_scale : Optional[Union[float, torch.Tensor]]
         The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
     v_scale : Optional[Union[float, torch.Tensor]]
@@ -1482,6 +1496,85 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    # FP8 per-(token, head) scale: derived from the KV dtype (float8, not NVFP4's uint8)
+    # plus a scale-factor tensor, mirroring the NVFP4 `is_nvfp4_kvcache` derivation. The
+    # scale is a separate float32 tensor whose layout mirrors the KV layout minus
+    # head_dim (scale stride = KV stride / head_dim; the kernel derives the scale strides
+    # from the KV strides, as the NVFP4 path does). Inline-slot views are supported by the
+    # paged path only.
+    is_fp8_token_head_sf = is_float8(k) and kv_cache_sf is not None
+    if is_fp8_token_head_sf:
+        if v.dtype != k.dtype:
+            raise ValueError("k and v must have the same dtype")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"FP8 token-head scale requires an fp16/bf16 query, got {q.dtype}"
+            )
+        if get_compute_capability(q.device)[0] < 8:
+            if q.dtype != torch.float16:
+                raise ValueError(
+                    "bf16 query is not supported with FP8 token-head scale on this "
+                    "architecture (only fp16 is supported on SM75)"
+                )
+        if q.shape[-1] % 16 != 0:
+            raise ValueError(
+                "FP8 token-head scale requires the query head_dim to be a multiple of 16, "
+                f"got {q.shape[-1]}"
+            )
+        # Standard KV layout: K head_dim == Q head_dim, V head_dim a multiple of 16.
+        if k.shape[-1] != q.shape[-1]:
+            raise ValueError(
+                "FP8 token-head scale expects the K head_dim to equal the query head_dim "
+                f"(got K head_dim {k.shape[-1]}, query head_dim {q.shape[-1]})"
+            )
+        if v.shape[-1] % 16 != 0:
+            raise ValueError(
+                "FP8 token-head scale expects the V head_dim to be a multiple of 16 "
+                f"(got V head_dim {v.shape[-1]})"
+            )
+        # The scale mirrors the KV layout minus head_dim: NHD [kv_len, num_kv_heads] /
+        # HND [num_kv_heads, kv_len]. Its strides must mirror the KV strides divided by
+        # head_dim (the kernel derives the scale strides from the KV strides, the same
+        # contract as the NVFP4 SF); a non-contiguous scale is accepted only when it
+        # mirrors the KV layout.
+        k_sf_arg, v_sf_arg = kv_cache_sf
+        kv_len = k.shape[0] if kv_layout == "NHD" else k.shape[1]
+        num_kv_heads = k.shape[1] if kv_layout == "NHD" else k.shape[0]
+        expected_sf_shape = (
+            (kv_len, num_kv_heads) if kv_layout == "NHD" else (num_kv_heads, kv_len)
+        )
+        for name, kv, sf in (("k_sf", k, k_sf_arg), ("v_sf", v, v_sf_arg)):
+            if sf is None:
+                raise ValueError(f"FP8 token-head scale requires {name} to be provided")
+            if sf.dtype != torch.float32:
+                raise ValueError(
+                    f"FP8 token-head scale requires {name} to be float32, got {sf.dtype}"
+                )
+            if sf.shape != expected_sf_shape:
+                raise ValueError(
+                    f"FP8 token-head scale expects {name} shape {expected_sf_shape} "
+                    f"for kv_layout={kv_layout!r}, got {tuple(sf.shape)}"
+                )
+            head_dim = kv.shape[-1]
+            for i in range(sf.ndim):
+                if not (
+                    kv.stride(i) % head_dim == 0
+                    and sf.stride(i) == kv.stride(i) // head_dim
+                ):
+                    raise ValueError(
+                        f"FP8 token-head scale: {name} layout must mirror the KV layout "
+                        f"(scale stride = KV stride / head_dim, as the NVFP4 path "
+                        f"requires); got {name} stride {sf.stride(i)} at dim {i}, "
+                        f"expected {kv.stride(i) // head_dim} from KV stride {kv.stride(i)}"
+                    )
+        # The token-head-scale path is only implemented in the FA2 kernels.
+        if backend == "auto":
+            backend = "fa2"
+        elif backend != "fa2":
+            raise ValueError(
+                "FP8 token-head scale is only supported with backend='fa2', "
+                f"got backend={backend!r}"
+            )
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1570,6 +1663,7 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        is_fp8_token_head_sf,
     )
 
     module.run(
@@ -2937,10 +3031,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
             self._jit_additional_scalar_names = list(jit_args[9])
+            self._jit_use_token_head_sf = bool(
+                jit_kwargs.get("use_token_head_sf", False)
+            )
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
             self._jit_additional_scalar_names = []
+            self._jit_use_token_head_sf = False
 
         if variant_owns_mask and self._jit_module is None:
             raise ValueError(
@@ -3009,6 +3107,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = max_total_num_rows
+        # `auto` is re-resolved on every plan() (its answer depends on plan
+        # arguments such as window_left); _backend holds the resolved value.
         self._requested_backend = backend
         self._backend = backend
         self._plan_info = None
@@ -3392,6 +3492,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
+        use_token_head_sf: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -3448,6 +3549,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+            For the ``trtllm-gen`` backend, an unsupported non-causal sliding window is rejected
+            during :meth:`plan` (rather than being deferred until :meth:`run`).
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -3513,6 +3616,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             the ragged worst case ``total_num_rows - batch_size + 1``. The hint is checked
             against ``qo_indptr`` on the host and dropped, with one warning, when the batch
             is not uniform. Defaults to ``None`` (no hint).
+        use_token_head_sf : bool
+            Whether the KV cache uses the per-(token, head) FP8 scale layout: the KV
+            cache is an FP8 (e4m3/e5m2) tensor with the standard layout (last dim
+            ``head_dim``), and a separate float32 scale tensor (mirroring the KV layout
+            minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
+            enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
+            Defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3541,12 +3651,72 @@ class BatchPrefillWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
+        # Reject this during planning so an unsupported request cannot reach the
+        # lower-level trtllm-gen launcher if wrapper setup changes later.
+        if self._backend == "trtllm-gen" and not causal and window_left >= 0:
+            raise NotImplementedError(
+                "Sliding-window non-causal attention is not supported for trtllm-gen "
+                "paged KV cache. Use window_left=-1 for dense bidirectional attention."
+            )
+
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        self._head_dim_qk = head_dim_qk
+        self._head_dim_vo = head_dim_vo
+
+        if use_token_head_sf:
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
+                    f"{kv_data_type}"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
+                )
+            if get_compute_capability(self.device)[0] < 8:
+                if q_data_type != torch.float16:
+                    raise ValueError(
+                        "bf16 query is not supported with use_token_head_sf on this "
+                        "device (SM75 only supports fp16)"
+                    )
+            # Standard KV layout: the cache last dim is head_dim (no inline slot).
+            # head_dim_qk/head_dim_vo must be multiples of 16 and may differ (asymmetric
+            # QK/VO plans).
+            if head_dim_qk % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
+                    f"got {head_dim_qk}"
+                )
+            if head_dim_vo % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
+                    f"got {head_dim_vo}"
+                )
+            # The token-head-scale path is only implemented for the fa2 backend. Key off
+            # the originally requested backend, not self._backend (which a prior "auto"
+            # plan may have resolved to a non-fa2 backend).
+            if self._requested_backend == "auto":
+                self._backend = "fa2"
+            elif self._requested_backend != "fa2":
+                raise ValueError(
+                    "use_token_head_sf is only supported with backend='fa2', "
+                    f"got backend={self._requested_backend!r}"
+                )
+        self._use_token_head_sf = use_token_head_sf
+        if (
+            self._jit_module is not None
+            and self._jit_use_token_head_sf != use_token_head_sf
+        ):
+            raise ValueError(
+                "use_token_head_sf must match the value used to build the custom JIT "
+                f"module: the module was built with use_token_head_sf="
+                f"{self._jit_use_token_head_sf}, plan() passed use_token_head_sf={use_token_head_sf}"
+            )
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -3602,7 +3772,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             self._max_kv_len = max_sequence_kv
 
-        if self._requested_backend == "auto" and self._jit_module is None:
+        # Per-token/head scales already pin FA2; preserve that plan-time choice.
+        if (
+            self._requested_backend == "auto"
+            and self._jit_module is None
+            and not use_token_head_sf
+        ):
             self._backend = determine_attention_backend(
                 self.device,
                 PosEncodingMode[pos_encoding_mode].value,
@@ -3914,6 +4089,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
+                    use_token_head_sf,
                 )
 
                 self._cached_module = get_batch_prefill_module(
@@ -3938,11 +4114,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if logits_soft_cap != 0.0:
                 raise ValueError(
                     "logits_soft_cap must be 0.0 for trtllm-gen paged KV cache"
-                )
-            if not causal and window_left >= 0:
-                raise NotImplementedError(
-                    "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
-                    "Use window_left=-1 for dense bidirectional attention."
                 )
             if self._block_tables is None:
                 self._block_tables = _build_block_tables_from_paged_kv_indices(
@@ -4405,6 +4576,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
             to HND internally (incurring a copy). Use ``HND`` for better performance.
             Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+
+            With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
+            ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
+            minus ``head_dim``: ``[num_pages, page_size, num_kv_heads]`` if
+            :attr:`kv_layout` is ``NHD``, and ``[num_pages, num_kv_heads, page_size]``
+            if ``HND``. The tensors may be non-contiguous views (e.g. sliced out of
+            an inline slot layout).
         use_fp16_softmax : Optional[bool]
             trtllm-gen backend only. Select the ``…Fp16Softmax…`` cubin variant
             (FP16 softmax accumulator). Currently only shipped for BF16 Q/KV/O context
@@ -4577,11 +4755,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
             k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
         ) and kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
-        key_block_scales, value_block_scales = (
-            _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
-            if kv_cache_sf is not None
-            else (None, None)
-        )
+        if getattr(self, "_use_token_head_sf", False):
+            # FP8 per-(token, head) scale: kv_cache_sf is a (k_sf, v_sf) tuple of
+            # float32 tensors mirroring the KV layout minus head_dim (3-D paged).
+            # Pass through as-is — the 4-D/5-D expansion in _unpack_paged_kv_cache
+            # is NVFP4-specific and would misinterpret the page_size dim.
+            if not isinstance(kv_cache_sf, (tuple, list)) or len(kv_cache_sf) != 2:
+                raise ValueError(
+                    "use_token_head_sf requires kv_cache_sf to be a "
+                    "(k_sf, v_sf) tuple of float32 tensors"
+                )
+            key_block_scales, value_block_scales = kv_cache_sf
+        else:
+            key_block_scales, value_block_scales = (
+                _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
+                if kv_cache_sf is not None
+                else (None, None)
+            )
 
         o_dtype = self._cached_o_data_type
         if out is not None and out.dtype != o_dtype:
@@ -4642,6 +4832,45 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
             else:
                 check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
+
+        if getattr(self, "_use_token_head_sf", False):
+            # FP8 per-(token, head) scale uses the standard KV layout (last dim =
+            # head_dim); the scale is a separate float32 tensor passed via kv_cache_sf.
+            if k_cache.shape[-1] != self._head_dim_qk:
+                raise ValueError(
+                    f"use_token_head_sf requires K cache last dim = head_dim_qk "
+                    f"({self._head_dim_qk}), got {k_cache.shape[-1]}"
+                )
+            if v_cache.shape[-1] != self._head_dim_vo:
+                raise ValueError(
+                    f"use_token_head_sf requires V cache last dim = head_dim_vo "
+                    f"({self._head_dim_vo}), got {v_cache.shape[-1]}"
+                )
+            if v_cache.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v_cache {v_cache.dtype} does not match the "
+                    f"kv_data_type {self._cached_kv_data_type} specified in plan function."
+                )
+            # Scale tensors mirror the KV layout minus head_dim; they may be
+            # non-contiguous views (e.g. sliced out of an inline slot), so only
+            # the logical shape and dtype are checked.
+            num_pages = k_cache.shape[0]
+            if self._kv_layout == "NHD":
+                expected_sf_shape = (num_pages, page_size, self._num_kv_heads)
+            else:
+                expected_sf_shape = (num_pages, self._num_kv_heads, page_size)
+            for name, sf in (("k_sf", key_block_scales), ("v_sf", value_block_scales)):
+                if sf is None:
+                    raise ValueError(
+                        "use_token_head_sf requires both k_sf and v_sf in kv_cache_sf"
+                    )
+                if sf.dtype != torch.float32:
+                    raise ValueError(f"{name} must be float32, got {sf.dtype}")
+                if tuple(sf.shape) != expected_sf_shape:
+                    raise ValueError(
+                        f"{name} must have shape {expected_sf_shape} for "
+                        f"kv_layout={self._kv_layout!r}, got {tuple(sf.shape)}"
+                    )
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
@@ -5202,9 +5431,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_use_token_head_sf = bool(
+                jit_kwargs.get("use_token_head_sf", False)
+            )
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_use_token_head_sf = False
 
         if variant_owns_mask and self._jit_module is None:
             raise ValueError(
@@ -5373,6 +5606,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         uniform_q_len: Optional[int] = None,
+        use_token_head_sf: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -5503,6 +5737,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             case); see :meth:`BatchPrefillWithPagedKVCacheWrapper.plan`. Checked against
             ``qo_indptr`` on the host and dropped when the batch is not uniform.
             Defaults to ``None``.
+        use_token_head_sf : bool
+            Whether the KV cache uses the per-(token, head) FP8 scale layout: the KV
+            cache is an FP8 (e4m3/e5m2) tensor with the standard layout (last dim
+            ``head_dim``), and a separate float32 scale tensor (mirroring the KV layout
+            minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
+            enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
+            Defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -5528,6 +5769,58 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        self._head_dim_qk = head_dim_qk
+        self._head_dim_vo = head_dim_vo
+
+        if use_token_head_sf:
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
+                    f"{kv_data_type}"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
+                )
+            if get_compute_capability(self.device)[0] < 8:
+                if q_data_type != torch.float16:
+                    raise ValueError(
+                        "bf16 query is not supported with use_token_head_sf on this "
+                        "device (SM75 only supports fp16)"
+                    )
+            # Standard KV layout: the cache last dim is head_dim (no inline slot).
+            # head_dim_qk/head_dim_vo must be multiples of 16 and may differ (asymmetric
+            # QK/VO plans).
+            if head_dim_qk % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
+                    f"got {head_dim_qk}"
+                )
+            if head_dim_vo % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
+                    f"got {head_dim_vo}"
+                )
+            # The token-head-scale path is only implemented for the fa2 backend. Key off
+            # the originally requested backend, not self._backend (which a prior "auto"
+            # plan may have resolved to a non-fa2 backend).
+            if self._requested_backend == "auto":
+                self._backend = "fa2"
+            elif self._requested_backend != "fa2":
+                raise ValueError(
+                    "use_token_head_sf is only supported with backend='fa2', "
+                    f"got backend={self._requested_backend!r}"
+                )
+        self._use_token_head_sf = use_token_head_sf
+        if (
+            self._jit_module is not None
+            and self._jit_use_token_head_sf != use_token_head_sf
+        ):
+            raise ValueError(
+                "use_token_head_sf must match the value used to build the custom JIT "
+                f"module: the module was built with use_token_head_sf="
+                f"{self._jit_use_token_head_sf}, plan() passed use_token_head_sf={use_token_head_sf}"
+            )
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
@@ -5850,7 +6143,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._requested_backend == "auto":
+            # use_token_head_sf pins the backend to fa2 (validation block above), so
+            # skip auto-resolution/upgrades that would override it.
+            if self._requested_backend == "auto" and not use_token_head_sf:
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -5970,6 +6265,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
+                use_token_head_sf,
             )
             if self._backend == "fmha_v2":
                 # Cache plan data for run() — avoid GPU-CPU sync in hot path
@@ -5982,12 +6278,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
                 self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
-                # insert the wrapper's device at the 9th position (0-indexed) of
-                # get_module_args. `self.device`, not `qo_indptr.device`: the
-                # caller may pass a host indptr, and the module has to be built
-                # for the device the kernel will run on.
+                # Insert the wrapper's device at position 9 (self.device, not qo_indptr.device:
+                # the caller may pass a host indptr). get_fmha_module takes (..., device,
+                # use_fp16_qk_reduction) with no use_token_head_sf — fa2-only, so this branch
+                # is only reached with it False; slice [9:10] to drop the trailing arg.
                 new_get_module_args = (
-                    get_module_args[:9] + (self.device,) + get_module_args[9:]
+                    get_module_args[:9] + (self.device,) + get_module_args[9:10]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
@@ -6280,6 +6576,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             structure expected by the chosen backend.  When ``None`` (default), the
             kernel runs without NVFP4 KV scaling.  See
             :func:`flashinfer.fp4_quantization.nvfp4_quantize` for layout details.
+
+            With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
+            ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
+            minus ``head_dim``: ``[total_tokens, num_kv_heads]`` if
+            :attr:`kv_layout` is ``NHD``, and ``[num_kv_heads, total_tokens]`` if
+            ``HND``. The scale strides must mirror the KV strides divided by
+            ``head_dim`` (the kernel derives the scale strides from the KV strides,
+            as the NVFP4 path does); inline-slot views are supported by the paged
+            path only.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -6377,6 +6682,63 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 k_sf, v_sf = kv_cache_sf
             else:
                 k_sf, v_sf = kv_cache_sf.unbind(dim=1)
+
+        if getattr(self, "_use_token_head_sf", False):
+            # FP8 per-(token, head) scale uses the standard KV layout (last dim =
+            # head_dim); the scale is a separate float32 tensor passed via kv_cache_sf.
+            if k.shape[-1] != self._head_dim_qk:
+                raise ValueError(
+                    f"use_token_head_sf requires K last dim = head_dim_qk "
+                    f"({self._head_dim_qk}), got {k.shape[-1]}"
+                )
+            if v.shape[-1] != self._head_dim_vo:
+                raise ValueError(
+                    f"use_token_head_sf requires V last dim = head_dim_vo "
+                    f"({self._head_dim_vo}), got {v.shape[-1]}"
+                )
+            if v.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v {v.dtype} does not match the "
+                    f"kv_data_type {self._cached_kv_data_type} specified in plan function."
+                )
+            # Scale tensors mirror the KV layout minus head_dim, and their strides must
+            # mirror the KV strides divided by head_dim (the kernel derives the scale
+            # strides from the KV strides, the same contract as the NVFP4 SF); a
+            # non-contiguous scale is accepted only when it mirrors the KV layout.
+            # (Inline-slot views are supported by the paged path only.)
+            # num_kv_heads comes from the K tensor itself (the ragged wrapper
+            # does not store it as an attribute, unlike the paged wrapper).
+            total_tokens = k.shape[0] if self._kv_layout == "NHD" else k.shape[1]
+            num_kv_heads = k.shape[1] if self._kv_layout == "NHD" else k.shape[0]
+            if self._kv_layout == "NHD":
+                expected_sf_shape = (total_tokens, num_kv_heads)
+            else:
+                expected_sf_shape = (num_kv_heads, total_tokens)
+            for name, kv, sf in (("k_sf", k, k_sf), ("v_sf", v, v_sf)):
+                if sf is None:
+                    raise ValueError(
+                        "use_token_head_sf requires both k_sf and v_sf in kv_cache_sf"
+                    )
+                if sf.dtype != torch.float32:
+                    raise ValueError(f"{name} must be float32, got {sf.dtype}")
+                if tuple(sf.shape) != expected_sf_shape:
+                    raise ValueError(
+                        f"{name} must have shape {expected_sf_shape} for "
+                        f"kv_layout={self._kv_layout!r}, got {tuple(sf.shape)}"
+                    )
+                head_dim = kv.shape[-1]
+                for i in range(sf.ndim):
+                    if (
+                        kv.stride(i) % head_dim != 0
+                        or sf.stride(i) != kv.stride(i) // head_dim
+                    ):
+                        raise ValueError(
+                            f"use_token_head_sf: {name} layout must mirror the KV layout "
+                            f"(scale stride = KV stride / head_dim, as the NVFP4 path "
+                            f"requires); got {name} stride {sf.stride(i)} at dim {i}, "
+                            f"expected {kv.stride(i) // head_dim} from KV stride "
+                            f"{kv.stride(i)}"
+                        )
 
         # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
         # asymmetric QK/VO; q.shape[-1] assumed QK == VO). Gate on the packed
@@ -7283,7 +7645,10 @@ def trtllm_ragged_attention_deepseek(
     batch_size : int
         batch size
     window_left : int
-        window left
+        The left (inclusive) window size for the attention window. A value of ``N`` includes the
+        current position and keys up to ``N`` positions to its left; ``-1`` selects the full
+        sequence. The ``trtllm-gen`` ragged interface has no right-window argument, so a finite
+        window is supported only for causal attention.
     cum_seq_lens_q : torch.Tensor
         cumulative sequence lengths for query
     cum_seq_lens_kv : torch.Tensor
@@ -7371,6 +7736,11 @@ def trtllm_ragged_attention_deepseek(
     check_trtllm_gen_sm107_only_feature(
         uses_spcompress, "uses_spcompress", query.device
     )
+    if backend != "cute-dsl" and not is_causal and window_left >= 0:
+        raise NotImplementedError(
+            "trtllm-gen ragged attention requires a right-window bound for non-causal "
+            "sliding-window attention, but the ragged interface exposes only window_left"
+        )
     is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
@@ -7873,6 +8243,47 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
+def _validate_trtllm_variable_window_bounds(
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Run opt-in VariableWindow checks that require a device-to-host sync."""
+    if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("", "0"):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    starts_cpu = starts.cpu()
+    ends_cpu = ends.cpu()
+    q_indptr = cum_seq_lens_q.cpu().tolist()
+    kv_lens = seq_lens.cpu().tolist()
+
+    if bool((starts_cpu < 0).any()):
+        raise ValueError("variable_window_token_starts must be >= 0")
+    if bool((starts_cpu > ends_cpu).any()):
+        raise ValueError(
+            "variable_window_token_starts must be <= variable_window_token_ends elementwise"
+        )
+    for batch_idx in range(batch_size):
+        q_start, q_end = q_indptr[batch_idx : batch_idx + 2]
+        seq_starts = starts_cpu[q_start:q_end]
+        seq_ends = ends_cpu[q_start:q_end]
+        if bool((seq_starts[1:] < seq_starts[:-1]).any()) or bool(
+            (seq_ends[1:] < seq_ends[:-1]).any()
+        ):
+            raise ValueError(
+                "variable window bounds must be nondecreasing within sequence "
+                f"{batch_idx}"
+            )
+        if bool((seq_ends >= kv_lens[batch_idx]).any()):
+            raise ValueError(
+                f"variable_window_token_ends exceed seq_len for sequence {batch_idx}"
+            )
+
+
 @flashinfer_api(trace=trtllm_batch_context_trace)
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
@@ -7907,6 +8318,9 @@ def trtllm_batch_context_with_kv_cache(
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
     backend: str = "trtllm-gen",
+    window_right: int = -1,
+    variable_window_token_starts: Optional[torch.Tensor] = None,
+    variable_window_token_ends: Optional[torch.Tensor] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -7952,8 +8366,25 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_kv : torch.Tensor
         cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
     window_left : int = -1
-        The left (inclusive) window size for the attention window, when set to ``-1``, the window
-        size will be set to the full length of the sequence. Defaults to ``-1``.
+        The left (inclusive) window size for the attention window. A value of ``N`` includes the
+        current position and keys up to ``N`` positions to its left. ``-1`` means unbounded.
+        Defaults to ``-1``.
+    window_right : int = -1
+        The right (inclusive) window size for the attention window. A value of ``N`` includes the
+        current position and keys up to ``N`` positions to its right. For backward compatibility,
+        causal attention with ``window_left >= 0`` treats ``window_right=-1`` as ``0``. A
+        non-causal fixed window requires a non-negative value. Defaults to ``-1``.
+    variable_window_token_starts : Optional[torch.Tensor]
+        Contiguous int32 tensor with one entry per packed query token. Together with
+        ``variable_window_token_ends``, supplies the inclusive K/V interval visible to every query
+        token. Bounds use positions within each batch item's full K/V sequence and must be
+        nondecreasing within a sequence. These value invariants are the caller's responsibility;
+        they are checked with a device-to-host synchronization only when
+        ``FLASHINFER_VALIDATE_INPUTS=1`` and CUDA graph capture is not active.
+    variable_window_token_ends : Optional[torch.Tensor]
+        Inclusive interval ends paired with ``variable_window_token_starts``. Variable windows
+        cannot be combined with fixed ``window_left``/``window_right`` bounds; when supplied, they
+        define the complete attention mask and the ``causal`` flag is ignored.
     out : Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
     out_dtype : Optional[Union[torch.dtype, str]] = None
@@ -8057,10 +8488,74 @@ def trtllm_batch_context_with_kv_cache(
         raise ValueError(
             "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen' or 'cake'"
         )
-    if not causal and window_left >= 0:
+    if isinstance(window_left, bool) or not isinstance(window_left, int):
+        raise TypeError("window_left must be an integer")
+    if isinstance(window_right, bool) or not isinstance(window_right, int):
+        raise TypeError("window_right must be an integer")
+    if window_left < -1 or window_right < -1:
+        raise ValueError("window_left and window_right must be at least -1")
+    has_variable_window = (
+        variable_window_token_starts is not None
+        or variable_window_token_ends is not None
+    )
+    if has_variable_window:
+        if variable_window_token_starts is None or variable_window_token_ends is None:
+            raise ValueError(
+                "variable_window_token_starts and variable_window_token_ends "
+                "must be provided together"
+            )
+        if window_left != -1 or window_right != -1:
+            raise ValueError(
+                "variable windows cannot be combined with fixed window bounds"
+            )
+        check_shape_dtype_device(
+            variable_window_token_starts,
+            (query.size(0),),
+            torch.int32,
+            query.device,
+            "variable_window_token_starts",
+        )
+        check_shape_dtype_device(
+            variable_window_token_ends,
+            (query.size(0),),
+            torch.int32,
+            query.device,
+            "variable_window_token_ends",
+        )
+        if (
+            not variable_window_token_starts.is_contiguous()
+            or not variable_window_token_ends.is_contiguous()
+        ):
+            raise ValueError("variable window bounds must be contiguous")
+        _validate_trtllm_variable_window_bounds(
+            variable_window_token_starts,
+            variable_window_token_ends,
+            cum_seq_lens_q,
+            seq_lens,
+            batch_size,
+        )
+        effective_window_right = -1
+    elif causal:
+        if window_right not in (-1, 0):
+            raise ValueError("causal attention requires window_right to be -1 or 0")
+        effective_window_right = 0 if window_left >= 0 else -1
+    else:
+        if window_left == -1 and window_right >= 0:
+            raise ValueError("right-only non-causal windows are unsupported")
+        if window_left >= 0 and window_right == -1:
+            raise ValueError(
+                "non-causal fixed-window attention requires window_right >= 0"
+            )
+        effective_window_right = window_right
+
+    if backend == "cake" and (
+        has_variable_window
+        or effective_window_right > 0
+        or (not causal and window_left >= 0)
+    ):
         raise NotImplementedError(
-            "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
-            "Use window_left=-1 for dense bidirectional attention."
+            "The cake backend supports only dense attention or a causal left window; "
+            "two-sided, non-causal sliding, and variable attention windows are unsupported."
         )
 
     if isinstance(kv_cache, tuple):
@@ -8272,21 +8767,38 @@ def trtllm_batch_context_with_kv_cache(
         o_sf_start_index,
         batch_size,
         window_left,
-        cum_seq_lens_q,
-        cum_seq_lens_kv,
-        sm_count,
-        enable_pdl,
-        workspace_size,
-        sinks,
-        key_block_scales,
-        value_block_scales,
-        skip_softmax_threshold_scale_factor,
-        uses_shared_paged_kv_idx,
-        use_fp16_softmax,
-        uses_spcompress,
-        causal,
-        lse,
     ]
+    if backend == "cake":
+        # Preserve Cake's established 34-argument FFI ABI. Its context entry
+        # point predates two-sided and per-token windows, but still consumes
+        # window_left for the causal compatibility route.
+        run_args.extend((cum_seq_lens_q, cum_seq_lens_kv))
+    else:
+        run_args.extend(
+            (
+                effective_window_right,
+                cum_seq_lens_q,
+                cum_seq_lens_kv,
+                variable_window_token_starts,
+                variable_window_token_ends,
+            )
+        )
+    run_args.extend(
+        [
+            sm_count,
+            enable_pdl,
+            workspace_size,
+            sinks,
+            key_block_scales,
+            value_block_scales,
+            skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
+            use_fp16_softmax,
+            uses_spcompress,
+            causal,
+            lse,
+        ]
+    )
     if backend != "cake":
         run_args.append(1.0)  # lse_scale
     run_args.extend((lse_stride_tokens, lse_stride_heads))
@@ -9055,6 +9567,153 @@ def minimax_h3_varlen_attention(
         )
     from .experimental.minimax_h3_varlen_attention.cake_backend import (
         minimax_h3_varlen_attention as run,
+    )
+
+    return run(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen FP8 attention")
+def minimax_h3_varlen_fp8_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    q_descale: Union[float, torch.Tensor],
+    k_descale: Union[float, torch.Tensor],
+    v_descale: Union[float, torch.Tensor],
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    r"""Noncausal packed-varlen all-FP8 attention over THD tensors (SM100/SM103).
+
+    The experimental Cake backend runs one persistent 2-CTA-cluster tcgen05
+    kernel (``kind::f8f6f4`` QK and PV over E4M3 operands, FP32 softmax and
+    accumulation) over packed E4M3 ``[T, H, 128]`` tensors with one FP32
+    descale per tensor: for every segment ``[a, b)`` of ``cu_seqlens`` and
+    every head ``h``,
+    ``out[a:b, h] = softmax((query[a:b, h] * q_descale) @ (key[a:b, h] * k_descale)^T * softmax_scale) @ (value[a:b, h] * v_descale)``
+    with the probabilities rounded to E4M3 at unit scale before the PV MMA.
+    ``query`` / ``key`` / ``value`` may be strided views (unit innermost
+    stride, 16-byte-aligned head and token strides and base); ``out`` is a
+    contiguous BF16 tensor.  Plans whose every segment has at most 32 tokens
+    run the kernel's tiny-plan build (same output bitwise).
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        ``[T, H, 128]`` ``torch.float8_e4m3fn`` tensors or strided views.
+    cu_seqlens : torch.Tensor
+        ``[B + 1]`` int32 CUDA segment offsets, ``cu_seqlens[0] == 0``,
+        non-decreasing, ``cu_seqlens[B] == T``.
+    q_descale, k_descale, v_descale : float or torch.Tensor
+        The per-tensor descales (the values that return each E4M3 tensor to
+        its real scale), as floats or one-element float32 CUDA tensors.
+    softmax_scale : float, optional
+        Defaults to ``1 / sqrt(128)``.
+    out : torch.Tensor, optional
+        Caller-owned contiguous ``[T, H, 128]`` BF16 output.
+    cu_seqlens_host : Sequence[int], optional
+        The segment offsets as host ints (avoids a device-to-host copy).
+    backend : str
+        ``"cake"`` (the only backend).
+
+    Returns
+    -------
+    torch.Tensor
+        ``out``.
+
+    Note
+    ----
+    Preparation and launch are separable through
+    ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_fp8_attention``,
+    whose runner launches with no allocation or synchronization.  See
+    ``flashinfer/experimental/minimax_h3_varlen_attention/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError(
+            "MiniMax-H3 varlen FP8 attention currently supports backend='cake'"
+        )
+    from .experimental.minimax_h3_varlen_attention.cake_backend import (
+        minimax_h3_varlen_fp8_attention as run,
+    )
+
+    return run(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen FP8 attention")
+def minimax_h3_varlen_fp8_attention_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    r"""BF16 convenience form of :func:`minimax_h3_varlen_fp8_attention` (SM100/SM103).
+
+    Quantizes BF16 ``query`` / ``key`` / ``value`` to E4M3 with one per-tensor
+    scale each (``descale = amax(|x|) / 448``, torch ops on the current stream,
+    no host synchronization) and runs the all-FP8 kernel on the results with
+    those descales.  The output equals ``minimax_h3_varlen_fp8_attention`` on
+    the same E4M3 tensors and descales bitwise.  The quantization is host
+    composition outside the kernel; for repeated problems prepare once with
+    ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_fp8_attention_bf16``,
+    whose runner re-quantizes and launches with no allocation and exposes
+    ``quantize()`` and ``attention()`` separately.
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        ``[T, H, 128]`` BF16 tensors or the strided views the BF16 route accepts.
+    cu_seqlens : torch.Tensor
+        ``[B + 1]`` int32 CUDA segment offsets.
+    softmax_scale : float, optional
+        Defaults to ``1 / sqrt(128)``.
+    out : torch.Tensor, optional
+        Caller-owned contiguous ``[T, H, 128]`` BF16 output.
+    cu_seqlens_host : Sequence[int], optional
+        The segment offsets as host ints (avoids a device-to-host copy).
+    backend : str
+        ``"cake"`` (the only backend).
+
+    Returns
+    -------
+    torch.Tensor
+        ``out``.
+    """
+    if backend != "cake":
+        raise ValueError(
+            "MiniMax-H3 varlen FP8 attention currently supports backend='cake'"
+        )
+    from .experimental.minimax_h3_varlen_attention.cake_backend import (
+        minimax_h3_varlen_fp8_attention_bf16 as run,
     )
 
     return run(

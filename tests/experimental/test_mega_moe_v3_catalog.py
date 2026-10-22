@@ -1,5 +1,6 @@
 """Catalog consistency of the generated MegaMoE v3 family (no GPU required)."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -47,14 +48,24 @@ def test_every_route_resolves_its_programs_grid_and_sm_count(arch):
 def test_programs_sources_symbols_and_compile_line_definitions():
     catalog = _catalog()
     data = json.loads(catalog.path.read_text())
-    for name, record in data["programs"].items():
+    programs = data["programs"]
+    for name, record in programs.items():
         kernel, binding = (ROOT / src for src in record["sources"])
-        assert (
-            kernel.name == f"{name}_kernel.cu" and binding.name == f"{name}_binding.cu"
-        )
+        assert kernel.name == f"{name}_kernel.cu"
+        # A pipeline launcher can be shared: the binding is the one shipped for a
+        # catalogued pipeline program and takes this program's kernel symbol from
+        # the compile definitions (CAKE_PROGRAM_KERNEL).
+        launcher = binding.name.removesuffix("_binding.cu")
+        assert launcher in programs and (
+            launcher == name or ("_pipeline_" in name and "_pipeline_" in launcher)
+        ), (name, binding.name)
         kernel_text, binding_text = kernel.read_text(), binding.read_text()
         symbol = f"kernel_{name}("
-        assert symbol in kernel_text and symbol in binding_text, name
+        assert symbol in kernel_text, name
+        if launcher != name:
+            for arch in record["arches"]:
+                flags = catalog.compile_flags(record, arch)
+                assert f"-DCAKE_PROGRAM_KERNEL=kernel_{name}" in flags, (name, arch)
         pipeline = "_pipeline_" in name
         if record.get("definitions"):
             # Architecture-neutral pipeline schedule: the SM count comes from the compile line.
@@ -73,6 +84,16 @@ def test_programs_sources_symbols_and_compile_line_definitions():
         assert (
             "ScopedCudaDevice" not in binding_text and "std::mutex" not in binding_text
         )
+
+
+def test_closure_sha256_names_the_shipped_sources():
+    """Each program's closure_sha256 is the SHA-256 of its kernel then binding source bytes."""
+    data = json.loads(_catalog().path.read_text())
+    for name, record in data["programs"].items():
+        digest = hashlib.sha256(
+            b"".join((ROOT / src).read_bytes() for src in record["sources"])
+        ).hexdigest()
+        assert record["closure_sha256"] == digest, name
 
 
 def test_load_program_supplies_the_route_sm_count_as_num_ctas():

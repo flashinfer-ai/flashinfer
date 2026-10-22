@@ -190,14 +190,20 @@ that writes the registry verifies the record against them before it is frozen.
 
 ## Layout of this package
 
-* `cake_jit.py` -- registry written by the generated-program export: one
-  record per program (`PROGRAMS`: role, the architecture-free `library` stem,
-  architectures, launch geometry), the program of every dispatch key per
-  architecture (`PROGRAM_KEYS`), the per-architecture dispatch policy
-  (`POLICY`), the argument plan per role, and the loader glue
+The kernel and launcher sources under `csrc/`, the registry `cake_jit.py` and
+`build.json` are exporter output, hand-folded here pending exporter support:
+programs that differ only in their constants or lever text share one
+translation unit, and each `build.json` entry selects its program through its
+own `-D` definitions.
+
+* `cake_jit.py` -- registry: one record per program (`PROGRAMS`: role, the
+  architecture-free `library` stem, architectures), the program of every
+  dispatch key per architecture (`PROGRAM_KEYS`), the per-architecture
+  dispatch policy (`POLICY`), the argument plan per role, and the loader glue
   (`library_name(program, arch)` = the `build.json` entry `<library>_<arch>`,
-  `load_program(program, arch)` through `cake_build.load_library`,
-  `specs_for_arch(arch)` for JIT warm-up).
+  `load_program(program, arch)` through `cake_build.load_library`).  The
+  launch geometry of a program (block, cluster, dynamic shared memory) is
+  fixed in its binding.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   FlashInfer package and this package's build manifest (schema `cake-build/1`),
   the only record of what the package compiles: one entry per program and
@@ -217,7 +223,20 @@ that writes the registry verifies the record against them before it is frozen.
 * `cake_backend.py` -- validation, planning, argument binding, the prepared
   runner and the eager entry point.
 * `csrc/cake_dsa_indexer_topk/` -- generated kernel and binding translation
-  units, one source per program for every architecture, with the shared device
+  units: one kernel per program or per group of programs that differ only in
+  their constants (a scan lever-twin group, the rank-finalize programs of one
+  window form, the CUB finalize programs) and one binding per launcher text
+  (the 37 scan programs share 7 bindings, one per TMA box shape, block size
+  and cluster form; the 25 rank-finalize programs share 2, the 5 CUB finalize
+  programs 1; the merge program has its own).  A shared source names its
+  kernel symbol and host-shim namespace through `CAKE_PROGRAM_KERNEL` /
+  `CAKE_PROGRAM_SHIM` and its constants (the lever text, the window or
+  thread-count constants; a finalize binding reads its block size and dynamic
+  shared memory from `THREADS` / `SMEM_TOTAL`) through `#ifndef` defaults
+  naming the program it was exported for; every other program's `build.json`
+  entry passes its own values with `-D`.  The TMA descriptor encoders every
+  scan binding carried verbatim live once in the shared launch helpers,
+  selected by `CAKE_HOST_COMMON_PART`.  The sources come with the shared device
   preamble `cake_dsa_indexer_topk_device_common.cuh` and the shared launch helpers
   `cake_dsa_indexer_topk_host_common.cuh` delivered once; the preamble's helper
   functions are content-addressed files under `csrc/cake_device_helpers/`
@@ -226,7 +245,10 @@ that writes the registry verifies the record against them before it is frozen.
 
 ## Tests and benchmark
 
-Tests: `tests/experimental/test_cake_dsa_indexer.py` with the independent
+Tests: `tests/experimental/test_cake_dsa_indexer.py` (the backend suite, which
+imports the package only through `tests/test_helpers/cake_package.py`) and
+`tests/experimental/test_cake_dsa_indexer_api.py` (the `flashinfer.dsa_indexer`
+wrapper), with the independent
 FP64 / FP32 reference in `tests/test_helpers/cake_dsa_indexer_reference.py`
 (exact semantic cases incl. cutoff ties, all-equal scores, mixed signed zeros
 at the boundary with bit checks, negative scores and a few winners over a

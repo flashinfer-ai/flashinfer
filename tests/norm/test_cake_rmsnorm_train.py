@@ -26,6 +26,13 @@ boundaries, row-strided inputs, extreme scales, zero input, the residual-add
 fusion (against an add-then-norm autograd reference for every input
 gradient), bitwise reproducibility of ``dw``, changing token counts in one
 process and the autograd wrapper end to end.
+
+This suite exercises the backend package alone: it names the package once,
+through ``tests.test_helpers.cake_package``, and imports nothing else from
+flashinfer, so a build that vendors the package under another import path
+runs it unchanged after pointing that table entry at its package.  The
+``flashinfer.cake_rmsnorm_train`` facade and the ``flashinfer`` top-level
+exposure are covered by ``test_cake_rmsnorm_train_api.py``.
 """
 
 from __future__ import annotations
@@ -37,26 +44,33 @@ from pathlib import Path
 
 import torch
 
-import flashinfer
-from flashinfer.cake_rmsnorm_train import (
-    CakeRMSNormFunction,
-    cake_rmsnorm,
-    cake_rmsnorm_train_backward,
-    cake_rmsnorm_train_backward_workspace,
-    cake_rmsnorm_train_backward_workspace_bytes,
-    cake_rmsnorm_train_forward,
-    is_cake_rmsnorm_train_supported,
+from tests.test_helpers.cake_package import cake_package
+
+pkg = cake_package("cake_rmsnorm_train")
+cake_build = cake_package("cake_rmsnorm_train", "cake_build")
+loader = cake_package("cake_rmsnorm_train", "cake_jit")
+cake_rmsnorm = pkg.cake_rmsnorm
+cake_rmsnorm_train_backward = pkg.cake_rmsnorm_train_backward
+cake_rmsnorm_train_backward_workspace = pkg.cake_rmsnorm_train_backward_workspace
+cake_rmsnorm_train_backward_workspace_bytes = (
+    pkg.cake_rmsnorm_train_backward_workspace_bytes
 )
-from flashinfer.cake_rmsnorm_train_backend import cake_build
-from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
-from flashinfer.jit.env import has_flashinfer_jit_cache
-from flashinfer.utils import get_compute_capability
+cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
+is_cake_rmsnorm_train_supported = pkg.is_cake_rmsnorm_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-WIDTHS = ((6144, 1e-5), (2048, 1e-6), (512, 1e-6))
+WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
 HIDDEN_SIZES = tuple(hidden for hidden, _eps in WIDTHS)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
+# Widths whose contract names both eps values: every case runs at each.
+EPS_VARIANTS = {4096: (1e-5, 1e-6), 1536: (1e-5, 1e-6)}
 ROWS = (1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 257, 16172, 16231)
+# Further row counts of the H=1536 / H=4096 contract: the program-window edges, the 2^n +- 1 counts and the
+# representative training shapes (GLM-5.3-Flash CP16 among them).
+CONTRACT_ROWS = {
+    4096: (1023, 1025, 4097, 14928, 16263, 16384, 32769, 65536),
+    1536: (1023, 1025, 4097, 14928, 16263, 16384, 32769, 65536),
+}
 STRIDE_PADS = (0, 64, "2H")
 SCALES = (1.0, 1e-3, 1e3)
 ATOL = 1e-2
@@ -70,10 +84,14 @@ def _device() -> torch.device:
     return torch.device("cuda:0")
 
 
+def _capability() -> tuple[int, int]:
+    return torch.cuda.get_device_capability(_device())
+
+
 def _supported() -> bool:
     return (
         torch.cuda.is_available()
-        and get_compute_capability(_device()) in SUPPORTED_CAPABILITIES
+        and _capability() in SUPPORTED_CAPABILITIES
         and is_cake_rmsnorm_train_supported(_device())
     )
 
@@ -84,11 +102,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(autouse=not has_flashinfer_jit_cache(), scope="module")
+@pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
+    # Build the local architecture's libraries that have no prebuilt file before
+    # the first test, through the spec objects the package's loader itself builds
+    # on first use (``cake_build.load_library``); a prebuilt or already cached
+    # library loads without compiling.
     if _supported():
-        arch = loader.arch_for_capability(get_compute_capability(_device()))
-        flashinfer.jit.build_jit_specs(loader.specs_for_arch(arch), verbose=False)
+        arch = loader.arch_for_capability(_capability())
+        for spec in loader.specs_for_arch(arch):
+            spec.build_and_load()
     yield
 
 
@@ -100,7 +123,7 @@ def _skip_unless_hidden(hidden: int) -> None:
 def _skip_unless_route(hidden: int, residual: bool) -> None:
     _skip_unless_hidden(hidden)
     if residual and not loader.route_applies(
-        device_capability=get_compute_capability(_device()),
+        device_capability=_capability(),
         hidden=hidden,
         kind="fwd",
         residual=True,
@@ -241,8 +264,9 @@ def _check_case(
     zeros: bool = False,
     residual: bool = False,
     spike: bool = False,
+    eps: float | None = None,
 ) -> None:
-    eps = EPS[hidden]
+    eps = EPS[hidden] if eps is None else eps
     pad_key = hidden if x_pad == "2H" else int(x_pad)
     generator = _generator(
         hidden, rows, pad_key, int(scale * 1e6) % 9973, zeros, residual, spike
@@ -264,7 +288,7 @@ def _check_case(
     y, rstd = outputs[0], outputs[1]
     assert tuple(y.shape) == (rows, hidden) and y.is_contiguous()
     assert rstd.dtype == torch.float32 and tuple(rstd.shape) == (rows,)
-    label = f"hidden={hidden} rows={rows} pad={x_pad} scale={scale} zeros={zeros} residual={residual}"
+    label = f"hidden={hidden} rows={rows} eps={eps} pad={x_pad} scale={scale} zeros={zeros} residual={residual}"
     _assert_bf16_close(y, y_ref, f"y {label}")
     assert torch.isfinite(rstd).all(), f"rstd {label}"
     assert _rel_l2(rstd, rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
@@ -292,11 +316,11 @@ def test_forward_backward_match_fp64(hidden: int, rows: int) -> None:
     _check_case(hidden, rows)
 
 
-def _forward_switch_rows(arch: str, hidden: int, residual: bool) -> tuple[int, ...]:
-    """Row counts on both sides of every forward program switch point of one route (and a single row)."""
+def _switch_rows(arch: str, hidden: int, kind: str, residual: bool) -> tuple[int, ...]:
+    """Row counts on both sides of every program switch point of one route (and a single row)."""
 
     switches = set()
-    for name in loader.route_modules(arch, hidden, "fwd", residual):
+    for name in loader.route_modules(arch, hidden, kind, residual):
         rule = loader.MODULES[name]["select_rule"]
         if rule is None:
             continue
@@ -306,6 +330,26 @@ def _forward_switch_rows(arch: str, hidden: int, residual: bool) -> tuple[int, .
     return tuple(sorted({1, *switches, *(rows + 1 for rows in switches)}))
 
 
+@pytest.mark.parametrize(
+    ("hidden", "rows"),
+    [(hidden, rows) for hidden, counts in CONTRACT_ROWS.items() for rows in counts],
+)
+def test_contract_rows_match_fp64(hidden: int, rows: int) -> None:
+    _skip_unless_hidden(hidden)
+    _check_case(hidden, rows)
+
+
+@pytest.mark.parametrize(
+    ("hidden", "eps"),
+    [(hidden, eps) for hidden, variants in EPS_VARIANTS.items() for eps in variants],
+)
+@pytest.mark.parametrize("rows", (7, 16231))
+@pytest.mark.parametrize("scale", SCALES)
+def test_eps_variants(hidden: int, eps: float, rows: int, scale: float) -> None:
+    _skip_unless_hidden(hidden)
+    _check_case(hidden, rows, scale=scale, eps=eps)
+
+
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
 @pytest.mark.parametrize("residual", (False, True))
 def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> None:
@@ -313,11 +357,11 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
     matches the FP64 reference on both sides of its switch point."""
 
     _skip_unless_route(hidden, residual)
-    arch = loader.arch_for_capability(get_compute_capability(_device()))
+    arch = loader.arch_for_capability(_capability())
     names = loader.route_modules(arch, hidden, "fwd", residual)
     eps = EPS[hidden]
     launched = set()
-    for rows in _forward_switch_rows(arch, hidden, residual):
+    for rows in _switch_rows(arch, hidden, "fwd", residual):
         selected = loader.selected_modules(arch, hidden, "fwd", residual, rows=rows)
         assert len(selected) == 1, (
             f"hidden={hidden} residual={residual} rows={rows}: {selected}"
@@ -336,6 +380,26 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
             assert torch.equal(outputs[2], h_new_ref), f"h_new {label}"
     assert launched == set(names), (
         f"hidden={hidden} residual={residual}: never launched {set(names) - launched}"
+    )
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_backward_programs_switch_on_row_count(hidden: int) -> None:
+    """Exactly one backward program runs per call, every exported backward program
+    runs for some row count, and forward + backward match the FP64 reference on
+    both sides of each switch point."""
+
+    _skip_unless_hidden(hidden)
+    arch = loader.arch_for_capability(_capability())
+    names = loader.route_modules(arch, hidden, "bwd", False)
+    launched = set()
+    for rows in _switch_rows(arch, hidden, "bwd", False):
+        selected = loader.selected_modules(arch, hidden, "bwd", False, rows=rows)
+        assert len(selected) == 1, f"hidden={hidden} rows={rows}: {selected}"
+        launched.add(selected[0])
+        _check_case(hidden, rows)
+    assert launched == set(names), (
+        f"hidden={hidden}: never launched {set(names) - launched}"
     )
 
 
@@ -374,7 +438,7 @@ def test_extreme_row(hidden: int) -> None:
 def test_residual_fusion(hidden: int, stride_pad, rows: int) -> None:
     _skip_unless_hidden(hidden)
     if not loader.route_applies(
-        device_capability=get_compute_capability(_device()),
+        device_capability=_capability(),
         hidden=hidden,
         kind="fwd",
         residual=True,
@@ -475,6 +539,45 @@ def test_misaligned_layouts_are_materialized(
     )
     assert dx_again is dx_user and torch.equal(dx_user, dx), f"dx copy-back {label}"
     assert torch.equal(dw_again, dw), f"dw bitwise across layouts {label}"
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_half_vector_aligned_weight_is_materialized(hidden: int) -> None:
+    """A contiguous ``w`` whose storage base is 16 bytes past a 32-byte boundary.
+
+    The backward kernels load the weight with 16-byte vectors and read this view
+    in place; the forward kernels load it with 32-byte vectors, so the forward
+    must copy it (an in-place read would be a misaligned vector load).  Both
+    match the FP64 reference and the aligned weight's results bitwise.
+    """
+
+    _skip_unless_hidden(hidden)
+    eps = EPS[hidden]
+    rows = 129
+    generator = _generator(hidden, rows, 47)
+    x = _rows(rows, hidden, generator=generator)
+    w_aligned = _weight(hidden, generator)
+    storage = torch.empty(hidden + 16, dtype=torch.bfloat16, device=_device())
+    offset = ((16 - storage.data_ptr() % 32) % 32) // storage.element_size()
+    w = storage[offset : offset + hidden]
+    w.copy_(w_aligned)
+    assert w.is_contiguous() and w.data_ptr() % 32 == 16, "test layout"
+    label = f"hidden={hidden} 16-byte aligned w"
+
+    y, rstd = cake_rmsnorm_train_forward(x, w, eps)
+    y_ref, rstd_ref, _ = _reference_forward(x, w, eps)
+    _assert_bf16_close(y, y_ref, f"y {label}")
+    assert _rel_l2(rstd, rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
+    y_aligned, rstd_aligned = cake_rmsnorm_train_forward(x, w_aligned, eps)
+    assert torch.equal(y, y_aligned) and torch.equal(rstd, rstd_aligned), label
+
+    g = _rows(rows, hidden, generator=generator)
+    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)
+    dx_ref, dw_ref = _reference_backward(g, x, w, eps)
+    _assert_bf16_close(dx, dx_ref, f"dx {label}")
+    _assert_dw(dw, dw_ref, g, x, rstd, f"dw {label}")
+    dx_aligned, dw_aligned = cake_rmsnorm_train_backward(g, x, w_aligned, rstd)
+    assert torch.equal(dx, dx_aligned) and torch.equal(dw, dw_aligned), label
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
@@ -591,7 +694,7 @@ def _autograd_reference(x, w, eps, residual=None, grad_y=None, grad_h=None):
 def test_autograd_end_to_end(hidden: int, residual: bool, rows: int) -> None:
     _skip_unless_hidden(hidden)
     if residual and not loader.route_applies(
-        device_capability=get_compute_capability(_device()),
+        device_capability=_capability(),
         hidden=hidden,
         kind="fwd",
         residual=True,
@@ -687,7 +790,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.cake_rmsnorm_train_backend"
+    assert manifest["package"] == pkg.__name__
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()
@@ -715,17 +818,6 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert "--prec-div=true" in entry["nvcc_flags"]
     assert referenced == set(libraries)
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
-
-
-def test_function_signature_is_exported() -> None:
-    assert flashinfer.cake_rmsnorm is cake_rmsnorm
-    assert flashinfer.cake_rmsnorm_train_forward is cake_rmsnorm_train_forward
-    assert flashinfer.cake_rmsnorm_train_backward is cake_rmsnorm_train_backward
-    assert (
-        flashinfer.cake_rmsnorm_train_backward_workspace_bytes
-        is cake_rmsnorm_train_backward_workspace_bytes
-    )
-    assert flashinfer.CakeRMSNormFunction is CakeRMSNormFunction
 
 
 def test_dw_not_worse_than_eager_fp32_over_the_matrix() -> None:

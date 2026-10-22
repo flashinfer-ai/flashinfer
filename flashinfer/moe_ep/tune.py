@@ -47,6 +47,7 @@ from .sm90_routing import (
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse offline workload, pipeline and sweep options without starting CUDA."""
     parser = argparse.ArgumentParser(
         prog="python -m flashinfer.moe_ep.tune",
         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
@@ -126,7 +127,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--kernel-variant",
         choices=("inference", "genphase"),
         default="inference",
-        help="SM107 kernel composition; GenPhase requires at most 1024 tokens/rank",
+        help="SM107 or SM100 MXFP8 kernel composition; GenPhase capacity <= 1024",
     )
     parser.add_argument(
         "--gate-up-clamp",
@@ -307,6 +308,11 @@ def _resolve_arch(arch: str) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Validate CLI options and run the architecture-specific offline tuner.
+
+    Invalid argument combinations return 2 before importing a backend tuner;
+    valid requests return the selected tuner's exit code.
+    """
     args = _parse_args(argv)
     error = _argument_error(args)
     if error is not None:
@@ -321,6 +327,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             ".backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_tuner", __package__
         )
         return tuner.run_tuning(args)
+    if args.shared_expert:
+        print("--shared-expert requires --dtype sm120_mxfp4_mxfp8", file=sys.stderr)
+        return 2
     if args.dtype == "sm90_mxfp4":
         if args.arch not in ("auto", "sm90"):
             print("sm90_mxfp4 requires --arch auto or sm90", file=sys.stderr)
@@ -380,8 +389,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
         return 2
 
-    if args.kernel_variant != "inference" and family != "sm107":
-        print("--kernel-variant genphase requires --arch sm107", file=sys.stderr)
+    if (
+        args.kernel_variant == "genphase"
+        and family != "sm107"
+        and not (
+            family == "sm100"
+            and args.dtype == "mxfp8_e4m3"
+            and not args.allow_nondeterministic
+        )
+    ):
+        print(
+            "GenPhase requires SM107 or SM100 MXFP8 E4M3 with deterministic reduction",
+            file=sys.stderr,
+        )
         return 2
 
     activation_requested = (

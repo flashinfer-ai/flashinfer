@@ -1373,12 +1373,16 @@ def stream_k_plan(
     whole wave of CTA pairs (all of them when there are fewer tiles than pairs) are the tail.
 
     * ``sk=False``: every work item is a whole tile.
-    * ``sk="auto"`` (the launcher default): a K-aligned two-way split of a single partial
-      wave -- unit ``u`` is tile ``u // 2``, K half ``u % 2`` -- so tiles sharing an A / B
-      panel stay K-synchronised and every tile has exactly two parts (one slab read in the
-      fixup).  Only when the whole problem is one partial wave whose halves fit the pairs
-      (``pair_tiles <= pairs`` and ``2 * tail <= pairs``) and K has at least
-      ``2 * SK_MIN_ITERS`` steps; multi-wave problems keep their tail data-parallel.
+    * ``sk="auto"`` (the launcher default): a two-way split of a single partial wave -- the
+      tail's ``tail * k_blocks`` K steps, linearised, cut into units of ``ceil(k_blocks / 2)``
+      steps.  On an even ``k_blocks`` unit ``u`` is tile ``u // 2``, K half ``u % 2``; on an odd
+      one a unit may cross into the next tile.  The units are the ``ceil(tail * k_blocks /
+      ceil(k_blocks / 2))`` that hold a K step (one fewer than ``2 * tail`` when ``k_blocks`` is
+      odd and ``2 * tail > k_blocks``): a unit without a K step never finishes in the programs
+      that hand off the work in an item's last segment (``pd`` 2, ``sk_slab`` 2, ``stt``).  Only
+      when the whole problem is one partial wave whose halves fit the pairs (``pair_tiles <=
+      pairs`` and ``2 * tail <= pairs``) and K has at least ``2 * SK_MIN_ITERS`` steps;
+      multi-wave problems keep their tail data-parallel.
     * ``sk=True``: the tail tiles are linearised over their K steps and shared by up to
       ``pairs`` (``max_units``) stream-K units of at least ``SK_MIN_ITERS`` contiguous K
       steps; no stream-K when that cannot create more units than tail tiles.
@@ -1398,7 +1402,7 @@ def stream_k_plan(
         if pair_tiles > pairs or 2 * tail > pairs or k_blocks < 2 * SK_MIN_ITERS:
             return pair_tiles, 0, 0, k_blocks
         half = _ceil_div(k_blocks, 2)
-        return pair_tiles - tail, tail, 2 * tail, half
+        return pair_tiles - tail, tail, _ceil_div(tail * k_blocks, half), half
     total = tail * k_blocks
     units = min(pairs, total // SK_MIN_ITERS, max_units or pairs)
     if units <= tail:
@@ -1408,6 +1412,34 @@ def stream_k_plan(
     if units <= tail:
         return pair_tiles, 0, 0, k_blocks
     return pair_tiles - tail, tail, units, iters_per_unit
+
+
+def check_stream_k_plan(plan: "GemmPlan") -> None:
+    """Refuse a stream-K plan outside the program's launch contract (the Cake kernel's ``requires``) before it
+    launches.  The programs that hand off the work inside an item's last segment (``pd`` 2, ``sk_slab`` 2,
+    ``stt``) never finish an item that holds no K step: the linearised plan needs ``iters_per_unit >= 1`` and
+    ``(sk_units - 1) * iters_per_unit < sk_iters``, the synchronised one at most ``tail_tiles`` collectors.  Every
+    synchronised plan needs a collector for the K steps ``[s, k_blocks)`` of its tail tiles.  A plan without
+    stream-K units holds every condition."""
+    if not plan.sk_units:
+        return
+    handoff = plan.pd == 2 or plan.sk_slab == 2 or plan.stt
+    if plan.sk_sync:
+        collectors = plan.sk_collectors
+        if collectors < 1 or (handoff and collectors > plan.tail_tiles):
+            raise ValueError(
+                f"dense_projection_gemm: {plan.template} needs 1 <= collectors"
+                f"{' <= tail_tiles' if handoff else ''} (got {collectors} collectors, {plan.tail_tiles} tail tiles)"
+            )
+    elif handoff and not plan.sk_exact:
+        if (
+            plan.iters_per_unit < 1
+            or (plan.sk_units - 1) * plan.iters_per_unit >= plan.sk_iters
+        ):
+            raise ValueError(
+                f"dense_projection_gemm: {plan.template} needs every stream-K unit to hold a K step (got "
+                f"{plan.sk_units} units of {plan.iters_per_unit} over {plan.sk_iters} K steps)"
+            )
 
 
 def sk_sync_plan(
@@ -2225,6 +2257,7 @@ def plan_dense_projection_gemm(
         stt=bool(key[30]),
         pro=int(key[31]),
     )
+    check_stream_k_plan(plan)
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
         for allow_swap, use_rules in ((False, True), (True, False), (False, False)):

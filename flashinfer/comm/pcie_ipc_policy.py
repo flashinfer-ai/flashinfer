@@ -191,7 +191,8 @@ def _is_launchable(
         # pcie_ipc_ce_ring.cuh says why, and how far that has been established.
         if world_size == 2:
             return False
-        if not 0 < config.blocks <= CE_MAX_PIECES:
+        # The launcher checks blocks <= max_blocks for every variant.
+        if not 0 < config.blocks <= min(CE_MAX_PIECES, max_blocks):
             return False
         # The ring is bound by the fabric rather than by the SM, so the add
         # kernel's geometry is not worth a search dimension. The SM variants

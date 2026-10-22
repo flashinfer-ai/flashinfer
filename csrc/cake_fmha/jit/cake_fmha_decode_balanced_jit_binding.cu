@@ -116,12 +116,7 @@ constexpr int64_t kReduceSlicesMax = 8;
 constexpr uint32_t kQBoxRows = static_cast<uint32_t>(kMaxNRows / kGroup);
 #endif
 
-void CheckSameDevice(TensorView query, TensorView tensor, const char* name) {
-  TVM_FFI_ICHECK_EQ(query.device().device_type, tensor.device().device_type)
-      << name << " must be on the query device";
-  TVM_FFI_ICHECK_EQ(query.device().device_id, tensor.device().device_id)
-      << name << " must be on the query device";
-}
+#include "include/cake_fmha_host_helpers.inc"
 
 double ScalarScale(Variant<double, ffi::Tensor> scale, const char* name) {
   auto scalar = scale.as<double>();

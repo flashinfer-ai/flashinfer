@@ -7,15 +7,20 @@ NVFP4 supports four or eight ranks; MXFP4 supports power-of-two rank counts up t
 
 Usage::
 
+    # Once, at load time. Inputs are already in the format described in
+    # flashinfer.megamoe.weights: Marlin byte order, scales within the decoder
+    # range, and the excess moved into per-expert FP32 global scales g1 / g2.
+    w1, w2 = transform_nvfp4_weights_for_mega_moe((w13, w13_sf), (w2_raw, w2_sf))
     buf = MegaMoESymmBuffer(group, num_experts=256, num_max_tokens_per_rank=8448,
                             num_topk=6, hidden=4096, intermediate_hidden=2048)
+    # Every step: stage FP8 activations and routing, then run.
     buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
-    nvfp4_mega_moe(y, l1_weights, l2_weights, buf)
+    nvfp4_mega_moe(y, w1, w2, buf, l1_global_scales=g1, l2_global_scales=g2)
 """
 
 import dataclasses
 import functools
-from typing import Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -60,7 +65,7 @@ def _get_jit_module(factory, *args):
     return factory(*args).build_and_load()
 
 
-def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
+def _jit_args(factory, plan, b):
     args = (plan, b.num_sms)
     # Keep the trailing fused rank argument compatible with existing JIT callers.
     if factory is not gen_megamoe_sm90_nvfp4_module:
@@ -76,7 +81,11 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
     )
     if factory is gen_megamoe_sm90_nvfp4_module:
         args += (b.group.size(),)
-    module = _get_jit_module(factory, *args)
+    return args
+
+
+def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
+    module = _get_jit_module(factory, *_jit_args(factory, plan, b))
     getattr(module, entry)(
         y,
         b.buffer,
@@ -96,7 +105,8 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
 class MegaMoESymmBuffer:
     """Allocate symmetric input, expert-token and output-combine storage.
 
-    All ranks must use identical geometry and invoke kernels in matching order.
+    All ranks must use identical geometry and invoke kernels in matching order,
+    with the same token count on every rank (the plan is selected from it).
     Allocation and rendezvous are collective and must precede CUDA graph capture.
 
     Parameters
@@ -117,6 +127,15 @@ class MegaMoESymmBuffer:
         SwiGLU clamp value. Defaults to 10.0.
     fast_math : bool
         Use the family's fast-math policy. Defaults to True.
+
+    Attributes
+    ----------
+    x, x_sf, topk_idx, topk_weights : torch.Tensor
+        This rank's staging views (E4M3 ``[capacity, hidden]``, FP32
+        ``[capacity, hidden // 128]``, INT64 ``[capacity, num_topk]`` and FP32
+        ``[capacity, num_topk]``). :meth:`stage` copies into them; a producer
+        that writes the first ``m`` rows directly calls
+        :meth:`commit_staged` instead.
     """
 
     def __init__(
@@ -233,7 +252,8 @@ class MegaMoESymmBuffer:
             FP32 routing weights with shape ``[tokens, num_topk]``.
 
         All tensors must be on the buffer's CUDA device. The token count must
-        be positive and fit the allocated capacity.
+        be positive and fit the allocated capacity. Every rank must stage the
+        same token count; pad short ranks with rows routed to -1.
         """
         m = x_fp8.shape[0]
         for tensor, shape, dtype in (
@@ -257,6 +277,85 @@ class MegaMoESymmBuffer:
         self.topk_idx[:m].copy_(topk_idx)
         self.topk_weights[:m].copy_(topk_weights)
         self.num_staged_tokens = m
+
+    def commit_staged(self, num_tokens: int) -> None:
+        """Mark rows written directly into the staging views as this call's input.
+
+        Use instead of :meth:`stage` when a producer (for example a fused
+        quantize-and-route kernel) already wrote the first ``num_tokens`` rows of
+        ``x``, ``x_sf``, ``topk_idx`` and ``topk_weights`` on the current stream.
+
+        Parameters
+        ----------
+        num_tokens : int
+            Number of staged rows; positive, at most the buffer capacity, and
+            equal on every rank (pad short ranks with rows routed to -1).
+        """
+        if self.buffer is None:
+            raise ValueError("symmetric buffer has been destroyed")
+        if not 0 < num_tokens <= self.num_max_tokens_per_rank:
+            raise ValueError("staged token count exceeds buffer capacity")
+        self.num_staged_tokens = int(num_tokens)
+
+    def prewarm(
+        self, kernel_family: str = "auto", family_threshold: Optional[int] = None
+    ) -> int:
+        """Build every NVFP4 module :func:`nvfp4_mega_moe` can select up to capacity.
+
+        Collective over the buffer's group, before CUDA graph capture: ranks
+        compile disjoint shards (the JIT cache is file-locked), synchronize, then
+        load every module, so the first call at any token count does not compile.
+
+        Parameters
+        ----------
+        kernel_family : str
+            ``"auto"``, ``"fused"`` or ``"split"``, as passed to
+            :func:`nvfp4_mega_moe`.
+        family_threshold : int, optional
+            Auto-selection threshold; defaults to ``FAMILY_THRESHOLD``.
+
+        Returns
+        -------
+        int
+            Number of distinct modules built.
+        """
+        if kernel_family not in ("auto", "fused", "split"):
+            raise ValueError(
+                f"kernel_family must be 'auto', 'fused' or 'split', got {kernel_family!r}"
+            )
+        threshold = FAMILY_THRESHOLD if family_threshold is None else family_threshold
+        geometry = (
+            self.num_sms,
+            self.group.size(),
+            self.num_experts,
+            self.num_topk,
+            self.hidden,
+            self.intermediate_hidden,
+            self.num_max_tokens_per_rank,
+        )
+        jobs: Dict[Tuple[Any, Tuple[Any, ...]], int] = {}
+        for m in range(1, self.num_max_tokens_per_rank + 1):
+            fused = kernel_family == "fused" or (
+                kernel_family == "auto" and m <= threshold
+            )
+            factory: Callable[..., Any]
+            plan: Union[FusedPlan, SplitPlan]
+            if fused:
+                factory = gen_megamoe_sm90_nvfp4_module
+                plan = select_fused_plan(*geometry, m)
+            else:
+                factory = gen_megamoe_sm90_nvfp4_split_module
+                plan = select_split_plan(*geometry, m)
+            jobs.setdefault((factory, _jit_args(factory, plan, self)), m)
+        keys = sorted(jobs, key=jobs.__getitem__)
+        rank, ranks = self.group.rank(), self.group.size()
+        for factory, args in keys[rank::ranks]:
+            _get_jit_module(factory, *args)
+        torch.distributed.barrier(group=self.group)
+        for factory, args in keys:
+            _get_jit_module(factory, *args)
+        torch.distributed.barrier(group=self.group)
+        return len(keys)
 
     def destroy(self) -> None:
         """Release this rank's views and symmetric-memory handle."""
@@ -291,7 +390,10 @@ def nvfp4_mega_moe(
     symm_buffer : MegaMoESymmBuffer
         Buffer populated by :meth:`MegaMoESymmBuffer.stage` on every rank.
     num_tokens : int, optional
-        Tokens on this rank. Defaults to ``y.shape[0]``.
+        Tokens on this rank. Defaults to ``y.shape[0]``. Must be equal on every
+        rank: the kernel family, tile and dispatch mode are selected from it, and
+        all ranks must launch the same kernel. Pad short ranks with rows routed
+        to -1.
     cumulative_local_expert_recv_stats : torch.Tensor, optional
         INT32 vector with one entry per local expert. Receive counts are
         accumulated in place; initialize the vector before first use.
@@ -299,7 +401,10 @@ def nvfp4_mega_moe(
         FP32 vectors with one multiplier per local expert. Omitted scales use 1.
     force_push_dispatch, force_no_clean_barrier : bool, optional
         Override the fused counter-dispatch policy. None uses the default
-        policy. These overrides do not apply to the split family.
+        policy. Counter dispatch is limited to the validated small-M plans
+        (``num_tokens <= 64`` and ``BLOCK_M <= 24``); outside them the
+        overrides are ignored and the barrier path is used. These overrides
+        do not apply to the split family.
     kernel_family : str
         ``"auto"``, ``"fused"`` or ``"split"``. Auto selects fused through
         ``family_threshold`` tokens per rank, then split.
@@ -452,7 +557,10 @@ def mxfp4_mega_moe(
     symm_buffer : MegaMoESymmBuffer
         Buffer populated by :meth:`MegaMoESymmBuffer.stage` on every rank.
     num_tokens : int, optional
-        Tokens on this rank. Defaults to ``y.shape[0]``.
+        Tokens on this rank. Defaults to ``y.shape[0]``. Must be equal on every
+        rank: the kernel family, tile and dispatch mode are selected from it, and
+        all ranks must launch the same kernel. Pad short ranks with rows routed
+        to -1.
     cumulative_local_expert_recv_stats : torch.Tensor, optional
         INT32 vector with one entry per local expert. Receive counts are
         accumulated in place; initialize the vector before first use.

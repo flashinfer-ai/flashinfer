@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ast
+import dataclasses
 import re
 from collections import OrderedDict
 from pathlib import Path
@@ -23,61 +24,62 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.experimental.dense_projection_gemm import (
-    cake_backend,
-    cake_build,
-    cake_jit,
-)
-from flashinfer.experimental.dense_projection_gemm.cake_backend import (
-    ARCH_RULE_DEFAULTS,
-    BLOCK_K,
-    BLOCK_N_CHOICES,
-    CONVENIENCE_CACHE_SIZE,
-    CTA_GROUP,
-    CTA_ROWS_CHOICES,
-    EPI_WARPS,
-    ROUTER_SPLITS,
-    ROW_RULES,
-    SK_DUMMY_BASE,
-    SK_MIN_ITERS,
-    SMEM_OPT_IN,
-    arch_for,
-    bind_launch,
-    convenience_key,
-    default_block_n,
-    default_group_m,
-    default_hints,
-    default_hints_cgrp,
-    b_stage_bytes,
-    box_rows_of,
-    default_stages,
-    device_l2_bytes,
-    epi_cols,
-    epi_mode,
-    epi_slots,
-    generated_program_available,
-    instance_key,
-    instance_symbol,
-    sk_exact_plan,
-    sk_sync_plan,
-    operand_view,
-    plan_dense_projection_gemm,
-    plan_router_fp32_gemm,
-    prepare_dense_projection_gemm,
-    prepare_projection_wgrad,
-    prepare_router_fp32_gemm,
-    router_layout_class,
-    row_rule,
-    sk_parts_plan,
-    smem_limit_for,
-    split_fp32_to_bf16x3_,
-    stream_k_plan,
-    swap_small_m,
-    wave_working_set,
-    wave_working_set_cgrp,
-    wgrad_swapped,
-    wgrad_views,
-)
+from tests.test_helpers.cake_package import cake_package
+
+# Backend suite: the package is named once, through ``cake_package``; nothing else
+# of flashinfer is imported here.
+cake_backend = cake_package("dense_projection_gemm", "cake_backend")
+cake_build = cake_package("dense_projection_gemm", "cake_build")
+cake_jit = cake_package("dense_projection_gemm", "cake_jit")
+ARCH_RULE_DEFAULTS = cake_backend.ARCH_RULE_DEFAULTS
+BLOCK_K = cake_backend.BLOCK_K
+BLOCK_N_CHOICES = cake_backend.BLOCK_N_CHOICES
+CONVENIENCE_CACHE_SIZE = cake_backend.CONVENIENCE_CACHE_SIZE
+CTA_GROUP = cake_backend.CTA_GROUP
+CTA_ROWS_CHOICES = cake_backend.CTA_ROWS_CHOICES
+EPI_WARPS = cake_backend.EPI_WARPS
+ROUTER_SPLITS = cake_backend.ROUTER_SPLITS
+ROW_RULES = cake_backend.ROW_RULES
+SK_DUMMY_BASE = cake_backend.SK_DUMMY_BASE
+SK_MIN_ITERS = cake_backend.SK_MIN_ITERS
+SMEM_OPT_IN = cake_backend.SMEM_OPT_IN
+arch_for = cake_backend.arch_for
+bind_launch = cake_backend.bind_launch
+convenience_key = cake_backend.convenience_key
+default_block_n = cake_backend.default_block_n
+default_group_m = cake_backend.default_group_m
+default_hints = cake_backend.default_hints
+default_hints_cgrp = cake_backend.default_hints_cgrp
+b_stage_bytes = cake_backend.b_stage_bytes
+box_rows_of = cake_backend.box_rows_of
+default_stages = cake_backend.default_stages
+device_l2_bytes = cake_backend.device_l2_bytes
+epi_cols = cake_backend.epi_cols
+epi_mode = cake_backend.epi_mode
+epi_slots = cake_backend.epi_slots
+generated_program_available = cake_backend.generated_program_available
+instance_key = cake_backend.instance_key
+instance_symbol = cake_backend.instance_symbol
+sk_exact_plan = cake_backend.sk_exact_plan
+sk_sync_plan = cake_backend.sk_sync_plan
+check_stream_k_plan = cake_backend.check_stream_k_plan
+operand_view = cake_backend.operand_view
+plan_dense_projection_gemm = cake_backend.plan_dense_projection_gemm
+plan_router_fp32_gemm = cake_backend.plan_router_fp32_gemm
+prepare_dense_projection_gemm = cake_backend.prepare_dense_projection_gemm
+prepare_projection_wgrad = cake_backend.prepare_projection_wgrad
+prepare_router_fp32_gemm = cake_backend.prepare_router_fp32_gemm
+router_layout_class = cake_backend.router_layout_class
+row_rule = cake_backend.row_rule
+sk_parts_plan = cake_backend.sk_parts_plan
+smem_limit_for = cake_backend.smem_limit_for
+split_fp32_to_bf16x3_ = cake_backend.split_fp32_to_bf16x3_
+stream_k_plan = cake_backend.stream_k_plan
+swap_small_m = cake_backend.swap_small_m
+wave_working_set = cake_backend.wave_working_set
+wave_working_set_cgrp = cake_backend.wave_working_set_cgrp
+wgrad_swapped = cake_backend.wgrad_swapped
+wgrad_views = cake_backend.wgrad_views
 
 # Accuracy gates against the FP64 reference of the exact BF16 operands.
 # BF16 output: elementwise |out - ref| <= atol + rtol * |ref|, zero violations.
@@ -165,9 +167,9 @@ MLA_ROWS = {
 # and the L2 size (TMA eviction-hint working-set gate); B200 SXM (148 SMs) and Rubin R200 (212 SMs)
 # both report a 126 MiB L2.
 SM_COUNTS = (148, 212)
-# The instance every GLM-5.2 row resolves to on those devices, and the set the export registers.
+# The instance every GLM-5.2 row resolves to on those devices.
 # GENERATED from the Cake kernel host (adapter _plan_k1 with the mirrored sm_100a rule table) by the Cake
-# workspace tool stage/r2/gen_fi_test_tables.py; the exported set is cake_jit.KERNELS of the delivered tree. Do not hand-edit.
+# workspace tool stage/r2/gen_fi_test_tables.py. Do not hand-edit.
 # Table values are a template, or {(T, sm_count): template} when the plan depends on T / the device.
 # fmt: off
 # --- BEGIN GENERATED TABLES ---
@@ -524,96 +526,21 @@ MLA_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
     },
 }
-EXPORTED_TEMPLATES = frozenset(
-    {
-        'dense_proj_gemm_kk_n128_c1',
-        'dense_proj_gemm_kk_n128_hen_c1',
-        'dense_proj_gemm_kk_n128_hen_pro15',
-        'dense_proj_gemm_kk_n128_hen_pro7',
-        'dense_proj_gemm_kk_n128_pro7',
-        'dense_proj_gemm_kk_n192_hee_s8_pro15',
-        'dense_proj_gemm_kk_n192_m256_hen_s5_pro15',
-        'dense_proj_gemm_kk_n192_pro7',
-        'dense_proj_gemm_kk_n256_cg_pro15',
-        'dense_proj_gemm_kk_n256_cg_pro7',
-        'dense_proj_gemm_kk_n256_ht_pro15',
-        'dense_proj_gemm_kk_n256_m256_cg_or_pro7',
-        'dense_proj_gemm_kk_n256_m256_ht_cg_or_pro7',
-        'dense_proj_gemm_kk_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_kk_n256_pro15',
-        'dense_proj_gemm_kk_n256_pro7',
-        'dense_proj_gemm_kk_n256_q_pro7',
-        'dense_proj_gemm_kn_n128_f32_tma1_c1',
-        'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
-        'dense_proj_gemm_kn_n128_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n128_f32_tma2_s4_c1',
-        'dense_proj_gemm_kn_n256',
-        'dense_proj_gemm_kn_n256_cg_pro7',
-        'dense_proj_gemm_kn_n256_f32_tma1_pro15',
-        'dense_proj_gemm_kn_n256_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_ef_s9_pro15',
-        'dense_proj_gemm_kn_n256_f32_v8_ht_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        'dense_proj_gemm_kn_n256_hne_pro7',
-        'dense_proj_gemm_kn_n256_ht_pro15',
-        'dense_proj_gemm_kn_n256_m256_cg_or_pro7',
-        'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_ht_pro7',
-        'dense_proj_gemm_kn_n256_m256_ov_ht_pro15',
-        'dense_proj_gemm_kn_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_kn_n256_m256_tma1_bg4_pro7',
-        'dense_proj_gemm_kn_n256_pro15',
-        'dense_proj_gemm_kn_n256_pro7',
-        'dense_proj_gemm_kn_n256_q_pd1_pro7',
-        'dense_proj_gemm_kn_n256_tma1_bg8_pro7',
-        'dense_proj_gemm_kn_n256_tma1_bg8_sol_pro7',
-        'dense_proj_gemm_kn_n256_tma1_pd2_pro15',
-        'dense_proj_gemm_kn_n256_tma1_pro7',
-        'dense_proj_gemm_kn_n256_tma2_pd2_pro15',
-        'dense_proj_gemm_kn_n256_tma2_pd2_pro7',
-        'dense_proj_gemm_kn_n256_tma2_pd3_c1',
-        'dense_proj_gemm_nk_n256_t_pro7',
-        'dense_proj_gemm_nn_n128_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_hen_f32_t_skx_pro7',
-        'dense_proj_gemm_nn_n128_hen_t_skx_pro7',
-        'dense_proj_gemm_nn_n128_m64_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_f32_t_skx_pro15',
-        'dense_proj_gemm_nn_n128_m64_hen_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_t_skx_pro15',
-        'dense_proj_gemm_nn_n128_m64_t_pro7',
-        'dense_proj_gemm_nn_n128_t_pro7',
-        'dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef_pro15',
-        'dense_proj_gemm_nn_n160_m256_bz64_pro15',
-        'dense_proj_gemm_nn_n192_bz64_hee_f32_t_pro7',
-        'dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt_pro15',
-        'dense_proj_gemm_nn_n192_hee_f32_t_tma1_pro7',
-        'dense_proj_gemm_nn_n192_hee_t_tma1_pro7',
-        'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6_pro7',
-        'dense_proj_gemm_nn_n192_m256_t_tma1_pro7',
-        'dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n256_f32_v8_pro15',
-        'dense_proj_gemm_nn_n256_f32_v8_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_ht_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_v8_ef_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
-        'dense_proj_gemm_nn_n256_m256_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_ht_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_pro7',
-        'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n256_m256_t_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        'dense_proj_gemm_nn_n256_pro15',
-        'dense_proj_gemm_nn_n256_sks_sb2_pro7',
-    }
-)
 # --- END GENERATED TABLES ---
 # fmt: on
+# The K1 templates the export registers: the union over the architectures of
+# ``cake_jit.KERNELS`` (the per-architecture filter of ``_registered`` below).
+# The count pins the number of templates in the export this suite was written
+# against: an export with another count fails here, at import, before any test
+# runs; a same-count substitution passes this pin and is left to the tests that
+# name templates (the planner tables above, the symbol and record pins below).
+EXPORTED_TEMPLATES = frozenset(
+    template
+    for arch in cake_jit.KERNELS
+    for template in cake_jit.KERNELS[arch]
+    if template.startswith("dense_proj_gemm_")
+)
+assert len(EXPORTED_TEMPLATES) == 84
 
 
 def _expected(table, key, T, sm_count):
@@ -3805,9 +3732,9 @@ def test_instance_key_rejects_bad_configurations():
 
 @pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
 def test_stream_k_plan_rules(pairs):
-    # --- sk="auto" (the launcher default): a K-aligned two-way split of a single partial wave ---
-    # every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an A / B
-    # panel stay K-synchronised and the fixup reads one slab
+    # --- sk="auto" (the launcher default): a two-way split of a single partial wave ---
+    # on an even K every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an
+    # A / B panel stay K-synchronised and the fixup reads one slab
     assert stream_k_plan(24, 96, pairs, sk="auto") == (0, 24, 48, 48)
     assert stream_k_plan(pairs // 2, 96, pairs, sk="auto") == (
         0,
@@ -3815,12 +3742,12 @@ def test_stream_k_plan_rules(pairs):
         2 * (pairs // 2),
         48,
     )
-    assert stream_k_plan(10, 17, pairs, sk="auto") == (
-        0,
-        10,
-        20,
-        9,
-    )  # odd K steps: ceil(k / 2)
+    # odd K steps: units of ceil(k / 2) over the linearised 10 x 17 steps; 2 x 10 units would leave the last one
+    # starting at step 19 x 9 = 171 of 170, so the plan has the 19 that hold a K step
+    assert stream_k_plan(10, 17, pairs, sk="auto") == (0, 10, 19, 9)
+    assert stream_k_plan(16, 17, pairs, sk="auto") == (0, 16, 31, 9)
+    # 15 x 9 < 8 x 17: still two units per tile
+    assert stream_k_plan(8, 17, pairs, sk="auto") == (0, 8, 16, 9)
     assert stream_k_plan(10, 2 * SK_MIN_ITERS, pairs, sk="auto") == (
         0,
         10,
@@ -3885,6 +3812,50 @@ def test_stream_k_plan_rules(pairs):
     # --- sk="tiles": the diagnostic whole-tile unit path ---
     assert stream_k_plan(pairs + 10, 256, pairs, sk="tiles") == (pairs, 10, 10, 256)
     assert stream_k_plan(0, 96, pairs, sk=True) == (0, 0, 0, 96)
+
+
+@pytest.mark.parametrize("pairs", [74, 76, 106])  # 148 / 152 / 212 SMs
+def test_stream_k_plans_give_every_unit_a_k_step(pairs):
+    # a unit without a K step never finishes in the pd 2 / sk_slab 2 / stt programs (the work handoff runs in an
+    # item's last segment): every linearised policy plans the units that hold one, and nothing more
+    for tiles in range(1, 2 * pairs + 3):
+        for k_blocks in range(1, 80):
+            for sk in ("auto", True):
+                num_full, tail, units, ipu = stream_k_plan(tiles, k_blocks, pairs, sk)
+                if units:
+                    assert (
+                        ipu >= 1 and (units - 1) * ipu < tail * k_blocks <= units * ipu
+                    )
+
+
+def test_check_stream_k_plan_refuses_a_plan_outside_the_launch_contract():
+    # the dgrad of T = 1024, N = 1032, K = 1000 on 76 CTA pairs: 16 tail tiles of 17 K steps, one partial wave
+    E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
+    kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
+    plan, *_ = plan_dense_projection_gemm(
+        E(1024, 1032), E(1032, 1000), E(1024, 1000), pd=2, slots=2, epi="tma", **kw
+    )
+    assert plan.pd == 2 and (plan.tail_tiles, plan.k_blocks) == (16, 17)
+    assert (plan.sk_units, plan.iters_per_unit, plan.sk_iters) == (31, 9, 272)
+    check_stream_k_plan(plan)
+    # the 2 x tail units of the earlier plan: unit 31 starts at K step 279 of 272
+    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
+        check_stream_k_plan(dataclasses.replace(plan, sk_units=32))
+    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
+        check_stream_k_plan(dataclasses.replace(plan, iters_per_unit=0))
+    # the same empty unit is legal on a program that hands off at the bottom of the item loop
+    check_stream_k_plan(dataclasses.replace(plan, pd=0, sk_units=32))
+    # synchronised plans: a collector for every program, at most one per tail tile for the sk_slab 2 / stt ones
+    sync = dataclasses.replace(
+        plan, pd=0, sk_sync=True, sk_slab=2, sk_units=32, iters_per_unit=9
+    )
+    check_stream_k_plan(sync)
+    with pytest.raises(ValueError, match="collectors <= tail_tiles"):
+        check_stream_k_plan(dataclasses.replace(sync, sk_units=33))
+    check_stream_k_plan(dataclasses.replace(sync, sk_slab=0, sk_units=33))
+    for slab in (0, 2):
+        with pytest.raises(ValueError, match="1 <= collectors"):
+            check_stream_k_plan(dataclasses.replace(sync, sk_slab=slab, sk_units=16))
 
 
 def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
@@ -4317,12 +4288,13 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         and 2 * plan.tail_tiles <= plan.sm_pairs
                     )
                     assert plan.k_blocks >= 2 * SK_MIN_ITERS
+                    # the units of ceil(k_blocks / 2) K steps that hold one: 2 x tail on an even k_blocks
+                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
                     assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
                         0,
                         plan.pair_tiles,
-                        2 * plan.pair_tiles,
+                        -(-(plan.pair_tiles * plan.k_blocks) // plan.iters_per_unit),
                     )
-                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
                 if plan.sk_units and not htail and sync_plan is None:
                     assert (
                         plan.ws_f32_elems
@@ -5515,6 +5487,46 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     ) != cake_backend.convenience_key(
         0, 0, (True, ("cta_rows", 128), ("sk", "auto")), G, X, out1
     )
+
+
+# longer than a cold-cache JIT build; the hang this test guards against never returns
+@pytest.mark.timeout(300)
+def test_pd2_stream_k_on_an_odd_k_completes():
+    """The dgrad of T = 1024, N = 1032, K = 1000 is one partial wave of 16 tiles of 17 K steps.  Two units per tile
+    would leave the last one without a K step, and the pd 2 program waits for that unit's accumulator forever; the
+    planner plans the 31 units that hold one."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(SEED + 11)
+    T, N, K = 1024, 1032, 1000
+    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
+    W = (torch.randn(N, K, device=device, generator=g) * N**-0.5).to(torch.bfloat16)
+    v = dict(
+        A=G,
+        B=W,
+        out=torch.full((T, K), float("nan"), device=device, dtype=torch.bfloat16),
+    )
+    knobs = _registered_knobs(
+        v,
+        dict(pd=2, slots=2, epi="tma"),
+        dict(pd=2, slots=2, epi="tma", pro=15),
+        dict(pd=2, slots=1, epi="tma", pro=15),
+    )
+    prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"], **knobs)
+    plan = prepared.plan
+    assert plan.pd == 2 and plan.k_blocks == 17 and plan.tail_tiles * 2 <= plan.sm_pairs
+    assert (
+        (plan.sk_units - 1) * plan.iters_per_unit
+        < plan.sk_iters
+        < 2 * plan.tail_tiles * plan.iters_per_unit
+    )
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(v["out"], G.double() @ W.double())
 
 
 def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):

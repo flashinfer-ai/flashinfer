@@ -2022,13 +2022,14 @@ def test_fp8_blackwell_tile_m_rule():
         and composition["form"] == constants["form"]
     )
     # the composition record is the gated record on the 512-row tile: only the tile height, the per-record identity
-    # (module / device / binding names) and the architecture list differ; the rule data and every launch fact are shared
+    # (module / device names and the compile definitions that select the program in the family's shared binding)
+    # and the architecture list differ; the rule data and every launch fact are shared
     assert {key for key in gated if gated[key] != composition[key]} == {
         "tile_m",
         "pair_m",
         "module",
         "device",
-        "binding",
+        "compile_flags",
         "arches",
     }
     assert gated["arches"] == ["sm_100a", "sm_103a"] and composition["arches"] == [
@@ -2583,10 +2584,14 @@ def test_fp8_sm90_dispatch_rule():
         "fp8_sm90",
         "fp8_sm90_hint",
     )
+    # The gated program's raster group is 1 since CAKE-2550 step 2 (4 since #6324): on the one contract row the rule
+    # selects (M 131072 x N 8192 x K 32768) this program reads 60.1-60.7 ms back to back / 58.7-60.4 ms cooled at group 1
+    # against 64.3-67.7 / 69.0-80.0 ms at group 4 (six same-GPU interleaved CUPTI cold-L2 runs on two H100 nodes, four of
+    # them sweeping the group; group 2 60.5-62.2 / 59.4-63.0 ms, group 8 79.5 ms); the output is bit-identical across groups.
     assert (
         (default["group_m"], gated["group_m"])
         == (constants["default_group_m"], constants["gated_group_m"])
-        == (8, 4)
+        == (8, 2)
     )
     assert default["form"] != gated["form"]
     assert default["block_n"] == gated["block_n"] == constants["block_n"] == 192
@@ -2684,7 +2689,13 @@ def test_launch_grid_rules():
         PROGRAMS["fp8_blackwell_n256_clc_blocked"], 32768, 8192, 148
     ) == (2 * 128 * 32, 1, 1)
     assert launch_grid(PROGRAMS["fp8_sm90"], 129, 3072, 132) == (132, 1, 1)
-    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (132, 1, 1)
+    # The gated program launches four cluster tiles per cluster: 512 m-pairs x 43 n-tiles = 22016 tiles -> 5504 clusters.
+    assert PROGRAMS["fp8_sm90"]["tiles_per_cluster"] is None
+    assert PROGRAMS["fp8_sm90_hint"]["tiles_per_cluster"] == 4
+    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (2 * 5504, 1, 1)
+    # A tail m-tile adds n_pairs single-m-tile tiles: 4097 rows = 33 m-tiles = 16 pairs + 1 tail, 3072 = 16 n-tiles
+    # -> 256 + 8 = 264 cluster tiles -> 66 clusters.
+    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 4097, 3072, 132) == (2 * 66, 1, 1)
 
 
 # --------------------------------------------------------------------------- #

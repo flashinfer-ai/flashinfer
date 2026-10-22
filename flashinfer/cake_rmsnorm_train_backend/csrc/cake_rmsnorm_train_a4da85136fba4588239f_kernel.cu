@@ -14,24 +14,56 @@
  * limitations under the License.
  */
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_rmsnorm_train_device_common.cuh"
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 16
-#define SMEM_PARTIALS_STRIDE 16
+#define SMEM_PARTIALS_STAGE_BYTES 32
+#define SMEM_PARTIALS_STRIDE 32
 #define SMEM_TOTAL 128
 #define THREADS 64
 #define ROWS_PER_CTA 2
 #define GROUP_THREADS 64
 #define LAUNCH_BOUNDS_THREADS 64
 
+#include <math_constants.h>
+
 extern "C" {
 
 __global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
-kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, long long x_stride, long long u_stride, float eps)
+kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -52,10 +84,10 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
     const int cta_rank = 0;
 
     // Kernel setup ops
-    float* partials = reinterpret_cast<float*>(smem_raw + SMEM_PARTIALS_OFF);
-    const int partials_addr = smem + SMEM_PARTIALS_OFF;
+    float* partials = reinterpret_cast<float*>(smem_raw + 0);
+    const int partials_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;
@@ -75,7 +107,7 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
             int rowa = row0 + group * 2 + rr_1;
             if (rowa < T) {
                 long long row64a = (long long)rowa;
-                long long xbasea = row64a * x_stride;
+                long long xbasea = row64a * x_stride_p0;
                 #pragma unroll
                 for (int v = 0; v < 2; v++) {
                     float _vec_load_0[16];
@@ -118,7 +150,7 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
                 for (int v_1 = 0; v_1 < 2; v_1++) {
                     #pragma unroll
                     for (int j_1 = 0; j_1 < 16; j_1++) {
-                        acc += x_cache[rr_2 * 32 + v_1 * 16 + j_1] * x_cache[rr_2 * 32 + v_1 * 16 + j_1];
+                        acc = __fmaf_rn(x_cache[rr_2 * 32 + v_1 * 16 + j_1], x_cache[rr_2 * 32 + v_1 * 16 + j_1], acc);
                     }
                 }
                 sums[rr_2] = acc;
@@ -128,11 +160,11 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
         #pragma unroll
         for (int rr_3 = 0; rr_3 < 2; rr_3++) {
             float red = sums[rr_3];
-            float _warp_reduce_0 = red;
+            float _warp_reduce_1 = red;
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-            red = _warp_reduce_0;
+                _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+            red = _warp_reduce_1;
             if (lane == 0) {
                 partials[par + warp_0 * 2 + rr_3] = red;
             }
@@ -152,10 +184,9 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
         for (int rr_5 = 0; rr_5 < 2; rr_5++) {
             float total_r = sums[rr_5];
             float mean_r = total_r * 0.00048828125f;
-            float _sqrt_0;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(mean_r + eps));
-            float _rcp_0 = __frcp_rn(_sqrt_0);
-            float rstd_r = _rcp_0;
+            float _sqrt_2;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_2) : "f"(mean_r + eps));
+            float rstd_r = __frcp_rn(_sqrt_2);
             int rowc = row0 + group * 2 + rr_5;
             if (rowc < T) {
                 long long row64c = (long long)rowc;
@@ -167,26 +198,26 @@ kernel_cake_rmsnorm_train_a4da85136fba4588239f(__nv_bfloat16* __restrict__ x, __
                 for (int v_2 = 0; v_2 < 2; v_2++) {
                     float _vec_load_1[16];
                     {
-                        const void* _v8p_1 = (const void*)(w + (gtid * 16 + v_2 * (GROUP_THREADS * 16)) + (0));
-                        uint32_t _v8_1_0[8];
+                        const void* _v8p_3 = (const void*)(w + (gtid * 16 + v_2 * (GROUP_THREADS * 16)) + (0));
+                        uint32_t _v8_3_0[8];
                         asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                            : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]), "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7]) : "l"((const void*)((const char*)_v8p_1 + 0)) : "memory");
-                        (&_vec_load_1[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) << 16);
-                        (&_vec_load_1[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) & 0xffff0000u);
-                        (&_vec_load_1[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) << 16);
-                        (&_vec_load_1[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) & 0xffff0000u);
-                        (&_vec_load_1[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) << 16);
-                        (&_vec_load_1[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) & 0xffff0000u);
-                        (&_vec_load_1[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) << 16);
-                        (&_vec_load_1[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) & 0xffff0000u);
-                        (&_vec_load_1[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) << 16);
-                        (&_vec_load_1[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) & 0xffff0000u);
-                        (&_vec_load_1[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) << 16);
-                        (&_vec_load_1[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) & 0xffff0000u);
-                        (&_vec_load_1[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) << 16);
-                        (&_vec_load_1[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) & 0xffff0000u);
-                        (&_vec_load_1[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) << 16);
-                        (&_vec_load_1[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) & 0xffff0000u);
+                            : "=r"(_v8_3_0[0]), "=r"(_v8_3_0[1]), "=r"(_v8_3_0[2]), "=r"(_v8_3_0[3]), "=r"(_v8_3_0[4]), "=r"(_v8_3_0[5]), "=r"(_v8_3_0[6]), "=r"(_v8_3_0[7]) : "l"((const void*)((const char*)_v8p_3 + 0)) : "memory");
+                        (&_vec_load_1[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[0]) << 16);
+                        (&_vec_load_1[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[0]) & 0xffff0000u);
+                        (&_vec_load_1[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[1]) << 16);
+                        (&_vec_load_1[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[1]) & 0xffff0000u);
+                        (&_vec_load_1[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[2]) << 16);
+                        (&_vec_load_1[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[2]) & 0xffff0000u);
+                        (&_vec_load_1[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[3]) << 16);
+                        (&_vec_load_1[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[3]) & 0xffff0000u);
+                        (&_vec_load_1[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[4]) << 16);
+                        (&_vec_load_1[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[4]) & 0xffff0000u);
+                        (&_vec_load_1[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[5]) << 16);
+                        (&_vec_load_1[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[5]) & 0xffff0000u);
+                        (&_vec_load_1[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[6]) << 16);
+                        (&_vec_load_1[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[6]) & 0xffff0000u);
+                        (&_vec_load_1[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[7]) << 16);
+                        (&_vec_load_1[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_3_0[7]) & 0xffff0000u);
                     }
                     #pragma unroll
                     for (int j_2 = 0; j_2 < 16; j_2++) {

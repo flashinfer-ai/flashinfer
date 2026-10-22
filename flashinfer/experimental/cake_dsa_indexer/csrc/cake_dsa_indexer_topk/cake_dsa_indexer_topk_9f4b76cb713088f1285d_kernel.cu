@@ -51,10 +51,22 @@
 #define TILE_UNROLL 1
 #define LAUNCH_MIN_BLOCKS 1
 
+// Shared by every build.json entry that lists this translation unit in its sources: the entry's
+// compile definitions select the snake-order lever arms below (-DCAKE_LEVER_SNAKE=<n>; the
+// guarded default is this file's own value) and the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own
+// symbol>; every library of the family exports a distinct kernel); the defaults name this file's
+// own program.
+#ifndef CAKE_LEVER_SNAKE
+#define CAKE_LEVER_SNAKE 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_topk_9f4b76cb713088f1285d
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsa_indexer_topk_9f4b76cb713088f1285d(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int check_period, int grid_ctas, float softmax_scale, int n_split)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int check_period, int grid_ctas, float softmax_scale, int n_split)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -188,6 +200,11 @@ kernel_cake_dsa_indexer_topk_9f4b76cb713088f1285d(const __grid_constant__ CUtens
                     for (int rnd = unit_base_q / (grid_ctas / 2); rnd < (unit_base_q + (nb + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd++) {
                         int bid_i = (int)bid;
                         int pos_e = bid_i / 2;
+#if CAKE_LEVER_SNAKE == 1
+                        if ((rnd & 1) != 0) {
+                            pos_e = grid_ctas / 2 - 1 - pos_e;
+                        }
+#endif
                         int unit = rnd * (grid_ctas / 2) + pos_e;
                         int _min_0 = ((unit - unit_base_q) < (unit_base_q + (nb + 1) / 2 - 1 - unit) ? (unit - unit_base_q) : (unit_base_q + (nb + 1) / 2 - 1 - unit));
                         if (_min_0 >= 0) {
@@ -238,6 +255,11 @@ kernel_cake_dsa_indexer_topk_9f4b76cb713088f1285d(const __grid_constant__ CUtens
                     for (int rnd_1 = unit_base_k / (grid_ctas / 2); rnd_1 < (unit_base_k + (nb_1 + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd_1++) {
                         int bid_i_1 = (int)bid;
                         int pos_e_1 = bid_i_1 / 2;
+#if CAKE_LEVER_SNAKE == 1
+                        if ((rnd_1 & 1) != 0) {
+                            pos_e_1 = grid_ctas / 2 - 1 - pos_e_1;
+                        }
+#endif
                         int unit_1 = rnd_1 * (grid_ctas / 2) + pos_e_1;
                         int _min_1 = ((unit_1 - unit_base_k) < (unit_base_k + (nb_1 + 1) / 2 - 1 - unit_1) ? (unit_1 - unit_base_k) : (unit_base_k + (nb_1 + 1) / 2 - 1 - unit_1));
                         if (_min_1 >= 0) {
@@ -377,6 +399,11 @@ kernel_cake_dsa_indexer_topk_9f4b76cb713088f1285d(const __grid_constant__ CUtens
                 for (int rnd_2 = unit_base_m / (grid_ctas / 2); rnd_2 < (unit_base_m + (nb_2 + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd_2++) {
                     int bid_i_2 = (int)bid;
                     int pos_e_2 = bid_i_2 / 2;
+#if CAKE_LEVER_SNAKE == 1
+                    if ((rnd_2 & 1) != 0) {
+                        pos_e_2 = grid_ctas / 2 - 1 - pos_e_2;
+                    }
+#endif
                     int unit_2 = rnd_2 * (grid_ctas / 2) + pos_e_2;
                     int _min_5 = ((unit_2 - unit_base_m) < (unit_base_m + (nb_2 + 1) / 2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + (nb_2 + 1) / 2 - 1 - unit_2));
                     if (_min_5 >= 0) {
@@ -561,6 +588,11 @@ kernel_cake_dsa_indexer_topk_9f4b76cb713088f1285d(const __grid_constant__ CUtens
                 for (int rnd_3 = unit_base / (grid_ctas / 2); rnd_3 < (unit_base + (nb_3 + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd_3++) {
                     int bid_i_0 = (int)bid;
                     int pos_e_3 = bid_i_0 / 2;
+#if CAKE_LEVER_SNAKE == 1
+                    if ((rnd_3 & 1) != 0) {
+                        pos_e_3 = grid_ctas / 2 - 1 - pos_e_3;
+                    }
+#endif
                     int unit_3 = rnd_3 * (grid_ctas / 2) + pos_e_3;
                     int _min_8 = ((unit_3 - unit_base) < (unit_base + (nb_3 + 1) / 2 - 1 - unit_3) ? (unit_3 - unit_base) : (unit_base + (nb_3 + 1) / 2 - 1 - unit_3));
                     if (_min_8 >= 0) {

@@ -11,19 +11,8 @@ import torch
 from tests.trace.reference_utils import (
     _assert_finite,
     _skip_if_not_sm100,
+    _unswizzle_mxfp8_scales_128x4,
 )
-
-
-def _unswizzle_mxfp8_scales_128x4(sf: torch.Tensor, row: int, col: int) -> torch.Tensor:
-    """Invert the 128x4 swizzle to a plain ``[row, col // 32]`` scale grid."""
-    scale_vec_size = 32
-    factor = scale_vec_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
-    sf_reshaped = sf.reshape(num_m_tiles, num_k_tiles, 32, 4, 4)
-    sf_unswizzled = sf_reshaped.transpose(1, 3)
-    sf_unswizzled = sf_unswizzled.reshape(num_m_tiles * 32 * 4, num_k_tiles * 4)
-    return sf_unswizzled[:row, : (col // scale_vec_size)].contiguous()
 
 
 @pytest.mark.parametrize(

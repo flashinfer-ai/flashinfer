@@ -10,8 +10,8 @@ at or beyond ``masked_m[g]`` are unspecified (whole tiles may be stored), as on
 the DeepGEMM path.
 
 The host side selects the route with the Cake dispatcher's ordered first-match
-chain rendered per ``(architecture, SM count)`` into
-:mod:`flashinfer.jit.gemm.cake_batch_deepgemm_fp8`, binds the positional argument
+route table of :mod:`flashinfer.jit.gemm.cake_batch_deepgemm_fp8`, read per
+``(architecture, SM count)``, binds the positional argument
 plan of each registered program and launches the one or two kernels of the route
 back to back on PyTorch's current stream.  Tensor maps are encoded by the binding
 and passed to the kernel by value, so a prepared launch owns no descriptor

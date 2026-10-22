@@ -61,9 +61,10 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   arbitrary downstream losses; its forward saves only the FP32 row statistics
   (`lse` and the selected logit) and the backward recomputes each chunk's
   logits from the saved inputs (four GEMMs per chunk).
-* Valid-row compaction (`compact_rows`, default on unless
-  `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS=0`): when some labels are `-100`
-  the chunk loop runs over the valid rows only.  The int64 row index
+* Valid-row compaction (`compact_rows`, a keyword of every eager and autograd
+  entry point, default `True`; `prepare_lm_head_loss` takes it as a bool or the
+  valid-row tensor, default `False`): when some labels are `-100` the chunk loop runs over the valid rows
+  only.  The int64 row index
   `(labels >= 0).nonzero()` is formed once per call (one device
   synchronization for the count, one for the index), every chunk gathers its
   rows of `X` into one reusable BF16 `[chunk_size, H]` buffer (`x_c`, a
@@ -80,8 +81,8 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   row ignored: zeros without a launch.  The prepared runner
   (`prepare_lm_head_loss(..., compact_rows=True)`) fixes the valid-row set at
   preparation and returns the compact forms (`runner.scatter` restores `[T]`).
-* Fused weight-gradient cast (`fuse_dw_cast`, default on unless
-  `FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST=0`): the last chunk's
+* Fused weight-gradient cast (`fuse_dw_cast`, keyword, default `True`): the
+  last chunk's
   weight-gradient GEMM runs in the backward, where the upstream scalar
   gradient `g` is known, with the scale and the output cast fused into its
   epilogue (`gemm_dw_cast_bf16` / `gemm_dw_cast_f32`): the forward
@@ -100,8 +101,8 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   and `ForwardResult.backward` / `backward_loss(..., dz_last=...)` finish
   `dW`; the prepared runner keeps that chunk's `dz` in the workspace between
   `forward()` and `backward()`.
-* Fused dX finalize (default on unless
-  `FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0`): a K-sliced `dX` GEMM's FP32
+* Fused dX finalize (`dx_finalize`, keyword, default `True`): a K-sliced `dX`
+  GEMM's FP32
   slabs are added into `dX_acc` by one fixed-order kernel (`slab_sum`: one RN
   add per element per slab in ascending slab order -- the evaluation order of
   the previous chain of in-place `add_` launches, with `dX_acc` read and
@@ -115,12 +116,13 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   row_valid=...)` / `finalize_dx` select the one-pass form, the log-probability
   backward finalizes its accumulator the same way, and every row valid stays
   the single flat cast.  The same FP32 operations in the same order: `dX` is
-  bitwise the previous path's, and `0` restores that path.  The prepared runner
+  bitwise the previous path's, and `dx_finalize=False` restores that path.  The prepared runner
   keeps its compact `dx_out` contract (`runner.scatter` restores `[T, H]`) and
   gains the kernel slab reduction only.
-* dW side stream (`FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`: `auto` (default) =
-  calls of three or more chunks, `1` = every multi-chunk call, `0` = never):
-  each chunk's weight-gradient accumulate GEMM is launched on a per-device side
+* dW side stream (`dw_stream`, keyword: `None` / `"auto"` (default) = calls of
+  three or more chunks, `True` = every multi-chunk call, `False` = never;
+  `cake_backend.dw_stream_mode` normalises the value): each chunk's
+  weight-gradient accumulate GEMM is launched on a per-device side
   stream forked after the chunk's `row_grad` (`dz` ready) and joined before the
   next chunk reuses the chunk buffer and before the call returns, so its CTAs
   fill the tail wave of the chunk's `dX` GEMM instead of queueing behind it.
@@ -128,11 +130,12 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   `logp`, `dX` and `dW` are bitwise the single-stream path's.  Two-chunk calls
   pay the cross-stream join without an overlap gain and a one-chunk call
   defers its only accumulate to the backward, hence the `auto` rule
-  (`cake_backend.dw_side_stream`).  The prepared runner follows the same rule
-  (a CUDA graph captured from it records the fork / join).
-* Hidden valid-row count (default on;
-  `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT=0` restores the previous path):
-  a compacted call used to count its valid rows on the host (`sum().item()`)
+  (`cake_backend.dw_side_stream`).  The prepared runner takes the same keyword
+  (`prepare_lm_head_loss(..., dw_stream=...)`; `runner.dw_stream` holds the
+  mode of its launches, and a CUDA graph captured from it records the fork /
+  join).
+* Hidden valid-row count (`hidden_count`, keyword, default `True`; `False`
+  restores the previous path): a compacted call used to count its valid rows on the host (`sum().item()`)
   and form their index (`nonzero`) before its first launch.  It now forms the
   index on the device (`labels >= 0` -> an inclusive int32 `cumsum` ->
   `searchsorted`), gathers chunk 0's rows of `X` with the `gather_rows_bf16`
@@ -179,13 +182,42 @@ the remembered argument plans with freshly allocated outputs and per-call
 scratch (`cake_backend.BINDING_CACHE`).  A remembered binding pins no caller
 tensor and holds no problem-sized scratch: the chunk workspace, the FP32
 accumulators and the outputs come from the caching allocator on every call.
-The cache keeps up to 64 bindings
-(`FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` sets the capacity) and
-evicts the least recently used one; `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`
-disables it.  `backend="reference"` on the `cake_backend` entry points runs
-the same chunk loop with PyTorch operators at the same rounding boundaries on
-any device (the host-layer tests use it); the public API accepts
-`backend="cake"` only.
+The cache keeps up to 64 bindings (`cake_backend.BINDING_CACHE_DEFAULT_CAPACITY`)
+and evicts the least recently used one;
+`cake_backend.BINDING_CACHE.configure(enabled=..., capacity=...)` changes both
+settings at runtime (a shrink evicts, `enabled=False` bypasses the cache and
+drops the remembered bindings).  `backend="reference"` on the `cake_backend`
+entry points runs the same chunk loop with PyTorch operators at the same
+rounding boundaries on any device (the host-layer tests use it); the public API
+accepts `backend="cake"` only.
+
+## Switches and environment variables
+
+Every switch above is a keyword argument of each entry point it affects
+(`chunked_lm_head_loss`, `chunked_lm_head_logprob`, `forward_loss`,
+`backward_loss`, `forward_logprob`, `backward_logprob`,
+`prepare_lm_head_loss`; `prepare_lm_head_loss` takes `compact_rows` as a bool or
+the valid-row tensor, default `False`, and no `hidden_count`; `forward_logprob`
+and `backward_loss` take no `dw_stream`), `None` selecting the documented default
+(`cake_backend.compact_rows_default()` and friends return the constants); the
+autograd entries resolve every switch once in the forward.  **The package reads
+no environment variable.**  The `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables are
+FlashInfer's own A/B knobs and are read by `flashinfer.chunked_lm_head` only: a
+switch keyword left at `None` there falls back to its variable and the resolved
+value is passed down; the two binding-cache variables are applied when that
+module is imported, through `BINDING_CACHE.configure`.  A build that vendors
+the package without the wrapper sees the backend defaults.
+
+| Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
+| --- | --- | --- |
+| `compact_rows` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS` | `0` -> `False`, else `True` |
+| `fuse_dw_cast` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST` | `0` -> `False`, else `True` |
+| `dx_finalize` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE` | `0` -> `False`, else `True` |
+| `dw_stream` (`"auto"`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM` | `0` / `false` / `off` / `no` -> `False`; `1` / `true` / `on` / `yes` -> `True`; else `"auto"` |
+| `hidden_count` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT` | `0` -> `False`, else `True` |
+| `gemm_tuning` (`{}`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | JSON object -> dict; unset / blank -> no knob; invalid -> `ValueError` |
+| `BINDING_CACHE.configure(enabled=...)` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `0` -> disabled (at import) |
+| `BINDING_CACHE.configure(capacity=...)` (`64`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | positive integer (at import) |
 
 ## Kernel structure of one token chunk
 
@@ -307,8 +339,9 @@ order changes.
 `stage_values` forms the scalars); a record carries exactly the forms its
 architecture's rules can reach (`cake_backend.reachable_variants`, checked by
 `generated_program_available`), and a form the record lacks fails closed.
-`gemm_tuning` (`prepare_lm_head_loss`; `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`
-as a JSON object for the eager entry points) pins knobs explicitly per GEMM --
+`gemm_tuning` (a keyword of `prepare_lm_head_loss` and of every eager /
+autograd entry point; default `None` = no explicit knob) pins knobs explicitly
+per GEMM --
 `{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2, "stages": 4},
 "dw": {"group_m": 32, "group_n": 0}}`, a knob given as `null` pins the default
 -- and wins over the rule for the knobs it names.
@@ -380,7 +413,8 @@ it), with the fourteen base stages above plus the nine structural forms the
 rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
 named in the pull request.
 
-Tests: `tests/experimental/test_cake_lm_head_loss.py` (the host-layer tests
+Tests: `tests/experimental/test_cake_lm_head_loss.py` and the public-API suite
+`tests/experimental/test_cake_lm_head_loss_api.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
 registered program or a compute capability 10.0 / 10.3 device).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
