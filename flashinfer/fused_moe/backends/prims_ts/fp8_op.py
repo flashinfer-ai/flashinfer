@@ -895,7 +895,8 @@ def prims_ts_fp8_block_scale_moe(
     r"""FP8 block-scaled MoE using Prims-TS on SM100/SM103/SM107.
 
     Same arguments and return value as
-    :func:`~flashinfer.fused_moe.trtllm_fp8_block_scale_moe`.
+    :func:`~flashinfer.fused_moe.trtllm_fp8_block_scale_moe`. On SM107 only the
+    MXFP8 mode is supported; DeepSeek FP8 runs on SM100/SM103.
 
     Parameters
     ----------
@@ -1051,7 +1052,8 @@ def prims_ts_fp8_block_scale_routed_moe(
 
     Same arguments and return value as
     :func:`~flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe`, plus
-    optional keyword-only FC1/FC2 bias tensors.
+    optional keyword-only FC1/FC2 bias tensors. On SM107 only the MXFP8 mode is
+    supported; DeepSeek FP8 runs on SM100/SM103.
 
     Parameters
     ----------

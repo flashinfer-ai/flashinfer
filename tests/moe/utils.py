@@ -411,6 +411,12 @@ def skip_checks(
             pytest.skip(
                 "Prims-TS FP8 per-tensor DeepSeekV3 routing requires a gated activation"
             )
+        if (
+            is_fp8_block_scale_moe
+            and moe_impl.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+            and tuple(compute_capability) == (10, 7)
+        ):
+            pytest.skip("Prims-TS DeepSeek FP8 is disabled on SM107")
     if (
         is_fp8_block_scale_moe
         and moe_impl.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8

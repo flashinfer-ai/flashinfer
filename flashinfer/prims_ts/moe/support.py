@@ -777,6 +777,8 @@ def is_prims_ts_fp8_block_scale_supported(
     is_mxfp8 = quantization_type == Fp8QuantizationType.MxFp8
     if not (is_deepseek or is_mxfp8):
         return False, "only DeepSeekFp8 and MxFp8 block-scale modes are supported"
+    if is_deepseek and _sm_arch_for_device(hidden_states.device) == 107:
+        return False, "DeepSeek FP8 Prims-TS is disabled on SM107"
 
     expected_dtype = DtypeTrtllmGen.E4m3 if is_deepseek else DtypeTrtllmGen.MxE4m3
     if not _enum_eq(runner.dtype_act, expected_dtype) or not _enum_eq(
