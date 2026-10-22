@@ -394,13 +394,16 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   lowering under `__CUDA_ARCH__` guards -- except the four logits GEMM forms,
   whose sm_103a lowering stages the C tile in shared memory for a TMA store
   behind a six-stage operand pipeline while sm_100a stores from registers
-  behind seven, so each of those has one unit per architecture) and their two-line launch stubs
-  (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL` + the include of the shared
+  behind seven, so each of those has one unit per architecture) and their launch stubs
+  (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL`, the compile definitions the
+  shared launcher reads for that kernel, + the include of the shared
   launcher); `csrc/cake_lm_head_loss/shim/` -- the shared tvm-ffi launchers
-  (`cake_lm_head_loss_shim_<digest>.cuh`, one per distinct host contract:
-  descriptor encoders, argument checks, dynamic shared memory and launch
-  geometry); `csrc/cake_ffi_checks.h` -- the tvm-ffi tensor checks the
-  launchers include (shipped with the package, no FlashInfer header).
+  (`cake_lm_head_loss_shim_<digest>.cuh`, one per launch shape, the stub's
+  compile definitions selecting the operand types, the C descriptor form,
+  dynamic shared memory and cluster form within it: descriptor encoders,
+  argument checks, dynamic shared memory and launch geometry);
+  `csrc/cake_ffi_checks.h` -- the tvm-ffi tensor checks the launchers
+  include (shipped with the package, no FlashInfer header).
   `.clang-format` disables formatting: the sources are identity-checked by
   the manifest's digests.
 
