@@ -2433,13 +2433,12 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
   }
 }
 
-template <typename KTraits>
+template <typename KTraits, typename DTypeO = typename KTraits::DTypeO>
 __device__ __forceinline__ void write_o_reg_gmem(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], smem_t<KTraits::SWIZZLE_MODE_Q>* o_smem,
-    typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
-    const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint_fastdiv group_size, const dim3 tid = threadIdx) {
-  using DTypeO = typename KTraits::DTypeO;
+    DTypeO* o_ptr_base, const uint32_t o_packed_idx_base, const uint32_t qo_upper_bound,
+    const uint32_t o_stride_n, const uint32_t o_stride_h, const uint_fastdiv group_size,
+    const dim3 tid = threadIdx) {
   constexpr uint32_t UPCAST_STRIDE_O = KTraits::UPCAST_STRIDE_O;
   const uint32_t warp_idx_x = get_warp_idx_q<KTraits>(tid.y);
   const uint32_t lane_idx = tid.x;
@@ -2537,12 +2536,12 @@ __device__ __forceinline__ void vosplit_compute_pv(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*o_scale)[2],
     const uint32_t warp_vo_base, const uint32_t warp_q_idx, const uint32_t lane_idx);
 
-template <typename KTraits>
+template <typename KTraits, typename DTypeO = typename KTraits::DTypeO>
 __device__ __forceinline__ void vosplit_write_o(
-    float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2],
-    typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
-    const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint32_t warp_vo_base, const uint_fastdiv group_size, const uint32_t lane_idx);
+    float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2], DTypeO* o_ptr_base,
+    const uint32_t o_packed_idx_base, const uint32_t qo_upper_bound, const uint32_t o_stride_n,
+    const uint32_t o_stride_h, const uint32_t warp_vo_base, const uint_fastdiv group_size,
+    const uint32_t lane_idx);
 
 /*!
  * \brief FlashAttention prefill CUDA kernel for a single request.
@@ -3291,16 +3290,16 @@ __device__ __forceinline__ void vosplit_compute_pv(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*o_scale)[2],
     const uint32_t warp_vo_base, const uint32_t warp_q_idx, const uint32_t lane_idx);
 
-template <typename KTraits>
+template <typename KTraits, typename DTypeO>
 __device__ __forceinline__ void vosplit_write_o(
-    float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2],
-    typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
-    const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint32_t warp_vo_base, const uint_fastdiv group_size, const uint32_t lane_idx);
+    float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2], DTypeO* o_ptr_base,
+    const uint32_t o_packed_idx_base, const uint32_t qo_upper_bound, const uint32_t o_stride_n,
+    const uint32_t o_stride_h, const uint32_t warp_vo_base, const uint_fastdiv group_size,
+    const uint32_t lane_idx);
 
 template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKVCacheKernel(
-    const __grid_constant__ Params params) {
+    const __grid_constant__ Params params, float* tmp_v) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -3433,10 +3432,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + kv_head_idx * group_size * q_stride_h;
 
-    DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
-                                            (kv_head_idx * group_size) * o_stride_h
-                                      : o + o_indptr[request_idx] * o_stride_n +
-                                            (kv_head_idx * group_size) * o_stride_h;
+    DTypeO* o_ptr_base =
+        o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h;
+    float* tmp_v_ptr_base = partition_kv
+                                ? tmp_v + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
+                                      (kv_head_idx * group_size) * o_stride_h
+                                : nullptr;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -3755,10 +3756,17 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       const uint32_t num_kv_chunks =
           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
       if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
-        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
-                                 partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
-                                 get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
-                                 group_size, lane_idx);
+        if (partition_kv) {
+          vosplit_write_o<KTraits, float>(
+              o_frag, d, tmp_v_ptr_base, qo_packed_idx_base, qo_len, num_kv_chunks * o_stride_n,
+              o_stride_h, get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+              group_size, lane_idx);
+        } else {
+          vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len, o_stride_n,
+                                   o_stride_h,
+                                   get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+                                   group_size, lane_idx);
+        }
       } else {
         // threadblock synchronization
         threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
@@ -3769,11 +3777,17 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                           kv_head_idx, group_size);
 
         // write back (o_ptr_base offset to this VO tile's columns: d_base mma * 16 elems)
-        write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
-                                  qo_len,
-                                  /*o_stride_n=*/
-                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
-                                  /*o_stride_h=*/o_stride_h, group_size, tid);
+        if (partition_kv) {
+          write_o_reg_gmem<KTraits, float>(o_frag, &qo_smem, tmp_v_ptr_base + d_base * 16,
+                                           qo_packed_idx_base, qo_len,
+                                           /*o_stride_n=*/num_kv_chunks * o_stride_n,
+                                           /*o_stride_h=*/o_stride_h, group_size, tid);
+        } else {
+          write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
+                                    qo_len,
+                                    /*o_stride_n=*/o_stride_n,
+                                    /*o_stride_h=*/o_stride_h, group_size, tid);
+        }
       }
 
       // write lse (identical across VO tiles; redundant rewrite on later tiles is harmless)
@@ -4066,13 +4080,12 @@ __device__ __forceinline__ void vosplit_compute_pv(
   }
 }
 
-template <typename KTraits>
+template <typename KTraits, typename DTypeO>
 __device__ __forceinline__ void vosplit_write_o(
-    float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2],
-    typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
-    const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint32_t warp_vo_base, const uint_fastdiv group_size, const uint32_t lane_idx) {
-  using DTypeO = typename KTraits::DTypeO;
+    float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2], DTypeO* o_ptr_base,
+    const uint32_t o_packed_idx_base, const uint32_t qo_upper_bound, const uint32_t o_stride_n,
+    const uint32_t o_stride_h, const uint32_t warp_vo_base, const uint_fastdiv group_size,
+    const uint32_t lane_idx) {
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
   constexpr uint32_t NUM_MMA_D_VO_PER_WARP = KTraits::NUM_MMA_D_VO_PER_WARP;
   // normalize by 1/d (o_frag holds unnormalized sum_kv P*V)
@@ -4116,7 +4129,7 @@ __device__ __forceinline__ void vosplit_write_o(
 
 template <typename KTraits, bool SAME_KV_STRIDES = false, typename Params, typename SmemStorage>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
-    const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
+    const Params params, SmemStorage& smem_storage, float* tmp_v, const dim3 tid = threadIdx,
     const uint32_t bx = blockIdx.x, const uint32_t kv_head_idx = blockIdx.z,
     const uint32_t num_kv_heads = gridDim.z) {
   using DTypeQ = typename Params::DTypeQ;
@@ -4260,10 +4273,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
-    DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
-                                            (kv_head_idx * group_size) * o_stride_h
-                                      : o + o_indptr[request_idx] * o_stride_n +
-                                            (kv_head_idx * group_size) * o_stride_h;
+    DTypeO* o_ptr_base =
+        o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h;
+    float* tmp_v_ptr_base = partition_kv
+                                ? tmp_v + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
+                                      (kv_head_idx * group_size) * o_stride_h
+                                : nullptr;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -4724,10 +4739,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
 
       if constexpr (KTraits::USE_VO_SPLIT) {
-        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
-                                 partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
-                                 get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
-                                 group_size, lane_idx);
+        if (partition_kv) {
+          vosplit_write_o<KTraits, float>(
+              o_frag, d, tmp_v_ptr_base, qo_packed_idx_base, qo_len, num_kv_chunks * o_stride_n,
+              o_stride_h, get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+              group_size, lane_idx);
+        } else {
+          vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len, o_stride_n,
+                                   o_stride_h,
+                                   get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+                                   group_size, lane_idx);
+        }
       } else {
         // threadblock synchronization
         threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
@@ -4738,11 +4760,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                           kv_head_idx, group_size);
 
         // write_back (o_ptr_base offset to this VO tile's columns: d_base mma * 16 elems)
-        write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
-                                  qo_len,
-                                  /*o_stride_n=*/
-                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
-                                  /*o_stride_h=*/o_stride_h, group_size, tid);
+        if (partition_kv) {
+          write_o_reg_gmem<KTraits, float>(o_frag, &qo_smem, tmp_v_ptr_base + d_base * 16,
+                                           qo_packed_idx_base, qo_len,
+                                           /*o_stride_n=*/num_kv_chunks * o_stride_n,
+                                           /*o_stride_h=*/o_stride_h, group_size, tid);
+        } else {
+          write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
+                                    qo_len,
+                                    /*o_stride_n=*/o_stride_n,
+                                    /*o_stride_h=*/o_stride_h, group_size, tid);
+        }
       }
 
       // write lse (identical across VO tiles since m/d depend only on Q.K^T; the
@@ -4787,18 +4815,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
 template <bool SAME_KV_STRIDES, typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
-    const __grid_constant__ Params params) {
+    const __grid_constant__ Params params, float* tmp_v) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStoragePaged&>(smem);
-  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage);
+  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage, tmp_v);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           bool USE_TOKEN_HEAD_SF, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, bool enable_pdl,
-                                                    cudaStream_t stream) {
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
+                                                    bool enable_pdl, cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -4998,9 +5025,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
           if (tmp_v == nullptr) {
             // do not partition kv
             params.partition_kv = false;
-            void* args[] = {(void*)&params};
+            void* args[] = {(void*)&params, (void*)&tmp_v};
             if (enable_pdl) {
-              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params, tmp_v));
             } else {
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -5010,11 +5037,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
             params.partition_kv = true;
             auto o = params.o;
             auto lse = params.lse;
-            params.o = tmp_v;
             params.lse = tmp_s;
-            void* args[] = {(void*)&params};
+            void* args[] = {(void*)&params, (void*)&tmp_v};
             if (enable_pdl) {
-              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params, tmp_v));
             } else {
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -5037,9 +5063,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 template <bool SAME_KV_STRIDES, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           bool USE_TOKEN_HEAD_SF, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, bool enable_pdl,
-                                                   cudaStream_t stream) {
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
+                                                   bool enable_pdl, cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -5227,9 +5252,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
             // do not partition kv
             params.partition_kv = false;
             if (enable_pdl) {
-              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params, tmp_v));
             } else {
-              void* args[] = {(void*)&params};
+              void* args[] = {(void*)&params, (void*)&tmp_v};
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
@@ -5237,12 +5262,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
             params.partition_kv = true;
             auto o = params.o;
             auto lse = params.lse;
-            params.o = tmp_v;
             params.lse = tmp_s;
             if (enable_pdl) {
-              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params, tmp_v));
             } else {
-              void* args[] = {(void*)&params};
+              void* args[] = {(void*)&params, (void*)&tmp_v};
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
