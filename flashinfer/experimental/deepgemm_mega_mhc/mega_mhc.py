@@ -511,10 +511,10 @@ def device_facts(device_index):
     device = torch.device("cuda", device_index)
     capability = get_compute_capability(device)
     arch = CAPABILITIES.get(capability)
-    if arch is None or arch not in ARCHES:
+    if arch is None or arch not in shipped_arches():
         raise RuntimeError(
             f"Mega mHC has no exported programs for compute capability {capability}; "
-            f"supported: {ARCHES}"
+            f"supported: {shipped_arches()}"
         )
     return arch, get_device_sm_count(device)
 
@@ -522,6 +522,14 @@ def device_facts(device_index):
 def record_arches(record):
     """The architectures a program ships for: its own ``arches`` leaf, else ARCHES."""
     return list(record.get("arches", ARCHES))
+
+
+def shipped_arches():
+    """Every architecture some exported program ships for: the records' own
+    ``arches`` leaves, else ARCHES."""
+    return sorted(
+        {arch for record in PROGRAMS.values() for arch in record_arches(record)}
+    )
 
 
 def record_arg_plan(record):
