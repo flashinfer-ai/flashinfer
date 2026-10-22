@@ -980,6 +980,7 @@ class MegaMHCPlan:
                 launch_epochs=launch_epochs,
                 num_tokens=tokens,
                 num_splits=splits,
+                split_div=splits,
                 num_ctas=launch_sms,
                 hc_norm_eps=hc_norm_eps,
                 hc_pre_eps=hc_pre_eps,
