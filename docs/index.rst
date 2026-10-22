@@ -8,7 +8,7 @@ Welcome to FlashInfer's documentation!
 
 `Blog <https://flashinfer.ai/>`_ | `Discussion Forum <https://github.com/orgs/flashinfer-ai/discussions>`_ | `GitHub <https://github.com/flashinfer-ai/flashinfer/>`_
 
-FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, PageAttention and LoRA. FlashInfer focus on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
+FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, PageAttention and LoRA. FlashInfer focuses on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
 
 .. toctree::
    :maxdepth: 2
@@ -29,6 +29,7 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    tutorials/recursive_attention
    tutorials/kv_layout
    tutorials/generated/jax_tvm_ffi/index
+   tutorials/cake_kimi_k3_situ
 
 .. toctree::
    :maxdepth: 2
@@ -37,11 +38,17 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/attention
    api/attn_scores
    api/cake_fmha
+   api/cake_fused_qk_rope_append
+   api/cake_fused_qk_rope_fp8_append
    api/cake_moe_grouped_gemm
+   api/cake_mxfp4_situ_moe
    api/cake_sampling
+   api/cake_stepfun_moe
    api/gemm
    api/grouped_mm
    api/fused_moe
+   api/megamoe
+   api/moe_ep_communication
    api/cascade
    api/comm
    api/sparse

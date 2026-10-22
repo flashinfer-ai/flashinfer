@@ -3,6 +3,7 @@
 import importlib
 import inspect
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,104 +20,17 @@ from flashinfer.cake_dcp import (
     run_dcp_spec_decode,
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-from flashinfer.jit.cake_dcp import get_dcp_spec_fp8_uri, get_dcp_spec_uri
-from flashinfer.jit.cake_fmha import (
-    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
-    CAKE_FMHA_MANIFEST_SHA256,
+from flashinfer.jit.cake_dcp import (
+    DCP_STATIC_FAMILIES,
+    get_cake_fmha_csrc_dir,
+    get_dcp_spec_registry,
+    get_dcp_spec_static_uri,
 )
 from flashinfer.trace.templates.attention import (
     trtllm_batch_decode_dcp_spec_split_kv_trace,
     trtllm_batch_decode_dcp_spec_trace,
     trtllm_batch_decode_trace_dispatch,
 )
-
-
-def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
-    v1_uri = get_dcp_spec_uri("v1", "sm103a", 64, 5, 32, 4, 8, 1)
-    assert v1_uri.startswith("cake_fmha_dcp_spec_bf16_v1_")
-    assert v1_uri.endswith(
-        f"_b64_q5_hq32_hkv4_cp8_retain1_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
-    v4_uri = get_dcp_spec_uri("v4", "sm100a", 1, 8, 64, 8, 4, 16)
-    assert v4_uri.startswith("cake_fmha_dcp_spec_bf16_v4_")
-    assert v4_uri.endswith(
-        f"_b1_q8_hq64_hkv8_cp4_split16_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
-    fp8_uri = get_dcp_spec_fp8_uri("sm100a", 256, 3, 64, 8, 4, 3, 1)
-    assert fp8_uri == (
-        "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1_"
-        f"{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
-
-
-@pytest.mark.parametrize("target", ["sm100a", "sm103a", "sm100f"])
-def test_dcp_jit_selects_the_route_specialized_source_family(
-    monkeypatch, target
-) -> None:
-    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
-    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
-    monkeypatch.setattr(jit_dcp, "get_cake_fmha_csrc_dir", lambda: source_dir)
-    monkeypatch.setattr(
-        jit_dcp,
-        "gen_jit_spec",
-        lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-    jit_dcp.gen_dcp_spec_module.cache_clear()
-    jit_dcp.gen_dcp_spec_fp8_module.cache_clear()
-
-    try:
-        v1 = jit_dcp.gen_dcp_spec_module("v1", target, 1, 1, 64, 8, 1, 1)
-        v4 = jit_dcp.gen_dcp_spec_module("v4", target, 1, 1, 64, 8, 1, 16)
-        fp8 = jit_dcp.gen_dcp_spec_fp8_module(target, 64, 3, 64, 8, 4, 3, 1)
-
-        arch = target.replace("sm", "", 1)
-        for spec in (v1, v4, fp8):
-            assert (
-                f"-gencode=arch=compute_{arch},code=sm_{arch}" in spec.extra_cuda_cflags
-            )
-            assert f"_{target}_" in spec.name
-
-        assert Path(v1.sources[0]).name == "retain_kv_l21.cu"
-        assert Path(v4.sources[0]).name == "num_split16.cu"
-        assert Path(fp8.sources[0]).name == "num_split3_retain_kv_l21.cu"
-        assert Path(fp8.sources[1]).name == (
-            "cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu"
-        )
-        assert "-DRETAIN_KV_L2=1" not in v1.extra_cuda_cflags
-        assert "-DNUM_SPLIT=16" not in v4.extra_cuda_cflags
-        assert "-DQ_LEN=3" in fp8.extra_cuda_cflags
-        assert "-DNUM_SPLIT=3" not in fp8.extra_cuda_cflags
-        assert "-DRETAIN_KV_L2=1" not in fp8.extra_cuda_cflags
-    finally:
-        jit_dcp.gen_dcp_spec_module.cache_clear()
-        jit_dcp.gen_dcp_spec_fp8_module.cache_clear()
-
-
-@pytest.mark.parametrize(
-    ("args", "message"),
-    [
-        (("v1", "sm103a", 1, 7, 32, 4, 4, 0), "q_len"),
-        (("v1", "sm103a", 1, 4, 32, 4, 3, 0), "cp_world"),
-        (("v1", "sm103a", 1, 4, 64, 4, 4, 0), "group ratio"),
-        (("v4", "sm103a", 1, 4, 32, 4, 4, 1), "num_split"),
-    ],
-)
-def test_dcp_spec_uri_rejects_unsupported_specialization(args, message) -> None:
-    with pytest.raises(ValueError, match=message):
-        get_dcp_spec_uri(*args)
-
-
-def test_fp8_dcp_spec_uri_supports_q3_but_rejects_other_gaps() -> None:
-    assert "_q3_" in get_dcp_spec_fp8_uri("sm103a", 64, 3, 64, 8, 4, 3, 1)
-    with pytest.raises(ValueError, match="q_len"):
-        get_dcp_spec_fp8_uri("sm103a", 64, 7, 64, 8, 4, 3, 1)
-    with pytest.raises(ValueError, match="num_split"):
-        get_dcp_spec_fp8_uri("sm103a", 64, 4, 64, 8, 4, 5, 1)
-    with pytest.raises(ValueError, match="retain_kv_l2"):
-        get_dcp_spec_fp8_uri("sm103a", 64, 4, 64, 8, 4, 3, 2)
 
 
 def test_public_decode_api_adds_optional_dcp_arguments() -> None:
@@ -272,7 +186,7 @@ def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
     jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
-    monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", lambda *args: module)
+    monkeypatch.setattr(jit_dcp, "load_dcp_spec_static_module", lambda *args: module)
 
     run_dcp_spec_decode(**_empty_rank_inputs())
 
@@ -288,7 +202,7 @@ def test_fp8_page64_q3_reaches_single_native_launch_with_fused_scales(
     jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
-    monkeypatch.setattr(jit_dcp, "load_dcp_spec_fp8_module", lambda *args: module)
+    monkeypatch.setattr(jit_dcp, "load_dcp_spec_static_module", lambda *args: module)
 
     inputs = _empty_rank_inputs(
         kv_dtype=torch.float8_e4m3fn,
@@ -318,7 +232,7 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(
         jit_dcp,
-        "load_dcp_spec_fp8_module",
+        "load_dcp_spec_static_module",
         lambda *args: loader_calls.append(args) or module,
     )
 
@@ -339,7 +253,8 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     run_dcp_spec_decode(**inputs)
 
     assert len(loader_calls) == 1
-    assert loader_calls[0][-2:] == (3, 0)
+    assert loader_calls[0][:2] == ("fp8_d128", "splitn_retain0")
+    assert loader_calls[0][3]["NUM_SPLIT"] == 3
     assert len(launches) == 1
     args = launches[0]
     assert args[3].data_ptr() == inputs["workspace_buffer"].data_ptr()
@@ -361,7 +276,7 @@ def test_bf16_page16_q3_reaches_native_v1_route(monkeypatch) -> None:
     jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
-    monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", lambda *args: module)
+    monkeypatch.setattr(jit_dcp, "load_dcp_spec_static_module", lambda *args: module)
 
     run_dcp_spec_decode(**_empty_rank_inputs(q_len_per_req=3))
 
@@ -371,3 +286,177 @@ def test_bf16_page16_q3_reaches_native_v1_route(monkeypatch) -> None:
 def test_dcp_rejects_non_int32_local_seq_lens() -> None:
     with pytest.raises(ValueError, match="contiguous int32"):
         run_dcp_spec_decode(**_empty_rank_inputs(torch.int64))
+
+
+def test_dcp_static_registry_lists_each_program_once() -> None:
+    registry = get_dcp_spec_registry()
+    programs = registry["programs"]
+    routes = registry["static_routes"]
+    assert set(routes) == set(DCP_STATIC_FAMILIES)
+    bound = set()
+    for instances in routes.values():
+        for by_arch in instances.values():
+            assert sorted(by_arch) == ["sm_100a", "sm_103a"]
+            for arch, name in by_arch.items():
+                assert arch in programs[name]["arches"], (name, arch)
+                bound.add(name)
+    assert sorted(bound) == sorted(programs)
+    for name, program in programs.items():
+        assert program["arches"] and set(program["arches"]) <= {"sm_100a", "sm_103a"}
+        assert len(program["sources"]) == 2
+        assert {"Q_LEN", "CP_WORLD", "NUM_Q_HEADS", "NUM_KV_HEADS"} <= set(
+            program["specializations"]
+        )
+        assert ("NUM_SPLIT" in program["specializations"]) == (
+            program["family"] != "bf16_v1"
+        )
+        for source in program["sources"]:
+            assert (Path(get_cake_fmha_csrc_dir()) / source).is_file(), (name, source)
+
+
+@pytest.mark.parametrize("target", ["sm100a", "sm103a", "sm100f"])
+def test_dcp_static_uri_names_the_program_target_and_constants(target) -> None:
+    constants = {
+        "Q_LEN": 4,
+        "CP_WORLD": 4,
+        "NUM_Q_HEADS": 64,
+        "NUM_KV_HEADS": 8,
+        "NUM_SPLIT": 4,
+    }
+    uri = get_dcp_spec_static_uri("bf16_v4", "splitn", target, constants)
+    assert uri.startswith(f"cake_fmha_dcp_spec_bf16_v4_splitn_{target}_")
+    assert uri.endswith("_CP_WORLD4_NUM_KV_HEADS8_NUM_Q_HEADS64_NUM_SPLIT4_Q_LEN4")
+    assert uri == get_dcp_spec_static_uri("bf16_v4", "splitn", target, constants)
+    assert uri != get_dcp_spec_static_uri(
+        "bf16_v4", "splitn", target, {**constants, "NUM_SPLIT": 8}
+    )
+    with pytest.raises(ValueError):
+        get_dcp_spec_static_uri("bf16_v4", "split7", target, constants)
+    with pytest.raises(ValueError):  # a missing or foreign constant
+        get_dcp_spec_static_uri(
+            "bf16_v4",
+            "splitn",
+            target,
+            {k: v for k, v in constants.items() if k != "NUM_SPLIT"},
+        )
+    with pytest.raises(ValueError):
+        get_dcp_spec_static_uri("bf16_v1", "retain0", target, constants)
+
+
+# ---------------------------------------------------------------------------
+# Folded static program sources
+# ---------------------------------------------------------------------------
+#
+# The programs of a static family compile one kernel source
+# (``cuda/dcp_spec/<family>_kernel.cu``; fp8_d256 one per architecture) and one
+# binding source (``cuda/dcp_spec/<family>_binding.cu``).  The
+# ``-DCAKE_FMHA_DCP_*`` values in a program's ``compile_flags`` select its text:
+# the retain flag, the split class (1, 2, or 0 for the NUM_SPLIT-generic text)
+# and, for the per-architecture fp8_d256 binding, the architecture.
+
+_DCP_STATIC_SPLIT_CLASS = {"split1": 1, "split2": 2, "splitn": 0}
+_DCP_STATIC_NUM_SPLIT = {"split1": 1, "split2": 2, "splitn": 4}
+
+
+def _dcp_static_program_knobs(program) -> dict[str, int]:
+    """The compile-line knobs a static program's family, instance and arches imply."""
+
+    family, instance = program["family"], program["instance"]
+    knobs = {}
+    if family in ("bf16_v1", "fp8_d128"):
+        knobs["CAKE_FMHA_DCP_RETAIN_KV_L2"] = int(instance.rsplit("retain", 1)[1])
+    if family != "bf16_v1":
+        knobs["CAKE_FMHA_DCP_SPLIT_CLASS"] = _DCP_STATIC_SPLIT_CLASS[
+            instance.split("_")[0]
+        ]
+    if family == "fp8_d256":
+        (arch,) = program["arches"]
+        knobs["CAKE_FMHA_DCP_ARCH"] = int(arch[3:-1])  # "sm_100a" -> 100
+    return knobs
+
+
+def _dcp_static_sources(program) -> list[str]:
+    family = program["family"]
+    kernel = f"cuda/dcp_spec/{family}_kernel.cu"
+    if family == "fp8_d256":
+        (arch,) = program["arches"]
+        kernel = f"cuda/dcp_spec/{family}_{arch}_kernel.cu"
+    return [kernel, f"cuda/dcp_spec/{family}_binding.cu"]
+
+
+def test_dcp_static_programs_share_one_folded_source_per_family() -> None:
+    """Each program compiles its family's folded sources; its flags pin the text."""
+
+    programs = get_dcp_spec_registry()["programs"]
+    csrc_dir = Path(get_cake_fmha_csrc_dir())
+    texts = {}
+    for name, program in programs.items():
+        assert program["sources"] == _dcp_static_sources(program), name
+        knobs = _dcp_static_program_knobs(program)
+        assert program["compile_flags"] == [
+            "--use_fast_math",
+            *(f"-D{knob}={value}" for knob, value in sorted(knobs.items())),
+        ], name
+        kernel, binding = program["sources"]
+        for source in (kernel, binding):
+            texts.setdefault(source, (csrc_dir / source).read_text(encoding="utf-8"))
+        assert f"\nkernel_{name}(" in texts[kernel], name
+        assert f'extern "C" __global__ void kernel_{name}(' in texts[binding], name
+    for source, text in texts.items():
+        knobs = {
+            knob
+            for program in programs.values()
+            if source in program["sources"]
+            for knob in _dcp_static_program_knobs(program)
+        }
+        if source.endswith("_kernel.cu"):
+            knobs.discard("CAKE_FMHA_DCP_ARCH")  # per-arch kernel files, no guard
+        assert knobs, source
+        for knob in sorted(knobs):
+            macro = knob
+            if knob == "CAKE_FMHA_DCP_RETAIN_KV_L2" and source.endswith("_kernel.cu"):
+                macro = "RETAIN_KV_L2"
+                assert f"#define {macro} {knob}\n" in text, source
+                assert not re.search(rf"^#define {macro} \d+$", text, re.M), source
+            # the fold tool's guard forms: #if M, #if !M, #if M == v, #if M != v
+            guard = rf"^#if !?{macro}(?: (?:==|!=) -?\d+)?$"
+            opened = len(re.findall(guard, text, re.M))
+            assert opened == text.count(f"#endif  // {macro}\n") > 0, (source, knob)
+
+
+@pytest.mark.parametrize("target", ["sm100a", "sm103a", "sm100f"])
+def test_dcp_static_jit_passes_the_program_knobs_and_folded_sources(
+    monkeypatch, target
+) -> None:
+    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
+    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
+    monkeypatch.setattr(jit_dcp, "get_cake_fmha_csrc_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        jit_dcp, "gen_jit_spec", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    registry = get_dcp_spec_registry()
+    arch = jit_dcp._TARGET_MANIFEST_ARCH[target]
+    for family, instances in registry["static_routes"].items():
+        for instance, by_arch in instances.items():
+            name = by_arch[arch]
+            program = registry["programs"][name]
+            constants = {
+                "Q_LEN": 4,
+                "CP_WORLD": 4,
+                "NUM_Q_HEADS": 64,
+                "NUM_KV_HEADS": 8,
+            }
+            if "NUM_SPLIT" in program["specializations"]:
+                constants["NUM_SPLIT"] = _DCP_STATIC_NUM_SPLIT[instance.split("_")[0]]
+            spec = jit_dcp.gen_dcp_spec_static_module(
+                family, instance, target, constants
+            )
+            assert spec.name == get_dcp_spec_static_uri(
+                family, instance, target, constants
+            )
+            assert [
+                source.relative_to(source_dir).as_posix() for source in spec.sources
+            ] == _dcp_static_sources(program)
+            assert "--use_fast_math" in spec.extra_cuda_cflags
+            for knob, value in _dcp_static_program_knobs(program).items():
+                assert f"-D{knob}={value}" in spec.extra_cuda_cflags, (name, knob)

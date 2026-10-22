@@ -60,6 +60,14 @@ _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS = frozenset(
     }
 )
 
+_CAKE_DSV4_NVFP4_ROPE_INSERT_LAZY_EXPORTS = frozenset(
+    {
+        "cake_dsv4_nvfp4_kv_rope_quantize_insert",
+        "cake_dsv4_nvfp4_rope_insert_format_info",
+        "cake_dsv4_nvfp4_rope_quantize_insert",
+    }
+)
+
 _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS = frozenset(
     {
         "cake_sparse_mla_sm120_dsv41_mixed_decode",
@@ -67,6 +75,7 @@ _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS = frozenset(
         "cake_sparse_mla_sm120_dsv41_mixed_num_chunks",
         "cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles",
         "cake_sparse_mla_sm120_dsv41_mixed_plan_splits",
+        "cake_sparse_mla_sm120_dsv41_mixed_plan_variant",
         "cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes",
         "cake_sparse_mla_sm120_dsv41_mixed_supported_heads",
     }
@@ -75,9 +84,17 @@ _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS = frozenset(
 _CAKE_DSV4_LAZY_EXPORTS = frozenset(
     {
         "cake_dsv4_workspace_layout",
+        "cake_dsv4_workspace_requirement",
         "cake_dsv4_workspace_reset",
         "get_cake_dsv4_workspace_bytes",
         "resolve_cake_dsv4_sparse_metadata",
+    }
+)
+
+_CAKE_MLA_NVFP4_PAGED_DECODE_LAZY_EXPORTS = frozenset(
+    {
+        "CakeMlaNvfp4PagedDecode",
+        "CakeMlaNvfp4QueryQuantize",
     }
 )
 
@@ -116,6 +133,12 @@ def __getattr__(name: str):
         value = getattr(_cake_dsv4_nvfp4, name)
         globals()[name] = value
         return value
+    if name in _CAKE_DSV4_NVFP4_ROPE_INSERT_LAZY_EXPORTS:
+        from ._sparse_mla_sm120 import _cake_dsv4_nvfp4_rope_insert
+
+        value = getattr(_cake_dsv4_nvfp4_rope_insert, name)
+        globals()[name] = value
+        return value
     if name in _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS:
         from ._sparse_mla_sm120 import cake_dsv41_mixed
 
@@ -126,6 +149,12 @@ def __getattr__(name: str):
         from . import cake_dsv4
 
         value = getattr(cake_dsv4, name)
+        globals()[name] = value
+        return value
+    if name in _CAKE_MLA_NVFP4_PAGED_DECODE_LAZY_EXPORTS:
+        from ..experimental.cake_mla_nvfp4_paged_decode import cake_backend
+
+        value = getattr(cake_backend, name)
         globals()[name] = value
         return value
     if name in _CAKE_KIMI_K3_MLA_LAZY_EXPORTS:
@@ -145,7 +174,9 @@ def __dir__():
         | _SPARSE_MLA_SM120_LAZY_EXPORTS
         | _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS
         | _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS
+        | _CAKE_DSV4_NVFP4_ROPE_INSERT_LAZY_EXPORTS
         | _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS
         | _CAKE_DSV4_LAZY_EXPORTS
         | _CAKE_KIMI_K3_MLA_LAZY_EXPORTS
+        | _CAKE_MLA_NVFP4_PAGED_DECODE_LAZY_EXPORTS
     )

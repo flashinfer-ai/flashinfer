@@ -5,12 +5,12 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_balanced_bf16_mtp_n64(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* O_ptr, int* page_table, int* seq_lens_kv, float* partial_o, float* partial_stats, uint32_t* tile_counters, uint32_t* queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int batch_size, int q_len, uint32_t max_items);
+extern "C" __global__ void kernel_cake_fmha_decode_balanced_bf16_mtp_n64(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* O_ptr, int* page_table, int* seq_lens_kv, float* partial_o, float* partial_stats, uint32_t* tile_counters, uint32_t* queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int batch_size, int q_len, uint32_t max_items);
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_mtp_n64(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,

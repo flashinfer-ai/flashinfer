@@ -163,7 +163,12 @@ def _make_packed_weights(
 
 
 def _mega_problem(
-    rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
+    rank: int,
+    world_size: int,
+    *,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    per_token_scale: bool = False,
 ):
     hidden = 2048
     intermediate = 1024
@@ -193,6 +198,19 @@ def _mega_problem(
     fc1_alpha, fc2_alpha, fc1_norm_const = _make_epilogue_params(
         rank, num_local_experts
     )
+    fc1_activation_per_token_scale = None
+    if per_token_scale:
+        import torch
+
+        # Kernel-team tester value set {0.5, 1.0, 1.5, 2.0}; per-rank seed so
+        # peer-pulled tokens carry scales that differ from the local ones.
+        g = torch.Generator(device="cuda").manual_seed(23 + rank)
+        fc1_activation_per_token_scale = (
+            torch.randint(1, 5, (num_tokens,), generator=g, device="cuda").to(
+                torch.float32
+            )
+            * 0.5
+        )
     return dict(
         hidden=hidden,
         intermediate=intermediate,
@@ -213,6 +231,8 @@ def _mega_problem(
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
+        # None -> enable_fc1_activation_per_token_scale=False everywhere.
+        fc1_activation_per_token_scale=fc1_activation_per_token_scale,
     )
 
 
@@ -237,6 +257,7 @@ def _reference_nvfp4_mega_moe_staged(
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    per_token_scale = problem.get("fc1_activation_per_token_scale")
     symm_buffer = get_symm_buffer_for_mega_moe(
         problem["num_experts"],
         problem["max_tokens"],
@@ -252,9 +273,11 @@ def _reference_nvfp4_mega_moe_staged(
         situ_beta=problem["situ_beta"],
         situ_linear_beta=problem["situ_linear_beta"],
         combine_dtype=combine_dtype,
+        apply_topk_in_fc1=problem.get("apply_topk_in_fc1", True),
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
         fc1_norm_const=problem["fc1_norm_const"],
+        enable_fc1_activation_per_token_scale=per_token_scale is not None,
     )
     num_tokens = problem["num_tokens"]
     stage_mega_moe_inputs(
@@ -266,6 +289,8 @@ def _reference_nvfp4_mega_moe_staged(
         symm_buffer.topk_idx[:num_tokens],
         symm_buffer.topk_weights[:num_tokens],
     )
+    if per_token_scale is not None:
+        symm_buffer.fc1_activation_per_token_scale[:num_tokens].copy_(per_token_scale)
 
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     transformed_l1, transformed_l2 = preprocess_mega_weights(
@@ -309,6 +334,7 @@ def _reference_nvfp4_mega_moe_prestaged(
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    per_token_scale = problem.get("fc1_activation_per_token_scale")
     symm_buffer = get_symm_buffer_for_mega_moe(
         problem["num_experts"],
         problem["max_tokens"],
@@ -318,15 +344,19 @@ def _reference_nvfp4_mega_moe_prestaged(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        apply_topk_in_fc1=problem.get("apply_topk_in_fc1", True),
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
         fc1_norm_const=problem["fc1_norm_const"],
+        enable_fc1_activation_per_token_scale=per_token_scale is not None,
     )
     num_tokens = problem["num_tokens"]
     symm_buffer.x[:num_tokens].copy_(x_nvfp4)
     symm_buffer.x_sf[:num_tokens].copy_(x_sf)
     symm_buffer.topk_idx[:num_tokens].copy_(problem["topk_ids"])
     symm_buffer.topk_weights[:num_tokens].copy_(problem["topk_weights"])
+    if per_token_scale is not None:
+        symm_buffer.fc1_activation_per_token_scale[:num_tokens].copy_(per_token_scale)
 
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     transformed_l1, transformed_l2 = preprocess_mega_weights(
@@ -393,6 +423,9 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
         fast_math=problem["fast_math"],
         swiglu_alpha=problem.get("swiglu_alpha"),
         swiglu_beta=problem.get("swiglu_beta"),
+        enable_fc1_activation_per_token_scale=(
+            problem.get("fc1_activation_per_token_scale") is not None
+        ),
     )
     if epilogue_via_config:
         kwargs.update(
@@ -416,6 +449,8 @@ def _run_mega_layer(
     check_output_view: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    per_token_scale: bool = False,
+    config_extra: dict | None = None,
 ):
     import torch
     import torch.distributed as dist
@@ -441,13 +476,20 @@ def _run_mega_layer(
     ensure_moe_ep_cuda_device(bootstrap)
 
     problem = _mega_problem(
-        rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
+        rank,
+        world_size,
+        num_tokens=num_tokens,
+        max_tokens=max_tokens,
+        per_token_scale=per_token_scale,
     )
     problem.update(swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta)
     config_extra = dict(
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
+        **(config_extra or {}),
     )
+    # The direct-shim references must run the same compute graph.
+    problem["apply_topk_in_fc1"] = config_extra.get("apply_topk_in_fc1", True)
     kernel = create_mega_kernel(
         _megakernel_config(problem, epilogue_via_config=quantize_input, **config_extra)
     )
@@ -523,6 +565,7 @@ def _run_mega_layer(
             topk_ids=problem["topk_ids"],
             topk_weights=problem["topk_weights"],
             scales=t_scales,
+            fc1_activation_per_token_scale=problem["fc1_activation_per_token_scale"],
             **tensor_kwargs,
         )
         y_layer = mega.forward(t).clone()
@@ -531,6 +574,36 @@ def _run_mega_layer(
         # kernel's tail cleanup of its workspace counters/flags -- this is the
         # regression guard for that contract.
         y_layer2 = mega.forward(t)
+        if per_token_scale:
+            # Steady-state forwards skip validate_forward (the layer gates it on
+            # a stable input signature that does not include this tensor); the
+            # backend must still reject a forward that omits the required scale
+            # instead of silently reusing the previous batch's values.
+            from flashinfer.moe_ep import MoEEpConfigError
+
+            t_missing = MoEEpTensors(
+                hidden_states=t_hidden,
+                topk_ids=problem["topk_ids"],
+                topk_weights=problem["topk_weights"],
+                scales=t_scales,
+                **tensor_kwargs,
+            )
+            with pytest.raises(MoEEpConfigError, match="required"):
+                mega.forward(t_missing)
+            t_short = MoEEpTensors(
+                hidden_states=t_hidden,
+                topk_ids=problem["topk_ids"],
+                topk_weights=problem["topk_weights"],
+                scales=t_scales,
+                fc1_activation_per_token_scale=problem[
+                    "fc1_activation_per_token_scale"
+                ][: problem["num_tokens"] // 2],
+                **tensor_kwargs,
+            )
+            with pytest.raises(MoEEpConfigError, match="shape"):
+                mega.forward(t_short)
+            # The session is still healthy after the rejected forwards.
+            torch.testing.assert_close(mega.forward(t), y_layer, atol=0.0, rtol=0.0)
 
         if check_output_view:
             assert mega.supports_output_view
@@ -612,6 +685,36 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("num_tokens", [64, 1024])
+def test_moe_ep_nvfp4_cutedsl_mega_layer_per_token_scale_matches_reference(
+    num_tokens,
+):
+    """Layer forward with ``enable_fc1_activation_per_token_scale`` + a per-token
+    ``MoEEpTensors.fc1_activation_per_token_scale`` is bit-exact vs the
+    direct-shim launch staging the same scale (plumbing: MoEEpTensors ->
+    backend.stage_inputs -> symm-buffer scale -> kernel).  1024 tokens per
+    rank puts many pulled tokens per expert (multi-tile pools) behind the
+    scale transport."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        per_token_scale=True,
+        num_tokens=num_tokens,
+        max_tokens=num_tokens,
+    )
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (per-token fc1 "
+        f"activation scale, {num_tokens} tokens) matches reference"
     )
 
 
@@ -983,6 +1086,8 @@ def _run_mega_torch_oracle(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     activation: str = "swiglu",
+    per_token_scale: bool = False,
+    num_tokens: int = 64,
 ):
     """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
 
@@ -1007,6 +1112,12 @@ def _run_mega_torch_oracle(
     ``combine_roundtrip_to_fp32`` on each per-topk fc2 term (mirroring the
     device combine encoder + topk_reduce), so the tolerance band stays the
     single-GPU one.  The two knobs are mutually exclusive (shim contract).
+
+    ``per_token_scale`` enables ``enable_fc1_activation_per_token_scale`` and
+    stages a per-rank random ``(T,)`` scale: the dispatch warps peer-pull the
+    SOURCE rank's scale for every routed token, so the oracle (which folds the
+    local rank's scale into its own tokens) checks the cross-rank scale
+    transport, not just the epilogue fold.
     """
     import torch
     import torch.distributed as dist
@@ -1037,7 +1148,13 @@ def _run_mega_torch_oracle(
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
-    problem = _mega_problem(rank, world_size)
+    problem = _mega_problem(
+        rank,
+        world_size,
+        num_tokens=num_tokens,
+        max_tokens=num_tokens,
+        per_token_scale=per_token_scale,
+    )
     if activation == "situ":
         problem.update(
             gate_up_clamp=None,
@@ -1098,6 +1215,7 @@ def _run_mega_torch_oracle(
             fc1_alpha=problem["fc1_alpha"],
             fc2_alpha=problem["fc2_alpha"],
             fc1_norm_const=problem["fc1_norm_const"],
+            enable_fc1_activation_per_token_scale=per_token_scale,
         )
         try:
             stage_mega_moe_inputs(
@@ -1114,6 +1232,12 @@ def _run_mega_torch_oracle(
             x_sf_local = symm_buffer.x_sf[:n].clone()
             idx_local = symm_buffer.topk_idx[:n].clone()
             w_local = symm_buffer.topk_weights[:n].clone()
+            scale_local = None
+            if per_token_scale:
+                symm_buffer.fc1_activation_per_token_scale[:n].copy_(
+                    problem["fc1_activation_per_token_scale"]
+                )
+                scale_local = symm_buffer.fc1_activation_per_token_scale[:n].clone()
 
             transformed_l1, transformed_l2 = preprocess_mega_weights(
                 MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
@@ -1181,6 +1305,7 @@ def _run_mega_torch_oracle(
                 term_transform=term_transform,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
+                fc1_activation_per_token_scale=scale_local,
             )
 
             assert torch.isfinite(y_kernel).all()
@@ -1262,6 +1387,44 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
     )
 
 
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "in_kernel_fc2_reduce,combine_dtype",
+    [
+        (False, "bf16"),
+        (True, "bf16"),
+        (False, "mxfp8"),
+    ],
+)
+def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle_per_token_scale(
+    in_kernel_fc2_reduce, combine_dtype
+):
+    """Real cross-rank EP with ``enable_fc1_activation_per_token_scale``: the
+    dispatch warps peer-pull each routed token's scale from its source rank and
+    the fc1 epilogue folds it before the activation; checked against the
+    pure-torch global-expert oracle with the same per-token fold.  Runs with
+    the explicit reduce, the in-flight REDG reduce, and a quantized (mxfp8)
+    combine wire."""
+    _require_cuda()
+    pytest.importorskip("triton")
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_torch_oracle(
+        rank,
+        world_size,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        combine_dtype=combine_dtype,
+        per_token_scale=True,
+    )
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega kernel (per-token fc1 "
+        f"activation scale, ikr={in_kernel_fc2_reduce}, combine={combine_dtype}) "
+        "matches the multi-rank torch oracle"
+    )
+
+
 def _run_nvfp4_routing_rounds(
     rank,
     world_size,
@@ -1278,6 +1441,11 @@ def _run_nvfp4_routing_rounds(
     with_norm=False,
     apply_topk_in_fc1=False,
     check_graph=False,
+    input_scale=1.0,
+    num_experts=None,
+    balanced_routing=False,
+    boundary_token_counts=(),
+    graph_rounds=(),
 ):
     """One public layer reuses its workspace across skew, empty sources and refill."""
     import dataclasses
@@ -1309,7 +1477,8 @@ def _run_nvfp4_routing_rounds(
     ensure_moe_ep_cuda_device(bootstrap)
     activation_params = {} if activation_params is None else activation_params
     clamp = None if activation_params.get("activation") == "situ" else 1.5
-    num_experts, topk, capacity = max(4, world_size), 2, num_tokens
+    num_experts = max(4, world_size) if num_experts is None else num_experts
+    topk, capacity = 2, num_tokens
     assert num_experts % world_size == 0
     local_experts = num_experts // world_size
     alpha1, alpha2 = None, None
@@ -1396,6 +1565,9 @@ def _run_nvfp4_routing_rounds(
                 ("all_empty", 0, False),
                 ("refill", 9, False),
             )
+        rounds += tuple(
+            (f"tile_boundary_{count}", count, False) for count in boundary_token_counts
+        )
         for name, n, skewed in rounds:
             # _make_inputs seeds with 7 + rank; retain the original 73 + rank
             # inputs without allocating the unused single-rank expert weights.
@@ -1406,6 +1578,25 @@ def _run_nvfp4_routing_rounds(
                 num_experts=num_experts,
                 topk=topk,
             )
+            if balanced_routing:
+                # Populate every expert in balanced/refill rounds; skewed and
+                # empty rounds still exercise gaps and workspace reuse.
+                topk_ids.copy_(
+                    (
+                        torch.arange(n * topk, device="cuda").reshape(n, topk)
+                        + rank * topk
+                    )
+                    % num_experts
+                )
+            if name.startswith("tile_boundary_"):
+                # One remote source per expert: the routed count is exactly n,
+                # including the requested token-tile and MMA-width boundaries.
+                remote_expert = ((rank + 1) % world_size) * local_experts
+                topk_ids.copy_(torch.arange(topk, device="cuda") + remote_expert)
+            if input_scale != 1.0:
+                # Kernel and exact oracle consume the same BF16 values near
+                # the SiTU origin or in its saturated gate/up regions.
+                hidden_states.mul_(input_scale)
             problem = dict(
                 hidden=hidden,
                 intermediate=intermediate,
@@ -1454,7 +1645,7 @@ def _run_nvfp4_routing_rounds(
                     mode=mode,
                     in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 )
-            if check_graph:
+            if check_graph or name in graph_rounds:
                 assert mode == "w4a16" and not in_kernel_fc2_reduce
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -1488,15 +1679,16 @@ def _run_nvfp4_routing_rounds(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "activation_params,with_norm,alpha_source,apply_topk_in_fc1,token_back_mode",
+    "activation_params,with_norm,alpha_source,apply_topk_in_fc1,token_back_mode,input_scale",
     [
-        pytest.param({}, True, "runtime", False, "epi_warps", id="swiglu-norm"),
+        pytest.param({}, True, "runtime", False, "epi_warps", 1.0, id="swiglu-norm"),
         pytest.param(
             {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
             False,
             "config",
             False,
             "epi_warps",
+            1.0,
             id="minimax",
         ),
         pytest.param(
@@ -1505,6 +1697,7 @@ def _run_nvfp4_routing_rounds(
             "runtime",
             True,
             "reuse_dispatch_warps",
+            1.0,
             id="minimax-norm-topk",
         ),
         pytest.param(
@@ -1513,6 +1706,7 @@ def _run_nvfp4_routing_rounds(
             "config",
             False,
             "epi_warps",
+            1.0,
             id="situ-norm",
         ),
         pytest.param(
@@ -1521,12 +1715,58 @@ def _run_nvfp4_routing_rounds(
             "runtime",
             True,
             "reuse_dispatch_warps",
+            1.0,
             id="situ-linear-norm-topk",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.00000024},
+            True,
+            "config",
+            False,
+            "epi_warps",
+            1.0,
+            id="situ-non-fp32-beta",
+        ),
+        pytest.param(
+            {
+                "activation": "situ",
+                "situ_beta": 4.00000024,
+                "situ_linear_beta": 25.000001,
+            },
+            True,
+            "runtime",
+            True,
+            "reuse_dispatch_warps",
+            1.0,
+            id="situ-linear-non-fp32-beta",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+            True,
+            "runtime",
+            False,
+            "epi_warps",
+            1e-4,
+            id="situ-small",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+            True,
+            "runtime",
+            False,
+            "epi_warps",
+            128.0,
+            id="situ-saturated",
         ),
     ],
 )
 def test_nvfp4_w4a16_epilogue_contract(
-    activation_params, with_norm, alpha_source, apply_topk_in_fc1, token_back_mode
+    activation_params,
+    with_norm,
+    alpha_source,
+    apply_topk_in_fc1,
+    token_back_mode,
+    input_scale,
 ):
     """Opt-in activations and normalization retain the EP-aware bit-exact contract."""
     _require_cuda()
@@ -1547,44 +1787,93 @@ def test_nvfp4_w4a16_epilogue_contract(
         alpha_source=alpha_source,
         apply_topk_in_fc1=apply_topk_in_fc1,
         check_graph=True,
+        input_scale=input_scale,
     )
 
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "mode,token_back_mode,in_kernel_fc2_reduce,alpha_source",
+    "mode,token_back_mode,in_kernel_fc2_reduce,alpha_source,tile",
     [
-        ("w4a4", "epi_warps", False, "config"),
-        ("w4a4", "reuse_dispatch_warps", False, "config"),
-        ("w4a16", "epi_warps", False, "config"),
-        ("w4a16", "reuse_dispatch_warps", False, "config"),
-        ("w4a16", "reuse_dispatch_warps", True, "config"),
-        ("w4a16", "reuse_dispatch_warps", False, "runtime"),
-        ("w4a16", "reuse_dispatch_warps", True, "runtime"),
+        ("w4a4", "epi_warps", False, "config", None),
+        ("w4a4", "reuse_dispatch_warps", False, "config", None),
+        ("w4a16", "epi_warps", False, "config", None),
+        ("w4a16", "reuse_dispatch_warps", False, "config", None),
+        ("w4a16", "reuse_dispatch_warps", True, "config", None),
+        ("w4a16", "reuse_dispatch_warps", False, "runtime", None),
+        ("w4a16", "reuse_dispatch_warps", True, "runtime", None),
+        pytest.param(
+            "w4a16", "epi_warps", False, "config", (256, 32, 256), id="n32-swiglu-epi"
+        ),
+        pytest.param(
+            "w4a16",
+            "reuse_dispatch_warps",
+            False,
+            "runtime",
+            (256, 32, 256),
+            id="n32-situ-dispatch",
+        ),
+        pytest.param(
+            "w4a16",
+            "epi_warps",
+            False,
+            "config",
+            (128, 32, 256),
+            id="m128-n32-swiglu-epi",
+        ),
+        pytest.param(
+            "w4a16",
+            "reuse_dispatch_warps",
+            False,
+            "runtime",
+            (128, 32, 256),
+            id="m128-n32-situ-dispatch",
+        ),
     ],
 )
 @pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
 def test_nvfp4_mega_uneven_sources_and_empty_refill(
-    mode, token_back_mode, in_kernel_fc2_reduce, alpha_source, load_balance_mode
+    mode, token_back_mode, in_kernel_fc2_reduce, alpha_source, tile, load_balance_mode
 ):
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size != 2:
         pytest.skip("requires two ranks")
+    tile_n = tile[1] if tile is not None else None
     _run_nvfp4_routing_rounds(
         rank,
         world_size,
         mode=mode,
-        hidden=256,
-        intermediate=256,
+        hidden=288 if tile_n == 32 else 256,
+        intermediate=448 if tile_n == 32 else 256,
         knobs={
             "token_back_mode": token_back_mode,
             "load_balance_mode": load_balance_mode,
+            **(
+                {
+                    "mma_tiler_mnk": tile,
+                    "use_2cta_instrs": tile[0] == 256,
+                    "group_hint": 6,
+                }
+                if tile is not None
+                else {}
+            ),
         },
         changing_batches=True,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         alpha_source=alpha_source,
+        num_experts=16 if tile_n is not None else None,
+        balanced_routing=tile_n is not None,
+        boundary_token_counts=(15, 16, 17, 31, 32, 33, 63, 64, 65)
+        if tile_n == 32
+        else (),
+        graph_rounds=("tile_boundary_33", "refill") if tile_n == 32 else (),
+        activation_params=(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0}
+            if tile_n == 32 and token_back_mode == "reuse_dispatch_warps"
+            else None
+        ),
     )
 
 
@@ -1741,25 +2030,110 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
     assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
-def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
-    """The TRT-LLM-import knobs are plumbed through the FI backend config."""
-    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+@pytest.mark.parametrize(
+    "config_name,kernel_name",
+    [
+        (
+            "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_nvfp4_nvfp4_bf16_cutedsl",
+        ),
+        (
+            "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_bf16_bf16_bf16_cutedsl",
+        ),
+        (
+            "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_bf16_nvfp4_bf16_cutedsl",
+        ),
+    ],
+)
+def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
+    """Caller finalization is an explicit opt-in for each CuTe-DSL backend."""
+    from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    config_cls = getattr(moe_ep, config_name)
+    cfg = config_cls(
         intermediate_size=128,
         top_k=2,
         enable_in_kernel_fc2_reduce=True,
     )
-    assert cfg.combine_dtype == "bf16"
-    assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert cfg.do_finalize is True
+    kernel = create_mega_kernel(cfg)
+    assert kernel.kernel_name() == kernel_name
+    assert not kernel.supports_unfinalized_output
 
-    cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    cfg_unfinalized = config_cls(
         intermediate_size=128,
         top_k=2,
-        combine_dtype="nvfp4",
+        do_finalize=False,
     )
-    assert create_mega_kernel(cfg_q).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert create_mega_kernel(cfg_unfinalized).supports_unfinalized_output
+
+    if kernel_name == "sm100_nvfp4_nvfp4_bf16_cutedsl":
+        assert cfg.combine_dtype == "bf16"
+        cfg_q = config_cls(intermediate_size=128, top_k=2, combine_dtype="nvfp4")
+        assert create_mega_kernel(cfg_q).kernel_name() == kernel_name
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        {"enable_in_kernel_fc2_reduce": True},
+        {"knobs": "auto"},
+    ],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+    ],
+)
+def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompatible):
+    from flashinfer import moe_ep
+
+    with pytest.raises(ValueError, match="do_finalize=False requires"):
+        getattr(moe_ep, config_name)(
+            intermediate_size=128,
+            top_k=2,
+            do_finalize=False,
+            **incompatible,
+        )
+
+
+def test_nvfp4_deferred_output_rejects_quantized_combine():
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    with pytest.raises(ValueError, match="do_finalize=False requires"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2, do_finalize=False, combine_dtype="mxfp8"
+        )
+
+
+def test_w4a16_deferred_frontend_preserves_mode_when_applying_knobs():
+    import dataclasses
+
+    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
+
+    config = bf16_nvfp4.MegaMoEBf16Nvfp4Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=7,
+        num_topk=2,
+        num_total_experts=2,
+        hidden=128,
+        intermediate=128,
+        defer_topk_reduce=True,
+    )
+    with pytest.raises(ValueError, match="defer_topk_reduce requires"):
+        dataclasses.replace(config, enable_in_kernel_fc2_reduce=True)
+    frontend = bf16_nvfp4.MegaMoEBf16Nvfp4Frontend(config)
+    frontend.apply_knobs({"defer_topk_reduce": False})
+    assert frontend.config.defer_topk_reduce
+    with pytest.raises(ValueError, match="unsupported BF16/NVFP4 MegaMoE knobs"):
+        frontend.apply_knobs({"in_kernel_fc2_reduce": True})
 
 
 def test_nvfp4_cutedsl_config_validates_situ():
@@ -1787,6 +2161,47 @@ def test_nvfp4_cutedsl_config_validates_situ():
             situ_beta=4.0,
             gate_up_clamp=10.0,
         )
+
+
+def test_nvfp4_cutedsl_config_exposes_per_token_scale():
+    """``enable_fc1_activation_per_token_scale`` is plumbed FI config -> shim
+    config, and ``MoEEpTensors`` carries the per-forward tensor (default None)."""
+    import dataclasses
+
+    from flashinfer.moe_ep import (
+        MoEEpTensors,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        MegaMoENvfp4Config,
+        MegaMoENvfp4Inputs,
+    )
+
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
+    assert cfg.enable_fc1_activation_per_token_scale is False
+    cfg_on = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128, top_k=2, enable_fc1_activation_per_token_scale=True
+    )
+    assert cfg_on.enable_fc1_activation_per_token_scale is True
+    assert create_mega_kernel(cfg_on).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+
+    fields = {f.name: f for f in dataclasses.fields(MoEEpTensors)}
+    assert fields["fc1_activation_per_token_scale"].default is None
+    shim_fields = {f.name: f for f in dataclasses.fields(MegaMoENvfp4Inputs)}
+    assert shim_fields["fc1_activation_per_token_scale"].default is None
+
+    shim_cfg = MegaMoENvfp4Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=8,
+        hidden=256,
+        intermediate=256,
+        enable_fc1_activation_per_token_scale=True,
+    )
+    assert shim_cfg.enable_fc1_activation_per_token_scale is True
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():

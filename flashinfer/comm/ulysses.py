@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from .. import cake_ulysses_backend
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_a2a_module
 from ..utils import register_custom_op
@@ -44,6 +45,51 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # communicator lifecycle states; CLOSED is only reached after a fully
 # successful teardown so a failed close() can be retried
 _OPEN, _CLOSING, _CLOSED = "open", "closing", "closed"
+
+
+# ---- the NVLink kernel route -------------------------------------------------
+#
+# The NVLink backend has two kernels behind one protocol: the exported Cake
+# programs of ``flashinfer.cake_ulysses_backend`` on the devices and element
+# types that package delivers (SM100 / SM103), and FlashInfer's portable kernel
+# (``csrc/ulysses_all_to_all.cu``) everywhere else.  Both run on the same IPC
+# staging and signal allocations of the init transaction below.  The route is
+# decided once per communicator, inside the transaction, so every rank agrees
+# on it; these module-level hooks are the only package entry points the
+# communicator calls (tests re-target them).
+
+
+def _cake_nvlink_route(
+    device_index: int, dtype: torch.dtype, world_size: int
+) -> Optional[str]:
+    """The exported Cake architecture when the package route owns this
+    communicator's collectives, else ``None`` (portable kernel)."""
+    return cake_ulysses_backend.cake_backend.route_arch(device_index, dtype, world_size)
+
+
+def _cake_nvlink_warm(arch: str, dtype: torch.dtype, world_size: int) -> None:
+    """Load (JIT-building when needed) the scatter and gather libraries of the route."""
+    cake_ulysses_backend.cake_backend.warm(arch, dtype, world_size)
+
+
+def _cake_nvlink_handle(
+    *,
+    staging_ptrs: List[int],
+    signal_ptrs: List[int],
+    rank: int,
+    world_size: int,
+    dtype: torch.dtype,
+    device_index: int,
+) -> "cake_ulysses_backend.CakeUlyssesA2A":
+    """Bind the package's launches to this rank's IPC allocations."""
+    return cake_ulysses_backend.cake_backend.CakeUlyssesA2A(
+        staging_ptrs=staging_ptrs,
+        signal_ptrs=signal_ptrs,
+        rank=rank,
+        world_size=world_size,
+        dtype=dtype,
+        device_index=device_index,
+    )
 
 
 def _storage_ranges_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -176,6 +222,17 @@ class UlyssesCommunicator:
     ``world_size == 1`` is a passthrough: both collectives return the input
     tensor unchanged (no copy).
 
+    The NVLink backend launches one of two kernels on the same IPC staging
+    and signal allocations, decided once per communicator inside the NVLink
+    initialization (every rank takes the same route; :attr:`nvlink_kernel`
+    reports it): the exported Cake programs of
+    ``flashinfer.cake_ulysses_backend`` when the device's compute capability
+    is one that package delivers for this dtype and world size (SM100 /
+    SM103), else FlashInfer's portable NVLink kernel. The raw entry points
+    (``init_ulysses_a2a`` / ``ulysses_a2a`` / ``dispose_ulysses_a2a``) always
+    drive the portable kernel; a communicator's own collectives never mix the
+    two kernels on its signal words.
+
     Constraints
     -----------
     - The constructor is always collective: every rank of ``group`` must
@@ -268,6 +325,10 @@ class UlyssesCommunicator:
         # opaque NVLink-backend handle (a C++ UlyssesA2A* as an int) from
         # init_ulysses_a2a; None until armed and after teardown
         self._fa: Optional[int] = None
+        # the Cake package handle of the NVLink path (None: portable kernel or
+        # not armed) and the exported architecture it was bound for
+        self._cake: Optional["cake_ulysses_backend.CakeUlyssesA2A"] = None
+        self._cake_arch: Optional[str] = None
         self._out_ptrs: Optional[List[int]] = None
         self._sig_ptrs: Optional[List[int]] = None
         # rank-local resource tracking for staged init/teardown
@@ -500,18 +561,38 @@ class UlyssesCommunicator:
         # Every import (including cudart below) lives inside a stage envelope:
         # an import failing on one rank must become a gathered outcome, not an
         # exception escaping before a gather.
+        # The Cake package route is decided here too: its libraries are
+        # loaded (JIT-built when needed) in this stage so a build failure is a
+        # gathered outcome, and the signal allocation below is sized for both
+        # kernels (they share it; each uses the words from zero).
         try:
             from .vllm_ar import meta_size
 
             with torch.cuda.device(self.device):
                 get_ulysses_a2a_module()
                 sig_bytes = int(meta_size())
-            outcome: Tuple[str, ...] = ("ok", str(sig_bytes))
+                cake_arch = _cake_nvlink_route(
+                    self.device.index, self.dtype, self.world_size
+                )
+                if cake_arch is not None:
+                    _cake_nvlink_warm(cake_arch, self.dtype, self.world_size)
+                    sig_bytes = max(sig_bytes, cake_ulysses_backend.SIGNAL_BYTES)
+            outcome: Tuple[str, ...] = ("ok", str(sig_bytes), cake_arch or "")
         except Exception as e:  # noqa: BLE001
             outcome = ("err", f"rank {self.rank} JIT/meta: {type(e).__name__}: {e}")
-        err = self._first_error(self._gather(outcome))
+        gathered_j = self._gather(outcome)
+        err = self._first_error(gathered_j)
         if err is not None:
             return err  # nothing allocated anywhere yet
+        routes = sorted({o[2] for o in gathered_j})
+        if len(routes) != 1:
+            # one kernel per group: a mixed route would pair two protocols on
+            # the shared signal words
+            return (
+                "ranks disagree on the NVLink kernel route "
+                f"(exported architectures per rank: {[o[2] or 'portable' for o in gathered_j]})"
+            )
+        self._cake_arch = cake_arch
 
         # stage A: allocate this rank's export buffers and IPC handles
         out_bytes = self.max_elems * self.dtype.itemsize
@@ -571,6 +652,20 @@ class UlyssesCommunicator:
                 self._fa = init_ulysses_a2a(
                     out_ptrs, sig_ptrs, self.rank, self.world_size, True
                 )
+                if self._cake_arch is not None:
+                    # the package route: the same staging and signal
+                    # allocations, bound once as the kernels' peer tables and
+                    # this rank's signal view; its signal words are zeroed on
+                    # the current stream before the synchronize below
+                    self._cake = _cake_nvlink_handle(
+                        staging_ptrs=out_ptrs,
+                        signal_ptrs=sig_ptrs,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        dtype=self.dtype,
+                        device_index=self.device.index,
+                    )
+                    self._cake.zero_signals()
                 torch.cuda.synchronize()
             outcome = ("ok",)
         except Exception as e:  # noqa: BLE001
@@ -660,18 +755,24 @@ class UlyssesCommunicator:
             return (1, f"rank {self.rank} synchronize: {type(e).__name__}: {e}")
 
     def _try_dispose(self) -> Tuple[int, Optional[str]]:
-        if self._fa is None:
+        if self._fa is None and self._cake is None:
             return (0, None)
         try:
             with torch.cuda.device(self.device):
-                dispose_ulysses_a2a(self._fa)
-                # ledger update inside the guard: a __exit__ raise after a
-                # successful dispose must not lead to a double-delete on retry
-                self._fa = None
+                if self._cake is not None:
+                    # the package handle holds bound arguments only (no device
+                    # memory of its own); drop them before the allocations go
+                    self._cake.dispose()
+                    self._cake = None
+                if self._fa is not None:
+                    dispose_ulysses_a2a(self._fa)
+                    # ledger update inside the guard: a __exit__ raise after a
+                    # successful dispose must not lead to a double-delete on retry
+                    self._fa = None
             return (0, None)
         except Exception as e:  # noqa: BLE001
             return (
-                0 if self._fa is None else 1,
+                0 if (self._fa is None and self._cake is None) else 1,
                 f"rank {self.rank} dispose: {type(e).__name__}: {e}",
             )
 
@@ -744,8 +845,37 @@ class UlyssesCommunicator:
             )
         self._out_ptrs = None
         self._sig_ptrs = None
+        self._cake_arch = None
         self._nvlink_armed = False
         self._state = _CLOSED
+
+    @property
+    def nvlink_kernel(self) -> Optional[str]:
+        r"""Which kernel the NVLink backend launches: ``"cake"`` (the exported
+        Cake programs of ``flashinfer.cake_ulysses_backend``), ``"portable"``
+        (FlashInfer's portable NVLink kernel) or ``None`` when the NVLink
+        backend is not armed (NCCL backend, ``world_size == 1``, closed)."""
+        if not self._nvlink_armed:
+            return None
+        return "cake" if self._cake is not None else "portable"
+
+    def _nvlink_a2a(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        B: int,
+        S_local: int,
+        H: int,
+        D: int,
+        mode: int,
+    ) -> None:
+        """One NVLink collective into ``out`` on the current stream, through the
+        route the init transaction armed (the Cake package writes ``out``
+        completely; the portable kernel stages and copies out)."""
+        if self._cake is not None:
+            self._cake.launch(inp, out, B, S_local, H, D, mode)
+            return
+        ulysses_a2a(self._fa, inp, out, B, S_local, H, D, mode)
 
     def __enter__(self) -> "UlyssesCommunicator":
         return self
@@ -853,7 +983,7 @@ class UlyssesCommunicator:
         if self.backend == "nvlink":
             if out is None:
                 out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            ulysses_a2a(self._fa, x, out, B, S_local, H, D, 0)
+            self._nvlink_a2a(x, out, B, S_local, H, D, 0)
             return out
         return self._nccl_scatter_heads(x, out=out, workspace=workspace)
 
@@ -1001,8 +1131,7 @@ class UlyssesCommunicator:
             )
             if out is None:
                 out = torch.empty(output_shape, dtype=self.dtype, device=self.device)
-            ulysses_a2a(
-                self._fa,
+            self._nvlink_a2a(
                 packed,
                 out,
                 B,
@@ -1098,7 +1227,7 @@ class UlyssesCommunicator:
         if self.backend == "nvlink":
             if out is None:
                 out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            ulysses_a2a(self._fa, x, out, B, S_local, H, D, 1)
+            self._nvlink_a2a(x, out, B, S_local, H, D, 1)
             return out
         return self._nccl_gather_heads(x, out=out, workspace=workspace)
 
@@ -1217,8 +1346,7 @@ class UlyssesCommunicator:
                 contiguous_input = send_storage.view_as(x)
                 contiguous_input.copy_(x)
             compact = recv_storage.view(B, S_local, self.world_size * head_count, D)
-            ulysses_a2a(
-                self._fa,
+            self._nvlink_a2a(
                 contiguous_input,
                 compact,
                 B,

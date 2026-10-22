@@ -36,6 +36,9 @@ from flashinfer.fused_moe.shared.validation import (
     resolve_moe_act_sf_layout,
 )
 from flashinfer.jit.core import logger
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP4_4OVER6_CODE_FROM_ENV,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -76,6 +79,7 @@ class MoERunner(TunableRunner):
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
         num_fused_shared_experts: int = 0,
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ):
         self.moe_op = moe_op
         self.num_local_experts = num_local_experts
@@ -94,6 +98,9 @@ class MoERunner(TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_packed_weights = use_packed_weights
         self.use_per_token_scaling = use_per_token_scaling
+        # 4over6 recipe (nvfp4_4over6_code()) for the per-token GEMM2-input
+        # requantization; the default reads FLASHINFER_NVFP4_4OVER6* per call.
+        self.nvfp4_4over6_code = int(nvfp4_4over6_code)
         self.num_experts = num_experts if num_experts is not None else num_local_experts
         # Runtime routing tensors and their initializer closures carry object
         # identity, so keep them in an attribute excluded by
@@ -314,6 +321,14 @@ class MoERunner(TunableRunner):
         da_routing_metadata = kwargs.get("da_routing_metadata", ())
         da_body_workspace = kwargs.get("da_body_workspace", ())
         prepare_da_body = do_preparation and bool(da_routing_metadata)
+        # Profiling launches share the caller's workspace so autotuning needs no scratch
+        # beyond it; a bucket larger than the buffer allocates what does not fit. DA bodies
+        # own their typed workspaces.
+        workspace_buffer = (
+            None
+            if da_routing_metadata or da_body_workspace
+            else kwargs.get("workspace_buffer")
+        )
 
         num_tokens = hidden_states.shape[0]
         assert output.shape[0] == num_tokens, (
@@ -401,6 +416,8 @@ class MoERunner(TunableRunner):
                 list(da_routing_metadata),
                 list(da_body_workspace),
                 prepare_da_body,
+                workspace_buffer,
+                False,  # query_workspace_size
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
@@ -458,6 +475,8 @@ class MoERunner(TunableRunner):
                     prepare_da_body,
                     kwargs.get("valid_hidden_size"),
                     kwargs.get("valid_intermediate_size"),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
             elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                 result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
@@ -490,6 +509,8 @@ class MoERunner(TunableRunner):
                     [-1, -1] if tactic == -1 else tactic,
                     self.activation_type,
                     kwargs.get("norm_topk_prob", True),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
             else:
                 common_args = (
@@ -520,6 +541,9 @@ class MoERunner(TunableRunner):
                     list(da_routing_metadata),
                     list(da_body_workspace),
                     prepare_da_body,
+                    kwargs.get("gemm1_clamp_limit"),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
                 if routing_logits is None:
                     # FP8 per tensor scale, pre-computed routing.
@@ -579,6 +603,8 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                workspace_buffer,
+                False,  # query_workspace_size
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
@@ -628,6 +654,9 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                workspace_buffer,
+                False,  # query_workspace_size
+                self.nvfp4_4over6_code,
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)

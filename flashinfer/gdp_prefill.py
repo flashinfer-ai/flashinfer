@@ -40,7 +40,9 @@ def chunk_gated_delta_product(
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["auto", "cudnn"] = "auto",
+    backend: Literal["auto", "cudnn", "cake"] = "auto",
+    state_indices: Optional[torch.Tensor] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct (GDP) attention for prefill.
 
@@ -109,13 +111,47 @@ def chunk_gated_delta_product(
     output_state : torch.Tensor, optional
         Pre-allocated final-state buffer, written in place.  Allocated
         internally when ``None`` and ``output_final_state`` is set.  It must
-        not alias ``initial_state``; the kernel splits one sequence across
+        not alias ``initial_state`` without ``state_indices``; the kernel splits one sequence across
         CTAs, so the CTA reading the incoming state would race the one writing
         the outgoing state.
-    backend : Literal["auto", "cudnn"], optional
-        FlashInfer carries no GDP kernel of its own, so ``"auto"`` (default)
-        and ``"cudnn"`` both run cuDNN's fused SM100 linear-attention engine
-        through :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+    backend : Literal["auto", "cudnn", "cake"], optional
+        ``"auto"`` (default) and ``"cudnn"`` run cuDNN's fused SM100
+        linear-attention engine through
+        :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.  ``"cake"``
+        runs the Cake GDP prefill kernel
+        (:func:`flashinfer.cake_gdp_backend.cake_chunk_gated_delta_product`):
+        ``head_size == 128`` with a 64-wide value / state row, one head count
+        for q, k and v, ``num_householder`` in 1..4, an SM90 device (H100 /
+        H200); the argument contract is this function's, with ``initial_state``
+        / ``output_state`` in float32 (a bfloat16 per-sequence ``initial_state``
+        is converted) and contiguous state pools.  One kernel launch per call;
+        nothing is read on the host and no device-to-host synchronization is
+        issued.  ``g=None`` runs the kernel's unit-gate program and
+        ``beta=None`` the unit-beta program, from a zero state; ``g=None``
+        together with ``beta=None``, a unit-gate / unit-beta call with an
+        ``initial_state`` or a ``state_indices`` pool, and a device without an
+        exported route raise ``ValueError`` naming what is exported.
+    cu_seqlens_cpu : torch.Tensor, optional
+        The host copy of ``cu_seqlens`` (a CPU int32 / int64 1-D tensor of ``N +
+        1`` entries, as vLLM keeps ``query_start_loc_cpu``).  The Cake backend
+        reads the sequence lengths on the host for the kernel's split rule of
+        record (a long sequence is cut into items for the gate-saturation split
+        program; a batch the rule leaves whole runs the exact program; the two
+        agree bitwise).  When it is None the Cake backend reads
+        ``cu_seqlens.cpu()``: one device-to-host synchronization, which CUDA
+        Graph capture does not allow, so a graph-captured caller passes it.  It
+        is checked for device, rank, length and dtype, never compared with
+        ``cu_seqlens`` value by value.  The cuDNN backends accept and ignore it.
+
+    state_indices : torch.Tensor, optional
+        Contiguous int32 ``[num_seqs]`` slots in ``initial_state`` and
+        ``output_state`` pools, requiring cuDNN frontend 1.31+. Pools have
+        shape ``[N_pool, H, V, K]``, dense inner rows, and a 16-byte aligned
+        slot stride. Slot values must be unique and in range.
+        When ``output_final_state=True``, an explicit output pool is required;
+        it may be the identical input view or disjoint memory. The returned
+        state is the whole output pool, with unselected slots unchanged.
+        When false, neither pool is modified. Values are not read on the CPU.
 
     Returns
     -------
@@ -130,13 +166,34 @@ def chunk_gated_delta_product(
     engine's call: a graph it cannot serve is declined by cuDNN (the per-engine
     reason lands in the frontend's log).
     """
-    if backend not in ("auto", "cudnn"):
-        raise ValueError(f'backend must be "auto" or "cudnn", got {backend!r}')
+    if backend not in ("auto", "cudnn", "cake"):
+        raise ValueError(f'backend must be "auto", "cudnn" or "cake", got {backend!r}')
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for varlen mode")
     if cu_seqlens.dtype not in _CU_SEQLENS_DTYPES:
         raise ValueError(
             f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
+        )
+
+    if backend == "cake":
+        from .cake_gdp_backend import cake_chunk_gated_delta_product
+
+        return cake_chunk_gated_delta_product(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            num_householder,
+            scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_indices=state_indices,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
     from .cudnn import cudnn_chunk_gated_delta_product
@@ -155,4 +212,5 @@ def chunk_gated_delta_product(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         output=output,
         output_state=output_state,
+        state_indices=state_indices,
     )

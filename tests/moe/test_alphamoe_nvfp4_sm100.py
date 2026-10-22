@@ -370,7 +370,7 @@ def _launch(
     return output
 
 
-# The five correctness-bearing rows in the originating Loom contract cover
+# The five correctness-bearing rows in the originating kernel contract cover
 # smoke, N tiling, route tails, and the K=7168 serving coordinate.
 _CONTRACT_CASES = [
     ("smoke_m8_n256_e4_k256_top2", 8, 256, 256, 4, 2, 8, 1.0, 2.5, 28101),

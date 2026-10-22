@@ -850,11 +850,11 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires matching K/V dtypes, except QK-BF16/PV-FP8",
             )
-        elif head_dim_qk != head_dim_vo or head_dim_qk not in (64, 128, 256):
+        elif head_dim_qk != head_dim_vo or head_dim_qk not in (64, 128, 192, 256):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires equal QK/VO head dimensions in {64, 128, 256}",
+                "requires equal QK/VO head dimensions in {64, 128, 192, 256}",
             )
         elif page_size not in (4, 16, 32, 64, 128):
             _drop_backend(
@@ -1076,7 +1076,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 # run-time q_len_per_req only validates against it).
                 q_len_per_req=s_qo,
             )
-            resolved_backends[backend] = backend_wrappers[backend]._backend
+            resolved_backends[backend] = backend_wrappers[backend].resolved_backend
         else:
             resolved_backends[backend] = backend
 
@@ -1623,11 +1623,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires matching K/V dtypes, except QK-BF16/PV-FP8",
             )
-        elif head_dim_qk != head_dim_vo or head_dim_qk not in (128, 256):
+        elif head_dim_qk != head_dim_vo or head_dim_qk not in (128, 192, 256):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires equal QK/VO head dimensions in {128, 256}",
+                "requires equal QK/VO head dimensions in {128, 192, 256}",
             )
         elif page_size not in (16, 32, 64, 128):
             _drop_backend(
@@ -1954,11 +1954,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
         elif backend == "cudnn":
-            # cuDNN uses NHD layout and the wrapper API
+            # K/V cache tensors use [pages, heads, page_size, dim] (HND).
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
-                    "NHD",
+                    "HND",
                     backend="cudnn",
                 )
             )
@@ -2574,11 +2574,16 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 "prims-ts",
                 "supports FP16, BF16, and FP8 E4M3 inputs only",
             )
-        elif (head_dim_qk, head_dim_vo) not in ((128, 128), (192, 128), (256, 256)):
+        elif (head_dim_qk, head_dim_vo) not in (
+            (128, 128),
+            (192, 128),
+            (192, 192),
+            (256, 256),
+        ):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires QK/VO head dimensions (128,128), (192,128), or (256,256)",
+                "requires QK/VO head dimensions (128,128), (192,128), (192,192), or (256,256)",
             )
         elif num_qo_heads % num_kv_heads != 0:
             _drop_backend(backends, "prims-ts", "requires Hq to be divisible by Hkv")
@@ -3420,6 +3425,12 @@ def testBatchMLAPagedAttentionWrapper(args):
             torch.float8_e5m2,
         ]:
             print("[INFO] Cutlass MLA backend does not support FP8. Skipping.")
+            remove_cutlass = True
+        if num_qo_heads != 128:
+            print(
+                "[INFO] Cutlass MLA backend requires 128 heads; "
+                f"got {num_qo_heads}. Skipping."
+            )
             remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")

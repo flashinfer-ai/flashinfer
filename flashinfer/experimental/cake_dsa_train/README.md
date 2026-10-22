@@ -10,8 +10,10 @@ SM100 (B200 / GB200) is the acceptance architecture of the native kernels and
 SM103 (B300 / GB300) is compiled from the same sources; SM107 (Rubin R200) is
 the acceptance architecture of the packed / strided-layout extension
 (flashinfer-ai/flashinfer#5675) and is compiled from the same sources with an
-nvcc that emits `compute_107a`.  The feature is JIT-only and does not
-participate in automatic backend selection, autotuning or trace-apply.
+nvcc that emits `compute_107a`.  The feature does not participate in
+automatic backend selection, autotuning or trace-apply.  Its libraries are
+loaded prebuilt from `aot/` when the package ships them and JIT-built by
+FlashInfer from `build.json` otherwise (see "Layout of this package").
 
 ## Public entry points (`flashinfer/dsa_sparse_attention.py`)
 
@@ -122,10 +124,13 @@ context-parallel window):
   needs `S_dst >= S`.
 * The kernel does not range-check `dkv_dst_map`: every value must lie in
   `[0, S_dst)` (the rows of `dkv_acc`), and a value outside that range would
-  add into memory outside the buffer.  Setting
-  `FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1` validates the values on every call
-  (one device synchronization) and raises `ValueError` on a violation; leave
-  it unset in production.
+  add into memory outside the buffer.  The keyword `check_dst_map` of the
+  entry points (default `False`) validates the values on every call when
+  `True` (one device synchronization) and raises `ValueError` on a violation;
+  leave it off in production.  The backend reads no environment variable:
+  flashinfer's public wrapper `flashinfer.dsa_sparse_attention` maps
+  `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` onto the keyword when the caller leaves
+  it at `None`.
 * With `dkv_acc` the backward returns `(dq_latent, dq_rope, None, None)`, the
   autograd wrapper returns `None` gradients for `kv_latent` / `k_rope`, and
   `dkv_fp32=True` is rejected.  The kernels' permuted FP32 accumulators remain
@@ -156,8 +161,11 @@ reduce-bound rows per tile, and only rows with many keys per query token pay
 it back (B200 backward: `S / T >= 16` 0.5-4 % faster, `S = T` 3.7 % slower), so
 the host takes the direct path by the size rule the record carries
 (`dkv_direct`: `min_keys_per_query`, 4 -- direct iff `S >= 4 T`) whenever
-`dkv_acc` is given; `FLASHINFER_CAKE_DSA_DKV_DIRECT=1` / `=0` forces or
-disables it (`auto` = the rule; the value is part of the binding key).  Both
+`dkv_acc` is given; the keyword `dkv_direct` of the entry points (default
+`None` = the rule) forces (`True`) or disables (`False`) it, and the resolved
+value is part of the binding key (flashinfer's public wrapper maps
+`FLASHINFER_CAKE_DSA_DKV_DIRECT=auto|1|0` onto the keyword when the caller
+leaves it at `None`).  Both
 paths add the same FP32 contributions into the same rows in another summation
 order; dq is bitwise the same.  Without the natural stages every `dkv_acc`
 call takes the cast's accumulate path.
@@ -169,16 +177,19 @@ resolved once per input geometry (shapes, strides, dtypes, device, alignment
 and the call options): the prepared runner carves its scratch from the
 workspace it is given; the eager entry points keep the resolved plans in a
 bounded, lock-protected cache (`BINDING_CACHE`, 64 entries by default,
-`FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` sets the capacity, least
-recently used first out; a plan owns only the full-length `topk_length` vector it
-materializes when the caller passes none) and, per call, allocate the outputs
+`BINDING_CACHE.configure(capacity=...)` resizes it -- flashinfer's public
+wrapper applies `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` through it
+when that variable is set; least recently used first out; a plan owns only the
+full-length `topk_length` vector it materializes when the caller passes none)
+and, per call, allocate the outputs
 and the backward scratch from the caching allocator and launch the stages
 through the generated positional launchers of `cake_launch.py`.  During
 CUDA-graph capture the eager entry points plan privately and leave the cache
 untouched.  The bindings encode the tensor maps by value, so a step is its
 kernels -- one launch for the forward; three for the single-pass backward
-(`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x passes` for the key-range-pass
-backward (`bwd_delta`, then `bwd_main_pass` + `bwd_compact` per pass, `bwd_cast`)
+(`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x chunks x passes` for the
+key-range-pass backward (`bwd_delta`, then `bwd_compact` + `bwd_main_pass` per
+token chunk and pass, `bwd_cast`)
 -- plus the two fills of the FP32 dK/dV accumulators; a direct binding (see
 "Direct accumulation from the main stage") launches the natural-layout variant
 of the main stage instead and has neither the fills nor the cast.  A call without query rows
@@ -241,20 +252,38 @@ slice one pass touches stays L2-resident: `bwd_delta`, then per pass
 `bwd_compact` + `bwd_main_pass` over the whole row, then `bwd_cast`.  The
 policy the record carries (`key_pass_policy`: L2 budget 100 MiB, 2304 B per
 key, workspace budget 640 MiB, token chunk multiple 128, at most
-`max_passes = 4` passes) takes the pass path only when `1 < P <= 4` and the
-whole row fits the pass workspace budget (`T <= 4224` tokens at top-k 2048;
-there is no token chunking); otherwise the single-pass `bwd_main` runs
-unchanged.  At top-k 2048 that is `T <= 4224` and `45,512 <= S <= 182,044`:
-two passes at `S = 65,536`, three at `131,072`, four up to `182,044`; beyond
-that (five passes and more) the per-pass FP32 dQ-partial round trip and
-pipeline fill outweigh the L2 benefit, so `S = 225,280` or `267,520` rows run
-one pass; 4k x 4k rows and 32k-token rows stay single-pass.  The passes split the whole key row
+`max_passes = 4` passes, and one rule per architecture under `rules`) takes
+the pass path only for `P > 1` and under the rule of the device's
+architecture, measured in paired sweeps per target:
+
+| target | tail rows (`2 T <= S`) | passes | floor (one-chunk row / tail row) | tail cap |
+|---|---|---|---|---|
+| `sm_100a` | no | `P` | - / - | - |
+| `sm_103a` | yes | `P` | - / 131,072 keys | 3 |
+| `sm_107a` | yes | 2 | 131,072 / 131,072 keys | - |
+
+A row qualifies when it is one token chunk (`T <= 4224` tokens at top-k
+2048: the chunk is the largest multiple of 128 whose pass scratch fits the
+workspace budget) or, where the rule admits tail rows, when `2 T <= S`; a
+qualifying row below its floor stays single-pass, and the count is the rule's
+fixed value or `P`, capped for tail rows of more than one chunk.  So at top-k
+2048 on `sm_100a`: `T <= 4224` and `S >= 45,512`, two passes at `S = 65,536`,
+three at `131,072`, 4k x 4k rows and 32k-token rows single-pass; on `sm_103a`
+also three passes on the 32k-token rows of 131,072 or more keys; on `sm_107a`
+two passes on every qualifying row of 131,072 or more keys and one pass
+below.  A count above `max_passes` runs one pass: beyond four passes the
+per-pass FP32 dQ-partial round trip and pipeline fill outweigh the L2 benefit
+(the `S = 225,280` / `267,520` one-chunk rows run one pass on `sm_100a` and
+`sm_103a`; `sm_107a`'s two passes are under the cap).  A record without
+`rules` (the first release) is the `sm_100a` rule everywhere.  The tokens of a multi-pass backward run in chunks of 4224 (every
+chunk through every pass, `token_base` = the chunk's first token), so the pass
+scratch holds one chunk.  The passes split the whole key row
 into equal ranges, which matches an index row whose keys spread over the whole
 row (one document); in a packed multi-segment row every token's keys lie
 inside its own segment, so the policy applies to one-segment rows only
 (`num_segments > 1`, the varlen entry's `len(cu_seqlens_k) - 1`, plans one
 pass unless `key_passes` overrides).  The passes add
-`T * (147,456 + 4 * topk + 4)` B to the workspace (`dq_partial`,
+`min(T, 4224) * (147,456 + 4 * topk + 4)` B to the workspace (`dq_partial`,
 `key_scratch`, `pass_counts`; 608 MiB at `T = 4096`, top-k 2048;
 `dsa_train_workspace_size` includes them).  dQ is
 still written once per row from the carried FP32 partial (bitwise
@@ -264,30 +293,188 @@ the same reds in another order.  `key_passes=` on the entry points overrides
 the policy (`1` = single pass, `n` = that many passes); a program without the
 pass stages serves the single pass only.
 
+## NoPE (zero-rope) program
+
+A second registry record, `cake_dsa_h64_nope_train`, carries the native kernels
+of the zero-rope form of the same attention (GLM-5.3 geometry: 64 heads, 512
+shared latent dimensions and no rope part, softmax scale `1 / 16`, top-k slot
+counts such as 2176 or 1152 -- any `K_slots >= 1`).  The score is the latent
+product alone, `softmax(scale * q . kv^T) . kv`, and the backward produces one
+combined gradient per key row, `dkv = dK + dV`, natural layout, FP32 `[S, 512]`.
+The rope entry points above are unchanged; the NoPE entries are additive.
+
+Slot-count rule: the host accepts every int32 `indices [T, K_slots]` with
+`K_slots >= 1` (any width, odd widths included; `topk_length` may be shorter
+per row) and rejects `K_slots <= 0`, a non-int32 dtype and a row stride below
+`K_slots` explicitly (`validate_dsa_nope_inputs`); the kernels bound the per-row
+work by `topk_length` and read no slot beyond `K_slots`.
+
+```python
+from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope, dsa_sparse_attention_nope_varlen
+
+out = dsa_sparse_attention_nope(q, kv, indices, topk_length=None, softmax_scale=None,
+                                return_lse=False, dkv_acc=None, dkv_dst_map=None)
+out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
+                                       max_seqlen_q=None, max_seqlen_k=None, causal=False,
+                                       topk_length=None, softmax_scale=None, return_lse=False,
+                                       dkv_acc=None, dkv_dst_map=None, check_cu_seqlens=True)
+```
+
+* `q [T, 64, 512]` BF16 (contiguous or a strided token / head view, consumed in
+  place); `kv [S, 512]` BF16 or its one-head form `[S, 1, 512]` (squeezed on the
+  host; the gradient reaches that leaf through the view); `indices [T, K_slots]`
+  int32 global key rows, `topk_length` and the validity rules as above.
+  `softmax_scale` defaults to `1 / 16`.
+* Backend entries (`cake_backend`): `forward_nope`, `backward_nope`,
+  `forward_nope_varlen` (the packed forward without autograd: the public
+  entry's index route by table size; returns `(out, lse, o_lo, indices,
+  topk_length)`, the global rows and lengths `backward_nope` takes with
+  `num_segments = cu_seqlens_k.numel() - 1` and a caller-zeroed `dkv_acc`),
+  `prepare_dsa_nope_train` / `DSANopeTrainRunner`, `dsa_nope_train_workspace_size`,
+  `validate_dsa_nope_inputs`, `DSASparseAttentionNopeFunction` (12 forward inputs,
+  gradients for `q` and `kv` only).  The binding cache is shared; the NoPE keys are
+  tagged (`"nope_fwd"` / `"nope_bwd"`) and never collide with the rope keys.
+* `dkv` semantics.  Fresh (no `dkv_acc`): `backward_nope` returns a new natural
+  FP32 `[S, 512]` buffer -- filled by the natural-layout main stage adding into
+  the zero-filled buffer when the record's direct rule selects it (`dkv_direct`:
+  `min_keys_per_query` 1, so whenever the row has at least one key per query --
+  every packed causal problem; measured faster than the permuted drain on every
+  row), else -- more query rows than keys, or `dkv_direct=False` -- by the cast
+  stage writing the permuted accumulator out densely (`out_f32`).  Accumulate
+  (`dkv_acc` FP32 `[S_dst, >= 512]`, optional `dkv_dst_map`): `+=` into columns
+  `0:512` of the caller's rows by the same two
+  paths and `None` for `dkv`; chunked backward passes of one long row sum into
+  one buffer without intermediate rounding.  Through autograd without
+  `dkv_acc`, the FP32 `dkv` becomes the `kv` gradient and the autograd engine
+  casts it to the leaf's dtype (BF16 for a BF16 leaf).
+* `dout` may be a head-major view (strides `[512, T * 512, 1]`) or any strided
+  `[T, 64, 512]` view under the layout rules of `q` (unit channel stride, token
+  and head strides multiples of 8 elements, 16-byte base): it is read in place
+  by every entry, the eager `backward_nope` and a prepared runner alike -- the
+  main stage through a stride-carrying tensor map, the delta stage through the
+  token / head strides (elements) and the element offset the launcher passes
+  (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
+* Varlen: per-document indices become global key rows on device, by table
+  size (`nope_varlen_index_mode`).  Below `NOPE_CONVERT_SLOT_LIMIT` (2^20)
+  index slots (`T * K_slots`) the forward program converts them itself
+  (`cu_seqlens_q`, `cu_seqlens_k`, `indices_out`, `num_docs`, `search_iters`,
+  `causal`, `convert` at the end of its launch arguments; `convert = 1` reads
+  the per-document rows at any row stride, writes the global rows the backward
+  consumes and derives the per-row lengths): the packed forward is one launch
+  -- seventeen with the torch glue `offset_gather_kv_indices`, which the rope
+  varlen entry keeps; the results are bitwise equal.  At or above the limit,
+  and always with a caller-given `topk_length`, the record's index-preparation
+  stage runs first (`index_prep`: one warp per index row, four rows per
+  128-thread CTA, any index row stride read in place; on large tables it
+  converts faster than the forward's own producer path) and the forward takes
+  its rows -- the host prepares the forward's plan, outputs and launch
+  arguments and converts its operands before the first launch, then issues
+  the forward from those pre-bound values inside the same stream context, so
+  only the forward's binding call sits between the two launches (it hides
+  behind the stage's kernel).
+  `causal=True` drops keys after the query's own position, query segments are
+  tails of their key prefix.  The NoPE entries have no torch fallback.
+* Backward host order: the autograd wrappers settle their backward at forward
+  time (the binding key without `dout`, the operands autograd does not save,
+  the caller's `dkv_acc` validated once), so the backward's host work before
+  its first launch is the key completion with `dout`'s geometry, the binding
+  lookup, the `dq` / `delta` allocations and the value binding; the zero fills
+  of the FP32 buffers the call owns and the delta / main stages then follow
+  back to back, with no allocation, validation or synchronization between the
+  launches.  The kernel-level `backward_nope` keeps the same launch order.
+  Every call checks the structure of the prefix sums (`validate_cu_seqlens`:
+  contiguous int32 `[num_docs + 1]` of one length) and never synchronizes with
+  the device; `check_cu_seqlens=True` also checks their values -- start at 0,
+  non-decreasing, `cu_seqlens_q[-1] == T`, `cu_seqlens_k[-1] == S` (a shorter
+  or longer key window is rejected, not truncated), `seqlen_q <= seqlen_k` per
+  document -- at the cost of one blocking device-to-host copy before any launch
+  (skipped during CUDA-graph capture).  The rope varlen entry is unchanged.
+
+Stages of the record, in launch order and with the kernels they share with the
+rope program: `nope_fwd` (own kernel, 320 threads), `nope_bwd_delta` (the
+strided sibling of the rope `bwd_delta` kernel, 256 threads: the `[T * 64, 512]`
+rows of `dout` addressed as `dout_offset + token * dout_token_stride + head *
+dout_head_stride + channel`, strides and offset multiples of 8 elements),
+`nope_bwd_main` /
+`nope_bwd_main_natural` (own kernels, 640 threads: no rope operands, one
+accumulator `dkv_f32` with `dkv_stride >= 512`, a multiple of 4, and the
+destination map; a persistent token loop, so the host launches them through
+`nope_bwd_launch_grid(num_queries, num_kv, sm_count)`: one CTA per SM --
+`min(num_queries, SMs)`, CTA `b` taking tokens `b, b + grid, ...` of the
+launch's `num_queries` tokens (the whole row or the chunk) -- while the launch's
+FP32 `dkv` window `num_kv x 2048 B` is within 64 MiB, else one CTA per token;
+the SM count is read once per device), `nope_bwd_compact` (the rope compaction kernel),
+`nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
+and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
+`ceil(num_kv * 16 / 256)`).  `index_prep` (own kernel, 128 threads, grid
+`ceil(T / 4)`) is the packed entry's index preparation at or above
+`NOPE_CONVERT_SLOT_LIMIT` slots or when the caller gives `topk_length`; it is
+launched before `nope_fwd` and is not part of the flat step.  The key-range-pass policy of the record plans one
+pass on every row (`max_passes` 1, no per-architecture rules: one pass measured
+fastest on every row, build and GPU of this form), so the single-pass main stage
+is the default and `dq_partial` is not allocated; `key_passes=n` on the entry
+points forces the pass form, which plans with 2048 B of accumulator per key and
+a dQ partial of 131,072 B per token: the token chunk of a multi-pass backward is
+4736 at `K_slots` 2048 / 2176, 4864 at 1152 and 4992 at 128 (the 640 MiB budget,
+a multiple of 128).
+
+`generated_program_available(..., program=cake_jit.NOPE_PROGRAM)` reports
+whether the record registers the stages a call needs for the device; the NoPE
+GPU tests additionally skip while `build.json` lacks a registered NoPE library
+(the export delivers the libraries; `scripts/check_cake_build_manifests.py`
+reports that gap).
+
 ## Layout of this package
 
-* `cake_jit.py` -- the `MODULES` registry (one record for every architecture,
-  filled by the generated-program export), stage names and the JIT specs
-  (compiled per architecture with its exact flag set; `sm_107a` only with an
-  nvcc that lists `compute_107`).
+* `cake_jit.py` -- the `MODULES` registry (one record per program, the rope
+  `cake_dsa_h64_train` and the NoPE `cake_dsa_h64_nope_train`, each shared by
+  every architecture it compiles for; per stage the `library` stem of its
+  `build.json` entries, the FFI entry and the launch geometry -- block,
+  cluster, cooperative, dynamic shared memory, PDL -- that the export rewrites),
+  the stage names of both programs (`STAGES` / `NOPE_STAGES`, `PROGRAMS`) and
+  the loader glue: `library_name(stage, arch, program)` is the `build.json`
+  entry `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch,
+  program)` loads through `cake_build`; `specs_for_arch(arch)` lists the JIT
+  specs of an architecture for `flashinfer.jit.build_jit_specs`.  Stages of
+  the two programs that share a kernel name the same library stem.
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  package (byte-identical copies) and this package's build manifest (schema
+  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
+  (eight stages x three architectures) with its translation units, digests,
+  nvcc flags (`--use_fast_math` per stage), closure digest and `aot/<name>.so`
+  path.  `cake_build.load_library(name)` loads the prebuilt library when
+  `aot/` holds it (next to the builder's `aot/build_info.json` sidecar, which
+  must agree with the library's exported `build_cuda_version()`) and otherwise
+  JIT-builds the entry through FlashInfer (`gen_jit_spec`, sources
+  digest-verified first; `sm_107a` needs an nvcc that lists `compute_107`).
+  `aot/` is never tracked (`.gitignore`).
 * `cake_launch.py` -- generated positional launchers and grid functions, one
-  per stage, over the kernels' own argument names.
+  per stage of either program, over the kernels' own argument names
+  (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
+* `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include
+  (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
+  shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
   eight pairs, one per stage (the main stage and its key-range-pass form each
   with a natural-layout variant), shared by `sm_100a`, `sm_103a` and `sm_107a` and
   compiled once per architecture (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+  identity-checked by the digests in `build.json`).
 
 ## Status
 
-The registry holds one program for `sm_100a`, `sm_103a` and `sm_107a` with the forward,
+The registry holds the rope program for `sm_100a`, `sm_103a` and `sm_107a` with the forward,
 backward preprocess, backward main (single-pass and key-range-pass form with
 its compaction, each with its natural-layout direct-accumulation variant) and
 cast stages plus the key-range-pass and direct-accumulation policies, exported
-from the kernel snapshot named in the pull request.
+from the kernel snapshot named in the pull request, and the NoPE program's
+record with its eight stages (three shared with the rope program) and its own
+key-range-pass and direct-accumulation policies (see "NoPE (zero-rope) program").
 
-Tests: `tests/experimental/test_cake_dsa_train.py` (skips without a registered
-program or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:
+Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
+only this package; skips without a registered program or a compute capability
+10.0 / 10.3 / 10.7 device) and `tests/experimental/test_cake_dsa_train_api.py`
+(the flashinfer public entry points and the environment variables the wrapper
+resolves into this package's keyword switches).  Benchmark:
 `benchmarks/bench_cake_dsa_train.py`.

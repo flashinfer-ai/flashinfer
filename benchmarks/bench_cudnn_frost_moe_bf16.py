@@ -9,7 +9,7 @@ reported even when it loses cross-backend selection.
 
 Use ``export``, ``sweep`` and ``select`` for offline kernel tuning. FC1 and FC2
 normal/swap-AB candidates are shortlisted independently, then ranked as complete
-MoE pairs. SM120 exports the warp-MMA template's normal STG kernels only. Export
+MoE pairs. SM120 exports the warp-MMA templates' normal and swap-AB STG kernels. Export
 and sweep need an idle target GPU; only export needs the cuDNN Frost compiler.
 Selection copies validated winners to an explicit destination; ``shortlist``
 instead writes each profile's two FC1 and two FC2 stage finalists.
@@ -32,7 +32,7 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
 )
 
@@ -44,6 +44,7 @@ if __package__:
         emit,
         error,
         measure,
+        prepare_original_view,
     )
 else:
     from bench_cudnn_frost_common import (
@@ -53,6 +54,7 @@ else:
         emit,
         error,
         measure,
+        prepare_original_view,
     )
 
 
@@ -71,14 +73,14 @@ def configure_source_jit():
 
 
 def benchmark(args):
+    from flashinfer.fused_moe import CudnnFrostBf16Config
+
     gpu_uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
     check_idle_gpu(gpu_uuid)
     torch.manual_seed(args.seed)
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import (
         BackendOptions,
-        CuTileBf16Config,
-        CutlassBf16Config,
         ExecutionConfig,
         ExpertConfig,
         MoEActivationPack,
@@ -87,14 +89,12 @@ def benchmark(args):
         MoEWeightPack,
         QuantConfig,
         RoutingConfig,
-        TrtllmBf16Config,
     )
-    from flashinfer.fused_moe.prepare import prepare_trtllm_bf16_weights
 
     torch.manual_seed(41)
     e, h, i = args.experts, args.hidden, args.intermediate
     if args.artifact_root is not None:
-        from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
             fc2,
             runtime,
         )
@@ -114,22 +114,11 @@ def benchmark(args):
     eligible = {
         cls: runner
         for cls, runner in _BACKEND_RUNNERS.items()
-        if cls.supported(arch)
+        if not runner.backend_key.startswith("cudnn_frost_")
+        and cls.supported(arch)
         and runner.supports_quant(QuantConfig())
         and isinstance(activation, runner.supported_activation_classes)
     }
-    # Fail visibly if a new applicable runner needs a prepared weight view;
-    # silently omitting it would invalidate the all-backend comparison.
-    unsupported_views = set(eligible) - {
-        CutlassBf16Config,
-        CuTileBf16Config,
-        TrtllmBf16Config,
-    }
-    if unsupported_views:
-        raise RuntimeError(
-            "Add benchmark weight preparation for all applicable backends: "
-            + ", ".join(sorted(cls.__name__ for cls in unsupported_views))
-        )
     backend_configs = tuple(cls() for cls in eligible)
     expected_backends = {runner.backend_key for runner in eligible.values()}
     config = MoEConfig(
@@ -152,24 +141,20 @@ def benchmark(args):
     )
     w2 = torch.randn(e, h, i, device="cuda", dtype=torch.bfloat16) * 0.02
     views = {"cutlass_bf16": dict(fc1_expert_weights=w1, fc2_expert_weights=w2)}
-    if CuTileBf16Config in eligible:
-        views["cutile_bf16"] = CuTileBf16Config.prepare_weights(
-            w1,
-            w2,
-            num_local_experts=e,
-            hidden_size=h,
-            intermediate_size=i,
-            activation=activation,
-        )
-    if TrtllmBf16Config in eligible:
-        views["trtllm_bf16_routed"] = prepare_trtllm_bf16_weights(
-            w1,
-            w2,
-            num_local_experts=e,
-            hidden_size=h,
-            intermediate_size=i,
-            activation=activation,
-        )
+    # Every applicable runner gets its own prepared view; a backend that cannot
+    # be prepared fails visibly rather than leaving the comparison incomplete.
+    for cls, runner in eligible.items():
+        if runner.backend_key not in views:
+            views[runner.backend_key] = prepare_original_view(
+                cls,
+                w1,
+                w2,
+                quant=QuantConfig(),
+                num_local_experts=e,
+                hidden_size=h,
+                intermediate_size=i,
+                activation=activation,
+            )
     weights = MoEWeightPack(views)
     print(
         json.dumps(
@@ -201,10 +186,26 @@ def benchmark(args):
         ids = logits.topk(args.top_k, dim=1).indices.int()
         scores = torch.rand(tokens, args.top_k, device="cuda").softmax(-1)
         act = MoEActivationPack(x, None, ids, scores)
-        layers = {"original": MoELayer(config), "with_cudnn_frost": MoELayer(config)}
+        layers = {
+            "original": MoELayer(config),
+            "with_cudnn_frost": MoELayer(
+                replace(
+                    config,
+                    backend=BackendOptions(
+                        (*config.backend.candidates, CudnnFrostBf16Config())
+                    ),
+                )
+            ),
+        }
         for label, layer in layers.items():
             actual_backends = {runner.backend_key for runner in layer.runners}
-            if actual_backends != expected_backends:
+            allowed = expected_backends | (
+                {"cudnn_frost_bf16"} if label == "with_cudnn_frost" else set()
+            )
+            if (
+                actual_backends - {"cudnn_frost_bf16"} != expected_backends
+                or not actual_backends <= allowed
+            ):
                 raise RuntimeError(
                     f"{label} backend pool mismatch: expected {expected_backends}, "
                     f"got {actual_backends}"
@@ -215,18 +216,14 @@ def benchmark(args):
             ),
             flush=True,
         )
-        # Benchmark-only dispatcher ablation, never a change to an existing runner.
-        layers["original"]._additional_candidates = lambda *args: []
         if args.probe_cudnn_frost:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.moe import (
-                CudnnFrostBf16MoeRunner,
+            # Explicit benchmark-only probe outside the normal model shortlist.
+            probe = next(
+                r
+                for r in layers["with_cudnn_frost"].runners
+                if r.backend_key == "cudnn_frost_bf16"
             )
-
-            probe = CudnnFrostBf16MoeRunner(config, x.device)
-            probe.check_support()
-            probe.build()
-            layers["with_cudnn_frost"]._automatic_runners["cudnn_frost_bf16"] = probe
-            layers["with_cudnn_frost"]._additional_candidates = lambda *args: [probe]
+            probe._accepts_shape = lambda act: True
         outputs, graphs, winners = {}, {}, {}
         for label, layer in layers.items():
             with autotune():
@@ -251,7 +248,9 @@ def benchmark(args):
 
         # Measure the best independent cuDNN Frost candidate even if an original backend wins.
         layer = layers["with_cudnn_frost"]
-        cudnn_frost = layer._automatic_runners.get("cudnn_frost_bf16")
+        cudnn_frost = next(
+            (r for r in layer.runners if r.backend_key == "cudnn_frost_bf16"), None
+        )
         if cudnn_frost is not None and (
             args.probe_cudnn_frost or cudnn_frost.accepts(act, weights)
         ):
@@ -398,8 +397,20 @@ def benchmark(args):
 
 
 # SM120 warp-MMA tiles: CTA M/N, K bytes and the compute-warp grid M x N. The
-# template has no swap-AB orientation, CTA pair, cluster or TMA-store epilogue.
+# templates have no CTA pair, cluster or TMA-store epilogue. Swap-AB tiles put
+# the expert's weight rows on M and its routed tokens on N.
 _SM120_SMALL_TILES = ((32, 64, 64, 2, 4), (64, 64, 128, 4, 2), (128, 128, 32, 1, 8))
+_SM120_SMALL_SWAP_TILES = ((128, 16, 128, 8, 1), (64, 32, 64, 4, 2))
+# Narrow token tiles for decoding, each with every compute-warp grid that cuts
+# it into whole 16x16 warp-MMA pairs.
+_SM120_SWAP_TILES = tuple(
+    (m, n, k, warps_m, warps_n)
+    for m in (64, 128, 256)
+    for n in (16, 32, 64, 128)
+    for k in (64, 128)
+    for warps_m, warps_n in ((2, 4), (4, 2), (1, 8), (8, 1))
+    if m % (16 * warps_m) == 0 and n % (16 * warps_n) == 0
+)
 _SM120_TILES = (
     *((32, n, k, 2, 4) for n, k in ((64, 64), (64, 128), (128, 32), (128, 64))),
     *((32, n, k, 1, 8) for n, k in ((128, 64), (256, 32), (256, 64))),
@@ -422,14 +433,16 @@ _SM120_TILES = (
 
 
 def sm120_configs(small=False):
-    for m, n, k_bytes, warps_m, warps_n in (
-        _SM120_SMALL_TILES if small else _SM120_TILES
+    for swap, tiles in (
+        (False, _SM120_SMALL_TILES if small else _SM120_TILES),
+        (True, _SM120_SMALL_SWAP_TILES if small else _SM120_SWAP_TILES),
     ):
-        name = (
-            f"CONFIG_sm120_{m}x{n}x{k_bytes}_16x16x32_"
-            f"cluster1x1_warps{warps_m}x{warps_n}"
-        )
-        yield name, 1, "stg"
+        for m, n, k_bytes, warps_m, warps_n in tiles:
+            name = (
+                f"CONFIG_sm120_{m}x{n}x{k_bytes}_16x16x32_"
+                f"cluster1x1_warps{warps_m}x{warps_n}" + ("_swapAB" if swap else "")
+            )
+            yield name, 1, "stg"
 
 
 def store_modes(config):
@@ -503,7 +516,7 @@ def catalog_configs(op, e, n, k, file):
     from cudnn.gemm.frost import tile_config
     from cudnn.gemm.frost.compiler import probe_chain
     from cudnn.gemm.frost.graph_analyzer import analyze
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+    from flashinfer.fused_moe.backends.cudnn_frost.export import (
         _build_graph,
     )
 
@@ -548,7 +561,7 @@ def catalog_configs(op, e, n, k, file):
 
 def export_task(opts):
     """A CPU compiler worker; no benchmark timing is collected in this phase."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+    from flashinfer.fused_moe.backends.cudnn_frost.export import (
         export_one,
     )
 
@@ -556,7 +569,7 @@ def export_task(opts):
     try:
         kernel = export_one(opts)
         if opts.warm_source_jit:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+            from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
                 runtime,
             )
 
@@ -581,6 +594,10 @@ def export_task(opts):
 
 def export(args, file):
     import cudnn
+    from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
+        read_manifest,
+        write_manifest,
+    )
 
     source = args.cudnn_frost_source.resolve()
     if not Path(cudnn.__file__).resolve().is_relative_to(source):
@@ -598,13 +615,26 @@ def export(args, file):
     major, minor = torch.cuda.get_device_capability()
     manifest = args.artifacts / "cudnn_frost_selected_kernels.json"
     payload = dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
+    catalog = {}
     if manifest.exists():
-        payload = json.loads(manifest.read_text())
-        if payload.get("schema_version") != 2:
-            raise ValueError(
-                "Re-export legacy object candidates into a new source directory"
-            )
+        catalog = json.loads(manifest.read_text())
+        payload = read_manifest(manifest)
     existing = {r["id"] for r in payload["kernels"]}
+    # V4 IDs omit sweep geometry and producer revision. Resolve the same axes
+    # against the existing catalog before comparing the generated sweep ID.
+    existing_axes = {
+        (
+            r["arch"],
+            r["op"],
+            r["tactic"]["tile"],
+            r["tactic"]["cta_group"],
+            r["tactic"]["scheduler"],
+            r["tactic"]["store_mode"],
+        ): r["id"]
+        for r in payload["kernels"]
+        if catalog.get("schema_version") == 4
+        and revision in payload.get("producer", {}).get("revisions", ())
+    }
     failed = set()
     if args.resume:
         for line in args.output.read_text().splitlines():
@@ -663,6 +693,9 @@ def export(args, file):
                 if index % args.num_shards != args.shard_index:
                     continue
                 identity = f"sm{major}{minor}_cudnn_frost_{op}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
+                identity = existing_axes.get(
+                    (f"sm_{major}{minor}a", op, name, cta, "clc", mode), identity
+                )
                 if identity in existing or identity in failed or args.catalog_only:
                     continue
                 opts = argparse.Namespace(
@@ -690,9 +723,7 @@ def export(args, file):
     args.artifacts.mkdir(parents=True, exist_ok=True)
 
     def save():
-        temporary = manifest.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        temporary.replace(manifest)
+        write_manifest(manifest, payload)
 
     def retain(result):
         if result["kind"] == "exported":
@@ -774,7 +805,7 @@ def measure_stage(fn, out, ref, args):
 
 
 def sweep(args, file):
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         moe,
         runtime,
@@ -816,6 +847,8 @@ def sweep(args, file):
                 prior[(tuple(r["geometry"]), r["tokens"], r["routing"], r["stage"])] = r
     # Staged search across activations: activations of one FC1 class share the
     # mainloop, so screen only the tiles another sweep ranked fastest per case.
+    # Both routings of a case screen the union of their fastest tiles, so the
+    # shortlist can rank every screened candidate across routings.
     screened_tiles = {}
     if args.candidates_from is not None:
         tiles = {
@@ -828,10 +861,10 @@ def sweep(args, file):
         for line in args.candidates_from.read_text().splitlines():
             r = json.loads(line)
             if r["kind"] == "stage":
-                key = (tuple(r["geometry"]), r["tokens"], r["routing"], r["stage"])
-                screened_tiles[key] = {
+                key = (tuple(r["geometry"]), r["tokens"], r["stage"])
+                screened_tiles.setdefault(key, set()).update(
                     tiles[x["id"]] for x in r["ranked"][: args.candidates_top]
-                }
+                )
     for e, h, i, topk in args.geometries:
         activation = ACTIVATIONS[args.activation]()
         w1 = (
@@ -914,9 +947,7 @@ def sweep(args, file):
                         if k.artifact_id not in screened or k.artifact_id in finalists
                     )
                 if args.candidates_from is not None:
-                    allowed = screened_tiles[
-                        ((e, h, i, topk), tokens, routing, stage + 1)
-                    ]
+                    allowed = screened_tiles[((e, h, i, topk), tokens, stage + 1)]
                     pool = tuple(
                         k for k in pool if k.tactic_metadata["tile"] in allowed
                     )
@@ -1051,7 +1082,8 @@ def sweep(args, file):
                 gc.collect()
                 continue
             # Independent stage rankings only shortlist; choose complete MoE here.
-            plans = moe._Plans(tokens, h, i, e, topk, device, *selected, {})
+            # Fresh workspace pool and executor cache: one plan per complete pair.
+            plans = moe._Plans(tokens, h, i, e, topk, device, *selected, {}, {})
             output = torch.empty_like(x)
             expected = reference(act, w1, w2, args.activation)
             ranked, graphs = [], []
@@ -1134,24 +1166,22 @@ def copy_selected(artifacts, selected_dir, identities, file):
 
     Packaged records keep their order; new records are appended by identity.
     """
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
+    from flashinfer.fused_moe.backends.cudnn_frost.runtime import (
         _safe_child,
     )
+    from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
+        read_manifest,
+        write_manifest,
+    )
 
-    manifest = json.loads((artifacts / "cudnn_frost_selected_kernels.json").read_text())
-    if manifest.get("schema_version") != 2:
-        raise ValueError(
-            "Selection requires a source manifest; re-export legacy objects"
-        )
+    manifest = read_manifest(artifacts / "cudnn_frost_selected_kernels.json")
     records = {r["id"]: r for r in manifest["kernels"]}
     target_manifest = selected_dir / "cudnn_frost_selected_kernels.json"
     payload = (
-        json.loads(target_manifest.read_text())
+        read_manifest(target_manifest)
         if target_manifest.exists()
         else dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
     )
-    if payload.get("schema_version") != 2:
-        raise ValueError(f"refusing to update unsupported manifest {target_manifest}")
     previous = {r["id"]: r for r in payload["kernels"]}
     for identity in sorted(identities):
         record = records[identity]
@@ -1175,9 +1205,7 @@ def copy_selected(artifacts, selected_dir, identities, file):
             payload["kernels"].append(record)
             previous[identity] = record
         emit(file, dict(kind="selected", id=identity))
-    temporary = target_manifest.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(target_manifest)
+    return write_manifest(target_manifest, payload)
 
 
 def rank_stage(runs, width):
@@ -1259,7 +1287,7 @@ def build_shortlist(results, width):
 
 def validate_shortlist(args, entries, file):
     """Check every shortlisted pair as a complete routed MoE and graph replay."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         moe,
         runtime,
@@ -1293,7 +1321,7 @@ def validate_shortlist(args, entries, file):
         tokens, topk = entry["tokens"], entry["top_k"]
         first = [kernels[identity] for identity in entry["fc1"]]
         second = [kernels[identity] for identity in entry["fc2"]]
-        plans = moe._Plans(tokens, h, i, e, topk, device, first, second, {})
+        plans = moe._Plans(tokens, h, i, e, topk, device, first, second, {}, {})
         for routing in ("uniform", "skew"):
             torch.manual_seed(tokens)
             x = torch.randn(tokens, h, device=device, dtype=torch.bfloat16) * 0.02
@@ -1370,15 +1398,7 @@ def shortlist(args, file):
         rank = geometries.index(geometry) if geometry in geometries else len(geometries)
         return activations[entry["activation"]], rank, entry["tokens"]
 
-    for entry in sorted(entries, key=order):
-        existing = index.get(profile(entry))
-        if existing is None:
-            payload["entries"].append(entry)
-        elif payload["entries"][existing] != entry:
-            if not args.replace:
-                raise ValueError(f"Shortlist already differs for {profile(entry)}")
-            payload["entries"][existing] = entry
-    copy_selected(
+    mapping = copy_selected(
         args.artifacts,
         args.selected_dir,
         {
@@ -1389,6 +1409,21 @@ def shortlist(args, file):
         },
         file,
     )
+    for entry in (*payload["entries"], *entries):
+        for stage in ("fc1", "fc2"):
+            entry[stage] = list(
+                dict.fromkeys(
+                    mapping.get(identity, identity) for identity in entry[stage]
+                )
+            )
+    for entry in sorted(entries, key=order):
+        existing = index.get(profile(entry))
+        if existing is None:
+            payload["entries"].append(entry)
+        elif payload["entries"][existing] != entry:
+            if not args.replace:
+                raise ValueError(f"Shortlist already differs for {profile(entry)}")
+            payload["entries"][existing] = entry
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
@@ -1548,7 +1583,7 @@ def parse_args(argv=None):
         "--candidates-top",
         type=int,
         default=8,
-        help="Tiles retained per case with --candidates-from",
+        help="Tiles retained per case and routing with --candidates-from",
     )
     sweeper.add_argument(
         "--resume",

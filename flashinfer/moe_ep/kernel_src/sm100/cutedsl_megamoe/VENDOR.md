@@ -6,6 +6,11 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
+The explicit Blackwell GenPhase prototype lives in the independent
+[`../next_cutedsl_megamoe`](../next_cutedsl_megamoe/VENDOR.md) package. This
+legacy package lazily re-exports its public API; it does not import Rubin or
+replace its own device snapshot.
+
 - **Vendored commit**: not recorded — the current `src/` drop was taken
   2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
   PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
@@ -29,6 +34,30 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
+- Sparse decode follow-up to FlashInfer PR #6447 (2026-10-14), based on
+  FlashInfer `0a0cecb50b1250f0b609a9c51f1b25816ba073b8`:
+  `src/src/token_comm.py` gives CTA0 ownership of small shared reset prefixes,
+  retaining both peer barriers and the late local reset, while preserving the
+  grid counter phase when omitting a join. EP1, prefixes above
+  16 KiB and NCU retain distributed reset. `src/moe_nvfp4_swapab/topk_reduce.py`
+  adds optional route masking to separate BF16 reduction; the NVFP4 and MXFP8
+  `megamoe_kernel*.py` launchers pass the indices and expert count for BF16
+  combine only. Payloads and scores of invalid routes are ignored.
+  Those launchers also allocate a local extent/ready counter for capacities
+  at most 1024. `token_comm.py` uses the last valid route extent to reduce the
+  dispatch CTA count while preserving physical metadata strides and full-grid
+  high-word completion counts. Larger capacities retain the original dispatch.
+  The histogram allocation also stages the four per-warp extent maxima;
+  padding it to at least four entries fits its existing 16-byte alignment.
+  Reapply
+  these four local device-file patches until upstream absorbs them; they do
+  not introduce a GenPhase path or change quantized/in-kernel reduction.
+
+- `src/src/inputs_process.py` carries the routing-output cast and optional
+  offline NVFP4 scale multiplier from source revision
+  `381675f3fa078867cebf8d64a0e034829f356424`. This is a narrow backport onto
+  the existing snapshot, not a full file sync. Replace it with the next
+  staging-helper import.
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
   (`src/inputs_process.py` in the internal repo), taken 2026-08-10: the kernel team's fix for the fused activation-quant
@@ -58,6 +87,26 @@ replace, what to audit) lives in `SKILL.md`.
   int32-indexed Triton helpers (`_rcp_approx_kernel`, `_swiglu_pair_kernel`);
   `_pack_fp4_kernel` is exempt because it widens its flat index to int64 for
   the > 2**31-element combine round-trip. Send upstream on the next re-sync.
+
+- FC1 per-token activation scale (`enable_fc1_activation_per_token_scale`),
+  ported from the kernel-team MR `qiangf/cutedsl_megamoe!1` (branch
+  `feature/nvfp4-static-per-token-scale`, head `71a70c7`, base `9d004cc`)
+  into the recorded drop. Touches `src/moe_nvfp4_swapab/{kernel_fc12,
+  megamoe_kernel,epilogue_refactor,custom_ext}.py` and `src/src/token_comm.py`:
+  a runtime `(T,)` fp32 tensor on the symmetric heap is peer-pulled by the
+  dispatch warps next to the topk weight into a new pool-ordered local region
+  (`l1_fc1_activation_per_token_scale_buffer`), and the fc1 epilogue folds it
+  into the dequant (`alpha * scale_t * acc`) before the clamp / gated
+  activation (pre-transpose half via warp shuffle, post-transpose half one
+  scale per lane -- same 3-transpose schedule). Only the per-token-scale part
+  of the MR is taken: the MR's compile-time `fc1_activation_norm_const` and
+  `gate_activation="quick_geglu"` are NOT ported (flashinfer keeps the runtime
+  per-expert `fc1_norm_const` tensor -- fold `1/norm_const` into `fc2_alpha`
+  on the host -- and already covers quick-GeGLU via `swiglu_alpha=1.702`).
+  Off by default: `name()` and the compile ABI are unchanged when disabled.
+  Upstream `main` has since moved this feature to the `next/` path (see the
+  kernel repo's `docs/FC1_PER_TOKEN_SCALE_NEXT_DESIGN.md`); re-derive on the
+  next re-sync.
 
 ## Related trees
 

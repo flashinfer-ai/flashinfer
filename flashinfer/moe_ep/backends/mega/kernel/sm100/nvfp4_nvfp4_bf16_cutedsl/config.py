@@ -48,6 +48,13 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    # Per-token fc1 activation scale (compile-time switch).  When True the
+    # workspace carries a ``(max_tokens_per_rank,)`` fp32 symmetric-heap tensor
+    # and every forward must supply ``MoEEpTensors.fc1_activation_per_token_scale``
+    # (``(num_tokens,)`` fp32).  The fc1 epilogue multiplies it into the
+    # dequantized fc1 output before the clamp / gated activation, so callers
+    # that quantize ``x_t / s_t`` to NVFP4 recover the per-token range in-kernel.
+    enable_fc1_activation_per_token_scale: bool = False
     # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).
@@ -58,8 +65,21 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # Uniform per-layer SwiGLU constants; None/None keeps standard SwiGLU.
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    # False exposes per-route outputs through MoEEpMegaLayer.forward_unfinalized()
+    # for caller finalization. Requires fixed/offline-tuned knobs.
+    do_finalize: bool = True
 
     def __post_init__(self) -> None:
+        if not self.do_finalize:
+            if self.enable_in_kernel_fc2_reduce or self.combine_dtype != "bf16":
+                raise ValueError(
+                    "do_finalize=False requires enable_in_kernel_fc2_reduce=False "
+                    "and combine_dtype='bf16'."
+                )
+            if self.knobs == "auto":
+                raise ValueError(
+                    "do_finalize=False requires fixed/offline-tuned knobs."
+                )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.activation not in ("swiglu", "situ"):

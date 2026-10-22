@@ -181,7 +181,9 @@ class TestSaveLoadRoundTrip:
         config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
         key = AutoTuner._get_cache_key("policy_op", runner, shapes, config)
         self.tuner.profiling_cache[key] = (2, None)
-        self.tuner._profiling_cache_policies[key] = self.tuner._profiling_policy(config)
+        self.tuner._profiling_cache_policies[(None, key)] = (
+            self.tuner._profiling_policy(config)
+        )
         path = str(tmp_path / "cold.json")
         self.tuner.save_configs(path)
 

@@ -33,6 +33,10 @@ from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
+# H100 CI peak GPU memory: 62.6 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
+
 def head_dim_512_supported() -> bool:
     # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
     return get_compute_capability(torch.device("cuda:0"))[0] >= 8
@@ -48,13 +52,6 @@ def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
         pytest.skip(
             "head_dim > 256 with NVFP4 KV decode is only validated on SM100 or newer"
         )
-
-
-def skip_if_nvfp4_kv_unsupported():
-    # Mirrors the guard in flashinfer.decode/prefill: no NVFP4-KV decode
-    # kernels exist for SM107.
-    if get_compute_capability(torch.device("cuda:0")) == (10, 7):
-        pytest.skip("KV Cache NVFP4 is not supported on SM107")
 
 
 @pytest.fixture(
@@ -798,7 +795,6 @@ def test_batch_decode_with_paged_kv_cache_nvfp4(
     Reference is computed by dequantizing the packed KV back to q_dtype and running
     single_decode_with_kv_cache per batch item.
     """
-    skip_if_nvfp4_kv_unsupported()
     kv_layout = "NHD"
     torch.manual_seed(42)
 

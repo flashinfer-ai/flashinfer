@@ -116,6 +116,13 @@ class MegaMoENvfp4Config:
     enable_iket: bool = False
     swiglu_alpha: Optional[float] = None
     swiglu_beta: Optional[float] = None
+    # Per-token fc1 activation scale (compile-time switch).  When True the
+    # launch takes a ``(T,)`` fp32 ``fc1_activation_per_token_scale`` on the
+    # symmetric heap; dispatch pulls it next to the topk weight and the fc1
+    # epilogue multiplies it into the dequantized fc1 output BEFORE the clamp /
+    # gated activation (``real = fc1_alpha * scale_t * acc``).  Lets the caller
+    # quantize ``x_t / scale_t`` to NVFP4 without losing the per-token range.
+    enable_fc1_activation_per_token_scale: bool = False
 
     def __post_init__(self) -> None:
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
@@ -205,13 +212,11 @@ class MegaMoENvfp4Config:
                 "absorbed before fc2."
             )
         if self.defer_topk_reduce and (
-            self.in_kernel_fc2_reduce
-            or self.combine_dtype != "bf16"
-            or not self.apply_topk_in_fc1
+            self.in_kernel_fc2_reduce or self.combine_dtype != "bf16"
         ):
             raise ValueError(
                 "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
-                "combine_dtype='bf16', and apply_topk_in_fc1=True."
+                "and combine_dtype='bf16'."
             )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
@@ -248,8 +253,14 @@ class MegaMoENvfp4Inputs:
     """Per-rank tensors for one NVFP4 MegaMoE launch.
 
     Symmetric-heap tensors (``activation``, ``activation_sf``, ``topk_idx``,
-    ``topk_weights``) must be allocated via NVSHMEM (or plain CUDA when
-    ``MEGA_NO_DIST=1``).  Weights and epilogue scalars are rank-local.
+    ``topk_weights``, and ``fc1_activation_per_token_scale`` when enabled)
+    must be allocated via NVSHMEM (or plain CUDA when ``MEGA_NO_DIST=1``).
+    Weights and epilogue scalars are rank-local.
+
+    ``fc1_activation_per_token_scale`` is an optional contiguous ``(T,)`` fp32
+    per-token scale folded into the fc1 dequant before the clamp / gated
+    activation; required iff
+    ``MegaMoENvfp4Config.enable_fc1_activation_per_token_scale``.
 
     ``output_activation`` is the kernel's single 2D ``(T, hidden)`` bf16 output;
     the kernel reduces the top-k combine internally (the drop replaced the old
@@ -268,6 +279,7 @@ class MegaMoENvfp4Inputs:
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
     output_activation: torch.Tensor
+    fc1_activation_per_token_scale: Optional[torch.Tensor] = None
 
 
 class MegaMoENvfp4Frontend:
@@ -491,6 +503,23 @@ class MegaMoENvfp4Frontend:
             t.fc2_alpha.data_ptr(),
             t.fc1_norm_const.data_ptr(),
             t.output_activation.data_ptr(),
+            # The scale is the one input a caller may legitimately re-view
+            # between launches (the other tensors are session buffers), and the
+            # kernel reads it as a flat contiguous plane -- so key its full
+            # metadata, not just the pointer, or a cache hit on the same
+            # data_ptr would bypass _validate_inputs for a strided / reshaped
+            # view and launch with the stale arguments.
+            (
+                (
+                    t.fc1_activation_per_token_scale.data_ptr(),
+                    tuple(t.fc1_activation_per_token_scale.shape),
+                    tuple(t.fc1_activation_per_token_scale.stride()),
+                    t.fc1_activation_per_token_scale.dtype,
+                    t.fc1_activation_per_token_scale.device,
+                )
+                if t.fc1_activation_per_token_scale is not None
+                else None
+            ),
             num_tokens,
             torch.cuda.current_stream().cuda_stream,
         )
@@ -532,6 +561,7 @@ class MegaMoENvfp4Frontend:
             c.swiglu_alpha,
             c.swiglu_beta,
             c.enable_iket,
+            c.enable_fc1_activation_per_token_scale,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
@@ -587,7 +617,7 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
-            defer_topk_reduce=c.defer_topk_reduce,
+            defer_topk_reduce=c.defer_topk_reduce and c.apply_topk_in_fc1,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
@@ -595,10 +625,14 @@ class MegaMoENvfp4Frontend:
             swiglu_beta=c.swiglu_beta,
             situ_beta=c.situ_beta,
             situ_linear_beta=c.situ_linear_beta,
+            enable_fc1_activation_per_token_scale=(
+                c.enable_fc1_activation_per_token_scale
+            ),
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
+        kernel.defer_topk_reduce = c.defer_topk_reduce
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -697,6 +731,11 @@ class MegaMoENvfp4Frontend:
             fc2_alpha=inputs.fc2_alpha,
             fc1_norm_const=inputs.fc1_norm_const,
             output_activation=inputs.output_activation[tok],
+            fc1_activation_per_token_scale=(
+                inputs.fc1_activation_per_token_scale[tok]
+                if inputs.fc1_activation_per_token_scale is not None
+                else None
+            ),
         )
 
     def _validate_inputs(
@@ -861,6 +900,38 @@ class MegaMoENvfp4Frontend:
             if tensor.dtype != torch.float32:
                 raise ValueError(f"{name} must be float32, got {tensor.dtype}.")
 
+        scale = inputs.fc1_activation_per_token_scale
+        if c.enable_fc1_activation_per_token_scale:
+            if scale is None:
+                raise ValueError(
+                    "fc1_activation_per_token_scale is required when "
+                    "enable_fc1_activation_per_token_scale=True."
+                )
+            _require_cuda("fc1_activation_per_token_scale", scale)
+            if scale.shape != (buf_tokens,):
+                raise ValueError(
+                    "fc1_activation_per_token_scale must have shape "
+                    f"({buf_tokens},), got {tuple(scale.shape)}."
+                )
+            if scale.dtype != torch.float32:
+                raise ValueError(
+                    "fc1_activation_per_token_scale must be float32, "
+                    f"got {scale.dtype}."
+                )
+            # The dispatch warps address the peer's scale as ``base + token * 4``
+            # (one fp32 per token, no stride operand), so a strided view would
+            # silently read the wrong elements.
+            if scale.stride() != (1,):
+                raise ValueError(
+                    "fc1_activation_per_token_scale must be contiguous (unit "
+                    f"stride), got stride {tuple(scale.stride())}."
+                )
+        elif scale is not None:
+            raise ValueError(
+                "fc1_activation_per_token_scale was provided but the session "
+                "was built with enable_fc1_activation_per_token_scale=False."
+            )
+
     @staticmethod
     def _to_cute(
         tensor: torch.Tensor,
@@ -907,7 +978,7 @@ class MegaMoENvfp4Frontend:
         )
         dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 
-        return dict(
+        kwargs = dict(
             activation=self._to_cute(inputs.activation),
             activation_sf=self._to_cute(inputs.activation_sf),
             topk_idx=self._to_cute(inputs.topk_idx),
@@ -936,6 +1007,12 @@ class MegaMoENvfp4Frontend:
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             stream=stream,
         )
+        if c.enable_fc1_activation_per_token_scale:
+            # Only passed when enabled so the default compile ABI is unchanged.
+            kwargs["fc1_activation_per_token_scale"] = self._to_cute(
+                inputs.fc1_activation_per_token_scale, assumed_align=4
+            )
+        return kwargs
 
     @staticmethod
     def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 16):
@@ -1039,7 +1116,8 @@ class MegaMoESymmBuffer:
     """Symmetric-heap staging buffers for one MegaMoE session.
 
     Mirrors DeepGEMM's symm-buffer object: exposes ``x``, ``x_sf``,
-    ``topk_idx``, and ``topk_weights`` views sized for ``num_max_tokens``.
+    ``topk_idx``, ``topk_weights`` (and, when enabled,
+    ``fc1_activation_per_token_scale``) views sized for ``num_max_tokens``.
     Internal combine / epilogue tensors are owned here but not part of the
     public DeepGEMM surface.
 
@@ -1065,7 +1143,14 @@ class MegaMoESymmBuffer:
     fc1_norm_const: torch.Tensor
 
     _frontend: MegaMoENvfp4Frontend
+    # Optional ``(num_max_tokens,)`` fp32 per-token fc1 activation scale on the
+    # symmetric heap; allocated (filled with 1.0) only when the session was
+    # built with ``enable_fc1_activation_per_token_scale=True``.  Stage
+    # ``[:num_tokens]`` alongside ``x`` before each launch.
+    fc1_activation_per_token_scale: Optional[torch.Tensor] = None
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
     _destroyed: bool = False
 
     def destroy(self) -> None:
@@ -1076,6 +1161,8 @@ class MegaMoESymmBuffer:
         for root in self._sym_roots:
             free_sym_tensor(root)
         self._sym_roots.clear()
+        self._unfinalized_route_map = None
+        self._unfinalized_weights = None
         self._destroyed = True
 
     @property
@@ -1106,6 +1193,7 @@ def get_symm_buffer_for_mega_moe(
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
+    enable_fc1_activation_per_token_scale: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
@@ -1147,6 +1235,14 @@ def get_symm_buffer_for_mega_moe(
     Pass a scalar to broadcast one value to all local experts, or pass a CUDA
     float32 tensor with that shape.  When omitted, each defaults to ``1.0``.
 
+    ``enable_fc1_activation_per_token_scale`` additionally allocates a
+    ``(num_max_tokens,)`` fp32 ``fc1_activation_per_token_scale`` on the
+    symmetric heap (initialised to 1.0).  The kernel multiplies it into the
+    dequantized fc1 output before the clamp / gated activation, so a caller
+    that quantizes ``x_t / s_t`` to NVFP4 can restore the per-token range
+    in-kernel.  Stage ``symm_buffer.fc1_activation_per_token_scale[:n]``
+    together with ``x``; it is a compile-time switch (separate kernel).
+
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, scale)`` tuples to :func:`nvfp4_mega_moe` instead.
     """
@@ -1180,6 +1276,8 @@ def get_symm_buffer_for_mega_moe(
             max_tokens=num_max_tokens,
             combine_dtype=combine_dtype,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            apply_topk_in_fc1=apply_topk_in_fc1,
+            defer_topk_reduce=defer_topk_reduce,
         )
     else:
         knobs = dict(knobs)
@@ -1202,6 +1300,7 @@ def get_symm_buffer_for_mega_moe(
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         defer_topk_reduce=defer_topk_reduce,
         combine_dtype=combine_dtype,
+        enable_fc1_activation_per_token_scale=enable_fc1_activation_per_token_scale,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
         token_back_mode=(
@@ -1247,6 +1346,13 @@ def get_symm_buffer_for_mega_moe(
     # internal combine staging.
     output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     sym_roots.append(output_activation)
+    fc1_activation_per_token_scale = None
+    if enable_fc1_activation_per_token_scale:
+        # Peer-pulled by the dispatch warps (like topk_weights) -> symmetric
+        # heap.  1.0 keeps unstaged rows neutral.
+        fc1_activation_per_token_scale = sym_zeros((num_max_tokens,), torch.float32)
+        fc1_activation_per_token_scale.fill_(1.0)
+        sym_roots.append(fc1_activation_per_token_scale)
     fc1_alpha = _resolve_per_expert_epilogue(
         "fc1_alpha",
         fc1_alpha,
@@ -1280,6 +1386,7 @@ def get_symm_buffer_for_mega_moe(
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
         _frontend=frontend,
+        fc1_activation_per_token_scale=fc1_activation_per_token_scale,
         _sym_roots=sym_roots,
     )
 
@@ -1392,6 +1499,7 @@ def nvfp4_mega_moe(
         fc2_alpha=symm_buffer.fc2_alpha,
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
+        fc1_activation_per_token_scale=symm_buffer.fc1_activation_per_token_scale,
     )
 
     # The kernel reduces the top-k combine internally and writes the final 2D
@@ -1422,7 +1530,9 @@ def nvfp4_mega_launch_thunk(
     Tester-parity timed region (``tester/solver.py perf_run``): the returned
     thunk is a bare compiled-kernel launch -- args prebuilt once, no per-call
     Python, no workspace reset (the kernel tail-cleans), no sync, no output
-    copy.  The reduced bf16 output lands in ``symm_buffer.output_activation``.
+    copy. The reduced output lands in ``symm_buffer.output_activation``;
+    deferred sessions expose per-route output through the frontend's
+    ``deferred_topk_reduce_workspace()`` instead.
     Compiles on this call if needed.  Rebuild the thunk after knob/clamp
     changes or buffer destruction.
     """
@@ -1443,6 +1553,7 @@ def nvfp4_mega_launch_thunk(
         fc2_alpha=symm_buffer.fc2_alpha,
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
+        fc1_activation_per_token_scale=symm_buffer.fc1_activation_per_token_scale,
     )
     return symm_buffer._frontend.make_launch_thunk(inputs)
 
@@ -1570,9 +1681,12 @@ def create_dummy_inputs(
     situ_linear_beta: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
+    apply_topk_in_fc1: bool = True,
+    defer_topk_reduce: bool = False,
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
+    enable_fc1_activation_per_token_scale: bool = False,
     seed: int = 0,
 ) -> tuple[
     torch.Tensor,
@@ -1587,7 +1701,9 @@ def create_dummy_inputs(
     per-local-expert values are generated from ``seed`` (see
     :func:`make_dummy_epilogue_params`).  ``combine_dtype`` is forwarded to
     :func:`get_symm_buffer_for_mega_moe` so tuning/benchmark sessions exercise
-    the same combine wire the deployment will use.
+    the same combine wire the deployment will use.  With
+    ``enable_fc1_activation_per_token_scale`` the per-token scale is staged
+    with random values from {0.5, 1.0, 1.5, 2.0} (kernel-team tester set).
     """
     if num_tokens < 0 or num_tokens > num_max_tokens:
         raise ValueError(
@@ -1624,9 +1740,12 @@ def create_dummy_inputs(
         situ_linear_beta=situ_linear_beta,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=defer_topk_reduce,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
+        enable_fc1_activation_per_token_scale=enable_fc1_activation_per_token_scale,
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(
@@ -1677,6 +1796,13 @@ def create_dummy_inputs(
     # launch covers the full buffer and relies on topk_idx[n:] == -1.
     symm_buffer.topk_idx[num_tokens:].fill_(-1)
     symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))
+    if enable_fc1_activation_per_token_scale:
+        symm_buffer.fc1_activation_per_token_scale[:num_tokens].copy_(
+            torch.randint(1, 5, (num_tokens,), generator=gen, device="cuda").to(
+                torch.float32
+            )
+            * 0.5
+        )
 
     y = torch.empty(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
     return y, transformed_l1, transformed_l2, symm_buffer

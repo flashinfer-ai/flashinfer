@@ -13,6 +13,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
+#include <mutex>
+#include <utility>
 
 #include "tvm_ffi_utils.h"
 
@@ -81,6 +84,28 @@ int sm_count(int device_id) {
     cache[device_id] = count;
   }
   return cache[device_id];
+}
+
+constexpr int kMaxCtasPerSm = 4;
+
+// Resident CTAs per SM for one kernel (register/shared-memory occupancy), capped at kMaxCtasPerSm.
+// Measured on B200: 4 saturates the byte paths at tokens >= 128; 6 (no longer co-resident
+// for the ws8 kernels) is slower again.  Cached per (device, kernel).
+int64_t ctas_per_sm(int device_id, const void* kernel) {
+  static std::mutex mutex;
+  static std::map<std::pair<int, const void*>, int64_t> cache;
+  std::lock_guard<std::mutex> guard(mutex);
+  auto it = cache.find({device_id, kernel});
+  if (it != cache.end()) return it->second;
+  int blocks = 0;
+  cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, static_cast<int>(kThreads),
+                                                                      kDynamicSmemBytes);
+  TVM_FFI_CHECK(status == cudaSuccess && blocks > 0, RuntimeError)
+      << "cudaOccupancyMaxActiveBlocksPerMultiprocessor failed for cuda:" << device_id << ": "
+      << cudaGetErrorString(status);
+  const int64_t ctas = std::min<int64_t>(blocks, kMaxCtasPerSm);
+  cache[{device_id, kernel}] = ctas;
+  return ctas;
 }
 
 void check_activation(const TensorView& t, const TensorView& ref, const char* name, int64_t rows) {
@@ -195,8 +220,14 @@ void cake_moe_finalize_allreduce_fusion(
 
   const DLDevice device = allreduce_in.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
+  const int ws_index = world_size == 2 ? 0 : (world_size == 4 ? 1 : 2);
+  const void* kernel = kKernels[dtype_index][ws_index][quantize ? 1 : 0];
+  // Persistent grid: enough four-CTA clusters to keep every SM at its resident CTA count (occupancy-derived,
+  // capped at kMaxCtasPerSm), never more clusters than tokens.  One CTA per SM leaves the HBM/NVLink paths
+  // 3-5x under-subscribed for tokens >= 128 (measured on B200: 1.9x at 128 tokens, 2.8x at 2048 with four).
   const int64_t clusters =
-      std::min<int64_t>(sm_count(device.device_id), tokens * kClusterSize) / kClusterSize;
+      std::min<int64_t>(ctas_per_sm(device.device_id, kernel) * sm_count(device.device_id), tokens * kClusterSize) /
+      kClusterSize;
   TVM_FFI_CHECK(clusters > 0, RuntimeError)
       << "Cake MoE finalize requires one complete four-CTA cluster";
 
@@ -246,9 +277,7 @@ void cake_moe_finalize_allreduce_fusion(
   config.stream = get_stream(device);
   config.attrs = attrs;
   config.numAttrs = num_attrs;
-  const int ws_index = world_size == 2 ? 0 : (world_size == 4 ? 1 : 2);
-  cudaError_t status =
-      cudaLaunchKernelExC(&config, kKernels[dtype_index][ws_index][quantize ? 1 : 0], args);
+  cudaError_t status = cudaLaunchKernelExC(&config, kernel, args);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "Cake MoE finalize launch failed: " << cudaGetErrorString(status);
 }

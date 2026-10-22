@@ -30,12 +30,16 @@ from ......jit.core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
 
 __all__ = [
     "GROUPED_GEMM_STAGES",
+    "gen_sm90_cake_bf16_combine_prereduced_module",
     "gen_sm90_cake_bf16_combine_tail_module",
+    "gen_sm90_cake_bf16_combine_tail_prereduced_module",
     "gen_sm90_cake_bf16_compact_module",
     "gen_sm90_cake_bf16_dispatch_module",
     "gen_sm90_cake_bf16_grouped_gemm_module",
     "grouped_gemm_manifest",
     "grouped_gemm_record",
+    "sm90_cake_bf16_combine_prereduced_uri",
+    "sm90_cake_bf16_combine_tail_prereduced_uri",
     "sm90_cake_bf16_combine_tail_uri",
     "sm90_cake_bf16_compact_uri",
     "sm90_cake_bf16_dispatch_uri",
@@ -63,6 +67,20 @@ _COMBINE_TAIL_SOURCES: _Sources = (
 )
 _DISPATCH_SOURCES: _Sources = (
     ("cake_dispatch_fused_bf16.cu", _SOURCE_DIR / "cake_dispatch_fused_bf16.cu"),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_COMBINE_PREREDUCED_SOURCES: _Sources = (
+    (
+        "cake_combine_prereduced_bf16.cu",
+        _SOURCE_DIR / "cake_combine_prereduced_bf16.cu",
+    ),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_COMBINE_TAIL_PREREDUCED_SOURCES: _Sources = (
+    (
+        "cake_combine_tail_prereduced_bf16.cu",
+        _SOURCE_DIR / "cake_combine_tail_prereduced_bf16.cu",
+    ),
     ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
 )
 
@@ -173,6 +191,44 @@ def gen_sm90_cake_bf16_dispatch_module() -> JitSpec:
     """JIT spec of ``sm90_cake_dispatch_fused_bf16`` (count + reserve + store_publish, one cooperative launch)."""
     return _gen_module(
         "sm90_cake_bf16_dispatch", _DISPATCH_SOURCES, "cake_dispatch_fused_bf16.cu"
+    )
+
+
+def sm90_cake_bf16_combine_prereduced_uri(
+    cuda_flags: tuple[str, ...] | None = None,
+) -> str:
+    """Content-addressed name of the pre-reduced combine publish module."""
+    return _module_uri(
+        "sm90_cake_bf16_combine_prereduced", _COMBINE_PREREDUCED_SOURCES, cuda_flags
+    )
+
+
+def gen_sm90_cake_bf16_combine_prereduced_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_combine_prereduced_bf16`` (group build + fp32 pre-reduce + one bf16 row per (token, source rank))."""
+    return _gen_module(
+        "sm90_cake_bf16_combine_prereduced",
+        _COMBINE_PREREDUCED_SOURCES,
+        "cake_combine_prereduced_bf16.cu",
+    )
+
+
+def sm90_cake_bf16_combine_tail_prereduced_uri(
+    cuda_flags: tuple[str, ...] | None = None,
+) -> str:
+    """Content-addressed name of the pre-reduced combine-tail module."""
+    return _module_uri(
+        "sm90_cake_bf16_combine_tail_prereduced",
+        _COMBINE_TAIL_PREREDUCED_SOURCES,
+        cuda_flags,
+    )
+
+
+def gen_sm90_cake_bf16_combine_tail_prereduced_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_combine_tail_prereduced_bf16`` (wait + source-rank-ordered reduce + ack)."""
+    return _gen_module(
+        "sm90_cake_bf16_combine_tail_prereduced",
+        _COMBINE_TAIL_PREREDUCED_SOURCES,
+        "cake_combine_tail_prereduced_bf16.cu",
     )
 
 

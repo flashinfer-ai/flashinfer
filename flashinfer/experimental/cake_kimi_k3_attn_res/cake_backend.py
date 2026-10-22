@@ -33,9 +33,18 @@ metadata only (architecture, SM count, ``M``, ``K``, the PDL launch policy and
 the semantic flags), exactly as the Cake production dispatcher does; the export
 verifies key, grid and schedule parity for every row of its denominator.  Dense
 token-major inputs with the residual add and the fused output norm take the
-persistent TMEM path (or one of the installed native ports / the exact K = 0
-path); the other semantic variants (no delta, snapshot write, no output norm,
-row-padded layouts) take the one-CTA-per-token bootstrap program.
+persistent TMEM path (or one of the installed native ports, the pair kernel or
+the exact K = 0 path); the block-boundary snapshot write (``block_write_idx`` ==
+K) runs the write variants of the dense write programs; the other semantic
+variants (no delta, a snapshot write below K, no output norm, row-padded
+layouts) take the one-CTA-per-token bootstrap program.
+
+The route tables are the registry's ``ROUTES`` literals (``cake_jit.py``, written
+by the exporter together with ``MODULES`` and ``KERNELS``): the legacy tables of
+the Cake dispatcher plus the round-2 cell tables (``R2_*``: per architecture and
+SM count the cells whose program changed -- a persistent key, a native port, the
+pair kernel, a small-M cluster or fast-math choice).  Persistent flag bit 4 is
+``register_carry_only`` (the K1 / K2 register-carry bodies).
 
 ``prepare_kimi_k3_attn_res`` binds one call; its ``launch()`` performs no CUDA
 allocation and no host synchronisation and is CUDA-graph capturable (capture
@@ -44,162 +53,257 @@ are mutated in place on every launch, as in the model.
 """
 
 import functools
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 import tvm_ffi
 
-from .cake_jit import (
-    MODULES,
-    kernel_module_name,
-    load_cake_kimi_k3_attn_res_module,
-    route_available,
-)
+from .cake_jit import KERNELS, MODULES, ROUTES, load, record_of
 
 HIDDEN_SIZE = 7168
-MAX_BLOCKS = 8
+MAX_BLOCKS = int(ROUTES["MAX_BLOCKS"])
 DIRECT_THREADS = 256
 PERSISTENT_THREADS = 288
-NATIVE_GRID = 148
-PERSISTENT_BALANCED_GRID = 128
-PERSISTENT_BALANCED_GRID_MAX_M = 512
-PERSISTENT_CHUNK_DEPTH = 2
-PERSISTENT_SOURCES_PER_CHUNK = 4
+PAIR_THREADS = 320
+#: Physical SM counts the native ports and the pair kernel are qualified on: 148 (B200 / B300) and
+#: 152 (GB300).  They launch one CTA per SM and grid-stride over the tokens, so their grid is the
+#: device's SM count; any other count keeps the persistent / small-M families, whose grids derive
+#: from ``num_sms`` as well.
+NATIVE_SM_COUNTS = tuple(int(n) for n in ROUTES["NATIVE_SM_COUNTS"])
+PERSISTENT_BALANCED_GRID = int(ROUTES["PERSISTENT_BALANCED_GRID"])
+PERSISTENT_BALANCED_GRID_MIN_M = int(ROUTES["PERSISTENT_BALANCED_GRID_MIN_M"])
+PERSISTENT_BALANCED_GRID_MAX_M = int(ROUTES["PERSISTENT_BALANCED_GRID_MAX_M"])
+PERSISTENT_BALANCED_GRID_MIN_SMS = int(ROUTES["PERSISTENT_BALANCED_GRID_MIN_SMS"])
+PERSISTENT_BALANCED_NC = frozenset(int(n) for n in ROUTES["PERSISTENT_BALANCED_NC"])
+PERSISTENT_CHUNK_DEPTH = int(ROUTES["PERSISTENT_CHUNK_DEPTH"])
+PERSISTENT_SOURCES_PER_CHUNK = int(ROUTES["PERSISTENT_SOURCES_PER_CHUNK"])
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
 
+
 # ---------------------------------------------------------------------------
 # Production route policy (Cake ``kimi_k3_attn_res.select_route``), ported.
-# Every table below is the measured per-architecture selection of the Cake
-# dispatcher; the export checks this port against it row by row.
+# Every table below is read from the registry's ``ROUTES`` literals: a set is
+# spelled as a sorted list, a table keyed by (M, K) cells as [[M, K], value]
+# pairs (an empty one as {}), the round-2 tables as architecture -> SM count ->
+# cell pairs.  The export checks this port against the policy row by row.
 # ---------------------------------------------------------------------------
-_SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
-    {
-        (256, 8),
-        (512, 4),
-        (512, 8),
-        (1024, 1),
-        (1024, 4),
-        (1024, 8),
-        (2048, 1),
-        (2048, 4),
-        (2048, 8),
-        (4096, 1),
-        (4096, 2),
-        (4096, 4),
-        (4096, 5),
-        (4096, 6),
-        (4096, 7),
-        (4096, 8),
-        (8192, 1),
-        (8192, 8),
-        (16384, 1),
-        (16384, 8),
+
+
+def _cells(table) -> dict[tuple[int, int], Any]:
+    """``[[[M, K], value], ...]`` -> ``{(M, K): value}`` (an empty table is ``{}``)."""
+    if isinstance(table, dict):
+        return {}
+    return {(int(cell[0]), int(cell[1])): value for cell, value in table}
+
+
+def _cell_set(table) -> frozenset[tuple[int, int]]:
+    return frozenset((int(cell[0]), int(cell[1])) for cell in table)
+
+
+def _bands(table) -> dict[int, tuple[tuple[int, int], ...]]:
+    """``{K: [[a, b], ...]}`` -> ``{K: ((a, b), ...)}``."""
+    return {
+        int(k): tuple((int(a), int(b)) for a, b in bands) for k, bands in table.items()
     }
+
+
+def _by_arch(table, convert) -> dict[str, Any]:
+    return {arch: convert(value) for arch, value in table.items()}
+
+
+def _by_arch_sm(table, convert) -> dict[str, dict[int, Any]]:
+    return {
+        arch: {int(sm): convert(value) for sm, value in by_sm.items()}
+        for arch, by_sm in table.items()
+    }
+
+
+_SM103_EARLY_CONSUMED_RELEASE_CELLS = _cell_set(
+    ROUTES["SM103_EARLY_CONSUMED_RELEASE_CELLS"]
 )
-_SM100_K1_NC2_M = frozenset({512, 1024, 2048, 8192})
-_SM103_K1_NC2_M = frozenset({256})
-_SM103_K5_NC4_DEPTH_M = {4096: 3}
-# Cells (M, K) that run three sources per chunk with a depth-3 pipeline.
-_NC3_D3_CELLS = {
-    "sm_100a": frozenset(
-        {(2048, 4), (4096, 4), (8192, 4), (16384, 4), (4096, 3), (4096, 5)}
-    ),
-    "sm_103a": frozenset({(1024, 4), (2048, 4), (4096, 4)}),
-}
-# sm_100a dense cells that hold the consumed-stage release through the output stats.
-_SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
-# K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
-_K0_TMA_GRID_MULTIPLIER_M = {
-    "sm_100a": {256: 2, 512: 2, 1024: 2},
-    "sm_103a": {256: 2, 512: 3, 1024: 3},
-}
-_SM100_RELAXED_PRODUCER_WAIT_CELLS: frozenset[tuple[int, int]] = frozenset()
-_SM103_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(4096, 5)})
-_NATIVE_ROUTES = (
-    # name, {arch: routed M}, num_blocks, PDL modes, consumed-release policy
-    (
-        "k5",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
-        5,
-        (False, True),
-        "native_lane0_before_wait_st",
-    ),
-    (
-        "m128",
-        {
-            "sm_100a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 1024}),
-            "sm_103a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256}),
-        },
-        4,
-        (False, True),
-        "native_all_reader_before_wait_st",
-    ),
-    (
-        "k6",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
-        6,
-        (False, True),
-        "native_all_reader_before_wait_st",
-    ),
-    (
-        "k7",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
-        7,
-        (False,),
-        "native_all_reader_nofence_before_wait_st",
-    ),
-    (
-        "k8",
-        {
-            "sm_100a": frozenset({1, 2, 4, 8, 32, 256}),
-            "sm_103a": frozenset({1, 8, 256}),
-        },
-        8,
-        (False, True),
-        "native_all_reader_nofence_before_wait_st",
-    ),
+_SM100_K1_NC2_M = frozenset(int(m) for m in ROUTES["SM100_K1_NC2_M"])
+_SM103_K1_NC2_M = frozenset(int(m) for m in ROUTES["SM103_K1_NC2_M"])
+_SM103_K5_NC4_D3_MIN_M = int(ROUTES["SM103_K5_NC4_D3_MIN_M"])
+_SM100_K5_NC4_D3_MIN_M = int(ROUTES["SM100_K5_NC4_D3_MIN_M"])
+_NC3_D3_CELLS = _by_arch(ROUTES["NC3_D3_CELLS"], _cell_set)
+_SM100_K4_NC3_D3_MIN_M = int(ROUTES["SM100_K4_NC3_D3_MIN_M"])
+_SM100_HELD_CONSUMED_RELEASE_CELLS = _cell_set(
+    ROUTES["SM100_HELD_CONSUMED_RELEASE_CELLS"]
 )
-_NATIVE_K8_SM100_PDL_ONLY_M = frozenset({16})
+_SM100_HELD_CONSUMED_RELEASE_MAX_M = {
+    int(k): int(m) for k, m in ROUTES["SM100_HELD_CONSUMED_RELEASE_MAX_M"].items()
+}
+_SM103_EARLY_CONSUMED_RELEASE_MIN_M = {
+    int(k): int(m) for k, m in ROUTES["SM103_EARLY_CONSUMED_RELEASE_MIN_M"].items()
+}
+_SM103_EARLY_CONSUMED_RELEASE_MAX_M = {
+    int(k): int(m) for k, m in ROUTES["SM103_EARLY_CONSUMED_RELEASE_MAX_M"].items()
+}
+_R5_PERSISTENT_SCHEDULE_CELLS = _by_arch(
+    ROUTES["R5_PERSISTENT_SCHEDULE_CELLS"],
+    lambda t: {cell: (int(v[0]), int(v[1])) for cell, v in _cells(t).items()},
+)
+_R5_WRITE_PERSISTENT_SCHEDULE_CELLS = _by_arch(
+    ROUTES["R5_WRITE_PERSISTENT_SCHEDULE_CELLS"],
+    lambda t: {cell: (int(v[0]), int(v[1])) for cell, v in _cells(t).items()},
+)
+_R5_PREFIX_BF16_ADD_CELLS = _by_arch(ROUTES["R5_PREFIX_BF16_ADD_CELLS"], _cell_set)
+_SM100_R5_EARLY_CONSUMED_RELEASE_CELLS = _cell_set(
+    ROUTES["SM100_R5_EARLY_CONSUMED_RELEASE_CELLS"]
+)
+_SM103_R5_HELD_CONSUMED_RELEASE_CELLS = _cell_set(
+    ROUTES["SM103_R5_HELD_CONSUMED_RELEASE_CELLS"]
+)
+_R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS = _by_arch(
+    ROUTES["R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS"], _cell_set
+)
+_R5_SMALL_M_EXCLUDED_CELLS = _by_arch(ROUTES["R5_SMALL_M_EXCLUDED_CELLS"], _cell_set)
+_R5_SMALL_M_INCLUDED_CELLS = _by_arch(ROUTES["R5_SMALL_M_INCLUDED_CELLS"], _cell_set)
+_R5_SMALL_M_CHUNK_CELLS = _by_arch(ROUTES["R5_SMALL_M_CHUNK_CELLS"], _cells)
+_R5_SMALL_M_CLUSTER_CELLS = _by_arch(ROUTES["R5_SMALL_M_CLUSTER_CELLS"], _cells)
+_WRITE_HELD_CONSUMED_RELEASE_MIN_M = _by_arch(
+    ROUTES["WRITE_HELD_CONSUMED_RELEASE_MIN_M"],
+    lambda t: {int(k): int(m) for k, m in t.items()},
+)
+_K0_TMA_GRID_MULTIPLIER_M = _by_arch(
+    ROUTES["K0_TMA_GRID_MULTIPLIER_M"], lambda t: {int(m): int(x) for m, x in t.items()}
+)
+_SM103_RELAXED_PRODUCER_WAIT_CELLS = _cell_set(
+    ROUTES["SM103_RELAXED_PRODUCER_WAIT_CELLS"]
+)
+# Native ports: name, {arch: routed M}, num_blocks.  Only the cells above the small-M table are
+# listed: every other cell the ports were measured on resolves to a small-M program first.
+_NATIVE_ROUTES = tuple(
+    (
+        str(name),
+        {arch: frozenset(int(m) for m in ms) for arch, ms in routed.items()},
+        int(k),
+    )
+    for name, routed, k in ROUTES["NATIVE_ROUTES"]
+)
 # Small-M direct kernel: one token per 256-thread CTA, every source register-resident,
 # selected ahead of every other dense program for M <= max_m (per architecture and K).
-_SMALL_M_DIRECT_MAX_M = {
-    "sm_100a": {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16},
-    "sm_103a": {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16},
-}
+_SMALL_M_DIRECT_MAX_M = _by_arch(
+    ROUTES["SMALL_M_DIRECT_MAX_M"], lambda t: {int(k): int(m) for k, m in t.items()}
+)
 # Cluster split of the small-M kernel: K -> ((max_m, cluster), ...) bands in ascending max_m; the
 # first band with max_m >= M gives the CTAs per token (2 or 4). K absent or M above the last band
 # -> one CTA per token.
-_SMALL_M_CLUSTER: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
-    "sm_100a": {
-        4: ((4, 4), (16, 2)),
-        5: ((4, 4), (16, 2)),
-        6: ((4, 4), (16, 2)),
-        7: ((4, 4), (16, 2)),
-        8: ((16, 4),),
+_SMALL_M_CLUSTER = _by_arch(ROUTES["SMALL_M_CLUSTER"], _bands)
+# Online-softmax chunk size of the small-M programs: K -> ((max_m, sources_per_chunk), ...) bands in
+# ascending max_m; the first band with max_m >= M applies, K absent or M above the last band -> the
+# program default (nc4 for K <= 3, nc3 for K >= 4).
+_SMALL_M_CHUNK_BANDS = _by_arch(ROUTES["SMALL_M_CHUNK_BANDS"], _bands)
+# Round r5 (dense coverage D): a structural cell also serves the off-grid M just below it: (lo, hi)
+# -> the r5 cell tables are consulted with M = hi for lo <= M <= hi (dense programs only).
+_R5_CELL_RANGES = _by_arch(ROUTES["R5_CELL_RANGES"], _bands)
+# Per program class ("small_m" / "persistent" and their snapshot-write twins), K -> inclusive M bands
+# whose program compiles with --use_fast_math (kernel key ``_fm``, schedule id ``_fastmath``).
+_FAST_MATH_BANDS = _by_arch(
+    ROUTES["FAST_MATH_BANDS"],
+    lambda t: {program: _bands(bands) for program, bands in t.items()},
+)
+# Round-2 cell tables (architecture -> SM count -> (M, K) cell), consulted before the legacy
+# derivation; a cell absent here keeps the legacy program.  The export spells the round-3 cells
+# into the same tables (the native K5 cells of both architectures and the sm_100a ``_crfnone``
+# persistent twins).
+_R2_PERSISTENT_KEY_CELLS = _by_arch_sm(
+    ROUTES["R2_PERSISTENT_KEY_CELLS"],
+    lambda t: {
+        cell: (tuple(v) if isinstance(v, (list, tuple)) else str(v))
+        for cell, v in _cells(t).items()
     },
-    "sm_103a": {
-        4: ((16, 2),),
-        5: ((16, 2),),
-        6: ((16, 2),),
-        7: ((16, 2),),
-        8: ((16, 2),),
-    },
-}
+)
+_R2_NATIVE_CELLS = _by_arch_sm(
+    ROUTES["R2_NATIVE_CELLS"], lambda t: {c: str(v) for c, v in _cells(t).items()}
+)
+_R2_PAIR_CELLS = _by_arch_sm(
+    ROUTES["R2_PAIR_CELLS"], lambda t: {c: str(v) for c, v in _cells(t).items()}
+)
+_R2_SMALL_M_CLUSTER_CELLS = _by_arch_sm(
+    ROUTES["R2_SMALL_M_CLUSTER_CELLS"],
+    lambda t: {c: int(v) for c, v in _cells(t).items()},
+)
+_R2_SMALL_M_WRITE_CLUSTER_CELLS = _by_arch_sm(
+    ROUTES["R2_SMALL_M_WRITE_CLUSTER_CELLS"],
+    lambda t: {c: int(v) for c, v in _cells(t).items()},
+)
+_R2_SMALL_M_FAST_MATH_CELLS = _by_arch_sm(
+    ROUTES["R2_SMALL_M_FAST_MATH_CELLS"], _cell_set
+)
+_R2_SMALL_M_WRITE_FAST_MATH_CELLS = _by_arch_sm(
+    ROUTES["R2_SMALL_M_WRITE_FAST_MATH_CELLS"], _cell_set
+)
 
 
-def _small_m_cluster(arch: str, M: int, K: int) -> int:
+def _r2(table: dict[str, dict[int, Any]], arch: str, num_sms: Optional[int]) -> Any:
+    """The round-2 cells of ``table`` at one configuration (empty when there are none)."""
+    if num_sms is None:
+        return {}
+    return table.get(arch, {}).get(int(num_sms), {})
+
+
+def _small_m_cluster(
+    arch: str, M: int, K: int, *, num_sms: Optional[int] = None, write: bool = False
+) -> int:
+    r2 = _r2(
+        _R2_SMALL_M_WRITE_CLUSTER_CELLS if write else _R2_SMALL_M_CLUSTER_CELLS,
+        arch,
+        num_sms,
+    ).get((M, K))
+    if r2 is not None:
+        return int(r2)
+    cell = _R5_SMALL_M_CLUSTER_CELLS.get(arch, {}).get((M, K))
+    if cell is not None:
+        return int(cell)
     for max_m, cluster in _SMALL_M_CLUSTER[arch].get(K, ()):
         if max_m >= M:
             return int(cluster)
     return 1
 
 
+def _cell_m(arch: str, M: int, K: int) -> int:
+    """The structural-cell M whose round-r5 tables apply to a dense row (``M`` itself outside the ranges)."""
+
+    for lo, hi in _R5_CELL_RANGES[arch].get(K, ()):
+        if lo <= M <= hi:
+            return hi
+    return M
+
+
+def _fast_math(gpu_arch, M, num_blocks, program, num_sms: Optional[int] = None):
+    if program == "small_m" and (M, num_blocks) in _r2(
+        _R2_SMALL_M_FAST_MATH_CELLS, gpu_arch, num_sms
+    ):
+        return True
+    if program == "small_m_write" and (M, num_blocks) in _r2(
+        _R2_SMALL_M_WRITE_FAST_MATH_CELLS, gpu_arch, num_sms
+    ):
+        return True
+    return any(
+        min_m <= M <= max_m
+        for min_m, max_m in _FAST_MATH_BANDS[gpu_arch][program].get(num_blocks, ())
+    )
+
+
+def _small_m_sources_per_chunk(arch: str, M: int, K: int) -> int | None:
+    default = 4 if K <= 3 else 3
+    cell = _R5_SMALL_M_CHUNK_CELLS.get(arch, {}).get((M, K))
+    if cell is not None:
+        return None if int(cell) == default else int(cell)
+    for max_m, sources_per_chunk in _SMALL_M_CHUNK_BANDS[arch].get(K, ()):
+        if max_m >= M:
+            return None if int(sources_per_chunk) == default else int(sources_per_chunk)
+    return None
+
+
 class RoutePlan(NamedTuple):
     """The generated program one call launches and its launch geometry."""
 
-    kind: str  # "direct" | "small_m" | "native" | "k0_tma" | "persistent"
+    kind: str  # "direct" | "small_m" | "native" | "pair" | "k0_tma" | "persistent"
     kernel_key: str
     grid_x: int
     threads: int
@@ -207,6 +311,9 @@ class RoutePlan(NamedTuple):
     route_id: str
     arch: Optional[str]
     use_pdl: bool
+    # Exact (table) key when this plan runs a registered variant of the same program family
+    # instead, because the checkout does not register the exact variant; None for exact plans.
+    fallback_from: Optional[str] = None
 
 
 @functools.lru_cache(maxsize=None)
@@ -242,26 +349,33 @@ def _wait_policy(arch: str) -> bool:
     return arch == "sm_100a"
 
 
-def _schedule(arch: str, M: int, K: int) -> tuple[int, int]:
-    """``(sources_per_chunk, chunk_depth)`` of the persistent common path."""
-    if (M, K) in _NC3_D3_CELLS[arch]:
+def _schedule(arch: str, M: int, K: int, write: bool = False) -> tuple[int, int]:
+    """``(sources_per_chunk, chunk_depth)`` of the persistent common path (``write``: the program the
+    snapshot-write twin is derived from; round r5 cells may give it its own schedule)."""
+    r5_cells = (
+        _R5_WRITE_PERSISTENT_SCHEDULE_CELLS if write else _R5_PERSISTENT_SCHEDULE_CELLS
+    ).get(arch, {})
+    cell = (M if write else _cell_m(arch, M, K), K)
+    if cell in r5_cells:
+        return r5_cells[cell]
+    if (M, K) in _NC3_D3_CELLS[arch] or (
+        arch == "sm_100a" and K == 4 and M >= _SM100_K4_NC3_D3_MIN_M
+    ):
         return 3, 3
     if arch == "sm_100a":
-        if K == 0 and M in {1, 2, 16, 32, 64, 512, 2048, 4096, 8192, 16384}:
-            return 1, PERSISTENT_CHUNK_DEPTH
         if K == 1 and M in _SM100_K1_NC2_M:
             return 2, PERSISTENT_CHUNK_DEPTH
+        if K == 5 and M >= _SM100_K5_NC4_D3_MIN_M:
+            return PERSISTENT_SOURCES_PER_CHUNK, 3
         if K == 4:
             return (
                 5 if M in {1, 32, 1024, 2048, 4096, 8192, 16384} else 3
             ), PERSISTENT_CHUNK_DEPTH
     else:
-        if K == 0 and M not in {4, 16, 256}:
-            return 1, PERSISTENT_CHUNK_DEPTH
         if K == 1 and M in _SM103_K1_NC2_M:
             return 2, PERSISTENT_CHUNK_DEPTH
-        if K == 5 and M in _SM103_K5_NC4_DEPTH_M:
-            return PERSISTENT_SOURCES_PER_CHUNK, _SM103_K5_NC4_DEPTH_M[M]
+        if K == 5 and M >= _SM103_K5_NC4_D3_MIN_M:
+            return PERSISTENT_SOURCES_PER_CHUNK, 3
         if K == 4:
             return (3 if M <= 512 else 5), PERSISTENT_CHUNK_DEPTH
     if K == 8:
@@ -271,42 +385,278 @@ def _schedule(arch: str, M: int, K: int) -> tuple[int, int]:
 
 def _grid(M: int, num_sms: int, sources_per_chunk: int) -> tuple[int, str]:
     if (
-        sources_per_chunk in {2, 3, PERSISTENT_SOURCES_PER_CHUNK}
-        and 256 <= M <= PERSISTENT_BALANCED_GRID_MAX_M
-        and num_sms >= PERSISTENT_BALANCED_GRID
+        sources_per_chunk in PERSISTENT_BALANCED_NC
+        and PERSISTENT_BALANCED_GRID_MIN_M <= M <= PERSISTENT_BALANCED_GRID_MAX_M
+        and num_sms >= PERSISTENT_BALANCED_GRID_MIN_SMS
     ):
         return PERSISTENT_BALANCED_GRID, "balanced128_m256_m512"
     return min(M, num_sms), "token_or_full_sm"
 
 
-def _early_consumed_release(arch: str, M: int, K: int, grid_x: int) -> bool:
+def _early_consumed_release(
+    arch: str, M: int, K: int, grid_x: int, write: bool = False
+) -> bool:
+    if (
+        write
+        and _WRITE_HELD_CONSUMED_RELEASE_MIN_M[arch].get(K, M + 1) <= M
+        and (M, K) not in _R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS.get(arch, ())
+    ):
+        return False
     if arch == "sm_100a":
-        return K > 0 and grid_x < M and (M, K) not in _SM100_HELD_CONSUMED_RELEASE_CELLS
-    return K > 0 and grid_x < M and (M, K) in _SM103_EARLY_CONSUMED_RELEASE_CELLS
-
-
-def _producer_wait_acquire(arch: str, M: int, K: int) -> bool:
-    return not (
-        (arch == "sm_100a" and (M, K) in _SM100_RELAXED_PRODUCER_WAIT_CELLS)
-        or (arch == "sm_103a" and (M, K) in _SM103_RELAXED_PRODUCER_WAIT_CELLS)
+        return (
+            K > 0
+            and grid_x < M
+            and (M, K) not in _SM100_HELD_CONSUMED_RELEASE_CELLS
+            and (
+                (
+                    not write
+                    and (_cell_m(arch, M, K), K)
+                    in _SM100_R5_EARLY_CONSUMED_RELEASE_CELLS
+                )
+                or _SM100_HELD_CONSUMED_RELEASE_MAX_M.get(K, 0) < M
+            )
+        )
+    return (
+        K > 0
+        and grid_x < M
+        and (write or (M, K) not in _SM103_R5_HELD_CONSUMED_RELEASE_CELLS)
+        and (
+            (M, K) in _SM103_EARLY_CONSUMED_RELEASE_CELLS
+            or (
+                _SM103_EARLY_CONSUMED_RELEASE_MIN_M.get(K, M + 1)
+                <= M
+                <= _SM103_EARLY_CONSUMED_RELEASE_MAX_M.get(K, M)
+            )
+        )
     )
 
 
-def _native_route(arch: str, num_sms: int, M: int, K: int, use_pdl: bool):
-    if num_sms != NATIVE_GRID:
+def _producer_wait_acquire(arch: str, M: int, K: int) -> bool:
+    return not (arch == "sm_103a" and (M, K) in _SM103_RELAXED_PRODUCER_WAIT_CELLS)
+
+
+def _native_route(arch: str, num_sms: int, M: int, K: int) -> Optional[str]:
+    if num_sms not in NATIVE_SM_COUNTS:
         return None
-    for name, routed, k, pdl_modes, release in _NATIVE_ROUTES:
-        if k != K or use_pdl not in pdl_modes:
-            continue
-        pdl_only = (
-            name == "k8"
-            and arch == "sm_100a"
-            and use_pdl
-            and M in _NATIVE_K8_SM100_PDL_ONLY_M
-        )
-        if M in routed[arch] or pdl_only:
-            return name, release
+    port = _r2(_R2_NATIVE_CELLS, arch, num_sms).get((M, K))
+    if port is not None:
+        return port
+    for name, routed, k in _NATIVE_ROUTES:
+        if k == K and M in routed[arch]:
+            return name
     return None
+
+
+# Flag positions of the persistent key's ``f<bits>`` field (see ``_plan_route_exact``).  Bit 4 is
+# ``register_carry_only`` (round-2 decision D3): the K1 / K2 register-carry bodies, which need bit 2.
+_PERSISTENT_FLAG_ECR = 0
+_PERSISTENT_FLAG_PWA = 1
+_PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
+_PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
+_PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
+# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_write]``: ``_fm`` is the fast-math
+# twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built with
+# ``consumed_release_fence_mode="none"`` (the kernel states its own tcgen05 fences), a registered
+# program of its own whose schedule label ends in ``_authored_fences`` -- and ``_write`` the
+# snapshot-write variant.  A fallback never crosses the ``_fm`` / ``_crfnone`` / ``_write`` lines.
+_PERSISTENT_KEY = re.compile(
+    r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)(_fm)?(_crfnone)?(_write)?$"
+)
+_SMALL_M_KEY = re.compile(
+    r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_fm)?(_write)?$"
+)
+_PAIR_KEY = re.compile(r"^pair:k(\d+)_nc(\d+)(_pbf16a)?(_fm)?(_write)?$")
+
+
+def _persistent_schedule_id(
+    nc: int, depth: int, bits: str, authored_fences: bool = False
+) -> str:
+    schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
+    if bits[_PERSISTENT_FLAG_ECR] == "1":
+        schedule_id += "_early_consume"
+    if bits[_PERSISTENT_FLAG_PWA] == "0":
+        schedule_id += "_relaxed_producer_wait"
+    if bits[_PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1":
+        schedule_id += "_prefix_bf16_add_packed_inputs_prefix_shared_addr"
+    if bits[_PERSISTENT_FLAG_PREFIX_ROUND_ONCE] == "1":
+        schedule_id += "_prefix_round_once"
+    if bits[_PERSISTENT_FLAG_REGISTER_CARRY_ONLY] == "1":
+        schedule_id += "_register_carry_only"
+    if authored_fences:
+        schedule_id += "_authored_fences"
+    return schedule_id
+
+
+def _small_m_plan(
+    arch: str,
+    M: int,
+    K: int,
+    use_pdl: bool,
+    cluster: int,
+    exact_key: Optional[str],
+    *,
+    sources_per_chunk: Optional[int] = None,
+    write_block: bool = False,
+    num_sms: Optional[int] = None,
+) -> RoutePlan:
+    """A small-M family plan: ``cluster`` CTAs per token, chunk ``sources_per_chunk`` (``None`` =
+    the module default of K), ``write_block`` = the snapshot-write variant (round r4), ``num_sms``
+    = the configuration whose round-2 fast-math cells apply.  ``exact_key`` marks a
+    registered-variant fallback of that exact plan."""
+    threads = DIRECT_THREADS // cluster
+    fast_math = _fast_math(
+        arch, M, K, "small_m_write" if write_block else "small_m", num_sms
+    )
+    nc_suffix = "" if sources_per_chunk is None else f"_nc{int(sources_per_chunk)}"
+    fm_suffix = "_fastmath" if fast_math else ""
+    fm_key = "_fm" if fast_math else ""
+    write_suffix = "_write" if write_block else ""
+    if cluster == 1:
+        schedule_id = (
+            f"small_m_direct_cta256_regres_fp32x2{nc_suffix}{fm_suffix}{write_suffix}"
+        )
+        grid_policy = "one_token_per_cta"
+        kernel_key = f"small_m_direct:k{K}{nc_suffix}{fm_key}{write_suffix}"
+    else:
+        schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2{nc_suffix}{fm_suffix}{write_suffix}"
+        grid_policy = f"one_token_per_cluster{cluster}"
+        kernel_key = f"small_m_cluster{cluster}:k{K}{nc_suffix}{fm_key}{write_suffix}"
+    route_id = (
+        f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write{int(write_block)}.norm1."
+        f"pdl{int(use_pdl)}.{grid_policy}"
+    )
+    if exact_key is not None:
+        route_id += ".registered_fallback"
+    return RoutePlan(
+        "small_m",
+        kernel_key,
+        M * cluster,
+        threads,
+        schedule_id,
+        route_id,
+        arch,
+        use_pdl,
+        exact_key,
+    )
+
+
+def _persistent_fallback(
+    plan: RoutePlan, table: dict[str, str], num_sms: int, M: int, K: int, exact_key: str
+) -> Optional[RoutePlan]:
+    """The registered persistent variant of block count ``K`` closest to the exact plan."""
+    exact = (
+        _PERSISTENT_KEY.match(plan.kernel_key) if plan.kind == "persistent" else None
+    )
+    want_nc, want_depth, want_bits = (
+        (int(exact.group(2)), int(exact.group(3)), exact.group(4))
+        if exact
+        else (None, None, None)
+    )
+    want_write = bool(exact and exact.group(7)) or plan.kernel_key.endswith("_write")
+    want_fm = bool(exact and exact.group(5)) or "_fm" in plan.kernel_key
+    want_authored = bool(exact and exact.group(6)) or "_crfnone" in plan.kernel_key
+    candidates = []
+    for key in table:
+        match = _PERSISTENT_KEY.match(key)
+        if match is None or int(match.group(1)) != K:
+            continue
+        if bool(match.group(7)) != want_write:
+            # the snapshot store exists only in the write variants: never cross that line
+            continue
+        if bool(match.group(5)) != want_fm:
+            # fast-math programs round differently (one BF16 ulp class): never substitute across it
+            continue
+        if bool(match.group(6)) != want_authored:
+            # the fence-authored twin states its own tcgen05 fences: never substitute across it
+            continue
+        nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
+        score = (
+            nc != want_nc,
+            depth != want_depth,
+            want_bits is None
+            or bits[_PERSISTENT_FLAG_ECR] != want_bits[_PERSISTENT_FLAG_ECR],
+            want_bits is None
+            or bits[_PERSISTENT_FLAG_PWA] != want_bits[_PERSISTENT_FLAG_PWA],
+            want_bits is None
+            or sum(a != b for a, b in zip(bits, want_bits, strict=False)),
+            key,
+        )
+        candidates.append((score, key, nc, depth, bits))
+    if not candidates:
+        return None
+    _score, key, nc, depth, bits = min(candidates)
+    grid_x, grid_policy = _grid(M, num_sms, nc)
+    schedule_id = _persistent_schedule_id(nc, depth, bits, want_authored)
+    if want_fm:
+        schedule_id += "_fastmath"
+    if want_write:
+        schedule_id += "_write"
+    wait_policy = "deferred_wait_st" if _wait_policy(plan.arch) else "control_wait_st"
+    route_id = (
+        f"{schedule_id}.{plan.arch}.{wait_policy}.k{K}.delta1.write{int(want_write)}.norm1."
+        f"pdl{int(plan.use_pdl)}.{grid_policy}.registered_fallback"
+    )
+    return RoutePlan(
+        "persistent",
+        key,
+        grid_x,
+        PERSISTENT_THREADS,
+        schedule_id,
+        route_id,
+        plan.arch,
+        plan.use_pdl,
+        exact_key,
+    )
+
+
+def _resolve_registered(plan: RoutePlan, num_sms: int, M: int) -> RoutePlan:
+    """``plan`` itself when its program is registered (or no registry exists for the
+    architecture); otherwise the closest registered variant of the same family and block
+    count.  Bootstrap ``direct`` variants encode semantics in their key and never substitute;
+    neither do the native ports and the pair kernel (their cells are measured)."""
+    if plan.arch is None or plan.kind == "direct":
+        return plan
+    table = KERNELS.get(plan.arch)
+    if not table or plan.kernel_key in table:
+        return plan
+    exact_key = plan.kernel_key
+    if plan.kind == "small_m":
+        match = _SMALL_M_KEY.match(exact_key)
+        if match is None:
+            return plan
+        K = int(match.group(3))
+        same_cluster = int(match.group(2)) if match.group(2) else 1
+        fm_key = match.group(5) or ""
+        write_block = match.group(6) is not None
+        write_suffix = "_write" if write_block else ""
+        for cluster in (same_cluster, 2, 4, 1):
+            family = "direct" if cluster == 1 else f"cluster{cluster}"
+            if f"small_m_{family}:k{K}{fm_key}{write_suffix}" in table:
+                return _small_m_plan(
+                    plan.arch,
+                    M,
+                    K,
+                    plan.use_pdl,
+                    cluster,
+                    exact_key,
+                    write_block=write_block,
+                    num_sms=num_sms,
+                )
+        if write_block:
+            # the snapshot store exists only in the small-M write programs: never substitute
+            # a program of other semantics
+            return plan
+        fallback = _persistent_fallback(plan, table, num_sms, M, K, exact_key)
+        return fallback if fallback is not None else plan
+    if plan.kind == "persistent":
+        match = _PERSISTENT_KEY.match(exact_key)
+        if match is None:
+            return plan
+        fallback = _persistent_fallback(
+            plan, table, num_sms, M, int(match.group(1)), exact_key
+        )
+        return fallback if fallback is not None else plan
+    return plan
 
 
 def plan_route(
@@ -321,7 +671,42 @@ def plan_route(
     apply_output_norm: bool = True,
     common_path: bool = True,
 ) -> RoutePlan:
-    """Select the generated program for one call from host-known facts only."""
+    """Select the generated program for one call from host-known facts only.
+
+    The route tables name the schedule variant measured for every cell of the evaluation
+    grid.  Cells outside that grid (token counts that are not powers of two, block counts
+    5-7 at mid token counts, ...) may name a variant this checkout does not register; such a
+    plan is resolved to a registered variant of the same program family and block count
+    (``fallback_from`` records the exact key), so every dense call has a program.  Measured
+    cells always run their exact program.
+    """
+    plan = _plan_route_exact(
+        arch,
+        num_sms,
+        M,
+        num_blocks,
+        use_pdl,
+        has_delta=has_delta,
+        block_write_idx=block_write_idx,
+        apply_output_norm=apply_output_norm,
+        common_path=common_path,
+    )
+    return _resolve_registered(plan, num_sms, M)
+
+
+def _plan_route_exact(
+    arch: Optional[str],
+    num_sms: int,
+    M: int,
+    num_blocks: int,
+    use_pdl: bool,
+    *,
+    has_delta: bool = True,
+    block_write_idx: int = -1,
+    apply_output_norm: bool = True,
+    common_path: bool = True,
+) -> RoutePlan:
+    """The table-exact plan (the schedule variant named by the route tables)."""
     M = int(M)
     K = int(num_blocks)
     use_pdl = bool(use_pdl)
@@ -345,41 +730,80 @@ def plan_route(
     num_sms = int(num_sms)
     if num_sms <= 0:
         raise ValueError(f"invalid persistent launch geometry M={M}, num_sms={num_sms}")
-    max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
-    if max_m is not None and max_m >= M:
-        cluster = _small_m_cluster(arch, M, K)
-        threads = DIRECT_THREADS // cluster
-        if cluster == 1:
-            schedule_id = "small_m_direct_cta256_regres_fp32x2"
-            grid_policy = "one_token_per_cta"
-            kernel_key = f"small_m_direct:k{K}"
+    write_idx = int(block_write_idx)
+    if write_idx >= 0:
+        # Round r4 (direction 4 / 4b): the block-boundary snapshot write (block K written)
+        # runs the write variant of the dense cell's program: the small-M write programs
+        # inside the dense family's M table, the persistent write variant above it (K >= 1,
+        # also where the dense cell runs a native port), one small-M CTA per token for K = 0
+        # only. The written index is the
+        # program's K; any other index keeps the bootstrap (``common_path_eligible``).
+        if write_idx != K or not 0 <= K < MAX_BLOCKS:
+            raise ValueError(
+                "dense snapshot-write route requires block_write_idx == num_blocks < "
+                f"{MAX_BLOCKS}, observed {write_idx} at K={K}"
+            )
+        max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
+        if max_m is not None and max_m >= M:
+            dense = None
+        elif K == 0:
+            dense = _plan_route_exact(arch, num_sms, M, K, use_pdl)
         else:
-            schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2"
-            grid_policy = f"one_token_per_cluster{cluster}"
-            kernel_key = f"small_m_cluster{cluster}:k{K}"
-        route_id = (
-            f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
-            f"pdl{int(use_pdl)}.{grid_policy}"
-        )
+            # Above the table the write runs the persistent write variant even where the dense
+            # cell runs a native port (Cake select_route persistent_dense_only).
+            dense = _persistent_plan_exact(arch, num_sms, M, K, use_pdl, write=True)
+        if dense is None or dense.kind != "persistent":
+            return _small_m_plan(
+                arch,
+                M,
+                K,
+                use_pdl,
+                _small_m_cluster(arch, M, K, num_sms=num_sms, write=True),
+                None,
+                sources_per_chunk=_small_m_sources_per_chunk(arch, M, K),
+                write_block=True,
+                num_sms=num_sms,
+            )
+        schedule_id = f"{dense.schedule_id}_write"
         return RoutePlan(
-            "small_m",
-            kernel_key,
-            M * cluster,
-            threads,
+            "persistent",
+            f"{dense.kernel_key}_write",
+            dense.grid_x,
+            dense.threads,
             schedule_id,
-            route_id,
+            dense.route_id.replace(dense.schedule_id, schedule_id, 1).replace(
+                ".write0.", ".write1.", 1
+            ),
             arch,
             use_pdl,
         )
-    native = _native_route(arch, num_sms, M, K, use_pdl)
+    max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
+    if (M, K) in _R5_SMALL_M_INCLUDED_CELLS.get(arch, ()) or (
+        max_m is not None
+        and max_m >= M
+        and (M, K) not in _R5_SMALL_M_EXCLUDED_CELLS[arch]
+    ):
+        return _small_m_plan(
+            arch,
+            M,
+            K,
+            use_pdl,
+            _small_m_cluster(arch, M, K, num_sms=num_sms),
+            None,
+            sources_per_chunk=_small_m_sources_per_chunk(arch, M, K),
+            num_sms=num_sms,
+        )
+    pair = _r2(_R2_PAIR_CELLS, arch, num_sms).get((M, K))
+    if pair is not None:
+        return _pair_plan(arch, num_sms, M, K, use_pdl, pair)
+    native = _native_route(arch, num_sms, M, K)
     if native is not None:
-        name, _release = native
-        schedule_id = f"native_{name}_nc3_d2_ws288_grid148"
+        schedule_id = f"native_{native}_nc3_d2_ws288_grid{num_sms}"
         route_id = f"{schedule_id}.{arch}.native_no_hint.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.native_full_sm"
         return RoutePlan(
             "native",
-            f"native_{name}",
-            NATIVE_GRID,
+            f"native_{native}",
+            num_sms,
             PERSISTENT_THREADS,
             schedule_id,
             route_id,
@@ -404,13 +828,81 @@ def plan_route(
             arch,
             use_pdl,
         )
-    defer = _wait_policy(arch)
-    nc, depth = _schedule(arch, M, K)
+    return _persistent_plan_exact(arch, num_sms, M, K, use_pdl)
+
+
+def _pair_plan(
+    arch: str, num_sms: int, M: int, K: int, use_pdl: bool, key: str
+) -> RoutePlan:
+    """The plan of a round-2 pair cell: one CTA per SM, 320 threads, the key as the table names it."""
+    match = _PAIR_KEY.match(key)
+    if match is None or int(match.group(1)) != K or match.group(5):
+        raise ValueError(
+            f"round-2 cell ({M}, {K}) names {key!r}, not a dense pair key of K={K}"
+        )
+    nc = int(match.group(2))
+    schedule_id = f"pair_ws{PAIR_THREADS}_nc{nc}"
+    if match.group(3):
+        schedule_id += "_prefix_bf16_add"
+    if match.group(4):
+        schedule_id += "_fastmath"
+    schedule_id += f"_grid{num_sms}"
+    route_id = f"{schedule_id}.{arch}.pair_no_hint.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.pair_full_sm"
+    return RoutePlan(
+        "pair", key, num_sms, PAIR_THREADS, schedule_id, route_id, arch, use_pdl
+    )
+
+
+def _persistent_plan_for_key(
+    arch: str, num_sms: int, M: int, K: int, use_pdl: bool, key: str
+) -> RoutePlan:
+    """The plan of a round-2 / round-3 persistent cell: the key as the table names it, the grid of
+    its ``nc`` and the labels of its fields (what ``_persistent_plan_exact`` derives for a legacy
+    cell; a ``_crfnone`` key labels its schedule ``_authored_fences``)."""
+    match = _PERSISTENT_KEY.match(key)
+    if match is None or int(match.group(1)) != K or match.group(7):
+        raise ValueError(
+            f"round-2 cell ({M}, {K}) names {key!r}, not a dense persistent key of K={K}"
+        )
+    nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
     grid_x, grid_policy = _grid(M, num_sms, nc)
-    ecr = _early_consumed_release(arch, M, K, grid_x)
+    schedule_id = _persistent_schedule_id(nc, depth, bits, bool(match.group(6))) + (
+        "_fastmath" if match.group(5) else ""
+    )
+    wait_policy = "deferred_wait_st" if _wait_policy(arch) else "control_wait_st"
+    route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
+    return RoutePlan(
+        "persistent",
+        key,
+        grid_x,
+        PERSISTENT_THREADS,
+        schedule_id,
+        route_id,
+        arch,
+        use_pdl,
+    )
+
+
+def _persistent_plan_exact(
+    arch: str, num_sms: int, M: int, K: int, use_pdl: bool, write: bool = False
+) -> RoutePlan:
+    """The persistent program of a cell (the dense tail of ``_plan_route_exact``), mirrored from the
+    Cake dispatcher's persistent policies (``write``: the program the snapshot-write variant is
+    derived from; it holds the release from ``_WRITE_HELD_CONSUMED_RELEASE_MIN_M``).  A dense
+    round-2 cell takes the key its table names (per PDL mode when the cell names two)."""
+    if not write:
+        cell = _r2(_R2_PERSISTENT_KEY_CELLS, arch, num_sms).get((M, K))
+        if cell is not None:
+            key = cell[int(use_pdl)] if isinstance(cell, tuple) else cell
+            return _persistent_plan_for_key(arch, num_sms, M, K, use_pdl, key)
+    defer = _wait_policy(arch)
+    nc, depth = _schedule(arch, M, K, write)
+    grid_x, grid_policy = _grid(M, num_sms, nc)
+    ecr = _early_consumed_release(arch, M, K, grid_x, write)
     pwa = _producer_wait_acquire(arch, M, K)
     prefix_bf16_add = (
-        (
+        (not write and (_cell_m(arch, M, K), K) in _R5_PREFIX_BF16_ADD_CELLS[arch])
+        or (
             arch == "sm_100a"
             and (
                 K == 2
@@ -430,7 +922,10 @@ def plan_route(
         or (arch == "sm_103a" and K == 8 and nc == 3 and not ecr)
     )
     prefix_round_once = K == 8 and nc == 3 and not ecr
-    one_token_per_cta = K in {1, 2, 3} and nc == 4 and not ecr and grid_x == M
+    # Bit 4 is register_carry_only (D3): set by the round-2 cells above only.  Its legacy reading,
+    # one token per CTA (K 1-3, nc 4, held release, grid_x == M), was never reached: every such
+    # cell is small-M at 148 / 152 SMs.
+    register_carry_only = False
     prefetch_fifth_stats = (
         (arch == "sm_103a" or (arch == "sm_100a" and M == 32))
         and K == 4
@@ -440,26 +935,14 @@ def plan_route(
     k4_early_nc5_input_first = (
         arch == "sm_100a" and M == 1024 and K == 4 and nc == 5 and ecr
     )
-    k4_held_nc3_input_first = arch == "sm_103a" and K == 4 and M in {64, 128}
-    k4_nc5_source0_carry = (
-        arch == "sm_103a" and M == 1024 and K == 4 and nc == 5 and not ecr
-    )
     k1_on_output_norm_cache = (
         arch == "sm_103a" and use_pdl and K == 1 and M in {1024, 2048, 4096, 8192}
     )
-    k1_m1_on_source_barrier_norm_prefetch = (
-        arch == "sm_103a" and use_pdl and K == 1 and M == 1
-    )
-    k4_m4_on_packed_cross_warp = (
-        arch == "sm_100a" and K == 4 and not use_pdl and M == 64
-    )
-    k5_m1_on_terminal_packed_stats = arch == "sm_103a" and use_pdl and K == 5 and M == 1
     k1_output_norm_packed_cache = (
         arch == "sm_103a"
         and not use_pdl
         and K == 1
         and nc == 4
-        and not one_token_per_cta
         and not prefix_bf16_add
         and not prefix_round_once
         and ecr
@@ -474,38 +957,36 @@ def plan_route(
         and not ecr
         and prefix_bf16_add
         and prefix_round_once
-        and not one_token_per_cta
     )
+    # Positions 7, 8, 10, 11 and 12 (the sm_103a K4 held input-first and source-0 carry
+    # programs; the sm_103a M = 1 K1 / K5 and the sm_100a M = 64 K4 programs) are '0' in
+    # every registered key and False for every input that reaches this function through
+    # plan_route: their cells resolve inside the small-M table or, for (1024, 4) on sm_103a,
+    # to a three-source schedule.  They stay in the key as constant 0 bits so its
+    # 15-character flag field matches the registered keys.
     flags = (
         ecr,
         pwa,
         prefix_bf16_add,
         prefix_round_once,
-        one_token_per_cta,
+        register_carry_only,
         prefetch_fifth_stats,
         k4_early_nc5_input_first,
-        k4_held_nc3_input_first,
-        k4_nc5_source0_carry,
+        False,
+        False,
         k1_on_output_norm_cache,
-        k1_m1_on_source_barrier_norm_prefetch,
-        k4_m4_on_packed_cross_warp,
-        k5_m1_on_terminal_packed_stats,
+        False,
+        False,
+        False,
         k1_output_norm_packed_cache,
         k8_sm103_nonallocator_qk_prelude,
     )
     bits = "".join("1" if flag else "0" for flag in flags)
-    key = f"persistent:k{K}_nc{nc}_d{depth}_f{bits}"
-    schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
-    if ecr:
-        schedule_id += "_early_consume"
-    if not pwa:
-        schedule_id += "_relaxed_producer_wait"
-    if prefix_bf16_add:
-        schedule_id += "_prefix_bf16_add_packed_inputs_prefix_shared_addr"
-    if prefix_round_once:
-        schedule_id += "_prefix_round_once"
-    if one_token_per_cta:
-        schedule_id += "_one_token_per_cta"
+    fast_math = _fast_math(arch, M, K, "persistent_write" if write else "persistent")
+    key = f"persistent:k{K}_nc{nc}_d{depth}_f{bits}" + ("_fm" if fast_math else "")
+    schedule_id = _persistent_schedule_id(nc, depth, bits) + (
+        "_fastmath" if fast_math else ""
+    )
     wait_policy = "deferred_wait_st" if defer else "control_wait_st"
     route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
     return RoutePlan(
@@ -603,12 +1084,20 @@ def common_path_eligible(
     output_norm_weight: Optional[torch.Tensor],
     out: torch.Tensor,
     *,
+    num_blocks: int,
     block_write_idx: int,
 ) -> bool:
-    """True when the call takes the persistent common path: residual add + fused output norm,
-    no snapshot write, token-major dense layouts with 16-byte aligned rows and a full
+    """True when the call takes the dense path: residual add + fused output norm, no snapshot
+    write or (round r4) the snapshot write of block ``num_blocks`` (the write variants of the
+    dense programs; an index below K names a block the call also reads, any other index keeps
+    the bootstrap), token-major dense layouts with 16-byte aligned rows and a full
     ``[M, 8, H]`` snapshot bank."""
-    if delta is None or output_norm_weight is None or int(block_write_idx) >= 0:
+    if delta is None or output_norm_weight is None:
+        return False
+    write_idx = int(block_write_idx)
+    if (write_idx >= 0 and write_idx != int(num_blocks)) or write_idx >= int(
+        blocks.shape[1]
+    ):
         return False
     if (
         prefix.stride(0) != HIDDEN_SIZE
@@ -636,22 +1125,39 @@ def common_path_eligible(
 # ---------------------------------------------------------------------------
 
 
-def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name`` and load its entry."""
-    record = MODULES[module_name]
+def _record_name(arch: str, kernel_key: str) -> str:
+    """The registry record of ``kernel_key`` on ``arch``; a key this checkout does not register
+    (a bootstrap variant without a program) is ``NotImplementedError``."""
+    try:
+        return record_of(arch, kernel_key)
+    except RuntimeError as exc:
+        raise NotImplementedError(str(exc)) from None
+
+
+def _bind(
+    name: str, arch: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the argument plan of record ``name`` (its kernel parameters through their
+    logical names, the ``launch`` switch ``enable_pdl``, then the grid) and load its entry."""
+    record = MODULES[name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
+    logical = record["logical"]
     arguments = []
-    for kind, name in record["arg_plan"]:
+    for kind, parameter in record["arg_plan"]:
         if kind == "grid":
-            arguments.append(grid[name])
-        elif name in kwargs:
-            arguments.append(kwargs[name])
-        else:
+            arguments.append(grid[parameter])
+            continue
+        if kind == "launch":
+            arguments.append(int(kwargs["enable_pdl"]))
+            continue
+        key = logical.get(parameter)
+        if key is None or key not in kwargs:
             raise KeyError(
-                f"generated module {module_name!r} expects argument {name!r} ({kind}); "
-                f"host binding provides {sorted(kwargs)}"
+                f"generated program {name!r} expects argument {parameter!r} ({kind}, "
+                f"logical {key!r}); host binding provides {sorted(kwargs)}"
             )
-    module = load_cake_kimi_k3_attn_res_module(module_name)
+        arguments.append(kwargs[key])
+    module = load(name, arch)
     return getattr(module, record["ffi_entry"]), tuple(arguments)
 
 
@@ -667,6 +1173,9 @@ class KimiK3AttnResRunner:
 
     plan: RoutePlan
     module_name: str
+    #: SM count of the device the plan was resolved for (the grids of the persistent, K = 0, native
+    #: and pair programs derive from it).
+    sm_count: int
     prefix: torch.Tensor
     blocks: torch.Tensor
     out: torch.Tensor
@@ -702,7 +1211,7 @@ def generated_program_available(
     if arch is None:
         return False
     if M is None and num_blocks is None:
-        return bool(MODULES) and route_available(arch)
+        return bool(MODULES) and bool(KERNELS.get(arch))
     if M is None or num_blocks is None:
         raise ValueError("pass both M and num_blocks or neither")
     plan = plan_route(
@@ -716,7 +1225,7 @@ def generated_program_available(
         apply_output_norm=apply_output_norm,
         common_path=common_path,
     )
-    return route_available(arch, (plan.kernel_key,))
+    return plan.kernel_key in KERNELS.get(arch, {})
 
 
 def prepare_kimi_k3_attn_res(
@@ -759,11 +1268,13 @@ def prepare_kimi_k3_attn_res(
         qk_weight,
         output_norm_weight,
         out,
+        num_blocks=num_blocks,
         block_write_idx=block_write_idx,
     )
+    sm_count = sm_count_for(device)
     plan = plan_route(
         arch,
-        sm_count_for(device),
+        sm_count,
         M,
         num_blocks,
         enable_pdl,
@@ -772,7 +1283,7 @@ def prepare_kimi_k3_attn_res(
         apply_output_norm=output_norm_weight is not None,
         common_path=common,
     )
-    module_name = kernel_module_name(arch, plan.kernel_key)
+    module_name = _record_name(arch, plan.kernel_key)
     # The bootstrap program receives valid dummy pointers for absent optional operands
     # and never dereferences them (Cake production substitutes the same operands).
     bound_delta = delta if delta is not None else prefix
@@ -796,14 +1307,17 @@ def prepare_kimi_k3_attn_res(
         eps=float(eps),
         output_norm_eps=float(output_norm_eps),
         block_write_idx=int(block_write_idx),
-        num_blocks=int(num_blocks),
-        has_delta=int(delta is not None),
-        apply_output_norm=int(output_norm_weight is not None),
         enable_pdl=int(enable_pdl),
         M=M,
     )
     return KimiK3AttnResRunner(
-        plan, module_name, prefix, blocks, out, (_bind(module_name, kwargs),)
+        plan,
+        module_name,
+        sm_count,
+        prefix,
+        blocks,
+        out,
+        (_bind(module_name, arch, kwargs),),
     )
 
 

@@ -13,6 +13,7 @@ SM103 (B300/GB300):
 | API | Program family | QK MMA | PV MMA |
 | --- | --- | --- | --- |
 | `minimax_h3_varlen_attention(q, k, v, cu_seqlens, *, softmax_scale=None, out=None)` | `bf16` | `kind::f16` (BF16 x BF16, FP32 accumulate) | `kind::f16` (BF16 P x BF16 V) |
+| `minimax_h3_varlen_fp8_attention(q8, k8, v8, cu_seqlens, *, q_descale, k_descale, v_descale, softmax_scale=None, out=None)` | `fp8` | `kind::f8f6f4` (E4M3 x E4M3, FP32 accumulate; `q_descale * k_descale` folded into the exponent) | `kind::f8f6f4` (E4M3 P at unit scale x E4M3 V, FP32 accumulate; `v_descale` in the epilogue) |
 | `minimax_h3_varlen_nvfp4_attention(..., pv_mode="fp8")` | `nvfp4_fp8pv` | `kind::mxf4nvf4` E2M1 x E2M1, UE4M3 block-16 scales | `kind::f8f6f4` E4M3 P (TMEM) x dense E4M3 V, one per-tensor scale `448 / amax(V)` |
 | `minimax_h3_varlen_nvfp4_attention(..., pv_mode="fp4")` | `nvfp4_fp4pv` | `kind::mxf4nvf4` E2M1 x E2M1, UE4M3 block-16 scales | `kind::mxf4nvf4` E2M1 P (score-tile maximum as the shared anchor of the eight K16 scales) x E2M1 V^T with per-16-token UE4M3 scales |
 
@@ -23,7 +24,7 @@ bias, dropout, sliding window or LSE output.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
-| `query`, `key`, `value` | `[T, H, 128]` packed THD, contiguous | bfloat16 |
+| `query`, `key`, `value` | `[T, H, 128]` packed THD. BF16 route: any view with unit innermost stride, a head stride that is a 16-byte multiple (>= 128 elements), a token stride that is a 16-byte multiple (>= H x head stride) and a 16-byte-aligned base, e.g. the column slices of a fused `[T, 3*H*128]` QKV projection (strides `(3*H*128, 128, 1)`) or the slices of a `[T, H, 3, 128]` pack (strides `(H*384, 384, 1)`); the three may differ in strides and are read in place. NVFP4 routes: contiguous | bfloat16 |
 | `cu_seqlens` | `[B + 1]`, `cu_seqlens[0] == 0`, non-decreasing, `cu_seqlens[B] == T` | int32 (CUDA) |
 | `out` | `[T, H, 128]` (optional, caller-owned) | bfloat16 |
 
@@ -53,12 +54,20 @@ out4 = minimax_h3_varlen_nvfp4_attention(
 )  # NVFP4 QK, NVFP4 PV
 ```
 
-Both one-shot APIs plan on every call. Without `cu_seqlens_host` they read
-`cu_seqlens` back to the host (one stream synchronization) to build the
-segment plan; passing `cu_seqlens_host=[...]` (the same offsets as a Python
-sequence) is the fast path: no device synchronization, only the small plan
-table uploads. For repeated launches or CUDA Graph capture use the prepared
-form from this package:
+The BF16 one-shot API resolves its segment plan through a most-recently-used
+plan cache (`cached_bf16_segment_plan`, `BF16_PLAN_CACHE_CAPACITY = 256`
+entries keyed by `(cu_seqlens, device, num_heads, kv_splits, q_split, stream)`): the
+first call for a segment layout builds and uploads the plan tables, every
+later call with the same `cu_seqlens` / `num_heads` on that device and stream
+re-launches with them -- no Python planning, no host-to-device copies, no
+allocation when `out` is given (the diffusion engine issues hundreds of
+identical-layout calls per sample). The NVFP4 one-shot API plans and
+allocates its packed operand workspace on every call. Without
+`cu_seqlens_host` both read `cu_seqlens` back to the host (one stream
+synchronization); passing `cu_seqlens_host=[...]` (the same offsets as a
+Python sequence) avoids any device synchronization. For CUDA Graph capture
+use the prepared form from this package (or warm the BF16 one-shot entry up
+with the exact `cu_seqlens` on the capture stream before capturing):
 
 ```python
 from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
@@ -95,10 +104,18 @@ unit with one table lookup. The host builds, from `cu_seqlens` (empty segments
 dropped) and `num_heads`:
 
 * `seg_begin[s]`, `seg_len[s]` (int32, `num_segments` entries),
-* `unit_table` (int32, `4 * total_tiles` entries): per slot the segment index,
-  `head << 16 | cluster_in_segment`, `kv_block_begin << 16 | kv_blocks` (the
-  unit's K/V block range inside the segment) and its partial slot (`-1` for an
-  unsplit unit, which writes the BF16 output directly),
+* `unit_table` (int32, `8 * (total_tiles + num_clusters + 1)` entries): per slot the
+  segment's token begin and length, `head << 16 | cluster_in_segment`,
+  `kv_block_begin << 16 | kv_blocks` (the unit's K/V block range inside the
+  segment), its partial slot (`-1` for an unsplit unit, which writes the BF16
+  output directly), `q_half` (`0` for a whole 512-row unit, `1` / `2` for the
+  first / second 256-row half of a tail-round Q-split unit) and two reserved
+  words, followed by `num_clusters` zero records (every kernel role prefetches
+  the record of its next unit; the `attention_dyn` program uses word 6 of
+  padding record `c` as cluster `c`'s ticket mailbox and leaves the terminal
+  ticket there after the launch) and one more zero record whose word 0 is the
+  dynamic scheduler's ticket counter (reset by the kernel at the end of every
+  launch),
 * `combine_table` (int32, `4 * num_combine_units` entries): per K/V-split
   unit the segment index, `head << 16 | cluster_in_segment`, its first partial
   slot and the number of splits, plus the plan's partial workspace
@@ -108,7 +125,9 @@ dropped) and `num_heads`:
 Units are enumerated segment-major (heads slow, clusters fast, so a cluster's
 Q tiles reuse the segment's K/V from L2) and placed into slots
 longest-processing-time first over the per-unit cost `ceil(seg_len / 128) + 2`
-K/V blocks (`assign_unit_slots`): the partial tail round receives the cheapest
+K/V blocks (`assign_unit_slots`; a unit with at most 256 valid Q rows runs a
+single Q stage and costs `ceil(3 / 5 * blocks) + 2`): the partial tail round
+receives the cheapest
 units and, within every full round, the clusters that also own a tail unit
 receive that round's cheapest units; equal costs keep the enumeration order.
 
@@ -129,13 +148,104 @@ It is launched after the attention kernel on the same stream and skipped when
 the plan has no split units. Plans with at least as many units as clusters
 per wave are unchanged (unsplit units are bitwise identical to the previous
 kernel).
+
+**Tail-round Q-split.** When the unit count leaves a partial tail round
+(`total_units mod num_clusters != 0`), the clusters without a tail unit idle
+for a whole unit time. The planner (`bf16_choose_q_splits`, on by default:
+`BF16_Q_SPLIT_PLAN = True`) halves the most expensive unsplit two-stage units
+of the tail round into two 256-row single-stage records, one per idle
+cluster (`q_half` `1` / `2` in record word 5: the kernel runs the half at
+`unit_row0 = cluster_in_segment * 512 + (q_half >> 1) * 256` with its second
+Q stage skipped), simulating the slot assignment for `n = 1..idle` halved
+units and keeping the smallest `n` with the lowest makespan when it beats the
+unhalved plan by at least 0.5 % (`BF16_Q_SPLIT_MIN_GAIN`, 1 % until round 10; `center_5s_p2`, 1064
+units on 74 clusters: the 28 tail units are halved, 2.6 %). Only the slot ->
+rows mapping changes: each row's arithmetic, K/V range and output path are
+those of the whole unit, so the output is bitwise identical to the plain
+plan's; K/V-split ranges and single-stage units are never halved, so the
+combine path is untouched. The halves are separate records of the table
+(`total_tiles` counts them, `num_q_split_units` the halved units);
+`build_bf16_segment_plan(..., q_split=False)` yields the plain enumeration
+(word 5 is `0`).
+
+**Per-plan program dispatch.** The route registers three bitwise-identical
+attention programs (retraces of one Weave body): `attention` (the static
+schedule above), `attention_dyn` (a dynamic whole-unit ticket scheduler: the
+first wave stays static, then the leader CTA's load warp draws the cluster's
+next unit from a per-plan ticket counter one unit ahead of its use; units are
+handed out in the LPT slot order, so only a unit's cluster changes) and, on
+sm_100a only (`BF16_SREAD_ARCHES`), `attention_sread` (the stage-0 cross-stage
+read wait issued before every P store: no per-block guard on the publish
+tail). The planner decides per plan from the plan numbers alone
+(`bf16_dyn_sched`): the dynamic program when the plan has at least two waves
+and every cluster's static share is at least 8192 stage-weighted K/V blocks
+(a two-stage unit counts its blocks twice) and then either at least 64 units
+per cluster or a static cluster imbalance above the cheapest unit (`W_max -
+W_min > min weight`); the ticket chain costs a fixed ~2.5 us at a cluster's
+first unit, so one-wave plans and plans of many small units keep the static
+schedule and bind `attention_sread` (sm_100a) or `attention` (sm_103a).
+`plan.dyn_sched` / `plan.sread_unified`, `runner.attention_stage` and
+`route_metadata["attention_variant"]` disclose the choice. The ticket counter
+is word 0 of the extra zero record at the end of `unit_table`; the kernel
+resets it at the end of every launch, so cached plans need no host reset.
+Word 6 of padding record `c` is cluster `c`'s ticket mailbox (never read by
+the record prefetch) and keeps the terminal ticket after a launch, so the
+padding of a launched plan is launch state, not zeros. Launches of one plan
+are stream-ordered (the plan cache keys the stream); never launch one cached
+plan concurrently from two streams.
 The plan is a host-side function of `(cu_seqlens, num_heads, num_SMs)` and
 reproduces the Cake production plan table for table (`num_heads < 2^15`,
 fewer than `2^16` clusters per segment). K/V TMA loads that run past a segment
-are masked to `-inf` before the softmax; ragged Q tail tiles are staged with
-predicated zero-filling copies;
-output rows are stored straight to global memory predicated on the row lying
-inside its segment.
+are masked to `-inf` before the softmax; every Q tile is one TMA load (rows past
+the segment are finite and never stored). Output tiles that lie wholly inside
+their segment are written by one TMA store from a swizzled shared-memory slab;
+ragged tail tiles are stored row by row predicated on the row lying inside its
+segment.
+
+### FP8 (`fp8`)
+
+`minimax_h3_varlen_fp8_attention` takes E4M3 (`torch.float8_e4m3fn`) `query` /
+`key` / `value` (contiguous or the same strided `[T, H, 128]` views the BF16
+route reads: unit innermost stride, 16-byte-aligned head and token strides and
+base) with one FP32 descale per tensor (a float or a one-element CUDA tensor),
+and writes BF16 `out`. The kernel is the BF16 schedule over E4M3 operands: one
+persistent 2-CTA-cluster tcgen05 program, `kind::f8f6f4` K32 MMAs for QK and
+PV, FP32 softmax whose exponent carries `softmax_scale * q_descale * k_descale`,
+probabilities rounded to E4M3 at unit scale (`cvt.rn.satfinite.e4m3x2.f32`, the
+row sum taken over the unrounded FP32 probabilities) and `v_descale / row_sum`
+applied once in the epilogue.
+
+The host reuses the BF16 planner unchanged (`cached_bf16_segment_plan`: the
+same unit table, LPT slot assignment, K/V splits below four waves and tail-round
+Q split, the same plan cache) and binds one of two static programs
+(`ROUTES["fp8__<arch>"]["programs"]`, generated in-tree under
+`csrc/cake_minimax_h3_varlen_fp8_attention/` with the loader
+`flashinfer/jit/cake_minimax_h3_varlen_fp8_attention.py`): `ATTENTION`, the
+general program, or `ATTENTION_TINY` when every segment has at most
+`FP8_TINY_SEGMENT_TOKENS = 32` tokens (`fp8_attention_stage`). In a tiny plan
+every K/V block is a tail block with at most 32 valid keys, so the tiny build
+runs its softmax exp stream over 32 keys and stores zero E4M3 groups for the
+masked rest -- the output is bitwise the general program's, and the 9-token DiT
+rows gain 5-6 %; on plans with full blocks the same build is slower, so the
+general program keeps every other plan byte for byte. K/V-split units are
+merged by the BF16 route's `combine` program (same FP16 partial rows and
+`(m, l)` format). There is no dynamic-schedule or `sread` program on this
+route. The grid is `2 * num_clusters` as the BF16 route's.
+
+Numerics: against an FP32 reference over the dequantized E4M3 inputs the kernel
+holds `0.1 + 0.1 |expected|` elementwise (the E4M3-P convention: the
+probabilities of a row are rounded to E4M3 before the PV MMA, which on a
+9-key softmax does not average out -- the DiT tiny rows sit at 1.11x the
+SM120 FP8 operator's error and within 1.07x of the best public per-tensor FP8
+route). The error is the one every per-tensor-scaled FP8 attention pays.
+
+`minimax_h3_varlen_fp8_attention_bf16(q, k, v, cu_seqlens, *, softmax_scale=None, out=None)`
+is the BF16 convenience form: it quantizes BF16 `query` / `key` / `value` per
+tensor (`descale = amax(|x|) / 448`, torch ops, no host synchronization) and
+calls the FP8 entry with those descales; `prepare_minimax_h3_varlen_fp8_attention_bf16`
+returns a runner whose `quantize()` and `attention()` halves are separately
+launchable (the quantization is host composition outside the kernel and is
+timed apart from the attention launch).
 
 ### NVFP4 (`nvfp4_fp4pv`, `nvfp4_fp8pv`)
 
@@ -224,19 +334,30 @@ is CUDA-Graph capturable.
   `tcgen05.ld.red` and runs every exp2 on MUFU; SM100 emulates the last
   quarter of the softmax exp2 pairs with a packed polynomial). SM120/SM121
   lack the tcgen05/TMEM path and are not supported; SM90 is not a target.
-* BF16 THD inputs and BF16 output only, head dimension 128, noncausal,
+* BF16 THD inputs (`bf16`, `nvfp4_*`) or E4M3 THD inputs with per-tensor
+  descales (`fp8`) and BF16 output only, head dimension 128, noncausal,
   self-attention (`H_q == H_kv`), no bias/mask/window/LSE/dropout.
+* The BF16 and FP8 routes read strided `query` / `key` / `value` views in place: the
+  host binding encodes the TMA descriptors from the views' strides and
+  passes the Q view's token/head strides to the kernel's ragged-tail copy
+  path. `out` is always contiguous. The NVFP4 routes (whose quantizers
+  read contiguous THD) require contiguous operands.
 * The NVFP4 variants trade accuracy for speed: validated tolerance against an
   FP32 reference is `atol=1.0, rtol=0.1` (BF16: `atol=rtol=1e-2`). The
   `fp8` PV mode is the default because its error is lower at similar speed;
   `fp4` PV is the fastest mode for long segments.
 * One-shot APIs synchronize once to read `cu_seqlens` unless
-  `cu_seqlens_host` is passed (the fast path). The prepared runners never
-  allocate or synchronize; device facts (SM count, compute capability) are
-  read once per device.
+  `cu_seqlens_host` is passed (the fast path). BF16 plans are cached per
+  `(cu_seqlens, device, num_heads, kv_splits, q_split, stream)` (most recent 256;
+  the oldest is evicted); launches of one plan are stream-ordered on their
+  stream (a K/V-split plan's partial workspace is rewritten by every
+  launch) and concurrent streams never share a plan. The prepared runners
+  never allocate or synchronize; device facts (SM count, compute
+  capability) are read once per device.
 * Generated sources live under `csrc/cake_minimax_h3_varlen_attention/` (one
-  kernel source and one host binding per program, shared by both
-  architectures) and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by
+  kernel source and one host binding per program, shared by the
+  architectures that build it -- the BF16 `attention_sread` program is
+  sm_100a only) and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by
   the Cake generated-program export; the JIT builds a program for the
   device's exact architecture on first use. Until the export
   has run, the entry points raise `NotImplementedError` naming the missing
