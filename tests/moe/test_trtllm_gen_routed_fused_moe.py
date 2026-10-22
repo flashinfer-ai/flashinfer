@@ -74,7 +74,7 @@ from .trtllm_gen_fused_moe_utils import (
 _OUTPUT_ROW_SENTINEL = 7.0
 
 
-def _row_strided_output(num_tokens, hidden_size, row_padding, device):
+def _row_strided_output(num_tokens, hidden_size, row_padding, device, column_offset=0):
     """A finalized output that is a row view of a wider buffer; (None, None) without padding."""
     if not row_padding:
         return None, None
@@ -84,7 +84,7 @@ def _row_strided_output(num_tokens, hidden_size, row_padding, device):
         dtype=torch.bfloat16,
         device=device,
     )
-    return buffer, buffer[:, :hidden_size]
+    return buffer, buffer[:, column_offset : column_offset + hidden_size]
 
 
 def _check_row_padding(buffer, hidden_size):
@@ -109,6 +109,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
     gemm1_beta: torch.Tensor | None = None,
     gemm1_clamp_limit: torch.Tensor | None = None,
     output_row_padding: int = 0,
+    output_column_offset: int = 0,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -123,7 +124,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
         torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
     )
     output_buffer, routed_output = _row_strided_output(
-        num_tokens, hidden_size, output_row_padding, device
+        num_tokens, hidden_size, output_row_padding, device, output_column_offset
     )
     if quant_mode == "NvFP4xNvFP4":
         hidden_states, hidden_states_scale = fp4_quantize(
@@ -428,6 +429,23 @@ def test_trtllm_gen_routed_fused_moe_rejects_unaligned_output_rows():
         )
 
 
+def test_trtllm_gen_routed_fused_moe_rejects_misaligned_output_base():
+    """out[:, 1:1025] has 16-byte-aligned rows but starts 2 bytes past a boundary."""
+    with pytest.raises(RuntimeError, match="16-byte boundary"):
+        _run_trtllm_gen_routed_fused_moe_case(
+            512,
+            1024,
+            1024,
+            8,
+            128,
+            RoutingMethodType.Renormalize,
+            "NvFP4xNvFP4",
+            "packed",
+            output_row_padding=64,
+            output_column_offset=1,
+        )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024])
@@ -686,9 +704,22 @@ def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
             (topk_ids, topk_weights),
             **common_kwargs,
         )[0].to(torch.float)
+        # Prims-TS finalizes through the staged finalize op, which must honor the row stride too.
+        strided_buffer, strided_output = _row_strided_output(
+            num_tokens, hidden_size, 64, device
+        )
+        prims_ts_fp4_block_scale_routed_moe(
+            pack_topk_for_routed_moe(topk_ids, topk_weights),
+            output=strided_output,
+            **common_kwargs,
+        )
 
     check_accuracy(logits_output, packed_output, atol=1e-2, rtol=1e-2, percent=0.99)
     check_accuracy(logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99)
+    _check_row_padding(strided_buffer, hidden_size)
+    check_accuracy(
+        packed_output, strided_output.float(), atol=1e-2, rtol=1e-2, percent=0.99
+    )
 
 
 def _run_trtllm_gen_fp8_routed_fused_moe_case(

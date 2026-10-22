@@ -104,14 +104,16 @@ int32_t moe_hidden_size_output(int64_t output_hidden_width, int32_t hidden_size,
 
 // Row stride, in elements, of a caller-supplied finalized `output`, which may be a row view of a
 // wider buffer (out[:, :hidden] of a [num_tokens, width] tensor). Finalize writes token t's row at
-// t * stride, and its vectorized stores need rows aligned to 16 bytes.
+// t * stride, and its vectorized stores need the base and every row aligned to 16 bytes.
 int64_t finalized_output_row_stride(TensorView const& output) {
+  TVM_FFI_ICHECK_EQ(output.stride(1), 1) << "MoE output must be contiguous within each row";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(output.data_ptr()) % 16, 0)
+      << "MoE output must start on a 16-byte boundary";
   if (output.size(0) <= 1) {
     return output.size(1);
   }
   int64_t const row_stride = output.stride(0);
   int64_t const element_bits = output.dtype().bits * output.dtype().lanes;
-  TVM_FFI_ICHECK_EQ(output.stride(1), 1) << "MoE output must be contiguous within each row";
   TVM_FFI_ICHECK_GE(row_stride, output.size(1)) << "MoE output rows must not overlap";
   TVM_FFI_ICHECK_EQ(row_stride * element_bits % 128, 0)
       << "MoE output row stride must be a multiple of 16 bytes, got " << row_stride << " elements";
@@ -2887,6 +2889,7 @@ void run_staged_moe_finalize(btg::Dtype dtype_elt, btg::Dtype dtype_exp_w, bool 
   finalizeData.topK = static_cast<int32_t>(top_k);
   finalizeData.hiddenDim = static_cast<int32_t>(hidden_size);
   finalizeData.hiddenDimPadded = static_cast<int32_t>(hidden_size);
+  finalizeData.outputRowStride = finalized_output_row_stride(output);
   finalizeData.totalNumPaddedTokens =
       static_cast<int32_t*>(const_cast<void*>(total_num_padded_tokens.data_ptr()));
 
