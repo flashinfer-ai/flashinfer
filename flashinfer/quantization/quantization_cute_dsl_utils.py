@@ -1753,12 +1753,16 @@ def _nvfp4_4over6_error_strict_from_packed(
 
 @cute.jit
 def _nvfp4_standard_quant_from_amax(
-    block_max: Float32, global_scale: Float32, disable_fp4_quant_fast_math: bool
+    block_max: Float32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool,
+    global_decode_scale: Float32 | None = None,
 ) -> tuple:
     from cutlass import Uint8
 
     from ..cute_dsl.fp4_common import (
         cvt_f32_to_e4m3,
+        cvt_e4m3_to_f32_via_f16,
         nvfp4_compute_output_scale,
         nvfp4_compute_output_scale_rn,
         nvfp4_scale_from_amax_rn,
@@ -1777,6 +1781,11 @@ def _nvfp4_standard_quant_from_amax(
         output_scale = nvfp4_compute_output_scale_rn(
             scale_fp8_u32, global_scale, block_max
         )
+    elif cutlass.const_expr(global_decode_scale is not None):
+        output_scale = Float32(0.0)
+        if block_max != Float32(0.0):
+            block_scale = cvt_e4m3_to_f32_via_f16(scale_fp8_u32)
+            output_scale = rcp_approx_ftz(block_scale * global_decode_scale)
     else:
         output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
     return scale_fp8, output_scale
@@ -1941,6 +1950,7 @@ def _quantize_nvfp4_from_h2x8_half(
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
     row_amax: Float32 | None = None,
+    global_decode_scale: Float32 | None = None,
 ) -> tuple:
     """Quantize 16 FP16 values to an E4M3 scale and packed E2M1 output."""
     # Compute max absolute value across 16 elements
@@ -1959,7 +1969,7 @@ def _quantize_nvfp4_from_h2x8_half(
         )
 
     scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
-        block_max, global_scale, disable_fp4_quant_fast_math
+        block_max, global_scale, disable_fp4_quant_fast_math, global_decode_scale
     )
     packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
@@ -1980,6 +1990,7 @@ def _quantize_nvfp4_from_h2x8_bfloat(
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
     row_amax: Float32 | None = None,
+    global_decode_scale: Float32 | None = None,
 ) -> tuple:
     """Quantize 16 BF16 values to an E4M3 scale and packed E2M1 output."""
     # Compute max absolute value across 16 elements
@@ -1998,7 +2009,7 @@ def _quantize_nvfp4_from_h2x8_bfloat(
         )
 
     scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
-        block_max, global_scale, disable_fp4_quant_fast_math
+        block_max, global_scale, disable_fp4_quant_fast_math, global_decode_scale
     )
     packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
@@ -2013,6 +2024,7 @@ def process_nvfp4_block_half(
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
     row_amax: Float32 | None = None,
+    global_decode_scale: Float32 | None = None,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for half precision input.
@@ -2055,6 +2067,7 @@ def process_nvfp4_block_half(
         disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
         row_amax,
+        global_decode_scale,
     )
 
 
@@ -2066,6 +2079,7 @@ def process_nvfp4_block_bfloat(
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
     row_amax: Float32 | None = None,
+    global_decode_scale: Float32 | None = None,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for bfloat16 precision input.
@@ -2108,6 +2122,7 @@ def process_nvfp4_block_bfloat(
         disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
         row_amax,
+        global_decode_scale,
     )
 
 
