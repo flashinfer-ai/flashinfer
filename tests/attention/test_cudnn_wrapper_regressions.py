@@ -1379,10 +1379,15 @@ def test_page_table_staging_capacity_and_strided_indices(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("lse_layout", ["NH", "HN"])
 @pytest.mark.parametrize("external_width", [None, 2, 6])
+@pytest.mark.parametrize("rectangular", [False, True])
 def test_paged_capture_replan_changes_indices_and_lengths(
-    dtype, lse_layout, external_width
+    dtype, lse_layout, external_width, rectangular
 ):
     q, k, v, qo, ip, ix, last = _paged_inputs()
+    if rectangular:
+        ip = torch.tensor([0, 3, 6], dtype=torch.int32)
+        ix = torch.tensor([3, 0, 4, 2, 1, 5], dtype=torch.int32)
+        last = torch.tensor([4, 4], dtype=torch.int32)
     q, k, v, ix = q.to(dtype), k.to(dtype), v.to(dtype), ix.cuda()
     out = torch.empty_like(q)
     lse = torch.empty((5, 8) if lse_layout == "NH" else (8, 5), device=q.device)
@@ -1434,6 +1439,10 @@ def test_paged_capture_replan_changes_indices_and_lengths(
         # stays fixed, so the captured table must be updated in place.
         ip = torch.tensor([0, 2, 5], dtype=torch.int32)
         ix = torch.tensor([5, 2, 4, 3, 1], device=q.device, dtype=torch.int32)
+        if rectangular:
+            ip = torch.tensor([0, 3, 6], dtype=torch.int32)
+            ix = torch.tensor([5, 2, 4, 3, 1, 0], device=q.device, dtype=torch.int32)
+            last = torch.tensor([1, 3], dtype=torch.int32)
         table = None
         if external_width is not None:
             # The retained graph keeps its original row stride; a later caller
