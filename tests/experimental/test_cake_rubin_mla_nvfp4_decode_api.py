@@ -289,6 +289,11 @@ def test_public_entries_run_the_rubin_backend() -> None:
         )  # fmt: skip
         assert isinstance(runner, cake_backend.CakeMlaNvfp4PagedDecode)
         assert runner.route_metadata["arch"] == "sm_107a"
+        assert (
+            runner.route_metadata["pdl"]
+            == runner.pdl
+            == cake_backend.pdl_for(runner.plan)
+        )
         runner.launch()
         torch.cuda.synchronize()
         first, first_lse = out.clone(), lse.clone()
