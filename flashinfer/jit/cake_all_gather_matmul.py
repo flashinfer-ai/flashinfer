@@ -27,7 +27,10 @@ plus the architecture's ``SM_PUSH_BANDS_BY_ARCH`` bands; the push launch of a
 call is the architecture's ``PUSH_LAUNCH_ROWS_BY_ARCH`` row of its world size
 and padded rows, else the per-peer payload rule). The main kernels are
 tcgen05 code, so a sequence is compiled for its exact architecture
-(``sm_100a`` or ``sm_103a``).
+(``sm_100a`` or ``sm_103a``); a row whose host sequence is another
+architecture's apart from its namespace lists that architecture's sequence
+source and names its own namespace through ``sequence_flags``, compile
+definitions passed to the sequence source alone.
 A route whose (world size, dtype, weight layout) class is listed in
 ``N128_CLASSES`` for the device's architecture also compiles the 128-wide main
 twin (``main_n128``) into its sequence module; ``main_block_n`` selects that
@@ -426,8 +429,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bb046ade8e857469f0c6_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_e68ff7dc1d24a48a"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "bfloat16",
@@ -472,8 +476,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c27adeb3c14305afd206_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_3d4c6b672fccc2e9"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "bfloat16",
@@ -571,8 +576,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_dba24f495a33b1a179e7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_4dd55b8a57fc515a"],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "bfloat16",
@@ -728,8 +734,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c0a6678e73a6e854bfac_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_65a8f6938e94e471"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "float16",
@@ -771,8 +778,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_61c61aabb5967bd8e9d9_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_cd42fdd423ee95ad"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "float16",
@@ -857,8 +865,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f0cbdce7150397ae0989_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_2bf1da83f19d9287"],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "float16",
@@ -1882,14 +1891,33 @@ def spec(sequence: str, arch: str) -> JitSpec:
         raise ValueError(
             f"sequence {sequence!r} is delivered for {row['arches']}, not {arch!r}"
         )
+    sources = [_source_path(relative) for relative in row["sources"]]
+    extra_cuda_cflags = [*ARCH_FLAGS[arch], *COMPILE_FLAGS]
+    # The source build carries every math flag in ``COMPILE_FLAGS``; the
+    # default ``-use_fast_math`` would otherwise be added or dropped.
+    use_fast_math = "--use_fast_math" in COMPILE_FLAGS
+    # A row that builds its host sequence from another architecture's sequence
+    # source names its own host namespace through ``sequence_flags``, compile
+    # definitions of that one source. A per-source list replaces the shared
+    # list and the default fast-math flag for its source, so it is spelled in
+    # full; the device units are absent from it and keep the shared list.
+    # Keyed as ``gen_jit_spec`` declares it (``Mapping[str | Path, ...]``);
+    # ``Mapping`` is invariant in its key type, so a ``dict[Path, ...]`` would not do.
+    by_source: dict[str | Path, list[str]] | None = None
+    if "sequence_flags" in row:
+        sequence_flags = [
+            *(["-use_fast_math"] if use_fast_math else []),
+            *extra_cuda_cflags,
+            *row["sequence_flags"],
+        ]
+        by_source = {sources[-1]: sequence_flags}
     return gen_jit_spec(
         name=f"{SOURCE_PACKAGE}_sequence_{sequence}",
-        sources=[_source_path(relative) for relative in row["sources"]],
-        extra_cuda_cflags=[*ARCH_FLAGS[arch], *COMPILE_FLAGS],
+        sources=sources,
+        extra_cuda_cflags=extra_cuda_cflags,
         extra_include_paths=[_source_dir().parent],
-        # The source build carries every math flag in ``COMPILE_FLAGS``; the
-        # default ``-use_fast_math`` would otherwise be added or dropped.
-        use_fast_math="--use_fast_math" in COMPILE_FLAGS,
+        use_fast_math=use_fast_math,
+        extra_cuda_cflags_by_source=by_source,
     )
 
 

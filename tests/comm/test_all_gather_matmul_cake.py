@@ -602,7 +602,21 @@ def test_every_route_has_one_host_sequence_per_architecture():
             assert row["sources"][-1].startswith(
                 "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_"
             )
-            assert row["sources"][-1].endswith(f"{name}.cu")
+            # The file is this class's sequence for one architecture of
+            # ``ARCH_FLAGS``; a row that builds from another architecture's
+            # file names its own host namespace through ``sequence_flags``.
+            file_arches = [
+                candidate
+                for candidate in loader.ARCH_FLAGS
+                if row["sources"][-1].endswith(
+                    loader.sequence_name(world_size, dtype_name, b_layout, candidate)
+                    + ".cu"
+                )
+            ]
+            assert len(file_arches) == 1
+            if file_arches != [arch]:
+                (flag,) = row["sequence_flags"]
+                assert flag.startswith("-DCAKE_SEQ_SHIM=cake_host_shim_seq_")
             # Every sequence module compiles both SM push programs: the route and
             # the push launch are decided per call (rows, world size).
             assert loader.peer_push_program() in programs
