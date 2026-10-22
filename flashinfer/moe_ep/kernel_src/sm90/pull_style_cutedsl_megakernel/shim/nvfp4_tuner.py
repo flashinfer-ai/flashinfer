@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Independent NV23 candidate identities and exact-capacity H200 defaults.
+"""Independent NVFP4 candidate identities and exact-capacity H200 defaults.
 
 Candidates are measured by the collective tuner on the current device. The
 portable default profiles contain configuration only, never imported scores.
@@ -25,11 +25,13 @@ from .nvfp4_candidate_data import (
     NVFP4_DEFAULT_TACTICS_BY_TOKENS,
 )
 
+# Stable cache-schema tag: single-promotion uses one FP8 weight operand.
+# The nv23/nv24 suffix counts tactic fields; preserve it for cache compatibility.
 NVFP4_TUNING_VERSION = "nvfp4_single_k64_sf0_nv23_candidates_v1"
 
 
 def normalize_hopper_nvfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the MX20 core plus compact pull, LUT replicas and lane map."""
+    """Validate the MXFP4 core fields plus compact pull, LUT replicas and lane map."""
     core, conversion = split_nvfp4_conversion_tactic(tactic)
     return dict(normalize_mxfp4_optimization_tactic(core), **conversion)
 
@@ -55,7 +57,7 @@ def _sf0_candidates(
     routing_profile: str,
     kperm: int,
 ) -> list[dict[str, Any]]:
-    """Retain the prototype's complete sf0 identities and ordering."""
+    """Return the complete sf0 candidate set in stable order."""
     validate_nvfp4_kperm(kperm)
     seeds = list(
         hopper_mxfp4_candidates(
@@ -98,7 +100,7 @@ def hopper_nvfp4_candidates(
     routing_profile: str = "block_permutation_v1",
     kperm: int = 64,
 ) -> list[dict[str, Any]]:
-    """Return the shape-legal NV23 union in its stable order."""
+    """Return the shape-legal NVFP4 candidate union in stable order."""
     return _sf0_candidates(
         max_tokens,
         hidden=hidden,
@@ -111,7 +113,7 @@ def hopper_nvfp4_candidates(
 
 
 def filter_hopper_nvfp4_candidates(candidates, **context) -> list[dict[str, Any]]:
-    """Normalize NV23 candidates; legality remains with the source policy."""
+    """Normalize NVFP4 candidates; legality follows the source policy."""
     del context
     return [normalize_hopper_nvfp4_tactic(candidate) for candidate in candidates]
 
@@ -186,7 +188,7 @@ def nvfp4_curated_domain_sha256(
     routing_profile: str,
     kperm: int,
 ) -> str:
-    """Bind the exact capacity, NV23 union and portable default policy."""
+    """Bind the exact capacity, candidate set and default policy."""
     candidates = hopper_nvfp4_candidates(
         max_tokens,
         hidden=hidden,

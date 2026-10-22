@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Experimental SM90 NVFP4 x FP8 layouts and single-promotion primitives.
+"""SM90 NVFP4 x FP8 layouts and conversion primitives.
 
 Weights remain packed E2M1, with one raw nonnegative E4M3 scale per K16.
 The caller appends a replicated shared conversion table (8, 16 or 32 KiB, see
@@ -58,7 +58,7 @@ def nvfp4_lut(scale: Int32):
 def nvfp4_word_original(
     src: Int32, scale: Int32, upper: cutlass.Constexpr, residual: cutlass.Constexpr
 ):
-    assert not residual, "NVFP4 single has no residual operand"
+    assert not residual, "NVFP4 promotion has no residual operand"
     lo, hi = nvfp4_lut(scale)
     selector = src & Int32(0x77777777)
     signs = src

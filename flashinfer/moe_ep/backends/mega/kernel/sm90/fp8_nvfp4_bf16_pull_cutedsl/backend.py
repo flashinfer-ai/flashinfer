@@ -1,4 +1,4 @@
-"""SM90 pull-style NVFP4 single x FP8 MegaMoE backend."""
+"""SM90 pull-style NVFP4 x FP8 MegaMoE backend."""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 _NVFP4_WEIGHT_FORMAT_ID = "nvfp4_e2m1"
 _NVFP4_ACTIVATION_FORMAT_ID = "fp8_e4m3_per_token_full_hidden"
+# Versioned packed-layout identity; "single" denotes one FP8 weight operand.
 _NVFP4_LAYOUT_ID = "nvfp4_sm90_m64_k128_gateup8_global_x8_single_v1"
 _FUSED_EXECUTION_MODE = "fused"
 
@@ -54,7 +55,7 @@ def _resolve_gate_up_clamp(
 
 @register_mega_kernel("sm90_fp8_nvfp4_bf16_pull_cutedsl")
 class Sm90PullNvfp4MegaKernelBackend(MegaKernelBackend):
-    """Fused NVFP4 single MegaMoE on the current Hopper framework."""
+    """Fused NVFP4 MegaMoE on Hopper."""
 
     supports_output_view = True
 

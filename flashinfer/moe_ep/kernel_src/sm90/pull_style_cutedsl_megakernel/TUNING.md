@@ -1086,10 +1086,10 @@ complete tactics fixed, then run the six formal processes independently of
 selection. Record source identity and actual clocks with the samples.
 
 
-## NVFP4 single port
+## NVFP4
 
-The initial K16/E4M3 NVFP4 single specialization lives under `shim/`, with a
+The K16/E4M3 NVFP4 specialization lives under `shim/`, with a
 separate backend and compilation identity. Its implementation, numerical
 contract and validation commands are documented in
-[moe_ep_sm90_nvfp4_single.md](../../../../../docs/design_docs/moe_ep_sm90_nvfp4_single.md).
+[moe_ep_sm90_nvfp4.md](../../../../../docs/design_docs/moe_ep_sm90_nvfp4.md).
 Current MXFP4 measurements in this document are not NVFP4 measurements.

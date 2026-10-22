@@ -1,9 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""SM90 NVFP4 single-weight x FP8-activation fused MegaMoE frontend.
+"""SM90 NVFP4-weight x FP8-activation fused MegaMoE frontend.
 
 This module is deliberately separate from :mod:`.hopper_fp8`: ordinary FP8
-and NVFP4 single have different weight, scale, and cache identities even
+and NVFP4 have different weight, scale, and cache identities even
 though they share the same communication/session lifecycle and launch ABI.
 The implementation reuses the established FP8 frontend's launch cache,
 workspace teardown, CUDA-graph guards, tensor conversion, and high-level
@@ -129,7 +129,7 @@ def _validate_complete_nvfp4_tactic(
 
 @dataclasses.dataclass(frozen=True)
 class MegaMoEHopperNvfp4Config(MegaMoEHopperFp8Config):
-    """Compile/launch configuration for fused NVFP4 single x FP8.
+    """Compile/launch configuration for fused NVFP4 x FP8.
 
     The inherited communication and scheduling knobs remain available, but
     the numerical format is fixed: E4M3 activation, packed E2M1/K16 weights,
@@ -142,7 +142,7 @@ class MegaMoEHopperNvfp4Config(MegaMoEHopperFp8Config):
     fp8_scale_mode: Literal["mxfp4_hybrid"] = "mxfp4_hybrid"  # type: ignore[assignment]
     fp8_accum_mode: Literal["1xacc"] = "1xacc"
     swap_ab: bool = True
-    # Preserve the qualified NVFP4 layout when the FP8 base gains new features.
+    # Preserve the default NVFP4 layout when the FP8 base gains new features.
     # The compact pull buffer (one dispatch slot per active warp) is a tactic
     # field: it frees shared memory for a larger LUT or another AB stage.
     compact_pull_buffer: bool = False
@@ -152,8 +152,8 @@ class MegaMoEHopperNvfp4Config(MegaMoEHopperFp8Config):
     # Only these two bounded performance strategies are optional.
     fc2_tail_n8: bool = field(default=False, kw_only=True)
     fc1_ready_mode: Literal["tile", "k256"] = field(default="tile", kw_only=True)
-    # None selects the measured large-token schedule; explicit booleans aid
-    # same-code A/D validation without changing the complete tactic schema.
+    # None selects the default FC1 K256 schedule; explicit booleans enable
+    # or disable conversion/MMA overlap without changing the tactic schema.
     nvfp4_fc1_k256_overlap: Optional[bool] = field(default=None, kw_only=True)
     # K-permuted weight layout; owned by the weights, not by the tactic.
     nvfp4_kperm: int = field(default=64, kw_only=True)
@@ -306,7 +306,7 @@ class MegaMoEHopperNvfp4Config(MegaMoEHopperFp8Config):
 
 @dataclasses.dataclass
 class MegaMoEHopperNvfp4Inputs(MegaMoEHopperFp8Inputs):
-    """Per-rank tensors for one fused NVFP4 single x FP8 launch.
+    """Per-rank tensors for one fused NVFP4 x FP8 launch.
 
     Field names intentionally match :class:`MegaMoEHopperFp8Inputs` because
     the composite kernel keeps the same thirteen-tensor runtime ABI.  Their
@@ -579,7 +579,7 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperFp8Frontend):
         )
 
     def _get_nvfp4_workspace(self, kernel) -> _CompiledMega:
-        """Allocate once collectively; A/D borrow the identical live regions."""
+        """Allocate once collectively; FC1 schedules share the same live regions."""
         key = self._nvfp4_workspace_compile_key()
         signature = self._nvfp4_workspace_layout_signature(kernel)
         owner = self._nvfp4_workspace_owner
@@ -588,7 +588,7 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperFp8Frontend):
                 key != self._nvfp4_workspace_key
                 or signature != self._nvfp4_workspace_signature
             ):
-                raise RuntimeError("NVFP4 A/D workspace layout mismatch")
+                raise RuntimeError("NVFP4 FC1 overlap workspace layout mismatch")
             return _CompiledMega(
                 compiled=None,
                 kernel=kernel,
@@ -1180,8 +1180,8 @@ def resolve_hopper_nvfp4_knobs(
                 )
                 if cached in allowed:
                     return cached
-            # Unknown live context, a neighboring bucket or an unqualified profile
-            # is a cache miss. Never reinterpret its old score as current evidence.
+            # Unknown live context, a neighboring bucket or an unsupported profile
+            # is a cache miss; its timing does not apply to this request.
 
     # Default resolution is independent of timing caches. The H200 table
     # applies only to its thirteen exact capacity buckets and model domain.
@@ -1283,7 +1283,7 @@ def _resolve_hopper_nvfp4_mega_moe_config(
     if manual_selector:
         # Every explicit geometry/execution selector is completely local: do
         # not consult a cache and accidentally inherit the remaining choices
-        # from a tuned session. Omitted fields use the historical manual-mode
+        # from a tuned session. Omitted fields use the manual-mode
         # defaults below.
         resolved: Dict[str, Any] = dict(
             swap_ab=True if swap_ab is None else swap_ab,
@@ -1438,7 +1438,7 @@ def get_symm_buffer_for_hopper_nvfp4_mega_moe(
     nvfp4_fc1_k256_overlap: Optional[bool] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
 ) -> MegaMoEHopperNvfp4SymmBuffer:
-    """Allocate symmetric inputs and a fused NVFP4 single frontend.
+    """Allocate symmetric inputs and a fused NVFP4 frontend.
 
     ``knobs=None`` performs a lookup using a dedicated, versioned NVFP4
     fused identity, then uses the manifest-derived per-token heuristic on a

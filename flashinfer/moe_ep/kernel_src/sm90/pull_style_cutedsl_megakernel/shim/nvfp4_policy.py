@@ -22,7 +22,7 @@ NVFP4_KPERM_CHOICES = (0, 32, 64)
 # over shared-memory banks. 32 replicas use 256-byte rows whose addresses are
 # built with one PRMT per scale byte.
 NVFP4_LUT_REPLICA_CHOICES = (8, 16, 32)
-# Lane -> replica map: lane quad (historical), lane pair, or lane.
+# Lane -> replica map: lane quad (default), lane pair, or lane.
 NVFP4_LUT_MAPS = ("quad", "pair", "lane")
 # NVFP4-only tactic fields and the values a legacy (MXFP4-schema) tactic
 # implies. They depend on the tile: a 32-replica table costs 24 KiB more

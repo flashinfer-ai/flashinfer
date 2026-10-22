@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # ruff: noqa: B007, F841
 # Preserve unused vendor loop indices and allocation views for protocol parity.
-"""NVFP4 single specialization of current-main SM90 mixed-input MegaMoE.
+"""NVFP4 specialization of SM90 mixed-input MegaMoE.
 
 Weight scales, candidate conversion, and LUT allocation specialize the vendor.
 The optional FC1 K256 schedule coalesces fences and overlaps conversion with
 WGMMA; disabling it retains the vendor schedule and communication protocol.
 ``nvfp4_conversion`` selects the K-permuted weight layout and the LUT size and
-banking; its default is the historical layout and 8-replica table.
+banking; its default uses natural K order and an 8-replica table.
 The MXFP4-prefixed private policy names retain the shared activation ABI.
 """
 
@@ -981,7 +981,7 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluFp8Fc12Kernel):
         n_half,
         tidx,
     ):
-        """Run baseline A or the qualified coalesced-fence/overlap schedule D."""
+        """Run the baseline or the FC1 K256 conversion/MMA overlap schedule."""
         if local_warp_idx < self.epilogue_warps_per_warpgroup:
             fp8_fragment_a = tiled_mma.make_fragment_A(
                 tiled_mma.partition_shape_A((self.wgmma_tile_m, 2 * MXFP4_K_TILE))
@@ -1200,8 +1200,8 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluFp8Fc12Kernel):
 
             # Keep the accepted K256 baseline explicit: every outstanding
             # WGMMA group must be retired before the final scale promotion.
-            # This is redundant with the per-half waits above, but retaining
-            # it avoids carrying an unproven scheduling-only experiment.
+            # Keep this synchronization point after both per-half waits to retire
+            # all WGMMA work before scaling the accumulators.
             warpgroup.wait_group(0)
             # FC1's per-token scale is invariant over K. Read it from the
             # final still-owned stage after all WGMMA retire so no scale
@@ -2448,7 +2448,7 @@ class Sm90MegaMoESwapABNvfp4Fp8Kernel(
         if not isinstance(nvfp4_conversion, Nvfp4ConversionLayout):
             raise ValueError("nvfp4_conversion must be an Nvfp4ConversionLayout")
         # The compact pull buffer (one dispatch slot per active warp) is
-        # supported by token_comm; keep the qualified full layout by default.
+        # supported by token_comm; use the full layout by default.
         kwargs.setdefault("compact_pull_buffer", False)
         if kwargs.setdefault("generate_c", False) is not False:
             raise ValueError("MXFP4 currently requires generate_c=False")

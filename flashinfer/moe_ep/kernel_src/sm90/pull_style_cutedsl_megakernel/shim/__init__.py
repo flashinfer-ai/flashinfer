@@ -8,7 +8,7 @@ Mirrors the SM100 package's shim layer
 this layer.  ``comm`` holds dist / symmetric-heap / compile helpers;
 ``hopper_fp8`` and ``hopper_mxfp4`` hold format-specific lazy-compile
 frontends plus their symmetric-buffer + fused-launch wrappers;
-``nvfp4_tuner`` / ``nvfp4_autotune`` own the independent NV23 candidate
+``nvfp4_tuner`` / ``nvfp4_autotune`` own the independent NVFP4 candidate
 surface; ``hopper_bf16`` is the BF16 twin (``tuner_bf16`` / ``autotune_bf16`` are
 its knob surface; the knob cache is shared).
 """

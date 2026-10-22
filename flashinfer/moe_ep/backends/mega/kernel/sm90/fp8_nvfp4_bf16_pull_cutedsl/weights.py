@@ -1,4 +1,4 @@
-"""Canonical NVFP4(K16/E4M3) weights for single-promotion SM90 MegaMoE.
+"""Canonical NVFP4(K16/E4M3) weights for SM90 MegaMoE.
 
 A decoded weight is G*q*s. The kernel consumes RN_E4M3(q*s/8),
 then restores 8G through its per-expert output scale. Packed weights remain
@@ -254,7 +254,7 @@ def preprocess_mega_weights(
     expert_chunk_size: int = 4,
     kperm: int = 64,
 ) -> TransformedMegaWeights:
-    """Raw NVFP4 or BF16 weights to packed single-promotion kernel layouts.
+    """Raw NVFP4 or BF16 weights to packed SM90 kernel layouts.
 
     ``kperm`` selects the K-permuted layout described in the module docstring;
     the kernel and the activation staging must use the same value.
@@ -264,7 +264,7 @@ def preprocess_mega_weights(
     from ..fp8_mxfp4_bf16_pull_cutedsl.weights import _interleave_gate_up_8
 
     if kind != "fp8_e4m3" or fp8_scale_mode != "mxfp4_hybrid":
-        raise ValueError("NVFP4 single requires FP8 E4M3 per-token activation scaling")
+        raise ValueError("NVFP4 requires FP8 E4M3 per-token activation scaling")
     kperm = validate_nvfp4_kperm(kperm)
     if (
         hidden_size <= 0
@@ -274,7 +274,7 @@ def preprocess_mega_weights(
         or expert_chunk_size <= 0
     ):
         raise ValueError(
-            "NVFP4 single requires positive M64/K128-aligned shapes and chunk size"
+            "NVFP4 requires positive M64/K128-aligned shapes and chunk size"
         )
     experts = weights.w13.shape[0]
     if experts < 1 or weights.w2.shape[0] != experts:
@@ -379,7 +379,7 @@ def validate_transformed_mega_weights(
     import torch
 
     if kind != "fp8_e4m3" or fp8_scale_mode != "mxfp4_hybrid":
-        raise ValueError("NVFP4 single requires FP8 E4M3 hybrid activation scaling")
+        raise ValueError("NVFP4 requires FP8 E4M3 hybrid activation scaling")
     if (
         world_size <= 0
         or num_experts <= 0

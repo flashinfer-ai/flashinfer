@@ -1,7 +1,7 @@
 """SM90 FP8-activation / NVFP4-weight pull-style MegaMoE config.
 
 This config describes the fixed numerical contract of the initial Hopper
-NVFP4 single path. Keeping the format invariants here prevents an ordinary FP8
+NVFP4 path. Keeping the format invariants here prevents an ordinary FP8
 tactic from being selected as a silent fallback.
 """
 
@@ -94,7 +94,7 @@ class Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig:
             raise ValueError(f"top_k must be positive, got {self.top_k}")
         if self.kind != "fp8_e4m3":
             raise ValueError(
-                f"SM90 NVFP4 x FP8 single requires kind='fp8_e4m3'; got {self.kind!r}"
+                f"SM90 NVFP4 x FP8 requires kind='fp8_e4m3'; got {self.kind!r}"
             )
         if self.fp8_scale_mode != "mxfp4_hybrid":
             raise ValueError(
