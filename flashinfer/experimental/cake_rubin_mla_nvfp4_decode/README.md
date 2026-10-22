@@ -143,8 +143,19 @@ log2-domain partial LSEs into the workspace.
 The **split-KV merge** (one program, three warps-per-row instantiations
 chosen by the row count: four up to 1024 rows, two up to 2048, one beyond;
 up to 64 splits per row) folds the partials and emits the natural-log LSE,
-skipping the rows the decode wrote directly; it runs behind the decode
-(programmatic dependent launch) when the plan has more than one split.
+skipping the rows the decode wrote directly; it runs behind the decode when
+the plan has more than one split.
+
+Programmatic dependent launch is a per-plan switch (`cake_backend.pdl_for`,
+reported as `runner.route_metadata["pdl"]`): when the plan has a split merge
+and its decode is one wave of clusters (`items <= units`), the decode and the
+merge launch with the programmatic attribute (the `enable_pdl` argument of
+their `run` entries), so each prologue overlaps its predecessor's tail; the
+quantizer triggers its dependents once its rows are stored and the decode once
+a role runs out of items, and each kernel syncs on its dependency before
+reading the predecessor's output. A plan without a merge, or with more items
+than resident clusters (an early-launched merge would take SMs from the
+decode's second wave), launches all three plain.
 
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`), evaluated by `cake_jit.select_record` / `launch_grid`;
@@ -158,7 +169,9 @@ The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
   the argument plan of its `run` entry; the derived leaves `kernel_symbol`,
   `launch`, `arg_plan` and `logical` are rewritten by the export), the stage
   order, the logical vocabulary, the loader glue (`library_name`, `load`,
-  `specs_for_arch`) and `run_module(name, values, grid=, device_index=)`.
+  `specs_for_arch`) and `run_module(name, values, grid=, device_index=,
+  enable_pdl=)` (the switch is taken by the decode and merge records, whose
+  `launch.use_pdl` is `"runtime"`).
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`): one entry per `<library>_sm_107a` (6 programs) with its
