@@ -1685,6 +1685,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
             "bmm2_scale": Scalar("float32", optional=True),
             "mask_type": Scalar("string", optional=True),
             "out_dtype": Scalar("dtype", optional=True),
+            "skip_correction_threshold": Scalar("float32", optional=True),
         },
         outputs={"output": Tensor(output_dims, dtype="bfloat16", param="out")},
         constraints=[
@@ -1739,9 +1740,32 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    skip_correction_threshold: float = 0.0,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
+    # A nonzero plan-time skip-correction threshold selects a different kernel; name it
+    # so its traces never alias the exact-rescale plan. Zero keeps old names.
+    threshold_suffix = ""
+    threshold_tags: list[str] = []
+    threshold_note = ""
+    if skip_correction_threshold > 0.0:
+        # Shortest round-trip text, so distinct compiled values never share a name.
+        threshold_value = float(skip_correction_threshold)
+        threshold_text = (
+            str(int(threshold_value))
+            if threshold_value.is_integer()
+            else repr(threshold_value)
+        )
+        threshold_suffix = "_sct" + threshold_text.replace(".", "p").replace(
+            "-", "m"
+        ).replace("+", "")
+        threshold_tags = [f"skip_correction_threshold:{threshold_text}"]
+        threshold_note = (
+            " The plan sets skip_correction_threshold="
+            f"{threshold_text}, so O rescales are skipped while a K tile raises "
+            "a row maximum by at most that many binades."
+        )
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Exact number of planned MLA requests."),
         "max_seq_len_q": Const(
@@ -1797,11 +1821,13 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         op_type="mla_paged",
         name_prefix=(
             f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
+            f"{threshold_suffix}"
         ),
         description=(
             "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static "
             "bounds, and exact batch size. Every run supplies page tables and "
             "sequence lengths; packed-Q runs also supply Q offsets."
+            f"{threshold_note}"
         ),
         axes=axes,
         inputs={
@@ -1857,6 +1883,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "status:experimental",
             "mla",
             f"mask:{mask_type}",
+            *threshold_tags,
         ],
     )
 
@@ -1890,6 +1917,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    skip_correction_threshold: float = 0.0,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -1901,6 +1929,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         max_kv_len=max_kv_len,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        skip_correction_threshold=skip_correction_threshold,
     )
 
 
@@ -1937,6 +1966,9 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         max_kv_len=int(state.max_kv_len),
         kv_lora_rank=int(state.kv_lora_rank),
         qk_rope_head_dim=int(state.qk_rope_head_dim),
+        skip_correction_threshold=float(
+            getattr(state, "skip_correction_threshold", 0.0)
+        ),
     )
 
 

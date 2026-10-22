@@ -151,6 +151,11 @@
       "shape": null,
       "dtype": "dtype",
       "optional": true
+    },
+    "skip_correction_threshold": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
     }
   },
   "outputs": {

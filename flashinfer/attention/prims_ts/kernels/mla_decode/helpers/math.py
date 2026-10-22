@@ -15,6 +15,9 @@
 """Math, dtype, and atomic helper functions for MLA decode TS examples."""
 
 from functools import partial
+import math
+import struct
+import numbers
 
 import cutlass
 import cutlass.cute as cute
@@ -39,6 +42,59 @@ ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
 def ceil_div(a, b):
     """Return integer ceil(a / b) for positive integer-like values."""
     return (a + b - 1) // b
+
+
+def max_skip_corr_threshold(qkv_dtype: str) -> float:
+    """Return the largest legal skip-correction threshold (binades) per P dtype.
+
+    The public option is ``skip_correction_threshold``. ``"e4m3"`` caps at
+    8: P reaches ``2**T`` and is quantized at the fixed scale
+    1.75 = 448 * 2**-8, so the cap keeps the scaled P within 448.
+    ``"bf16"`` caps at 32 binades (P <= ``2**32``).  Both bounds match the trtllm-gen FMHA
+    ``skipCorrThreshold`` checks for E4M3 and BF16 BMM2.
+    """
+
+    if qkv_dtype == "e4m3":
+        return 8.0
+    if qkv_dtype == "bf16":
+        return 32.0
+    raise ValueError(f"unsupported qkv_dtype={qkv_dtype!r}")
+
+
+def validate_skip_corr_threshold(threshold: object, *, qkv_dtype: str) -> float:
+    """Validate ``skip_correction_threshold`` and return it as ``float``.
+
+    Zero keeps the exact rescale.  A positive value is compiled into the
+    kernel, which compares it with the log2-scaled row-max increase.  Any zero
+    (including ``-0.0``) returns ``0.0`` so it selects the default kernel.
+    """
+
+    if isinstance(threshold, bool) or not isinstance(threshold, numbers.Real):
+        raise TypeError("skip_correction_threshold must be a real number")
+    try:
+        value = float(threshold)
+    except OverflowError:
+        value = math.inf
+    if value == 0.0:
+        # The default needs no per-dtype bound.
+        return 0.0
+    bound = max_skip_corr_threshold(qkv_dtype)
+    if math.isfinite(value) and 0.0 < value <= bound:
+        # The kernel compares in float32: canonicalize so values equal in
+        # float32 share one compiled kernel, and reject positive values that
+        # round to zero (they would change the FP8 P scale without skipping).
+        value = struct.unpack("<f", struct.pack("<f", value))[0]
+        if value == 0.0:
+            raise ValueError(
+                "skip_correction_threshold must be 0 or at least the smallest "
+                "positive float32"
+            )
+    if not math.isfinite(value) or not 0.0 <= value <= bound:
+        raise ValueError(
+            "skip_correction_threshold must be a finite number in "
+            f"[0, {bound:g}] for {qkv_dtype} P"
+        )
+    return value
 
 
 def qkv_dtype(cfg):

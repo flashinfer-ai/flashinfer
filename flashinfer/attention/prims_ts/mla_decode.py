@@ -134,6 +134,7 @@ class _MLADecodePlanState:
     compiled: Callable[..., object]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
+    skip_correction_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -690,6 +691,22 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _validate_mla_skip_correction_threshold(
+    threshold: object, *, q_dtype: torch.dtype
+) -> float:
+    """Validate the skip-correction threshold against its per-dtype bound."""
+
+    from .kernels.mla_decode.helpers.math import validate_skip_corr_threshold
+
+    if threshold == 0.0 and type(threshold) in (int, float):
+        # Zero selects the default kernel for every dtype, including ones
+        # without a threshold bound.
+        return 0.0
+    return validate_skip_corr_threshold(
+        threshold, qkv_dtype=_kernel_dtype_name(_dtype_key(q_dtype))
+    )
+
+
 def _kernel_dtype_name(dtype_key: str) -> str:
     names = {
         "bfloat16": "bf16",
@@ -739,6 +756,7 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
+    skip_corr_threshold: float = 0.0,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -869,6 +887,7 @@ def _resolve_mla_decode_launch_spec(
                 explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
+                skip_corr_threshold=skip_corr_threshold,
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
@@ -951,6 +970,7 @@ def _resolve_mla_decode_launch_spec(
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
+                skip_corr_threshold=skip_corr_threshold,
             )
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
@@ -1307,6 +1327,9 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         _dtype_key(out_dtype),
         mask_type,
         max_seq_len_q,
+        # The skip-correction threshold does not change the workspace; pass the default
+        # positionally so a default plan() hits the same cached spec.
+        0.0,
     )
     return _make_mla_workspace_layout(
         spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
@@ -1490,6 +1513,7 @@ class BatchMLADecodePagedTSWrapper:
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
+        skip_correction_threshold: float = 0.0,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1535,6 +1559,28 @@ class BatchMLADecodePagedTSWrapper:
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
+        skip_correction_threshold : float
+            Opt-in skip of the online-softmax O rescale (correction), in
+            binades: 0 to 8 for FP8 QKV, 0 to 32 for BF16 QKV. The name,
+            unit, default and bounds follow the trtllm-gen FMHA
+            ``skipCorrThreshold``. ``0.0`` (default) rescales on every new row
+            maximum. A positive value keeps a row's softmax anchor while a K
+            tile raises the row maximum by at most this many binades, which
+            skips that tile's rescale of the accumulated output.
+            Probabilities then reach ``2**threshold``, so for any positive
+            threshold FP8 P is quantized at the fixed scale 1.75
+            (``448 * 2**-8``, as in trtllm-gen) instead of 448. E4M3 P then
+            loses precision from about 4.7 nats below the anchor (about 10
+            nats at 448) and flushes to zero below about 7.5 nats (about 13);
+            the FP32 row sum keeps the exact values, so the tail's weight is
+            biased low. The loss covers the KV range
+            that shares the anchor's split, which is the whole row when
+            split-KV is not used (typically large batches). Rows whose largest
+            scores come first, such as attention sinks, with a long
+            low-probability tail are the most exposed, so check model accuracy
+            when enabling it for FP8. BF16 P is not scaled. The value is
+            compiled into the kernel, so each distinct value builds its own
+            kernel. It is range-checked even when ``validate`` is False.
         """
 
         if not isinstance(validate, bool):
@@ -1556,6 +1602,11 @@ class BatchMLADecodePagedTSWrapper:
                 max_seq_len_q=max_seq_len_q,
             )
             _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
+        # Range-check the threshold even when validate is False: it selects a
+        # compiled kernel, and a value past the per-dtype bound saturates FP8 P.
+        skip_correction_threshold = _validate_mla_skip_correction_threshold(
+            skip_correction_threshold, q_dtype=q_data_type
+        )
 
         device, device_index = _resolve_cuda_device(device)
         if validate:
@@ -1577,7 +1628,7 @@ class BatchMLADecodePagedTSWrapper:
             mask_type,
             max_seq_len_q,
         )
-        spec = _resolve_mla_decode_launch_spec(*spec_key)
+        spec = _resolve_mla_decode_launch_spec(*spec_key, skip_correction_threshold)
         compile_spec = _make_mla_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -1630,6 +1681,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=int(dict(policy)["split_kv"]),
+            skip_correction_threshold=skip_correction_threshold,
         )
 
     @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -1756,6 +1808,7 @@ def batch_mla_decode_with_paged_kv_cache(
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
     validate: bool = True,
+    skip_correction_threshold: float = 0.0,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1793,13 +1846,17 @@ def batch_mla_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype
         Output dtype.
-
     workspace_buffer : torch.Tensor, optional
         Caller-owned byte scratch, exclusive to one in-flight launch/graph.
     validate : bool
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
+    skip_correction_threshold : float
+        Opt-in skip of the online-softmax O rescale in binades; see
+        :meth:`BatchMLADecodePagedTSWrapper.plan`. ``0.0`` (default) keeps the
+        exact rescale. A positive value quantizes FP8 P at 1.75 instead of
+        448, which costs E4M3 precision for probabilities far below the anchor.
 
     Returns
     -------
@@ -1923,6 +1980,7 @@ def batch_mla_decode_with_paged_kv_cache(
         mask_type=mask_type,
         workspace_buffer=workspace_buffer,
         validate=validate,
+        skip_correction_threshold=skip_correction_threshold,
     )
     return wrapper.run(
         query,
