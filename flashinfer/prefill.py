@@ -9378,6 +9378,153 @@ def minimax_h3_varlen_attention(
     )
 
 
+@flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen FP8 attention")
+def minimax_h3_varlen_fp8_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    q_descale: Union[float, torch.Tensor],
+    k_descale: Union[float, torch.Tensor],
+    v_descale: Union[float, torch.Tensor],
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    r"""Noncausal packed-varlen all-FP8 attention over THD tensors (SM100/SM103).
+
+    The experimental Cake backend runs one persistent 2-CTA-cluster tcgen05
+    kernel (``kind::f8f6f4`` QK and PV over E4M3 operands, FP32 softmax and
+    accumulation) over packed E4M3 ``[T, H, 128]`` tensors with one FP32
+    descale per tensor: for every segment ``[a, b)`` of ``cu_seqlens`` and
+    every head ``h``,
+    ``out[a:b, h] = softmax((query[a:b, h] * q_descale) @ (key[a:b, h] * k_descale)^T * softmax_scale) @ (value[a:b, h] * v_descale)``
+    with the probabilities rounded to E4M3 at unit scale before the PV MMA.
+    ``query`` / ``key`` / ``value`` may be strided views (unit innermost
+    stride, 16-byte-aligned head and token strides and base); ``out`` is a
+    contiguous BF16 tensor.  Plans whose every segment has at most 32 tokens
+    run the kernel's tiny-plan build (same output bitwise).
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        ``[T, H, 128]`` ``torch.float8_e4m3fn`` tensors or strided views.
+    cu_seqlens : torch.Tensor
+        ``[B + 1]`` int32 CUDA segment offsets, ``cu_seqlens[0] == 0``,
+        non-decreasing, ``cu_seqlens[B] == T``.
+    q_descale, k_descale, v_descale : float or torch.Tensor
+        The per-tensor descales (the values that return each E4M3 tensor to
+        its real scale), as floats or one-element float32 CUDA tensors.
+    softmax_scale : float, optional
+        Defaults to ``1 / sqrt(128)``.
+    out : torch.Tensor, optional
+        Caller-owned contiguous ``[T, H, 128]`` BF16 output.
+    cu_seqlens_host : Sequence[int], optional
+        The segment offsets as host ints (avoids a device-to-host copy).
+    backend : str
+        ``"cake"`` (the only backend).
+
+    Returns
+    -------
+    torch.Tensor
+        ``out``.
+
+    Note
+    ----
+    Preparation and launch are separable through
+    ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_fp8_attention``,
+    whose runner launches with no allocation or synchronization.  See
+    ``flashinfer/experimental/minimax_h3_varlen_attention/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError(
+            "MiniMax-H3 varlen FP8 attention currently supports backend='cake'"
+        )
+    from .experimental.minimax_h3_varlen_attention.cake_backend import (
+        minimax_h3_varlen_fp8_attention as run,
+    )
+
+    return run(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen FP8 attention")
+def minimax_h3_varlen_fp8_attention_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    r"""BF16 convenience form of :func:`minimax_h3_varlen_fp8_attention` (SM100/SM103).
+
+    Quantizes BF16 ``query`` / ``key`` / ``value`` to E4M3 with one per-tensor
+    scale each (``descale = amax(|x|) / 448``, torch ops on the current stream,
+    no host synchronization) and runs the all-FP8 kernel on the results with
+    those descales.  The output equals ``minimax_h3_varlen_fp8_attention`` on
+    the same E4M3 tensors and descales bitwise.  The quantization is host
+    composition outside the kernel; for repeated problems prepare once with
+    ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_fp8_attention_bf16``,
+    whose runner re-quantizes and launches with no allocation and exposes
+    ``quantize()`` and ``attention()`` separately.
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        ``[T, H, 128]`` BF16 tensors or the strided views the BF16 route accepts.
+    cu_seqlens : torch.Tensor
+        ``[B + 1]`` int32 CUDA segment offsets.
+    softmax_scale : float, optional
+        Defaults to ``1 / sqrt(128)``.
+    out : torch.Tensor, optional
+        Caller-owned contiguous ``[T, H, 128]`` BF16 output.
+    cu_seqlens_host : Sequence[int], optional
+        The segment offsets as host ints (avoids a device-to-host copy).
+    backend : str
+        ``"cake"`` (the only backend).
+
+    Returns
+    -------
+    torch.Tensor
+        ``out``.
+    """
+    if backend != "cake":
+        raise ValueError(
+            "MiniMax-H3 varlen FP8 attention currently supports backend='cake'"
+        )
+    from .experimental.minimax_h3_varlen_attention.cake_backend import (
+        minimax_h3_varlen_fp8_attention_bf16 as run,
+    )
+
+    return run(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend="cake",
+    )
+
+
 @flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen NVFP4 attention")
 def minimax_h3_varlen_nvfp4_attention(
     query: torch.Tensor,
