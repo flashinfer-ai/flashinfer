@@ -221,10 +221,13 @@ class MoEEpMegaLayer(nn.Module):
         inherits the layer's configuration. A dictionary selects fixed knobs
         for this handle and is copied before allocation. The layer must use
         fixed knobs, and its default workspace must not already be allocated
-        when overriding that capacity.
+        when overriding its profile.
 
         ``live_tokens`` selects an offline workload profile without shrinking
         capacity. Explicit knobs take precedence over that profile's cache.
+        ``live_tokens=None`` selects full capacity, even when the layer has a
+        different default tuning profile. Handles retain their compiled tactics
+        and stable addresses.
         Call collectively with matching arguments on all EP ranks before
         capture. Only one live handle per (capacity, live_tokens) is allowed.
         """
@@ -254,9 +257,9 @@ class MoEEpMegaLayer(nn.Module):
                 "a MegaMoE workspace profile for max_tokens_per_rank="
                 f"{max_tokens_per_rank}, live_tokens={live_tokens} already exists on this layer"
             )
-        is_default_capacity = (
-            live_tokens is None
-            and max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+        is_default_profile = (
+            max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+            and live_tokens == self._fleet_params.tuning_live_tokens
         )
         kernel = self._kernel
         if knobs is not None:
@@ -268,7 +271,7 @@ class MoEEpMegaLayer(nn.Module):
                 or not hasattr(self._megakernel_config, "knobs")
             ):
                 raise MoEEpConfigError("this MegaMoE backend does not support knobs")
-            if is_default_capacity and self._workspace is not None:
+            if is_default_profile and self._workspace is not None:
                 raise MoEEpConfigError(
                     "cannot override knobs for an already allocated default workspace"
                 )
@@ -282,7 +285,7 @@ class MoEEpMegaLayer(nn.Module):
             tuning_live_tokens=live_tokens,
         )
         kernel.validate_init(self._bootstrap, fleet_params)
-        if is_default_capacity and self._workspace is not None:
+        if is_default_profile and self._workspace is not None:
             # Transfer the already-lazy-allocated default profile into the
             # explicit handle without acquiring a second pooled reference.
             backend_workspace = self._workspace
@@ -296,7 +299,7 @@ class MoEEpMegaLayer(nn.Module):
             self, fleet_params, backend_workspace, kernel=kernel
         )
         self._workspaces[profile_key] = handle
-        if is_default_capacity:
+        if is_default_profile:
             self._default_workspace_handle = handle
         return handle
 
