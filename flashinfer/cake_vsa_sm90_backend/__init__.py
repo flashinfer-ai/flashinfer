@@ -351,11 +351,14 @@ class CakeVsaSm90Plan:
             self.tile_stride = plan["tile_stride"]
             self.queue = plan["queue"]
             self.compact = plan["compact"]
+            self.tagged = plan["tagged"]
             self.num_rows = plan["num_rows"]
             self.num_heads = plan["H"]
             self.qo_len = plan["MB"] * BLOCK
             self.kv_len = plan["NB"] * BLOCK
-            self.stage = persistent_stage(bool(self.queue), bool(self.compact))
+            self.stage = persistent_stage(
+                bool(self.queue), bool(self.compact), bool(self.tagged)
+            )
             rule = _loader.workspace_rule(self.stage)
             assert rule is not None and rule["kind"] == "persistent"
             with torch.cuda.device(self.device):
