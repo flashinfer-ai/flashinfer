@@ -169,8 +169,10 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         out, saved = cake_kcp.chunk_kda_kcp_fwd(
             q, k, v, g, beta, ctx, workspace=ws, **opts
         )
+        # ``boundary_mode`` is a forward keyword: the backward replays the forward whenever ``saved`` is None
+        bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
         dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(
-            q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **opts
+            q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **bwd_opts
         )
         return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
 
