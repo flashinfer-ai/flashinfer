@@ -217,6 +217,11 @@ class _MetadataPushRouter(KernelComponent):
             value = getattr(self, field_name)
             if value <= 0:
                 raise ValueError(f"{field_name} must be positive, got {value}.")
+        if self.world_size > TokenSrcMetadata.MAX_RANKS or self.topk > TokenSrcMetadata.MAX_TOPK:
+            raise ValueError(
+                f"Routing metadata supports at most {TokenSrcMetadata.MAX_RANKS} ranks "
+                f"and {TokenSrcMetadata.MAX_TOPK} routes per token."
+            )
         if self.max_tokens_per_rank > TokenSrcMetadata.MAX_TOKENS:
             raise ValueError(
                 f"TokenSrcMetadata keeps the token index in {TokenSrcMetadata.TOKEN_BITS} bits; "

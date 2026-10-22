@@ -185,6 +185,11 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
                 f"compute_cluster_count must be a Python int in (0, {self.launch_cluster_cnt_merge_as_preferred}], got "
                 f"{self.compute_cluster_count}."
             )
+        if (
+            self.work_id_mode == "grid_stride"
+            and self.compute_cluster_count != self.launch_cluster_cnt_merge_as_preferred
+        ):
+            raise ValueError("grid_stride requires one compute cluster per launched cluster.")
         if self.work_id_mode not in ("grid_stride", "atomic_counter", "cluster_launch_control"):
             raise ValueError(
                 "work_id_mode must be 'grid_stride', 'atomic_counter', or "
