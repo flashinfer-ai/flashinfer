@@ -11,15 +11,10 @@ from typing import List, Literal, Optional, Tuple
 import numpy as np
 import torch
 
-# Ensure absolute package imports work when this file is run as a script.
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PARENT_DIR = os.path.dirname(_PKG_DIR)
-if _PARENT_DIR not in sys.path:
-    sys.path.insert(0, _PARENT_DIR)
 
 # Re-export the shared descriptors so legacy importers (e.g. mega_runner.py)
 # continue to find them at ``moe_nvfp4_swapab.runner_fc12``.
-from moe_nvfp4_swapab.runner_fc12_common import (
+from .runner_fc12_common import (
     ProblemDesc,
     ImplDesc,
     MiscDesc,
@@ -27,14 +22,14 @@ from moe_nvfp4_swapab.runner_fc12_common import (
     add_common_fc12_arguments,
     parse_tuple,
 )
-from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue
-from moe_nvfp4_swapab.runner_common import (
+from .epilogue_refactor import SwapABSwigluFp4Epilogue
+from .runner_common import (
     Nvfp4DataDtype,
     dequant_block_scale_to_fp32,
     from_blocked,
     nvfp4_quantize_per_block_16,
 )
-from common.host_utils import (
+from ..common.host_utils import (
     kind_data_dtype,
     kind_sf_vec_size,
 )
@@ -221,7 +216,7 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
 
     def _instantiate_kernel(self, common_kwargs: dict):
         import cutlass
-        from moe_nvfp4_swapab.kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
+        from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
 
         return Sm100SwapABSwigluFp4Fc12Kernel(
             **common_kwargs,

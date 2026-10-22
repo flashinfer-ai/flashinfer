@@ -47,10 +47,10 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
 
-from common.host_utils import get_cutedsl_target_arch
+from ..common.host_utils import get_cutedsl_target_arch
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
 from .topk_reduce import TopkReduce
-from src.token_comm import (
+from ..src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenInPullTokenBackPush,
@@ -1045,7 +1045,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         )
         from cutlass.cute.typing import sym_int64
 
-        from src.sym_buffer import SymBufferHost
+        from ..src.sym_buffer import SymBufferHost
 
         def round_up(value: int, multiple: int) -> int:
             return ((value + multiple - 1) // multiple) * multiple

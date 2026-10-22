@@ -38,7 +38,7 @@ import cutlass.cute as cute
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,

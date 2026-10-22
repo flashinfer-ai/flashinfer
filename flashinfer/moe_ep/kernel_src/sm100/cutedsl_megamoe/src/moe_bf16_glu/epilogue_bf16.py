@@ -8,9 +8,9 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 
-from common.megamoe_constants import Log2E
+from ..common.megamoe_constants import Log2E
 from cutlass.cute.typing import Float32
-from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
+from ..moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
 
 
 @cute.jit

@@ -16,7 +16,7 @@ allocation and teardown; only the kind-specific stages are overridden:
 
 Launcher::
 
-    torchrun --nproc_per_node=4 -m moe_bf16_glu.mega_runner \\
+    torchrun --nproc_per_node=4 -m flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.moe_bf16_glu.mega_runner \\
         --kind bf16 --num_total_experts 32 --route_distribution balanced
 """
 
@@ -28,18 +28,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-## TODO: some common modules currently live in moe_nvfp4_swapab; these path
-## dependencies can be removed once the modules move to a shared package.
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PARENT_DIR = os.path.dirname(_PKG_DIR)
-_NVFP4_DIR = os.path.join(_PARENT_DIR, "moe_nvfp4_swapab")
-for _p in (_PARENT_DIR, _NVFP4_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from common.host_utils import compare_and_report_mismatches
-from moe_nvfp4_swapab.runner_common import round_up
-from moe_nvfp4_swapab.mega_runner import (
+from ..common.host_utils import compare_and_report_mismatches
+from ..moe_nvfp4_swapab.runner_common import round_up
+from ..moe_nvfp4_swapab.mega_runner import (
     TokenCommProblemDesc,
     MiscDesc,
     MegaMoETester,
@@ -53,8 +44,8 @@ from moe_nvfp4_swapab.mega_runner import (
     _parse_output_dtype,
     _NO_DIST,
 )
-from moe_bf16_glu.runner_common import TrainingImplDesc
-from moe_bf16_glu.mega_reference_bf16 import compute_megamoe_reference
+from .runner_common import TrainingImplDesc
+from .mega_reference_bf16 import compute_megamoe_reference
 
 
 # =============================================================================
@@ -478,9 +469,9 @@ class MegaMoEBf16Tester(MegaMoETester):
         import cutlass.torch as cutlass_torch
         import cutlass.utils as utils
 
-        from moe_nvfp4_swapab.epilogue import EpilogueTokenTile
-        from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
-        from src.sym_buffer import SymBufferHost
+        from ..moe_nvfp4_swapab.epilogue import EpilogueTokenTile
+        from .megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
+        from ..src.sym_buffer import SymBufferHost
 
         # -- 1. Kernel instance (BF16 requires static_expert_shape != None) --
         static_expert_shape = (
@@ -761,7 +752,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rank = 0
         world_size = 1
     else:
-        from src.bootstrap import (
+        from ..src.bootstrap import (
             init_dist_and_nvshmem,
             finalize_dist_and_nvshmem,
         )

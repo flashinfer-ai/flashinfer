@@ -19,9 +19,9 @@ from typing import Literal, Optional, Tuple, Type, Union, Any
 import torch
 import cutlass
 
-from common.megamoe_constants import Nvfp4BlockSize, Nvfp4E2M1RcpLimit
-from common.host_utils import get_cutedsl_target_arch, mxfp8_quantize_per_block_32
-from moe_nvfp4_swapab.runner_common import (
+from ..common.megamoe_constants import Nvfp4BlockSize, Nvfp4E2M1RcpLimit
+from ..common.host_utils import get_cutedsl_target_arch, mxfp8_quantize_per_block_32
+from .runner_common import (
     nvfp4_quantize_per_block_16,
     swiglu_fold_interleave,
     to_blocked,
@@ -30,7 +30,7 @@ from moe_nvfp4_swapab.runner_common import (
     _pack_f32_to_fp4,
     _rcp_approx_ftz_f32_cuda,
 )
-from src.token_comm import CombineFormat
+from ..src.token_comm import CombineFormat
 
 
 @dataclass(frozen=True)

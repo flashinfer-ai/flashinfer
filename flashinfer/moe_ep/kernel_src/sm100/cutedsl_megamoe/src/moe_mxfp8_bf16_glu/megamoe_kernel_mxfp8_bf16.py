@@ -35,10 +35,10 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
 
-from moe_mxfp8_bf16_glu.kernel_mxfp8_bf16_glu_fc12 import (
+from .kernel_mxfp8_bf16_glu_fc12 import (
     Sm100SwapABMxfp8Bf16Fc12Kernel,
 )
-from moe_nvfp4_swapab.megamoe_kernel import (
+from ..moe_nvfp4_swapab.megamoe_kernel import (
     _GridSyncSlotCount,
     _NvlinkSlotCount,
     _RegionSpec,
@@ -46,7 +46,7 @@ from moe_nvfp4_swapab.megamoe_kernel import (
     _layout_regions,
     _round_up,
 )
-from src.token_comm import (
+from ..src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenInPullTokenBackPush,

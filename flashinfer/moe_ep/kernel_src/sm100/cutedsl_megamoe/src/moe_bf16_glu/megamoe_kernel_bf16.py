@@ -48,10 +48,10 @@ from cutlass.cutlass_dsl import Int64, Int32
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 
-from moe_bf16_glu.kernel_bf16_glu_fc12 import Sm100SwigluBf16Fc12Kernel
-from src.token_comm import (
+from .kernel_bf16_glu_fc12 import Sm100SwigluBf16Fc12Kernel
+from ..src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenInPullTokenBackPush,
@@ -59,7 +59,7 @@ from src.token_comm import (
 
 # Region-layout helpers + module constants shared across the mega kernels'
 # workspace plumbing.
-from moe_nvfp4_swapab.megamoe_kernel import (
+from ..moe_nvfp4_swapab.megamoe_kernel import (
     _RegionSpec,
     _round_up,
     _layout_regions,

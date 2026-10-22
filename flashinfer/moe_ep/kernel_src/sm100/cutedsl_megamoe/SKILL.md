@@ -19,7 +19,6 @@ kernel_src/sm100/cutedsl_megamoe/
 │   └── moe_nvfp4_swapab/   ← NVFP4 kernel implementation
 ├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
 ├── shim/                   ← thin adapters over src/ (our code) — ALL adaptation lives here
-│   ├── _paths.py           ← adds sibling src/ to sys.path (bootstrap_paths); shim glue
 │   ├── comm.py             ← dist bootstrap, sym heap, compile state, resolve_gate_up_clamp
 │   ├── nvfp4.py            ← NVFP4 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── mxfp8.py            ← MXFP8 frontend + symm-buffer/launch wrappers (self-contained)
@@ -41,13 +40,13 @@ kernel_src/sm100/cutedsl_megamoe/
 
 Core principle: **keep `src/` equal to the kernel-team drop except for the
 explicit pending-upstream patches in `VENDOR.md`.** Reapply and requalify those
-patches after a drop until upstream absorbs them. Every adaptation (path bootstrap, symbol re-exports, API
+patches after a drop until upstream absorbs them. Every adaptation (symbol re-exports, API
 shims) lives in `shim/`. A new drop replaces the source baseline; reapply the
 pending patches and update `shim/` to whatever the new `src/` exposes.
 
 Layering: `moe_ep` backends import from the package (`__init__.py`) only →
 `__init__.py` re-exports from `shim/` → `shim/` imports the raw kernel packages
-from `src/` via sys.path (`shim/_paths.bootstrap_paths`).
+from `src/` via package-relative imports.
 
 Layer isolation (enforce on every drop — grep before/after):
 - `shim/` is the **only** layer that imports `src/` packages (`common`,
@@ -82,9 +81,10 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    absorbed. Requalify them with the tests under "Sparse combine and tail-reset
    contracts" below, in addition to the tests in step 5.
 
-2. **Path bootstrap needs nothing** — it lives in `shim/_paths.py` and points at
-   the sibling `src/` dir, so a verbatim drop just works. (Ignore any bootstrap
-   the drop ships inside its packages.)
+2. **Preserve package-relative imports** — reapply the namespace fix recorded in
+   `VENDOR.md` until the kernel-team source absorbs it. Keep `src/__init__.py`,
+   remove runner path insertions, and run `tests/moe_ep/test_sm100_cutedsl_imports.py`.
+   Standalone runners use `python -m` with their full FlashInfer package name.
 
 3. **Audit the kernel construct + launch signatures FIRST** — the highest-churn
    surface, and one a symbol-existence grep will NOT catch (the args change, not
@@ -100,30 +100,30 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 4. **Audit shim compatibility** — `shim/nvfp4.py`, `shim/mxfp8.py`, and
    `shim/bf16.py` call into `common`, `moe_nvfp4_swapab`, `moe_mxfp8_glu`,
-   `moe_bf16_glu`, and `src` via sys.path imports. Check these entrypoints
+   `moe_bf16_glu`, and `src` via package-relative imports. Check these entrypoints
    after updating src/:
 
    | Shim import | Kernel src file |
    |---|---|
-   | `from common.megamoe_constants import Nvfp4BlockSize, Mxfp8BlockSize` | `src/common/megamoe_constants.py` |
-   | `from moe_nvfp4_swapab.runner_common import _DataDtype, ceil_div, …` | `src/moe_nvfp4_swapab/runner_common.py` |
-   | `from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel` | `src/moe_nvfp4_swapab/megamoe_kernel.py` |
-   | `from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue` | `src/moe_nvfp4_swapab/epilogue_refactor.py` |
-   | `from moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel` | `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py` |
-   | `from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel` (lazy, `shim/bf16.py`) | `src/moe_bf16_glu/megamoe_kernel_bf16.py` |
-   | `from src.sym_buffer import SymBufferHost` | `src/src/sym_buffer.py` |
-   | `from src.bootstrap import finalize_dist_and_nvshmem` | `src/src/bootstrap.py` |
+   | `from ..src.common.megamoe_constants import Nvfp4BlockSize, Mxfp8BlockSize` | `src/common/megamoe_constants.py` |
+   | `from ..src.moe_nvfp4_swapab.runner_common import _DataDtype, ceil_div, …` | `src/moe_nvfp4_swapab/runner_common.py` |
+   | `from ..src.moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel` | `src/moe_nvfp4_swapab/megamoe_kernel.py` |
+   | `from ..src.moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue` | `src/moe_nvfp4_swapab/epilogue_refactor.py` |
+   | `from ..src.moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel` | `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py` |
+   | `from ..src.moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel` (lazy, `shim/bf16.py`) | `src/moe_bf16_glu/megamoe_kernel_bf16.py` |
+   | `from ..src.src.sym_buffer import SymBufferHost` | `src/src/sym_buffer.py` |
+   | `from ..src.src.bootstrap import finalize_dist_and_nvshmem` | `src/src/bootstrap.py` |
 
    `shim/kernel_helpers.py` (the backend/test helper boundary) additionally
    depends on these src symbols — audit them too:
 
    | `kernel_helpers.py` import | Kernel src file |
    |---|---|
-   | `from common.megamoe_constants import Nvfp4BlockSize, Mxfp8BlockSize` | `src/common/megamoe_constants.py` |
-   | `from common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32` | `src/common/host_utils.py` |
-   | `from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, ceil_div, round_up, to_blocked, nvfp4_quantize_per_block_16, _stack_byte_reinterpretable_tensors` | `src/moe_nvfp4_swapab/runner_common.py` |
-   | `from moe_mxfp8_glu.mega_runner import _make_fp8_tensor, _make_e8m0_scale_tensor` (lazy) | `src/moe_mxfp8_glu/mega_runner.py` |
-   | `from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8` (lazy) | `src/moe_mxfp8_glu/mega_reference_mxfp8.py` |
+   | `from ..src.common.megamoe_constants import Nvfp4BlockSize, Mxfp8BlockSize` | `src/common/megamoe_constants.py` |
+   | `from ..src.common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32` | `src/common/host_utils.py` |
+   | `from ..src.moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, ceil_div, round_up, to_blocked, nvfp4_quantize_per_block_16, _stack_byte_reinterpretable_tensors` | `src/moe_nvfp4_swapab/runner_common.py` |
+   | `moe_mxfp8_glu.mega_runner` (lazy, relative to `src/`) | `src/moe_mxfp8_glu/mega_runner.py` |
+   | `moe_mxfp8_glu.mega_reference_mxfp8` (lazy, relative to `src/`) | `src/moe_mxfp8_glu/mega_reference_mxfp8.py` |
 
 5. **Run the cutedsl tests** to confirm everything still works:
    ```bash
@@ -142,10 +142,8 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 - `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/`, `mxfp8_mxfp8_bf16_cutedsl/`,
   and `bf16_bf16_bf16_cutedsl/` — those are the FI backend wrappers; they
   import from the package (`__init__.py`) but are not part of this drop.
-- `core/runtime/bootstrap.py` — initializes NVSHMEM without touching this
-  package (each tree's shim bootstraps its own `src/` paths at import; core
-  must never import a specific kernel tree, or it would trip the sm90/sm100
-  process-exclusivity guard for the other tree's sessions).
+- `core/runtime/bootstrap.py` — initializes NVSHMEM independently of any
+  kernel tree; it must not import a specific drop.
 
 ## Sparse combine and tail-reset contracts
 

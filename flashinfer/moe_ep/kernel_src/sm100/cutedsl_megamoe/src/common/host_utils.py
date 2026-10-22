@@ -8,7 +8,7 @@ import sys
 from typing import List, Optional, Tuple
 import torch
 
-from common.megamoe_constants import (
+from .megamoe_constants import (
     Fp8E5M2Max,
     Fp8E4M3FNMax,
     Nvfp4E2M1Max,

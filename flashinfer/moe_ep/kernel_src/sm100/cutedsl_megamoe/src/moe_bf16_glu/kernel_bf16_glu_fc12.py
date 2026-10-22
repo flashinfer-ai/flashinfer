@@ -14,25 +14,25 @@ import cutlass.cute as cute
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from moe_bf16_glu.epilogue_bf16 import GluBf16Epilogue
-from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
+from .epilogue_bf16 import GluBf16Epilogue
+from ..moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
     MoEFusedFc12SchedulerParams,
 )
-from moe_bf16_glu.custom_ext_bf16 import GluBf16Fc12SchedExtension
-from common.megamoe_constants import (
+from .custom_ext_bf16 import GluBf16Fc12SchedExtension
+from ..common.megamoe_constants import (
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
-from common.host_utils import get_cutedsl_target_arch
-from moe_nvfp4_swapab.moe_utils import spin_wait
+from ..common.host_utils import get_cutedsl_target_arch
+from ..moe_nvfp4_swapab.moe_utils import spin_wait
 
 
 # =============================================================================
@@ -371,7 +371,7 @@ class Sm100SwigluBf16Fc12Kernel:
         # Raw gate+up SMEM (ping-pong) — only when generate_c=True.
         c_bytes_total = 0
         if self.generate_c:
-            from moe_bf16_glu.epilogue_bf16 import Fc1CTMAStages
+            from .epilogue_bf16 import Fc1CTMAStages
 
             self.num_c_raw_stage = Fc1CTMAStages
             c_bytes_total += self.epilogue.c_bytes_per_stage * self.num_c_raw_stage

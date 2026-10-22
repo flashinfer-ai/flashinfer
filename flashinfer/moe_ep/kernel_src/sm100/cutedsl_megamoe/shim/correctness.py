@@ -34,7 +34,7 @@ from .nvfp4 import (
     MegaMoENvfp4Frontend,
 )
 from .comm import free_sym_tensor
-from moe_nvfp4_swapab.mega_runner import _build_arg_parser
+from ..src.moe_nvfp4_swapab.mega_runner import _build_arg_parser
 
 
 def _config_from_args(
@@ -116,7 +116,7 @@ def _finalize(runner: MegaMoENvfp4Frontend | None, tester) -> None:
     no_dist = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
     if not no_dist and torch.distributed.is_initialized():
         torch.distributed.barrier()
-        from src.bootstrap import finalize_dist_and_nvshmem
+        from ..src.src.bootstrap import finalize_dist_and_nvshmem
 
         finalize_dist_and_nvshmem()
 

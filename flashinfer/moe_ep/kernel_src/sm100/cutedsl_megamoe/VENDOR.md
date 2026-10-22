@@ -34,6 +34,14 @@ replace its own device snapshot.
 
 ## Pending local diffs vs upstream
 
+- Kernel-package imports use package-relative paths, including the shim's lazy
+  helper table. `src/__init__.py` makes the source root a package, and the runner
+  path-insertion blocks are removed so applications can own top-level names such
+  as `common` and `src`. Shell launchers and command examples use full package
+  module names; launchers add the repository root to `PYTHONPATH`.
+  Carry this namespace fix into the kernel-team source;
+  until then, reapply it on re-sync and run `tests/moe_ep/test_sm100_cutedsl_imports.py`.
+
 - Sparse decode follow-up to FlashInfer PR #6447 (2026-10-14), based on
   FlashInfer `0a0cecb50b1250f0b609a9c51f1b25816ba073b8`:
   `src/src/token_comm.py` gives CTA0 ownership of small shared reset prefixes,
@@ -69,10 +77,11 @@ replace its own device snapshot.
   pulling that file forward breaks the rest of the recorded drop (shim
   `kernel_helpers`, `mega_reference*.py` — the rename ripples through
   `mega_reference.py`'s changed return signature into the runners). Known
-  cost: the harness at the bottom of `inputs_process.py`
-  (`python -m src.inputs_process`) fails its **mxfp8** case with an
-  ImportError against the recorded-drop `host_utils` — the nvfp4 cases and
-  every shim/kernel path are unaffected (the kernel code imports
+  cost: the harness at the bottom of `inputs_process.py`, invoked as
+  `python -m flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.inputs_process`,
+  imports the missing `mxfp8_quantize_per_block_32_row` helper unconditionally
+  in `_run_case`, so **all harness cases**, including NVFP4, fail before GPU
+  work. Shim/kernel paths are unaffected (the kernel code imports
   `host_utils` nowhere). The harness was validated green (3/3 cases, dsl
   4.6.1 + 4.7.0) with the newer `host_utils` before this was understood.
   Resolves at the next full re-sync once the tree moves past that commit.

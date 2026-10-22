@@ -39,23 +39,23 @@ import torch
 import cutlass
 from cutlass.utils import HardwareInfo
 
-from moe_nvfp4_swapab.epilogue import (
+from .epilogue import (
     EpilogueTokenTile,
     Fc1GateUpInterleave as Nvfp4Fc1GateUpInterleave,
 )
-from moe_mxfp8_glu.epilogue_mxfp8 import (
+from ..moe_mxfp8_glu.epilogue_mxfp8 import (
     Fc1GateUpInterleave as Mxfp8Fc1GateUpInterleave,
 )
-from common.megamoe_constants import (
+from ..common.megamoe_constants import (
     Nvfp4BlockSize,
     Mxfp8BlockSize,
     SfPaddingBlock,
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
-from moe_nvfp4_swapab.simulate_fc1_fc2_sched import FusedFc12Simulator
+from .simulate_fc1_fc2_sched import FusedFc12Simulator
 
-from moe_nvfp4_swapab.runner_common import (
+from .runner_common import (
     Nvfp4DataDtype,
     _create_raw_scale_tensor,
     assemble_raw_scales_grouped_token,
@@ -65,7 +65,7 @@ from moe_nvfp4_swapab.runner_common import (
     round_up,
     slice_tensor_logical_dim,
 )
-from common.host_utils import (
+from ..common.host_utils import (
     kind_data_dtype,
     kind_scale_dtype,
     kind_sf_vec_size,
@@ -214,7 +214,7 @@ class ProblemDesc:
         # and not exposed via ProblemDesc, but its leading-dim alignment
         # still has to hold or fc2's TMA load reads garbage -- check
         # explicitly here with the kernel-fixed layout inlined.
-        from moe_nvfp4_swapab.runner_common import (
+        from .runner_common import (
             check_tma_leading_dim_align as _check_tma_leading_dim_align,
         )
 
@@ -1013,7 +1013,7 @@ class Fc12TesterBase:
         if self.misc.skip_ref_check:
             return
 
-        from moe_nvfp4_swapab.mega_reference import (
+        from .mega_reference import (
             _BlockScaledGemmReferenceLauncher,
             reference_expert_fc12,
         )

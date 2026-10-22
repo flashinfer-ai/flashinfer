@@ -22,7 +22,7 @@ from cutlass._mlir import ir
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 
 from .moe_persistent_scheduler import (
     MoEWorkTileInfo,

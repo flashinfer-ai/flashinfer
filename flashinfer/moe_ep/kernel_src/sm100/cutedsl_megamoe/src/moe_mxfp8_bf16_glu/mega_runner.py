@@ -25,27 +25,27 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from common.host_utils import (
+from ..common.host_utils import (
     compare_and_report_mismatches,
     mxfp8_quantize_per_block_32_row,
 )
-from common.megamoe_constants import Mxfp8BlockSize, SfPaddingBlock
-from moe_bf16_glu.mega_runner import (
+from ..common.megamoe_constants import Mxfp8BlockSize, SfPaddingBlock
+from ..moe_bf16_glu.mega_runner import (
     MegaMoEBf16Tester,
     _NO_DIST,
     _build_arg_parser as _build_bf16_arg_parser,
 )
-from moe_bf16_glu.runner_common import TrainingImplDesc
-from moe_nvfp4_swapab.mega_runner import (
+from ..moe_bf16_glu.runner_common import TrainingImplDesc
+from ..moe_nvfp4_swapab.mega_runner import (
     MiscDesc,
     TokenCommProblemDesc,
     _parse_tuple,
 )
-from moe_nvfp4_swapab.runner_common import (
+from ..moe_nvfp4_swapab.runner_common import (
     assemble_raw_scales_stacked_expert,
     round_up,
 )
-from src.token_comm import CombineFormat
+from ..src.token_comm import CombineFormat
 
 
 WeightKind = str
@@ -90,13 +90,13 @@ def _load_runtime_bindings() -> _RuntimeBindings:
     import cutlass.torch as cutlass_torch
     import cutlass.utils as utils
 
-    from moe_mxfp8_bf16_glu.epilogue_mxfp8_bf16 import (
+    from .epilogue_mxfp8_bf16 import (
         EpilogueTokenTile,
     )
-    from moe_mxfp8_bf16_glu.megamoe_kernel_mxfp8_bf16 import (
+    from .megamoe_kernel_mxfp8_bf16 import (
         Sm100MegaMoEMxfp8Bf16Kernel,
     )
-    from src.sym_buffer import SymBufferHost
+    from ..src.sym_buffer import SymBufferHost
 
     return _RuntimeBindings(
         cuda=cuda,
@@ -449,7 +449,7 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
             )
         self._validate_weight_abi()
 
-        from moe_mxfp8_bf16_glu.mega_reference_mxfp8_bf16 import (
+        from .mega_reference_mxfp8_bf16 import (
             compute_megamoe_reference_mxfp8_bf16,
         )
 
@@ -994,7 +994,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rank = 0
         world_size = 1
     else:
-        from src.bootstrap import (
+        from ..src.bootstrap import (
             finalize_dist_and_nvshmem,
             init_dist_and_nvshmem,
         )

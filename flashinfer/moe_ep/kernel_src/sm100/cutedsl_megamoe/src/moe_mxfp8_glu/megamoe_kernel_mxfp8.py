@@ -49,17 +49,17 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64, Int32
 
-from common.host_utils import get_cutedsl_target_arch
+from ..common.host_utils import get_cutedsl_target_arch
 
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 
-from moe_mxfp8_glu.kernel_mxfp8_glu_fc12 import Sm100SwigluMxfp8Fc12Kernel
-from moe_nvfp4_swapab.moe_utils import spin_wait
-from moe_nvfp4_swapab.topk_reduce import TopkReduce
-from src.token_comm import (
+from .kernel_mxfp8_glu_fc12 import Sm100SwigluMxfp8Fc12Kernel
+from ..moe_nvfp4_swapab.moe_utils import spin_wait
+from ..moe_nvfp4_swapab.topk_reduce import TopkReduce
+from ..src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenInPullTokenBackPush,
@@ -67,7 +67,7 @@ from src.token_comm import (
 
 # Reuse the region-layout helpers + module constants from the NVFP4 mega kernel
 # so the two paths stay byte-for-byte consistent in their workspace plumbing.
-from moe_nvfp4_swapab.megamoe_kernel import (
+from ..moe_nvfp4_swapab.megamoe_kernel import (
     _RegionSpec,
     _round_up,
     _layout_regions,

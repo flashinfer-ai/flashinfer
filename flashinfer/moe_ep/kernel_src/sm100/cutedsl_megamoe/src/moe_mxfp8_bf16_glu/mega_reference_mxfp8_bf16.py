@@ -303,7 +303,7 @@ def _load_bf16_megamoe_reference() -> Callable[..., Any]:
     # ``mega_reference_bf16`` owns a CuTeDSL dense-GEMM launcher and imports
     # CUDA bindings at module scope.  A local import keeps transform/ABI tests
     # CPU-only; those tests monkeypatch this loader with a recording callable.
-    from moe_bf16_glu.mega_reference_bf16 import compute_megamoe_reference
+    from ..moe_bf16_glu.mega_reference_bf16 import compute_megamoe_reference
 
     return compute_megamoe_reference
 

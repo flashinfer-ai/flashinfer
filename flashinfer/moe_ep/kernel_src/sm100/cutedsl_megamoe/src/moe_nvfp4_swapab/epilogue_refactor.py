@@ -17,7 +17,7 @@ from typing import Any, Callable, ClassVar, List, Literal, Optional, Tuple, Type
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int64, T
-from src.iket_compat import iket
+from ..src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace
 import cutlass.utils as utils
@@ -39,7 +39,7 @@ from .moe_persistent_scheduler import (
     MoESchedExtension,
     MoEWorkTileInfo,
 )
-from common.megamoe_constants import (
+from ..common.megamoe_constants import (
     Nvfp4BlockSize,
     Mxfp8BlockSize,
     Nvfp4E2M1RcpLimit,
@@ -47,15 +47,15 @@ from common.megamoe_constants import (
     Fp8E5M2RcpLimit,
     Fp32Max,
 )
-from common.moe_utils import cvt_f32_to_f8_to_f32
-from src.token_comm import CombineFormat, TokenCommArgs, TokenSrcMetadata
-from src.ptx_helpers import (
+from ..common.moe_utils import cvt_f32_to_f8_to_f32
+from ..src.token_comm import CombineFormat, TokenCommArgs, TokenSrcMetadata
+from ..src.ptx_helpers import (
     cp_async_bulk_s2g as _cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_noftz_bf16_s2g as _cp_reduce_async_bulk_add_noftz_bf16_s2g,
     red_add_relaxed_sys_v2_bf16x2 as _red_add_relaxed_sys_v2_bf16x2,
 )
-from src.flag_batch import GpuReleaseFlagBatchTracker
-from src.sym_buffer import SymBufferDeviceBase
+from ..src.flag_batch import GpuReleaseFlagBatchTracker
+from ..src.sym_buffer import SymBufferDeviceBase
 
 
 @dataclasses.dataclass(frozen=True)

@@ -33,15 +33,15 @@ from typing import Literal, Optional
 
 import torch
 
-from common.megamoe_constants import Mxfp8BlockSize
-from moe_nvfp4_swapab.runner_common import (
+from ..common.megamoe_constants import Mxfp8BlockSize
+from ..moe_nvfp4_swapab.runner_common import (
     dequant_block_scale_to_fp32,
     transpose_rhs_for_block_dequant,
     _swiglu_pair_hw_match_cuda,
 )
-from moe_nvfp4_swapab.mega_reference import combine_roundtrip_to_fp32
-from common.host_utils import mxfp8_quantize_per_block_32
-from src.token_comm import CombineFormat
+from ..moe_nvfp4_swapab.mega_reference import combine_roundtrip_to_fp32
+from ..common.host_utils import mxfp8_quantize_per_block_32
+from ..src.token_comm import CombineFormat
 
 
 def compute_megamoe_reference_mxfp8(
