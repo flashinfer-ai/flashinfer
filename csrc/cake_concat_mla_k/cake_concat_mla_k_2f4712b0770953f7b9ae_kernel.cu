@@ -53,10 +53,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_concat_mla_k_e4d878c1c0ec28530858(uint8_t* __restrict__ k, uint8_t* __restrict__ k_nope, uint8_t* __restrict__ k_rope, int element_bytes, long long k_stride_0_bytes, long long k_stride_1_bytes, long long k_nope_stride_0_bytes, long long k_nope_stride_1_bytes, long long k_rope_stride_0_bytes, int tokens)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+kernel_cake_concat_mla_k_2f4712b0770953f7b9ae(uint8_t* __restrict__ k, uint8_t* __restrict__ k_nope, uint8_t* __restrict__ k_rope, int element_bytes, long long k_stride_0_bytes, long long k_stride_1_bytes, long long k_nope_stride_0_bytes, long long k_nope_stride_1_bytes, long long k_rope_stride_0_bytes, int tokens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
