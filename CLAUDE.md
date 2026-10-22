@@ -122,6 +122,19 @@ Caveats:
 - The cache is per-devcontainer by design: sccache's local storage supports a
   single server at a time, so two containers must not share one cache directory.
 
+GitHub PR Test GPU jobs keep a different, per-runner cache: they set
+`CI_COMPILE_CACHE_DIR` to a directory under the runner's work directory, and
+`ci/bash.sh` mounts a per-CI-image subdirectory of it as the FlashInfer workspace
+base and Triton cache. Other `ci/bash.sh` callers leave it unset and run cold.
+Before each job the cache is cleared when it exceeds `CI_COMPILE_CACHE_MAX_MB`
+(default 40960) or its volume has less than `CI_COMPILE_CACHE_MIN_FREE_MB`
+(default 20480) free. Only content-keyed artifacts survive between jobs: CuTe-DSL (with
+`FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1`), TIRx, KDA PTX, Triton and downloaded
+cubins. nvcc modules, tuning results and the generated-source tree are pruned,
+since a fresh checkout rebuilds nvcc modules anyway. Each test job's
+`FLASHINFER_JIT_BUILD_LOG` is summarized per toolchain by
+`scripts/summarize_jit_builds.py` in the job summary.
+
 ## cuDNN linear attention
 
 Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
@@ -605,7 +618,12 @@ current device) since the artifacts are single-arch, unlike nvcc fatbins.
 Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
 kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
-`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`. The SHA256 covers only the files a caller
+passes as `extra_key_files` (often just `__file__`); with
+`FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` it also covers every flashinfer module
+those files transitively import (not the top-level `__init__.py`, `version.py` or
+`_build_meta.py`), for
+long-lived caches shared across commits such as CI's.
 Task-scheduled attention shares this cache through
 `flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
 options, and embedded device-capacity constants. It hashes the attention source
@@ -707,6 +725,8 @@ match what the code uses today; values are strings unless noted.
 |----------|---------|---------|--------|
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
+| `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` extends each CuTe-DSL disk-cache key from the caller's `extra_key_files` to their in-package import closure, so editing an imported helper invalidates the kernel. Changes every key, so the first run after enabling recompiles. Set by CI's persistent compile cache. |
+| `FLASHINFER_JIT_BUILD_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`toolchain`, `name`, `seconds`) per build made through `JitSpec.build_and_load()` or a bulk `build_jit_specs()` prebuild: nvcc modules (ninja no-ops included), CuTe-DSL kernels and TIRx modules. Triton, cuTile and the cake nvcc/NVRTC side paths are not recorded. Summarize with `scripts/summarize_jit_builds.py`. |
 | `FLASHINFER_CUDNN_FROST_PTXAS` | unset | `flashinfer/fused_moe/backends/cudnn_frost/compiler.py` | Select an external PTXAS executable path for all Frost dtypes; unset or empty uses the bundled assembler. The executable path, version, and SHA-256 participate in compiler and tactic cache identities. MoE engines snapshot this configuration at build time; call `layer.refresh_backends()` or reconstruct the layer to adopt changes. |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the check that pins flashinfer-cubin and flashinfer-jit-cache to the installed flashinfer-python. Without it, mismatched kernel wheels (typically left behind by an upgrade) are ignored with a warning at import, falling back to on-demand cubin downloads and JIT compilation until `flashinfer download-kernels` installs matching ones. Set it only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
