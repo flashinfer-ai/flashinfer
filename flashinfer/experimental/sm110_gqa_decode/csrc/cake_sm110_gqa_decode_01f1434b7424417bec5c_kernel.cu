@@ -92,7 +92,7 @@ __device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_sm110_gqa_decode_9a947aef08ff38567eef(__half* __restrict__ Q, __half* __restrict__ K, __half* __restrict__ V, __half* __restrict__ O, int* __restrict__ sequence_lengths, float softmax_scale_log2, long long Q_stride_p0, long long Q_stride_p1, long long Q_stride_p2, long long K_stride_p0, long long K_stride_p1, long long K_stride_p2, long long V_stride_p0, long long V_stride_p1, long long V_stride_p2, long long K_size_p2, long long V_size_p2)
+kernel_cake_sm110_gqa_decode_01f1434b7424417bec5c(__half* __restrict__ Q, __half* __restrict__ K, __half* __restrict__ V, __half* __restrict__ O, int* __restrict__ sequence_lengths, float softmax_scale_log2, long long Q_stride_p0, long long Q_stride_p1, long long Q_stride_p2, long long K_stride_p0, long long K_stride_p1, long long K_stride_p2, long long V_stride_p0, long long V_stride_p1, long long V_stride_p2, long long K_size_p2, long long V_size_p2)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -215,78 +215,44 @@ kernel_cake_sm110_gqa_decode_9a947aef08ff38567eef(__half* __restrict__ Q, __half
     v_words[13] = 0;
     v_words[14] = 0;
     v_words[15] = 0;
-    int key = kq * 2;
-    if (key < 64 && key < k_capacity) {
+    int key = kg * 4;
+    if (key < 8 && key < v_capacity) {
         {
-            uint4 _uv4_1 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key + (long long)(q8 * 16)) + 0);
-            k_words[0 + 0] = _uv4_1.x;
-            k_words[0 + 1] = _uv4_1.y;
-            k_words[0 + 2] = _uv4_1.z;
-            k_words[0 + 3] = _uv4_1.w;
-        }
-        {
-            uint4 _uv4_2 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key + (long long)(q8 * 16 + 8)) + 0);
-            k_words[4 + 0] = _uv4_2.x;
-            k_words[4 + 1] = _uv4_2.y;
-            k_words[4 + 2] = _uv4_2.z;
-            k_words[4 + 3] = _uv4_2.w;
+            uint4 _uv4_1 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key + (long long)(ch * 8)) + 0);
+            v_words[0 + 0] = _uv4_1.x;
+            v_words[0 + 1] = _uv4_1.y;
+            v_words[0 + 2] = _uv4_1.z;
+            v_words[0 + 3] = _uv4_1.w;
         }
     }
-    int key_0 = kq * 2 + 1;
-    if (key_0 < 64 && key_0 < k_capacity) {
+    int key_0 = kg * 4 + 1;
+    if (key_0 < 8 && key_0 < v_capacity) {
         {
-            uint4 _uv4_3 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key_0 + (long long)(q8 * 16)) + 0);
-            k_words[8 + 0] = _uv4_3.x;
-            k_words[8 + 1] = _uv4_3.y;
-            k_words[8 + 2] = _uv4_3.z;
-            k_words[8 + 3] = _uv4_3.w;
-        }
-        {
-            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key_0 + (long long)(q8 * 16 + 8)) + 0);
-            k_words[12 + 0] = _uv4_4.x;
-            k_words[12 + 1] = _uv4_4.y;
-            k_words[12 + 2] = _uv4_4.z;
-            k_words[12 + 3] = _uv4_4.w;
+            uint4 _uv4_2 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key_0 + (long long)(ch * 8)) + 0);
+            v_words[4 + 0] = _uv4_2.x;
+            v_words[4 + 1] = _uv4_2.y;
+            v_words[4 + 2] = _uv4_2.z;
+            v_words[4 + 3] = _uv4_2.w;
         }
     }
-    int key_1 = kg * 4;
+    int key_1 = kg * 4 + 2;
     if (key_1 < 8 && key_1 < v_capacity) {
         {
-            uint4 _uv4_5 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key_1 + (long long)(ch * 8)) + 0);
-            v_words[0 + 0] = _uv4_5.x;
-            v_words[0 + 1] = _uv4_5.y;
-            v_words[0 + 2] = _uv4_5.z;
-            v_words[0 + 3] = _uv4_5.w;
+            uint4 _uv4_3 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key_1 + (long long)(ch * 8)) + 0);
+            v_words[8 + 0] = _uv4_3.x;
+            v_words[8 + 1] = _uv4_3.y;
+            v_words[8 + 2] = _uv4_3.z;
+            v_words[8 + 3] = _uv4_3.w;
         }
     }
-    int key_2 = kg * 4 + 1;
+    int key_2 = kg * 4 + 3;
     if (key_2 < 8 && key_2 < v_capacity) {
         {
-            uint4 _uv4_6 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key_2 + (long long)(ch * 8)) + 0);
-            v_words[4 + 0] = _uv4_6.x;
-            v_words[4 + 1] = _uv4_6.y;
-            v_words[4 + 2] = _uv4_6.z;
-            v_words[4 + 3] = _uv4_6.w;
-        }
-    }
-    int key_3 = kg * 4 + 2;
-    if (key_3 < 8 && key_3 < v_capacity) {
-        {
-            uint4 _uv4_7 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key_3 + (long long)(ch * 8)) + 0);
-            v_words[8 + 0] = _uv4_7.x;
-            v_words[8 + 1] = _uv4_7.y;
-            v_words[8 + 2] = _uv4_7.z;
-            v_words[8 + 3] = _uv4_7.w;
-        }
-    }
-    int key_4 = kg * 4 + 3;
-    if (key_4 < 8 && key_4 < v_capacity) {
-        {
-            uint4 _uv4_8 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key_4 + (long long)(ch * 8)) + 0);
-            v_words[12 + 0] = _uv4_8.x;
-            v_words[12 + 1] = _uv4_8.y;
-            v_words[12 + 2] = _uv4_8.z;
-            v_words[12 + 3] = _uv4_8.w;
+            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(V + (v_base + v_stride_key * (long long)key_2 + (long long)(ch * 8)) + 0);
+            v_words[12 + 0] = _uv4_4.x;
+            v_words[12 + 1] = _uv4_4.y;
+            v_words[12 + 2] = _uv4_4.z;
+            v_words[12 + 3] = _uv4_4.w;
         }
     }
     float v[8];
@@ -319,6 +285,40 @@ kernel_cake_sm110_gqa_decode_9a947aef08ff38567eef(__half* __restrict__ Q, __half
             }
         }
     } else {
+        int key_3 = kq * 2;
+        if (key_3 >= 0 && key_3 < seqlen && key_3 < k_capacity) {
+            {
+                uint4 _uv4_5 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key_3 + (long long)(q8 * 16)) + 0);
+                k_words[0 + 0] = _uv4_5.x;
+                k_words[0 + 1] = _uv4_5.y;
+                k_words[0 + 2] = _uv4_5.z;
+                k_words[0 + 3] = _uv4_5.w;
+            }
+            {
+                uint4 _uv4_6 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key_3 + (long long)(q8 * 16 + 8)) + 0);
+                k_words[4 + 0] = _uv4_6.x;
+                k_words[4 + 1] = _uv4_6.y;
+                k_words[4 + 2] = _uv4_6.z;
+                k_words[4 + 3] = _uv4_6.w;
+            }
+        }
+        int key_4 = kq * 2 + 1;
+        if (key_4 >= 0 && key_4 < seqlen && key_4 < k_capacity) {
+            {
+                uint4 _uv4_7 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key_4 + (long long)(q8 * 16)) + 0);
+                k_words[8 + 0] = _uv4_7.x;
+                k_words[8 + 1] = _uv4_7.y;
+                k_words[8 + 2] = _uv4_7.z;
+                k_words[8 + 3] = _uv4_7.w;
+            }
+            {
+                uint4 _uv4_8 = *reinterpret_cast<const uint4*>(K + (k_base + k_stride_key * (long long)key_4 + (long long)(q8 * 16 + 8)) + 0);
+                k_words[12 + 0] = _uv4_8.x;
+                k_words[12 + 1] = _uv4_8.y;
+                k_words[12 + 2] = _uv4_8.z;
+                k_words[12 + 3] = _uv4_8.w;
+            }
+        }
         int key_5 = kg * 4;
         if (key_5 >= 8 && key_5 < seqlen && key_5 < v_capacity) {
             {

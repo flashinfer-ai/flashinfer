@@ -123,7 +123,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "batch_heads", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_9a947aef08ff38567eef",
+        "kernel_symbol": "kernel_cake_sm110_gqa_decode_01f1434b7424417bec5c",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -131,7 +131,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 17152,
             "use_pdl": False,
         },
-        "library": "cake_sm110_gqa_decode_9a947aef08ff38567eef",
+        "library": "cake_sm110_gqa_decode_01f1434b7424417bec5c",
         "logical": {
             "K": "K",
             "O": "O",
