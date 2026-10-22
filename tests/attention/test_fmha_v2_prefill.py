@@ -614,9 +614,9 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
 
 
 def _initialize_glm47_gqa(
-    batch_size, seq_len, num_heads, num_kv_heads, device_scales, head_dim=128
+    batch_size, seq_len, num_heads, num_kv_heads, device_scales, head_dim=128, seed=42
 ):
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     q_shape = (batch_size, seq_len, num_heads, head_dim)
     kv_shape = (batch_size, seq_len, num_kv_heads, head_dim)
     q, q_scale = to_float8(
@@ -655,6 +655,49 @@ def _initialize_glm47_gqa(
     return q, k, v, out, lse, scales, kwargs
 
 
+def _glm47_gqa_fp8_p_reference(q, k, v, scales):
+    """Emulate E4M3 P packing in the SM12x separate-Q/K/V kernels."""
+    _, seq_len, num_heads, head_dim = q.shape
+    heads_per_kv = num_heads // k.shape[2]
+    q_float, k_float, v_float = (
+        tensor.float().permute(0, 2, 1, 3) for tensor in (q, k, v)
+    )
+    out_ref = torch.empty_like(q, dtype=torch.float32)
+    positions = torch.arange(seq_len, device=q.device)
+    causal_mask = positions[:, None] < positions[None, :]
+    qk_scale = scales[0] * scales[1] / math.sqrt(head_dim)
+    # These kernels visit 64-key tiles in ascending order. Their softmax is
+    # FP32, but the unnormalized exp weights (maximum scaled to 256) are
+    # rounded to E4M3 before PV. Casting the final softmax probabilities to
+    # FP8 would model a different algorithm.
+    tile_size = 64
+    for kv_h in range(k.shape[2]):
+        h_lo, h_hi = kv_h * heads_per_kv, (kv_h + 1) * heads_per_kv
+        scores = torch.matmul(
+            q_float[:, h_lo:h_hi], k_float[:, kv_h : kv_h + 1].transpose(-1, -2)
+        )
+        scores.mul_(qk_scale).masked_fill_(causal_mask, float("-inf"))
+        # Every causal self-attention row has a valid key in the first tile.
+        row_max = scores[..., :tile_size].amax(dim=-1, keepdim=True)
+        row_sum = torch.zeros_like(row_max)
+        numerator = torch.zeros_like(q_float[:, h_lo:h_hi])
+        for start in range(0, seq_len, tile_size):
+            tile = scores[..., start : start + tile_size]
+            next_max = torch.maximum(row_max, tile.amax(dim=-1, keepdim=True))
+            correction = torch.exp(row_max - next_max)
+            weights = torch.exp(tile - (next_max - math.log(256.0)))
+            # Keep the denominator in FP32 BEFORE rounding P. When a later
+            # tile raises the running max, rescale both previous accumulators.
+            row_sum = row_sum * correction + weights.sum(dim=-1, keepdim=True)
+            packed_p = weights.to(torch.float8_e4m3fn).float()
+            numerator = numerator * correction + torch.matmul(
+                packed_p, v_float[:, kv_h : kv_h + 1, start : start + tile_size]
+            )
+            row_max = next_max
+        out_ref[:, :, h_lo:h_hi] = ((numerator / row_sum) * scales[2]).transpose(1, 2)
+    return out_ref
+
+
 def _assert_glm47_gqa_reference(q, k, v, out, lse, scales):
     batch_size, seq_len, num_heads, head_dim = q.shape
     num_kv_heads = k.shape[2]
@@ -685,9 +728,19 @@ def _assert_glm47_gqa_reference(q, k, v, out, lse, scales):
         actual_lse, lse_ref.reshape_as(actual_lse), rtol=1e-2, atol=1e-3
     )
     # The existing FP8 tests calibrate this absolute tolerance for unit-variance V.
-    torch.testing.assert_close(
-        out, out_ref.reshape_as(out).to(out.dtype), rtol=4e-2, atol=6e-2
-    )
+    try:
+        torch.testing.assert_close(
+            out, out_ref.reshape_as(out).to(out.dtype), rtol=4e-2, atol=6e-2
+        )
+    except AssertionError:
+        # FP32 attention omits the kernel's intermediate E4M3 P rounding.
+        # Rare inputs can therefore exceed the original output tolerance
+        # (e.g. GLM-4.7-Flash B1/S129/H20, seeds 3/12 on SM120 and seed 42
+        # on Spark). Accept those outputs only if the quantized-P reference
+        # also agrees, using the same tolerances. LSE must still pass the
+        # unconditional FP32 check above; unrelated output errors still fail.
+        out_ref_fp8 = _glm47_gqa_fp8_p_reference(q, k, v, scales)
+        torch.testing.assert_close(out, out_ref_fp8.to(out.dtype), rtol=4e-2, atol=6e-2)
 
 
 @pytest.mark.parametrize("device_scales", ["host", "bmm1", "bmm2", "both"])
@@ -803,14 +856,21 @@ def test_fmha_v2_prefill_sm120_gqa_head_dim_64():
         (1, 1024, 5, "both"),
     ],
 )
+@pytest.mark.parametrize("seed", [42, 3, 12])
 def test_fmha_v2_prefill_deepseek_glm47_flash_mla(
-    batch_size, seq_len, num_heads, device_scales
+    batch_size, seq_len, num_heads, device_scales, seed
 ):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     # GLM-4.7-Flash expands MLA context to Q/K/V=256 with 20 heads (5 per TP4 rank).
     q, k, v, out, lse, scales, kwargs = _initialize_glm47_gqa(
-        batch_size, seq_len, num_heads, num_heads, device_scales, head_dim=256
+        batch_size,
+        seq_len,
+        num_heads,
+        num_heads,
+        device_scales,
+        head_dim=256,
+        seed=seed,
     )
     fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
     _assert_glm47_gqa_reference(q, k, v, out, lse, scales)
