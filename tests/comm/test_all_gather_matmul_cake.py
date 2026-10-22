@@ -617,20 +617,25 @@ def test_every_route_has_one_host_sequence_per_architecture():
             if file_arches != [arch]:
                 (flag,) = row["sequence_flags"]
                 assert flag.startswith("-DCAKE_SEQ_SHIM=cake_host_shim_seq_")
-            # Every sequence module compiles both SM push programs: the route and
-            # the push launch are decided per call (rows, world size).
-            assert loader.peer_push_program() in programs
-            assert loader.peer_push_wide_program() in programs
+            # A sequence of a world size the SM push route serves (4 and 8, as
+            # ``uses_sm_push`` decides) compiles both SM push programs: the route
+            # and the push launch are decided per call (rows, world size). No
+            # two-rank call takes that route, so a world-size-2 sequence compiles
+            # neither.
+            sm_push = row["world_size"] >= 4
+            assert (loader.peer_push_program() in programs) is sm_push
+            assert (loader.peer_push_wide_program() in programs) is sm_push
             # The ``_n128`` twin travels with the sequence exactly for the classes
             # with a delivered twin on this architecture (the per-call width is
             # chosen by ``main_block_n``, so both mains are compiled in).
             route = {
                 loader.barrier_program(0),
                 loader.barrier_program(1),
-                loader.peer_push_program(),
-                loader.peer_push_wide_program(),
                 loader.main_program(world_size, dtype_name, b_layout),
             }
+            if sm_push:
+                route.add(loader.peer_push_program())
+                route.add(loader.peer_push_wide_program())
             delivered = (world_size, dtype_name, b_layout) in _n128_classes(arch)
             assert ("main_n128" in row["programs"]) is delivered
             if delivered:
