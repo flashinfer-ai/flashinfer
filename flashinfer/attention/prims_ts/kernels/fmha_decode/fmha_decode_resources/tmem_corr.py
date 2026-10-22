@@ -91,6 +91,10 @@ from .sage_scales import SageVScalesResource
 from .smem_p import SmemPResource
 from .tmem_softmax_stats import TmemSoftmaxLocalResource
 
+# Swaps loop correction keeps at most this many FP32 O values live per lane;
+# wider O stages (H512 TileQ32) are rescaled in streamed chunk groups.
+SWAPS_RESCALE_MAX_LIVE_F32_REGS = 64
+
 _KV_TILE_256_CORRECTION_THREADS = 128
 _KV_TILE_256_LOGICAL_OUTPUT_ROWS = 64
 # One D32 fragment slot, padded by four floats so adjacent slots fall on
@@ -829,6 +833,70 @@ class TmemCorrResource(DecodeGenResourceBase):
         output_f32_regs: Constexpr[int],
     ) -> None:
         """Apply online-softmax correction scales to one Swaps O stage."""
+        if cutlass.const_expr(
+            num_o_chunks * 4 * q_repeats > SWAPS_RESCALE_MAX_LIVE_F32_REGS
+        ):
+            # H512 TileQ32 holds 8 chunks x 16 = 128 FP32 O values per lane,
+            # above correction's 88-register grant, so the load-all form
+            # spills on every K/V tile. Stream groups of chunks instead:
+            # load, scale and store each group before loading the next. The
+            # arithmetic per element is unchanged (bitwise-identical O).
+            if not skip_correction:
+                group_chunks = max(
+                    SWAPS_RESCALE_MAX_LIVE_F32_REGS // 2 // (4 * q_repeats), 1
+                )
+                for group_base in cutlass.range_constexpr(
+                    0, num_o_chunks, group_chunks
+                ):
+                    group_end = min(group_base + group_chunks, num_o_chunks)
+                    group_vals = cutlass.Array(
+                        Float32,
+                        (group_end - group_base) * 4 * q_repeats,
+                        space=cutlass.AddressSpace.rmem,
+                    )
+                    for chunk_idx in cutlass.range_constexpr(group_base, group_end):
+                        loaded = prims.tcgen05_ld(
+                            "16x256b",
+                            prims.make_tmem_ptr(
+                                base_addr
+                                + Int32(self.cfg.swaps_o_chunk_tmem_offset(chunk_idx)),
+                                Float32,
+                            ),
+                            num=q_repeats,
+                        )
+                        for reg_idx in cutlass.range_constexpr(4 * q_repeats):
+                            group_vals[
+                                (chunk_idx - group_base) * 4 * q_repeats + reg_idx
+                            ] = loaded[reg_idx]
+                    cute.arch.fence_view_async_tmem_load()
+                    for chunk_idx in cutlass.range_constexpr(group_base, group_end):
+                        chunk_scaled = cutlass.Array(
+                            Float32, 4 * q_repeats, space=cutlass.AddressSpace.rmem
+                        )
+                        for reg_pair_idx in cutlass.range_constexpr(2 * q_repeats):
+                            scale_base = (reg_pair_idx // 2) * 2
+                            reg_base = (chunk_idx - group_base) * 4 * q_repeats + (
+                                reg_pair_idx * 2
+                            )
+                            scaled_pair = fmul2(
+                                (
+                                    scale_vals[scale_base],
+                                    scale_vals[scale_base + 1],
+                                ),
+                                (group_vals[reg_base], group_vals[reg_base + 1]),
+                            )
+                            chunk_scaled[reg_pair_idx * 2] = scaled_pair[0]
+                            chunk_scaled[reg_pair_idx * 2 + 1] = scaled_pair[1]
+                        self._swaps_store_scaled_o_chunk(
+                            base_addr,
+                            chunk_idx,
+                            chunk_scaled,
+                            q_repeats=q_repeats,
+                        )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            if not skip_correction:
+                cute.arch.fence_view_async_tmem_store()
+            return
         if not skip_correction:
             o_vals = self._swaps_load_o_stage_chunks(
                 base_addr,
