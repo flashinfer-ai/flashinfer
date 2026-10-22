@@ -515,11 +515,6 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         launch = mock.Mock()
     elif backend == "bf16":
         config_cls = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
-        options = {
-            "knobs": {
-                "apply_routing_weights_before_fc2": apply_routing_weights_before_fc2
-            }
-        }
         monkeypatch.setattr(
             cutedsl_megamoe, "get_symm_buffer_for_bf16_mega_moe", allocate
         )
@@ -622,7 +617,7 @@ def test_nvfp4_knobs_reject_explicit_config_fields(monkeypatch, knobs):
         moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=128,
             top_k=2,
-            do_finalize=False,
+            finalize_mode=FinalizeMode.NONE,
             knobs=knobs,
         )
     )

@@ -275,7 +275,9 @@ def _reference_nvfp4_mega_moe_staged(
         situ_beta=problem["situ_beta"],
         situ_linear_beta=problem["situ_linear_beta"],
         combine_dtype=combine_dtype,
-        apply_topk_in_fc1=problem.get("apply_topk_in_fc1", True),
+        apply_routing_weights_before_fc2=problem.get(
+            "apply_routing_weights_before_fc2", True
+        ),
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
         fc1_norm_const=problem["fc1_norm_const"],
@@ -346,7 +348,9 @@ def _reference_nvfp4_mega_moe_prestaged(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
-        apply_topk_in_fc1=problem.get("apply_topk_in_fc1", True),
+        apply_routing_weights_before_fc2=problem.get(
+            "apply_routing_weights_before_fc2", True
+        ),
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
         fc1_norm_const=problem["fc1_norm_const"],
@@ -491,7 +495,9 @@ def _run_mega_layer(
         **(config_extra or {}),
     )
     # The direct-shim references must run the same compute graph.
-    problem["apply_topk_in_fc1"] = config_extra.get("apply_topk_in_fc1", True)
+    problem["apply_routing_weights_before_fc2"] = config_extra.get(
+        "apply_routing_weights_before_fc2", True
+    )
     kernel = create_mega_kernel(
         _megakernel_config(problem, epilogue_via_config=quantize_input, **config_extra)
     )
