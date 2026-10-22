@@ -3543,6 +3543,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         row_max = other_row_max
         row_sum = other_row_sum
 
+        # Skipping correction rolls back the maximum in the metadata sent to
+        # the correction warp. Apply that decision before computing the factor
+        # used by row_sum, including the final tile, so numerator and denominator
+        # use the same normalization. Preserve the default threshold-zero body.
+        if cutlass.const_expr(self.skip_correction_threshold > 0):
+            if (
+                row_max_new - row_max
+            ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+                row_max_new = row_max
+
         # find correction factor (uses inherited row_max from peer = prev global max)
         correction_factor = cute.math.exp2(
             (row_max - row_max_new) * softmax_params.softmax_scale_log2, fastmath=True
