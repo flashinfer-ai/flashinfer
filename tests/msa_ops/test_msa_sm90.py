@@ -886,7 +886,7 @@ def test_fp8_proxy_decode_rejects_multi_head_index_cache():
     torch.manual_seed(0)
     batch, hq, hkv, pages = 2, 4, 2, 8
     npages = pages * batch
-    q = (torch.randn(batch, hq, HEAD_DIM, device="cuda") / 3).to(torch.bfloat16)
+    q = (torch.randn(batch, hq, HEAD_DIM, device="cuda") / 3).to(torch.float8_e4m3fn)
     k = (torch.randn(npages, hkv, BLK_KV, HEAD_DIM, device="cuda") / 3).to(
         torch.float8_e4m3fn
     )
