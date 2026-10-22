@@ -372,20 +372,19 @@ class TmemOResource(MlaResource):
         cfg = self.cfg
         v_stage_idx = v_subtile_idx % cfg.v_head_dim_stages
         task_cache = decode_gen_task_cache(stage_info)
-        if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
-            # Native FP4 QK: P has its own TMEM columns (S is single-staged).
-            p_addr = (
-                task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-                + Int32(self.p_tmem_ref._tmem_alloc.offset)
-                + Int32(p_stage_idx) * Int32(cfg.tmem_p_cols)
-            )
-        else:
-            p_addr = (
-                task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-                + Int32(self.p_tmem_ref.tmem_alias_ref._tmem_alloc.offset)
-                + Int32(WARP_LANES)
-                + Int32(p_stage_idx) * Int32(cfg.tmem_s_cols)
-            )
+        # Native FP4 QK: P has its own TMEM columns (S is single-staged);
+        # otherwise P aliases the score columns.  ``p_addr`` is assigned
+        # unconditionally: the elected MMA loop below advances it, and the DSL
+        # rejects a loop-carried value first bound inside a branch.
+        p_col = (
+            Int32(self.p_tmem_ref._tmem_alloc.offset)
+            + Int32(p_stage_idx) * Int32(cfg.tmem_p_cols)
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4)
+            else Int32(self.p_tmem_ref.tmem_alias_ref._tmem_alloc.offset)
+            + Int32(WARP_LANES)
+            + Int32(p_stage_idx) * Int32(cfg.tmem_s_cols)
+        )
+        p_addr = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET] + p_col
         if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
             p_addr = tcgen05_panel_addr(p_addr, v_stage_idx // 2)
         idesc = cprims.Tcgen05InstrDesc.build(
