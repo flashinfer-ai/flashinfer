@@ -56,7 +56,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define TMEM_O0_OFFSET 256
 #define TMEM_O1_OFFSET 384
 #define NUM_RING_STAGES 6
-#define NUM_Q_PIPE_STAGES 4
+#define NUM_Q_PIPE_STAGES 8
 #define NUM_S_PIPE_STAGES 2
 #define NUM_P_PIPE_STAGES 2
 #define SMEM_SQ_OFF 1024
@@ -81,18 +81,16 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #include <stddef.h>
 #endif
 struct __align__(8) KVCacheList {
-    void* pool;
-    const int* page_list;
+    void* data;
     const int* sequence_lengths;
-    unsigned int max_pages;
+    unsigned int capacity;
 };
-static_assert(sizeof(KVCacheList) == 32, "KVCacheList size");
+static_assert(sizeof(KVCacheList) == 24, "KVCacheList size");
 static_assert(__alignof__(KVCacheList) == 8, "KVCacheList alignment");
 #if !defined(__CUDACC_RTC__)
-static_assert(offsetof(KVCacheList, pool) == 0, "KVCacheList.pool offset");
-static_assert(offsetof(KVCacheList, page_list) == 8, "KVCacheList.page_list offset");
-static_assert(offsetof(KVCacheList, sequence_lengths) == 16, "KVCacheList.sequence_lengths offset");
-static_assert(offsetof(KVCacheList, max_pages) == 24, "KVCacheList.max_pages offset");
+static_assert(offsetof(KVCacheList, data) == 0, "KVCacheList.data offset");
+static_assert(offsetof(KVCacheList, sequence_lengths) == 8, "KVCacheList.sequence_lengths offset");
+static_assert(offsetof(KVCacheList, capacity) == 16, "KVCacheList.capacity offset");
 #endif
 
 #include <math_constants.h>
@@ -173,6 +171,20 @@ __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, ui
 }
 
 
+__device__ __forceinline__ void tcgen05_mma_f16(
+    int taddr, uint64_t a_desc, uint64_t b_desc,
+    uint32_t i_desc, int enable_input_d) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
+        "}\n"
+        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
+           "r"(i_desc), "r"(enable_input_d)
+         : "memory");
+}
+
 
 
 union MmaSmemDesc {
@@ -180,6 +192,24 @@ union MmaSmemDesc {
     uint32_t u32[2];
 };
 
+__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
+    MmaSmemDesc tmp;
+    tmp.u64 = smem_desc;
+    tmp.u32[0] += offset;
+    smem_desc = tmp.u64;
+}
+
+
+__device__ __forceinline__ void elect_commit(int mbar_addr) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred leader;\n\t"
+        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+        ".shared::cluster.b64 [%0];\n\t"
+        "}\n"
+        :: "r"(mbar_addr));
+}
 
 
 
@@ -274,24 +304,20 @@ __device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
 
 
 
-__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
 
 
 
-__device__ __forceinline__ void tcgen05_commit_cg1_multicast(int mbar_addr, uint16_t cta_mask) {
+
+
+__device__ __forceinline__ void tcgen05_commit_cg1_multicast_leader(
+    int mbar_addr, uint16_t cta_mask, uint32_t leader) {
     asm volatile(
         "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
+        ".reg .pred leader;\n\t"
+        "setp.ne.b32 leader, %2, 0;\n\t"
+        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
+        :: "r"(mbar_addr), "h"(cta_mask), "r"(leader) : "memory");
 }
 
 
@@ -311,7 +337,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,2,1) void
-kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale)
+kernel_cake_sm110_xqa_09a5cd2e68fb4fbe4ec9(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -331,12 +357,12 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
     #define ready_addr (mbar_base + 48)
     #define free_addr (mbar_base + 96)
     #define q_ready_addr (mbar_base + 144)
-    #define s_full_addr (mbar_base + 176)
-    #define s_empty_addr (mbar_base + 192)
-    #define p_full_addr (mbar_base + 208)
-    #define p_empty_addr (mbar_base + 224)
-    #define tmem_retire_addr (mbar_base + 240)
-    #define o_ready_addr (mbar_base + 248)
+    #define s_full_addr (mbar_base + 208)
+    #define s_empty_addr (mbar_base + 224)
+    #define p_full_addr (mbar_base + 240)
+    #define p_empty_addr (mbar_base + 256)
+    #define tmem_retire_addr (mbar_base + 272)
+    #define o_ready_addr (mbar_base + 280)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -360,25 +386,6 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
     const int sx_addr = smem + 230400;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV))) : "memory");
-    unsigned int info_hoisted[4];
-    unsigned int zero = 0;
-    info_hoisted[1] = zero;
-    info_hoisted[2] = zero;
-    {
-        info_hoisted[0] = *reinterpret_cast<const unsigned int*>(kv_cache_list.sequence_lengths + blockIdx.z);
-    }
-    if ((unsigned long long)q_cu_seq_lens != 0) {
-        {
-            info_hoisted[1] = *reinterpret_cast<const unsigned int*>(q_cu_seq_lens + blockIdx.z);
-        }
-        {
-            info_hoisted[2] = *reinterpret_cast<const unsigned int*>(q_cu_seq_lens + (blockIdx.z + 1));
-        }
-    }
-    unsigned int slot0 = (unsigned int)(blockIdx.z * 2) * kv_cache_list.max_pages;
-    {
-        info_hoisted[3] = *reinterpret_cast<const unsigned int*>(kv_cache_list.page_list + slot0);
-    }
     if (warp == 13) {
         if (elect_sync()) {
             unsigned int blocks_per_head = (unsigned int)gridDim.y / num_kv_heads;
@@ -388,7 +395,7 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             unsigned int qpf_qhead = head * 8;
             unsigned int qpf_odd = (unsigned int)cta_rank & 1;
             #pragma unroll
-            for (int pair = 0; pair < 4; pair++) {
+            for (int pair = 0; pair < 2; pair++) {
                 if (qpf_odd == (unsigned int)(pair & 1)) {
                     #pragma unroll
                     for (int slab = 2 * pair; slab < 2 * pair + 2; slab++) {
@@ -400,16 +407,26 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
     }
     int _mma_base_lo_0 = ((sq_addr) >> 4) & 0x3FFF;
     int _mma_base_lo_1 = ((sk_addr) >> 4) & 0x3FFF;
-    int _mma_base_lo_2 = ((sq_addr + 32768) >> 4) & 0x3FFF;
-    int _mma_base_lo_3 = ((sq_addr + 65536) >> 4) & 0x3FFF;
-    int _mma_base_lo_4 = ((sq_addr + 98304) >> 4) & 0x3FFF;
-    int _mma_base_lo_5 = (((sv_addr) >> 4) & 0x3FFF) | 0x2000000;
-    int _mma_base_lo_6 = (((sv_addr + 2048) >> 4) & 0x3FFF) | 0x2000000;
-    int _mma_base_lo_7 = (((sv_addr + 4096) >> 4) & 0x3FFF) | 0x2000000;
-    int _mma_base_lo_8 = (((sv_addr + 6144) >> 4) & 0x3FFF) | 0x2000000;
+    int _mma_base_lo_2 = ((sq_addr + 16384) >> 4) & 0x3FFF;
+    int _mma_base_lo_3 = ((sk_addr + 8192) >> 4) & 0x3FFF;
+    int _mma_base_lo_4 = ((sq_addr + 32768) >> 4) & 0x3FFF;
+    int _mma_base_lo_5 = ((sq_addr + 49152) >> 4) & 0x3FFF;
+    int _mma_base_lo_6 = ((sq_addr + 65536) >> 4) & 0x3FFF;
+    int _mma_base_lo_7 = ((sq_addr + 81920) >> 4) & 0x3FFF;
+    int _mma_base_lo_8 = ((sq_addr + 98304) >> 4) & 0x3FFF;
+    int _mma_base_lo_9 = ((sq_addr + 114688) >> 4) & 0x3FFF;
+    int _mma_base_lo_10 = ((sq_addr) >> 4) & 0x3FFF;
+    int _mma_base_lo_11 = ((sk_addr) >> 4) & 0x3FFF;
+    int _mma_base_lo_12 = ((sq_addr + 32768) >> 4) & 0x3FFF;
+    int _mma_base_lo_13 = ((sq_addr + 65536) >> 4) & 0x3FFF;
+    int _mma_base_lo_14 = ((sq_addr + 98304) >> 4) & 0x3FFF;
+    int _mma_base_lo_15 = (((sv_addr) >> 4) & 0x3FFF) | 0x2000000;
+    int _mma_base_lo_16 = (((sv_addr + 2048) >> 4) & 0x3FFF) | 0x2000000;
+    int _mma_base_lo_17 = (((sv_addr + 4096) >> 4) & 0x3FFF) | 0x2000000;
+    int _mma_base_lo_18 = (((sv_addr + 6144) >> 4) & 0x3FFF) | 0x2000000;
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 32 barriers)
-    // Mbarriers at smem_raw[0..256)
+    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 36 barriers)
+    // Mbarriers at smem_raw[0..288)
 
 
     // Mbarrier init group 1
@@ -440,18 +457,22 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             mbarrier_init(smem + 152, 1);
             mbarrier_init(smem + 160, 1);
             mbarrier_init(smem + 168, 1);
-            // --- pipeline 's_pipe' ---
             mbarrier_init(smem + 176, 1);
             mbarrier_init(smem + 184, 1);
-            mbarrier_init(smem + 192, 256);
-            mbarrier_init(smem + 200, 256);
+            mbarrier_init(smem + 192, 1);
+            mbarrier_init(smem + 200, 1);
+            // --- pipeline 's_pipe' ---
+            mbarrier_init(smem + 208, 1);
+            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 224, 256);
+            mbarrier_init(smem + 232, 256);
             // --- pipeline 'p_pipe' ---
-            mbarrier_init(smem + 208, 256);
-            mbarrier_init(smem + 216, 256);
-            mbarrier_init(smem + 224, 1);
-            mbarrier_init(smem + 232, 1);
             mbarrier_init(smem + 240, 256);
-            mbarrier_init(smem + 248, 1);
+            mbarrier_init(smem + 248, 256);
+            mbarrier_init(smem + 256, 1);
+            mbarrier_init(smem + 264, 1);
+            mbarrier_init(smem + 272, 256);
+            mbarrier_init(smem + 280, 1);
             asm volatile("fence.mbarrier_init.release.cluster;");
         }
     }
@@ -462,9 +483,9 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 256);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 288);
     if (warp == 12) {
-        int _tmem_hold = smem + 256;
+        int _tmem_hold = smem + 288;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -500,11 +521,11 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             unsigned int head_1 = (unsigned int)blockIdx.y / blocks_per_head_1;
             unsigned int row_begin = (unsigned int)blockIdx.y % blocks_per_head_1 * 128;
             unsigned int output_col = blockIdx.x * 256;
-            int _vec_load_5[1];
+            int _vec_load_2[1];
             {
-                _vec_load_5[0] = *reinterpret_cast<const int*>(kv_cache_list.sequence_lengths + blockIdx.z);
+                _vec_load_2[0] = *reinterpret_cast<const int*>(kv_cache_list.sequence_lengths + blockIdx.z);
             }
-            unsigned int length = (unsigned int)_vec_load_5[0];
+            unsigned int length = (unsigned int)_vec_load_2[0];
             unsigned int num_tiles = (length + 63) / 64;
             int row_base = warp % 4 * 32 << 16;
             unsigned int my_row = warp % 4 * 32 + lane;
@@ -515,38 +536,38 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             unsigned int mask_stride = (q_seq_len + 31) / 32;
             unsigned int _min_0 = ((query_token) < (actual_q - 1) ? (query_token) : (actual_q - 1));
             unsigned int mask_row = (request_offset + _min_0) * mask_stride;
-            unsigned int _vec_load_6[1];
+            unsigned int _vec_load_3[1];
             {
-                _vec_load_6[0] = *reinterpret_cast<const unsigned int*>(mask + mask_row);
+                _vec_load_3[0] = *reinterpret_cast<const unsigned int*>(mask + mask_row);
             }
-            unsigned int mw0 = _vec_load_6[0];
+            unsigned int mw0 = _vec_load_3[0];
             unsigned int mw1 = 0;
             unsigned int mw2 = 0;
             unsigned int mw3 = 0;
             unsigned int zero32 = 0;
             if (mask_stride > 1) {
-                unsigned int _vec_load_7[1];
+                unsigned int _vec_load_4[1];
                 {
-                    _vec_load_7[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + 1));
+                    _vec_load_4[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + 1));
                 }
-                mw1 = _vec_load_7[0];
+                mw1 = _vec_load_4[0];
             }
             if (mask_stride > 2) {
-                unsigned int _vec_load_8[1];
+                unsigned int _vec_load_5[1];
                 {
-                    _vec_load_8[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + 2));
+                    _vec_load_5[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + 2));
                 }
-                mw2 = _vec_load_8[0];
+                mw2 = _vec_load_5[0];
             }
             if (mask_stride > 3) {
-                unsigned int _vec_load_9[1];
+                unsigned int _vec_load_6[1];
                 {
-                    _vec_load_9[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + 3));
+                    _vec_load_6[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + 3));
                 }
-                mw3 = _vec_load_9[0];
+                mw3 = _vec_load_6[0];
             }
             unsigned int pk[16];
-            float scale = attention_scale * 1.4426950408889634f * k_cache_scale;
+            float scale = attention_scale * 1.442695f * k_cache_scale;
             float m_used = -CUDART_INF_F;
             float row_sum = 0.0f;
             unsigned int sm_s_stage = 0;
@@ -755,26 +776,26 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                         } else {
                             int _max_3 = ((tree0) > (0) ? (tree0) : (0));
                             unsigned int word0 = _max_3 >> 5;
-                            unsigned int _vec_load_10[1];
+                            unsigned int _vec_load_7[1];
                             {
-                                _vec_load_10[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + word0));
+                                _vec_load_7[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + word0));
                             }
-                            unsigned int w0 = _vec_load_10[0];
+                            unsigned int w0 = _vec_load_7[0];
                             unsigned int w1 = 0;
                             unsigned int w2 = 0;
                             if (mask_stride > word0 + 1) {
-                                unsigned int _vec_load_11[1];
+                                unsigned int _vec_load_8[1];
                                 {
-                                    _vec_load_11[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + word0 + 1));
+                                    _vec_load_8[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + word0 + 1));
                                 }
-                                w1 = _vec_load_11[0];
+                                w1 = _vec_load_8[0];
                             }
                             if (mask_stride > word0 + 2) {
-                                unsigned int _vec_load_12[1];
+                                unsigned int _vec_load_9[1];
                                 {
-                                    _vec_load_12[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + word0 + 2));
+                                    _vec_load_9[0] = *reinterpret_cast<const unsigned int*>(mask + (mask_row + word0 + 2));
                                 }
-                                w2 = _vec_load_12[0];
+                                w2 = _vec_load_9[0];
                             }
                             int _max_0 = ((tree0) > (0) ? (tree0) : (0));
                             _tmem_load_0[0] = ((tree0 + col0 < 0 || ((((tree0 + col0 >> 5) - (_max_0 >> 5) == 0) ? w0 : (((tree0 + col0 >> 5) - (_max_0 >> 5) == 1) ? w1 : w2)) >> (unsigned int)(tree0 + col0 & 31) & 1) != 0) ? _tmem_load_0[0] : -CUDART_INF_F);
@@ -1266,15 +1287,15 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             unsigned int head_2 = (unsigned int)blockIdx.y / blocks_per_head_2;
             unsigned int row_begin_1 = (unsigned int)blockIdx.y % blocks_per_head_2 * 128;
             unsigned int output_col_1 = blockIdx.x * 256;
-            int _vec_load_3[1];
+            int _vec_load_0[1];
             {
-                _vec_load_3[0] = *reinterpret_cast<const int*>(kv_cache_list.sequence_lengths + blockIdx.z);
+                _vec_load_0[0] = *reinterpret_cast<const int*>(kv_cache_list.sequence_lengths + blockIdx.z);
             }
-            unsigned int length_1 = (unsigned int)_vec_load_3[0];
+            unsigned int length_1 = (unsigned int)_vec_load_0[0];
             unsigned int num_tiles_1 = (length_1 + 63) / 64;
             int warp_id_in_role = (warp - 8);
             unsigned int tid_1 = (unsigned int)(warp_id_in_role * 32) + lane;
-            unsigned int zero_0 = 0;
+            unsigned int zero = 0;
             unsigned int conv_stage = 0;
             unsigned int _phase_landed = 0;
             #pragma unroll 1
@@ -1297,8 +1318,8 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                         if (valid_1 < 64) {
                             unsigned int f16_base = conv_stage * 16384;
                             for (unsigned int g = valid_1 * 8 + tid_1; g < 512; g += 128) {
-                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base + g * 16)), "r"(zero_0), "r"(zero_0), "r"(zero_0), "r"(zero_0) : "memory");
-                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base + 8192 + g * 16)), "r"(zero_0), "r"(zero_0), "r"(zero_0), "r"(zero_0) : "memory");
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base + g * 16)), "r"(zero), "r"(zero), "r"(zero), "r"(zero) : "memory");
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base + 8192 + g * 16)), "r"(zero), "r"(zero), "r"(zero), "r"(zero) : "memory");
                             }
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         }
@@ -1318,8 +1339,8 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                 if (valid_2 < 64) {
                     unsigned int f16_base_1 = conv_stage * 16384;
                     for (unsigned int g_1 = valid_2 * 8 + tid_1; g_1 < 512; g_1 += 128) {
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base_1 + g_1 * 16)), "r"(zero_0), "r"(zero_0), "r"(zero_0), "r"(zero_0) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base_1 + 8192 + g_1 * 16)), "r"(zero_0), "r"(zero_0), "r"(zero_0), "r"(zero_0) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base_1 + g_1 * 16)), "r"(zero), "r"(zero), "r"(zero), "r"(zero) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sk_addr + (f16_base_1 + 8192 + g_1 * 16)), "r"(zero), "r"(zero), "r"(zero), "r"(zero) : "memory");
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 }
@@ -1351,11 +1372,11 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             unsigned int head_3 = (unsigned int)blockIdx.y / blocks_per_head_3;
             unsigned int row_begin_2 = (unsigned int)blockIdx.y % blocks_per_head_3 * 128;
             unsigned int output_col_2 = blockIdx.x * 256;
-            int _vec_load_4[1];
+            int _vec_load_1[1];
             {
-                _vec_load_4[0] = *reinterpret_cast<const int*>(kv_cache_list.sequence_lengths + blockIdx.z);
+                _vec_load_1[0] = *reinterpret_cast<const int*>(kv_cache_list.sequence_lengths + blockIdx.z);
             }
-            unsigned int length_2 = (unsigned int)_vec_load_4[0];
+            unsigned int length_2 = (unsigned int)_vec_load_1[0];
             unsigned int num_tiles_2 = (length_2 + 63) / 64;
             unsigned int mma_stage = 0;
             unsigned int qk_stage = 0;
@@ -1366,6 +1387,10 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             unsigned int _phase_q_ready_1 = 0;
             unsigned int _phase_q_ready_2 = 0;
             unsigned int _phase_q_ready_3 = 0;
+            unsigned int _phase_q_ready_4 = 0;
+            unsigned int _phase_q_ready_5 = 0;
+            unsigned int _phase_q_ready_6 = 0;
+            unsigned int _phase_q_ready_7 = 0;
             unsigned int _phase_p_full = 0;
             #pragma unroll 1
             for (unsigned int tile_2 = 0; tile_2 < num_tiles_2; tile_2++) {
@@ -1375,80 +1400,42 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     _phase_q_ready_0 ^= 1;
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_0 = (_mma_base_lo_0) + (0) * 8192;
-                        int _smem_desc_lo_1 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 1018;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_s0), "r"(0) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
+                    int _smem_desc_lo_0 = (_mma_base_lo_0) + (0) * 8192;
+                    int _smem_desc_lo_1 = (_mma_base_lo_1) + (mma_stage) * 1024;
+                    {
+                        uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_0);
+                        uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_1);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135266320, 0);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135266320, 1);
+                        }
                     }
-                    mma_stage += 1;
-                    if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(q_ready_addr + 8, _phase_q_ready_1, 10000000);
                     _phase_q_ready_1 ^= 1;
-                    mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_2 = (_mma_base_lo_2) + (0) * 8192;
-                        int _smem_desc_lo_3 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_3 = elect_sync();
+                    int _smem_desc_lo_4 = (_mma_base_lo_2) + (0) * 8192;
+                    int _smem_desc_lo_5 = (_mma_base_lo_3) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1459,126 +1446,67 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 1018;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_s0), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_s0), "r"(1), "r"(_elected_3) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_3);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(q_ready_addr + 16, _phase_q_ready_2, 10000000);
                     _phase_q_ready_2 ^= 1;
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_4 = (_mma_base_lo_3) + (0) * 8192;
-                        int _smem_desc_lo_5 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 1018;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_s0), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
+                    int _smem_desc_lo_6 = (_mma_base_lo_4) + (0) * 8192;
+                    int _smem_desc_lo_7 = (_mma_base_lo_1) + (mma_stage) * 1024;
+                    {
+                        uint64_t _mma_ss_a_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_6);
+                        uint64_t _mma_ss_b_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_7);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_8, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_8, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_8, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_8, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_8, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_8, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 135266320, 1);
+                        }
                     }
-                    mma_stage += 1;
-                    if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(q_ready_addr + 24, _phase_q_ready_3, 10000000);
                     _phase_q_ready_3 ^= 1;
-                    mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_6 = (_mma_base_lo_4) + (0) * 8192;
-                        int _smem_desc_lo_7 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_9 = elect_sync();
+                    int _smem_desc_lo_10 = (_mma_base_lo_5) + (0) * 8192;
+                    int _smem_desc_lo_11 = (_mma_base_lo_3) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1589,60 +1517,181 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 1018;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"(tmem_s0), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
+                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_s0), "r"(1), "r"(_elected_9) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_9);
+                    mma_stage += 1;
+                    if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
+                    mbarrier_wait_hint(q_ready_addr + 32, _phase_q_ready_4, 10000000);
+                    _phase_q_ready_4 ^= 1;
+                    mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int _smem_desc_lo_12 = (_mma_base_lo_6) + (0) * 8192;
+                    int _smem_desc_lo_13 = (_mma_base_lo_1) + (mma_stage) * 1024;
+                    {
+                        uint64_t _mma_ss_a_desc_14 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_12);
+                        uint64_t _mma_ss_b_desc_14 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_13);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_14, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_14, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_14, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_14, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_14, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_14, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 135266320, 1);
+                        }
                     }
+                    mbarrier_wait_hint(q_ready_addr + 40, _phase_q_ready_5, 10000000);
+                    _phase_q_ready_5 ^= 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    uint32_t _elected_15 = elect_sync();
+                    int _smem_desc_lo_16 = (_mma_base_lo_7) + (0) * 8192;
+                    int _smem_desc_lo_17 = (_mma_base_lo_3) + (mma_stage) * 1024;
+                    asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "setp.ne.b32 leader, %4, 0;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(_smem_desc_lo_16), "r"(_smem_desc_lo_17), "r"(tmem_s0), "r"(1), "r"(_elected_15) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_15);
+                    mma_stage += 1;
+                    if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
+                    mbarrier_wait_hint(q_ready_addr + 48, _phase_q_ready_6, 10000000);
+                    _phase_q_ready_6 ^= 1;
+                    mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int _smem_desc_lo_18 = (_mma_base_lo_8) + (0) * 8192;
+                    int _smem_desc_lo_19 = (_mma_base_lo_1) + (mma_stage) * 1024;
+                    {
+                        uint64_t _mma_ss_a_desc_20 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_18);
+                        uint64_t _mma_ss_b_desc_20 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_smem_desc_lo_19);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_20, _mma_ss_b_desc_20, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_20, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_20, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_20, _mma_ss_b_desc_20, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_20, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_20, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_20, _mma_ss_b_desc_20, 135266320, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_20, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_20, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f16(tmem_s0, _mma_ss_a_desc_20, _mma_ss_b_desc_20, 135266320, 1);
+                        }
+                    }
+                    mbarrier_wait_hint(q_ready_addr + 56, _phase_q_ready_7, 10000000);
+                    _phase_q_ready_7 ^= 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    uint32_t _elected_21 = elect_sync();
+                    int _smem_desc_lo_22 = (_mma_base_lo_9) + (0) * 8192;
+                    int _smem_desc_lo_23 = (_mma_base_lo_3) + (mma_stage) * 1024;
+                    asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "setp.ne.b32 leader, %4, 0;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(_smem_desc_lo_22), "r"(_smem_desc_lo_23), "r"(tmem_s0), "r"(1), "r"(_elected_21) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_21);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                 } else if (qk_stage == 0) {
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_8 = (_mma_base_lo_0) + (0) * 8192;
-                        int _smem_desc_lo_9 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_24 = elect_sync();
+                    int _smem_desc_lo_25 = (_mma_base_lo_10) + (0) * 8192;
+                    int _smem_desc_lo_26 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1653,59 +1702,58 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"(tmem_s0), "r"(0) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_25), "r"(_smem_desc_lo_26), "r"(tmem_s0), "r"(0), "r"(_elected_24) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_24);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_10 = (_mma_base_lo_2) + (0) * 8192;
-                        int _smem_desc_lo_11 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_27 = elect_sync();
+                    int _smem_desc_lo_28 = (_mma_base_lo_12) + (0) * 8192;
+                    int _smem_desc_lo_29 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1716,59 +1764,58 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_s0), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_28), "r"(_smem_desc_lo_29), "r"(tmem_s0), "r"(1), "r"(_elected_27) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_27);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_12 = (_mma_base_lo_3) + (0) * 8192;
-                        int _smem_desc_lo_13 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_30 = elect_sync();
+                    int _smem_desc_lo_31 = (_mma_base_lo_13) + (0) * 8192;
+                    int _smem_desc_lo_32 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1779,59 +1826,58 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_12), "r"(_smem_desc_lo_13), "r"(tmem_s0), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_31), "r"(_smem_desc_lo_32), "r"(tmem_s0), "r"(1), "r"(_elected_30) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_30);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_14 = (_mma_base_lo_4) + (0) * 8192;
-                        int _smem_desc_lo_15 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_33 = elect_sync();
+                    int _smem_desc_lo_34 = (_mma_base_lo_14) + (0) * 8192;
+                    int _smem_desc_lo_35 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1842,60 +1888,59 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_14), "r"(_smem_desc_lo_15), "r"(tmem_s0), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_34), "r"(_smem_desc_lo_35), "r"(tmem_s0), "r"(1), "r"(_elected_33) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_33);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                 } else {
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_16 = (_mma_base_lo_0) + (0) * 8192;
-                        int _smem_desc_lo_17 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_36 = elect_sync();
+                    int _smem_desc_lo_37 = (_mma_base_lo_10) + (0) * 8192;
+                    int _smem_desc_lo_38 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1906,59 +1951,58 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_16), "r"(_smem_desc_lo_17), "r"(tmem_s1), "r"(0) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_37), "r"(_smem_desc_lo_38), "r"(tmem_s1), "r"(0), "r"(_elected_36) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_36);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_18 = (_mma_base_lo_2) + (0) * 8192;
-                        int _smem_desc_lo_19 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_39 = elect_sync();
+                    int _smem_desc_lo_40 = (_mma_base_lo_12) + (0) * 8192;
+                    int _smem_desc_lo_41 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -1969,59 +2013,58 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_18), "r"(_smem_desc_lo_19), "r"(tmem_s1), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_40), "r"(_smem_desc_lo_41), "r"(tmem_s1), "r"(1), "r"(_elected_39) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_39);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_20 = (_mma_base_lo_3) + (0) * 8192;
-                        int _smem_desc_lo_21 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_42 = elect_sync();
+                    int _smem_desc_lo_43 = (_mma_base_lo_13) + (0) * 8192;
+                    int _smem_desc_lo_44 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2032,59 +2075,58 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_20), "r"(_smem_desc_lo_21), "r"(tmem_s1), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_43), "r"(_smem_desc_lo_44), "r"(tmem_s1), "r"(1), "r"(_elected_42) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_42);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        int _smem_desc_lo_22 = (_mma_base_lo_4) + (0) * 8192;
-                        int _smem_desc_lo_23 = (_mma_base_lo_1) + (mma_stage) * 1024;
-                        asm volatile(
+                    uint32_t _elected_45 = elect_sync();
+                    int _smem_desc_lo_46 = (_mma_base_lo_14) + (0) * 8192;
+                    int _smem_desc_lo_47 = (_mma_base_lo_11) + (mma_stage) * 1024;
+                    asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2095,68 +2137,65 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 1018;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_22), "r"(_smem_desc_lo_23), "r"(tmem_s1), "r"(1) : "memory");
-                        tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                    }
+                    :: "r"(_smem_desc_lo_46), "r"(_smem_desc_lo_47), "r"(tmem_s1), "r"(1), "r"(_elected_45) : "memory");
+                    tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_45);
                     mma_stage += 1;
                     if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                 }
-                if (elect_sync()) {
-                    tcgen05_commit(s_full_addr + (qk_stage) * 8);
-                }
+                elect_commit(s_full_addr + (qk_stage) * 8);
                 qk_stage += 1;
                 if (qk_stage == 2) { qk_stage = 0; _phase_s_empty ^= 1; }
                 if (tile_2 > 0) {
                     mbarrier_wait_hint(p_full_addr + (pv_stage) * 8, _phase_p_full, 10000000);
-                    const bool _selected_wait_cond_24 = pv_stage == 0;
-                    mbarrier_wait((_selected_wait_cond_24 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_24 ? (_phase_ready) : (_phase_ready)));
-                    if (_selected_wait_cond_24) {
+                    const bool _selected_wait_cond_48 = pv_stage == 0;
+                    mbarrier_wait((_selected_wait_cond_48 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_48 ? (_phase_ready) : (_phase_ready)));
+                    if (_selected_wait_cond_48) {
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (elect_sync()) {
-                            int _smem_desc_lo_25 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                            asm volatile(
+                        uint32_t _elected_49 = elect_sync();
+                        int _smem_desc_lo_50 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2165,16 +2204,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_25), "r"(tmem_p0), "r"(((tile_2 - 1 == 0) ? 0 : 1)) : "memory");
-                            int _smem_desc_lo_26 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_50), "r"(tmem_p0), "r"(((tile_2 - 1 == 0) ? 0 : 1)), "r"(_elected_49) : "memory");
+                        int _smem_desc_lo_51 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2183,16 +2222,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_26), "r"(tmem_p0 + 8), "r"(1) : "memory");
-                            int _smem_desc_lo_27 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_51), "r"(tmem_p0 + 8), "r"(1), "r"(_elected_49) : "memory");
+                        int _smem_desc_lo_52 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2201,16 +2240,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_27), "r"(tmem_p0 + 16), "r"(1) : "memory");
-                            int _smem_desc_lo_28 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_52), "r"(tmem_p0 + 16), "r"(1), "r"(_elected_49) : "memory");
+                        int _smem_desc_lo_53 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2219,23 +2258,22 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_28), "r"(tmem_p0 + 24), "r"(1) : "memory");
-                            tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                        }
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_53), "r"(tmem_p0 + 24), "r"(1), "r"(_elected_49) : "memory");
+                        tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_49);
                         mma_stage += 1;
                         if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (elect_sync()) {
-                            int _smem_desc_lo_29 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                            asm volatile(
+                        uint32_t _elected_54 = elect_sync();
+                        int _smem_desc_lo_55 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2244,16 +2282,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_29), "r"(tmem_p0), "r"(((tile_2 - 1 == 0) ? 0 : 1)) : "memory");
-                            int _smem_desc_lo_30 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_55), "r"(tmem_p0), "r"(((tile_2 - 1 == 0) ? 0 : 1)), "r"(_elected_54) : "memory");
+                        int _smem_desc_lo_56 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2262,16 +2300,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_30), "r"(tmem_p0 + 8), "r"(1) : "memory");
-                            int _smem_desc_lo_31 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_56), "r"(tmem_p0 + 8), "r"(1), "r"(_elected_54) : "memory");
+                        int _smem_desc_lo_57 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2280,16 +2318,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_31), "r"(tmem_p0 + 16), "r"(1) : "memory");
-                            int _smem_desc_lo_32 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_57), "r"(tmem_p0 + 16), "r"(1), "r"(_elected_54) : "memory");
+                        int _smem_desc_lo_58 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2298,23 +2336,22 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_32), "r"(tmem_p0 + 24), "r"(1) : "memory");
-                            tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                        }
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_58), "r"(tmem_p0 + 24), "r"(1), "r"(_elected_54) : "memory");
+                        tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_54);
                         mma_stage += 1;
                         if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     } else {
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (elect_sync()) {
-                            int _smem_desc_lo_33 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                            asm volatile(
+                        uint32_t _elected_59 = elect_sync();
+                        int _smem_desc_lo_60 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2323,16 +2360,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_33), "r"(tmem_p1), "r"(((tile_2 - 1 == 0) ? 0 : 1)) : "memory");
-                            int _smem_desc_lo_34 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_60), "r"(tmem_p1), "r"(((tile_2 - 1 == 0) ? 0 : 1)), "r"(_elected_59) : "memory");
+                        int _smem_desc_lo_61 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2341,16 +2378,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_34), "r"(tmem_p1 + 8), "r"(1) : "memory");
-                            int _smem_desc_lo_35 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_61), "r"(tmem_p1 + 8), "r"(1), "r"(_elected_59) : "memory");
+                        int _smem_desc_lo_62 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2359,16 +2396,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_35), "r"(tmem_p1 + 16), "r"(1) : "memory");
-                            int _smem_desc_lo_36 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_62), "r"(tmem_p1 + 16), "r"(1), "r"(_elected_59) : "memory");
+                        int _smem_desc_lo_63 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2377,23 +2414,22 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_36), "r"(tmem_p1 + 24), "r"(1) : "memory");
-                            tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                        }
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_63), "r"(tmem_p1 + 24), "r"(1), "r"(_elected_59) : "memory");
+                        tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_59);
                         mma_stage += 1;
                         if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (elect_sync()) {
-                            int _smem_desc_lo_37 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                            asm volatile(
+                        uint32_t _elected_64 = elect_sync();
+                        int _smem_desc_lo_65 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2402,16 +2438,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_37), "r"(tmem_p1), "r"(((tile_2 - 1 == 0) ? 0 : 1)) : "memory");
-                            int _smem_desc_lo_38 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_65), "r"(tmem_p1), "r"(((tile_2 - 1 == 0) ? 0 : 1)), "r"(_elected_64) : "memory");
+                        int _smem_desc_lo_66 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2420,16 +2456,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_38), "r"(tmem_p1 + 8), "r"(1) : "memory");
-                            int _smem_desc_lo_39 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_66), "r"(tmem_p1 + 8), "r"(1), "r"(_elected_64) : "memory");
+                        int _smem_desc_lo_67 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2438,16 +2474,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_39), "r"(tmem_p1 + 16), "r"(1) : "memory");
-                            int _smem_desc_lo_40 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                            asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_67), "r"(tmem_p1 + 16), "r"(1), "r"(_elected_64) : "memory");
+                        int _smem_desc_lo_68 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                        asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2456,34 +2492,31 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_40), "r"(tmem_p1 + 24), "r"(1) : "memory");
-                            tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                        }
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_68), "r"(tmem_p1 + 24), "r"(1), "r"(_elected_64) : "memory");
+                        tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_64);
                         mma_stage += 1;
                         if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                     }
-                    if (elect_sync()) {
-                        tcgen05_commit(p_empty_addr + (pv_stage) * 8);
-                    }
+                    elect_commit(p_empty_addr + (pv_stage) * 8);
                     pv_stage += 1;
                     if (pv_stage == 2) { pv_stage = 0; _phase_p_full ^= 1; }
                 }
             }
             mbarrier_wait_hint(p_full_addr + (pv_stage) * 8, _phase_p_full, 10000000);
-            const bool _selected_wait_cond_41 = pv_stage == 0;
-            mbarrier_wait((_selected_wait_cond_41 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_41 ? (_phase_ready) : (_phase_ready)));
-            if (_selected_wait_cond_41) {
+            const bool _selected_wait_cond_69 = pv_stage == 0;
+            mbarrier_wait((_selected_wait_cond_69 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_69 ? (_phase_ready) : (_phase_ready)));
+            if (_selected_wait_cond_69) {
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                if (elect_sync()) {
-                    int _smem_desc_lo_42 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                    asm volatile(
+                uint32_t _elected_70 = elect_sync();
+                int _smem_desc_lo_71 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2492,16 +2525,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_42), "r"(tmem_p0), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)) : "memory");
-                    int _smem_desc_lo_43 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_71), "r"(tmem_p0), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)), "r"(_elected_70) : "memory");
+                int _smem_desc_lo_72 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2510,16 +2543,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_43), "r"(tmem_p0 + 8), "r"(1) : "memory");
-                    int _smem_desc_lo_44 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_72), "r"(tmem_p0 + 8), "r"(1), "r"(_elected_70) : "memory");
+                int _smem_desc_lo_73 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2528,16 +2561,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_44), "r"(tmem_p0 + 16), "r"(1) : "memory");
-                    int _smem_desc_lo_45 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_73), "r"(tmem_p0 + 16), "r"(1), "r"(_elected_70) : "memory");
+                int _smem_desc_lo_74 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2546,23 +2579,22 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_45), "r"(tmem_p0 + 24), "r"(1) : "memory");
-                    tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                }
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_74), "r"(tmem_p0 + 24), "r"(1), "r"(_elected_70) : "memory");
+                tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_70);
                 mma_stage += 1;
                 if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                 mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                if (elect_sync()) {
-                    int _smem_desc_lo_46 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                    asm volatile(
+                uint32_t _elected_75 = elect_sync();
+                int _smem_desc_lo_76 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2571,16 +2603,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_46), "r"(tmem_p0), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)) : "memory");
-                    int _smem_desc_lo_47 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_76), "r"(tmem_p0), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)), "r"(_elected_75) : "memory");
+                int _smem_desc_lo_77 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2589,16 +2621,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_47), "r"(tmem_p0 + 8), "r"(1) : "memory");
-                    int _smem_desc_lo_48 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_77), "r"(tmem_p0 + 8), "r"(1), "r"(_elected_75) : "memory");
+                int _smem_desc_lo_78 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2607,16 +2639,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_48), "r"(tmem_p0 + 16), "r"(1) : "memory");
-                    int _smem_desc_lo_49 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_78), "r"(tmem_p0 + 16), "r"(1), "r"(_elected_75) : "memory");
+                int _smem_desc_lo_79 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2625,23 +2657,22 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_49), "r"(tmem_p0 + 24), "r"(1) : "memory");
-                    tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                }
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_79), "r"(tmem_p0 + 24), "r"(1), "r"(_elected_75) : "memory");
+                tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_75);
                 mma_stage += 1;
                 if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
             } else {
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                if (elect_sync()) {
-                    int _smem_desc_lo_50 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                    asm volatile(
+                uint32_t _elected_80 = elect_sync();
+                int _smem_desc_lo_81 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2650,16 +2681,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_50), "r"(tmem_p1), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)) : "memory");
-                    int _smem_desc_lo_51 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_81), "r"(tmem_p1), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)), "r"(_elected_80) : "memory");
+                int _smem_desc_lo_82 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2668,16 +2699,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_51), "r"(tmem_p1 + 8), "r"(1) : "memory");
-                    int _smem_desc_lo_52 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_82), "r"(tmem_p1 + 8), "r"(1), "r"(_elected_80) : "memory");
+                int _smem_desc_lo_83 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2686,16 +2717,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_52), "r"(tmem_p1 + 16), "r"(1) : "memory");
-                    int _smem_desc_lo_53 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_83), "r"(tmem_p1 + 16), "r"(1), "r"(_elected_80) : "memory");
+                int _smem_desc_lo_84 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2704,23 +2735,22 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o0), "r"(_smem_desc_lo_53), "r"(tmem_p1 + 24), "r"(1) : "memory");
-                    tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                }
+                    :: "r"(tmem_o0), "r"(_smem_desc_lo_84), "r"(tmem_p1 + 24), "r"(1), "r"(_elected_80) : "memory");
+                tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_80);
                 mma_stage += 1;
                 if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
                 mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                if (elect_sync()) {
-                    int _smem_desc_lo_54 = (_mma_base_lo_5) + (mma_stage) * 1024;
-                    asm volatile(
+                uint32_t _elected_85 = elect_sync();
+                int _smem_desc_lo_86 = (_mma_base_lo_15) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2729,16 +2759,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_54), "r"(tmem_p1), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)) : "memory");
-                    int _smem_desc_lo_55 = (_mma_base_lo_6) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_86), "r"(tmem_p1), "r"(((num_tiles_2 - 1 == 0) ? 0 : 1)), "r"(_elected_85) : "memory");
+                int _smem_desc_lo_87 = (_mma_base_lo_16) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2747,16 +2777,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_55), "r"(tmem_p1 + 8), "r"(1) : "memory");
-                    int _smem_desc_lo_56 = (_mma_base_lo_7) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_87), "r"(tmem_p1 + 8), "r"(1), "r"(_elected_85) : "memory");
+                int _smem_desc_lo_88 = (_mma_base_lo_17) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2765,16 +2795,16 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_56), "r"(tmem_p1 + 16), "r"(1) : "memory");
-                    int _smem_desc_lo_57 = (_mma_base_lo_8) + (mma_stage) * 1024;
-                    asm volatile(
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_88), "r"(tmem_p1 + 16), "r"(1), "r"(_elected_85) : "memory");
+                int _smem_desc_lo_89 = (_mma_base_lo_18) + (mma_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -2783,27 +2813,21 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
                     "}\n"
-                    :: "r"(tmem_o1), "r"(_smem_desc_lo_57), "r"(tmem_p1 + 24), "r"(1) : "memory");
-                    tcgen05_commit_cg1_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
-                }
+                    :: "r"(tmem_o1), "r"(_smem_desc_lo_89), "r"(tmem_p1 + 24), "r"(1), "r"(_elected_85) : "memory");
+                tcgen05_commit_cg1_multicast_leader(free_addr + (mma_stage) * 8, (uint16_t)(15), _elected_85);
                 mma_stage += 1;
                 if (mma_stage == 6) { mma_stage = 0; _phase_ready ^= 1; }
             }
-            if (elect_sync()) {
-                tcgen05_commit(p_empty_addr + (pv_stage) * 8);
-            }
+            elect_commit(p_empty_addr + (pv_stage) * 8);
             pv_stage += 1;
             if (pv_stage == 2) { pv_stage = 0; _phase_p_full ^= 1; }
-            if (elect_sync()) {
-                tcgen05_commit(o_ready_addr);
-            }
+            elect_commit(o_ready_addr);
             unsigned int _phase_tmem_retire_0 = 0;
             mbarrier_wait_hint(tmem_retire_addr, _phase_tmem_retire_0, 10000000);
             _phase_tmem_retire_0 ^= 1;
-            int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.cluster.arrive.release;" ::: "memory");
             asm volatile("barrier.cluster.wait.acquire;" ::: "memory");
@@ -2815,15 +2839,31 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
         { // load_main
             asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
             asm volatile("tcgen05.fence::after_thread_sync;");
+            unsigned int info[4];
+            unsigned int zero_1 = 0;
+            info[1] = zero_1;
+            info[2] = zero_1;
+            {
+                info[0] = *reinterpret_cast<const unsigned int*>(kv_cache_list.sequence_lengths + blockIdx.z);
+            }
+            if ((unsigned long long)q_cu_seq_lens != 0) {
+                {
+                    info[1] = *reinterpret_cast<const unsigned int*>(q_cu_seq_lens + blockIdx.z);
+                }
+                {
+                    info[2] = *reinterpret_cast<const unsigned int*>(q_cu_seq_lens + (blockIdx.z + 1));
+                }
+            }
             unsigned int rank = (unsigned int)cta_rank;
             unsigned int blocks_per_head_4 = (unsigned int)gridDim.y / num_kv_heads;
             unsigned int head_4 = (unsigned int)blockIdx.y / blocks_per_head_4;
             unsigned int load_stage = 0;
-            unsigned int k0_token = info_hoisted[3] * 128;
             unsigned int tile0 = 0;
             unsigned int _phase_free = 1;
             #pragma unroll
             for (int c_1 = 0; c_1 < 4; c_1++) {
+                unsigned int kv_index = (unsigned int)(blockIdx.z * 2) * num_kv_heads + head_4;
+                unsigned int token = tile0 * 64;
                 mbarrier_wait_hint(free_addr + (load_stage) * 8, _phase_free, 10000000);
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(landed_addr + (load_stage) * 8, 16384);
@@ -2833,7 +2873,7 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h * 8192)), "l"((&KV)), "r"(c_1 * 128 + h * 64), "r"(head_4), "r"(k0_token),
+                                :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h * 8192)), "l"((&KV)), "r"(c_1 * 128 + h * 64), "r"(token), "r"(kv_index),
                                    "r"(landed_addr + (load_stage) * 8), "h"((uint16_t)(15)) : "memory");
                         }
                     }
@@ -2844,34 +2884,37 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             unsigned int actual_q_3 = q_seq_len;
             unsigned int request_offset_3 = q_seq_len * (unsigned int)blockIdx.z;
             if ((unsigned long long)q_cu_seq_lens != 0) {
-                request_offset_3 = info_hoisted[1];
-                actual_q_3 = info_hoisted[2] - info_hoisted[1];
+                request_offset_3 = info[1];
+                actual_q_3 = info[2] - info[1];
             }
             unsigned int blocks_per_head_0 = (unsigned int)gridDim.y / num_kv_heads;
             unsigned int row_begin_3 = (unsigned int)blockIdx.y % blocks_per_head_0 * 128;
             unsigned int output_col_3 = blockIdx.x * 256;
-            unsigned int length_3 = info_hoisted[0];
+            unsigned int length_3 = info[0];
             unsigned int num_tiles_3 = (length_3 + 63) / 64;
             unsigned int token0 = request_offset_3 + row_begin_3 / 8;
             #pragma unroll
             for (int pair_1 = 0; pair_1 < 4; pair_1++) {
                 if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(q_ready_addr + (pair_1) * 8, 32768);
+                    #pragma unroll
+                    for (int slab_1 = 2 * pair_1; slab_1 < 2 * pair_1 + 2; slab_1++) {
+                        mbarrier_arrive_expect_tx(q_ready_addr + (slab_1) * 8, 16384);
+                    }
                     if ((rank & 1) == (unsigned int)(pair_1 & 1)) {
                         #pragma unroll
-                        for (int slab_1 = 2 * pair_1; slab_1 < 2 * pair_1 + 2; slab_1++) {
+                        for (int slab_2 = 2 * pair_1; slab_2 < 2 * pair_1 + 2; slab_2++) {
                             if (rank >> 1 == 0) {
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(sq_addr + (unsigned int)(slab_1 * 16384)), "l"((&Q)), "r"(slab_1 * 64), "r"(head_4 * 8), "r"(token0),
-                                       "r"(q_ready_addr + (pair_1) * 8), "h"((uint16_t)(3)) : "memory");
+                                    :: "r"(sq_addr + (unsigned int)(slab_2 * 16384)), "l"((&Q)), "r"(slab_2 * 64), "r"(head_4 * 8), "r"(token0),
+                                       "r"(q_ready_addr + (slab_2) * 8), "h"((uint16_t)(3)) : "memory");
                             } else {
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(sq_addr + (unsigned int)(slab_1 * 16384)), "l"((&Q)), "r"(slab_1 * 64), "r"(head_4 * 8), "r"(token0),
-                                       "r"(q_ready_addr + (pair_1) * 8), "h"((uint16_t)(12)) : "memory");
+                                    :: "r"(sq_addr + (unsigned int)(slab_2 * 16384)), "l"((&Q)), "r"(slab_2 * 64), "r"(head_4 * 8), "r"(token0),
+                                       "r"(q_ready_addr + (slab_2) * 8), "h"((uint16_t)(12)) : "memory");
                             }
                         }
                     }
@@ -2885,16 +2928,8 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             for (unsigned int tile_3 = 1; tile_3 < num_tiles_3; tile_3++) {
                 #pragma unroll
                 for (int c_2 = 0; c_2 < 4; c_2++) {
-                    int page = 0;
-                    if (length_3 > tile_3 * 64) {
-                        unsigned int slot = (unsigned int)(blockIdx.z * 2) * kv_cache_list.max_pages + tile_3 * 64 / 128;
-                        int _vec_load_0[1];
-                        {
-                            _vec_load_0[0] = *reinterpret_cast<const int*>(kv_cache_list.page_list + slot);
-                        }
-                        page = _vec_load_0[0];
-                    }
-                    unsigned int token = (unsigned int)page * 128 + tile_3 * 64 % 128;
+                    unsigned int kv_index_1 = (unsigned int)(blockIdx.z * 2) * num_kv_heads + head_4;
+                    unsigned int token_1 = tile_3 * 64;
                     mbarrier_wait_hint(free_addr + (load_stage) * 8, _phase_free, 10000000);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(landed_addr + (load_stage) * 8, 16384);
@@ -2904,7 +2939,7 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_1 * 8192)), "l"((&KV)), "r"(c_2 * 128 + h_1 * 64), "r"(head_4), "r"(token),
+                                    :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_1 * 8192)), "l"((&KV)), "r"(c_2 * 128 + h_1 * 64), "r"(token_1), "r"(kv_index_1),
                                        "r"(landed_addr + (load_stage) * 8), "h"((uint16_t)(15)) : "memory");
                             }
                         }
@@ -2915,16 +2950,8 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                 if (tile_3 > 0) {
                     #pragma unroll
                     for (int v_2 = 0; v_2 < 2; v_2++) {
-                        int page_1 = 0;
-                        if (length_3 > (tile_3 - 1) * 64) {
-                            unsigned int slot_1 = (unsigned int)(blockIdx.z * 2 + 1) * kv_cache_list.max_pages + (tile_3 - 1) * 64 / 128;
-                            int _vec_load_1[1];
-                            {
-                                _vec_load_1[0] = *reinterpret_cast<const int*>(kv_cache_list.page_list + slot_1);
-                            }
-                            page_1 = _vec_load_1[0];
-                        }
-                        unsigned int token_1 = (unsigned int)page_1 * 128 + (tile_3 - 1) * 64 % 128;
+                        unsigned int kv_index_2 = (unsigned int)(blockIdx.z * 2 + 1) * num_kv_heads + head_4;
+                        unsigned int token_2 = (tile_3 - 1) * 64;
                         mbarrier_wait_hint(free_addr + (load_stage) * 8, _phase_free, 10000000);
                         if (elect_sync()) {
                             mbarrier_arrive_expect_tx(landed_addr + (load_stage) * 8, 16384);
@@ -2935,13 +2962,13 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                                         asm volatile(
                                             "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                            :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_2 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_2 * 128) + (unsigned int)(h_2 * 64)), "r"(head_4), "r"(token_1),
+                                            :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_2 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_2 * 128) + (unsigned int)(h_2 * 64)), "r"(token_2), "r"(kv_index_2),
                                                "r"(landed_addr + (load_stage) * 8), "h"((uint16_t)(5)) : "memory");
                                     } else {
                                         asm volatile(
                                             "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                            :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_2 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_2 * 128) + (unsigned int)(h_2 * 64)), "r"(head_4), "r"(token_1),
+                                            :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_2 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_2 * 128) + (unsigned int)(h_2 * 64)), "r"(token_2), "r"(kv_index_2),
                                                "r"(landed_addr + (load_stage) * 8), "h"((uint16_t)(10)) : "memory");
                                     }
                                 }
@@ -2954,16 +2981,8 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
             }
             #pragma unroll
             for (int v_3 = 0; v_3 < 2; v_3++) {
-                int page_2 = 0;
-                if (length_3 > (num_tiles_3 - 1) * 64) {
-                    unsigned int slot_2 = (unsigned int)(blockIdx.z * 2 + 1) * kv_cache_list.max_pages + (num_tiles_3 - 1) * 64 / 128;
-                    int _vec_load_2[1];
-                    {
-                        _vec_load_2[0] = *reinterpret_cast<const int*>(kv_cache_list.page_list + slot_2);
-                    }
-                    page_2 = _vec_load_2[0];
-                }
-                unsigned int token_2 = (unsigned int)page_2 * 128 + (num_tiles_3 - 1) * 64 % 128;
+                unsigned int kv_index_3 = (unsigned int)(blockIdx.z * 2 + 1) * num_kv_heads + head_4;
+                unsigned int token_3 = (num_tiles_3 - 1) * 64;
                 mbarrier_wait_hint(free_addr + (load_stage) * 8, _phase_free, 10000000);
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(landed_addr + (load_stage) * 8, 16384);
@@ -2974,13 +2993,13 @@ kernel_cake_sm110_xqa_f33996e73152ed4684d8(const __grid_constant__ CUtensorMap Q
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_3 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_3 * 128) + (unsigned int)(h_3 * 64)), "r"(head_4), "r"(token_2),
+                                    :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_3 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_3 * 128) + (unsigned int)(h_3 * 64)), "r"(token_3), "r"(kv_index_3),
                                        "r"(landed_addr + (load_stage) * 8), "h"((uint16_t)(5)) : "memory");
                             } else {
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_3 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_3 * 128) + (unsigned int)(h_3 * 64)), "r"(head_4), "r"(token_2),
+                                    :: "r"(sk_addr + load_stage * 16384 + (unsigned int)(h_3 * 8192)), "l"((&KV)), "r"(output_col_3 + (unsigned int)(v_3 * 128) + (unsigned int)(h_3 * 64)), "r"(token_3), "r"(kv_index_3),
                                        "r"(landed_addr + (load_stage) * 8), "h"((uint16_t)(10)) : "memory");
                             }
                         }

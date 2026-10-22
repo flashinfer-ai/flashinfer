@@ -401,7 +401,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
-        "kernel_symbol": "kernel_cake_sm110_xqa_540d778c6d72fe04ef66",
+        "kernel_symbol": "kernel_cake_sm110_xqa_09a5cd2e68fb4fbe4ec9",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 2, 1),
@@ -409,7 +409,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 232448,
             "use_pdl": False,
         },
-        "library": "cake_sm110_xqa_540d778c6d72fe04ef66",
+        "library": "cake_sm110_xqa_09a5cd2e68fb4fbe4ec9",
         "logical": {
             "KV": "KV",
             "Q": "Q",
@@ -882,7 +882,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
-        "kernel_symbol": "kernel_cake_sm110_xqa_f33996e73152ed4684d8",
+        "kernel_symbol": "kernel_cake_sm110_xqa_a4f5ce3e09448c9c190a",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 2, 1),
@@ -890,7 +890,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 232448,
             "use_pdl": False,
         },
-        "library": "cake_sm110_xqa_f33996e73152ed4684d8",
+        "library": "cake_sm110_xqa_a4f5ce3e09448c9c190a",
         "logical": {
             "KV": "KV",
             "Q": "Q",
