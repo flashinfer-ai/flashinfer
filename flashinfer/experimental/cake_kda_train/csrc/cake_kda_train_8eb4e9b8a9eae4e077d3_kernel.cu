@@ -234,7 +234,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_007ea6c08cff5df30288(const __grid_constant__ CUtensorMap kg_tma, const __grid_constant__ CUtensorMap qg_tma, const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap do_tma, const __grid_constant__ CUtensorMap aqk_tma, float* __restrict__ gk, const __grid_constant__ CUtensorMap dh_out, const __grid_constant__ CUtensorMap dv2, int num_heads, int* __restrict__ seq_chunk_start, float scale, int* __restrict__ seq_order, int* __restrict__ chunk_bos, int* __restrict__ chunk_len)
+kernel_cake_kda_train_8eb4e9b8a9eae4e077d3(const __grid_constant__ CUtensorMap kg_tma, const __grid_constant__ CUtensorMap qg_tma, const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap do_tma, const __grid_constant__ CUtensorMap aqk_tma, float* __restrict__ gk, const __grid_constant__ CUtensorMap dh_out, const __grid_constant__ CUtensorMap dv2, int num_heads, int* __restrict__ seq_chunk_start, float scale, int* __restrict__ seq_order, int* __restrict__ chunk_bos, int* __restrict__ chunk_len)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -712,6 +712,17 @@ kernel_cake_kda_train_007ea6c08cff5df30288(const __grid_constant__ CUtensorMap k
                             tma_3d_gmem2smem(w_panel_addr + (unsigned int)(seg_5 * 8192), (&w_tma), seg_5 * 64, head_1, trow - 64, w_full_addr + (ws) * 8);
                         }
                         _phase_w_empty ^= 1;
+                    }
+                    if (nc_1 > rc_1 + 2) {
+                        if (blockIdx.x % 4 == 0) {
+                            int trow2 = trow - 128;
+                            #pragma unroll
+                            for (int seg_6 = 0; seg_6 < 2; seg_6++) {
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&kg_tma))), "r"((int)(seg_6 * 64)), "r"((int)(head_1)), "r"((int)(trow2)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&qg_tma))), "r"((int)(seg_6 * 64)), "r"((int)(head_1)), "r"((int)(trow2)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&w_tma))), "r"((int)(seg_6 * 64)), "r"((int)(head_1)), "r"((int)(trow2)) : "memory");
+                            }
+                        }
                     }
                 }
                 asm volatile("cp.async.bulk.wait_group 0;");

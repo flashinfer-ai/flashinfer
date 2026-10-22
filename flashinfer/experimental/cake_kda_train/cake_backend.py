@@ -27,8 +27,11 @@ of 1 is optional on every operand and the outputs take the rank of the inputs.
 Every operand is contiguous; a strided view is refused, never copied.
 
 The host reads no tensor contents: the chunk tables are built on the device
-from ``cu_seqlens`` by the ``table`` program (the segmented route's block table
-too, by ``table_v3``, up to 256 documents; by ``seg_table`` above), the
+from ``cu_seqlens`` -- on the segmented route up to 256 documents by the intra
+program ``fwd_intra_v14`` (the block table too; no table launch) on the forward
+and the replay and by ``table_v3`` where a saved-set path rebuilds them, else
+by the ``table`` program (``table_v2`` on the serial route up to 256 documents;
+``seg_table`` writes the segmented route's block table above) -- the
 chunk-shaped programs launch at the host bound
 ``num_chunks_pad`` and treat ``chunk_len == 0`` as a no-op, and the persistent
 programs read the real chunk count from ``seq_chunk_start[num_docs]``.  Which
@@ -38,16 +41,23 @@ and the path of the call (:data:`cake_jit.PATHS`) through the rules of
 :mod:`.cake_jit`.  Every launch is ``cake_jit.run_module`` with a plan grid;
 nothing here synchronizes or reads device memory.
 
-Launch sequences.  Forward: table (+ seg_table above 256 documents on the
-segmented route), intra (``Aqk`` / ``Akk`` and
+Launch sequences.  Forward: table (the serial route; the segmented route above
+256 documents, with ``seg_table`` after it; up to 256 documents the segmented
+route's intra program writes the tables and no table runs), intra (``Aqk`` /
+``Akk`` and
 the GLM prep's outputs: the gated keys / queries, the gate row and the
 ``v_new`` pads), then on the serial route (more than eight heads)
 the state recurrence, which forms the output itself and, from 32 heads, the
 WY representation too (below that ``wy_fwd`` runs first, forming the gated
 values from the user's ``v`` / ``beta`` token rows), and on the segmented
 route (at most eight heads) ``wy_fwd``, pass 1 of the recurrence, ``seg_carry``
-and pass 2 (which forms the output).  Backward: GLM prep, [intra on the
-checkpoint-replay path], [WY], [the state recurrence recompute], [dA / dv],
+and pass 2 (which forms the output).  With ``save_for_backward`` (the ``fwd``
+path) the recurrence and WY programs read the saved ``Aqk`` / ``Akk`` token rows
+where a program for them ships and the intra program writes no internal copies;
+without it (``fwd_nosave``) the internal-row forms run.  Backward: GLM prep, [intra on the
+checkpoint-replay path: before the prep where the intra program writes the
+tables the prep reads, after it otherwise], [WY], [the state recurrence
+recompute], [dA / dv],
 the adjoint state recurrence, the fused dq / dk / dg, GLM intra, the gate
 epilogue.  The bracketed launches depend on the path and the row: from a
 version-2 (tape) saved set there is no recurrence recompute; from a version-3
@@ -139,9 +149,12 @@ TABLE_NAMES = (
     "seg_table",
 )
 # The stages each path launches, in registry order (``seg_carry`` where the segmented route launches a
-# recurrence; the tables only when the saved set carries none).
+# recurrence; the tables only when the saved set carries none).  The two forward paths launch the same stages:
+# their records differ (the saving forward's token-row forms).
+_FWD_STAGES = tuple(s for s in STAGES if s in STAGES_FWD or s == "seg_carry")
 _PATH_STAGES: dict[str, tuple[str, ...]] = {
-    "fwd": tuple(s for s in STAGES if s in STAGES_FWD or s == "seg_carry"),
+    "fwd": _FWD_STAGES,
+    "fwd_nosave": _FWD_STAGES,
     "replay": tuple(
         s
         for s in STAGES
@@ -173,6 +186,32 @@ def _geometry(S: int, num_docs: int) -> tuple[int, int, int]:
     nc_max = -(-S // BT) + num_docs
     nc_pad = nc_max + nc_max % 2
     return nc_max, nc_pad, nc_pad * BT
+
+
+def _check_problem(
+    S: int, num_docs: int, H: int, sm_count: int
+) -> tuple[int, int, int]:
+    """``(NC_max, NC_pad, R)`` of a problem within the host's limits (:func:`_geometry`); ``ValueError`` when a
+    scalar is below one, ``num_docs`` exceeds :data:`MAX_DOCS` (the depth of the layout table's document search)
+    or an int32 offset of the kernels would overflow: ``H * 128 * 64`` per chunk, ``R * H * 64`` over the padded
+    rows of the ``[R, H, 64]`` intra-chunk buffers.  :func:`plan` and the byte queries share these checks."""
+    if S < 1 or num_docs < 1 or H < 1 or sm_count < 1:
+        raise ValueError(
+            f"plan: S={S}, num_docs={num_docs}, H={H}, sm_count={sm_count} must all be >= 1"
+        )
+    if H * D * BT >= 2**31:
+        raise ValueError(f"plan: H={H} overflows the kernels' per-chunk int32 offsets")
+    if num_docs > MAX_DOCS:
+        raise ValueError(
+            f"plan: num_docs={num_docs} exceeds {MAX_DOCS}, the depth of the layout table's document search"
+        )
+    nc_max, nc_pad, rows = _geometry(S, num_docs)
+    if rows * H * BT >= 2**31:
+        raise ValueError(
+            f"plan: R={rows} padded rows (S={S}, num_docs={num_docs}) x H={H} overflow the kernels' int32 "
+            f"row-head offsets: R * H * 64 must stay below 2**31"
+        )
+    return nc_max, nc_pad, rows
 
 
 @dataclasses.dataclass(frozen=True)
@@ -243,6 +282,19 @@ class Plan:
     def grid(self, stage: str, path: str, launch: int = 0) -> tuple[int, int, int]:
         return self.grids[self.record(stage, path)][launch]
 
+    def internal_rows(self, path: str) -> bool:
+        """Whether the intra program writes the internal-layout ``Aqk`` / ``Akk`` copies on ``path`` (its
+        ``write_int``): a record of the path other than the intra program itself binds ``aqk_int`` or ``akk_int``.
+        On the saving forward (``"fwd"``) the fused serial recurrence (``fwdh_wy_rows``) and the overlap rows' WY and
+        pass-2 programs (``wy_fwd_rows``, ``fwdh_p3_o_ov_rows`` / ``fwdh_p3_o_ov_id_rows``) read the saved token rows
+        instead, so no copy is written there; the forward without a saved set (``"fwd_nosave"``) and the replay keep
+        the internal-row forms and the copies."""
+        return any(
+            {"aqk_int", "akk_int"} & set(cake_jit.MODULES[name]["logical"].values())
+            for stage, name in self._records(path).items()
+            if name is not None and stage != "fwd_intra"
+        )
+
     @property
     def seg_save(self) -> bool:
         """Whether the light forward of this plan saves the segment-boundary states (``hseg``, ``seg_state``):
@@ -271,18 +323,21 @@ class Plan:
         """Programs launched by one call on ``path`` (a path name, or ``"bwd"`` for the backward from this plan's
         own light saved set, :attr:`light_path`).  A saved set carries the tables (``tables=True``): the table
         programs are not launched; ``tables=False`` counts the backward from a set whose tables the caller dropped
-        (they are built again).  The forward and the replay always build them."""
+        (they are built again).  The forward and the replay build them where the plan dispatches a table program
+        (the segmented route's intra program writes them up to 256 documents: no table launch there)."""
         if path == "bwd":
             path = self.light_path
         count = 0
         for stage in self.stages(path):
             if stage in ("table", "seg_table"):
-                if (not tables) or path in ("fwd", "replay"):
+                if (not tables) or path in ("fwd", "fwd_nosave", "replay"):
                     count += 1
             elif stage == "seg_carry":
                 # the forward recurrence's carry where its pass 1 runs, the adjoint recurrence's on every
                 # backward path
-                count += int(self.dispatched("fwdh", path)) + int(path != "fwd")
+                count += int(self.dispatched("fwdh", path)) + int(
+                    path not in ("fwd", "fwd_nosave")
+                )
             else:
                 count += self.launches(stage, path)
         return count
@@ -294,16 +349,19 @@ class Plan:
         return _layout(self.R, self.H, self.NC_pad, self.NSEG, mode)
 
     def workspace_bytes(self, mode: str = "bwd") -> int:
-        return max((r.offset + r.nbytes for r in self.layout(mode)), default=0)
+        return _mode_bytes(self.R, self.H, self.NC_pad, self.NSEG, mode)
 
     def arena_bytes(self, *, backward: bool = True, save_mode: str = "light") -> int:
         """The arena a :class:`KdaWorkspace` of this plan allocates: the larger of the saved-set and the replay
         layouts for a backward workspace (both paths run in it), the forward layout otherwise."""
-        tape = save_mode == "tape"
-        if not backward:
-            return self.workspace_bytes("fwd_tape" if tape else "fwd")
-        modes = ("bwd_tape", "replay_tape") if tape else ("bwd", "replay")
-        return max(self.workspace_bytes(mode) for mode in modes)
+        return _arena_bytes(
+            self.R,
+            self.H,
+            self.NC_pad,
+            self.NSEG,
+            backward=backward,
+            save_mode=save_mode,
+        )
 
     def table_layout(self) -> tuple[tuple[str, int, int], ...]:
         """``(name, word offset, words)`` of the tables inside one int32 buffer, each 256 B aligned: ``chunk_bos``,
@@ -319,34 +377,19 @@ class Plan:
 def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) -> Plan:
     """The :class:`Plan` of a packed problem; reads no tensor.
 
-    ``arch`` selects the architecture's records (``None``: the first exported architecture, which serves the
-    layouts and byte queries, none of which depend on it).  ``ValueError`` when a scalar is below one, ``num_docs``
-    exceeds :data:`MAX_DOCS` (the depth of the layout table's document search) or an int32 offset of the kernels
-    would overflow: ``H * 128 * 64`` per chunk, ``R * H * 64`` over the padded rows of the ``[R, H, 64]``
-    intra-chunk buffers.
+    ``arch`` selects the architecture's records and, on the few-chain segmented rows, its segment count
+    (:func:`cake_jit.segment_plan`; ``None``: the first exported architecture; the byte queries below take an
+    ``arch`` of their own).  ``ValueError`` when a scalar is below one, ``num_docs`` exceeds :data:`MAX_DOCS` (the
+    depth of the layout table's document search) or an int32 offset of the kernels would overflow: ``H * 128 *
+    64`` per chunk, ``R * H * 64`` over the padded rows of the ``[R, H, 64]`` intra-chunk buffers.
     """
     S, num_docs, H, sm_count = int(S), int(num_docs), int(H), int(sm_count)
     arch = cake_jit.ARCHES[0] if arch is None else arch
     if arch not in cake_jit.ARCHES:
         raise ValueError(f"plan: arch {arch!r} is not one of {cake_jit.ARCHES}")
-    if S < 1 or num_docs < 1 or H < 1 or sm_count < 1:
-        raise ValueError(
-            f"plan: S={S}, num_docs={num_docs}, H={H}, sm_count={sm_count} must all be >= 1"
-        )
-    if H * D * BT >= 2**31:
-        raise ValueError(f"plan: H={H} overflows the kernels' per-chunk int32 offsets")
-    if num_docs > MAX_DOCS:
-        raise ValueError(
-            f"plan: num_docs={num_docs} exceeds {MAX_DOCS}, the depth of the layout table's document search"
-        )
-    nc_max, nc_pad, rows = _geometry(S, num_docs)
-    if rows * H * BT >= 2**31:
-        raise ValueError(
-            f"plan: R={rows} padded rows (S={S}, num_docs={num_docs}) x H={H} overflow the kernels' int32 "
-            f"row-head offsets: R * H * 64 must stay below 2**31"
-        )
-    recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sm_count)
-    proportional, seg_arg = cake_jit.segment_args(num_docs, H, sm_count)
+    nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sm_count)
+    recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sm_count, arch)
+    proportional, seg_arg = cake_jit.segment_args(num_docs, H, sm_count, arch)
     scalars = {
         "num_chunks_pad": nc_pad,
         "num_seqs": num_docs,
@@ -678,12 +721,44 @@ def _table_layout(
 # Byte queries (host only)
 
 
-def _sms(sm_count: int | None) -> int:
-    """``sm_count``, or the current CUDA device's when ``None`` (the segmented route's segment count depends on
-    it)."""
+def _arch_sms(sm_count: int | None, arch: str | None) -> tuple[str | None, int]:
+    """``(arch, sm_count)`` of a byte query.  ``arch``: the explicit one, else the current CUDA device's where a
+    device is available and is an exported target, else ``None`` (the architecture-independent few-chain segment
+    count, :func:`cake_jit.segment_plan`); ``sm_count``: the explicit one, else the current device's.  So a query
+    with or without the device's own SM count agrees with the plan of a workspace on that device."""
+    if arch is None and torch.cuda.is_available():
+        capability = tuple(
+            torch.cuda.get_device_capability(torch.cuda.current_device())
+        )
+        arch = cake_jit.arch_for_capability(capability)
     if sm_count is not None:
-        return int(sm_count)
-    return cake_jit.sm_count(torch.cuda.current_device())
+        return arch, int(sm_count)
+    return arch, cake_jit.sm_count(torch.cuda.current_device())
+
+
+def _num_segments(num_docs: int, H: int, sm_count: int, arch: str | None) -> int:
+    """``NSEG`` of the problem (zero on the serial route)."""
+    return cake_jit.segment_plan(num_docs, H, sm_count, arch)[2]
+
+
+def _mode_bytes(R: int, H: int, NC_pad: int, NSEG: int, mode: str) -> int:
+    """The bytes of one arena layout (:data:`MODES`)."""
+    return max(
+        (r.offset + r.nbytes for r in _layout(R, H, NC_pad, NSEG, mode)), default=0
+    )
+
+
+def _arena_bytes(
+    R: int, H: int, NC_pad: int, NSEG: int, *, backward: bool, save_mode: str
+) -> int:
+    """The arena a :class:`KdaWorkspace` of the problem allocates: the larger of the saved-set and the replay
+    layouts for a backward workspace (both paths run in it), the forward layout otherwise; the ``*_tape`` layouts
+    under ``save_mode="tape"``."""
+    tape = save_mode == "tape"
+    if not backward:
+        return _mode_bytes(R, H, NC_pad, NSEG, "fwd_tape" if tape else "fwd")
+    modes = ("bwd_tape", "replay_tape") if tape else ("bwd", "replay")
+    return max(_mode_bytes(R, H, NC_pad, NSEG, mode) for mode in modes)
 
 
 def workspace_bytes(
@@ -694,29 +769,41 @@ def workspace_bytes(
     backward: bool = True,
     save_mode: str = "light",
     sm_count: int | None = None,
+    arch: str | None = None,
 ) -> int:
     """Arena bytes a :class:`KdaWorkspace` of the problem allocates (``backward=False``: the forward's layout only;
     a backward workspace takes the larger of the saved-set paths' layout and the replay's; ``save_mode`` selects
     the tape layouts).  A function of the host scalars and, through the segmented route's segment count, of
-    ``sm_count`` (the current device's when ``None``).  The outputs and the saved set are allocated per call:
-    :func:`saved_bytes`, :func:`output_bytes`."""
+    ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's SM count when ``sm_count`` is ``None``, the
+    current device's architecture when ``arch`` is ``None``).  The outputs and the saved set are allocated per
+    call: :func:`saved_bytes`, :func:`output_bytes`."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"workspace_bytes: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
-    p = plan(S, num_docs, H, _sms(sm_count))
-    return p.arena_bytes(backward=backward, save_mode=save_mode)
+    arch, sms = _arch_sms(sm_count, arch)
+    S, num_docs, H = int(S), int(num_docs), int(H)
+    _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
+    nseg = _num_segments(num_docs, H, sms, arch)
+    return _arena_bytes(rows, H, nc_pad, nseg, backward=backward, save_mode=save_mode)
 
 
 def tables_bytes(
-    S: int, num_docs: int, H: int | None = None, *, sm_count: int | None = None
+    S: int,
+    num_docs: int,
+    H: int | None = None,
+    *,
+    sm_count: int | None = None,
+    arch: str | None = None,
 ) -> int:
     """Bytes of the int32 table buffer the forward hands over in the saved set (rebuilt by the backward when
-    absent); given ``H``, the segmented route's block table is included when that route is dispatched."""
+    absent); given ``H``, the segmented route's block table is included when that route is dispatched (its length
+    reads ``sm_count`` and ``arch``, :func:`_arch_sms`)."""
     _nc_max, nc_pad, _rows = _geometry(int(S), int(num_docs))
-    num_segments = (
-        cake_jit.segment_plan(num_docs, H, _sms(sm_count))[2] if H is not None else 0
-    )
+    num_segments = 0
+    if H is not None:
+        arch, sms = _arch_sms(sm_count, arch)
+        num_segments = _num_segments(int(num_docs), int(H), sms, arch)
     _name, off, words = _table_layout(nc_pad, int(num_docs), num_segments)[-1]
     return _round_up(off + words, ALIGN // 4) * 4
 
@@ -728,12 +815,14 @@ def saved_bytes(
     *,
     save_mode: str = "light",
     sm_count: int | None = None,
+    arch: str | None = None,
 ) -> int:
     """Bytes of the saved set: ``Aqk`` + ``Akk`` BF16 ``[S, H, 64]`` (``256 * S * H``), plus, when ``num_docs``
     is given, the tables and, for ``save_mode="light"`` (version 3) on the segmented route when ``S >= 384 * NSEG``
     (:func:`seg_states_saved`), the forward's segment-boundary states ``hseg`` FP32 ``[NSEG, H, 128, 128]`` and
     ``seg_state`` FP32 ``[2, NSEG, H, 128, 128]`` (three state blocks of ``NSEG * H * 64 KiB``; the segment count
-    needs ``num_docs`` and ``sm_count``).  ``save_mode="tape"`` adds the internal-layout ``h`` BF16 ``[NC_pad, H,
+    needs ``num_docs`` and ``sm_count`` / ``arch``, :func:`_arch_sms`).  ``save_mode="tape"`` adds the
+    internal-layout ``h`` BF16 ``[NC_pad, H,
     128, 128]``, ``v_new`` BF16 ``[R, H, 128]`` and, on the segmented route, the forward's segment states FP32
     ``[2, NSEG, H, 128, 128]`` whose transfer half is the saved ``seg_m`` (``num_docs`` required)."""
     if save_mode not in SAVE_MODES:
@@ -742,21 +831,21 @@ def saved_bytes(
         )
     S, H = int(S), int(H)
     total = 2 * S * H * BT * 2
-    if num_docs is not None:
-        total += tables_bytes(S, num_docs, H, sm_count=sm_count)
-    if save_mode == "tape":
-        if num_docs is None:
+    if num_docs is None:
+        if save_mode == "tape":
             raise ValueError("saved_bytes: save_mode='tape' needs num_docs")
-        _nc_max, nc_pad, rows = _geometry(S, int(num_docs))
+        return total
+    num_docs = int(num_docs)
+    arch, sms = _arch_sms(sm_count, arch)
+    num_segments = _num_segments(num_docs, H, sms, arch)
+    total += tables_bytes(S, num_docs, H, sm_count=sms, arch=arch)
+    if save_mode == "tape":
+        _nc_max, nc_pad, rows = _geometry(S, num_docs)
         total += nc_pad * H * D * D * 2 + rows * H * D * 2
-        total += (
-            2 * cake_jit.segment_plan(num_docs, H, _sms(sm_count))[2] * H * D * D * 4
-        )
-    elif num_docs is not None:
+        total += 2 * num_segments * H * D * D * 4
+    elif seg_states_saved(S, num_segments):
         # light (version 3): the segment-boundary states when the size rule holds
-        num_segments = cake_jit.segment_plan(num_docs, H, _sms(sm_count))[2]
-        if seg_states_saved(S, num_segments):
-            total += 3 * num_segments * H * D * D * 4
+        total += 3 * num_segments * H * D * D * 4
     return total
 
 
@@ -816,24 +905,32 @@ def memory_report(
     save_mode: str = "light",
     *,
     sm_count: int | None = None,
+    arch: str | None = None,
 ) -> dict[str, Any]:
     """Bytes one problem needs beyond its inputs: the arena (forward-only and full, with the saved-set paths' and
     the replay's backward layouts apart), the saved set, the outputs and the totals of the three boundaries (arena
-    + the per-call tensors live at the peak).  ``sm_count`` (the current device's when ``None``) selects the
-    segmented route's segment count."""
+    + the per-call tensors live at the peak).  ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's
+    when ``None``) select the segmented route's segment count."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"memory_report: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
     tape = save_mode == "tape"
-    sms = _sms(sm_count)
-    p = plan(S, num_docs, H, sms)
-    recur, segments, num_segments = p.recur, p.P, p.NSEG
-    arena_fwd = p.arena_bytes(backward=False, save_mode=save_mode)
-    arena_saved = p.workspace_bytes("bwd_tape" if tape else "bwd")
-    arena_replay = p.workspace_bytes("replay_tape" if tape else "replay")
+    arch, sms = _arch_sms(sm_count, arch)
+    S, num_docs, H = int(S), int(num_docs), int(H)
+    _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
+    recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sms, arch)
+    arena_fwd = _arena_bytes(
+        rows, H, nc_pad, num_segments, backward=False, save_mode=save_mode
+    )
+    arena_saved = _mode_bytes(
+        rows, H, nc_pad, num_segments, "bwd_tape" if tape else "bwd"
+    )
+    arena_replay = _mode_bytes(
+        rows, H, nc_pad, num_segments, "replay_tape" if tape else "replay"
+    )
     arena_bwd = max(arena_saved, arena_replay)
-    saved = saved_bytes(S, H, num_docs, save_mode=save_mode, sm_count=sms)
+    saved = saved_bytes(S, H, num_docs, save_mode=save_mode, sm_count=sms, arch=arch)
     out_f, out_b = output_bytes(S, H, backward=False), output_bytes(S, H, backward=True)
     # The per-call segment states in the saved set: tape two blocks (seg_state, its transfer half is the saved
     # seg_m), light three (hseg and the seg_state pair, version 3) when the size rule holds; none on the serial route.
@@ -846,6 +943,7 @@ def memory_report(
     return {
         "save_mode": save_mode,
         "sm_count": sms,
+        "arch": arch,
         "recur": recur,
         "segments": segments,
         "num_segments": num_segments,
@@ -1082,10 +1180,10 @@ class KdaWorkspace:
         return other
 
     def paths(self) -> tuple[str, ...]:
-        """The paths this workspace serves: the forward and, with ``backward``, the backward paths this plan can
-        take (``light_states`` on the segmented route only)."""
+        """The paths this workspace serves: the two forward paths (with and without a saved set) and, with
+        ``backward``, the backward paths this plan can take (``light_states`` on the segmented route only)."""
         if not self.backward:
-            return ("fwd",)
+            return ("fwd", "fwd_nosave")
         return tuple(
             path for path in PATHS if path != "light_states" or self.plan.recur == "seg"
         )
@@ -1260,27 +1358,30 @@ def _values(
 def _tables(
     ws: KdaWorkspace, cu_seqlens: torch.Tensor, path: str
 ) -> tuple[torch.Tensor, ...]:
-    """A fresh table buffer written by the table program (pad entries are written as zeros): the four table views
-    and, on the segmented route, the block table ``seg_table`` (``[NSEG + 2 * num_docs + 1]``: the chains' first
-    segments in the layout table's document order, then per chain its segment starts and end chunk; per-document
-    proportional segment counts under ``proportional``) derived from ``seq_chunk_start``, ``seq_order`` and
-    ``segments``: by the ``table_v3`` record in the same launch as the chunk tables up to 256 documents, by the
-    ``seg_table`` program after the table above (the table stage's rules pick the record; the block table is a
-    launch of its own only where the plan dispatches ``seg_table``)."""
+    """A fresh table buffer (pad entries are written as zeros): the four table views and, on the segmented route,
+    the block table ``seg_table`` (``[NSEG + 2 * num_docs + 1]``: the chains' first segments in the layout table's
+    document order, then per chain its segment starts and end chunk; per-document proportional segment counts
+    under ``proportional``) derived from ``seq_chunk_start``, ``seq_order`` and ``segments``.  Written by the table
+    program where the plan dispatches one on ``path`` (``table_v2`` / ``table`` on the serial route; ``table`` then
+    ``seg_table`` on the segmented route above 256 documents; ``table_v3``, the chunk tables and the block table in
+    one launch, where a saved-set path rebuilds them up to 256 documents); on the forward and the replay of the
+    segmented route up to 256 documents no table program runs: the intra program ``fwd_intra_v14``, the first
+    launch there, computes the layout from ``cu_seqlens`` and writes every entry of the buffer itself."""
     p = ws.plan
     buffer = _alloc((p.table_words(),), torch.int32, ws.device)
     tables = tuple(buffer[off : off + words] for _name, off, words in p.table_layout())
-    values = {
-        "cu_seqlens": cu_seqlens,
-        "num_seqs": p.N,
-        "num_chunks_pad": p.NC_pad,
-        "segments": p.P,
-        "proportional": p.proportional,
-    }
-    values.update(zip(TABLE_NAMES, tables, strict=False))
-    ws.run("table", values, path=path)
-    if p.recur == "seg" and p.dispatched("seg_table", path):
-        ws.run("seg_table", values, path=path)
+    if p.dispatched("table", path):
+        values = {
+            "cu_seqlens": cu_seqlens,
+            "num_seqs": p.N,
+            "num_chunks_pad": p.NC_pad,
+            "segments": p.P,
+            "proportional": p.proportional,
+        }
+        values.update(zip(TABLE_NAMES, tables, strict=False))
+        ws.run("table", values, path=path)
+        if p.recur == "seg" and p.dispatched("seg_table", path):
+            ws.run("seg_table", values, path=path)
     return tables
 
 
@@ -1304,10 +1405,13 @@ def _fwd_intra(
     write_int: int,
     write_prep: int,
 ) -> None:
-    """The intra-chunk program: ``Aqk`` / ``Akk`` on the internal rows (``write_int``) and on the token rows
+    """The intra-chunk program: ``Aqk`` / ``Akk`` on the internal rows (``write_int``: where a later program of the
+    path reads them, :meth:`Plan.internal_rows`) and on the token rows
     (``write_ext``), and with ``write_prep`` the GLM prep's outputs the later programs read (``gk``, ``kb``, ``kg``,
     ``qg`` and the ``v_new`` pad rows: the forward); the replay (``write_prep = 0``) has them from its own prep and
-    passes the same buffers untouched."""
+    passes the same buffers untouched.  The segmented route's record up to 256 documents (``fwd_intra_v14``) also
+    computes the chunk layout from ``cu_seqlens`` and writes the chunk tables and the block table: it is the first
+    launch of its call and no table program runs there."""
     ws.run(
         "fwd_intra",
         {
@@ -1341,9 +1445,11 @@ def _forward_recurrence(
     (the backward from a version-3 saved set carrying the states) only pass 2 runs, from the saved ``hseg``; pass
     2 never writes ``seg_state`` (``write_ht = 0``).  ``write_tapes`` is 1 where the ``h`` / ``v_new`` tapes are
     needed (the backward, the tape forward).  On the forward's segmented rows whose pass-2 grid is at least 3.0
-    waves of the device (``sm_100a`` / ``sm_103a``) the carry and pass 2 are the overlap pair ``seg_carry_ov`` /
-    ``fwdh_p3_o_ov`` (``_id`` above two heads): pass 2 is launched with the programmatic-stream-serialization
-    attribute and waits on the carry's per-segment release flags instead of the stream order."""
+    waves of the device on ``sm_100a`` / ``sm_103a`` (2.3 on ``sm_107a``) the carry and pass 2 are the overlap pair
+    ``seg_carry_ov`` / ``fwdh_p3_o_ov`` (``_id`` above two heads; on the saving forward the ``_rows`` twins, reading
+    the saved ``Aqk`` token rows): pass 2 is launched with the programmatic-stream-serialization attribute and
+    waits on the carry's per-segment release flags instead of the stream order.  The saving forward's fused serial
+    recurrence is ``fwdh_wy_rows`` (the saved ``Akk`` / ``Aqk`` token rows), the other forward's ``fwdh_wy``."""
     p = ws.plan
     if p.recur != "seg":
         ws.run("fwdh", {**values, "write_tapes": int(write_tapes)}, path=path)
@@ -1442,13 +1548,18 @@ def chunk_kda_fwd(
     (version 3; shorter packs save neither and the backward recomputes them); with ``save_mode="tape"`` the fresh
     ``h`` tape, ``v_new`` and the segment transfers instead).
 
-    Launches (``Plan.launch_count("fwd")``): the table, the intra-chunk program (which also writes the GLM prep's
-    outputs), then on the serial route the state recurrence (which forms the output; ``wy_fwd`` before it below 32
-    heads: three or four launches), on the segmented route ``wy_fwd``, pass 1, ``seg_carry`` and pass 2 (six
-    launches up to 256 documents, where ``table_v3`` writes the block table with the chunk tables; seven above,
-    with ``seg_table`` after the table); saving the states moves two output pointers of the recurrence from the arena to the saved
-    tensors and adds no launch.  The token-row ``Aqk`` / ``Akk`` are written only with ``save_for_backward``; the
-    ``h`` / ``v_new`` tapes only in tape mode.  ``workspace`` (:class:`KdaWorkspace`, the forward layout at least)
+    Launches (``Plan.launch_count("fwd")``): the table where the plan dispatches one, the intra-chunk program
+    (which also writes the GLM prep's outputs), then on the serial route the state recurrence (which forms the
+    output; ``wy_fwd`` before it below 32 heads: three or four launches), on the segmented route ``wy_fwd``, pass 1,
+    ``seg_carry`` and pass 2 (five launches up to 256 documents, where the intra program ``fwd_intra_v14`` runs
+    first and writes the chunk tables and the block table itself, no table launch; seven above, with ``table`` and
+    ``seg_table`` before it); saving the states moves two output pointers of the recurrence from the arena to the
+    saved tensors and adds no launch.  The token-row ``Aqk`` / ``Akk`` are written only with ``save_for_backward``
+    (the ``fwd`` path; ``fwd_nosave`` without it): there the fused serial recurrence (``fwdh_wy_rows``) and the overlap
+    rows' WY and pass-2 programs (``wy_fwd_rows``, ``fwdh_p3_o_ov_rows`` / ``_id_rows``) read those rows and the intra
+    program writes no internal copies (``write_int = 0``, :meth:`Plan.internal_rows`); every other forward keeps the
+    internal-row programs and the copies.  The ``h`` / ``v_new`` tapes are written only in tape mode.  ``workspace``
+    (:class:`KdaWorkspace`, the forward layout at least)
     is reused; without one a workspace is allocated for this call.  ``save_mode=None`` takes the workspace's
     default.
     """
@@ -1493,7 +1604,7 @@ def chunk_kda_fwd(
     if save_states:
         seg_state = _alloc((2, p.NSEG, H, D, D), torch.float32, ws.device)
         hseg = _alloc((p.NSEG, H, D, D), torch.float32, ws.device)
-    path = "fwd"
+    path = "fwd" if save_for_backward else "fwd_nosave"
     tables = _tables(ws, cu_seqlens, path)
     values = _values(
         ws,
@@ -1504,6 +1615,7 @@ def chunk_kda_fwd(
         v=v,
         g=g,
         beta=beta,
+        cu_seqlens=cu_seqlens,
         h=h,
         h2d=h.view(-1, D),
         v_new=v_new,
@@ -1517,7 +1629,7 @@ def chunk_kda_fwd(
         values,
         path=path,
         write_ext=1 if save_for_backward else 0,
-        write_int=1,
+        write_int=1 if p.internal_rows(path) else 0,
         write_prep=1,
     )
     if p.dispatched("wy_fwd", path):
@@ -1582,8 +1694,10 @@ def chunk_kda_bwd(
     ``light_states`` from a version-3 set carrying them (the segmented recurrence as pass 2 alone from the saved
     ``hseg``, the adjoint carry reading the saved ``seg_state[1]``), ``tape`` from a version-2 set (no recurrence
     recompute: dA / dv and the fused gradient read the saved ``h`` / ``v_new``, the segmented carry the saved
-    ``seg_m``), ``replay`` with ``saved=None`` (the checkpoint replay: table, prep, intra recompute the internal
-    rows first).  The launches are the GLM prep, [intra], [WY], [the recurrence recompute], [dA / dv], the
+    ``seg_m``), ``replay`` with ``saved=None`` (the checkpoint replay: the table where the plan dispatches one,
+    the prep and the intra program recompute the internal rows first; on the segmented rows up to 256 documents
+    the intra program runs before the prep and writes the tables the prep reads).  The launches are the GLM prep,
+    [intra], [WY], [the recurrence recompute], [dA / dv], the
     adjoint recurrence, the fused dq / dk / dg, GLM intra and the gate epilogue, where the bracketed ones depend
     on the path and the row (``Plan.launch_count(path)``; the tables are rebuilt when the saved set carries
     none).  The backward writes nothing into the saved set.  ``workspace`` (:class:`KdaWorkspace` with the
@@ -1702,6 +1816,7 @@ def chunk_kda_bwd(
         v=v,
         g=g,
         beta=beta,
+        cu_seqlens=cu_seqlens,
         dout=dout,
         h=h,
         h2d=h.view(-1, D),
@@ -1716,13 +1831,11 @@ def chunk_kda_bwd(
         dbeta=dbeta,
         scale=float(scale),
     )
-    # prep's pad-row zero-fill target: the saved v_new already carries its pads
-    ws.run(
-        "bwd_prep",
-        {**values, "v_new": b.v_new_scratch if tape else v_new},
-        path=path,
-    )
-    if replay:
+
+    # The replay recomputes the internal Aqk / Akk rows with the intra program (write_prep = 0: the prep buffers are
+    # the replay prep's; the token-row pointers are unused, write_ext = 0): before the prep where the intra program
+    # writes the tables the prep reads (the segmented rows up to 256 documents: no table launch), after it otherwise.
+    def replay_intra() -> None:
         _fwd_intra(
             ws,
             {**values, "aqk_ext": b.akk_int, "akk_ext": b.akk_int},
@@ -1731,6 +1844,18 @@ def chunk_kda_bwd(
             write_int=1,
             write_prep=0,
         )
+
+    intra_first = replay and not p.dispatched("table", path)
+    if intra_first:
+        replay_intra()
+    # prep's pad-row zero-fill target: the saved v_new already carries its pads
+    ws.run(
+        "bwd_prep",
+        {**values, "v_new": b.v_new_scratch if tape else v_new},
+        path=path,
+    )
+    if replay and not intra_first:
+        replay_intra()
     if p.dispatched("wy", path):
         ws.run("wy", values, path=path)
     if not tape:  # h / v_new come from the saved set in tape mode (wy still runs for w)

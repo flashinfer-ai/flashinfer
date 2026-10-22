@@ -50,7 +50,8 @@ ws = kda_train_workspace(S, num_docs, H, device, backward=True, save_mode="light
   the chunk-shaped kernels launch at the host bound `NC_pad` chunks (the empty
   pad chunks are no-ops) and the persistent kernels read the real chunk count
   from the device table.  Which variant of a stage runs and how large its grid
-  is follow from `S`, `num_docs`, `H` and the device's SM count alone.
+  is follow from `S`, `num_docs`, `H`, the device's SM count and its
+  architecture alone.
 * Repeated calls on the same inputs give bitwise the same outputs: the kernels
   reduce in a fixed order and use no atomic adds.  The backward from the saved
   set (with or without the saved segment states) and the checkpoint replay
@@ -90,21 +91,25 @@ rule (`cake_backend.seg_states_saved(S, NSEG)`,
 no larger than the `Aqk` / `Akk` set (`3 * NSEG * H * 65536 <= 2 * S * H *
 256`).  With `NSEG = num_docs * P` and `P = clamp(ceil(4 * sm_count /
 (num_docs * H)), 1, 64)`, at most `sm_count // H` (at most 38 with `num_docs *
-H <= 4`), `NSEG * H` is at most `4 * sm_count` (that much for `num_docs * H >=
+H <= 4`; 37 on `sm_100a`), `NSEG * H` is at most `4 * sm_count` (that much for `num_docs * H >=
 10` unless the per-SM cap binds, which brings it down to `num_docs *
 sm_count`), so the states cost at most about `12 * sm_count * 64 KiB` (115 MiB
 on a 152-SM device) independent of `S`, and the threshold is about 58k tokens
 at `H = 4` (four documents), 29k at `H = 8`,
 `384 * 38 * num_docs` tokens with at most four chains (14592 for one document
-at `H = 1`, 58368 for four) and `384 * 64 * num_docs` tokens where `P` is
+at `H = 1`, 58368 for four; `384 * 37 * num_docs` on `sm_100a`: 14208 and
+56832) and `384 * 64 * num_docs` tokens where `P` is
 capped at 64 (196608 for eight documents at `H = 1`); the contract's
 performance shapes (`S` around 240k-260k tokens) all save, a pack of a few
-thousand tokens does not.  Every
+thousand tokens does not.  The byte queries read `sm_count` (the current
+device's when `None`) and the current device's architecture (the
+architecture-independent count of 38 without a device).  Every
 tensor of the set is allocated by the call that writes it: a saved set can go
 to a backward on any workspace of the same problem.  A caller may keep only
 `Aqk` / `Akk` (`tables=None`).  With `save_for_backward=False` the token-row
-`Aqk` / `Akk` are not written and the backward must replay (`saved=None`:
-table, prep and intra recompute them).  From a version-2 set the backward
+`Aqk` / `Akk` are not written (the `fwd_nosave` path: the forward's programs
+read the internal copies) and the backward must replay (`saved=None`:
+the table where the plan launches one, prep and intra recompute them).  From a version-2 set the backward
 skips its recurrence recompute (WY still runs for `w`); from a version-3 set
 with the states its recurrence recompute is pass 2 alone from `hseg` and the
 reverse carry reads `seg_state[1]`; from a version-3 set without them or on
@@ -141,7 +146,10 @@ of the calls on it.
 
 The host resolves one plan per `(S, num_docs, H, sm_count, arch)`: which
 record of each stage runs on each path and with which grid.  The paths are
-`fwd` (the forward), and four backward paths: `light` (from a version-3 saved
+`fwd` (the forward with `save_for_backward`: its programs read the saved
+`Aqk` / `Akk` token rows where a form for them ships and the intra program
+writes no internal copies there), `fwd_nosave` (the forward without a saved
+set: the internal-row programs), and four backward paths: `light` (from a version-3 saved
 set without the segment-boundary states: every serial problem, and a
 segmented pack below the size rule), `light_states` (from a version-3 set that
 carries them: the segmented route only), `tape` (from a version-2 set) and
@@ -152,22 +160,28 @@ head count alone: the serial walk over each document's chunk chain for
 the segmented route for `H <= 8`: every document is cut into `P` chunk-aligned
 segments (`NSEG = num_docs * P` pseudo-sequences described by the block table
 `seg_table`) with `P = clamp(ceil(4 * sm_count / (num_docs * H)), 1, 64)`, at
-most `sm_count // H`, and at most 38 when `num_docs * H <= 4` (the "few-chain"
-rows, which also take proportional segment lengths: `seg_arg = -num_docs`);
-`cake_jit.SEGMENTS` holds the constants.
+most `sm_count // H`, and at most 38 (37 on `sm_100a`) when `num_docs * H <= 4`
+(the "few-chain" rows, which also take proportional segment lengths: `seg_arg =
+-num_docs`); `cake_jit.SEGMENTS` holds the constants (`small_segments_by_arch`
+the per-architecture few-chain counts).
 
 Forward (`fwd`): the chunk tables from `cu_seqlens` -- on the segmented route
-`table_v3` (one CTA per 256 chunks; its first CTA also writes the block table)
-up to 256 documents, else `table` (one CTA) followed by `seg_table` (the block
-table, one CTA); on the serial route `table_v2` (one CTA per 256 chunks) up to
-256 documents, else `table`; `fwd_intra` (the intra-chunk
+up to 256 documents no table launch: the intra program `fwd_intra_v14`, launched
+first, computes the layout in its prologue and writes the chunk tables and the
+block table itself; above 256 documents `table` (one CTA) followed by
+`seg_table` (the block table, one CTA); on the serial route `table_v2` (one CTA
+per 256 chunks) up to 256 documents, else `table`; the intra program
+(`fwd_intra_v14` on the segmented route up to 256 documents, `fwd_intra`
+elsewhere: the intra-chunk
 `Aqk` / `Akk` and, with `save_for_backward`, their token-row copies, and the
 gated keys / queries of the GLM contract on the chunk layout, the chunk-final
 gate row and the `v_new` pad rows: no separate prep launch); then the WY
 representation and the recurrence, which also writes the output:
 
-* serial, `H >= 32` (`sm_107a`: `H == 32` only): `fwdh_wy` forms the WY
-  representation itself, walks the chain and writes `out` (three launches);
+* serial, `H >= 32` (`sm_107a`: `H == 32` only): `fwdh_wy_rows` (on `fwd`,
+  from the saved `Akk` / `Aqk` token rows) or `fwdh_wy` (on `fwd_nosave`)
+  forms the WY representation itself, walks the chain and writes `out` (three
+  launches);
 * serial otherwise: `wy_fwd` (persistent grid of `min(NC_pad / 2 * H,
   sm_count)` CTAs over the chunk pairs; forms the gated values `v * beta` from
   the token rows) then `fwdh_o_v1` (64 columns) or `fwdh_o_v2` (32 columns),
@@ -178,27 +192,34 @@ representation and the recurrence, which also writes the output:
   into the carried initial state of every segment; two CTAs per document and
   head, TF32 tensor-core products with FP32 accumulation) and `fwdh_p3_o`
   (pass 2 from the carried states, writing the `h` / `v_new` tapes and `out`;
-  grid `NSEG * H`) (six; seven above 256 documents).  On `sm_100a` / `sm_103a`
-  rows whose pass-2 grid
-  is at least 3.0 waves of the device (`NSEG * H >= 3.0 * sm_count`, and at
-  most 8192 segment-heads) the carry and pass 2 are the overlap pair:
-  `seg_carry_ov` releases one flag per segment, head and carry half as each
-  carried state is stored, and `fwdh_p3_o_ov` (`fwdh_p3_o_ov_id` above two
-  heads: the chain-major CTA order) is launched with the
-  programmatic-stream-serialization attribute, starts while the carry runs and
-  waits on its segment's flags (the flags live in the identity buffer, stamped
-  with a per-call epoch; the same launch count, bitwise the same results).
+  grid `NSEG * H`) (five; seven above 256 documents, where `table` and
+  `seg_table` run first).  On the rows whose pass-2 grid is at least 3.0
+  waves of the device on `sm_100a` / `sm_103a` and 2.3 waves on `sm_107a`
+  (`NSEG * H >= waves * sm_count`, and at most 8192 segment-heads) the carry
+  and pass 2 are the overlap pair: `seg_carry_ov` releases one flag per
+  segment, head and carry half as each carried state is stored, and
+  `fwdh_p3_o_ov` (`fwdh_p3_o_ov_id` above two heads: the chain-major CTA
+  order) is launched with the programmatic-stream-serialization attribute,
+  starts while the carry runs and waits on its segment's flags (the flags live
+  in the identity buffer, stamped with a per-call epoch; the same launch count,
+  bitwise the same results).  On `fwd` those rows launch the token-row twins:
+  `wy_fwd_rows` (the backward's WY program on the saved `Akk`) and
+  `fwdh_p3_o_ov_rows` / `fwdh_p3_o_ov_id_rows` (the saved `Aqk`), and the intra
+  program writes no internal `Aqk` / `Akk` copies.
 
 With `save_mode="light"` and `S >= 384 * NSEG` the offsets / transfers and the
 carried states go into the saved set's `seg_state` / `hseg` instead of the
 workspace (the same launches).
 
-Backward: the table programs (when the saved set carries none; always on the
-replay), `bwd_prep_g8` (the gated keys / values of the GLM contract and the
+Backward: the table programs (when the saved set carries none: `table_v3` on
+the segmented route up to 256 documents; on the replay where the intra program
+does not write them), `bwd_prep_g8` (the gated keys / values of the GLM contract and the
 chunk-final gate row on the chunk layout; no copies of `q` / `k` / `v`, which
 the gradient kernels read on the token rows; the replay form also keeps a copy
-of `dout` on the internal rows), on the replay `fwd_intra` (the internal
-`Aqk` / `Akk`), then the recompute of the states:
+of `dout` on the internal rows), on the replay the intra program (the internal
+`Aqk` / `Akk`; on the segmented rows up to 256 documents `fwd_intra_v14` runs
+before the prep and writes the tables the prep reads), then the recompute of
+the states:
 
 * serial 64-column form with `H >= 64` (`light` / `replay`): `fwdh_wy_bwd`
   forms the WY representation and walks the chain in one launch (no `wy`
@@ -222,7 +243,9 @@ on the serial forms; on the segmented route two launches around a reverse
 `seg_carry`, every form accumulating `dv1` itself: on the few-chain rows
 `dhu_v3s_f` (two CTAs per segment and head; `dhu_v3s_f_wt` reads the
 transposed `w` of `fwdh_p3_wy`), above four chains `dhu_v3_f` with TMA tapes
-when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`), else the register-tape
+when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` below that
+bound `dhu_v3p_f`, the same recurrence prefetching the next chunk's tiles into
+L2 in the launches that write no tapes -- else the register-tape
 build `dhu_v3r_f` (their `_wt` forms behind `fwdh_p3_wy`, their `_replay`
 forms on the replay)); `dqkg` (fused dq / dk / dg / dbeta partials and
 `dA_kk`; `_davq` forms host `dA_qk`; `_int` forms read the internal rows on
@@ -233,12 +256,12 @@ the replay; persistent grid of `min(NC_pad * H, sm_count)` CTAs);
 Launches per call (148 SMs; the table programs of a saved-set path count only
 when the set carries no tables):
 
-| problem | `fwd` | `light` | `light_states` | `tape` | `replay` |
+| problem | `fwd` / `fwd_nosave` | `light` | `light_states` | `tape` | `replay` |
 |---|---|---|---|---|---|
 | 1 document, 16 heads (serial, 32-column form) | 4 | 7 | - | 6 | 9 |
 | 4 documents, 64 heads (serial, 64-column form; fused forward and recompute) | 3 | 6 | - | 6 | 8 |
-| 4 documents, 2 heads (segmented, 8 chains) | 6 | 11 | 8 | 8 | 13 |
-| 1 document, 4 heads (segmented, 4 chains) | 6 | 11 | 8 | 8 | 13 |
+| 4 documents, 2 heads (segmented, 8 chains) | 5 | 11 | 8 | 8 | 12 |
+| 1 document, 4 heads (segmented, 4 chains) | 5 | 11 | 8 | 8 | 12 |
 
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`) and are evaluated by `cake_jit.select_record` / `launch_grid` /
@@ -249,26 +272,27 @@ backward from the plan's own light saved set).
 
 ### Programs by stage
 
-50 records naming 49 programs from 30 kernels (`fwdh_v3` and `fwdh_p3` are
-one program, the two passes of the segmented walk; `fwdh_p3_o_ov` and
-`fwdh_p3_o_ov_id` are the only programs launched with the
-programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
+58 records naming 56 programs from 34 kernels (`fwdh_v3` and `fwdh_p3` are
+one program, the two passes of the segmented walk; `wy_bwd` and `wy_fwd_rows`
+are one program, the WY representation from the saved `Akk`; `fwdh_p3_o_ov`,
+`fwdh_p3_o_ov_id` and their `_rows` twins are the only programs launched with
+the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 "segmented" `H <= 8`; "64-column form" `num_docs * H * 4 > 4 * sm_count`,
 "32-column form" otherwise; "few chains" `num_docs * H <= 4`.
 
 | stage | records | dispatch |
 |---|---|---|
-| `table` | `table_v3`, `table_v2`, `table` | up to 256 documents one CTA per 256 chunks: `table_v3` on the segmented route (the block table too), `table_v2` on the serial route; above, `table` (one CTA); forward, replay, and a saved-set path whose set carries no tables |
-| `seg_table` | `seg_table` | segmented route above 256 documents, after `table` (below, `table_v3` writes the block table) |
-| `fwd_intra` | `fwd_intra` | forward (the GLM prep's outputs too: `write_prep = 1`), and the replay (the intra-chunk rows alone) |
-| `wy_fwd` | `wy_fwd` | forward, unless `fwdh_wy` runs |
+| `table` | `table_v3`, `table_v2`, `table` | up to 256 documents one CTA per 256 chunks: `table_v2` on the serial route (forward, replay, and a saved-set path whose set carries no tables), `table_v3` on the segmented route (the block table too) on a saved-set path whose set carries no tables alone (the forward and the replay there launch no table program: `fwd_intra_v14` writes the tables); above, `table` (one CTA) on every path that builds the tables |
+| `seg_table` | `seg_table` | segmented route above 256 documents, after `table` (below, `fwd_intra_v14` or `table_v3` writes the block table) |
+| `fwd_intra` | `fwd_intra_v14`, `fwd_intra` | forward (the GLM prep's outputs too: `write_prep = 1`), and the replay (the intra-chunk rows alone); `fwd_intra_v14` on the segmented route up to 256 documents (the first launch of its call: it computes the chunk layout from `cu_seqlens` and writes the chunk tables and the block table), `fwd_intra` on the serial route and above 256 documents |
+| `wy_fwd` | `wy_fwd`, `wy_fwd_rows` | forward, unless the fused recurrence (`fwdh_wy*`) runs; `wy_fwd_rows` (the saved `Akk` token rows, the `wy_bwd` program) on the overlap rows of `fwd`, `wy_fwd` elsewhere |
 | `wy` | `wy_bwd`, `wy_bwd_replay` | backward (`_replay` on the replay), unless a fused recompute forms the WY representation (`fwdh_wy_bwd*`, `fwdh_p3_wy`) |
-| `fwdh` | `fwdh_wy`, `fwdh_o_v1`, `fwdh_o_v2`, `fwdh_v3`, `fwdh_wy_bwd`, `fwdh_wy_bwd_replay`, `fwdh_v1`, `fwdh_v1_sm107`, `fwdh_v2`, `fwdh_v2h` | forward: serial `fwdh_wy` from 32 heads (`sm_107a`: at 32 only), else `fwdh_o_v1` / `fwdh_o_v2` by form; segmented `fwdh_v3` pass 1 (forward, `light`, replay). Backward recompute (`light`, replay): `fwdh_wy_bwd*` on the 64-column form from 64 heads, `fwdh_v1` (`fwdh_v1_sm107` on `sm_107a`) below, `fwdh_v2` / `fwdh_v2h` (from 16 heads; `sm_107a`: at 16 only) on the 32-column form |
-| `seg_carry` | `seg_carry`, `seg_carry_ov` | segmented route: between the forward passes (where pass 1 runs) and, in reverse, between the adjoint passes; `seg_carry_ov` (the release flags) on the forward of the `sm_100a` / `sm_103a` rows with `NSEG * H >= 3.0 * sm_count` (at most 8192 segment-heads) |
-| `fwdh_p3` | `fwdh_p3_o`, `fwdh_p3_o_ov`, `fwdh_p3_o_ov_id`, `fwdh_p3_wy`, `fwdh_p3` | segmented pass 2: `fwdh_p3_o` on the forward (the output fused), `fwdh_p3_o_ov` / `fwdh_p3_o_ov_id` (PDL launch; the release order up to 2 heads, the chain-major order above) where `seg_carry_ov` runs, `fwdh_p3_wy` on `light_states` with at most 32 chains (the WY representation fused), `fwdh_p3` otherwise (`light`, replay, `light_states` above 32 chains) |
+| `fwdh` | `fwdh_wy`, `fwdh_wy_rows`, `fwdh_o_v1`, `fwdh_o_v2`, `fwdh_v3`, `fwdh_wy_bwd`, `fwdh_wy_bwd_replay`, `fwdh_v1`, `fwdh_v1_sm107`, `fwdh_v2`, `fwdh_v2h` | forward: serial `fwdh_wy_rows` (`fwd`: the saved token rows) / `fwdh_wy` (`fwd_nosave`) from 32 heads (`sm_107a`: at 32 only), else `fwdh_o_v1` / `fwdh_o_v2` by form; segmented `fwdh_v3` pass 1 (both forward paths, `light`, replay). Backward recompute (`light`, replay): `fwdh_wy_bwd*` on the 64-column form from 64 heads, `fwdh_v1` (`fwdh_v1_sm107` on `sm_107a`) below, `fwdh_v2` / `fwdh_v2h` (from 16 heads; `sm_107a`: at 16 only) on the 32-column form |
+| `seg_carry` | `seg_carry`, `seg_carry_ov` | segmented route: between the forward passes (where pass 1 runs) and, in reverse, between the adjoint passes; `seg_carry_ov` (the release flags) on the forward paths of the rows with `NSEG * H >= 3.0 * sm_count` (`sm_100a` / `sm_103a`) or `>= 2.3 * sm_count` (`sm_107a`), at most 8192 segment-heads |
+| `fwdh_p3` | `fwdh_p3_o`, `fwdh_p3_o_ov`, `fwdh_p3_o_ov_id`, `fwdh_p3_o_ov_rows`, `fwdh_p3_o_ov_id_rows`, `fwdh_p3_wy`, `fwdh_p3` | segmented pass 2: `fwdh_p3_o` on the forward paths (the output fused), `fwdh_p3_o_ov` / `fwdh_p3_o_ov_id` (PDL launch; the release order up to 2 heads, the chain-major order above) where `seg_carry_ov` runs on `fwd_nosave` and their token-row twins `fwdh_p3_o_ov_rows` / `fwdh_p3_o_ov_id_rows` (the saved `Aqk`) on `fwd`, `fwdh_p3_wy` on `light_states` with at most 32 chains (the WY representation fused), `fwdh_p3` otherwise (`light`, replay, `light_states` above 32 chains) |
 | `bwd_prep` | `bwd_prep_g8`, `bwd_prep_g8_replay` | backward; one CTA per chunk and head; the replay form keeps the internal `dout` copy |
 | `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
-| `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`), else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
+| `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3p_f`, `dhu_v3p_f_wt`, `dhu_v3p_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` `dhu_v3p_f*` (the form prefetching the next chunk's tiles) below `4 * sm_count` and `dhu_v3_f*` at the boundary alone -- else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
 | `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; reads `q` / `k` / `v` on the token rows |
 | `glm_intra` | `glm_intra` | backward; reads `k` / `q` on the token rows |
 | `gate_epilogue` | `gate_epilogue` | backward |
@@ -285,7 +309,7 @@ programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
   `run_module(name, values, grid=, device_index=)`.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_<arch>` (49 programs x 3
+  `cake-build/1`): one entry per `<library>_<arch>` (56 programs x 3
   architectures) with its two translation units, digests, nvcc flags
   (`--use_fast_math`), closure digest and `aot/<name>.so` path.
   `cake_build.load_library(name)` loads the prebuilt library when `aot/` holds
@@ -298,14 +322,14 @@ programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include,
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` -- the generated device
-  and binding translation units of the 49 programs, shared by the three
+  and binding translation units of the 56 programs, shared by the three
   architectures (per-architecture lines under `#if __CUDA_ARCH__`) and
   compiled once per architecture.  The sources are identity-checked by the
   digests in `build.json`.
 
 ## Status
 
-The registry holds the 50 records (49 programs) for `sm_100a`, `sm_103a` and
+The registry holds the 58 records (56 programs) for `sm_100a`, `sm_103a` and
 `sm_107a`,
 exported from the kernel snapshot named in the pull request.
 
