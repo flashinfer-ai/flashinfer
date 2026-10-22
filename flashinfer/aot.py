@@ -1414,6 +1414,12 @@ def compile_and_package_modules(
     # Copy built kernels
     if out_dir is not None:
         copy_built_kernels(jit_specs, out_dir)
+    # CuTe-DSL exports standalone objects, rather than ninja-built shared
+    # libraries. Build on CPU release workers without loading the GPU code.
+    from .jit.cute_dsl_aot import compile_and_package_cute_dsl
+
+    for major, minor in sorted(CompilationContext().TARGET_CUDA_ARCHS):
+        compile_and_package_cute_dsl(f"sm{major}{minor}", out_dir)
     if verbose:
         print("AOT kernels saved to:", out_dir)
 

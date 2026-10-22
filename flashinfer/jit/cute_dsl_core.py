@@ -160,10 +160,84 @@ def _expand_key_files(paths: tuple) -> tuple:
     return tuple(expanded)
 
 
+# Empirically measured host-RAM budget (RSS) per precompile worker -- 1 GiB
+_CUTE_DSL_WORKER_RAM_BYTES = 1 << 30
+
+
+def _cgroup_available_memory_bytes() -> Optional[int]:
+    """Headroom under the current cgroup memory limit, or None if
+    unlimited/unreadable.
+
+    Inside containers /proc/meminfo reports *host* memory, so the cgroup
+    limit is what actually prevents an OOM kill.
+    cgroup's memory.current is profiled here to estimate the headroom.
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            limit = f.read().strip()
+        if limit != "max":
+            with open("/sys/fs/cgroup/memory.current") as f:
+                current = int(f.read())
+            return max(0, int(limit) - current)
+    except (OSError, ValueError):
+        pass
+    # cgroup v1
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
+            limit_v1 = int(f.read())
+        if limit_v1 < 1 << 60:  # values near 2**63 mean "unlimited"
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
+                usage = int(f.read())
+            return max(0, limit_v1 - usage)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _available_host_memory_bytes() -> Optional[int]:
+    """Best-effort available memory: the tighter of host MemAvailable and
+    the cgroup limit headroom, or None if neither is readable."""
+    candidates = []
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    candidates.append(int(line.split()[1]) * 1024)
+                    break
+    except OSError:
+        pass
+    cgroup = _cgroup_available_memory_bytes()
+    if cgroup is not None:
+        candidates.append(cgroup)
+    return min(candidates) if candidates else None
+
+
+def cap_cute_dsl_compile_workers(workers: int) -> int:
+    """Cap compiler processes using available host/cgroup memory (1 GiB each)."""
+    if workers <= 1:
+        return workers
+    available = _available_host_memory_bytes()
+    if available is not None:
+        mem_cap = available // _CUTE_DSL_WORKER_RAM_BYTES
+        if mem_cap < workers:
+            logger.warning(
+                f"Capping CuTe-DSL compile workers {workers} -> {mem_cap} (available host memory {available / (1 << 30):.1f} GiB)"
+            )
+            return mem_cap
+    return workers
+
+
 def _hash_source_files(paths: tuple) -> str:
     sha = hashlib.sha256()
-    for path in sorted(str(p) for p in _expand_key_files(paths)):
-        sha.update(path.encode())
+    paths = _expand_key_files(paths)
+    # Absolute checkout/install paths must not invalidate packaged artifacts.
+    root = (
+        Path(os.path.commonpath([str(Path(p).resolve().parent) for p in paths]))
+        if paths
+        else Path()
+    )
+    for path in sorted(Path(p).resolve() for p in paths):
+        sha.update(path.relative_to(root).as_posix().encode())
         with open(path, "rb") as f:
             sha.update(f.read())
     return sha.hexdigest()
@@ -240,30 +314,49 @@ class JitSpecCuteDsl(JitSpec):
 
     @property
     def is_compiled(self) -> bool:
-        return (
-            self.object_path.exists()
-            and _read_meta(self.meta_path) == self.expected_meta
-        )
+        return bool(self._matching_object_paths())
+
+    def _matching_object_paths(self) -> list[Path]:
+        paths = [self.object_path]
+        # DSL artifacts are single-target objects. Use exact architecture and
+        # compiler/source metadata matches, including for read-only providers.
+        for provider in jit_env.FLASHINFER_AOT_PROVIDERS:
+            if (
+                self.module_dir_name in provider.modules
+                and self.expected_meta["arch"] in provider.cuda_architectures
+            ):
+                paths.append(
+                    provider.jit_cache_dir
+                    / self.module_dir_name
+                    / self.object_path.name
+                )
+        return [
+            path
+            for path in paths
+            if path.is_file()
+            and _read_meta(path.parent / _META_FILENAME) == self.expected_meta
+        ]
 
     def get_library_path(self) -> Path:
-        return self.object_path
+        paths = self._matching_object_paths()
+        return paths[0] if paths else self.object_path
 
     def try_load(self) -> Optional[Any]:
         """The cached kernel iff its ``.o`` exists and meta.json matches."""
-        if not self.object_path.exists():
-            return None
-        if _read_meta(self.meta_path) != self.expected_meta:
-            return None
-        try:
-            kernel = self._load_from_disk()
-            logger.debug(f"Loaded cached CuTe-DSL kernel from {self.object_path}")
-            return kernel
-        except Exception as e:
-            logger.warning(
-                f"Failed to load cached CuTe-DSL kernel from {self.object_path}: "
-                f"{e}. Recompiling."
-            )
-            return None
+        for path in self._matching_object_paths():
+            try:
+                kernel = (
+                    self._load_from_disk()
+                    if path == self.object_path
+                    else self._load_object(path)
+                )
+                logger.debug(f"Loaded cached CuTe-DSL kernel from {path}")
+                return kernel
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load cached CuTe-DSL kernel from {path}: {e}."
+                )
+        return None
 
     def build(self) -> None:
         """Compile via ``cute.compile`` and export the ``.o`` artifact.
@@ -349,9 +442,12 @@ class JitSpecCuteDsl(JitSpec):
         return self._load_from_disk()
 
     def _load_from_disk(self) -> Any:
+        return self._load_object(self.object_path)
+
+    def _load_object(self, path: Path) -> Any:
         import cutlass.cute as cute
 
-        module = cute.runtime.load_module(str(self.object_path), enable_tvm_ffi=True)
+        module = cute.runtime.load_module(str(path), enable_tvm_ffi=True)
         return getattr(module, self.symbol)
 
     def _export(self) -> None:

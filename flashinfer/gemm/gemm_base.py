@@ -56,9 +56,16 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from .gemm_blockscaled_cute_dsl import _get_sm100_block_scaled_tactics
 from .gemm_mm_fp4_cute_dsl import (
+    _get_mm_fp4_cute_dsl_tactics,
+    _get_mm_fp4_kernel_classes,
+    _SM100_DEEP_K_INST,
+    _SM100_DEEP_K_TILE,
+    _SM100_SPLITK_KERNEL_TYPE,
     _compile_block_scaled_gemm,
     _mm_fp4_cache_key,
+    _make_mm_fp4_kernel,
     mm_fp4_l2_policy,
     _prepare_alpha_for_launch,
     per_token_alpha_mode,
@@ -70,8 +77,6 @@ from .gemm_mm_mxfp8_cute_dsl import (
 )
 from ..experimental.cake_nvfp4_per_token.support import cake_mm_fp4_requirement
 from .kernels.utils import (
-    _CLUSTER_SHAPE_MN_CANDIDATES,
-    _SM100_MMA_TILER_MN_CANDIDATES,
     _SM107_MXFP8_MMA_INST_SHAPE_K,
     _SM107_MXFP8_MMA_TILER_K,
     _get_sm107_mxfp8_tactics,
@@ -6380,85 +6385,6 @@ _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS = 32
 
 
-def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
-    tile_m, tile_n = tile_mn
-    cluster_m, cluster_n = cluster_shape_mn
-    ctas_m = ((m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
-    ctas_n = ((n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
-    return ctas_m * ctas_n
-
-
-def _get_sm100_block_scaled_tactics(
-    m,
-    n,
-    real_k,
-    ab_dtype,
-    sf_dtype,
-    sf_vec_size,
-    c_cutlass_dtype,
-    device,
-):
-    """Enumerate valid SM100 block-scaled GEMM tactics for autotuning.
-
-    Returns list of (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
-    tuples.  Shared by both the mxfp8 and fp4 cute-dsl runners.
-    """
-    from .kernels.dense_blockscaled_gemm_sm100 import (
-        Sm100BlockScaledPersistentDenseGemmKernel,
-    )
-
-    batch_size = 1
-    n_aligned = n % 8 == 0
-
-    valid_tactics = []
-    for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
-        for cluster_shape_mn in _CLUSTER_SHAPE_MN_CANDIDATES:
-            for swap_ab in (False, True):
-                if not n_aligned:
-                    continue
-
-                if swap_ab:
-                    c_major = "m"
-                    kernel_m, kernel_n = n, m
-                else:
-                    c_major = "n"
-                    kernel_m, kernel_n = m, n
-
-                if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-                    ab_dtype,
-                    sf_dtype,
-                    sf_vec_size,
-                    c_cutlass_dtype,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    kernel_m,
-                    kernel_n,
-                    real_k,
-                    batch_size,
-                    "k",
-                    "k",
-                    c_major,
-                ):
-                    continue
-
-                for use_prefetch in (False, True):
-                    if use_prefetch:
-                        cta_nums = _get_approximate_cta_nums(
-                            kernel_m, kernel_n, mma_tiler_mn, cluster_shape_mn
-                        )
-                        sm_count = torch.cuda.get_device_properties(
-                            device
-                        ).multi_processor_count
-                        cta_wave_ratio = cta_nums / sm_count
-                        if not (0.5 < cta_wave_ratio < 1.0 or real_k >= 8192):
-                            continue
-
-                    valid_tactics.append(
-                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
-                    )
-    return valid_tactics
-
-
 # Compute capabilities on which mm_fp4 serves a per-token alpha. Only the
 # SM100 CuTe-DSL kernel has the per-row alpha epilogue, and SM103 runs that
 # same kernel. The SM103 3xFP4 and SM107 kernels have no such epilogue, and the
@@ -8392,18 +8318,6 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
 #            kernel_type, use_tma_store, enable_pdl, out_dtype).
 _CUTE_DSL_MM_FP4_KERNEL_CACHE: dict[tuple, tuple] = {}
 
-# kernel_type of the low-M cluster split-K tactics of mm_fp4(backend="cute-dsl");
-# their use_tma_store slot carries the K-slice count (2 or 4).
-_SM100_SPLITK_KERNEL_TYPE = "sm100sk"
-# Deep-K persistent tactic: 8 MMA K instructions per stage (K tile 512 for FP4)
-# instead of 4, so every TMA row fetch is 256 B. Carried in the use_tma_store
-# slot of an "sm100" tactic. Wins for narrow (<= 32) token tiles once the
-# weight grid is about a wave or more (>= _SM100_DEEP_K_MIN_TILES weight
-# tiles); below that the longer pipeline fill/drain costs 1-2 %.
-_SM100_DEEP_K_INST = 8
-
-
-_SM100_DEEP_K_TILE = 512
 _SM100_DEEP_K_MIN_TILES = 128
 
 
@@ -8495,7 +8409,7 @@ def _cute_dsl_gemm_fp4_runner(
     """Create a CuTe DSL FP4 GEMM runner for the cute_dsl backend.
 
     On SM100: uses the SM100 kernel only.
-    On SM103: uses both SM100 kernel and the SM103-specific 3xFP4 kernel.
+    On SM103: currently uses the SM100 kernel family.
     On SM107: uses all SM100, SM103 and SM107 kernels.
     The autotuner selects the best (kernel_type, tile, cluster, swap_ab, prefetch,
     use_tma_store) combination.
@@ -8516,31 +8430,7 @@ def _cute_dsl_gemm_fp4_runner(
 
     sm_version = sm_major * 10 + sm_minor
 
-    # TODO(yunzheq): Re-enable SM103 kernel on Blackwell once cutlass-dsl package
-    # includes SM103MmaMXF4Op and compatible PersistentTileSchedulerParams. On
-    # Blackwell (sm103) this stays disabled to match main; the Sm103 kernel class
-    # is only used on Rubin (sm107), where the internal cutlass-dsl wheel supports it.
-    Sm103Kernel = None
-    if sm_version == 107:
-        try:
-            from .kernels.dense_blockscaled_gemm_sm103 import (
-                Sm103BlockScaledPersistentDenseGemmKernel,
-            )
-
-            Sm103Kernel = Sm103BlockScaledPersistentDenseGemmKernel
-        except ImportError:
-            pass
-
-    Sm107Kernel = None
-    if sm_version == 107:
-        try:
-            from .kernels.dense_blockscaled_gemm_sm107 import (
-                Sm107BlockScaledPersistentDenseGemmKernel,
-            )
-
-            Sm107Kernel = Sm107BlockScaledPersistentDenseGemmKernel
-        except ImportError:
-            pass
+    Sm103Kernel, Sm107Kernel = _get_mm_fp4_kernel_classes(sm_version)
 
     from ..cute_dsl.utils import torch_to_cutlass_dtype
 
@@ -8566,223 +8456,19 @@ def _cute_dsl_gemm_fp4_runner(
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> list:
-            (a, b, a_descale, b_descale, alpha, _, out, _, _, _) = inputs
-            m = a.shape[0]
-            k_packed = a.shape[1]
-            n = b.shape[1]
-            real_k = k_packed * 2  # FP4 packed as uint8
-
-            sf_vec_size = 16 if use_nvfp4 else 32
-            ab_dtype = cutlass.Float4E2M1FN
-            sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
-
-            # SM100 tactics (shared enumeration with mxfp8)
-            sm100_base = _get_sm100_block_scaled_tactics(
+            (a, b, _, _, alpha, _, out, _, _, _) = inputs
+            m, n, real_k = a.shape[0], b.shape[1], a.shape[1] * 2
+            valid_tactics = _get_mm_fp4_cute_dsl_tactics(
                 m,
                 n,
                 real_k,
-                ab_dtype,
-                sf_dtype,
-                sf_vec_size,
+                use_nvfp4,
                 c_cutlass_dtype,
                 a.device,
+                sm_version,
+                out.is_contiguous(),
+                _is_per_token_alpha(alpha),
             )
-
-            if m <= 32:
-                allowed_tiles = {
-                    (128, 8),
-                    (128, 16),
-                    (128, 32),
-                    (256, 8),
-                    (256, 16),
-                    (256, 32),
-                }
-
-                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles and t[2]]
-
-            valid_tactics = [(*t, "sm100", None) for t in sm100_base]
-            # Deep-K variant (K tile 512, use_tma_store slot = 8 MMA K
-            # instructions per stage) for narrow N tiles; see
-            # _select_sm100_mm_fp4_splitk_tactic for where it wins untuned.
-            if real_k % _SM100_DEEP_K_TILE == 0:
-                valid_tactics += [
-                    (*t, "sm100", _SM100_DEEP_K_INST)
-                    for t in sm100_base
-                    if t[0][1] <= 32
-                ]
-
-            # Low-M cluster split-K (swap_ab only; the use_tma_store slot
-            # carries the K-slice count). Its epilogue applies the per-token
-            # alpha after the FP32 cluster reduction, so it stays valid for
-            # per-token alpha.
-            if use_nvfp4 and out.is_contiguous() and _SplitKKernel.supports_m(m):
-                for split_k_slices in _SplitKKernel.SUPPORTED_SPLIT_K_SLICES:
-                    if not _SplitKKernel.is_valid_tactic(
-                        m, real_k, ab_dtype, split_k_slices
-                    ):
-                        continue
-                    for sk_tile in _SplitKKernel.mma_tilers_for_m(m):
-                        valid_tactics.append(
-                            (
-                                sk_tile,
-                                (1, 1),
-                                True,
-                                False,
-                                _SM100_SPLITK_KERNEL_TYPE,
-                                split_k_slices,
-                            )
-                        )
-
-            # Shared by the SM103 and SM107 tactic blocks below. Hoisted out of
-            # the SM103 block: the two blocks have independent guards (the SM103
-            # kernel needs the internal cutlass-dsl wheel, the SM107 one needs
-            # rubin_helpers), so on a public DSL with Sm103Kernel None but
-            # Sm107Kernel present the SM107 block would otherwise reference these
-            # before assignment.
-            batch_size = 1
-            m_aligned = m % 8 == 0
-            n_aligned = n % 8 == 0
-
-            # --- SM103 tactics (only on SM103) ---
-            if sm_version in [103, 107] and Sm103Kernel is not None:
-                sm103_mma_tiler_candidates = [
-                    (128, 128),
-                    (256, 128),
-                    (128, 256),
-                    (256, 256),
-                ]
-
-                for mma_tiler_mn in sm103_mma_tiler_candidates:
-                    for cluster_shape_mn in _CLUSTER_SHAPE_MN_CANDIDATES:
-                        for swap_ab in (False, True):
-                            if not swap_ab and not n_aligned:
-                                continue
-                            if swap_ab and not m_aligned:
-                                continue
-
-                            if swap_ab:
-                                c_major = "m"
-                                kernel_m, kernel_n = n, m
-                            else:
-                                c_major = "n"
-                                kernel_m, kernel_n = m, n
-
-                            for use_tma_store in (True, False):
-                                if not Sm103Kernel.can_implement(
-                                    ab_dtype,
-                                    sf_dtype,
-                                    sf_vec_size,
-                                    c_cutlass_dtype,
-                                    mma_tiler_mn,
-                                    cluster_shape_mn,
-                                    kernel_m,
-                                    kernel_n,
-                                    real_k,
-                                    batch_size,
-                                    "k",
-                                    "k",
-                                    c_major,
-                                    use_tma_store,
-                                ):
-                                    continue
-
-                                valid_tactics.append(
-                                    (  # type: ignore[arg-type]
-                                        mma_tiler_mn,
-                                        cluster_shape_mn,
-                                        swap_ab,
-                                        False,
-                                        "sm103",
-                                        use_tma_store,
-                                    )
-                                )
-
-            # --- SM107 tactics (only on SM107) ---
-            if sm_version == 107 and Sm107Kernel is not None:
-                sm107_mma_tiler_mn_candidates = [
-                    (128, 64),
-                    (256, 64),
-                    (128, 128),
-                    (256, 128),
-                    (128, 192),
-                    (256, 192),
-                    (128, 256),
-                    (256, 256),
-                ]
-                sm107_mma_inst_shape_m_candidates = [128, 256]
-
-                for mma_tiler_mn in sm107_mma_tiler_mn_candidates:
-                    for mma_inst_shape_m in sm107_mma_inst_shape_m_candidates:
-                        mma_inst_shape_k = 128  # fixed for FP4
-                        mma_tiler_k = 256  # fixed for FP4
-                        mma_inst_shape = (
-                            mma_inst_shape_m,
-                            mma_tiler_mn[1],
-                            mma_inst_shape_k,
-                        )
-
-                        for cluster_shape_mn in _CLUSTER_SHAPE_MN_CANDIDATES:
-                            for swap_ab in (False, True):
-                                if not swap_ab and not n_aligned:
-                                    continue
-                                if swap_ab and not m_aligned:
-                                    continue
-
-                                if swap_ab:
-                                    c_major = "m"
-                                    kernel_m, kernel_n = n, m
-                                else:
-                                    c_major = "n"
-                                    kernel_m, kernel_n = m, n
-
-                                if not Sm107Kernel.can_implement(
-                                    ab_dtype,
-                                    sf_dtype,
-                                    sf_vec_size,
-                                    c_cutlass_dtype,
-                                    mma_tiler_mn,
-                                    mma_inst_shape,
-                                    cluster_shape_mn,
-                                    kernel_m,
-                                    kernel_n,
-                                    real_k,
-                                    batch_size,
-                                    "k",
-                                    "k",
-                                    c_major,
-                                ):
-                                    continue
-
-                                # prefetch_dist: 0=off (best default at generic
-                                # shapes), 2=shallow, None=auto (num_ab_stage
-                                # depth; helps at long-K DSV4-like shapes)
-                                for prefetch_dist in (0, 2, None):
-                                    valid_tactics.append(
-                                        (  # type: ignore[arg-type]
-                                            mma_tiler_mn,
-                                            cluster_shape_mn,
-                                            swap_ab,
-                                            False,  # use_prefetch is SM100-only
-                                            "sm107",
-                                            (
-                                                mma_inst_shape_m,
-                                                mma_tiler_mn[1],
-                                                mma_inst_shape_k,
-                                                mma_tiler_k,
-                                                prefetch_dist,
-                                            ),
-                                        )
-                                    )
-
-            if _is_per_token_alpha(alpha):
-                # Only the SM100 kernel has the per-row alpha epilogue. The
-                # SM103/SM107 tactics would each raise in forward() and cost the
-                # tuner a profiling pass for a tactic that can never win.
-                valid_tactics = [
-                    t
-                    for t in valid_tactics
-                    if t[4] in ("sm100", _SM100_SPLITK_KERNEL_TYPE)
-                ]
 
             # Rank individual tactics so the limit is an actual benchmark
             # budget. Group-counting with ``max_tactics // 2`` only produced
@@ -8947,7 +8633,6 @@ def _cute_dsl_gemm_fp4_runner(
             )
 
             split_k_slices = 1
-            make_kernel: Callable
             if kernel_type == _SM100_SPLITK_KERNEL_TYPE:
                 split_k_slices = int(use_tma_store)
                 if (
@@ -8961,39 +8646,17 @@ def _cute_dsl_gemm_fp4_runner(
                     or not _SplitKKernel.supports_mma_tiler_for_m(mma_tiler_mn, m)
                 ):
                     raise ValueError(f"Invalid FP4 split-K tactic: {tactic}")
-                make_kernel = lambda: _SplitKKernel(
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    split_k_slices,
-                    enable_pdl,
-                    alpha_mode,
-                )
             elif kernel_type == "sm107" and Sm107Kernel is not None:
                 if alpha_mode is not None:
                     raise ValueError(
                         "The SM107 FP4 CuTe-DSL kernel has no per-token alpha epilogue."
                     )
-                sm107_params = use_tma_store  # repurposed: (inst_m, inst_n, inst_k, tiler_k, prefetch_dist)
-                make_kernel = lambda: Sm107Kernel(
-                    sf_vec_size,
-                    (sm107_params[0], sm107_params[1], sm107_params[2]),
-                    (mma_tiler_mn[0], mma_tiler_mn[1], sm107_params[3]),
-                    cluster_shape_mn,
-                    prefetch_dist=sm107_params[4],
-                )
             elif kernel_type == "sm103" and Sm103Kernel is not None:
                 if alpha_mode is not None:
                     raise ValueError(
                         "The SM103 3xFP4 CuTe-DSL kernel has no per-token alpha "
                         "epilogue."
                     )
-                make_kernel = lambda: Sm103Kernel(
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    use_tma_store,
-                    enable_pdl,
-                )
             else:
                 # use_tma_store slot: None (K tile 256) or _SM100_DEEP_K_INST
                 # (K tile 512, narrow N tiles only).
@@ -9003,22 +8666,10 @@ def _cute_dsl_gemm_fp4_runner(
                     or real_k % _SM100_DEEP_K_TILE != 0
                 ):
                     raise ValueError(f"Invalid FP4 SM100 tactic: {tactic}")
-                deep_k_inst = use_tma_store or 4
-                make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    use_prefetch,
-                    enable_pdl,
-                    alpha_mode,
-                    mma_inst_tile_k=deep_k_inst,
-                    a_l2_evict_first=l2_policy == "a_ef",
-                    b_l2_evict_first=l2_policy == "b_ef",
-                    a_l2_evict_last=l2_policy == "ab_el",
-                    b_l2_evict_last=l2_policy == "ab_el",
-                )
 
-            compiled_gemm, _ = _compile_block_scaled_gemm(
+            make_kernel = lambda: _make_mm_fp4_kernel(cache_key)
+
+            compiled_gemm, max_active_clusters = _compile_block_scaled_gemm(
                 _CUTE_DSL_MM_FP4_KERNEL_CACHE,
                 cache_key,
                 make_kernel,
@@ -9062,6 +8713,7 @@ def _cute_dsl_gemm_fp4_runner(
                 kernel_a_sf.data_ptr(),
                 kernel_b_sf.data_ptr(),
                 alpha_for_launch,
+                max_active_clusters,
             )
             return out
 

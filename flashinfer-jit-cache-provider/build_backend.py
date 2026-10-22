@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from packaging.requirements import Requirement
+
 from setuptools import build_meta as _orig
 from wheel.bdist_wheel import bdist_wheel
 
@@ -78,7 +80,11 @@ def _write_provider_manifest(jit_cache_dir: Path) -> None:
     modules = sorted(
         module_dir.name
         for module_dir in jit_cache_dir.iterdir()
-        if module_dir.is_dir() and (module_dir / f"{module_dir.name}.so").is_file()
+        if module_dir.is_dir()
+        and (
+            (module_dir / f"{module_dir.name}.so").is_file()
+            or ((module_dir / "meta.json").is_file() and any(module_dir.glob("*.o")))
+        )
     )
     if not modules:
         raise RuntimeError("No .so files were generated for the jit-cache provider")
@@ -90,6 +96,11 @@ def _write_provider_manifest(jit_cache_dir: Path) -> None:
         "version": config.version,
         "cuda_architectures": [config.provider_tag],
         "modules": modules,
+        "cute_dsl_kernels": {
+            name: sorted(path.stem for path in (jit_cache_dir / name).glob("*.o"))
+            for name in modules
+            if (jit_cache_dir / name / "meta.json").is_file()
+        },
     }
     (PROVIDER_SOURCE_DIR / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -205,11 +216,24 @@ def prepare_metadata_for_build_editable(metadata_directory, config_settings=None
         )
 
 
+def _get_provider_build_requirements():
+    requirements = get_build_dependency_requirements(config.cuda_major)
+    if config.provider_tag == "sm107a":
+        # Rubin (SM107a) kernels require the Rubin APIs introduced in CuTe-DSL 4.8.
+        requirements = [
+            "nvidia-cutlass-dsl[cu13]>=4.8"
+            if Requirement(requirement).name == "nvidia-cutlass-dsl"
+            else requirement
+            for requirement in requirements
+        ]
+    return requirements
+
+
 def get_requires_for_build_wheel(config_settings=None):
     """Install configured dependencies in the isolated wheel build env."""
     return [
         *_orig.get_requires_for_build_wheel(config_settings),
-        *get_build_dependency_requirements(config.cuda_major),
+        *_get_provider_build_requirements(),
     ]
 
 
@@ -217,4 +241,4 @@ def get_requires_for_build_editable(config_settings=None):
     """Install configured dependencies in the isolated editable build env."""
     get_requires = getattr(_orig, "get_requires_for_build_editable", None)
     requirements = [] if get_requires is None else get_requires(config_settings)
-    return [*requirements, *get_build_dependency_requirements(config.cuda_major)]
+    return [*requirements, *_get_provider_build_requirements()]
