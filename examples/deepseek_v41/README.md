@@ -220,8 +220,6 @@ There is no prepare kernel, per-source state or merge. Workspace contains
 private natural-log, sink-exclusive FP32 LSE and the K0 dummy main storage.
 Sinks contain finite logits or -inf and affect output normalization exactly once;
 empty rows produce exact zero output and -inf LSE. Effective Q/K/V must be finite.
-See [`SPARSE.md`](../../flashinfer/attention/prims_ts/kernels/mla_decode/SPARSE.md)
-for routing, producer publication and private arithmetic hooks.
 
 Capture requires caller output/workspace and eager warmup for the same declaration.
 Keep addresses alive/fixed and update values in place. Changing Python scales
