@@ -84,7 +84,13 @@ def test_kernel_sources_exist_and_define_their_symbol() -> None:
         assert path.is_file(), path
         text = path.read_text()
         symbol = union.kernel_symbol(name)
-        assert re.search(r"\bvoid\s+" + re.escape(symbol) + r"\(", text), symbol
+        pattern = r"\bvoid\s+" + re.escape(symbol) + r"\("
+        if f"-DCAKE_UNION_KERNEL={symbol}" in union.kernel_defines(name):
+            # A source shared by sibling kernels defines the symbol through
+            # the CAKE_UNION_KERNEL definition of the module's flag list; a
+            # preprocessor arm may close between the return type and the name.
+            pattern += r"|\bvoid\s+(?:#[^\n]*\n\s*)*CAKE_UNION_KERNEL\("
+        assert re.search(pattern, text), symbol
         # The device text takes the rank at runtime and reads every workspace
         # address from the device pointer table.
         assert "world_rank" in text
