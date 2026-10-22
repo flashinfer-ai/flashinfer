@@ -2216,9 +2216,9 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            from .kernels.tgv_gemm_cute_ext import get_tgv_cute_ext_tactic_num
+            from .kernels.tgv_gemm_cute_ext import get_tgv_cute_ext_valid_tactics
 
-            return list(range(get_tgv_cute_ext_tactic_num()))
+            return get_tgv_cute_ext_valid_tactics(inputs[0].device)
 
         def forward(
             self,
