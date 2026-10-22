@@ -17,7 +17,7 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-from typing import Any, Optional
+from typing import Any
 
 from . import cake_build
 
@@ -837,60 +837,20 @@ def toolchain_runs_hidden_count(arch: str) -> bool:
     return tuple(cake_build.record_cuda_version(arch)) != (13, 0)
 
 
-PRIMARY_RECORD = "cake_lm_head_loss_{arch}"  # the architecture's record (geometry-free: H / V are launch scalars)
-
-
-def record_geometry(record: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
-    """``(hidden, vocab)`` a record's GEMM instances are specialized to (``None`` = any multiple)."""
-    geometry = record.get("geometry", {})
-    hidden, vocab = geometry.get("hidden"), geometry.get("vocab")
-    return (
-        None if hidden is None else int(hidden),
-        None if vocab is None else int(vocab),
-    )
-
-
-def select_module(
-    arch: str, hidden: Optional[int] = None, vocab: Optional[int] = None
-) -> str:
-    """Return the registered module name for ``arch`` -- the record specialized to the
-    ``(hidden, vocab)`` geometry when given (a record pinned to neither accepts any), else
-    the sole record of the architecture or its default-geometry record ``PRIMARY_RECORD``."""
+def select_module(arch: str) -> str:
+    """Return the registered module name for ``arch``: the architecture's sole record (the kernels take ``H`` / ``V``
+    as launch scalars, so one record serves every admissible geometry)."""
     names = [name for name, record in MODULES.items() if record["arch"] == arch]
     if not names:
         raise NotImplementedError(
             f"The generated chunked LM-head + loss program for {arch} is not "
             "registered in this checkout yet (see flashinfer-ai/flashinfer#5680)"
         )
-    if hidden is None and vocab is None:
-        if len(names) == 1:
-            return names[0]
-        primary = PRIMARY_RECORD.format(arch=arch)
-        if primary in names:
-            return primary
+    if len(names) > 1:
         raise NotImplementedError(
-            f"{arch} registers more than one chunked LM-head program and no default-geometry "
-            f"record {primary!r}: {names}; select by hidden= / vocab="
+            f"{arch} registers more than one chunked LM-head program: {names}"
         )
-
-    def matches(record):
-        pinned_h, pinned_v = record_geometry(record)
-        return (pinned_h is None or hidden is None or pinned_h == int(hidden)) and (
-            pinned_v is None or vocab is None or pinned_v == int(vocab)
-        )
-
-    found = [name for name in names if matches(MODULES[name])]
-    if len(found) > 1:
-        raise NotImplementedError(
-            f"{arch} registers more than one chunked LM-head program for H = {hidden}, V = {vocab}: {found}"
-        )
-    if not found:
-        registered = sorted(record_geometry(MODULES[name]) for name in names)
-        raise ValueError(
-            f"the registered chunked LM-head programs for {arch} are specialized to (H, V) in {registered}, "
-            f"got H = {hidden}, V = {vocab}"
-        )
-    return found[0]
+    return names[0]
 
 
 def registered_stages(name: str) -> tuple[str, ...]:

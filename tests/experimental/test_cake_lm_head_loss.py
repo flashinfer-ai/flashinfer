@@ -352,16 +352,9 @@ def test_registry_records_are_well_formed():
         assert record["arch"] in SUPPORTED_COMPUTE_CAPABILITIES.values()
         assert record_abi(record) in SUPPORTED_ABIS
         assert (
-            cake_jit.select_module(record["arch"], *cake_jit.record_geometry(record))
-            == name
-        )
-        if name == cake_jit.PRIMARY_RECORD.format(arch=record["arch"]):
-            assert cake_jit.select_module(record["arch"]) == name
+            cake_jit.select_module(record["arch"]) == name
+        )  # one record per architecture
         geometry = Geometry.from_record(record)
-        assert (
-            geometry.hidden is None or geometry.hidden % geometry.hidden_multiple == 0
-        )
-        assert geometry.vocab is None or geometry.vocab % geometry.vocab_multiple == 0
         for op in (
             "logits",
             "dx",
@@ -738,16 +731,6 @@ def _cuda_scalar():
             NotImplementedError,
             "deterministic",
         ),
-        (
-            lambda kw: dict(
-                kw,
-                geometry=Geometry.from_record(
-                    {"geometry": {"hidden": DEFAULT_H, "vocab": DEFAULT_V}}
-                ),
-            ),
-            ValueError,
-            "specialized",
-        ),
     ],
     ids=[
         "x_fp32",
@@ -773,7 +756,6 @@ def _cuda_scalar():
         "unknown_objective",
         "logprob_with_objective_args",
         "nondeterministic",
-        "pinned_geometry",
     ],
 )
 def test_validate_rejects(mutate, exc, match):
@@ -2054,65 +2036,25 @@ def test_toolchain_runs_hidden_count(monkeypatch):
         assert cake_jit.toolchain_runs_hidden_count("sm_100a") is True, version
 
 
-def test_select_module_by_geometry(monkeypatch):
-    def rec(arch, H, V):
-        return {
-            "arch": arch,
-            "abi": ABI_CONTRACT,
-            "geometry": {"hidden": H, "vocab": V},
-            "stages": [],
-        }
+def test_select_module_one_record_per_arch(monkeypatch):
+    def rec(arch):
+        return {"arch": arch, "abi": ABI_CONTRACT, "geometry": {}, "stages": []}
 
     monkeypatch.setattr(
         cake_jit,
         "MODULES",
         {
-            "cake_lm_head_loss_sm_100a": rec("sm_100a", 6144, 154880),
-            "cake_lm_head_loss_sm_100a_h7168_v129280": rec("sm_100a", 7168, 129280),
-            "cake_lm_head_loss_sm_103a_h8192_v128256": rec("sm_103a", 8192, 128256),
+            "cake_lm_head_loss_sm_100a": rec("sm_100a"),
+            "cake_lm_head_loss_sm_103a": rec("sm_103a"),
         },
     )
-    assert (
-        cake_jit.select_module("sm_100a") == "cake_lm_head_loss_sm_100a"
-    )  # the default-geometry record
-    assert (
-        cake_jit.select_module("sm_100a", 6144, 154880) == "cake_lm_head_loss_sm_100a"
-    )
-    assert (
-        cake_jit.select_module("sm_100a", 7168, 129280)
-        == "cake_lm_head_loss_sm_100a_h7168_v129280"
-    )
-    assert (
-        cake_jit.select_module("sm_103a") == "cake_lm_head_loss_sm_103a_h8192_v128256"
-    )  # the sole record
-    assert (
-        cake_jit.select_module("sm_103a", hidden=8192)
-        == "cake_lm_head_loss_sm_103a_h8192_v128256"
-    )
-    with pytest.raises(ValueError, match="specialized"):
-        cake_jit.select_module("sm_100a", 8192, 128256)
-    with pytest.raises(ValueError, match="specialized"):
-        cake_jit.select_module("sm_103a", 6144, 154880)
+    assert cake_jit.select_module("sm_100a") == "cake_lm_head_loss_sm_100a"
+    assert cake_jit.select_module("sm_103a") == "cake_lm_head_loss_sm_103a"
     with pytest.raises(NotImplementedError):
         cake_jit.select_module("sm_90a")
-    monkeypatch.setattr(
-        cake_jit,
-        "MODULES",
-        {"a": rec("sm_100a", 6144, 154880), "b": rec("sm_100a", 7168, 129280)},
-    )
-    with pytest.raises(NotImplementedError, match="default-geometry"):
-        cake_jit.select_module("sm_100a")
-    assert cake_jit.select_module("sm_100a", 7168, 129280) == "b"
-    monkeypatch.setattr(
-        cake_jit,
-        "MODULES",
-        {"a": rec("sm_100a", None, None), "b": rec("sm_100a", 7168, 129280)},
-    )
+    monkeypatch.setattr(cake_jit, "MODULES", {"a": rec("sm_100a"), "b": rec("sm_100a")})
     with pytest.raises(NotImplementedError, match="more than one"):
-        cake_jit.select_module(
-            "sm_100a", 7168, 129280
-        )  # an unpinned record accepts every geometry
-    assert cake_jit.record_geometry(rec("sm_100a", None, 4)) == (None, 4)
+        cake_jit.select_module("sm_100a")
 
 
 def test_reachable_variants_complete_the_rule_closure():
@@ -5669,7 +5611,7 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
     zeros after the count), and the logits and row statistics of the counted rows are bitwise the host-bound form's."""
     _require_program(entry="logprob")
     _require_hidden_count()
-    name, record = cake_backend.record_for(CUDA, DEFAULT_H, DEFAULT_V)
+    name, record = cake_backend.record_for(CUDA)
     # calls of three chunks and more (the chunk rule): some rows ignored, none, most (a count below the buffer
     # extent), five chunks at half, all ignored
     cases = (
