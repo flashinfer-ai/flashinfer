@@ -111,6 +111,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.kimi_k3_fp8_projection" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a per-token NVFP4 quantizer and GEMM backend, compiled on demand.
 "flashinfer.experimental.cake_nvfp4_per_token" = ["csrc/**"]
+# CUDA sources of the experimental SM120 DSA indexer, JIT-compiled on first use.
+"flashinfer.experimental.sm120_dsa_indexer" = ["csrc/**"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
 # Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
