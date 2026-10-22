@@ -117,11 +117,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "main",
         "sources": [
             "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_be8f417457dc53a8e527_kernel.cu",
-            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_2694148151c989006fa4_binding.cu",
+            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_binding.cu",
         ],
         "source_flags": [
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_2694148151c989006fa4",
             "-DCAKE_ITEM_GROUPS=16",
+        ],
+        "binding_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_2694148151c989006fa4",
+            "-DCAKE_HOST_SHIM_NS=cake_host_shim_b4cd28847ffcf39d",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -129,10 +133,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "main",
         "sources": [
             "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_kernel.cu",
-            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_4ad9a542b809cf44d979_binding.cu",
+            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_binding.cu",
         ],
         "source_flags": [
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_4ad9a542b809cf44d979",
+            "-DCAKE_PAGE_SIZE=32",
+        ],
+        "binding_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_4ad9a542b809cf44d979",
+            "-DCAKE_HOST_SHIM_NS=cake_host_shim_30a77ce10c6ce98b",
             "-DCAKE_PAGE_SIZE=32",
         ],
         "arches": ["sm_100a", "sm_103a"],
@@ -141,7 +150,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "main",
         "sources": [
             "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_54bce6b66e691dc646b1_kernel.cu",
-            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_54bce6b66e691dc646b1_binding.cu",
+            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_binding.cu",
+        ],
+        "binding_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_54bce6b66e691dc646b1",
+            "-DCAKE_HOST_SHIM_NS=cake_host_shim_0cebb0c30ee31fdf",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -149,11 +162,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "main",
         "sources": [
             "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_54bce6b66e691dc646b1_kernel.cu",
-            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4_binding.cu",
+            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_binding.cu",
         ],
         "source_flags": [
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4",
             "-DCAKE_ITEM_GROUPS=16",
+        ],
+        "binding_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4",
+            "-DCAKE_HOST_SHIM_NS=cake_host_shim_ab10387e0a49337d",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -161,11 +178,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "main",
         "sources": [
             "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_kernel.cu",
-            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712_binding.cu",
+            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_binding.cu",
         ],
         "source_flags": [
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712",
             "-DCAKE_PAGE_SIZE=128",
+        ],
+        "binding_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712",
+            "-DCAKE_HOST_SHIM_NS=cake_host_shim_459c67197528d5ab",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -181,7 +202,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "main",
         "sources": [
             "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_be8f417457dc53a8e527_kernel.cu",
-            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_be8f417457dc53a8e527_binding.cu",
+            "cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_binding.cu",
+        ],
+        "binding_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_mla_varq_dcp_decode_be8f417457dc53a8e527",
+            "-DCAKE_HOST_SHIM_NS=cake_host_shim_b69bcd9a47fb5819",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
