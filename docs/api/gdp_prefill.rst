@@ -7,11 +7,13 @@ Gated DeltaProduct prefill. ``chunk_gated_delta_product`` is the chunked GDP
 scan: GDN with ``num_householder`` beta-gated Householder updates per token
 instead of one, on an expanded k/v/beta sub-token timeline.
 
-FlashInfer carries no GDP kernel of its own, so this runs on cuDNN's fused
-SM100 linear-attention engine
-(:func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`). It needs an
-SM100-family device and cudnn-frontend 1.28+ with the ``cutedsl`` extra; the
-engine declines anything else it cannot serve.
+``backend="auto"`` and ``backend="cudnn"`` run cuDNN's fused SM100
+linear-attention engine
+(:func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`); it needs an
+SM100-family device and cudnn-frontend 1.28+ with the ``cutedsl`` extra, and
+declines anything else it cannot serve.  ``backend="cake"`` runs the Cake GDP
+prefill kernel (K=128, V=64, one to four Householder steps per token; SM90)
+with the same argument contract.
 
 .. currentmodule:: flashinfer.gdp_prefill
 
