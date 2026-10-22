@@ -175,7 +175,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -223,7 +223,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b9a6204da826be87d972_kernel.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -496,6 +496,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a01c4436c21e679aaed9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_52f3fc23159650a89719_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b9a6204da826be87d972_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -510,6 +511,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "main": "cake_all_gather_matmul_a01c4436c21e679aaed9",
             "main_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
             "main_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
+            "main_cg2s2": "cake_all_gather_matmul_b9a6204da826be87d972",
         },
     },
     "bfloat16_ws4_k_major_sm_103a": {
@@ -592,6 +594,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a55baa3bdb6ce5b39f7e_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -606,6 +609,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "main": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
             "main_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
             "main_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
+            "main_cg2s2": "cake_all_gather_matmul_9d5d20282a6a1082a079",
         },
     },
     "bfloat16_ws8_k_major_sm_103a": {
@@ -1069,7 +1073,10 @@ CG2_REGIONS: dict[str, list[list[Any]]] = {
 # N-split pair main (``form`` ``cg2s1`` / ``cg2s2``), per architecture;
 # ``main_form`` selects a point's program only inside this table.
 CG2S_CLASSES: dict[str, list[list[Any]]] = {
-    "sm_100a": [],
+    "sm_100a": [
+        [4, "bfloat16", "k_major", "cg2s2"],
+        [8, "bfloat16", "k_major", "cg2s2"],
+    ],
     "sm_103a": [
         [4, "bfloat16", "k_major", "cg2s2"],
         [8, "bfloat16", "k_major", "cg2s2"],
@@ -1082,7 +1089,10 @@ CG2S_CLASSES: dict[str, list[list[Any]]] = {
 # its class, ``ceil128(rows)`` and exact ``N`` match a point, else the CTA-pair
 # twin.
 CG2_SPILL_POINTS: dict[str, list[list[Any]]] = {
-    "sm_100a": [],
+    "sm_100a": [
+        [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
+        [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
+    ],
     "sm_103a": [
         [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
         [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],

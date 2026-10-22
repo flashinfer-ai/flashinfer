@@ -566,7 +566,7 @@ def fake_one_sided(monkeypatch):
     )
 
     module = _FakeOneSidedModule()
-    probe: dict = {"reason": None, "probed": 0}
+    probe: dict = {"reason": None, "probed": 0, "fabric_handles": True}
 
     def acquire(self, mapping, comm, metainfo, cft_capable):
         return {
@@ -579,8 +579,10 @@ def fake_one_sided(monkeypatch):
             "cft_ready": cft_capable,
         }
 
-    def unsupported_reason(device_index):
+    def unsupported_reason(device_index, fabric_handles):
         probe["probed"] += 1
+        if not fabric_handles:
+            return "the workspace is not shared through FABRIC handles"
         return probe["reason"]
 
     monkeypatch.setattr(
@@ -617,6 +619,11 @@ def fake_one_sided(monkeypatch):
         mnnvl.MnnvlMemory, "get_comm", staticmethod(lambda mapping: None)
     )
     monkeypatch.setattr(mnnvl, "all_ranks_agree", lambda comm, local: local)
+    monkeypatch.setattr(
+        mnnvl.MnnvlMemory,
+        "uses_fabric_handles",
+        staticmethod(lambda comm, dev_id: probe["fabric_handles"]),
+    )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(flashinfer.utils, "device_support_pdl", lambda device: True)
     return SimpleNamespace(module=module, probe=probe)
@@ -658,6 +665,10 @@ def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     assert not _one_sided().cft_enabled
 
     fake_one_sided.probe["reason"] = None
+    fake_one_sided.probe["fabric_handles"] = False
+    assert not _one_sided().cft_enabled
+
+    fake_one_sided.probe["fabric_handles"] = True
     comm = _one_sided(use_low_precision_combine=True, cft_max_tokens_for_dispatch=2)
     assert comm.cft_enabled
     # FP8 wire format sizes the CFT receive inbox.
@@ -673,19 +684,19 @@ def test_nvlink_one_sided_enable_pdl_override(fake_one_sided) -> None:
 
 
 def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:
-    import flashinfer.comm.mnnvl as mnnvl
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
         communication as one_sided,
     )
 
-    def no_fabric_info(device_index):
-        raise RuntimeError("nvmlDeviceGetGpuFabricInfoV: Not Supported")
+    def no_driver_version():
+        raise RuntimeError("nvmlSystemGetDriverVersion: Uninitialized")
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: (10, 0))
-    monkeypatch.setattr(one_sided, "_driver_branch", lambda: 620)
-    monkeypatch.setattr(mnnvl, "is_mnnvl_fabric_supported", no_fabric_info)
-    reason = one_sided._cft_unsupported_reason(0)
+    monkeypatch.setattr(one_sided, "_driver_branch", no_driver_version)
+    reason = one_sided._cft_unsupported_reason(0, fabric_handles=True)
     assert reason is not None and "RuntimeError" in reason
+    # POSIX file descriptor workspaces rule CFT out before any probe runs.
+    assert "FABRIC" in one_sided._cft_unsupported_reason(0, fabric_handles=False)
 
 
 def test_nvlink_one_sided_instances_sharing_a_workspace_cannot_interleave(

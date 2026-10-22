@@ -58,18 +58,19 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 | Feature | Support |
 | --- | --- |
 | GPU | Blackwell SM100/SM103 and Rubin SM107; see validation scope below |
-| Head dimensions | Equal QK/V: 128 or 256; separate contiguous MLA: QK=192, V=128 |
+| Head dimensions | Equal QK/V: 128, 192, or 256; separate contiguous MLA: QK=192, V=128 |
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_dtype`; defaults to `k_dtype`) |
 | Output dtype | `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Contiguous storage | Fixed BSHD or packed THD with uniform or ragged request lengths |
-| Paged storage | Packed Q plus separate compact HND K/V page pools |
+| Paged storage | Packed Q plus separate logical HND K/V views, including NHD/interleaved physical storage |
 | Page size | 16, 32, 64, or 128 tokens |
 | Mask | Dense or bottom-right causal; fixed contiguous also supports variable-window bounds |
 | Sliding window | Positive causal left window; `window_left=-1` disables it |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
-| Accumulation | FP32 QK/PV and softmax state |
+| Accumulation | FP32 QK/PV and softmax state; INT8 Q/K accumulate INT32 scores that the softmax reads as FP32 |
+| Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` or `torch.int8` (SM100a only) Q/K, `torch.float8_e4m3fn` V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
 
 The established equal-dimension paths have accuracy and performance signoff
 on SM100a/B200. The 192/128 extension has been validated on SM103/GB300;
@@ -77,8 +78,12 @@ its B200 performance remains to be measured. SM107 accuracy and performance
 have not been validated for this extension.
 
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
-one. Causal attention requires `Sq <= Sk` for every request at run time. All
-tensor extents and packed request lengths must be positive. For each contiguous
+one. Causal attention requires `Sq <= Sk` for every active request at run time.
+Paged sliding-window loads ignore K/V pages wholly before the earliest visible
+key in a query tile. Those evicted pages may have been recycled and contain
+NaNs; the first partially visible page remains live.
+Plan capacities and fixed tensor extents must be positive; packed request lengths
+may be zero. For each contiguous
 run, the aggregate logical Q and K extents—`B*Sq` and `B*Sk` for fixed storage,
 or `total_q` and `total_k` for packed storage—must each be at most
 `2**31 - 256`. Paged runs apply that limit only to `total_q`. At plan time,
@@ -87,8 +92,11 @@ paged plans cap only `B*max_seq_len_q`. This coordinate-representation limit
 reserves 255 values for the padded tail of the largest supported 256-row query
 work tile.
 
-Q, K, V, and `out` must be compact, 16-byte-aligned CUDA tensors on one
-device. Cumulative offsets, sequence lengths, and variable-window metadata must
+Q and `out`, and contiguous-path K/V, must be compact, 16-byte-aligned CUDA
+tensors on one device. Paged K/V accepts positive, non-overlapping page/head/token
+strides aligned to 16 bytes and unit head-dimension stride. The strides are
+runtime TensorMap inputs, so interleaved K/V slices need no repacking.
+Cumulative offsets, sequence lengths, and variable-window metadata must
 be compact CUDA `torch.int32` tensors on that device and at least 4-byte
 aligned. `block_tables` instead permits the row-strided layout documented
 below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
@@ -105,16 +113,16 @@ Contiguous inputs:
 - Packed Q: `[total_q, Hq, Dqk]`; K: `[total_kv, Hkv, Dqk]`;
   V: `[total_kv, Hkv, Dv]`; O: `[total_q, Hq, Dv]`.
 - Supported contiguous `(Dqk, Dv)` pairs: `(128, 128)`, `(192, 128)`,
-  `(256, 256)`. The 192/128 path uses separate Q, K, and V tensors
+  `(192, 192)`, and `(256, 256)`. The 192/128 path uses separate Q, K, and V tensors
   with compact rows; callers do not pad the head dimension.
 - Packed metadata: compact CUDA `int32[B + 1]` `qo_indptr` and `kv_indptr`.
-  Both start at zero, increase strictly, and end at the corresponding packed
+  Both start at zero, are nondecreasing, and end at the corresponding packed
   tensor extent.
 - Fixed variable-window metadata: inclusive per-token starts and ends shaped
   `[B, max_seq_len_q]`. `variable_window_cta_starts` may additionally provide
   the exact minimum token start for every Q work tile, shaped
   `[B, ceil(max_seq_len_q / Tq)]`, where `Tq=256` for head dimension 128 and
-  `Tq=128` for head dimension 256. The final entry in each row covers only the
+  `Tq=128` for head dimensions 192 and 256. The final entry in each row covers only the
   remaining real Q rows, without conceptual padding.
 
 Paged inputs:
@@ -132,12 +140,12 @@ Paged inputs:
   same physical page IDs.
 - Physical page IDs may be arbitrary, repeated, and nonidentity ordered.
 
-Every cumulative-offset vector starts at zero and increases strictly. For
+Every cumulative-offset vector starts at zero and is nondecreasing. For
 packed contiguous runs, `qo_indptr[-1]` equals `total_q`, `kv_indptr[-1]`
 equals `total_k`, each Q delta is at most `max_seq_len_q`, and each K/V delta
 is at most `max_kv_len`. For paged runs, `qo_indptr[-1]` equals `total_q`, each
 Q delta is at most `max_seq_len_q`, and each `seq_lens_kv` value is at most
-`max_kv_len`. All deltas and lengths are positive, and every page ID selected
+`max_kv_len`. All deltas and lengths are nonnegative, and every page ID selected
 for an active page indexes the physical cache.
 
 For request `b`, bottom-right causal row `i` can see through
@@ -150,14 +158,14 @@ For packed contiguous attention, planning fixes only static capacities and
 compile-time semantics. Every run supplies `qo_indptr` and `kv_indptr`; their
 values and packed tensor totals may change between runs while preserving the
 exact planned batch, zero starting offsets, matching terminal tensor extents,
-strictly positive deltas, and these per-request capacity bounds:
+nonnegative deltas, and these per-request capacity bounds:
 
 ```text
-0 < Sq[b] <= planned max_seq_len_q
-0 < Sk[b] <= planned max_kv_len
+0 <= Sq[b] <= planned max_seq_len_q
+0 <= Sk[b] <= planned max_kv_len
 ```
 
-Every causal replay must additionally satisfy `Sq[b] <= Sk[b]`. The
+Every active causal request must additionally satisfy `Sq[b] <= Sk[b]`. The
 request-local bottom-right offset `Sk[b] - Sq[b]` may change and is derived
 from the live offsets. Fixed variable-window plans likewise receive current
 `[B, max_seq_len_q]` inclusive start/end bounds on every run. Only the start
@@ -170,9 +178,9 @@ Paged wrapper planning fixes static capacities and one compile-time metadata
 contract. The conservative defaults, `uniform_packed_lengths=False` and
 `has_q_offset=True`, allow each run to provide different valid Q offsets,
 block-table rows, K/V lengths, and physical page IDs without another plan. The
-batch remains exact; Q deltas stay positive and within `max_seq_len_q`, K/V
+batch remains exact; Q deltas stay nonnegative and within `max_seq_len_q`, K/V
 lengths stay within `max_kv_len`, and the final Q offset matches the packed Q/O
-extent. For causal attention, every per-run `Sq[b]` is no greater than `Sk[b]`.
+extent. For causal attention, every active per-run `Sq[b]` is no greater than `Sk[b]`.
 
 `uniform_packed_lengths=True` is a caller promise that every Q delta equals
 `max_seq_len_q` and every K/V length equals `max_kv_len`.
@@ -217,6 +225,10 @@ Q + contiguous or paged K/V
 The TS graph assigns load, MMA, softmax, correction, epilogue, page-offset,
 and scheduling work to cooperating tasks. Resources own the corresponding
 SMEM/TMEM buffers and pipeline state.
+
+Equal D192 keeps 128-wide physical K/V staging buffers but issues PV with N128 then N64 into 192 logical O columns. Descriptor strides and TMA barrier bytes follow the physical SMEM layout; correction and normalization touch only the logical output columns. TMA fragments are 128 bytes, so `smem_q_head_dim` is 192 for FP16/BF16 and 256 for FP8; global tensors remain D192. The whole-CTA TMEM allocation still rounds all S/P/O/statistics regions to a legal allocation size.
+
+The window path selects `head_paired=True`, which specifies how peers map to heads. D192 uses one Q/KV instance, so each work tile owns one query head; this does not pair two heads inside the CTA. The internal full-192 staging candidate supports 16-bit Q/K/V and the common output dtypes. FP8 retains 128-wide stages because full-192 FP8 TMA staging has not been implemented and qualified.
 
 Non-absorbed MLA (QK=192, V=128) reuses the paired 128-row Q schedule.
 K is streamed in two 128-wide stages, with MMA restricted to the 128+64
@@ -328,14 +340,10 @@ q_lens, kv_lens = (32, 48), (64, 80)
 num_pages = 5
 
 q = torch.randn(sum(q_lens), Hq, D, device=device, dtype=torch.float16)
-k_cache = torch.randn(
-    num_pages, Hkv, page_size, D, device=device, dtype=torch.float16
-)
+k_cache = torch.randn(num_pages, Hkv, page_size, D, device=device, dtype=torch.float16)
 v_cache = torch.randn_like(k_cache)
 qo_indptr = torch.tensor((0, 32, 80), device=device, dtype=torch.int32)
-block_tables = torch.tensor(
-    ((0, 1, -1), (2, 3, 4)), device=device, dtype=torch.int32
-)
+block_tables = torch.tensor(((0, 1, -1), (2, 3, 4)), device=device, dtype=torch.int32)
 seq_lens_kv = torch.tensor(kv_lens, device=device, dtype=torch.int32)
 
 wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
@@ -367,7 +375,7 @@ assert out.shape == q.shape
 For a `torch.bfloat16` Q/K with a `torch.float8_e4m3fn` V, pass
 `v_dtype=v.dtype` (or `v_dtype=v_cache.dtype` for paged) to `plan()` and
 supply `output_scale=v_descale`; `sm_scale` is unchanged because Q and K stay
-BF16. Both wrappers accept this combination for head dimensions 128 and 256.
+BF16. Both wrappers accept this combination for head dimensions 128, 192, and 256.
 
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
@@ -384,15 +392,21 @@ runtime tensors alive until every graph using that plan is destroyed.
 - The 192/128 MLA extension requires contiguous separate Q/K/V and does not
   support a positive left window. Paged K/V retains equal head dimensions.
 
-- Paged context accepts separate compact HND K/V pools with page size 16, 32,
+- Paged context accepts separate logical HND K/V views with page size 16, 32,
   64, or 128.
 - `window_left=0` is unsupported; use `-1` to disable the window or a positive
   value to enable it.
 - Positive windows are restricted to even-ratio GQA because the kernel pairs
   query heads that share a K/V head.
 - Attention sinks and custom masks are not exposed. Q and K must share one
-  dtype; the only mixed combination is `torch.bfloat16` Q/K with
+  dtype; the mixed combinations are `torch.bfloat16` Q/K with
+  `torch.float8_e4m3fn` V, and a Sage plan's `torch.int8` Q/K with
   `torch.float8_e4m3fn` V.
+- Sage attention covers only the contiguous dense fixed-length
+  `head_dim=128` path; causal and variable-window masks, packed or paged
+  storage and left windows are rejected at plan time. The recipe, the scale
+  tensors and the decode kernel's coverage are in
+  [Sage attention](../../README.md#sage-attention).
 - Re-plan either wrapper after changing a static capacity, head or dtype
   geometry, mask, window, or default scale; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may
@@ -408,9 +422,10 @@ runtime tensors alive until every graph using that plan is destroyed.
 
 ## Validation
 
-The public suite covers fixed, ragged, and paged layouts; MHA/GQA; both head
-dimensions; `torch.float16`, `torch.bfloat16`, and `torch.float8_e4m3fn`
-inputs; BF16 Q/K with FP8 V for contiguous and paged storage at both head
+The public suite covers fixed, ragged, and paged layouts; MHA/GQA; head
+dimensions 128, 192, and 256; `torch.float16`, `torch.bfloat16`, and
+`torch.float8_e4m3fn` inputs; BF16 Q/K with FP8 V for contiguous and paged
+storage at all three head
 dimensions; dense, causal, and left-window masks; nonidentity pages; scheduler
 safety; CUDA graphs; and reference accuracy. Explicit input-to-output dtype
 conversion coverage spans all nine pairings of FP16, BF16, and FP8 input and
@@ -419,4 +434,7 @@ output state.
 ```bash
 pytest -q tests/attention/test_attention_ts_context.py
 pytest -q tests/attention/test_attention_ts_features.py
+pytest -q tests/attention/test_attention_ts_context_sage.py
 ```
+
+Packed contiguous and paged context accept zero-length K/V requests with a positive plan capacity. Persistent schedules skip those requests while advancing the queue; static schedules skip their data work. Caller-owned O is unchanged for inactive requests, and newly allocated inactive O is unspecified. Uniform-length specialization remains a promise that every request's metadata length equals the planned positive value; use the general dynamic plan for padding or empty/live graph transitions.

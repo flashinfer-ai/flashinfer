@@ -124,8 +124,7 @@ kernel_cake_kimi_k3_attn_res_d303ab9caf060fc8ad8d(__nv_bfloat16* __restrict__ ou
         unsigned long long elem = (unsigned long long)tid + (unsigned long long)(item * 256);
         float updated = (float)prefix[prefix_base + elem];
         unsigned long long write_offset = block_row_base + (unsigned long long)block_write_idx * blocks_k_stride + elem;
-        __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)updated;
-        blocks[write_offset] = _cvt_bf16_0;
+        blocks[write_offset] = (__nv_bfloat16)updated;
     }
     float mixed[28];
     #pragma unroll
@@ -160,8 +159,8 @@ kernel_cake_kimi_k3_attn_res_d303ab9caf060fc8ad8d(__nv_bfloat16* __restrict__ ou
     output_sum_sq = _warp_reduce_1;
     if (warp == 0) {
         if (elect_sync()) {
-            float _rsqrt_0 = rsqrtf(output_sum_sq / 7168.0f + output_norm_eps);
-            output_norm_scalar[0] = _rsqrt_0;
+            float _rsqrt_2 = rsqrtf(output_sum_sq / 7168.0f + output_norm_eps);
+            output_norm_scalar[0] = _rsqrt_2;
         }
     }
     __syncthreads();
@@ -170,8 +169,7 @@ kernel_cake_kimi_k3_attn_res_d303ab9caf060fc8ad8d(__nv_bfloat16* __restrict__ ou
     for (int item_4 = 0; item_4 < 28; item_4++) {
         unsigned long long elem_2 = (unsigned long long)tid + (unsigned long long)(item_4 * 256);
         float value = mixed[item_4] * output_inv_rms * (float)output_norm_weight[elem_2];
-        __nv_bfloat16 _cvt_bf16_1 = (__nv_bfloat16)value;
-        out[out_base + elem_2] = _cvt_bf16_1;
+        out[out_base + elem_2] = (__nv_bfloat16)value;
     }
 }
 
