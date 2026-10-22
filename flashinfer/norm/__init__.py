@@ -27,7 +27,7 @@ This package provides high-performance normalization kernels:
 import functools
 import os
 import warnings
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 
@@ -92,6 +92,18 @@ try:
     _HAS_CUTE_DSL_FUSED_NORM = True
 except (ImportError, AttributeError):
     _HAS_CUTE_DSL_FUSED_NORM = False
+
+try:
+    from ..cake_muse_spark_norm_backend import (
+        cake_gated_residual_next_rmsnorm as _cake_gated_residual_next_rmsnorm,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        is_cake_gated_residual_next_rmsnorm_supported as _cake_gated_residual_next_rmsnorm_supported,
+    )
+
+    _HAS_CAKE_FUSED_NORM = True
+except (ImportError, AttributeError):
+    _HAS_CAKE_FUSED_NORM = False
 
     def supports_rmsnorm_sigmoid_gate(
         dtype: torch.dtype,
@@ -180,6 +192,41 @@ def _is_aligned(tensor: torch.Tensor, alignment: int = _FUSED_NORM_ALIGNMENT) ->
     return tensor.data_ptr() % alignment == 0
 
 
+_GATED_RESIDUAL_NEXT_BACKENDS = ("auto", "cake", "cute")
+
+
+def _cute_gated_residual_next_rmsnorm_available(device: torch.device) -> bool:
+    return _HAS_CUTE_DSL_FUSED_NORM and _fused_norm_arch_supported(device)
+
+
+def _cake_gated_residual_next_rmsnorm_available(
+    device: torch.device, *, tensor_alpha: bool, has_post_weight: bool
+) -> bool:
+    return _HAS_CAKE_FUSED_NORM and _cake_gated_residual_next_rmsnorm_supported(
+        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight
+    )
+
+
+def _gated_residual_next_rmsnorm_backend(
+    backend: str, device: torch.device, *, tensor_alpha: bool, has_post_weight: bool
+) -> Optional[str]:
+    """The backend one call runs on: ``"cake"`` when the Cake package ships a
+    program for the device and the call's variant (preferred under ``"auto"``),
+    else ``"cute"`` when the CuTe DSL kernel targets the device; ``None`` when the
+    requested backend is not available."""
+    if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
+        )
+    if backend != "cute" and _cake_gated_residual_next_rmsnorm_available(
+        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight
+    ):
+        return "cake"
+    if backend != "cake" and _cute_gated_residual_next_rmsnorm_available(device):
+        return "cute"
+    return None
+
+
 def supports_gated_residual_rmsnorm(
     branch: torch.Tensor,
     residual: torch.Tensor,
@@ -230,8 +277,11 @@ def supports_gated_residual_next_rmsnorm(
     beta: torch.Tensor,
     *,
     post_weight: Optional[torch.Tensor] = None,
+    backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> bool:
-    """Return whether inputs satisfy the SM100/SM103/SM107 two-norm kernel contract."""
+    """Return whether inputs satisfy the SM100/SM103/SM107 two-norm kernel contract
+    and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
+    the call on their device."""
     tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, beta)
     if isinstance(alpha, torch.Tensor):
         if (
@@ -245,8 +295,7 @@ def supports_gated_residual_next_rmsnorm(
     if post_weight is not None:
         tensors += (post_weight,)
     return (
-        _HAS_CUTE_DSL_FUSED_NORM
-        and branch.ndim == 2
+        branch.ndim == 2
         and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
         and residual.shape == branch.shape
         and next_weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
@@ -269,7 +318,13 @@ def supports_gated_residual_next_rmsnorm(
             and _is_aligned(tensor, _DUAL_NORM_ALIGNMENT)
             for tensor in tensors
         )
-        and _fused_norm_arch_supported(branch.device)
+        and _gated_residual_next_rmsnorm_backend(
+            backend,
+            branch.device,
+            tensor_alpha=isinstance(alpha, torch.Tensor),
+            has_post_weight=post_weight is not None,
+        )
+        is not None
     )
 
 
@@ -289,6 +344,7 @@ def gated_residual_next_rmsnorm(
     post_weight: Optional[torch.Tensor] = None,
     post_gain_center: float = 0.0,
     enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated residual RMSNorm plus the next RMSNorm in one launch, for hidden size 8192.
 
@@ -327,8 +383,18 @@ def gated_residual_next_rmsnorm(
     post_gain_center : float
         Constant added to ``post_weight`` in FP32; unused when it is ``None``.
     enable_pdl : bool
-        Whether to enable programmatic dependent launch. Defaults to ``True``;
-        pass ``False`` to disable it.
+        Whether to enable programmatic dependent launch on the CuTe DSL kernel.
+        Defaults to ``True``; pass ``False`` to disable it. The Cake kernels
+        launch without the attribute and ignore this argument.
+    backend : str
+        ``"auto"`` (default) runs the Cake kernels
+        (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
+        a program for the device and the call's inputs, else the CuTe DSL kernel;
+        ``"cake"`` and ``"cute"`` select one and raise ``ValueError`` when it is
+        not available. The Cake package ships programs for a tensor ``alpha``
+        with ``post_weight`` and for a scalar ``alpha`` with or without it; a
+        tensor ``alpha`` without ``post_weight`` runs its ``post_weight`` programs
+        with a zero vector and ``post_gain_center = 1.0``, which is exact.
 
     Returns
     -------
@@ -340,6 +406,19 @@ def gated_residual_next_rmsnorm(
     ):
         raise ValueError(
             "tensors do not satisfy the gated_residual_next_rmsnorm contract"
+        )
+    if (
+        _gated_residual_next_rmsnorm_backend(
+            backend,
+            branch.device,
+            tensor_alpha=isinstance(alpha, torch.Tensor),
+            has_post_weight=post_weight is not None,
+        )
+        is None
+    ):
+        raise ValueError(
+            f"gated_residual_next_rmsnorm: backend {backend!r} is not available "
+            f"on {branch.device}"
         )
     if residual_out is None:
         residual_out = torch.empty_like(residual)
@@ -381,6 +460,7 @@ def gated_residual_next_rmsnorm(
         post_gain_center,
         alpha_scalar,
         enable_pdl,
+        backend,
     )
     return residual_out, ffn_input
 
@@ -404,7 +484,38 @@ def _gated_residual_next_rmsnorm_impl(
     post_gain_center: float,
     alpha_scalar: Optional[float] = None,
     enable_pdl: bool = True,
+    backend: str = "auto",
 ) -> None:
+    chosen = _gated_residual_next_rmsnorm_backend(
+        backend,
+        branch.device,
+        tensor_alpha=alpha_scalar is None,
+        has_post_weight=post_weight is not None,
+    )
+    if chosen == "cake":
+        # The Cake programs launch without programmatic dependent launch; a scalar
+        # gate travels as alpha_scalar and the alpha slot (beta) is unread.
+        _cake_gated_residual_next_rmsnorm(
+            branch,
+            residual,
+            next_weight,
+            alpha,
+            beta,
+            residual_out,
+            ffn_input,
+            post_eps=post_eps,
+            next_eps=next_eps,
+            next_gain_center=next_gain_center,
+            post_weight=post_weight,
+            post_gain_center=post_gain_center,
+            alpha_scalar=alpha_scalar,
+        )
+        return
+    if chosen is None:
+        raise ValueError(
+            f"gated_residual_next_rmsnorm: backend {backend!r} is not available "
+            f"on {branch.device}"
+        )
     if enable_pdl:
         enable_pdl = device_support_pdl(branch.device)
     _gated_residual_next_rmsnorm_cute(
@@ -441,6 +552,7 @@ def _gated_residual_next_rmsnorm_fake(
     post_gain_center: float,
     alpha_scalar: Optional[float] = None,
     enable_pdl: bool = True,
+    backend: str = "auto",
 ) -> None:
     return None
 

@@ -67,7 +67,9 @@ def _arch(device: torch.device) -> Optional[str]:
     return arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
 
 
-def gated_residual_next_rmsnorm_variant(tensor_alpha: bool, has_post_weight: bool) -> str:
+def gated_residual_next_rmsnorm_variant(
+    tensor_alpha: bool, has_post_weight: bool
+) -> str:
     """The variant a call maps onto (``alpha_tensor_pw``, ``alpha_scalar_nopw``, ``alpha_scalar_pw``,
     ``alpha_tensor_nopw``)."""
     alpha = "alpha_tensor" if tensor_alpha else "alpha_scalar"
@@ -199,9 +201,13 @@ def cake_gated_residual_next_rmsnorm(
     vector = (HIDDEN_SIZE,)
     _check(branch, "branch", shape=matrix, dtype=torch.bfloat16, device=device)
     _check(residual, "residual", shape=matrix, dtype=torch.float32, device=device)
-    _check(next_weight, "next_weight", shape=vector, dtype=torch.bfloat16, device=device)
+    _check(
+        next_weight, "next_weight", shape=vector, dtype=torch.bfloat16, device=device
+    )
     _check(beta, "beta", shape=vector, dtype=torch.float32, device=device)
-    _check(residual_out, "residual_out", shape=matrix, dtype=torch.float32, device=device)
+    _check(
+        residual_out, "residual_out", shape=matrix, dtype=torch.float32, device=device
+    )
     _check(ffn_input, "ffn_input", shape=matrix, dtype=torch.bfloat16, device=device)
     tensor_alpha = alpha_scalar is None
     if tensor_alpha:
@@ -217,7 +223,13 @@ def cake_gated_residual_next_rmsnorm(
         alpha_value = float(alpha_scalar)  # type: ignore[arg-type]
     has_post_weight = post_weight is not None
     if post_weight is not None:
-        _check(post_weight, "post_weight", shape=vector, dtype=torch.bfloat16, device=device)
+        _check(
+            post_weight,
+            "post_weight",
+            shape=vector,
+            dtype=torch.bfloat16,
+            device=device,
+        )
         gain = float(post_gain_center)
     elif tensor_alpha:
         # No dedicated program: the post-weight route with a zero vector and gain 1.0 is exact.

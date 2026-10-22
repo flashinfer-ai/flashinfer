@@ -60,7 +60,7 @@ from . import cake_build
 # rewritten by the exporter from the rendered programs; every other field is
 # host plan.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_muse_spark_norm_56eff83bf7907815599b": {
+    "cake_muse_spark_norm_1aa28374ae397e05d09f": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -139,12 +139,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "H": 8192,
             "cluster": 1,
             "exit_sync": False,
+            "expect_hoist": False,
             "issue_order": "source",
             "l2_hint": None,
             "load_order": "vectors_first",
             "min_blocks": 0,
             "packed": True,
             "pdl": False,
+            "pdl_launch": "statistic",
             "persistent": True,
             "post_weight": True,
             "prefetch": True,
@@ -152,8 +154,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "reload_fp32": False,
             "resident": True,
             "rsqrt_approx": False,
+            "store_all_lanes": False,
             "tensor_alpha": True,
             "threads": 512,
+            "tma_stages": 0,
             "vec": 16,
             "wait_form": "acquire_cluster",
         },
@@ -162,7 +166,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": 1,
             "kind": "persistent_rows",
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_56eff83bf7907815599b",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_1aa28374ae397e05d09f",
         "launch": {
             "block": (
                 512,
@@ -178,7 +182,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_muse_spark_norm_56eff83bf7907815599b",
+        "library": "cake_muse_spark_norm_1aa28374ae397e05d09f",
         "logical": {
             "M": "rows",
             "alpha": "alpha",
@@ -203,13 +207,13 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_100a": [
                     [
-                        512,
+                        1536,
                         None,
                     ],
                 ],
                 "sm_103a": [
                     [
-                        512,
+                        1536,
                         None,
                     ],
                 ],
@@ -222,12 +226,12 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "gated_residual_next_rmsnorm_alpha_tensor_pw": [
-            "cake_muse_spark_norm_56eff83bf7907815599b",
+            "cake_muse_spark_norm_1aa28374ae397e05d09f",
         ],
     },
     "sm_103a": {
         "gated_residual_next_rmsnorm_alpha_tensor_pw": [
-            "cake_muse_spark_norm_56eff83bf7907815599b",
+            "cake_muse_spark_norm_1aa28374ae397e05d09f",
         ],
     },
 }
