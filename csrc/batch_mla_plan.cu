@@ -14,6 +14,13 @@
  * limitations under the License.
  */
 #include <flashinfer/attention/scheduler.cuh>
+#ifndef FLASHINFER_MLA_SM89_Q_TILE
+#define FLASHINFER_MLA_SM89_Q_TILE 64
+#endif
+
+#ifndef FLASHINFER_MLA_SM89_CHUNK_QUANTUM
+#define FLASHINFER_MLA_SM89_CHUNK_QUANTUM 0
+#endif
 
 #include "batch_mla_config.inc"
 #include "tvm/ffi/container/array.h"
@@ -46,12 +53,26 @@ Tuple<Array<int64_t>, int64_t> BatchMLAPagedAttentionPlan(
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
-  cudaError_t status = MLAPlan(
-      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
-      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
-      int_workspace_size_in_bytes, plan_info, staged_int_workspace_bytes,
-      static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
-      static_cast<IdType*>(kv_len.data_ptr()), batch_size, num_heads, head_dim_o, causal, stream);
+  int major, minor;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                         float_workspace_buffer.device().device_id);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                         float_workspace_buffer.device().device_id);
+  int tile_q = (major == 8 && minor == 9 && std::is_same_v<DTypeKV, __nv_fp8_e4m3> &&
+                HEAD_DIM_CKV == 512 && HEAD_DIM_KPE == 64)
+                   ? FLASHINFER_MLA_SM89_Q_TILE
+                   : 64;
+  int chunk_quantum = 0;
+  if (major == 8 && minor == 9 && std::is_same_v<DTypeKV, __nv_fp8_e4m3>) {
+    chunk_quantum = FLASHINFER_MLA_SM89_CHUNK_QUANTUM;
+  }
+  cudaError_t status =
+      MLAPlan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+              int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+              int_workspace_size_in_bytes, plan_info, staged_int_workspace_bytes,
+              static_cast<IdType*>(qo_indptr.data_ptr()),
+              static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len.data_ptr()),
+              batch_size, num_heads, head_dim_o, causal, stream, tile_q, chunk_quantum);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan MLA, error: " << cudaGetErrorString(status);
 

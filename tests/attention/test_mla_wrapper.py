@@ -165,10 +165,17 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
             module, "_validate_generated_fa_plan", lambda **kwargs: None
         )
     monkeypatch.setattr(fa_common, "_validate_fa_plan_workload", lambda *args: None)
+    # Fake planners also model hardware capability; CPU tensors never query a
+    # real CUDA device. SM89 dispatch itself has separate explicit tests.
+    monkeypatch.setattr(fa_common, "get_compute_capability", lambda device: (9, 0))
     # Model one SM while keeping the real workspace-capacity check enabled.
     monkeypatch.setattr(fa_common, "get_device_sm_count", lambda device: 1)
-    monkeypatch.setattr(fa2_backend, "get_batch_mla_module", lambda *args: fake_module)
-    monkeypatch.setattr(fa3_backend, "get_batch_mla_module", lambda *args: fake_module)
+    monkeypatch.setattr(
+        fa2_backend, "get_batch_mla_module", lambda *args, **kwargs: fake_module
+    )
+    monkeypatch.setattr(
+        fa3_backend, "get_batch_mla_module", lambda *args, **kwargs: fake_module
+    )
 
 
 def _patch_fake_cutlass_module(monkeypatch, fake_module):
@@ -318,7 +325,9 @@ def test_failed_fa_replan_keeps_sglang_fast_replay_mirrors_transactional(
             raise RuntimeError("backend plan failed")
 
     monkeypatch.setattr(
-        fa2_backend, "get_batch_mla_module", lambda *args: _FailingPlanModule()
+        fa2_backend,
+        "get_batch_mla_module",
+        lambda *args, **kwargs: _FailingPlanModule(),
     )
     with pytest.raises(RuntimeError, match="backend plan failed"):
         wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
@@ -766,7 +775,9 @@ def test_failed_backend_replan_keeps_previous_runnable_backend(
         old_indices = wrapper._kv_indices_buf.clone()
         failing = _FakeBatchMLAModule()
         failing.plan = fail_plan
-        monkeypatch.setattr(fa2_backend, "get_batch_mla_module", lambda *args: failing)
+        monkeypatch.setattr(
+            fa2_backend, "get_batch_mla_module", lambda *args, **kwargs: failing
+        )
 
     old_backend = wrapper._planned_backend
     old_contract = wrapper._input_contract
@@ -1825,7 +1836,7 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
             args[2].fill_(88)
             raise RuntimeError("candidate plan failure")
 
-    def failing_module_loader(*args):
+    def failing_module_loader(*args, **kwargs):
         nonlocal failing_module
         failing_module = _FailsAfterPlanningStarts()
         return failing_module
@@ -3835,3 +3846,71 @@ def test_mla_page_index_uint32_overflow_regression(backend):
     ref = _run(real_ckv, real_kpe, ref_indices)
 
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "heads,kv_len,expected_tile", [(16, 32769, 32), (128, 4097, 32), (128, 32769, 64)]
+)
+def test_sm89_fp8_plan_passes_selected_tile_to_jit(
+    monkeypatch, heads, kv_len, expected_tile
+):
+    import flashinfer.mla as mla
+    import flashinfer.mla._batch_mla._backends.fa2_backend as fa2_backend
+    import flashinfer.mla._batch_mla._backends._fa_common as fa_common
+
+    fake_module = _FakeBatchMLAModule()
+    _patch_fake_fa_module(monkeypatch, fake_module)
+    monkeypatch.setattr(fa_common, "get_compute_capability", lambda device: (8, 9))
+    calls = []
+
+    def record_module(*args, **kwargs):
+        calls.append(kwargs)
+        return fake_module
+
+    monkeypatch.setattr(fa2_backend, "get_batch_mla_module", record_module)
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    pages = (kv_len + 31) // 32
+    wrapper.plan(
+        metadata=mla.MLAPlanMetadata.csr(
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.tensor([0, pages], dtype=torch.int32),
+            torch.arange(pages, dtype=torch.int32),
+            torch.tensor([kv_len], dtype=torch.int32),
+        ),
+        num_heads=heads,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=32,
+        causal=False,
+        sm_scale=0.125,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.float8_e4m3fn,
+        output_dtype=torch.bfloat16,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="none",
+        scale_mode="kv-per-tensor",
+    )
+    assert calls == [{"sm89_q_tile": expected_tile, "sm89_chunk_quantum": 32}]
+
+
+@pytest.mark.parametrize("heads", [1, 16, 32])
+def test_sm89_small_head_tile_selection_does_not_read_lengths(monkeypatch, heads):
+    from flashinfer.mla._batch_mla._backends import _fa_common
+
+    monkeypatch.setattr(_fa_common, "get_compute_capability", lambda _: (8, 9))
+
+    class UnreadableLengths:
+        def __iter__(self):
+            raise AssertionError("small-head selection must not read KV lengths")
+
+    assert (
+        _fa_common._sm89_mla_q_tile(
+            torch.device("cuda:0"),
+            "fa2",
+            torch.float8_e4m3fn,
+            UnreadableLengths(),
+            heads,
+        )
+        == 32
+    )

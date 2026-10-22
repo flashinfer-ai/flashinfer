@@ -3387,13 +3387,22 @@ def testBatchMLAPagedAttentionWrapper(args):
         mla_api_extra_kwargs["cute_dsl_impl"] = mla_cute_dsl_impl_arg
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    # The SM89 extension supports BF16 query/output with per-tensor FP8 KV.
+    fa2_sm89_fp8 = (
+        torch.cuda.get_device_capability(device) == (8, 9)
+        and q_dtype == torch.bfloat16
+        and kv_dtype == torch.float8_e4m3fn
+        and head_dim_ckv == 512
+        and head_dim_kpe == 64
+        and s_qo == 1
+    )
     # Check for backend-specific constraints
     if "fa2" in backends:
         remove_fa2 = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
+        if not fa2_sm89_fp8 and (
+            q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+            or kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+        ):
             print("[INFO] FA2 backend does not support FP8. Skipping.")
             remove_fa2 = True
         if remove_fa2:
@@ -3490,7 +3499,8 @@ def testBatchMLAPagedAttentionWrapper(args):
         dtype=q_init_dtype,
         device=device,
     )
-    q_pe = torch.zeros(
+    # Exercise positional-key reads in the newly enabled SM89 FP8 path.
+    q_pe = (torch.rand if fa2_sm89_fp8 else torch.zeros)(
         batch_size * s_qo,
         num_qo_heads,
         head_dim_kpe,
@@ -3612,6 +3622,11 @@ def testBatchMLAPagedAttentionWrapper(args):
                     sm_scale=sm_scale,
                     q_data_type=q_dtype,
                     kv_data_type=kv_dtype,
+                    **(
+                        {"scale_mode": "kv-per-tensor"}
+                        if backend == "fa2" and fa2_sm89_fp8
+                        else {}
+                    ),
                 )
 
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -3663,6 +3678,10 @@ def testBatchMLAPagedAttentionWrapper(args):
             dtype=torch.bfloat16,
         )
 
+    fa2_fp8_out = (
+        torch.empty_like(q_nope) if fa2_sm89_fp8 and "fa2" in backends else None
+    )
+
     def run_backend_wrapper(
         backend,
         q_nope,
@@ -3696,6 +3715,11 @@ def testBatchMLAPagedAttentionWrapper(args):
                 ckv_cache,
                 kpe_cache,
                 return_lse=False,
+                **(
+                    {"ckv_scale": 1.0, "kpe_scale": 1.0, "out": fa2_fp8_out}
+                    if backend == "fa2" and fa2_sm89_fp8
+                    else {}
+                ),
             )
         elif backend == "cutlass":
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl.
@@ -3884,6 +3908,42 @@ def testBatchMLAPagedAttentionWrapper(args):
                 .detach()
                 .clone()
             )
+            if cur_backend == "fa2" and fa2_sm89_fp8:
+                # With one backend, cross-backend comparison is vacuous. Check
+                # dequantized stored KV against an independent FP32 oracle.
+                previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+                try:
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                    for request, length in enumerate(mla_kv_len_arr.cpu().tolist()):
+                        page_ids = block_tables[
+                            request, : (length + page_size - 1) // page_size
+                        ].long()
+                        c = (
+                            ckv_cache[page_ids]
+                            .reshape(-1, head_dim_ckv)[:length]
+                            .float()
+                        )
+                        p = (
+                            kpe_cache[page_ids]
+                            .reshape(-1, head_dim_kpe)[:length]
+                            .float()
+                        )
+                        scores = (
+                            q_nope[request].float() @ c.T + q_pe[request].float() @ p.T
+                        ) * sm_scale
+                        reference = torch.softmax(scores, dim=-1) @ c
+                        torch.testing.assert_close(
+                            outputs[cur_backend][request].float(),
+                            reference,
+                            rtol=0.03,
+                            atol=0.004,
+                        )
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+                if args.verbose >= 1:
+                    print(
+                        "[INFO] SM89 FP8 MLA passed independent FP32 reference check."
+                    )
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
@@ -3918,7 +3978,9 @@ def testBatchMLAPagedAttentionWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+            use_cuda_graph=(
+                is_cuda_graph_compatible and (cur_backend != "fa2" or fa2_sm89_fp8)
+            ),
             cold_l2_cache=True,
             input_args=(
                 runtime_q_nope,

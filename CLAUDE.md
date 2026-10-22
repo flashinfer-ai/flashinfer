@@ -313,6 +313,15 @@ follow effective compute precision; TMA descriptors and raw allocations must
 follow storage precision. The public plan accepts separate `k_data_type` and
 `v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
 
+## SM89 MLA FP8-cache decode
+
+FA2 supports one query token per request with BF16 query/output and paged E4M3
+CKV512/KPE64 caches on SM89. Cache tiles are converted to BF16 in shared memory
+for MMA. See the [kernel design and validation](docs/design_docs/mla_sm89_fp8_design.md)
+for layout and Graph invariants, workspace tests and benchmark commands.
+Run `tests/attention/test_mla_sm89_fp8.py`; include `test_mla_wrapper.py` when
+changing the planner or private JIT arguments.
+
 ## Code Linting
 
 Run all pre-commit hooks:
