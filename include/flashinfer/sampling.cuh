@@ -306,8 +306,6 @@ template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, bool CACHE_
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFusedKernel(
     DType* logits, DType* output, DType* temperature_arr, DType temperature_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
-  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   using TempStorage = OnlineSoftmaxTempStorage<BLOCK_THREADS>;
   extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
@@ -327,8 +325,10 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
   float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
+  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   // Pass 1: Compute running max and denominator
 #pragma unroll 2
@@ -430,8 +430,6 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
   const uint32_t bx = blockIdx.x;
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
-  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
-  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   const uint32_t vec_alignment_elems = alignof(vec_t<DType, VEC_SIZE>) / sizeof(DType);
   const uint32_t slice_stride = round_up(ceil_div(d, num_slices), vec_alignment_elems);
@@ -450,8 +448,10 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
   float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
+  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -516,8 +516,6 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
     float temperature_val, uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
-  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
-  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   // Reduce slice results
   using TempStorage = OnlineSoftmaxTempStorage<BLOCK_THREADS>;
@@ -529,8 +527,10 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
   float2 thread_aggregate = make_float2(-cuda::std::numeric_limits<float>::infinity(), 0.0f);
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
+  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   for (uint32_t i = tx; i < num_slices; i += BLOCK_THREADS) {
     PartialSoftmaxResult partial = partial_results[bx * num_slices + i];

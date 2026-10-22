@@ -255,21 +255,6 @@ quantize_with_block_size(
       !IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value || SF_VEC_SIZE == CVT_FP4_SF_VEC_SIZE,
       "NVFP4 4over6 requires NVFP4 scale blocks");
 
-  // Get the caller-provided global scaling factor, which will be applied to the SF.
-  float SFScaleVal = 1.0f;
-  if constexpr (!USE_ROW_WISE_SCALE) {
-    if (SFScale != nullptr) {
-      SFScaleVal = *SFScale;
-      if constexpr (USE_INVERSE_SCALE) {
-        if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-          SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
-        } else {
-          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
-        }
-      }
-    }
-  }
-
   // Is it swizzled layout?
   bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
                             layout == QuantizationSFLayout::SWIZZLED_8x4;
@@ -285,7 +270,22 @@ quantize_with_block_size(
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  // Get the caller-provided global scaling factor, which will be applied to the SF.
+  float SFScaleVal = 1.0f;
+  if constexpr (!USE_ROW_WISE_SCALE) {
+    if (SFScale != nullptr) {
+      SFScaleVal = *SFScale;
+      if constexpr (USE_INVERSE_SCALE) {
+        if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+          SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
+        } else {
+          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+        }
+      }
+    }
+  }
 
   // Input tensor batch/row/col loops.
   // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
@@ -447,6 +447,17 @@ quantize_with_block_size_tma(
   auto empty_barriers =
       PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (NUM_STAGES + i); });
 
+  // Is it swizzled layout?
+  bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                            layout == QuantizationSFLayout::SWIZZLED_8x4;
+
+  // The number of padded rows considering 128x4 or 8x4 SF layout.
+  int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
+  int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
+  int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
   // Get the global scaling factor
   float SFScaleVal = 1.0f;
   if constexpr (!USE_ROW_WISE_SCALE) {
@@ -461,17 +472,6 @@ quantize_with_block_size_tma(
       }
     }
   }
-
-  // Is it swizzled layout?
-  bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
-                            layout == QuantizationSFLayout::SWIZZLED_8x4;
-
-  // The number of padded rows considering 128x4 or 8x4 SF layout.
-  int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
-  int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
-  int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
-
-  asm volatile("griddepcontrol.wait;");
 
   // TMA barrier initialization.
   if (warpIdx == 0 and laneIdx == 0) {
