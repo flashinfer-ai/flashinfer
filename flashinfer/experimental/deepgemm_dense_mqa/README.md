@@ -163,7 +163,7 @@ without allocating (CUDA Graph replay with changed contents is supported, on the
 Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the one-shot entry) and
 `tests/experimental/test_paged_mqa_generated.py` (paged; skips while the catalog has no paged routes).
 
-## Catalog schema `dense_mqa.v12` (route records)
+## Catalog schema `dense_mqa.v13` (route records)
 
 `dense_mqa_catalog.json` carries `policy`, `programs`, the dense `routes` and the paged
 `paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
@@ -187,7 +187,11 @@ architecture) that bound the single-launch 32-head routes, -- v10 --
 PER-ARCHITECTURE map `{"sm_100a": 34048, "sm_103a": 65536}` -- the logical `route_name` applies the most permissive
 bound, `served_route` the device's own) and `single_launch_precedence` (per architecture and overlap tier `le128` /
 `le2048`, the consultation order of the two single-launch families `le_class` / `qle`; a reader must know every key --
-the schema version carries them together), and
+the schema version carries them together), -- v13 -- `h32_text_options` (per architecture, `{route: [option, ...]}` over the
+32-head routes whose delivered logits program is built with an adopted cache-hint / ordering option -- `scan_window_l2_prefetch`,
+`pre_issue`, `source_consumer_release`; the same logits and schedule words as the knob-off program; informational: the route
+record already binds the option program, per architecture where only one adopted it -- `fp8:qle128:short` on sm_100a,
+`fp8:full:le128` / `fp8:full:le2048` on sm_103a), and
 `paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
 `next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
 `max_batch`, `metadata_program`, `admission` -- per architecture and route the ordered boxes a call must lie in to be served:
@@ -244,9 +248,13 @@ the 64-head `:ts` tile-schedule-words routes -- the production text whose load_q
 KV-split gate, so it applies where `dense_kvsplit` leaves the call to the grid-stride text), and `dense_kvsplit`
 (`min_kv` 256, `max_sms` 256, `max_q_blocks` 512, `plans` -- the inclusive query bands of the three plan texts,
 `{"q1": [1, 1], "qle128": [2, 64], "qle2048": [65, 1024]}` --, `sm_count` -- per architecture the catalogued SM count the gate is
-applied at, `{"sm_100a": 148, "sm_103a": 152}` --, `fallback` `"tier"` and `unreached_routes` -- the grid-stride tier aliases the
-gate leaves without a domain, not catalogued: the shape-only gate of the 64-head in-kernel KV-split `:kvsplit` routes, `K > min_kv`
-and `ceil(Q / 2) < sm_count[arch]`, the one SM-count dependent route rule, applied at the catalogued count rather than the
+applied at, `{"sm_100a": 148, "sm_103a": 152}` --, `fallback` `"tier"`, `unreached_routes` -- the grid-stride tier aliases the
+gate leaves without a domain, not catalogued -- and -- v13 -- `fullgrid` (per architecture, `{"sm_100a": true, "sm_103a": true}`)
+with `fullgrid_min_kv` (2048 = `dense_ts.max_kv`): the shape-only gate of the 64-head in-kernel KV-split `:kvsplit` routes,
+`K > min_kv` and `ceil(Q / 2) < sm_count[arch]`, or -- where `fullgrid[arch]` -- `K > fullgrid_min_kv` and
+`sm_count[arch] <= ceil(Q / 2) <= max_q_blocks` (the `qle2048` plan's whole-grid band: the same program at grid = the SM count;
+the `:ts` gate keeps `256 < K <= fullgrid_min_kv` at those block counts, so the `le1024` tier routes have no domain and no record
+where the band is on), the one SM-count dependent route rule, applied at the catalogued count rather than the
 device's, and where a withheld `:kvsplit` route is served; absent while the producer's adoption switch is off). Every route record
 has `stages` (`[[stage, program], ...]`: the program the stage launches -- one name where the architectures share
 one text, a `{arch: program}` map where the production text is chosen per architecture, as for the 64-head tier and
@@ -264,7 +272,8 @@ the v9 scan classes; 1 where they may extend past the tensor, the fused `fp8:qle
 64-head programs). A paged route record carries `stages` and `sequence` only; its geometry is the route name (the
 schedule-meta producer routes `paged:fp8:meta:v<N>` add their launch geometry: `threads`, `dynamic_smem_bytes`, `grid`).
 Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short`, `fp8:{full,partial}:le768:short`,
-`fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` writing the tiered schedule in-kernel for
+`fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` -- bound per architecture since v13: the
+`source_consumer_release` text on sm_100a, the pinned text on sm_103a, `policy.h32_text_options` -- writing the tiered schedule in-kernel for
 `1 < Q <= 128`, `K <= fused_qle128_max_kv`; catalogued where the `le128` tier's precedence reaches it -- under the
 published order on both architectures),
 `fp8:qle2048:short` (one `logits` stage, the program `fp8_fused_qle2048` writing the tiered `le2048` schedule in-kernel for
@@ -283,7 +292,9 @@ while `dense_kvsplit` is catalogued, `ceil(Q / 2) >= policy.dense_kvsplit.sm_cou
 maps a `:short` or `:ts` route the device's arch withholds -- or the catalog does not carry -- to the tier route of the query
 count, never to the stock kernel) and
 the in-kernel KV-split `fp8:h64:q1:kvsplit` / `fp8:h64:{full,partial}:{qle128,qle2048}:kvsplit` (a call with `K > 256` and
-fewer query blocks than `policy.dense_kvsplit.sm_count[arch]`, the plan text of its query count -- the KV-split gate is
+fewer query blocks than `policy.dense_kvsplit.sm_count[arch]`, the plan text of its query count, or -- where
+`policy.dense_kvsplit.fullgrid[arch]` -- a call with `K > dense_kvsplit.fullgrid_min_kv` and `sm_count[arch] <= ceil(Q / 2) <=
+dense_kvsplit.max_q_blocks`, the `qle2048` plan at the whole grid -- the KV-split gate is
 consulted before the `:short` and `:ts` gates, so it owns the calls with `256 < K <= 2048`, `3 <= Q` and
 `ceil(Q / 2) < sm_count[arch]` that the `:ts` gate alone would admit; `served_route` maps a
 `:kvsplit` route the arch withholds -- or the catalog does not carry -- to the grid-stride `q1` / tier route of the query

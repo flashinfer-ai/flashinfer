@@ -26,24 +26,9 @@
 #define NUM_Q_PIPE_STAGES 3
 #define NUM_KV_PIPE_STAGES 5
 #define NUM_TMEM_PIPE_STAGES 3
-#define SMEM_NEGINF_SCRATCH_OFF 221200
+#define SMEM_NEGINF_SCRATCH_OFF 220672
 #define SMEM_NEGINF_SCRATCH_STAGE_BYTES 4096
 #define SMEM_NEGINF_SCRATCH_STRIDE 4096
-#define SMEM_LOCAL_WORK_OFF 220672
-#define SMEM_LOCAL_WORK_STAGE_BYTES 128
-#define SMEM_LOCAL_WORK_STRIDE 128
-#define SMEM_LOCAL_COST_OFF 220800
-#define SMEM_LOCAL_COST_STAGE_BYTES 128
-#define SMEM_LOCAL_COST_STRIDE 128
-#define SMEM_LOCAL_BASE_OFF 220928
-#define SMEM_LOCAL_BASE_STAGE_BYTES 128
-#define SMEM_LOCAL_BASE_STRIDE 128
-#define SMEM_LOCAL_SPLITS_OFF 221056
-#define SMEM_LOCAL_SPLITS_STAGE_BYTES 128
-#define SMEM_LOCAL_SPLITS_STRIDE 128
-#define SMEM_LOCAL_HEADER_OFF 221184
-#define SMEM_LOCAL_HEADER_STAGE_BYTES 12
-#define SMEM_LOCAL_HEADER_STRIDE 12
 #define SMEM_SMEM_Q_OFF 1024
 #define SMEM_SMEM_Q_STAGE_BYTES 16384
 #define SMEM_SMEM_Q_STRIDE 16384
@@ -62,7 +47,7 @@
 #define SMEM_CANDIDATE_QUEUE_INDICES_OFF 161280
 #define SMEM_CANDIDATE_QUEUE_INDICES_STAGE_BYTES 8192
 #define SMEM_CANDIDATE_QUEUE_INDICES_STRIDE 8192
-#define SMEM_TOTAL 225408
+#define SMEM_TOTAL 224768
 #define CANDIDATE_MODE 0
 #define FULL_Q_BLOCKS 0
 #ifndef SM_COUNT
@@ -73,7 +58,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
+kernel_cake_deepgemm_dense_mqa_adf83fa1a7fedd4f48e6(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -104,16 +89,6 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
     // Kernel setup ops
     float* neginf_scratch = reinterpret_cast<float*>(smem_raw + SMEM_NEGINF_SCRATCH_OFF);
     const int neginf_scratch_addr = smem + SMEM_NEGINF_SCRATCH_OFF;
-    unsigned int* local_work = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_WORK_OFF);
-    const int local_work_addr = smem + SMEM_LOCAL_WORK_OFF;
-    unsigned int* local_cost = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_COST_OFF);
-    const int local_cost_addr = smem + SMEM_LOCAL_COST_OFF;
-    unsigned int* local_base = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_BASE_OFF);
-    const int local_base_addr = smem + SMEM_LOCAL_BASE_OFF;
-    unsigned int* local_splits = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_SPLITS_OFF);
-    const int local_splits_addr = smem + SMEM_LOCAL_SPLITS_OFF;
-    unsigned int* local_header = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_HEADER_OFF);
-    const int local_header_addr = smem + SMEM_LOCAL_HEADER_OFF;
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_Q_OFF);
     const int smem_q_addr = smem + SMEM_SMEM_Q_OFF;
     float* smem_weights = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_WEIGHTS_OFF);
@@ -126,6 +101,34 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
     const int candidate_queue_values_addr = smem + SMEM_CANDIDATE_QUEUE_VALUES_OFF;
     int* candidate_queue_indices = reinterpret_cast<int*>(smem_raw + SMEM_CANDIDATE_QUEUE_INDICES_OFF);
     const int candidate_queue_indices_addr = smem + SMEM_CANDIDATE_QUEUE_INDICES_OFF;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    unsigned int _min_0 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+    unsigned int start = _min_0;
+    unsigned int _min_1 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+    unsigned int end = _min_1;
+    unsigned int base = start / 4 * 4;
+    unsigned int work = (end - base + 255) / 256;
+    unsigned int empty_work = work;
+    if (empty_work == 0) {
+        if (tid == 0) {
+            ScheduleMeta[2 * bid] = 1;
+            ScheduleMeta[2 * bid + 1] = 0;
+            ScheduleMeta[2 * SM_COUNT + bid] = 0;
+            if (bid == 0) {
+                ScheduleMeta[(3 * SM_COUNT + 1) / 2 * 2] = base;
+                ScheduleMeta[(3 * SM_COUNT + 1) / 2 * 2 + 1] = 0;
+            }
+        }
+        float empty_fill[4];
+        #pragma unroll
+        for (int component = 0; component < 4; component++) {
+            empty_fill[component] = -CUDART_INF_F;
+        }
+        for (unsigned int col = (bid * 384 + tid) * 4; col < stride_logits; col += SM_COUNT * 384 * 4) {
+            reinterpret_cast<int4*>(Logits + col)[0] = reinterpret_cast<int4*>(empty_fill)[0];
+        }
+    }
+    if (__syncthreads_and(empty_work == 0)) return;
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q_scales_alias))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Weights))) : "memory"); }
@@ -173,7 +176,106 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
         }
     }
 
-    __syncwarp();
+    __syncthreads();
+
+    // Kernel pre-TMEM ops
+    if (warp == 8) {
+        if (elect_sync()) {
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            unsigned int _min_2 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+            unsigned int start_0 = _min_2;
+            unsigned int _min_3 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+            unsigned int end_1 = _min_3;
+            unsigned int base_2 = start_0 / 4 * 4;
+            unsigned int work_3 = (end_1 - base_2 + 255) / 256;
+            unsigned int total_work = work_3;
+            unsigned int total_cost = total_work;
+            if (total_work != 0) {
+                total_cost += 1;
+            }
+            unsigned int quotient = total_cost / (unsigned int)SM_COUNT;
+            unsigned int remainder = total_cost % (unsigned int)SM_COUNT;
+            int _min_4 = ((bid) < (remainder) ? (bid) : (remainder));
+            unsigned int begin = (unsigned int)bid * quotient + (unsigned int)_min_4;
+            int _min_5 = ((bid + 1) < (remainder) ? (bid + 1) : (remainder));
+            unsigned int end_4 = (unsigned int)(bid + 1) * quotient + (unsigned int)_min_5;
+            unsigned int first_q = 1;
+            unsigned int first_split = 0;
+            unsigned int begin_coord = total_work;
+            unsigned int end_coord = total_work;
+            if (begin != total_cost) {
+                first_q = 0;
+                unsigned int _max_0 = ((begin) > (1) ? (begin) : (1));
+                unsigned int _min_6 = ((_max_0 - 1) < (total_work - 1) ? (_max_0 - 1) : (total_work - 1));
+                first_split = _min_6;
+                begin_coord = first_split;
+            }
+            if (end_4 != total_cost) {
+                unsigned int _max_1 = ((end_4) > (1) ? (end_4) : (1));
+                unsigned int _min_7 = ((_max_1 - 1) < (total_work - 1) ? (_max_1 - 1) : (total_work - 1));
+                end_coord = _min_7;
+            }
+            unsigned int remaining = end_coord - begin_coord;
+            unsigned int pq_remaining = remaining;
+            if (pq_remaining > 0) {
+                tma_2d_gmem2smem(smem_q_addr, (&Q), 0, 0, q_full_addr);
+                tma_2d_gmem2smem(smem_weights_addr, (&Weights), 0, 0, q_full_addr);
+                mbarrier_arrive_expect_tx(q_full_addr, 16896);
+            }
+        }
+    }
+    if (warp == 9) {
+        if (elect_sync()) {
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            unsigned int _min_8 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+            unsigned int start_0_1 = _min_8;
+            unsigned int _min_9 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+            unsigned int end_1_1 = _min_9;
+            unsigned int base_2_1 = start_0_1 / 4 * 4;
+            unsigned int work_3_1 = (end_1_1 - base_2_1 + 255) / 256;
+            unsigned int total_work_1 = work_3_1;
+            unsigned int total_cost_1 = total_work_1;
+            if (total_work_1 != 0) {
+                total_cost_1 += 1;
+            }
+            unsigned int quotient_1 = total_cost_1 / (unsigned int)SM_COUNT;
+            unsigned int remainder_1 = total_cost_1 % (unsigned int)SM_COUNT;
+            int _min_10 = ((bid) < (remainder_1) ? (bid) : (remainder_1));
+            unsigned int begin_1 = (unsigned int)bid * quotient_1 + (unsigned int)_min_10;
+            int _min_11 = ((bid + 1) < (remainder_1) ? (bid + 1) : (remainder_1));
+            unsigned int end_4_1 = (unsigned int)(bid + 1) * quotient_1 + (unsigned int)_min_11;
+            unsigned int first_q_1 = 1;
+            unsigned int first_split_1 = 0;
+            unsigned int begin_coord_1 = total_work_1;
+            unsigned int end_coord_1 = total_work_1;
+            if (begin_1 != total_cost_1) {
+                first_q_1 = 0;
+                unsigned int _max_2 = ((begin_1) > (1) ? (begin_1) : (1));
+                unsigned int _min_12 = ((_max_2 - 1) < (total_work_1 - 1) ? (_max_2 - 1) : (total_work_1 - 1));
+                first_split_1 = _min_12;
+                begin_coord_1 = first_split_1;
+            }
+            if (end_4_1 != total_cost_1) {
+                unsigned int _max_3 = ((end_4_1) > (1) ? (end_4_1) : (1));
+                unsigned int _min_13 = ((_max_3 - 1) < (total_work_1 - 1) ? (_max_3 - 1) : (total_work_1 - 1));
+                end_coord_1 = _min_13;
+            }
+            unsigned int remaining_1 = end_coord_1 - begin_coord_1;
+            unsigned int pk_remaining = remaining_1;
+            if (pk_remaining > 0) {
+                unsigned int _min_14 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                unsigned int start_1 = _min_14;
+                unsigned int _min_15 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                unsigned int end_2 = _min_15;
+                unsigned int base_3 = start_1 / 4 * 4;
+                unsigned int work_4 = (end_2 - base_3 + 255) / 256;
+                int pk_kv_row = base_3 + first_split_1 * 256;
+                tma_2d_gmem2smem(smem_kv_addr, (&KV), 0, pk_kv_row, kv_full_addr);
+                tma_2d_gmem2smem(smem_kv_scales_addr, (&KV_scales), pk_kv_row, 0, kv_full_addr);
+                mbarrier_arrive_expect_tx(kv_full_addr, 33792);
+            }
+        }
+    }
 
     // TMEM alloc (512 columns, 384 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 176);
@@ -191,190 +293,55 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
     // Kernel post-init ops
     const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    if (tid < 32) {
-        unsigned int qidx = tid;
-        unsigned int splits = 0;
-        unsigned int cost = 0;
-        if (qidx < num_q_blocks) {
-            unsigned int start = 4294967295;
-            unsigned int end = 0;
-            #pragma unroll
-            for (int qi = 0; qi < 4; qi++) {
-                unsigned int _min_0 = ((qidx * 4 + (unsigned int)qi) < (seq_len - 1) ? (qidx * 4 + (unsigned int)qi) : (seq_len - 1));
-                unsigned int row = _min_0;
-                unsigned int _min_1 = (((unsigned int)cu_seq_len_k_start[row]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[row]) : (seq_len_kv));
-                unsigned int _min_2 = ((start) < (_min_1) ? (start) : (_min_1));
-                start = _min_2;
-                unsigned int _min_3 = (((unsigned int)cu_seq_len_k_end[row]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[row]) : (seq_len_kv));
-                unsigned int _max_0 = ((end) > (_min_3) ? (end) : (_min_3));
-                end = _max_0;
-            }
-            unsigned int base = start / 4 * 4;
-            unsigned int splits_0 = (end - base + 255) / 256;
-            unsigned int cost_1 = splits_0;
-            if (splits_0 != 0) {
-                cost_1 += 1;
-            }
-            splits = splits_0;
-            cost = cost_1;
-            local_base[qidx] = base;
-            local_splits[qidx] = splits_0;
-            if (bid == 0) {
-                ScheduleMeta[(unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + 2 * qidx] = base;
-                ScheduleMeta[(unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + 2 * qidx + 1] = splits_0;
-            }
-        }
-        unsigned long long scanned = ((unsigned long long)splits << 32) + (unsigned long long)cost;
-        unsigned long long _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scanned, 1, 32);
-        unsigned long long preceding = _shfl_up_0;
-        if (lane >= 1) {
-            scanned += preceding;
-        }
-        unsigned long long _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scanned, 2, 32);
-        unsigned long long preceding_0 = _shfl_up_1;
-        if (lane >= 2) {
-            scanned += preceding_0;
-        }
-        unsigned long long _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scanned, 4, 32);
-        unsigned long long preceding_1 = _shfl_up_2;
-        if (lane >= 4) {
-            scanned += preceding_1;
-        }
-        unsigned long long _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scanned, 8, 32);
-        unsigned long long preceding_2 = _shfl_up_3;
-        if (lane >= 8) {
-            scanned += preceding_2;
-        }
-        unsigned long long _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scanned, 16, 32);
-        unsigned long long preceding_3 = _shfl_up_4;
-        if (lane >= 16) {
-            scanned += preceding_3;
-        }
-        local_work[qidx] = (unsigned int)(scanned >> 32);
-        local_cost[qidx] = (unsigned int)scanned;
-    }
-    __syncthreads();
     if (tid == 0) {
-        unsigned int total_work = local_work[num_q_blocks - 1];
-        unsigned int total_cost = local_cost[num_q_blocks - 1];
-        unsigned int quotient = total_cost / (unsigned int)SM_COUNT;
-        unsigned int remainder = total_cost % (unsigned int)SM_COUNT;
-        int _min_4 = ((bid) < (remainder) ? (bid) : (remainder));
-        unsigned int target = (unsigned int)bid * quotient + (unsigned int)_min_4;
-        unsigned int block = num_q_blocks;
-        unsigned int split = 0;
-        unsigned int coordinate = total_work;
-        if (target != total_cost) {
-            block = 0;
-            unsigned int probe = block + 32;
-            if (probe <= num_q_blocks) {
-                if (target >= local_cost[probe - 1]) {
-                    block = probe;
-                }
-            }
-            unsigned int probe_0 = block + 16;
-            if (probe_0 <= num_q_blocks) {
-                if (target >= local_cost[probe_0 - 1]) {
-                    block = probe_0;
-                }
-            }
-            unsigned int probe_1 = block + 8;
-            if (probe_1 <= num_q_blocks) {
-                if (target >= local_cost[probe_1 - 1]) {
-                    block = probe_1;
-                }
-            }
-            unsigned int probe_2 = block + 4;
-            if (probe_2 <= num_q_blocks) {
-                if (target >= local_cost[probe_2 - 1]) {
-                    block = probe_2;
-                }
-            }
-            unsigned int probe_3 = block + 2;
-            if (probe_3 <= num_q_blocks) {
-                if (target >= local_cost[probe_3 - 1]) {
-                    block = probe_3;
-                }
-            }
-            unsigned int probe_4 = block + 1;
-            if (probe_4 <= num_q_blocks) {
-                if (target >= local_cost[probe_4 - 1]) {
-                    block = probe_4;
-                }
-            }
-            unsigned int cost_before = 0;
-            unsigned int work_before = 0;
-            if (block > 0) {
-                cost_before = local_cost[block - 1];
-                work_before = local_work[block - 1];
-            }
-            unsigned int _max_1 = ((target - cost_before) > (1) ? (target - cost_before) : (1));
-            unsigned int _min_5 = ((_max_1 - 1) < (local_work[block] - work_before - 1) ? (_max_1 - 1) : (local_work[block] - work_before - 1));
-            split = _min_5;
-            coordinate = work_before + split;
+        unsigned int _min_16 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+        unsigned int start_0_2 = _min_16;
+        unsigned int _min_17 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+        unsigned int end_1_2 = _min_17;
+        unsigned int base_2_2 = start_0_2 / 4 * 4;
+        unsigned int work_3_2 = (end_1_2 - base_2_2 + 255) / 256;
+        unsigned int total_work_2 = work_3_2;
+        unsigned int total_cost_2 = total_work_2;
+        if (total_work_2 != 0) {
+            total_cost_2 += 1;
         }
-        int _min_6 = ((bid + 1) < (remainder) ? (bid + 1) : (remainder));
-        unsigned int target_0 = (unsigned int)(bid + 1) * quotient + (unsigned int)_min_6;
-        unsigned int block_1 = num_q_blocks;
-        unsigned int split_2 = 0;
-        unsigned int coordinate_3 = total_work;
-        if (target_0 != total_cost) {
-            block_1 = 0;
-            unsigned int probe_5 = block_1 + 32;
-            if (probe_5 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_5 - 1]) {
-                    block_1 = probe_5;
-                }
-            }
-            unsigned int probe_0_1 = block_1 + 16;
-            if (probe_0_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_0_1 - 1]) {
-                    block_1 = probe_0_1;
-                }
-            }
-            unsigned int probe_1_1 = block_1 + 8;
-            if (probe_1_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_1_1 - 1]) {
-                    block_1 = probe_1_1;
-                }
-            }
-            unsigned int probe_2_1 = block_1 + 4;
-            if (probe_2_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_2_1 - 1]) {
-                    block_1 = probe_2_1;
-                }
-            }
-            unsigned int probe_3_1 = block_1 + 2;
-            if (probe_3_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_3_1 - 1]) {
-                    block_1 = probe_3_1;
-                }
-            }
-            unsigned int probe_4_1 = block_1 + 1;
-            if (probe_4_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_4_1 - 1]) {
-                    block_1 = probe_4_1;
-                }
-            }
-            unsigned int cost_before_1 = 0;
-            unsigned int work_before_1 = 0;
-            if (block_1 > 0) {
-                cost_before_1 = local_cost[block_1 - 1];
-                work_before_1 = local_work[block_1 - 1];
-            }
-            unsigned int _max_2 = ((target_0 - cost_before_1) > (1) ? (target_0 - cost_before_1) : (1));
-            unsigned int _min_7 = ((_max_2 - 1) < (local_work[block_1] - work_before_1 - 1) ? (_max_2 - 1) : (local_work[block_1] - work_before_1 - 1));
-            split_2 = _min_7;
-            coordinate_3 = work_before_1 + split_2;
+        unsigned int quotient_2 = total_cost_2 / (unsigned int)SM_COUNT;
+        unsigned int remainder_2 = total_cost_2 % (unsigned int)SM_COUNT;
+        int _min_18 = ((bid) < (remainder_2) ? (bid) : (remainder_2));
+        unsigned int begin_2 = (unsigned int)bid * quotient_2 + (unsigned int)_min_18;
+        int _min_19 = ((bid + 1) < (remainder_2) ? (bid + 1) : (remainder_2));
+        unsigned int end_4_2 = (unsigned int)(bid + 1) * quotient_2 + (unsigned int)_min_19;
+        unsigned int first_q_2 = 1;
+        unsigned int first_split_2 = 0;
+        unsigned int begin_coord_2 = total_work_2;
+        unsigned int end_coord_2 = total_work_2;
+        if (begin_2 != total_cost_2) {
+            first_q_2 = 0;
+            unsigned int _max_4 = ((begin_2) > (1) ? (begin_2) : (1));
+            unsigned int _min_20 = ((_max_4 - 1) < (total_work_2 - 1) ? (_max_4 - 1) : (total_work_2 - 1));
+            first_split_2 = _min_20;
+            begin_coord_2 = first_split_2;
         }
-        local_header[0] = block;
-        local_header[1] = split;
-        local_header[2] = coordinate_3 - coordinate;
-        ScheduleMeta[2 * bid] = block;
-        ScheduleMeta[2 * bid + 1] = split;
-        ScheduleMeta[2 * SM_COUNT + bid] = coordinate_3 - coordinate;
+        if (end_4_2 != total_cost_2) {
+            unsigned int _max_5 = ((end_4_2) > (1) ? (end_4_2) : (1));
+            unsigned int _min_21 = ((_max_5 - 1) < (total_work_2 - 1) ? (_max_5 - 1) : (total_work_2 - 1));
+            end_coord_2 = _min_21;
+        }
+        unsigned int remaining_2 = end_coord_2 - begin_coord_2;
+        ScheduleMeta[2 * bid] = first_q_2;
+        ScheduleMeta[2 * bid + 1] = first_split_2;
+        ScheduleMeta[2 * SM_COUNT + bid] = remaining_2;
+        if (bid == 0) {
+            unsigned int _min_22 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+            unsigned int start_1_1 = _min_22;
+            unsigned int _min_23 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+            unsigned int end_2_1 = _min_23;
+            unsigned int base_3_1 = start_1_1 / 4 * 4;
+            unsigned int work_4_1 = (end_2_1 - base_3_1 + 255) / 256;
+            ScheduleMeta[(3 * SM_COUNT + 1) / 2 * 2] = base_3_1;
+            ScheduleMeta[(3 * SM_COUNT + 1) / 2 * 2 + 1] = work_4_1;
+        }
     }
-    __syncthreads();
 
     // ---- Role: load_q ----
     if (warp == 8) {
@@ -384,37 +351,83 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
             unsigned int load_q_num_blocks = (seq_len + 4 - 1) / 4;
             unsigned int _phase_q_empty = 1;
             if (elect_sync()) {
-                unsigned int first_q = bid;
-                unsigned int first_split = 0;
-                unsigned int remaining = 0;
+                unsigned int first_q_3 = bid;
+                unsigned int first_split_3 = 0;
+                unsigned int remaining_3 = 0;
                 {
-                    first_q = local_header[0];
-                    first_split = local_header[1];
-                    remaining = local_header[2];
+                    unsigned int _min_31 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                    unsigned int start_0_3 = _min_31;
+                    unsigned int _min_32 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                    unsigned int end_1_3 = _min_32;
+                    unsigned int base_2_3 = start_0_3 / 4 * 4;
+                    unsigned int work_3_3 = (end_1_3 - base_2_3 + 255) / 256;
+                    unsigned int total_work_3 = work_3_3;
+                    unsigned int total_cost_3 = total_work_3;
+                    if (total_work_3 != 0) {
+                        total_cost_3 += 1;
+                    }
+                    unsigned int quotient_3 = total_cost_3 / (unsigned int)SM_COUNT;
+                    unsigned int remainder_3 = total_cost_3 % (unsigned int)SM_COUNT;
+                    int _min_33 = ((bid) < (remainder_3) ? (bid) : (remainder_3));
+                    unsigned int begin_3 = (unsigned int)bid * quotient_3 + (unsigned int)_min_33;
+                    int _min_34 = ((bid + 1) < (remainder_3) ? (bid + 1) : (remainder_3));
+                    unsigned int end_4_3 = (unsigned int)(bid + 1) * quotient_3 + (unsigned int)_min_34;
+                    unsigned int first_q_5 = 1;
+                    unsigned int first_split_6 = 0;
+                    unsigned int begin_coord_3 = total_work_3;
+                    unsigned int end_coord_3 = total_work_3;
+                    if (begin_3 != total_cost_3) {
+                        first_q_5 = 0;
+                        unsigned int _max_8 = ((begin_3) > (1) ? (begin_3) : (1));
+                        unsigned int _min_35 = ((_max_8 - 1) < (total_work_3 - 1) ? (_max_8 - 1) : (total_work_3 - 1));
+                        first_split_6 = _min_35;
+                        begin_coord_3 = first_split_6;
+                    }
+                    if (end_4_3 != total_cost_3) {
+                        unsigned int _max_9 = ((end_4_3) > (1) ? (end_4_3) : (1));
+                        unsigned int _min_36 = ((_max_9 - 1) < (total_work_3 - 1) ? (_max_9 - 1) : (total_work_3 - 1));
+                        end_coord_3 = _min_36;
+                    }
+                    unsigned int remaining_7 = end_coord_3 - begin_coord_3;
+                    first_q_3 = first_q_5;
+                    first_split_3 = first_split_6;
+                    remaining_3 = remaining_7;
                 }
-                unsigned int first_q_0 = first_q;
-                unsigned int first_split_1 = first_split;
-                unsigned int remaining_2 = remaining;
+                unsigned int first_q_0 = first_q_3;
+                unsigned int first_split_1_1 = first_split_3;
+                unsigned int remaining_2_1 = remaining_3;
+                if (remaining_2_1 > 0) {
+                    load_q_stage = 1;
+                    remaining_2_1 = 0;
+                }
                 #pragma unroll 1
                 for (unsigned int q_block_idx = first_q_0; q_block_idx < load_q_num_blocks; q_block_idx++) {
                     unsigned int scheduled_kv_start = 0;
                     unsigned int scheduled_num_splits = 1;
                     {
-                        if (remaining_2 == 0) {
+                        if (remaining_2_1 == 0) {
                             break;
                         }
                         unsigned int span_word = (unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + q_block_idx * 2;
-                        unsigned int base_1 = local_base[q_block_idx];
-                        unsigned int span_splits = local_splits[q_block_idx];
-                        unsigned int splits_1 = 0;
-                        if (first_split_1 < span_splits) {
-                            unsigned int available = span_splits - first_split_1;
-                            splits_1 = ((available < remaining_2) ? available : remaining_2);
+                        unsigned int base_0 = 0;
+                        unsigned int span_splits = 0;
+                        unsigned int _min_37 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                        unsigned int start_1_2 = _min_37;
+                        unsigned int _min_38 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                        unsigned int end_2_2 = _min_38;
+                        unsigned int base_3_2 = start_1_2 / 4 * 4;
+                        unsigned int work_4_2 = (end_2_2 - base_3_2 + 255) / 256;
+                        base_0 = base_3_2;
+                        span_splits = work_4_2;
+                        unsigned int splits = 0;
+                        if (first_split_1_1 < span_splits) {
+                            unsigned int available = span_splits - first_split_1_1;
+                            splits = ((available < remaining_2_1) ? available : remaining_2_1);
                         }
-                        scheduled_kv_start = base_1 + first_split_1 * 256;
-                        scheduled_num_splits = splits_1;
-                        remaining_2 -= scheduled_num_splits;
-                        first_split_1 = 0;
+                        scheduled_kv_start = base_0 + first_split_1_1 * 256;
+                        scheduled_num_splits = splits;
+                        remaining_2_1 -= scheduled_num_splits;
+                        first_split_1_1 = 0;
                     }
                     if (scheduled_num_splits > 0) {
                         mbarrier_wait(q_empty_addr + (load_q_stage) * 8, _phase_q_empty);
@@ -434,38 +447,85 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
         { // load_kv_main
             unsigned int load_kv_stage = 0;
             unsigned int load_kv_num_blocks = (seq_len + 4 - 1) / 4;
-            unsigned int first_q_1 = bid;
-            unsigned int first_split_2 = 0;
-            unsigned int remaining_1 = 0;
+            unsigned int first_q_4 = bid;
+            unsigned int first_split_4 = 0;
+            unsigned int remaining_4 = 0;
             {
-                first_q_1 = local_header[0];
-                first_split_2 = local_header[1];
-                remaining_1 = local_header[2];
+                unsigned int _min_39 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                unsigned int start_0_4 = _min_39;
+                unsigned int _min_40 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                unsigned int end_1_4 = _min_40;
+                unsigned int base_2_4 = start_0_4 / 4 * 4;
+                unsigned int work_3_4 = (end_1_4 - base_2_4 + 255) / 256;
+                unsigned int total_work_4 = work_3_4;
+                unsigned int total_cost_4 = total_work_4;
+                if (total_work_4 != 0) {
+                    total_cost_4 += 1;
+                }
+                unsigned int quotient_4 = total_cost_4 / (unsigned int)SM_COUNT;
+                unsigned int remainder_4 = total_cost_4 % (unsigned int)SM_COUNT;
+                int _min_41 = ((bid) < (remainder_4) ? (bid) : (remainder_4));
+                unsigned int begin_4 = (unsigned int)bid * quotient_4 + (unsigned int)_min_41;
+                int _min_42 = ((bid + 1) < (remainder_4) ? (bid + 1) : (remainder_4));
+                unsigned int end_4_4 = (unsigned int)(bid + 1) * quotient_4 + (unsigned int)_min_42;
+                unsigned int first_q_5_1 = 1;
+                unsigned int first_split_6_1 = 0;
+                unsigned int begin_coord_4 = total_work_4;
+                unsigned int end_coord_4 = total_work_4;
+                if (begin_4 != total_cost_4) {
+                    first_q_5_1 = 0;
+                    unsigned int _max_10 = ((begin_4) > (1) ? (begin_4) : (1));
+                    unsigned int _min_43 = ((_max_10 - 1) < (total_work_4 - 1) ? (_max_10 - 1) : (total_work_4 - 1));
+                    first_split_6_1 = _min_43;
+                    begin_coord_4 = first_split_6_1;
+                }
+                if (end_4_4 != total_cost_4) {
+                    unsigned int _max_11 = ((end_4_4) > (1) ? (end_4_4) : (1));
+                    unsigned int _min_44 = ((_max_11 - 1) < (total_work_4 - 1) ? (_max_11 - 1) : (total_work_4 - 1));
+                    end_coord_4 = _min_44;
+                }
+                unsigned int remaining_7_1 = end_coord_4 - begin_coord_4;
+                first_q_4 = first_q_5_1;
+                first_split_4 = first_split_6_1;
+                remaining_4 = remaining_7_1;
             }
-            unsigned int first_q_0_1 = first_q_1;
-            unsigned int first_split_1_1 = first_split_2;
-            unsigned int remaining_2_1 = remaining_1;
+            unsigned int first_q_0_1 = first_q_4;
+            unsigned int first_split_1_2 = first_split_4;
+            unsigned int remaining_2_2 = remaining_4;
+            if (remaining_2_2 > 0) {
+                load_kv_stage = 1;
+                first_split_1_2 = first_split_1_2 + 1;
+                remaining_2_2 = remaining_2_2 - 1;
+            }
             unsigned int _phase_kv_empty = 1;
             #pragma unroll 1
             for (unsigned int q_block_idx_1 = first_q_0_1; q_block_idx_1 < load_kv_num_blocks; q_block_idx_1++) {
                 unsigned int scheduled_kv_start_1 = 0;
                 unsigned int scheduled_num_splits_1 = 1;
                 {
-                    if (remaining_2_1 == 0) {
+                    if (remaining_2_2 == 0) {
                         break;
                     }
                     unsigned int span_word_1 = (unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + q_block_idx_1 * 2;
-                    unsigned int base_2 = local_base[q_block_idx_1];
-                    unsigned int span_splits_1 = local_splits[q_block_idx_1];
-                    unsigned int splits_2 = 0;
-                    if (first_split_1_1 < span_splits_1) {
-                        unsigned int available_1 = span_splits_1 - first_split_1_1;
-                        splits_2 = ((available_1 < remaining_2_1) ? available_1 : remaining_2_1);
+                    unsigned int base_0_1 = 0;
+                    unsigned int span_splits_1 = 0;
+                    unsigned int _min_45 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                    unsigned int start_1_3 = _min_45;
+                    unsigned int _min_46 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                    unsigned int end_2_3 = _min_46;
+                    unsigned int base_3_3 = start_1_3 / 4 * 4;
+                    unsigned int work_4_3 = (end_2_3 - base_3_3 + 255) / 256;
+                    base_0_1 = base_3_3;
+                    span_splits_1 = work_4_3;
+                    unsigned int splits_1 = 0;
+                    if (first_split_1_2 < span_splits_1) {
+                        unsigned int available_1 = span_splits_1 - first_split_1_2;
+                        splits_1 = ((available_1 < remaining_2_2) ? available_1 : remaining_2_2);
                     }
-                    scheduled_kv_start_1 = base_2 + first_split_1_1 * 256;
-                    scheduled_num_splits_1 = splits_2;
-                    remaining_2_1 -= scheduled_num_splits_1;
-                    first_split_1_1 = 0;
+                    scheduled_kv_start_1 = base_0_1 + first_split_1_2 * 256;
+                    scheduled_num_splits_1 = splits_1;
+                    remaining_2_2 -= scheduled_num_splits_1;
+                    first_split_1_2 = 0;
                 }
                 if (scheduled_num_splits_1 > 0) {
                     unsigned int kv_start = scheduled_kv_start_1;
@@ -494,17 +554,51 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
             unsigned int mma_kv_stage = 0;
             unsigned int mma_tmem_stage = 0;
             unsigned int mma_num_blocks = (seq_len + 4 - 1) / 4;
-            unsigned int first_q_2 = bid;
-            unsigned int first_split_3 = 0;
-            unsigned int remaining_3 = 0;
+            unsigned int first_q_6 = bid;
+            unsigned int first_split_5 = 0;
+            unsigned int remaining_5 = 0;
             {
-                first_q_2 = local_header[0];
-                first_split_3 = local_header[1];
-                remaining_3 = local_header[2];
+                unsigned int _min_47 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                unsigned int start_0_5 = _min_47;
+                unsigned int _min_48 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                unsigned int end_1_5 = _min_48;
+                unsigned int base_2_5 = start_0_5 / 4 * 4;
+                unsigned int work_3_5 = (end_1_5 - base_2_5 + 255) / 256;
+                unsigned int total_work_5 = work_3_5;
+                unsigned int total_cost_5 = total_work_5;
+                if (total_work_5 != 0) {
+                    total_cost_5 += 1;
+                }
+                unsigned int quotient_5 = total_cost_5 / (unsigned int)SM_COUNT;
+                unsigned int remainder_5 = total_cost_5 % (unsigned int)SM_COUNT;
+                int _min_49 = ((bid) < (remainder_5) ? (bid) : (remainder_5));
+                unsigned int begin_5 = (unsigned int)bid * quotient_5 + (unsigned int)_min_49;
+                int _min_50 = ((bid + 1) < (remainder_5) ? (bid + 1) : (remainder_5));
+                unsigned int end_4_5 = (unsigned int)(bid + 1) * quotient_5 + (unsigned int)_min_50;
+                unsigned int first_q_5_2 = 1;
+                unsigned int first_split_6_2 = 0;
+                unsigned int begin_coord_5 = total_work_5;
+                unsigned int end_coord_5 = total_work_5;
+                if (begin_5 != total_cost_5) {
+                    first_q_5_2 = 0;
+                    unsigned int _max_12 = ((begin_5) > (1) ? (begin_5) : (1));
+                    unsigned int _min_51 = ((_max_12 - 1) < (total_work_5 - 1) ? (_max_12 - 1) : (total_work_5 - 1));
+                    first_split_6_2 = _min_51;
+                    begin_coord_5 = first_split_6_2;
+                }
+                if (end_4_5 != total_cost_5) {
+                    unsigned int _max_13 = ((end_4_5) > (1) ? (end_4_5) : (1));
+                    unsigned int _min_52 = ((_max_13 - 1) < (total_work_5 - 1) ? (_max_13 - 1) : (total_work_5 - 1));
+                    end_coord_5 = _min_52;
+                }
+                unsigned int remaining_7_2 = end_coord_5 - begin_coord_5;
+                first_q_6 = first_q_5_2;
+                first_split_5 = first_split_6_2;
+                remaining_5 = remaining_7_2;
             }
-            unsigned int first_q_0_2 = first_q_2;
-            unsigned int first_split_1_2 = first_split_3;
-            unsigned int remaining_2_2 = remaining_3;
+            unsigned int first_q_0_2 = first_q_6;
+            unsigned int first_split_1_3 = first_split_5;
+            unsigned int remaining_2_3 = remaining_5;
             unsigned int _phase_q_full = 0;
             unsigned int _phase_kv_full = 0;
             unsigned int _phase_umma_empty = 1;
@@ -513,21 +607,29 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                 unsigned int scheduled_kv_start_2 = 0;
                 unsigned int scheduled_num_splits_2 = 1;
                 {
-                    if (remaining_2_2 == 0) {
+                    if (remaining_2_3 == 0) {
                         break;
                     }
                     unsigned int span_word_2 = (unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + q_block_idx_2 * 2;
-                    unsigned int base_3 = local_base[q_block_idx_2];
-                    unsigned int span_splits_2 = local_splits[q_block_idx_2];
-                    unsigned int splits_3 = 0;
-                    if (first_split_1_2 < span_splits_2) {
-                        unsigned int available_2 = span_splits_2 - first_split_1_2;
-                        splits_3 = ((available_2 < remaining_2_2) ? available_2 : remaining_2_2);
+                    unsigned int base_0_2 = 0;
+                    unsigned int span_splits_2 = 0;
+                    unsigned int _min_53 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                    unsigned int start_1_4 = _min_53;
+                    unsigned int _min_54 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                    unsigned int end_2_4 = _min_54;
+                    unsigned int base_3_4 = start_1_4 / 4 * 4;
+                    unsigned int work_4_4 = (end_2_4 - base_3_4 + 255) / 256;
+                    base_0_2 = base_3_4;
+                    span_splits_2 = work_4_4;
+                    unsigned int splits_2 = 0;
+                    if (first_split_1_3 < span_splits_2) {
+                        unsigned int available_2 = span_splits_2 - first_split_1_3;
+                        splits_2 = ((available_2 < remaining_2_3) ? available_2 : remaining_2_3);
                     }
-                    scheduled_kv_start_2 = base_3 + first_split_1_2 * 256;
-                    scheduled_num_splits_2 = splits_3;
-                    remaining_2_2 -= scheduled_num_splits_2;
-                    first_split_1_2 = 0;
+                    scheduled_kv_start_2 = base_0_2 + first_split_1_3 * 256;
+                    scheduled_num_splits_2 = splits_2;
+                    remaining_2_3 -= scheduled_num_splits_2;
+                    first_split_1_3 = 0;
                 }
                 if (scheduled_num_splits_2 > 0) {
                     unsigned int kv_start_1 = scheduled_kv_start_2;
@@ -637,29 +739,29 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
             {
                 float neg_inf[4];
                 #pragma unroll
-                for (int component = 0; component < 4; component++) {
-                    neg_inf[component] = -CUDART_INF_F;
+                for (int component_1 = 0; component_1 < 4; component_1++) {
+                    neg_inf[component_1] = -CUDART_INF_F;
                 }
                 for (unsigned int scratch_j = (unsigned int)lane; scratch_j < 1024; scratch_j += 32) {
                     neginf_scratch[scratch_j] = -CUDART_INF_F;
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 __syncwarp();
-                unsigned int clean_num_q_blocks = (seq_len + 4 - 1) / 4;
-                unsigned int clean_tiles_per_row = (stride_logits + 4095) / 4096;
+                unsigned int clean_num_q_blocks = 1;
+                unsigned int clean_tiles_per_row = (stride_logits + 1023) / 1024;
                 unsigned int clean_tasks = clean_num_q_blocks * clean_tiles_per_row;
                 #pragma unroll 1
                 for (unsigned int clean_task = bid; clean_task < clean_tasks; clean_task += SM_COUNT) {
-                    unsigned int q_block_idx_3 = clean_task / clean_tiles_per_row;
-                    unsigned int clean_begin = clean_task % clean_tiles_per_row * 4096;
-                    unsigned int clean_end_raw = clean_begin + 4096;
-                    unsigned int _min_8 = ((clean_end_raw) < (stride_logits) ? (clean_end_raw) : (stride_logits));
-                    unsigned int clean_end = _min_8;
+                    unsigned int q_block_idx_3 = 0;
+                    unsigned int clean_begin = clean_task % clean_tiles_per_row * 1024;
+                    unsigned int clean_end_raw = clean_begin + 1024;
+                    unsigned int _min_24 = ((clean_end_raw) < (stride_logits) ? (clean_end_raw) : (stride_logits));
+                    unsigned int clean_end = _min_24;
                     unsigned int q_start = q_block_idx_3 * 4;
                     unsigned int start_v = 4294967295;
                     unsigned int end_v = 0;
                     #pragma unroll 8
-                    for (unsigned int token_idx = 0; token_idx < 4; token_idx++) {
+                    for (unsigned int token_idx = 0; token_idx < 1; token_idx++) {
                         unsigned int row_unclamped = q_start + token_idx;
                         unsigned int row_idx = ((row_unclamped < seq_len - 1) ? row_unclamped : seq_len - 1);
                         unsigned int k_start_raw = cu_seq_len_k_start[row_idx];
@@ -674,32 +776,32 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                     unsigned int raw_end = kv_start_2 + num_kv_blocks_2 * 256;
                     unsigned int coverage_end = ((raw_end < stride_logits) ? raw_end : stride_logits);
                     #pragma unroll 1
-                    for (unsigned int qi_1 = 0; qi_1 < 4; qi_1++) {
-                        unsigned long long row_base = (unsigned long long)(q_start + qi_1) * (unsigned long long)stride_logits;
-                        if (q_start + qi_1 < seq_len) {
-                            float* tail_row_ptr = Logits + row_base;
-                            unsigned int _min_12 = ((kv_start_2) < (clean_end) ? (kv_start_2) : (clean_end));
+                    for (unsigned int qi = 0; qi < 1; qi++) {
+                        unsigned long long row_base = (unsigned long long)(q_start + qi) * (unsigned long long)stride_logits;
+                        {
+                            float* row_ptr = Logits + row_base;
+                            unsigned int _min_25 = ((kv_start_2) < (clean_end) ? (kv_start_2) : (clean_end));
                             unsigned int aligned_start = (clean_begin + 3) / 4 * 4;
-                            unsigned int aligned_end = _min_12 / 4 * 4;
+                            unsigned int aligned_end = _min_25 / 4 * 4;
                             if (aligned_start >= aligned_end) {
-                                for (unsigned int j = clean_begin + (unsigned int)lane; j < _min_12; j += 32) {
-                                    *(reinterpret_cast<float*>(tail_row_ptr + j) + (0)) = -CUDART_INF_F;
+                                for (unsigned int j = clean_begin + (unsigned int)lane; j < _min_25; j += 32) {
+                                    *(reinterpret_cast<float*>(row_ptr + j) + (0)) = -CUDART_INF_F;
                                 }
                                 __syncwarp();
                             } else {
                                 for (unsigned int j_1 = clean_begin + (unsigned int)lane; j_1 < aligned_start; j_1 += 32) {
-                                    *(reinterpret_cast<float*>(tail_row_ptr + j_1) + (0)) = -CUDART_INF_F;
+                                    *(reinterpret_cast<float*>(row_ptr + j_1) + (0)) = -CUDART_INF_F;
                                 }
-                                for (unsigned int j_2 = aligned_end + (unsigned int)lane; j_2 < _min_12; j_2 += 32) {
-                                    *(reinterpret_cast<float*>(tail_row_ptr + j_2) + (0)) = -CUDART_INF_F;
+                                for (unsigned int j_2 = aligned_end + (unsigned int)lane; j_2 < _min_25; j_2 += 32) {
+                                    *(reinterpret_cast<float*>(row_ptr + j_2) + (0)) = -CUDART_INF_F;
                                 }
                                 __syncwarp();
                                 if (elect_sync()) {
                                     for (unsigned int j_3 = aligned_start; j_3 < aligned_end; j_3 += 1024) {
-                                        unsigned int _min_13 = ((aligned_end - j_3) < (1024) ? (aligned_end - j_3) : (1024));
-                                        unsigned int bulk_elems = _min_13;
+                                        unsigned int _min_26 = ((aligned_end - j_3) < (1024) ? (aligned_end - j_3) : (1024));
+                                        unsigned int bulk_elems = _min_26;
                                         {
-                                            void* _cpbulk_dst_0 = reinterpret_cast<void*>(tail_row_ptr + j_3);
+                                            void* _cpbulk_dst_0 = reinterpret_cast<void*>(row_ptr + j_3);
                                             asm volatile(
                                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                                 :: "l"(_cpbulk_dst_0), "r"(neginf_scratch_addr), "r"((uint32_t)(bulk_elems * 4))
@@ -710,28 +812,28 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                                 }
                                 __syncwarp();
                             }
-                            unsigned int _max_4 = ((coverage_end) > (clean_begin) ? (coverage_end) : (clean_begin));
-                            unsigned int aligned_start_0 = (_max_4 + 3) / 4 * 4;
+                            unsigned int _max_6 = ((coverage_end) > (clean_begin) ? (coverage_end) : (clean_begin));
+                            unsigned int aligned_start_0 = (_max_6 + 3) / 4 * 4;
                             unsigned int aligned_end_1 = clean_end / 4 * 4;
                             if (aligned_start_0 >= aligned_end_1) {
-                                for (unsigned int j_4 = _max_4 + (unsigned int)lane; j_4 < clean_end; j_4 += 32) {
-                                    *(reinterpret_cast<float*>(tail_row_ptr + j_4) + (0)) = -CUDART_INF_F;
+                                for (unsigned int j_4 = _max_6 + (unsigned int)lane; j_4 < clean_end; j_4 += 32) {
+                                    *(reinterpret_cast<float*>(row_ptr + j_4) + (0)) = -CUDART_INF_F;
                                 }
                                 __syncwarp();
                             } else {
-                                for (unsigned int j_5 = _max_4 + (unsigned int)lane; j_5 < aligned_start_0; j_5 += 32) {
-                                    *(reinterpret_cast<float*>(tail_row_ptr + j_5) + (0)) = -CUDART_INF_F;
+                                for (unsigned int j_5 = _max_6 + (unsigned int)lane; j_5 < aligned_start_0; j_5 += 32) {
+                                    *(reinterpret_cast<float*>(row_ptr + j_5) + (0)) = -CUDART_INF_F;
                                 }
                                 for (unsigned int j_6 = aligned_end_1 + (unsigned int)lane; j_6 < clean_end; j_6 += 32) {
-                                    *(reinterpret_cast<float*>(tail_row_ptr + j_6) + (0)) = -CUDART_INF_F;
+                                    *(reinterpret_cast<float*>(row_ptr + j_6) + (0)) = -CUDART_INF_F;
                                 }
                                 __syncwarp();
                                 if (elect_sync()) {
                                     for (unsigned int j_7 = aligned_start_0; j_7 < aligned_end_1; j_7 += 1024) {
-                                        unsigned int _min_14 = ((aligned_end_1 - j_7) < (1024) ? (aligned_end_1 - j_7) : (1024));
-                                        unsigned int bulk_elems_1 = _min_14;
+                                        unsigned int _min_27 = ((aligned_end_1 - j_7) < (1024) ? (aligned_end_1 - j_7) : (1024));
+                                        unsigned int bulk_elems_1 = _min_27;
                                         {
-                                            void* _cpbulk_dst_1 = reinterpret_cast<void*>(tail_row_ptr + j_7);
+                                            void* _cpbulk_dst_1 = reinterpret_cast<void*>(row_ptr + j_7);
                                             asm volatile(
                                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                                 :: "l"(_cpbulk_dst_1), "r"(neginf_scratch_addr), "r"((uint32_t)(bulk_elems_1 * 4))
@@ -763,17 +865,51 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
             unsigned int math_tmem_stage = wg_idx;
             unsigned int math_tmem_phase = 0;
             unsigned int math_num_blocks = (seq_len + 4 - 1) / 4;
-            unsigned int first_q_3 = bid;
-            unsigned int first_split_4 = 0;
-            unsigned int remaining_4 = 0;
+            unsigned int first_q_7 = bid;
+            unsigned int first_split_7 = 0;
+            unsigned int remaining_6 = 0;
             {
-                first_q_3 = local_header[0];
-                first_split_4 = local_header[1];
-                remaining_4 = local_header[2];
+                unsigned int _min_55 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                unsigned int start_0_6 = _min_55;
+                unsigned int _min_56 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                unsigned int end_1_6 = _min_56;
+                unsigned int base_2_6 = start_0_6 / 4 * 4;
+                unsigned int work_3_6 = (end_1_6 - base_2_6 + 255) / 256;
+                unsigned int total_work_6 = work_3_6;
+                unsigned int total_cost_6 = total_work_6;
+                if (total_work_6 != 0) {
+                    total_cost_6 += 1;
+                }
+                unsigned int quotient_6 = total_cost_6 / (unsigned int)SM_COUNT;
+                unsigned int remainder_6 = total_cost_6 % (unsigned int)SM_COUNT;
+                int _min_57 = ((bid) < (remainder_6) ? (bid) : (remainder_6));
+                unsigned int begin_6 = (unsigned int)bid * quotient_6 + (unsigned int)_min_57;
+                int _min_58 = ((bid + 1) < (remainder_6) ? (bid + 1) : (remainder_6));
+                unsigned int end_4_6 = (unsigned int)(bid + 1) * quotient_6 + (unsigned int)_min_58;
+                unsigned int first_q_5_3 = 1;
+                unsigned int first_split_6_3 = 0;
+                unsigned int begin_coord_6 = total_work_6;
+                unsigned int end_coord_6 = total_work_6;
+                if (begin_6 != total_cost_6) {
+                    first_q_5_3 = 0;
+                    unsigned int _max_14 = ((begin_6) > (1) ? (begin_6) : (1));
+                    unsigned int _min_59 = ((_max_14 - 1) < (total_work_6 - 1) ? (_max_14 - 1) : (total_work_6 - 1));
+                    first_split_6_3 = _min_59;
+                    begin_coord_6 = first_split_6_3;
+                }
+                if (end_4_6 != total_cost_6) {
+                    unsigned int _max_15 = ((end_4_6) > (1) ? (end_4_6) : (1));
+                    unsigned int _min_60 = ((_max_15 - 1) < (total_work_6 - 1) ? (_max_15 - 1) : (total_work_6 - 1));
+                    end_coord_6 = _min_60;
+                }
+                unsigned int remaining_7_3 = end_coord_6 - begin_coord_6;
+                first_q_7 = first_q_5_3;
+                first_split_7 = first_split_6_3;
+                remaining_6 = remaining_7_3;
             }
-            unsigned int first_q_0_3 = first_q_3;
-            unsigned int first_split_1_3 = first_split_4;
-            unsigned int remaining_2_3 = remaining_4;
+            unsigned int first_q_0_3 = first_q_7;
+            unsigned int first_split_1_4 = first_split_7;
+            unsigned int remaining_2_4 = remaining_6;
             unsigned int _phase_q_full_1 = 0;
             unsigned int _phase_kv_full_1 = 0;
             #pragma unroll 1
@@ -781,21 +917,29 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                 unsigned int scheduled_kv_start_3 = 0;
                 unsigned int scheduled_num_splits_3 = 1;
                 {
-                    if (remaining_2_3 == 0) {
+                    if (remaining_2_4 == 0) {
                         break;
                     }
                     unsigned int span_word_3 = (unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + q_block_idx_4 * 2;
-                    unsigned int base_4 = local_base[q_block_idx_4];
-                    unsigned int span_splits_3 = local_splits[q_block_idx_4];
-                    unsigned int splits_4 = 0;
-                    if (first_split_1_3 < span_splits_3) {
-                        unsigned int available_3 = span_splits_3 - first_split_1_3;
-                        splits_4 = ((available_3 < remaining_2_3) ? available_3 : remaining_2_3);
+                    unsigned int base_0_3 = 0;
+                    unsigned int span_splits_3 = 0;
+                    unsigned int _min_61 = (((unsigned int)cu_seq_len_k_start[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : (seq_len_kv));
+                    unsigned int start_1_5 = _min_61;
+                    unsigned int _min_62 = (((unsigned int)cu_seq_len_k_end[0]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : (seq_len_kv));
+                    unsigned int end_2_5 = _min_62;
+                    unsigned int base_3_5 = start_1_5 / 4 * 4;
+                    unsigned int work_4_5 = (end_2_5 - base_3_5 + 255) / 256;
+                    base_0_3 = base_3_5;
+                    span_splits_3 = work_4_5;
+                    unsigned int splits_3 = 0;
+                    if (first_split_1_4 < span_splits_3) {
+                        unsigned int available_3 = span_splits_3 - first_split_1_4;
+                        splits_3 = ((available_3 < remaining_2_4) ? available_3 : remaining_2_4);
                     }
-                    scheduled_kv_start_3 = base_4 + first_split_1_3 * 256;
-                    scheduled_num_splits_3 = splits_4;
-                    remaining_2_3 -= scheduled_num_splits_3;
-                    first_split_1_3 = 0;
+                    scheduled_kv_start_3 = base_0_3 + first_split_1_4 * 256;
+                    scheduled_num_splits_3 = splits_3;
+                    remaining_2_4 -= scheduled_num_splits_3;
+                    first_split_1_4 = 0;
                 }
                 if (scheduled_num_splits_3 > 0) {
                     unsigned int q_start_1 = q_block_idx_4 * 4;
@@ -843,18 +987,12 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                     {
                         dense_start[0] = ks0;
                         dense_end[0] = ke0;
-                        dense_start[1] = ks1;
-                        dense_end[1] = ke1;
-                        dense_start[2] = ks2;
-                        dense_end[2] = ke2;
-                        dense_start[3] = ks3;
-                        dense_end[3] = ke3;
                     }
                     mbarrier_wait(q_full_addr + (math_q_stage) * 8, _phase_q_full_1);
                     float weights_reg[128];
                     int weight_stage_base = math_q_stage * 128;
                     #pragma unroll
-                    for (int wi = 0; wi < 128; wi++) {
+                    for (int wi = 0; wi < 32; wi++) {
                         weights_reg[wi] = smem_weights[weight_stage_base + wi];
                     }
                     int q_row_valid[4];
@@ -863,7 +1001,7 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                     float threshold_qi[4];
                     int queue_counts[4];
                     #pragma unroll
-                    for (int qi_pre = 0; qi_pre < 4; qi_pre++) {
+                    for (int qi_pre = 0; qi_pre < 1; qi_pre++) {
                         int q_row_pre = q_start_0 + (unsigned int)qi_pre;
                         {
                             int in_range = (((unsigned int)q_row_pre < seq_len) ? 1 : 0);
@@ -884,18 +1022,12 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                         int kv_pos = kv_start_1_1 + kv_iter_2 * 256 + (unsigned int)math_thread_idx;
                         float _tmem_load_0[32];
                         tmem_ld_x16(&_tmem_load_0[0], taddr + math_tmem_stage * 128 + (unsigned int)(warp % 4 * 32 << 16));
+                        asm volatile("tcgen05.wait::ld.sync.aligned;");
                         tmem_ld_x16(&_tmem_load_0[16], taddr + math_tmem_stage * 128 + (unsigned int)(warp % 4 * 32 << 16) + 16);
-                        float _tmem_load_1[32];
-                        tmem_ld_x16(&_tmem_load_1[0], taddr + math_tmem_stage * 128 + 32 + (unsigned int)(warp % 4 * 32 << 16));
-                        tmem_ld_x16(&_tmem_load_1[16], taddr + math_tmem_stage * 128 + 32 + (unsigned int)(warp % 4 * 32 << 16) + 16);
-                        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                        float _tmem_load_2[32];
-                        tmem_ld_x16(&_tmem_load_2[0], taddr + math_tmem_stage * 128 + 64 + (unsigned int)(warp % 4 * 32 << 16));
-                        tmem_ld_x16(&_tmem_load_2[16], taddr + math_tmem_stage * 128 + 64 + (unsigned int)(warp % 4 * 32 << 16) + 16);
-                        float _tmem_load_3[32];
-                        tmem_ld_x16(&_tmem_load_3[0], taddr + math_tmem_stage * 128 + 96 + (unsigned int)(warp % 4 * 32 << 16));
-                        tmem_ld_x16(&_tmem_load_3[16], taddr + math_tmem_stage * 128 + 96 + (unsigned int)(warp % 4 * 32 << 16) + 16);
+                        asm volatile("tcgen05.wait::ld.sync.aligned;");
                         {
+                            asm volatile("tcgen05.fence::before_thread_sync;");
+                            mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
                             float _relu_wsum_0;
                             {
                                 float2 _sum0 = make_float2(0.0f, 0.0f);
@@ -933,132 +1065,6 @@ kernel_cake_deepgemm_dense_mqa_f27e5332ba291057767c(const __grid_constant__ CUte
                                 unsigned int out_elem_u32 = (unsigned int)q_row * stride_logits + (unsigned int)kv_pos;
                                 if (q_row_valid[0] != 0) {
                                     *(reinterpret_cast<float*>(Logits + out_elem_u32) + (0)) = materialized_result;
-                                }
-                            }
-                        }
-                        {
-                            float _relu_wsum_1;
-                            {
-                                float2 _sum0 = make_float2(0.0f, 0.0f);
-                                float2 _sum1 = make_float2(0.0f, 0.0f);
-                                #pragma unroll
-                                for (int _j = 0; _j < 32; _j += 4) {
-                                    asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
-                                        "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
-                                        "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
-                                        "add.rn.f32x2 _pr, _pr, _pa;\n\t"
-                                        "mov.b64 _pb, {%3, %4};\n\t"
-                                        "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                        : "+l"(*(unsigned long long*)&_sum0) : "f"(_tmem_load_1[0 + _j + 0]), "f"(_tmem_load_1[0 + _j + 1]), "f"(weights_reg[32 + _j + 0]), "f"(weights_reg[32 + _j + 1]));
-                                    asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
-                                        "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
-                                        "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
-                                        "add.rn.f32x2 _pr, _pr, _pa;\n\t"
-                                        "mov.b64 _pb, {%3, %4};\n\t"
-                                        "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                        : "+l"(*(unsigned long long*)&_sum1) : "f"(_tmem_load_1[0 + _j + 2]), "f"(_tmem_load_1[0 + _j + 3]), "f"(weights_reg[32 + _j + 2]), "f"(weights_reg[32 + _j + 3]));
-                                }
-                                float2 _sum;
-                                asm("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_sum) : "l"(*(const unsigned long long*)&_sum0), "l"(*(const unsigned long long*)&_sum1));
-                                _relu_wsum_1 = (_sum.x + _sum.y) * 0.5f;
-                            }
-                            int q_row_1 = q_start_0 + 1;
-                            float in_range_result_1 = scale_kv * _relu_wsum_1;
-                            {
-                                float materialized_result_1 = in_range_result_1;
-                                {
-                                    unsigned int rel_kv_1 = (unsigned int)kv_pos - dense_start[1];
-                                    unsigned int row_len_1 = dense_end[1] - dense_start[1];
-                                    materialized_result_1 = ((rel_kv_1 < row_len_1) ? in_range_result_1 : -CUDART_INF_F);
-                                }
-                                unsigned int out_elem_u32_1 = (unsigned int)q_row_1 * stride_logits + (unsigned int)kv_pos;
-                                if (q_row_valid[1] != 0) {
-                                    *(reinterpret_cast<float*>(Logits + out_elem_u32_1) + (0)) = materialized_result_1;
-                                }
-                            }
-                        }
-                        {
-                            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                            asm volatile("tcgen05.fence::before_thread_sync;");
-                            mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
-                            float _relu_wsum_2;
-                            {
-                                float2 _sum0 = make_float2(0.0f, 0.0f);
-                                float2 _sum1 = make_float2(0.0f, 0.0f);
-                                #pragma unroll
-                                for (int _j = 0; _j < 32; _j += 4) {
-                                    asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
-                                        "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
-                                        "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
-                                        "add.rn.f32x2 _pr, _pr, _pa;\n\t"
-                                        "mov.b64 _pb, {%3, %4};\n\t"
-                                        "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                        : "+l"(*(unsigned long long*)&_sum0) : "f"(_tmem_load_2[0 + _j + 0]), "f"(_tmem_load_2[0 + _j + 1]), "f"(weights_reg[64 + _j + 0]), "f"(weights_reg[64 + _j + 1]));
-                                    asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
-                                        "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
-                                        "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
-                                        "add.rn.f32x2 _pr, _pr, _pa;\n\t"
-                                        "mov.b64 _pb, {%3, %4};\n\t"
-                                        "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                        : "+l"(*(unsigned long long*)&_sum1) : "f"(_tmem_load_2[0 + _j + 2]), "f"(_tmem_load_2[0 + _j + 3]), "f"(weights_reg[64 + _j + 2]), "f"(weights_reg[64 + _j + 3]));
-                                }
-                                float2 _sum;
-                                asm("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_sum) : "l"(*(const unsigned long long*)&_sum0), "l"(*(const unsigned long long*)&_sum1));
-                                _relu_wsum_2 = (_sum.x + _sum.y) * 0.5f;
-                            }
-                            int q_row_2 = q_start_0 + 2;
-                            float in_range_result_2 = scale_kv * _relu_wsum_2;
-                            {
-                                float materialized_result_2 = in_range_result_2;
-                                {
-                                    unsigned int rel_kv_2 = (unsigned int)kv_pos - dense_start[2];
-                                    unsigned int row_len_2 = dense_end[2] - dense_start[2];
-                                    materialized_result_2 = ((rel_kv_2 < row_len_2) ? in_range_result_2 : -CUDART_INF_F);
-                                }
-                                unsigned int out_elem_u32_2 = (unsigned int)q_row_2 * stride_logits + (unsigned int)kv_pos;
-                                if (q_row_valid[2] != 0) {
-                                    *(reinterpret_cast<float*>(Logits + out_elem_u32_2) + (0)) = materialized_result_2;
-                                }
-                            }
-                        }
-                        {
-                            float _relu_wsum_3;
-                            {
-                                float2 _sum0 = make_float2(0.0f, 0.0f);
-                                float2 _sum1 = make_float2(0.0f, 0.0f);
-                                #pragma unroll
-                                for (int _j = 0; _j < 32; _j += 4) {
-                                    asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
-                                        "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
-                                        "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
-                                        "add.rn.f32x2 _pr, _pr, _pa;\n\t"
-                                        "mov.b64 _pb, {%3, %4};\n\t"
-                                        "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                        : "+l"(*(unsigned long long*)&_sum0) : "f"(_tmem_load_3[0 + _j + 0]), "f"(_tmem_load_3[0 + _j + 1]), "f"(weights_reg[96 + _j + 0]), "f"(weights_reg[96 + _j + 1]));
-                                    asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
-                                        "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
-                                        "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
-                                        "add.rn.f32x2 _pr, _pr, _pa;\n\t"
-                                        "mov.b64 _pb, {%3, %4};\n\t"
-                                        "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                        : "+l"(*(unsigned long long*)&_sum1) : "f"(_tmem_load_3[0 + _j + 2]), "f"(_tmem_load_3[0 + _j + 3]), "f"(weights_reg[96 + _j + 2]), "f"(weights_reg[96 + _j + 3]));
-                                }
-                                float2 _sum;
-                                asm("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_sum) : "l"(*(const unsigned long long*)&_sum0), "l"(*(const unsigned long long*)&_sum1));
-                                _relu_wsum_3 = (_sum.x + _sum.y) * 0.5f;
-                            }
-                            int q_row_3 = q_start_0 + 3;
-                            float in_range_result_3 = scale_kv * _relu_wsum_3;
-                            {
-                                float materialized_result_3 = in_range_result_3;
-                                {
-                                    unsigned int rel_kv_3 = (unsigned int)kv_pos - dense_start[3];
-                                    unsigned int row_len_3 = dense_end[3] - dense_start[3];
-                                    materialized_result_3 = ((rel_kv_3 < row_len_3) ? in_range_result_3 : -CUDART_INF_F);
-                                }
-                                unsigned int out_elem_u32_3 = (unsigned int)q_row_3 * stride_logits + (unsigned int)kv_pos;
-                                if (q_row_valid[3] != 0) {
-                                    *(reinterpret_cast<float*>(Logits + out_elem_u32_3) + (0)) = materialized_result_3;
                                 }
                             }
                         }
