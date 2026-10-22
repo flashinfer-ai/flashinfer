@@ -273,6 +273,20 @@ inline cudaError_t launch_m537_mixed_kernel(void const* x, void const* pre_quant
   return cudaGetLastError();
 }
 
+// Quantize CTAs of the row-major small-M kernel. Ranks 32/64 give each CTA
+// RowsPerQuantBlock rows; rank 128 gives each thread one (row, scale column)
+// item of the 128-row-padded SF tile, so the count follows M x K rather than M.
+template <int BlockThreads, int RowsPerQuantBlock, int Rank>
+__host__ __device__ __forceinline__ int small_m_quant_blocks(int m, int sf_cols) {
+  if constexpr (Rank > 64) {
+    std::int64_t const items = static_cast<std::int64_t>((m + 127) / 128 * 128) * sf_cols;
+    return static_cast<int>((items + BlockThreads - 1) / BlockThreads);
+  } else {
+    (void)sf_cols;
+    return (m + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
+  }
+}
+
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
           bool SignalLaunch = false, int Rank = 32>
 __global__
@@ -296,7 +310,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     }
   }
   int const kPaddedM = (M + 127) / 128 * 128;
-  int const kQuantBlocks = (M + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
+  int const kQuantBlocks =
+      small_m_quant_blocks<BlockThreads, RowsPerQuantBlock, Rank>(M, K / quant::SF_VEC_SIZE);
   constexpr int kDownWarps = BlockThreads / 32;
   int const kSfCols = K / quant::SF_VEC_SIZE;
   int const kDownKPerWarp = K / kDownWarps;
@@ -316,6 +331,33 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     }
 
     float const scale = global_scale[0];
+    if constexpr (Rank > 64) {
+      // One (row, scale column) item per thread over the whole padded SF tile,
+      // padding rows included (zero scales). Graph-replay ablation at M=64: the
+      // row-blocked loop's M / RowsPerQuantBlock CTAs took 4.1 us (K=3072) and
+      // 9.1 us (K=12288) alone; a flat split over enough CTAs, 2.9 and 4.0 us.
+      std::int64_t const items = static_cast<std::int64_t>(kPaddedM) * kSfCols;
+      std::int64_t const item = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
+      if (item < items) {
+        int const row = static_cast<int>(item / kSfCols);
+        int const sf_col = static_cast<int>(item - static_cast<std::int64_t>(row) * kSfCols);
+        std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+        if (row < M) {
+          quant::Bf16x8 x_lo;
+          quant::Bf16x8 x_hi;
+          quant::Bf16x8 pqs_lo;
+          quant::Bf16x8 pqs_hi;
+          quant::loadBf16x8(x + item * quant::FAST_ELTS_PER_THREAD, x_lo);
+          quant::loadBf16x8(x + item * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+          quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+          quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+          xq[item] = quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+        } else {
+          sf[sf_offset] = 0u;
+        }
+      }
+      return;
+    }
     int const row_base = block * RowsPerQuantBlock;
     int const kWorkItems = RowsPerQuantBlock * kSfCols;
     for (std::int64_t item = threadIdx.x; item < kWorkItems; item += BlockThreads) {
@@ -528,8 +570,9 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     if (kRank > 64 && (k / kDownWarps) % 32) return cudaErrorInvalidValue;
     if (k % (4 * quant::SF_VEC_SIZE)) return cudaErrorInvalidValue;
     int const padded_m = (m + 127) / 128 * 128;
-    int const quant_blocks = (m + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
-    if (quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
+    int const quant_blocks =
+        small_m_quant_blocks<BlockThreads, RowsPerQuantBlock, Rank>(m, k / quant::SF_VEC_SIZE);
+    if (kRank <= 64 && quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
     int const grid_blocks = quant_blocks + ((m + 15) / 16) * kDownNTiles;
     // Keep the primary's ordinary stream dependency, including the preceding GEMM.
     nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<

@@ -337,6 +337,9 @@ def sm120_small_m_tiling_is_valid(
     down_n_tiles = rank // down_tile_cols
     if down_n_tiles * down_tile_cols != rank:
         return False
+    if rank > 64:
+        # Rank 128 splits quantize work per item, not per RowsPerQuantBlock rows.
+        return True
     padded_m = (m + 127) // 128 * 128
     quant_blocks = (m + rows_per_quant_block - 1) // rows_per_quant_block
     return quant_blocks * rows_per_quant_block <= padded_m
