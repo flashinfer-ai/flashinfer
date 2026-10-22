@@ -1617,7 +1617,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                            size_t& staged_int_workspace_bytes, IdType* qo_indptr_h,
                            IdType* kv_indptr_h, IdType* kv_len_arr_h, uint32_t batch_size,
                            uint32_t num_heads, uint32_t head_dim_o, bool causal,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, int cta_tile_q = 64, int chunk_quantum = 0) {
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1644,7 +1644,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   int avg_packed_qo_len = accum_packed_qo_len / batch_size;
 
   int cluster_size;
-  if (avg_packed_qo_len > 64) {
+  if (avg_packed_qo_len > cta_tile_q) {
     cluster_size = 2;  // two ctas in a cluster
   } else {
     cluster_size = 1;  // one cta in a cluster
@@ -1652,7 +1652,6 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   uint32_t num_clusters = num_sm / cluster_size;
   plan_info.num_blks_x = cluster_size;
   plan_info.num_blks_y = num_clusters;
-  const int cta_tile_q = 64;
   int cluster_tile_q = cluster_size * cta_tile_q;
 
   int64_t total_kv_lens = 0;
@@ -1680,7 +1679,9 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     return ceil_div(x, 256) * 256;
   };
 
-  int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
+  int average_kv = std::max(ceil_div(total_kv_lens, num_clusters), 1L);
+  int kv_len_limit =
+      chunk_quantum > 0 ? ceil_div(average_kv, chunk_quantum) * chunk_quantum : f(average_kv);
 
   // step 1. load-balancing scheduling algorithm
   MinHeap cluster_cost_heap(num_clusters);

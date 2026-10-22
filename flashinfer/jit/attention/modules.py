@@ -261,6 +261,8 @@ def gen_batch_mla_module(
     head_dim_ckv: int,
     head_dim_kpe: int,
     use_profiler: bool,
+    sm89_q_tile: int = 0,
+    sm89_chunk_quantum: int = 0,
 ) -> JitSpec:
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -274,6 +276,9 @@ def gen_batch_mla_module(
         head_dim_kpe,
         use_profiler,
     )
+    if sm89_q_tile:
+        assert backend == "fa2" and sm89_q_tile in (32, 64)
+        uri += f"_sm89_fp8_bf16_q{sm89_q_tile}_chunk{sm89_chunk_quantum}"
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
@@ -335,7 +340,14 @@ def gen_batch_mla_module(
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 
-    extra_cuda_cflags = []
+    extra_cuda_cflags = (
+        [
+            f"-DFLASHINFER_MLA_SM89_Q_TILE={sm89_q_tile}",
+            f"-DFLASHINFER_MLA_SM89_CHUNK_QUANTUM={sm89_chunk_quantum}",
+        ]
+        if sm89_q_tile
+        else []
+    )
     if backend == "fa3":
         extra_cuda_cflags += sm90a_nvcc_flags
     if use_profiler:

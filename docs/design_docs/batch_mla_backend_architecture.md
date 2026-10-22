@@ -533,7 +533,7 @@ device, and backend-specific option checks.
 
 | Backend | Native metadata | Kernel input | LSE | Output scale | CUDA Graph replan |
 | --- | --- | --- | --- | --- | --- |
-| FA2 | CSR | Split | None, base 2, or base e | None | Supported with reserved metadata buffers |
+| FA2 | CSR | Split | None, base 2, or base e | None or per-tensor FP8 | Supported with reserved metadata buffers |
 | FA3 | CSR | Split | None, base 2, or base e | None | Supported with reserved metadata buffers |
 | CUTLASS | Dense | Packed | None | None or per-tensor FP8 | Rejected |
 | cuTile | Dense | Split | None | None | First plan/capture only |
@@ -546,8 +546,16 @@ device, and backend-specific option checks.
 
 The generated-FA backends accept FP16 or BF16 queries and require the output
 dtype to match the query dtype. KV-cache data may be FP16, BF16, or FP8 E4M3.
-FP8 KV-cache plans require an SM90 device, a BF16 query, compressed
-width 512, positional width 0 or 64, and the per-tensor KV scale contract.
+FP8 support depends on the device:
+
+- **SM90:** BF16 query, compressed width 512, positional width 0 or 64, and
+  the per-tensor KV scale contract.
+- **SM89 (FA2):** BF16 query/output, E4M3 cache, compressed width 512,
+  positional width 64, and one query token per request.
+
+The SM89 kernel converts FP8 tiles to BF16 in shared memory before MMA,
+avoiding a full BF16 cache copy. It supports causal/non-causal execution,
+empty KV rows, and base-2 or natural-log LSE.
 At run time, that contract requires `kpe_scale` plus exactly one scalar
 `ckv_scale` or contiguous FP32 `ckv_scale_arr`. Non-FP8 plans use the default
 no-scale contract.
@@ -556,6 +564,12 @@ FA2 and FA3 support causal and non-causal planning, all three LSE modes, and
 backend profiler planning. Their kernel-facing query and cache representation is
 split; a packed planned input reaches that representation through zero-copy
 slices.
+
+For SM89 FP8 CUDA Graphs, the first successful plan fixes the compiled tile
+and scheduling configuration. Replanning can update sequence lengths and page
+indices within reserved metadata/workspace capacity. Changes to captured head
+count, page size, mask, softmax scale, layout or dtype are rejected before plan
+state is updated. Use a new wrapper to change or retune the captured configuration.
 
 Native workspace-capacity and causal-layout restrictions produce typed support
 errors, allowing automatic selection to try another backend.
@@ -1023,3 +1037,14 @@ context, avoiding generic cache selection on ordinary functional calls.
 Planned XQA keeps scalar-only BMM scales. Existing
 `auto` routing remains unchanged; cross-backend expansion applies to the
 wrapper's explicit `backend="autotune"` policy.
+
+### SM89 FP8-cache validation
+
+FA backend plan state owns the SM89 captured signature and frozen schedule. The
+wrapper forwards opaque previous-plan state and calls the previous backend's
+replan validator before selection or metadata mutation; architecture-specific
+fields do not belong in `_MLAPlanArguments`.
+
+
+See [SM89 FP8 MLA design and validation](mla_sm89_fp8_design.md) for the supported
+operation, layout and Graph invariants, and correctness/performance commands.

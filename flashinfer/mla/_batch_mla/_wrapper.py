@@ -54,6 +54,9 @@ from ._auto_policy import (
 
 
 class _PlannedBackend(Protocol):
+    # Backends with captured-plan restrictions may also implement the optional
+    # validate_graph_replan(args) hook. It must reject incompatible changes
+    # before mutating metadata; the wrapper probes it before backend selection.
     _backend: str
     _plan_capabilities: ClassVar[MLAPlanCapabilities]
 
@@ -698,11 +701,22 @@ class BatchMLAPagedAttentionWrapper:
             _kv_len_arr_buf=self._kv_len_arr_buf,
             _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
             _previous_backend_name=previous_backend_name,
+            _previous_graph_plan_state=(
+                getattr(previous_backend, "_graph_plan_state", None)
+                if self._use_cuda_graph
+                else None
+            ),
         )
 
         # ---------------------------------------------------------------------------
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
+        # The previous backend owns captured-plan invariants. Validate before
+        # selection or writes to shared Graph metadata, including dtype changes.
+        if self._use_cuda_graph and previous_backend is not None:
+            validate_replan = getattr(previous_backend, "validate_graph_replan", None)
+            if validate_replan is not None:
+                validate_replan(plan_args)
         planned_backend = self._backend_type.plan_from_wrapper(plan_args)
         capabilities = planned_backend._plan_capabilities
         if capabilities.is_experimental:

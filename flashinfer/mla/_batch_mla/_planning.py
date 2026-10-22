@@ -626,6 +626,10 @@ class _MLAPlanArguments:
     _graph_plan_int_workspace_buffer: Optional[torch.Tensor] = field(
         default=None, repr=False, compare=False
     )
+    # Opaque state owned and interpreted by the previous backend.
+    _previous_graph_plan_state: Optional[object] = field(
+        default=None, repr=False, compare=False
+    )
     # Selector context; eager replans may choose a different concrete backend.
     _previous_backend_name: Optional[str] = field(
         default=None, repr=False, compare=False

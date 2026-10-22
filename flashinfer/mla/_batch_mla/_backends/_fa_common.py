@@ -5,6 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 """
 
+from dataclasses import dataclass
 import functools
 import math
 from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union, cast
@@ -30,6 +31,39 @@ from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 from .._contracts import _resolve_structural_mla_input
 
 
+@dataclass(frozen=True)
+class _Sm89GraphPlanState:
+    schedule: tuple[int, int]
+    signature: tuple[tuple[str, object], ...]
+
+
+def _sm89_graph_signature(args: _MLAPlanArguments) -> tuple[tuple[str, object], ...]:
+    # These values become captured launch/scalar arguments, not mutable metadata.
+    names = (
+        "num_heads",
+        "head_dim_ckv",
+        "head_dim_kpe",
+        "page_size",
+        "causal",
+        "sm_scale",
+        "q_data_type",
+        "kv_data_type",
+        "output_dtype",
+        "query_layout",
+        "kv_cache_layout",
+        "lse_mode",
+        "scale_mode",
+        "output_scale",
+        "use_profiler",
+    )
+    return tuple((name, getattr(args, name)) for name in names)
+
+
+def _previous_sm89_schedule(args: _MLAPlanArguments) -> Optional[tuple[int, int]]:
+    state = args._previous_graph_plan_state
+    return state.schedule if isinstance(state, _Sm89GraphPlanState) else None
+
+
 class _GeneratedBatchMLAModule(Protocol):
     def plan(self, *args: object) -> object: ...
 
@@ -48,6 +82,8 @@ def get_batch_mla_module(
     head_dim_ckv: int,
     head_dim_kpe: int,
     use_profiler: bool,
+    sm89_q_tile: int = 0,
+    sm89_chunk_quantum: int = 0,
 ) -> _GeneratedBatchMLAModule:
     return gen_batch_mla_module(
         backend,
@@ -58,6 +94,8 @@ def get_batch_mla_module(
         head_dim_ckv,
         head_dim_kpe,
         use_profiler,
+        sm89_q_tile=sm89_q_tile,
+        sm89_chunk_quantum=sm89_chunk_quantum,
     ).build_and_load()
 
 
@@ -113,6 +151,7 @@ def _validate_generated_fa_plan(
     kv_data_type: torch.dtype,
     output_dtype: torch.dtype,
     scale_mode: str,
+    sm89_schedule=None,
 ) -> None:
     for name, tensor in (
         ("qo_indptr", qo_indptr),
@@ -152,7 +191,15 @@ def _validate_generated_fa_plan(
         )
     if kv_data_type == torch.float8_e4m3fn:
         major, minor = get_compute_capability(device)
-        if major != 9:
+        if (
+            backend == "fa2"
+            and (major, minor) == (8, 9)
+            and (head_dim_ckv != 512 or head_dim_kpe != 64)
+        ):
+            raise _BackendPlanUnsupportedError(
+                "SM89 FP8 MLA requires head_dim_ckv=512 and head_dim_kpe=64."
+            )
+        if major != 9 and not (backend == "fa2" and (major, minor) == (8, 9)):
             raise _BackendPlanUnsupportedError(
                 "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
                 f"got SM{major}{minor}."
@@ -210,6 +257,11 @@ def _validate_generated_fa_plan(
         head_dim_kpe,
         kv_data_type == torch.float8_e4m3fn,
         smem_per_sm,
+        sm89_q_tile=(
+            sm89_schedule[0]
+            if sm89_schedule
+            else _sm89_mla_q_tile(device, backend, kv_data_type, kv_len_arr)
+        ),
     )
     if shared_bytes > smem_per_block:
         raise _BackendPlanUnsupportedError(
@@ -218,9 +270,55 @@ def _validate_generated_fa_plan(
         )
 
 
-def _generated_fa_shared_bytes(backend, ckv, kpe, fp8_kv, smem_per_sm):
+def _sm89_mla_q_tile(device, backend, kv_data_type, kv_lengths, num_heads=64):
+    if (
+        backend != "fa2"
+        or kv_data_type != torch.float8_e4m3fn
+        or get_compute_capability(device) != (8, 9)
+    ):
+        return 64
+    # No length read or device-to-host synchronization is needed for small heads.
+    if num_heads <= 32:
+        return 32
+    # Large head-weighted KV workloads favor Q64 reuse.
+    total = (
+        int(kv_lengths.sum().item())
+        if isinstance(kv_lengths, torch.Tensor)
+        else sum(kv_lengths)
+    )
+    q32_head_tiles = (num_heads + 63) // 64
+    return 32 if total * q32_head_tiles <= 16384 else 64
+
+
+def _sm89_mla_schedule(
+    device, backend, kv_dtype, kv_lengths, frozen=None, num_heads=64
+):
+    if (
+        backend != "fa2"
+        or kv_dtype != torch.float8_e4m3fn
+        or get_compute_capability(device) != (8, 9)
+    ):
+        return None
+    if frozen is not None:
+        return frozen
+    tile = _sm89_mla_q_tile(device, backend, kv_dtype, kv_lengths, num_heads)
+    # Keep the full cooperative grid and quantize split lengths to KV32.
+    return (tile, 32)
+
+
+def _generated_fa_shared_bytes(backend, ckv, kpe, fp8_kv, smem_per_sm, sm89_q_tile=64):
     """Sizes of SharedStorageQKVO / HopperSharedStorageQKVO, including padding."""
     align16 = lambda size: (size + 15) // 16 * 16
+    if (
+        backend == "fa2"
+        and fp8_kv
+        and smem_per_sm == 102400
+        and ckv == 512
+        and kpe == 64
+    ):
+        if sm89_q_tile == 32:
+            return 32 * (ckv + kpe) * 2 + 32 * (ckv + kpe) * 3 + 2 * 32 * 4
+        return 64 * (ckv + kpe) * 2 + 16 * (ckv + kpe) * 3
     q_bytes = 64 * (ckv + kpe) * 2
     if backend == "fa3":
         stage = 64 * ckv * (1 if fp8_kv else 2) + max(
@@ -255,7 +353,15 @@ def _generated_fa_shared_bytes(backend, ckv, kpe, fp8_kv, smem_per_sm):
 _FA_MAX_WORK_ITEMS = 16384
 
 
-def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
+def _fa_plan_work_count(
+    q_lens,
+    kv_lens,
+    num_heads,
+    num_sm,
+    causal,
+    tile_q=64,
+    chunk_quantum=0,
+):
     """Mirror scheduler.cuh MLAPlan, excluding its heap ordering (not its splits).
 
     Raise early when the unsplit tile count already exceeds native capacity;
@@ -267,13 +373,13 @@ def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
         )
     if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
         raise ValueError(f"num_heads must be a positive integer, got {num_heads!r}.")
-    cluster = 2 if sum(q_lens) * num_heads // len(q_lens) > 64 else 1
+    cluster = 2 if sum(q_lens) * num_heads // len(q_lens) > tile_q else 1
     clusters = num_sm // cluster
     if clusters <= 0:
         raise _BackendPlanUnsupportedError(
             "FA MLA device has insufficient SMs for its cluster size."
         )
-    tile = 64 * cluster
+    tile = tile_q * cluster
     tile_counts = [(q * num_heads + tile - 1) // tile for q in q_lens]
     if sum(tile_counts) > _FA_MAX_WORK_ITEMS:
         raise _BackendPlanUnsupportedError(
@@ -306,6 +412,8 @@ def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
         if average <= 64
         else (average + 255) // 256 * 256
     )
+    if chunk_quantum:
+        limit = (average + chunk_quantum - 1) // chunk_quantum * chunk_quantum
     if average > 64 and average + 256 > 2**31 - 1:
         # Native ceil_div spells (x + y - 1) / y in signed int32: the
         # intermediate x + y must fit before the subtraction takes place.
@@ -335,7 +443,18 @@ def _validate_fa_causal_tile_bound(
     starts a native KV tile. KV split starts are subtracted *after* absolute
     ceil_div, so this is an absolute key boundary, not a split-relative one.
     """
-    tile_q = 64 * (2 if sum(q_lens) * num_heads // len(q_lens) > 64 else 1)
+    # Both SM89 decode layouts use ceil(query cluster end / heads), matching MLAPlan.
+    if (
+        backend == "fa2"
+        and kv_data_type == torch.float8_e4m3fn
+        and get_compute_capability(device) == (8, 9)
+        and all(q == 1 for q in q_lens)
+    ):
+        return
+    base_tile_q = _sm89_mla_q_tile(device, backend, kv_data_type, kv_lens)
+    tile_q = base_tile_q * (
+        2 if sum(q_lens) * num_heads // len(q_lens) > base_tile_q else 1
+    )
     if tile_q % num_heads == 0:
         return
     if backend == "fa3":
@@ -360,7 +479,14 @@ def _validate_fa_causal_tile_bound(
 
 
 def _validate_fa_plan_workload(
-    qo_indptr, kv_len_arr, num_heads, causal, device, backend, kv_data_type
+    qo_indptr,
+    kv_len_arr,
+    num_heads,
+    causal,
+    device,
+    backend,
+    kv_data_type,
+    sm89_schedule=None,
 ):
     offsets = qo_indptr.to(device="cpu", dtype=torch.int64).tolist()
     kv_lens = kv_len_arr.to(device="cpu", dtype=torch.int64).tolist()
@@ -371,8 +497,27 @@ def _validate_fa_plan_workload(
             "FA MLA requires query offsets for every KV request."
         )
     q_lens = [offsets[i + 1] - offsets[i] for i in range(len(kv_lens))]
+    if (
+        backend == "fa2"
+        and kv_data_type == torch.float8_e4m3fn
+        and get_compute_capability(device) == (8, 9)
+        and any(q != 1 for q in q_lens)
+    ):
+        raise _BackendPlanUnsupportedError(
+            "SM89 FP8 MLA currently supports single-token decode only."
+        )
+    schedule = _sm89_mla_schedule(
+        device, backend, kv_data_type, kv_lens, sm89_schedule, num_heads
+    )
+    tile_q, quantum = schedule if schedule else (64, 0)
     count = _fa_plan_work_count(
-        q_lens, kv_lens, num_heads, get_device_sm_count(device), causal
+        q_lens,
+        kv_lens,
+        num_heads,
+        get_device_sm_count(device),
+        causal,
+        tile_q=tile_q,
+        chunk_quantum=quantum,
     )
     if count > _FA_MAX_WORK_ITEMS:
         raise _BackendPlanUnsupportedError(
@@ -590,6 +735,7 @@ class _BatchMLAGeneratedFaMechanics:
             self.device,
             self._backend,
             kv_data_type,
+            getattr(self, "_sm89_schedule", None),
         )
         cached_module = module_loader()
         qo_indptr_host = qo_indptr.to("cpu")
@@ -838,6 +984,8 @@ class _BatchMLAPagedAttentionFaBackendBase(
         )
         self._query_split_widths = query_split_widths
         self._kv_split_widths = kv_split_widths
+        self._sm89_schedule: Optional[tuple[int, int]] = None
+        self._graph_plan_state: Optional[_Sm89GraphPlanState] = None
 
     def plan(
         self,
@@ -860,8 +1008,28 @@ class _BatchMLAPagedAttentionFaBackendBase(
     ) -> None:
         raise NotImplementedError
 
+    def validate_graph_replan(self, args: _MLAPlanArguments) -> None:
+        state = getattr(self, "_graph_plan_state", None)
+        if not isinstance(state, _Sm89GraphPlanState):
+            return
+        current = dict(_sm89_graph_signature(args))
+        changed = [name for name, value in state.signature if current[name] != value]
+        if changed:
+            raise ValueError(
+                "SM89 FP8 MLA CUDA graph replan requires fixed captured "
+                "parameters; changed: "
+                + ", ".join(changed)
+                + ". Create a new wrapper and capture for structural changes."
+            )
+
     @classmethod
     def preflight_plan_from_wrapper(cls, args: _MLAPlanArguments) -> None:
+        cls._validate_and_select_schedule(args)
+
+    @classmethod
+    def _validate_and_select_schedule(
+        cls, args: _MLAPlanArguments
+    ) -> Optional[tuple[int, int]]:
         assert cls._plan_capabilities is not None
         csr = args.csr()  # Malformed caller metadata is never a support refusal.
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
@@ -883,7 +1051,16 @@ class _BatchMLAPagedAttentionFaBackendBase(
                     f"{cls._plan_capabilities.backend_name} CUDA graph mode requires reserved "
                     "qo_indptr, kv_indptr, kv_indices, and kv_len_arr buffers."
                 )
+        schedule = _sm89_mla_schedule(
+            args._float_workspace_buffer.device,
+            cls._plan_capabilities.backend_name,
+            args.kv_data_type,
+            csr.kv_len_arr,
+            _previous_sm89_schedule(args),
+            args.num_heads,
+        )
         _validate_generated_fa_plan(
+            sm89_schedule=schedule,
             backend=cls._plan_capabilities.backend_name,
             device=args._float_workspace_buffer.device,
             qo_indptr=csr.qo_indptr,
@@ -905,6 +1082,7 @@ class _BatchMLAPagedAttentionFaBackendBase(
             args._float_workspace_buffer.device,
             cls._plan_capabilities.backend_name,
             args.kv_data_type,
+            schedule,
         )
         # Mirror scheduler.cuh MLAPlan's two 16-byte-aligned partial buffers.
         # Classify capacity before JIT/native planning so other candidates can
@@ -912,11 +1090,11 @@ class _BatchMLAPagedAttentionFaBackendBase(
         offsets = csr.qo_indptr.to(device="cpu", dtype=torch.int64)
         batch_size = csr.kv_len_arr.numel()
         total_q = int(offsets[batch_size] - offsets[0])
-        cluster_size = 2 if total_q * args.num_heads // batch_size > 64 else 1
-        num_clusters = (
-            get_device_sm_count(args._float_workspace_buffer.device) // cluster_size
-        )
-        partial_rows = 2 * num_clusters * cluster_size * 64
+        tile_q, _ = schedule if schedule else (64, 0)
+        cluster_size = 2 if total_q * args.num_heads // batch_size > tile_q else 1
+        num_sm = get_device_sm_count(args._float_workspace_buffer.device)
+        num_clusters = num_sm // cluster_size
+        partial_rows = 2 * num_clusters * cluster_size * tile_q
         workspace = args._float_workspace_buffer
         required_bytes = (-workspace.data_ptr()) % 16 + partial_rows * (
             2 * args.head_dim_ckv + 4
@@ -927,6 +1105,8 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 "float workspace bytes for partial outputs and LSE."
             )
 
+        return schedule
+
     @classmethod
     @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
@@ -935,7 +1115,7 @@ class _BatchMLAPagedAttentionFaBackendBase(
         snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
         try:
             assert cls._plan_capabilities is not None
-            cls.preflight_plan_from_wrapper(args)
+            schedule = cls._validate_and_select_schedule(args)
             csr = args.csr()
             backend = cls(
                 float_workspace_buffer=args._float_workspace_buffer,
@@ -948,6 +1128,7 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
                 int_workspace_buffer=args._graph_plan_int_workspace_buffer,
             )
+            backend._sm89_schedule = schedule
             if args._use_cuda_graph:
                 backend._preflight_graph_metadata_buffers(
                     qo_indptr=csr.qo_indptr,
@@ -984,6 +1165,10 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 scale_mode=args.scale_mode,
                 use_profiler=args.use_profiler,
             )
+            if args._use_cuda_graph and backend._sm89_schedule is not None:
+                backend._graph_plan_state = _Sm89GraphPlanState(
+                    backend._sm89_schedule, _sm89_graph_signature(args)
+                )
             return backend
         except BaseException:
             for buffer, original in snapshots:
