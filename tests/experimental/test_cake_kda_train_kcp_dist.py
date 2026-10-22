@@ -383,7 +383,7 @@ def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
 
 
 def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
-    """P1-R15: the ``transfer_walk`` knob (K3's ``bf16x3`` candidates of ``build.test.json``) is reachable only through
+    """The ``transfer_walk`` knob (K3's ``bf16x3`` candidates of ``build.test.json``) is reachable only through
     the gated test hook; the public options never select a non-shipped transfer-walk program (SPEC-11)."""
     monkeypatch.delenv(cake_kcp_plan.TEST_KNOBS_ENV, raising=False)
     with pytest.raises(TypeError):
@@ -419,7 +419,9 @@ def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
 
 
 def test_module_imports_only_torch_and_its_package() -> None:
-    """FINAL_DESIGN §11.3 line 938: the host module imports torch, torch.distributed, tvm_ffi and its own package."""
+    """The design note §11.3: the host module imports torch, torch.distributed, tvm_ffi and its own package
+    (plus ``ctypes`` for the CUDA runtime's device cache-config preference around the tape launches,
+    ``cake_kcp.walk_device_cache_config``)."""
     import ast
 
     src = Path(cake_kcp.__file__).read_text()
@@ -436,7 +438,9 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "torch",
         "torch.distributed",
         "tvm_ffi",
-    }
+        "ctypes",
+        "warnings",
+    }  # ctypes: the cache-config bracket of the walk-launch geometry; warnings: its one RuntimeWarning without a loadable CUDA runtime; no other use
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
