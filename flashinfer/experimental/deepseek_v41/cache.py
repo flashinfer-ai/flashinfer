@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
 
-"""Minimal quantize-and-write helper for the two SM100 decode cache formats."""
+"""Quantize-and-write helpers for the SM100 DS4.1 decode cache formats."""
 
 import torch
 import triton as tr
@@ -82,7 +82,47 @@ def _quantize_cache(
     tl.store(OUT + scale_base[:, None] + groups[None, :], encoded, valid[:, None])
 
 
-def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
+@tr.jit
+def _quantize_swa_fp8(X, OUT, SLOTS, N, CAPACITY, HAS_SLOTS: tl.constexpr):
+    # Widen before every row/slot multiplication: a valid physical row may be
+    # well below INT32_MAX while its input or output byte address exceeds 2 GiB.
+    rows = tl.program_id(0).to(tl.int64) * 4 + tl.arange(0, 4).to(tl.int64)
+    valid = rows < N
+    slot = tl.load(SLOTS + rows, valid, -1) if HAS_SLOTS else rows
+    slot = slot.to(tl.int64)
+    if HAS_SLOTS:
+        valid = valid & (slot >= 0) & (slot < CAPACITY)
+    col = tl.arange(0, 512).to(tl.int64)
+    x = tl.load(X + rows[:, None] * 512 + col[None, :], rows[:, None] < N, 0).to(
+        tl.float32
+    )
+    # E4M3 stores common cache units without a scale plane. Explicit RTNE after the
+    # finite-range clamp preserves signed zero and representable subnormals.
+    fp8 = tl.minimum(tl.maximum(x, -448.0), 448.0).to(
+        tl.float8e4nv, fp_downcast_rounding="rtne"
+    )
+    tl.store(OUT + slot[:, None] * 512 + col[None, :], fp8, valid[:, None])
+
+
+def quantize_cache(x, *, format, page_size=64, out=None, slots=None, kv_layout="NHD"):
+    """Write finite contiguous BF16/FP32 ``[N,512]`` rows into a decode pool.
+
+    ``swa_fp8`` clamps to ``[-448,448]`` in cache units and rounds to nearest
+    even, preserving signed zero and subnormals, with no scale plane. For
+    shared nonunit descales, normalize both writers' inputs upstream.
+    ``main_kv_fp4`` and ``swa_mxfp8`` retain their packed payload/scale layouts.
+    Default NHD returns ``[pages,64,1,width]``; explicit HND returns
+    ``[pages,1,64,width]`` with identical storage bytes.
+
+    ``out`` owns the capacity for scatter updates. Live ``slots`` must be
+    unique; negative or out-of-capacity slots are skipped. Unwritten rows,
+    including page padding, are untouched (and uninitialized in a new pool).
+    Finiteness and slot uniqueness are caller preconditions, not synchronized
+    CPU checks. Reusing ``out`` and updating input/slot values in place is
+    CUDA Graph compatible.
+    """
+    if kv_layout not in ("HND", "NHD"):
+        raise ValueError("kv_layout must be HND or NHD")
     if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) != (10, 0):
         raise ValueError("DS4.1 decode cache preparation requires SM100")
     if (
@@ -94,28 +134,32 @@ def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
         raise ValueError("cache quantization requires contiguous BF16/FP32 [N,512]")
     if x.requires_grad and torch.is_grad_enabled():
         raise ValueError("cache quantization has no implicit QAT derivative")
-    if format not in ("main_kv_fp4", "swa_mxfp8"):
-        raise ValueError("cache format must be main_kv_fp4 or swa_mxfp8")
+    if format not in ("main_kv_fp4", "swa_mxfp8", "swa_fp8"):
+        raise ValueError("cache format must be main_kv_fp4, swa_mxfp8 or swa_fp8")
     if page_size != 64:
         raise ValueError("DS4.1 decode cache requires page_size=64")
     n = x.shape[0]
-    width = 288 if format == "main_kv_fp4" else 528
+    fp8_swa = format == "swa_fp8"
+    width = 512 if fp8_swa else 288 if format == "main_kv_fp4" else 528
+    dtype = torch.float8_e4m3fn if fp8_swa else torch.uint8
+    tail = (1, 64, width) if kv_layout == "HND" else (64, 1, width)
     if out is None:
         if slots is not None:
             raise ValueError("scatter updates require caller-owned cache capacity")
-        out = torch.empty(
-            (tr.cdiv(n, 64), 64, 1, width), dtype=torch.uint8, device=x.device
-        )
+        out = torch.empty((tr.cdiv(n, 64), *tail), dtype=dtype, device=x.device)
     elif (
         out.ndim != 4
-        or out.shape[1:] != (64, 1, width)
-        or out.dtype != torch.uint8
+        or out.shape[1:] != tail
+        or out.dtype != dtype
         or out.device != x.device
         or not out.is_contiguous()
     ):
         raise ValueError(
-            "output must be contiguous uint8 decode cache on the input device"
+            f"{format} output must be a contiguous {dtype} {kv_layout} decode cache "
+            "on the input device"
         )
+    if fp8_swa and out.requires_grad and torch.is_grad_enabled():
+        raise ValueError("cache quantization has no implicit QAT derivative")
     if slots is None and out.shape[0] * 64 < n:
         raise ValueError("cache capacity is smaller than input")
     if slots is not None and (
@@ -131,15 +175,27 @@ def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
         if _overlaps(out, x) or (slots is not None and _overlaps(out, slots)):
             raise ValueError("cache output may not overlap input rows or slots")
         with torch.cuda.device(x.device):
-            _quantize_cache[(tr.cdiv(n, 4),)](
-                x,
-                out,
-                slots,
-                n,
-                out.shape[0] * 64,
-                format == "main_kv_fp4",
-                slots is not None,
-                num_warps=4,
-                enable_fp_fusion=False,
-            )
+            if fp8_swa:
+                _quantize_swa_fp8[(tr.cdiv(n, 4),)](
+                    x,
+                    out,
+                    slots,
+                    n,
+                    out.shape[0] * 64,
+                    slots is not None,
+                    num_warps=4,
+                    enable_fp_fusion=False,
+                )
+            else:
+                _quantize_cache[(tr.cdiv(n, 4),)](
+                    x,
+                    out,
+                    slots,
+                    n,
+                    out.shape[0] * 64,
+                    format == "main_kv_fp4",
+                    slots is not None,
+                    num_warps=4,
+                    enable_fp_fusion=False,
+                )
     return out
