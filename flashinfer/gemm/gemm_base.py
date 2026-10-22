@@ -2216,9 +2216,18 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
+            # forward() routes 2D inputs to the C++ kernel under the debug
+            # toggle, which has its own (smaller) tactic table.
+            if _TGV_DEBUG_USE_CPP and inputs[0].dim() == 2:
+                return _get_cpp_runner().get_valid_tactics(inputs, profile)
             from .kernels.tgv_gemm_cute_ext import get_tgv_cute_ext_valid_tactics
 
             return get_tgv_cute_ext_valid_tactics(inputs[0].device)
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # The valid tactic ids depend on the arch (SM107-only ids), so a
+            # tuned tactic must not be reused on another arch.
+            return (torch.cuda.get_device_capability(inputs[0].device),)
 
         def forward(
             self,
