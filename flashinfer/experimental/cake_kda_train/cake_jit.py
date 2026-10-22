@@ -227,7 +227,7 @@ OPTIONAL_STAGES = (
 # proportional share of the ``num_seqs * segments`` segments (``seg_table``'s
 # ``proportional`` scalar; the walk programs then take ``-num_seqs`` as their
 # ``seg_arg`` and read each chain's bounds from the table).
-SEGMENTS = {
+SEGMENTS: dict[str, Any] = {
     "max_heads": 8,
     "slot_factor": 4,
     "max_segments": 64,
