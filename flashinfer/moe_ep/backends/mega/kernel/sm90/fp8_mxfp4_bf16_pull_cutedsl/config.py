@@ -69,6 +69,9 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
     fc1_store_offload: bool | None = None
     fc1_early_done_publish: bool | None = None
     fold_producer_warps: bool | None = None
+    # One dispatch pull slot per active warp instead of four (frees shared
+    # memory for AB stages when active_dispatch_warps < 4). Not a tactic field.
+    compact_pull_buffer: bool = False
     routing_profile: str = field(
         default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
         kw_only=True,
@@ -137,6 +140,8 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
                 raise ValueError(f"{field_name} must be a bool when set")
         if not isinstance(self.grouped_token_back, bool):
             raise ValueError("grouped_token_back must be a bool")
+        if not isinstance(self.compact_pull_buffer, bool):
+            raise ValueError("compact_pull_buffer must be a bool")
         if self.grouped_token_back:
             raise ValueError(
                 "the production MXFP4 BF16-combine profile does not support "

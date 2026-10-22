@@ -206,6 +206,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             "fc1_store_offload": k.fc1_store_offload,
             "fc1_early_done_publish": k.fc1_early_done_publish,
             "fold_producer_warps": k.fold_producer_warps,
+            "compact_pull_buffer": k.compact_pull_buffer,
             "routing_profile": k.routing_profile,
         }
 

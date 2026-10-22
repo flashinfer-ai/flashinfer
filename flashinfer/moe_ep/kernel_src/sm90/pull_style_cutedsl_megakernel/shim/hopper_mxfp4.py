@@ -123,7 +123,8 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
     fp8_accum_mode: Literal["1xacc"] = "1xacc"
     swap_ab: bool = True
     # Preserve the qualified MXFP4 layout when the FP8 base gains new features.
-    compact_pull_buffer: Literal[False] = False
+    # The compact pull buffer (one dispatch slot per active warp) is opt-in.
+    compact_pull_buffer: bool = False
     generate_c: Literal[False] = False
     mma_tiler_mnk: Tuple[int, int, int] = _MXFP4_MMA_TILER_DEFAULT
     # Local layout improvements are derived defaults, not tuning axes.
@@ -156,10 +157,10 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
                 "Hopper MXFP4 x FP8 supports only fp8_accum_mode='1xacc'; "
                 f"got {self.fp8_accum_mode!r}."
             )
-        if self.compact_pull_buffer is not False or self.generate_c is not False:
-            raise ValueError(
-                "MXFP4 requires compact_pull_buffer=False and generate_c=False"
-            )
+        if not isinstance(self.compact_pull_buffer, bool):
+            raise ValueError("compact_pull_buffer must be a bool.")
+        if self.generate_c is not False:
+            raise ValueError("MXFP4 requires generate_c=False")
         if self.tail_split_pairs and self.fc1_ready_mode != "tile":
             raise ValueError("MXFP4 tail_split_pairs requires fc1_ready_mode='tile'")
         if not self.swap_ab:
@@ -353,6 +354,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             # but naming both protects against future generic packed formats.
             ("fc1_logical_storage_k", c.hidden, c.hidden // 2),
             ("fc2_logical_storage_k", c.intermediate, c.intermediate // 2),
+            ("compact_pull_buffer", c.compact_pull_buffer),
             *super()._mega_compile_key(),
         )
 
@@ -450,7 +452,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             grouped_token_back=c.grouped_token_back,
             combine_format=c.combine_format,
             active_dispatch_warps=c.active_dispatch_warps,
-            compact_pull_buffer=False,
+            compact_pull_buffer=c.compact_pull_buffer,
             fc1_store_offload=c.fc1_store_offload,
             fc1_early_done_publish=c.fc1_early_done_publish,
             fold_producer_warps=c.fold_producer_warps,
@@ -859,6 +861,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
+    compact_pull_buffer: bool = False,
     apply_topk_in_fc1: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
@@ -974,6 +977,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             if fold_producer_warps is None
             else fold_producer_warps
         ),
+        compact_pull_buffer=compact_pull_buffer,
         apply_topk_in_fc1=apply_topk_in_fc1,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
@@ -1025,6 +1029,7 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
+    compact_pull_buffer: bool = False,
     apply_topk_in_fc1: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
@@ -1072,6 +1077,7 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
+        compact_pull_buffer=compact_pull_buffer,
         apply_topk_in_fc1=apply_topk_in_fc1,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,

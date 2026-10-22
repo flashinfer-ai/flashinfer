@@ -125,6 +125,11 @@ from .backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl import (
     Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_mxfp4_mega_weights,
 )
+from .backends.mega.kernel.sm90.fp8_nvfp4_bf16_pull_cutedsl import (
+    Nvfp4WeightPack,
+    Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_nvfp4_mega_weights,
+)
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
@@ -328,6 +333,8 @@ __all__ = [
     "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
+    "Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig",
+    "Nvfp4WeightPack",
     "Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
@@ -367,6 +374,7 @@ __all__ = [
     "preprocess_sm90_pull_bf16_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_pull_mxfp4_mega_weights",
+    "preprocess_sm90_pull_nvfp4_mega_weights",
     "preprocess_sm90_push_cake_bf16_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
     "register_communication",

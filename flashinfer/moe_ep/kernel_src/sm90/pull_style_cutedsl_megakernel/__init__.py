@@ -54,6 +54,8 @@ from .shim import (
     Mxfp4RoutingProfile,
     autotune_hopper_fp8_mega_moe,
     autotune_hopper_mxfp4_mega_moe,
+    autotune_hopper_nvfp4_mega_moe,
+    hopper_nvfp4_candidates,
     autotune_knobs,
     default_knobs,
     hopper_fp8_candidates,
@@ -160,7 +162,33 @@ def __getattr__(name):  # PEP 562
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+from .shim.hopper_nvfp4 import (
+    MegaMoEHopperNvfp4Config,
+    MegaMoEHopperNvfp4Frontend,
+    MegaMoEHopperNvfp4Inputs,
+    MegaMoEHopperNvfp4SymmBuffer,
+    TransformedNvfp4Weights,
+    _get_symm_buffer_for_hopper_nvfp4_mega_moe_from_resolved_config,
+    _resolve_hopper_nvfp4_mega_moe_config,
+    get_symm_buffer_for_hopper_nvfp4_mega_moe,
+    hopper_nvfp4_mega_launch_thunk,
+    hopper_nvfp4_mega_moe,
+    resolve_hopper_nvfp4_knobs,
+)
+
 __all__ = [
+    'MegaMoEHopperNvfp4Config',
+    'MegaMoEHopperNvfp4Frontend',
+    'MegaMoEHopperNvfp4Inputs',
+    'MegaMoEHopperNvfp4SymmBuffer',
+    'TransformedNvfp4Weights',
+    '_get_symm_buffer_for_hopper_nvfp4_mega_moe_from_resolved_config',
+    '_resolve_hopper_nvfp4_mega_moe_config',
+    'get_symm_buffer_for_hopper_nvfp4_mega_moe',
+    'hopper_nvfp4_mega_launch_thunk',
+    'hopper_nvfp4_mega_moe',
+    'resolve_hopper_nvfp4_knobs',
+
     *_LAZY_HELPERS,
     "MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE",
     "MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE",
@@ -170,6 +198,8 @@ __all__ = [
     "Mxfp4RoutingProfile",
     "autotune_hopper_fp8_mega_moe",
     "autotune_hopper_mxfp4_mega_moe",
+    "autotune_hopper_nvfp4_mega_moe",
+    "hopper_nvfp4_candidates",
     "autotune_knobs",
     "default_knobs",
     "hopper_fp8_candidates",
