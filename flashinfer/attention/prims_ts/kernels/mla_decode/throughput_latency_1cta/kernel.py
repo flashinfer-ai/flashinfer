@@ -2773,6 +2773,12 @@ class ThroughputLatencyMlaDecodeTs:
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse and acc_o is not None):
+            # Split-KV launches use PDL (for the reducer); wait for the
+            # upstream grid before reading Q / routes / pools in case the
+            # producer of those inputs (e.g. the top-k indexer) releases its
+            # dependents early.  No-op when it does not.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         # The user threshold is pre-divided by the log2 softmax scale so
         # the row-max freeze compares raw-score increases (same contract as the
         # throughput-2CTA TmemS resource).
@@ -2893,18 +2899,19 @@ class ThroughputLatencyMlaDecodeTs:
                         "prefetch.global.L2 [{$r0}];", read_only_args=[address]
                     )
             if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                # FP8 gathers through the maps at bytes 0 / 128; NVFP4 through
+                # the RoPE (256) and latent (384) maps of the raw rows.
+                desc_base = 256 if cfg.is_dynamic_token_sparse_nvfp4 else 0
                 prims.prefetch_tensormap(
-                    _gmem_pointer_to_generic(raw_tma_descriptors.iterator)
-                )
-                prims.prefetch_tensormap(
-                    _gmem_pointer_to_generic(raw_tma_descriptors.iterator + Int64(128))
-                )
-                if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
-                    prims.prefetch_tensormap(
-                        _gmem_pointer_to_generic(
-                            raw_tma_descriptors.iterator + Int64(256)
-                        )
+                    _gmem_pointer_to_generic(
+                        raw_tma_descriptors.iterator + Int64(desc_base)
                     )
+                )
+                prims.prefetch_tensormap(
+                    _gmem_pointer_to_generic(
+                        raw_tma_descriptors.iterator + Int64(desc_base + 128)
+                    )
+                )
 
         clc_response_ptr = None
 

@@ -52,7 +52,9 @@ def _encode_pool_gather4_descriptor_host(
     """Encode a ``[row_bytes, rows(pool)]`` uint8 Gather4 map with a ``[box_bytes, 1]`` box.
 
     Row coordinates outside ``[0, rows)`` (``-1`` slots, stale indices) are
-    zero-filled by the TMA unit.
+    zero-filled by the TMA unit. (The NVFP4 block-scale rows are copied with
+    ``cp.async`` and only ``-1`` is masked there, so routes must still address
+    the pool; see ``FLASHINFER_VALIDATE_INPUTS``.)
     """
 
     from cuda.bindings import driver as cuda_drv

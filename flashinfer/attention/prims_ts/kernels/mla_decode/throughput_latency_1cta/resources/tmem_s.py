@@ -389,9 +389,9 @@ class TmemSResource(MlaResource):
     ):
         """Native FP4 QK: ten ``kind::mxf4nvf4`` M128 N128 K64 MMAs for one K tile.
 
-        Chunks 0-3 / 4-7 read the two SW128 latent segments, chunk 8 the rope
-        main half and chunk 9 the rope residual half of the SW64 segment against
-        the same Q rope (Q rope is stored twice).  Block scales come from TMEM,
+        Chunks 0-3 / 4-7 read the two SW128 latent segments, chunks 8 / 9 the
+        SW64 rope segment (rope groups 0-1 / 2-3, each chunk holding a group's
+        main and residual pairs) against the matching Q rope layout.  Block scales come from TMEM,
         4 columns per chunk: SFA (Q, staged once per work tile by ``q_desc``)
         and SFB (tokens, written by the dequant warps with ``tcgen05.st`` and
         made visible through ``SfbReadyResource.sfb_visible``).

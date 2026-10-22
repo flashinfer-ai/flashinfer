@@ -236,17 +236,26 @@ def _require_supported_device(device_index: int) -> None:
         )
 
 
+@functools.lru_cache(maxsize=None)
+def _require_nvfp4_toolchain() -> None:
+    """Raise once if cutlass-dsl cannot emit the NVFP4 dequantization (QMUL4, PTX ISA 9.4)."""
+    import cutlass
+
+    version = tuple(int(part) for part in cutlass.__version__.split(".")[:2])
+    if version < (4, 8):
+        raise NotImplementedError(
+            "prims_ts_dsa_sparse_mla_nvfp4 requires nvidia-cutlass-dsl>=4.8 "
+            f"(PTX ISA 9.4 QMUL4, CUDA 13.4); found {cutlass.__version__}"
+        )
+
+
 def _validate_inputs_enabled() -> bool:
     """Return whether ``FLASHINFER_VALIDATE_INPUTS`` asks for device-synchronizing value checks."""
     if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("", "0"):
         return False
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "FLASHINFER_VALIDATE_INPUTS reads routing values on the host and "
-            "cannot run during CUDA graph capture; validate the inputs eagerly "
-            "before capture or unset the variable"
-        )
-    return True
+    # The checks read routing values on the host; like the MLA wrapper, skip
+    # them during CUDA graph capture (validate eagerly before capturing).
+    return not torch.cuda.is_current_stream_capturing()
 
 
 def _validate_route_values(
@@ -336,9 +345,15 @@ def prims_ts_dsa_sparse_mla_fp8(
         and kv_cache.shape[-1] == _HEAD_DIM,
         f"kv_cache must be a contiguous CUDA E4M3 tensor with last dim {_HEAD_DIM}",
     )
+    _require(
+        kv_cache.data_ptr() % 16 == 0,
+        "kv_cache must start at a 16-byte-aligned address",
+    )
     kv_pool = kv_cache.view(-1, _HEAD_DIM)
     device_index = _device_index(query.device)
     _require_supported_device(device_index)
+    if query.shape[0] == 0:
+        return out
     if _validate_inputs_enabled():
         _validate_route_values(
             block_tables,
@@ -472,6 +487,10 @@ def prims_ts_dsa_sparse_mla_nvfp4(
         "kv_data_pool and kv_scale_pool must have the same row count",
     )
     _require(
+        scale_pool.numel() < 2**31,
+        "kv_scale_pool must hold fewer than 2**31 bytes (32-bit scale-row offsets)",
+    )
+    _require(
         data_pool.data_ptr() % 16 == 0 and scale_pool.data_ptr() % 16 == 0,
         "kv_data_pool and kv_scale_pool must start at 16-byte-aligned addresses",
     )
@@ -485,6 +504,9 @@ def prims_ts_dsa_sparse_mla_nvfp4(
     device = query.device
     device_index = _device_index(device)
     _require_supported_device(device_index)
+    _require_nvfp4_toolchain()
+    if query.shape[0] == 0:
+        return out
     if _validate_inputs_enabled():
         _validate_route_values(
             block_tables,

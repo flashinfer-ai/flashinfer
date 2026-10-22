@@ -480,6 +480,14 @@ _COMMON_INVALID = [
 _FP8_INVALID = [
     ("cache-dtype", lambda a, d: a.update(kv_cache=a["kv_cache"].to(torch.bfloat16))),
     ("cache-row", lambda a, d: a.update(kv_cache=a["kv_cache"][:, :512].contiguous())),
+    (
+        "cache-misaligned",
+        lambda a, d: a.update(
+            kv_cache=torch.zeros(128 * _HEAD_DIM + 1, dtype=_FP8, device=d)[1:].view(
+                128, _HEAD_DIM
+            )
+        ),
+    ),
 ]
 _NVFP4_INVALID = [
     (
@@ -523,6 +531,24 @@ def test_prims_ts_dsa_rejects_invalid_arguments(kernel: str, name: str, mutate) 
     )
     with pytest.raises(ValueError):
         entry(**args)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kernel", ["fp8", "nvfp4"])
+def test_prims_ts_dsa_zero_tokens(kernel: str) -> None:
+    """A step without query tokens returns the empty output without a launch."""
+    device = torch.device("cuda")
+    args = _valid_args(device, nvfp4=kernel == "nvfp4")
+    args["query"] = args["query"][:0]
+    args["block_tables"] = args["block_tables"][:0]
+    entry = (
+        prims_ts_dsa_sparse_mla_nvfp4
+        if kernel == "nvfp4"
+        else prims_ts_dsa_sparse_mla_fp8
+    )
+    out = entry(**args)
+    assert tuple(out.shape) == (0, 64, _V_DIM) and out.dtype == torch.bfloat16
 
 
 @_REQUIRES_PRIMTS_GPU

@@ -521,7 +521,15 @@ class SmemPageOffsetsResource(MlaResource):
         # returns after the page-offset stage is ready.
         self._init_smem_state(stage_info)
         cache_slots = 2 if self.cfg.kernel_variant != "keeps_mma_ab" else 1
-        cache_entries = max(1, cache_slots * self.cfg.pages_per_kv_tile)
+        cache_entries = max(
+            1,
+            cache_slots
+            * (
+                self.cfg.sparse_cache_words
+                if self.cfg.native_sparse_pages
+                else self.cfg.pages_per_kv_tile
+            ),
+        )
         if self.cfg.is_dynamic_token_sparse:
             # The Gather4 loader reads its four row indices per lane straight
             # from the SMEM stage; a 128-entry register cache would not fit.
@@ -1048,8 +1056,12 @@ class SmemKvResource(MlaResource):
                     if lane_idx == Int32(0):
                         ring._smem_page_offsets[mask_base + word_idx] = bits
         quads_per_warp = 32 // num_load_warps
-        # Lane l < quads_per_warp issues quad (warp_in_task * quads_per_warp + l).
-        quad = warp_in_task * Int32(quads_per_warp) + lane_idx
+        # Lane l < quads_per_warp issues quad (warp_in_task * quads_per_warp + l);
+        # the other lanes read (and drop) the last quad's indices, staying in
+        # the index stage.
+        quad = warp_in_task * Int32(quads_per_warp) + cute.math.min(
+            lane_idx, Int32(quads_per_warp - 1)
+        )
         q_base = quad * Int32(4)
         row0 = ring.token_row(q_base)
         row1 = ring.token_row(q_base + Int32(1))
@@ -2468,8 +2480,8 @@ class SmemRawKvResource(SmemKvResource):
             # a whole tile old; rows(tile + 2) must have landed before its scale
             # rows are staged.  Committing the scales before the rows makes the
             # scale group the older of the two groups in flight, so the
-            # ``scales_landed`` publication at the next loop top completes it
-            # with ``cp.async.wait_group 1`` and leaves only the row prefetch.
+            # ``scales_landed`` publication of the next step completes it with
+            # ``cp.async.wait_group 1`` and leaves only the row prefetch.
             cp_async_wait_group(0)
             stage_scales(tile + Int32(2))
             prefetch_rows(tile + Int32(3))

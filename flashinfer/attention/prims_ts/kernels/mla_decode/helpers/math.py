@@ -14,8 +14,6 @@
 
 """Math, dtype, and atomic helper functions for MLA decode TS examples."""
 
-import math
-import numbers
 from functools import partial
 
 import cutlass
@@ -65,33 +63,6 @@ def max_skip_corr_threshold(qkv_dtype: str) -> float:
     if qkv_dtype == "bf16":
         return 64.0
     raise ValueError(f"unsupported qkv_dtype={qkv_dtype!r}")
-
-
-def validate_skip_corr_threshold(
-    threshold: object, *, qkv_dtype: str, bmm1_scale: float
-) -> float:
-    """Validate a public ``skip_corr_threshold`` and return it as ``float``.
-
-    Zero disables skip correction.  A positive value selects the enabled kernel
-    specialization and requires a positive ``bmm1_scale`` because the kernel
-    divides the threshold by the log2 softmax scale.
-    """
-
-    bound = max_skip_corr_threshold(qkv_dtype)
-    if (
-        isinstance(threshold, bool)
-        or not isinstance(threshold, numbers.Real)
-        or not math.isfinite(float(threshold))
-        or not 0.0 <= float(threshold) <= bound
-    ):
-        raise ValueError(
-            f"skip_corr_threshold must be a finite number in [0, {bound:g}] "
-            f"for {qkv_dtype} P"
-        )
-    value = float(threshold)
-    if value > 0.0 and not bmm1_scale > 0.0:
-        raise ValueError("positive skip_corr_threshold requires a positive bmm1_scale")
-    return value
 
 
 def qkv_dtype(cfg):

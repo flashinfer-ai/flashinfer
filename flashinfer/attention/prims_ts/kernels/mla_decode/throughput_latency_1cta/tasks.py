@@ -2440,8 +2440,8 @@ def create_native_fp4_cs8_softmax_task(
     Threads 0-127 own the first 64 columns of every 128-key tile and threads
     128-255 the second 64 (``_col_half``); the half-row maxima meet at a
     named barrier through SMEM.  One copy of the softmax code per SMSP and a
-    single S / P / PV-done pipeline each.  All 256 threads quantize Q
-    (duplicate, idempotent writes); at the tail the halves exchange
+    single S / P / PV-done pipeline each.  The 8 warps quantize Q (8 heads
+    per warp, each head once); at the tail the halves exchange
     (max, sum) through the correction scratch and each normalizes the two V
     stages of its panel.
     """
