@@ -3961,8 +3961,8 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                     _phase_scale_empty_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _smem_desc_lo_0 = ((smem_q0_addr) >> 4) & 0x3FFF;
-                    int _smem_desc_lo_1 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
+                    int _mma_a_lo_0 = ((smem_q0_addr) >> 4) & 0x3FFF;
+                    int _mma_b_lo_0 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -3996,7 +3996,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_scores), "r"(0) : "memory");
+                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_scores), "r"(0) : "memory");
                     elect_commit_cg2_multicast(s_full_addr, (uint16_t)(3));
                     if (two_stages_2 == 1) {
 #if __CUDA_ARCH__ == 1030
@@ -4006,8 +4006,8 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                         _phase_scale_empty_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_2 = ((smem_q1_addr) >> 4) & 0x3FFF;
-                        int _smem_desc_lo_3 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
+                        int _mma_a_lo_1 = ((smem_q1_addr) >> 4) & 0x3FFF;
+                        int _mma_b_lo_1 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4041,7 +4041,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_scores + (128))), "r"(0) : "memory");
+                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_scores + (128))), "r"(0) : "memory");
                         elect_commit_cg2_multicast(s_full_addr + 8, (uint16_t)(3));
                     }
                     elect_commit_cg2_multicast(kv_empty_addr + (k_stage) * 8, (uint16_t)(3));
@@ -4061,8 +4061,8 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                         _phase_scale_empty_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_4 = ((smem_q0_addr) >> 4) & 0x3FFF;
-                        int _smem_desc_lo_5 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
+                        int _mma_a_lo_2 = ((smem_q0_addr) >> 4) & 0x3FFF;
+                        int _mma_b_lo_2 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4096,7 +4096,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_scores), "r"(0) : "memory");
+                    :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_scores), "r"(0) : "memory");
                         elect_commit_cg2_multicast(s_full_addr, (uint16_t)(3));
                         mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
 #if __CUDA_ARCH__ == 1030
@@ -4106,7 +4106,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                         _phase_p_full_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_6 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                        int _mma_b_lo_3 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4127,7 +4127,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(_smem_desc_lo_6), "r"(tmem_probs_0), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_0), "r"(_mma_b_lo_3), "r"(tmem_probs_0), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
 #if __CUDA_ARCH__ == 1030
                         mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
 #else
@@ -4135,7 +4135,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                         _phase_p_full_2_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_7 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                        int _mma_b_lo_4 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4156,7 +4156,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(_smem_desc_lo_7), "r"(tmem_probs_0), "r"(1) : "memory");
+                    :: "r"(tmem_output_0), "r"(_mma_b_lo_4), "r"(tmem_probs_0), "r"(1) : "memory");
                         elect_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
                         if (two_stages_2 == 1) {
 #if __CUDA_ARCH__ == 1030
@@ -4166,8 +4166,8 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                             _phase_scale_empty_1 ^= 1;
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_8 = ((smem_q1_addr) >> 4) & 0x3FFF;
-                            int _smem_desc_lo_9 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
+                            int _mma_a_lo_3 = ((smem_q1_addr) >> 4) & 0x3FFF;
+                            int _mma_b_lo_5 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 512;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4201,7 +4201,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"((tmem_scores + (128))), "r"(0) : "memory");
+                    :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_5), "r"((tmem_scores + (128))), "r"(0) : "memory");
                             elect_commit_cg2_multicast(s_full_addr + 8, (uint16_t)(3));
                         }
                         elect_commit_cg2_multicast(kv_empty_addr + (k_stage) * 8, (uint16_t)(3));
@@ -4217,7 +4217,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                             _phase_p_full_1 ^= 1;
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_10 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                            int _mma_b_lo_6 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4238,7 +4238,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(_smem_desc_lo_10), "r"(tmem_probs_1), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_1), "r"(_mma_b_lo_6), "r"(tmem_probs_1), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
 #if __CUDA_ARCH__ == 1030
                             mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
 #else
@@ -4246,7 +4246,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                             _phase_p_full_2_1 ^= 1;
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_11 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                            int _mma_b_lo_7 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4267,7 +4267,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(_smem_desc_lo_11), "r"(tmem_probs_1), "r"(1) : "memory");
+                    :: "r"(tmem_output_1), "r"(_mma_b_lo_7), "r"(tmem_probs_1), "r"(1) : "memory");
                             elect_commit_cg2_multicast(o_full_addr + 8, (uint16_t)(3));
                         }
                         elect_commit_cg2_multicast(kv_empty_addr + (v_stage) * 8, (uint16_t)(3));
@@ -4287,7 +4287,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                     _phase_p_full_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _smem_desc_lo_12 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                    int _mma_b_lo_8 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4308,7 +4308,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(_smem_desc_lo_12), "r"(tmem_probs_0), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_0), "r"(_mma_b_lo_8), "r"(tmem_probs_0), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
 #if __CUDA_ARCH__ == 1030
                     mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
 #else
@@ -4316,7 +4316,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                     _phase_p_full_2_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _smem_desc_lo_13 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                    int _mma_b_lo_9 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4337,7 +4337,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(_smem_desc_lo_13), "r"(tmem_probs_0), "r"(1) : "memory");
+                    :: "r"(tmem_output_0), "r"(_mma_b_lo_9), "r"(tmem_probs_0), "r"(1) : "memory");
                     elect_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
                     if (two_stages_2 == 1) {
 #if __CUDA_ARCH__ == 1030
@@ -4347,7 +4347,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                         _phase_p_full_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_14 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                        int _mma_b_lo_10 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4368,7 +4368,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(_smem_desc_lo_14), "r"(tmem_probs_1), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_1), "r"(_mma_b_lo_10), "r"(tmem_probs_1), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
 #if __CUDA_ARCH__ == 1030
                         mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
 #else
@@ -4376,7 +4376,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
 #endif
                         _phase_p_full_2_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_15 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
+                        int _mma_b_lo_11 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -4397,7 +4397,7 @@ kernel_cake_minimax_h3_varlen_fp8_attention_529a83afa416443c4fb4(const __grid_co
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(_smem_desc_lo_15), "r"(tmem_probs_1), "r"(1) : "memory");
+                    :: "r"(tmem_output_1), "r"(_mma_b_lo_11), "r"(tmem_probs_1), "r"(1) : "memory");
                         elect_commit_cg2_multicast(o_full_addr + 8, (uint16_t)(3));
                     }
                     elect_commit_cg2_multicast(kv_empty_addr + (v_stage) * 8, (uint16_t)(3));
