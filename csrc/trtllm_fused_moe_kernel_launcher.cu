@@ -1325,15 +1325,18 @@ class FusedMoeLauncher {
    */
   int64_t measure_workspace_size() {
     int64_t tactic = -1;
+    scratch_.begin_measure();
+    // Routing initializes mode flags (including DeepSeek FP8) used to select the runner.
+    // Match run()'s ordering, while counting routing scratch without device work.
+    prepare_routing();
     try {
       prepare_moe_runner(tactic);
     } catch (std::exception const&) {
       // Some advertised tiles have no kernels, or no valid tactic, for this problem; run()
       // would reject them the same way.
+      scratch_.end();
       return 0;
     }
-    scratch_.begin_measure();
-    prepare_routing();
     prepare_moe(tactic);
     int64_t const bytes = scratch_.used();
     scratch_.end();

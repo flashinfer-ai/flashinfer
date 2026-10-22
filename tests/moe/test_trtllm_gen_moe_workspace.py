@@ -68,14 +68,15 @@ def _workspace(
         quant_mode=quant_mode,
         **kwargs,
     )
+    assert nbytes > 0
     return torch.empty(nbytes, dtype=torch.uint8, device="cuda")
 
 
-def _routing(num_tokens: int, generator: torch.Generator):
+def _routing(num_tokens: int, generator: torch.Generator, top_k: int = TOP_K):
     logits = torch.rand(num_tokens, NUM_EXPERTS, device="cuda", generator=generator).to(
         torch.bfloat16
     )
-    weights, ids = torch.topk(logits.float().softmax(-1), TOP_K, dim=-1)
+    weights, ids = torch.topk(logits.float().softmax(-1), top_k, dim=-1)
     return logits, (
         ids.to(torch.int32),
         (weights / weights.sum(-1, keepdim=True)).to(torch.bfloat16),
@@ -96,13 +97,29 @@ def _bf16_weights(generator: torch.Generator):
     return prepare(w1 * 0.05), prepare(w2 * 0.05)
 
 
-def _make_bf16_case(seed: int, use_logits: bool) -> Launch:
+def _make_bf16_case(
+    seed: int,
+    use_logits: bool,
+    *,
+    packed: bool = False,
+    routing_method: RoutingMethodType = RoutingMethodType.Renormalize,
+) -> Launch:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     w1, w2 = _bf16_weights(generator)
     hidden = (
         torch.randn(MAX_TOKENS, HIDDEN, device="cuda", generator=generator) * 0.1
     ).to(torch.bfloat16)
-    logits, routed = _routing(MAX_TOKENS, generator)
+    top_k = 1 if routing_method == RoutingMethodType.Llama4 else TOP_K
+    logits, routed = _routing(MAX_TOKENS, generator, top_k)
+    packed_ids = (routed[0] << 16) | (
+        routed[1].view(torch.int16).to(torch.int32) & 0xFFFF
+    )
+    grouped = routing_method == RoutingMethodType.DeepSeekV3
+    bias = (
+        torch.rand(NUM_EXPERTS, device="cuda", generator=generator)
+        if routing_method in (RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2)
+        else None
+    )
 
     def launch(n: int, workspace_buffer=None, do_finalize: bool = True):
         common = dict(
@@ -110,14 +127,14 @@ def _make_bf16_case(seed: int, use_logits: bool) -> Launch:
             gemm1_weights=w1,
             gemm2_weights=w2,
             num_experts=NUM_EXPERTS,
-            top_k=TOP_K,
-            n_group=None,
-            topk_group=None,
+            top_k=top_k,
+            n_group=4 if grouped else None,
+            topk_group=2 if grouped else None,
             intermediate_size=INTER,
             local_expert_offset=0,
             local_num_experts=NUM_EXPERTS,
-            routed_scaling_factor=None,
-            routing_method_type=1,  # Renormalize
+            routed_scaling_factor=1.0 if bias is not None else None,
+            routing_method_type=int(routing_method),
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=do_finalize,
             # Tune only the buckets a MAX_TOKENS buffer can hold.
@@ -126,11 +143,12 @@ def _make_bf16_case(seed: int, use_logits: bool) -> Launch:
         )
         if use_logits:
             out = trtllm_bf16_moe(
-                routing_logits=logits[:n], routing_bias=None, **common
+                routing_logits=logits[:n], routing_bias=bias, **common
             )
         else:
             out = trtllm_bf16_routed_moe(
-                topk_ids=(routed[0][:n], routed[1][:n]), **common
+                topk_ids=packed_ids[:n] if packed else (routed[0][:n], routed[1][:n]),
+                **common,
             )
         return out if isinstance(out, torch.Tensor) else out[0]
 
@@ -254,10 +272,35 @@ def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 @pytest.mark.parametrize("quant_mode", QUANT_MODES)
-def test_workspace_size_is_positive_and_monotonic(quant_mode: str):
+@pytest.mark.parametrize("hidden", [HIDDEN])
+@pytest.mark.parametrize("inter", [INTER])
+@pytest.mark.parametrize("use_shuffled_weight", [False, True])
+@pytest.mark.parametrize("num_experts", [64, 128, 256])
+@pytest.mark.parametrize("top_k", [4, 8])
+def test_workspace_size_is_positive_and_monotonic(
+    quant_mode: str,
+    hidden: int,
+    inter: int,
+    use_shuffled_weight: bool,
+    num_experts: int,
+    top_k: int,
+):
+    if quant_mode == "bf16" and not use_shuffled_weight:
+        pytest.skip("BF16 requires shuffled BlockMajorK weights.")
     sizes = [
         trtllm_fused_moe_workspace_size(
-            n, HIDDEN, INTER, NUM_EXPERTS, TOP_K, quant_mode=quant_mode
+            n,
+            hidden,
+            inter,
+            num_experts,
+            top_k,
+            quant_mode=quant_mode,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=(
+                WeightLayout.BlockMajorK
+                if quant_mode == "bf16"
+                else WeightLayout.MajorK
+            ),
         )
         for n in (1, 16, 256, 4096)
     ]
@@ -383,6 +426,45 @@ def test_workspace_buffer_matches_per_call_allocation(case: str):
         # Poison the shared buffer: the launch must not depend on its prior contents.
         workspace.fill_(0xFF)
         actual = launch(n, workspace_buffer=workspace)
+        _assert_bitwise_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "routing_input_mode", list(RoutingInputMode), ids=lambda m: m.name
+)
+@pytest.mark.parametrize(
+    "routing_method",
+    [m for m in RoutingMethodType if m != RoutingMethodType.Unspecified],
+    ids=lambda m: m.name,
+)
+def test_workspace_buffer_covers_routing(
+    routing_input_mode: RoutingInputMode, routing_method: RoutingMethodType
+):
+    """The logits-based size query bounds scratch for each routing path."""
+    launch = _make_bf16_case(
+        seed=0,
+        use_logits=routing_input_mode == RoutingInputMode.FromLogits,
+        packed=routing_input_mode == RoutingInputMode.PackedPrecomputed,
+        routing_method=routing_method,
+    )
+    top_k = 1 if routing_method == RoutingMethodType.Llama4 else TOP_K
+    nbytes = trtllm_fused_moe_workspace_size(
+        MAX_TOKENS, HIDDEN, INTER, NUM_EXPERTS, top_k, quant_mode="bf16"
+    )
+    assert nbytes > 0
+    workspace = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+    for n in TOKEN_COUNTS:
+        expected = launch(n)
+        # Warm the buffered path before measuring allocations.
+        launch(n, workspace_buffer=workspace)
+        workspace.fill_(0xFF)
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        actual = launch(n, workspace_buffer=workspace)
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+        # Only the returned output may allocate; scratch must fit in the buffer.
+        assert allocated == 1, allocated
         _assert_bitwise_equal(actual, expected)
 
 
