@@ -418,14 +418,19 @@ def fp32_errors(value, oracle):
     return (error.norm() / oracle.double().norm()).item(), error.abs().max().item()
 
 
+FP32_ULP = 2.0**-23
+
+
 def check_h4096(outputs, values, label=""):
     """The BF16 outputs at ``atol = rtol = 1e-2`` against the FP64 oracle; the
     FP32 outputs given each side's own BF16 ``new_residual`` (the arithmetic
     past the post sum's rounding), since an FP32-quality implementation's error
     there is bounded by the IEEE FP32 comparator's on the same inputs: rel-L2
-    <= 1e-5 and <= 2x the comparator's, max abs <= 2e-5 or <= 2x the
-    comparator's. The readings against the oracle itself and the literal
-    ``atol=2e-5/rtol=1e-5`` clause are printed, not gated."""
+    <= 1e-5 and (<= 2x the comparator's or below one FP32 ulp, as differences
+    below one FP32 ulp are the comparator's own rounding, not implementation
+    error), max abs <= 2e-5 or <= 2x the comparator's. The readings against the
+    oracle itself and the literal ``atol=2e-5/rtol=1e-5`` clause are printed,
+    not gated."""
     oracle = reference_h4096(values)
     comparator = ieee_fp32_comparator(values)
     given = reference_h4096(values, residual_cur=outputs["new_residual"])
@@ -453,7 +458,11 @@ def check_h4096(outputs, values, label=""):
             f" literal atol=2e-5/rtol=1e-5 {met[literal]}"
             f" (comparator {met[literal_c]})"
         )
-        assert rel_l2 <= 1e-5 and rel_l2 <= 2 * rel_l2_c, (name, rel_l2, rel_l2_c)
+        assert rel_l2 <= 1e-5 and (rel_l2 <= 2 * rel_l2_c or rel_l2 <= FP32_ULP), (
+            name,
+            rel_l2,
+            rel_l2_c,
+        )
         assert max_abs <= 2e-5 or max_abs <= 2 * max_abs_c, (name, max_abs, max_abs_c)
 
 
