@@ -390,7 +390,9 @@ def test_repeated_calls_are_bitwise_equal(rows):
     q, cache, selection, gate = _inputs(rows, 24, 2, "NHD", 100 + rows)
     first = _run(q, cache, selection, gate)
     assert torch.isfinite(first.float()).all()
-    workspace = torch.empty(
+    # Zeroed: the counters' zero state is the kernel's precondition; that the host zeroes a
+    # buffer it has not seen is the last test's subject.
+    workspace = torch.zeros(
         cake_backend.qsa_workspace_bytes(rows, 24, 2, _splits(rows, 2, device)),
         dtype=torch.uint8,
         device=device,
@@ -412,10 +414,10 @@ def test_caller_workspace_allocates_nothing():
     # FP32 partial outputs and LSEs per split, one 32-bit group counter per (row, KV head).
     partials = splits * rows * num_qo_heads * (HEAD_DIM + 1) * 4
     assert nbytes >= partials + rows * num_kv_heads * 4
-    workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    workspace = torch.zeros(nbytes, dtype=torch.uint8, device=device)
     expected = _run(q, cache, selection, gate)
     out = torch.full_like(q, math.nan)
-    # The first call with a buffer zeroes its counters; every later call reuses them.
+    # The first call with a buffer records it; every later call reuses its counters.
     _run(q, cache, selection, gate, out, workspace_buffer=workspace)
     assert torch.equal(out, expected)
     out.fill_(math.nan)
@@ -451,13 +453,13 @@ def test_cuda_graph_replay_with_caller_workspace():
     device = _device_or_skip()
     rows = 8
     q, cache, selection, gate = _inputs(rows, 24, 2, "NHD", 9)
-    workspace = torch.empty(
+    workspace = torch.zeros(
         cake_backend.qsa_workspace_bytes(rows, 24, 2, _splits(rows, 2, device)),
         dtype=torch.uint8,
         device=device,
     )
     out = torch.empty_like(q)
-    # Eager warm-up: the counters are zeroed on the buffer's first sight, outside capture.
+    # Eager warm-up: the host records the buffer outside capture.
     _run(q, cache, selection, gate, out, workspace_buffer=workspace)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -703,3 +705,46 @@ def test_registry_and_host_pin_no_digest_literal():
     for name in ("cake_jit.py", "cake_backend.py", "__init__.py"):
         text = (PACKAGE_DIR / name).read_text()
         assert re.search(r"\b[0-9a-f]{64}\b", text) is None, name
+
+
+# ---------------------------------------------------------------------------
+# Last on purpose: against a host that skips the zeroing, the launch below faults and the
+# CUDA context keeps the error for the rest of the process.
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_at_a_recycled_address_is_zeroed_again():
+    """A new workspace the allocator places at the address of a freed one holds whatever
+    that address held in between (here the FP32 partials of another call); the host must
+    zero its counters as for any buffer it has not seen -- a buffer is new when its storage
+    is new, not when its address is.  The fused decode faults on counters that are not
+    zero, so this is the suite's last test."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 8, 24, 2
+    splits = _splits(rows, num_kv_heads, device)
+    if cake_backend.select_form(rows, num_kv_heads, splits, device.index) != "fused":
+        pytest.skip("the split form keeps no counters in the workspace")
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 31)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+    expected = _run(q, cache, selection, gate)
+    out = torch.full_like(q, math.nan)
+    # Zeroed: an earlier buffer of this process may have had this address.  The hazard is
+    # staged below, where the address is recycled with garbage in it.
+    first = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    address = first.data_ptr()
+    _run(q, cache, selection, gate, out, workspace_buffer=first)
+    assert torch.equal(out, expected)
+    del first
+    scratch = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    scratch.view(torch.float32).fill_(-6.0)
+    del scratch
+    second = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    if second.data_ptr() != address:
+        pytest.skip(
+            "the allocator did not place the new workspace at the freed address"
+        )
+    torch.cuda.synchronize()
+    assert second[:4].view(torch.float32).item() == -6.0  # the counters hold garbage
+    out.fill_(math.nan)
+    _run(q, cache, selection, gate, out, workspace_buffer=second)
+    assert torch.equal(out, expected)
