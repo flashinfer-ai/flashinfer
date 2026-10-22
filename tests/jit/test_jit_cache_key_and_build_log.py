@@ -72,6 +72,8 @@ def test_import_closure_follows_helpers_but_not_unkeyed_files(fake_package):
     )
     names = {str(p.relative_to(fake_package)) for p in closure}
     assert names == {
+        "__init__.py",  # hashed without following all public reexports
+        "kernels/__init__.py",
         "kernels/kernel.py",
         "helpers/deep.py",
         "helpers/math.py",  # transitively, via an absolute import
@@ -79,6 +81,104 @@ def test_import_closure_follows_helpers_but_not_unkeyed_files(fake_package):
         "helpers/reexported.py",
         "kernels/local_only.py",  # function-local import
     }
+
+
+def test_strict_key_tracks_implicit_parent_initializers(fake_package, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
+    kernel = str(fake_package / "kernels/kernel.py")
+    before = cute_dsl_core._hash_source_files((kernel,))
+    (fake_package / "kernels/__init__.py").write_text("TILE = 256\n")
+    assert cute_dsl_core._hash_source_files((kernel,)) != before
+    before = cute_dsl_core._hash_source_files((kernel,))
+    (fake_package / "__init__.py").write_text("ROOT_SETTING = 1\n")
+    assert cute_dsl_core._hash_source_files((kernel,)) != before
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'import importlib; helper = importlib.import_module("flashinfer.helpers.math")',
+        'from importlib import import_module as load; helper = load(".helpers.math", __package__)',
+        'import importlib as il; helper = il.import_module(f"{__package__}.helpers.math")',
+        'helper = __import__("flashinfer.helpers.math")',
+        'helper = __import__("flashinfer.helpers", fromlist=["math"]).math',
+        'helper = __import__("flashinfer.helpers", globals(), locals(), ["math"]).math',
+        'helper = __import__("helpers.math", globals(), locals(), [], 1)',
+        'import importlib; helper = importlib.import_module(name="flashinfer.helpers.math")',
+    ],
+)
+def test_strict_key_tracks_resolvable_dynamic_imports(
+    fake_package, monkeypatch, statement
+):
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
+    kernel = fake_package / "dynamic.py"
+    kernel.write_text(statement + "\n")
+    before = cute_dsl_core._hash_source_files((str(kernel),))
+    (fake_package / "helpers/math.py").write_text("SCALE = 64\n")
+    assert cute_dsl_core._hash_source_files((str(kernel),)) != before
+
+
+def test_strict_key_tracks_package_export_shadowing_a_submodule(
+    fake_package, monkeypatch
+):
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
+    (fake_package / "helpers/child.py").write_text("UNUSED = 1\n")
+    (fake_package / "helpers/__init__.py").write_text("from .reexported import child\n")
+    helper = fake_package / "helpers/reexported.py"
+    helper.write_text("def child(): return 1\n")
+    kernel = fake_package / "shadowed.py"
+    kernel.write_text("from .helpers import child\n")
+    before = cute_dsl_core._hash_source_files((str(kernel),))
+    helper.write_text("def child(): return 2\n")
+    assert cute_dsl_core._hash_source_files((str(kernel),)) != before
+
+
+@pytest.mark.parametrize(
+    "dependency", ["apache-tvm-ffi", "torch", "nvidia-cutlass-dsl-libs-cu13"]
+)
+def test_compiler_fingerprint_tracks_resolved_dependencies(monkeypatch, dependency):
+    import importlib.metadata
+
+    class Distribution:
+        metadata = {"Name": dependency}
+        version = "1.0"
+        record = "build-1"
+        direct_url = None
+
+        def read_text(self, name):
+            return self.record if name == "RECORD" else self.direct_url
+
+    distribution = Distribution()
+    monkeypatch.setattr(importlib.metadata, "distributions", lambda: [distribution])
+
+    def fingerprint():
+        cute_dsl_core._get_cute_dsl_version.cache_clear()
+        return cute_dsl_core._get_cute_dsl_version()
+
+    try:
+        first = fingerprint()
+        distribution.version = "1.1"
+        second = fingerprint()
+        distribution.record = "rebuilt-wheel"
+        third = fingerprint()
+        distribution.direct_url = '{"vcs_info":{"commit_id":"new-commit"}}'
+        assert len({first, second, third, fingerprint()}) == 4
+    finally:
+        cute_dsl_core._get_cute_dsl_version.cache_clear()
+
+
+def test_compiler_fingerprint_tracks_extension_abi(monkeypatch):
+    import sysconfig
+
+    def fingerprint(abi):
+        monkeypatch.setattr(sysconfig, "get_config_var", lambda name: abi)
+        cute_dsl_core._get_cute_dsl_version.cache_clear()
+        return cute_dsl_core._get_cute_dsl_version()
+
+    try:
+        assert fingerprint("cpython-310-x86_64") != fingerprint("cpython-310d-x86_64")
+    finally:
+        cute_dsl_core._get_cute_dsl_version.cache_clear()
 
 
 def test_strict_key_tracks_imported_helpers(fake_package, monkeypatch):

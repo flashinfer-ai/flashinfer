@@ -20,6 +20,8 @@ import json
 import os
 import re
 import shutil
+import sys
+import sysconfig
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -39,7 +41,8 @@ def cute_dsl_cache_disabled() -> bool:
 def _get_cute_dsl_version() -> str:
     """Fingerprint of the CuTe-DSL compiler stack.
 
-    Covers every installed ``nvidia-cutlass-dsl*`` distribution, not just the
+    Covers TVM-FFI, Torch, Python's ABI, and every installed
+    ``nvidia-cutlass-dsl*`` distribution, not just the
     main package: the codegen backend lives in the libs packages, and the
     CUDA-family variant is encoded in the package *name* (e.g.
     ``nvidia-cutlass-dsl-libs-cu13``), so two environments with the same DSL
@@ -49,12 +52,25 @@ def _get_cute_dsl_version() -> str:
     """
     import importlib.metadata
 
-    stack = sorted(
-        f"{dist.metadata['Name']}=={dist.version}"
-        for dist in importlib.metadata.distributions()
-        if (dist.metadata["Name"] or "").lower().startswith("nvidia-cutlass-dsl")
+    stack = []
+    for dist in importlib.metadata.distributions():
+        name = (dist.metadata["Name"] or "").lower().replace("_", "-")
+        if name in {"torch", "apache-tvm-ffi"} or name.startswith("nvidia-cutlass-dsl"):
+            # RECORD distinguishes rebuilt wheels with the same version;
+            # direct_url carries the commit of a VCS dependency override.
+            provenance = json.dumps(
+                [dist.read_text("RECORD"), dist.read_text("direct_url.json")]
+            ).encode()
+            stack.append(
+                f"{name}=={dist.version}:{hashlib.sha256(provenance).hexdigest()}"
+            )
+    return ";".join(
+        [
+            str(sys.implementation.cache_tag),
+            str(sysconfig.get_config_var("SOABI")),
+            *sorted(stack),
+        ]
     )
-    return ";".join(stack) if stack else "unknown"
 
 
 def cute_dsl_strict_cache_key() -> bool:
@@ -65,12 +81,10 @@ def cute_dsl_strict_cache_key() -> bool:
 # The flashinfer package directory; only imports resolving inside it are followed.
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 # Never followed by the strict key:
-# - ``__init__.py`` re-exports the whole public API and defines no kernels;
-#   following it would key every kernel on every file in the package.
 # - ``version.py`` / ``_build_meta.py`` carry the build's git commit, which
 #   differs on every CI checkout. The package version is already part of the
 #   cache directory path (``FLASHINFER_JIT_DIR``).
-_UNKEYED_PACKAGE_FILES = ("__init__.py", "version.py", "_build_meta.py")
+_UNKEYED_PACKAGE_FILES = ("version.py", "_build_meta.py")
 
 
 def _resolve_package_module(parts: Sequence[str]) -> Optional[Path]:
@@ -88,10 +102,8 @@ def _resolve_package_module(parts: Sequence[str]) -> Optional[Path]:
 def _direct_package_imports(path: Path) -> tuple:
     """Flashinfer source files ``path`` imports, including function-local imports.
 
-    Parent-package ``__init__`` files are not followed unless named by the
-    import itself: a kernel module depends on what it imports, not on
-    everything its package re-exports, and following them would pull in the
-    whole package and defeat cache reuse.
+    Implicit parent initializers are hashed separately without traversing all
+    their reexports. Nonliteral dynamic imports still need explicit key files.
     """
     import ast
 
@@ -99,6 +111,45 @@ def _direct_package_imports(path: Path) -> tuple:
     package = list(rel.parts[:-1])  # same for ``__init__`` and plain modules
     tree = ast.parse(path.read_bytes(), filename=str(path))
     found = set()
+    unkeyed = {_PACKAGE_DIR / name for name in _UNKEYED_PACKAGE_FILES}
+    importlib_names = {"importlib"}
+    import_module_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            importlib_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "importlib"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            import_module_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "import_module"
+            )
+
+    def import_string(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name) and node.id == "__package__":
+            return ".".join(package)
+        if isinstance(node, ast.JoinedStr):
+            if any(
+                isinstance(part, ast.FormattedValue)
+                and (part.conversion != -1 or part.format_spec is not None)
+                for part in node.values
+            ):
+                return None
+            parts = [
+                import_string(part.value)
+                if isinstance(part, ast.FormattedValue)
+                else import_string(part)
+                for part in node.values
+            ]
+            if all(part is not None for part in parts):
+                return "".join(part for part in parts if part is not None)
+        return None
+
     for node in ast.walk(tree):
         resolved_files = []
         if isinstance(node, ast.Import):
@@ -114,15 +165,125 @@ def _direct_package_imports(path: Path) -> tuple:
                 base = []
             module = base + (node.module.split(".") if node.module else [])
             for alias in node.names:
-                # ``from pkg import submodule`` depends on the submodule only;
-                # any other name is defined by ``pkg`` itself.
+                # A name can resolve to a submodule or a package export.
                 submodule = _resolve_package_module(module + [alias.name])
                 resolved_files.append(
                     submodule
                     if submodule is not None
                     else _resolve_package_module(module)
                 )
-        unkeyed = {_PACKAGE_DIR / name for name in _UNKEYED_PACKAGE_FILES}
+                # A package may export `child` even when child.py also exists.
+                # Follow explicit subpackage exports as well as the submodule.
+                if submodule is not None:
+                    parent = _resolve_package_module(module)
+                    if parent is not None and parent.name == "__init__.py":
+                        parent_tree = ast.parse(
+                            parent.read_bytes(), filename=str(parent)
+                        )
+                        exported = any(
+                            (
+                                isinstance(item, (ast.FunctionDef, ast.ClassDef))
+                                and item.name in {alias.name, "__getattr__"}
+                            )
+                            or (
+                                isinstance(item, (ast.Import, ast.ImportFrom))
+                                and any(
+                                    (a.asname or a.name) == alias.name
+                                    for a in item.names
+                                )
+                            )
+                            or (
+                                isinstance(item, ast.Name)
+                                and isinstance(item.ctx, ast.Store)
+                                and item.id == alias.name
+                            )
+                            for item in ast.walk(parent_tree)
+                        )
+                        if exported:
+                            resolved_files.append(parent)
+        elif isinstance(node, ast.Call):
+            function = node.func
+            dynamic_import = (
+                isinstance(function, ast.Name)
+                and function.id in import_module_names | {"__import__"}
+            ) or (
+                isinstance(function, ast.Attribute)
+                and function.attr == "import_module"
+                and isinstance(function.value, ast.Name)
+                and function.value.id in importlib_names
+            )
+            if dynamic_import:
+                name = (
+                    import_string(node.args[0])
+                    if node.args
+                    else next(
+                        (
+                            import_string(kw.value)
+                            for kw in node.keywords
+                            if kw.arg == "name"
+                        ),
+                        None,
+                    )
+                )
+                if name is None:
+                    continue  # Caller must list nonliteral dependencies explicitly.
+                builtin_import = (
+                    isinstance(function, ast.Name) and function.id == "__import__"
+                )
+                if builtin_import:
+                    level = (
+                        node.args[4]
+                        if len(node.args) > 4
+                        else next(
+                            (kw.value for kw in node.keywords if kw.arg == "level"),
+                            ast.Constant(0),
+                        )
+                    )
+                    if not isinstance(level, ast.Constant) or not isinstance(
+                        level.value, int
+                    ):
+                        continue
+                    if level.value:
+                        from importlib.util import resolve_name
+
+                        name = resolve_name("." * level.value + name, ".".join(package))
+                if name.startswith("."):
+                    from importlib.util import resolve_name
+
+                    context = (
+                        import_string(node.args[1]) if len(node.args) > 1 else None
+                    )
+                    if context is None:
+                        context = next(
+                            (
+                                import_string(kw.value)
+                                for kw in node.keywords
+                                if kw.arg == "package"
+                            ),
+                            None,
+                        )
+                    if context is None:
+                        raise ValueError(f"Unresolved relative import in {path}")
+                    name = resolve_name(name, context)
+                resolved_files.append(_resolve_package_module(name.split(".")))
+                if builtin_import:
+                    fromlist = (
+                        node.args[3]
+                        if len(node.args) > 3
+                        else next(
+                            (kw.value for kw in node.keywords if kw.arg == "fromlist"),
+                            None,
+                        )
+                    )
+                    if isinstance(fromlist, (ast.List, ast.Tuple)):
+                        for child in fromlist.elts:
+                            child_name = import_string(child)
+                            if child_name is not None:
+                                resolved_files.append(
+                                    _resolve_package_module(
+                                        name.split(".") + child_name.split(".")
+                                    )
+                                )
         for resolved in resolved_files:
             if resolved is not None and resolved != path and resolved not in unkeyed:
                 found.add(resolved)
@@ -139,7 +300,17 @@ def _package_import_closure(path: Path) -> tuple:
             if dep not in seen:
                 seen.add(dep)
                 stack.append(dep)
-    return tuple(sorted(seen))
+    # Initializers execute on import even when no symbol is imported from
+    # them. Hash their bytes without recursively following implicit reexports.
+    parents = set()
+    for source in seen:
+        for directory in source.parents:
+            if not directory.is_relative_to(_PACKAGE_DIR):
+                break
+            initializer = directory / "__init__.py"
+            if initializer.is_file():
+                parents.add(initializer)
+    return tuple(sorted(seen | parents))
 
 
 def _expand_key_files(paths: tuple) -> tuple:
@@ -426,7 +597,7 @@ def build_and_load_cute_dsl_kernel(
     # file from the hash: a weakened key could serve stale artifacts.
     try:
         source_sha256 = _hash_source_files(tuple(extra_key_files))
-    except (OSError, TypeError, SyntaxError) as e:  # SyntaxError: strict-key parse
+    except (OSError, TypeError, SyntaxError, ValueError) as e:
         logger.warning(
             f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
             f"({e}); bypassing the disk cache for this kernel."

@@ -18,4 +18,6 @@ jobs:
         python-version-file: '.python-version'
     - name: Validate CUDA configuration
       run: python3 ci/validate_cuda_versions.py
+    - name: Test compile cache lifecycle (CPU only)
+      run: python3 -m unittest discover -s ci/tests -p 'test_compile_cache.py' -v
     - uses: pre-commit/action@v3.0.1
