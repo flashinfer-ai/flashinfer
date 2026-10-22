@@ -7237,6 +7237,8 @@ def trtllm_sage_attention_quantize(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     cum_seq_lens_kv: Optional[torch.Tensor] = None,
     smooth_k: bool = False,
+    *,
+    allow_strided_input: bool = False,
 ) -> Union[
     Tuple[
         torch.Tensor,
@@ -7260,7 +7262,8 @@ def trtllm_sage_attention_quantize(
 
     Q and K use per-token-block scaling and can be quantized to INT8 or FP8
     E4M3. V is always quantized to FP8 E4M3 with one scale per head channel.
-    All inputs use contiguous ``[tokens, heads, head_dim]`` layout.
+    Inputs use ``[tokens, heads, head_dim]`` layout. By default they are
+    materialized as contiguous tensors before quantization.
 
     Parameters
     ----------
@@ -7282,6 +7285,14 @@ def trtllm_sage_attention_quantize(
         NOTE: K-smoothing shifts LSE by ``-sm_scale * (query * k_mean).sum(-1)``
         FlashInfer does not consume `k_mean`, thus it's up to users to shift
         back the LSE if performing ring attention with this option enabled.
+
+    allow_strided_input : bool
+        Opt in to direct reads of inputs with packed head/channel dimensions
+        and a positive, 16-byte-aligned token stride and base address, such as
+        plane-major Ulysses Q/K/V views.
+        Other layouts are materialized as contiguous tensors. K is always
+        materialized when ``smooth_k=True``. Outputs remain contiguous. The
+        default preserves the original packed-input kernel specialization.
 
     Returns
     -------
@@ -7323,12 +7334,42 @@ def trtllm_sage_attention_quantize(
 
     batch_size = cum_seq_lens_q.numel() - 1
 
-    query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
-    q_quant = torch.empty_like(query, dtype=qk_quant_dtype)
-    k_quant = torch.empty_like(key, dtype=qk_quant_dtype)
-    v_quant = torch.empty_like(value, dtype=torch.float8_e4m3fn)
+    if allow_strided_input:
+
+        def prepare_input(
+            t: torch.Tensor, force_contiguous: bool = False
+        ) -> torch.Tensor:
+            if (
+                not force_contiguous
+                and t.stride(2) == 1
+                and t.stride(1) == t.shape[2]
+                and t.stride(0) > 0
+                and t.stride(0) % (16 // t.element_size()) == 0
+                and t.data_ptr() % 16 == 0
+            ):
+                return t
+            # The CUDA kernel uses 128-bit vector loads. A contiguous view
+            # can still start at an unaligned storage offset, so clone it.
+            if t.data_ptr() % 16:
+                return t.clone(memory_format=torch.contiguous_format)
+            return t.contiguous()
+
+        query = prepare_input(query)
+        key = prepare_input(key, force_contiguous=smooth_k)
+        value = prepare_input(value)
+        # empty_like may preserve a non-packed input layout.
+        q_quant = torch.empty(query.shape, dtype=qk_quant_dtype, device=query.device)
+        k_quant = torch.empty(key.shape, dtype=qk_quant_dtype, device=key.device)
+        v_quant = torch.empty(
+            value.shape, dtype=torch.float8_e4m3fn, device=value.device
+        )
+    else:
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        q_quant = torch.empty_like(query, dtype=qk_quant_dtype)
+        k_quant = torch.empty_like(key, dtype=qk_quant_dtype)
+        v_quant = torch.empty_like(value, dtype=torch.float8_e4m3fn)
     q_scale = torch.empty(
         (query.shape[1], ceil_div(query.shape[0], q_block_size) + batch_size - 1),
         dtype=torch.float32,
@@ -7354,7 +7395,13 @@ def trtllm_sage_attention_quantize(
         else None
     )
 
-    get_trtllm_gen_fmha_module().trtllm_sage_attention_quantize(
+    module = get_trtllm_gen_fmha_module()
+    quantize = (
+        module.trtllm_sage_attention_quantize_strided
+        if allow_strided_input
+        else module.trtllm_sage_attention_quantize
+    )
+    quantize(
         q_quant,
         k_quant,
         v_quant,
