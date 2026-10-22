@@ -131,7 +131,9 @@ def _reference(hidden, ids, route_weights, raw):
     hidden = hidden.flatten(0, 1).float()
     ids = ids.flatten(0, 1)
     route_weights = route_weights.flatten(0, 1)
-    input_scale = (hidden.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(1e-30)
+    input_scale = (hidden.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(
+        1e-30
+    )
     x = (hidden / input_scale).to(torch.float8_e4m3fn).float()
     order = _k64_order(HIDDEN, hidden.device)
     group_order = _k64_order(64, hidden.device)
@@ -148,7 +150,9 @@ def _reference(hidden, ids, route_weights, raw):
         up = fc1[:, INTERMEDIATE:].clamp(-CLAMP, CLAMP)
         activated = functional.silu(gate) * up * route_weights[token, slot, None]
         grouped = activated.reshape(-1, INTERMEDIATE // 64, 64)
-        scale = (grouped.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(1e-30)
+        scale = (grouped.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(
+            1e-30
+        )
         quantized = (grouped * torch.reciprocal(scale)).to(torch.float8_e4m3fn).float()
         fc2 = torch.zeros(token.numel(), HIDDEN, device=hidden.device)
         for block in range(INTERMEDIATE // 64):
