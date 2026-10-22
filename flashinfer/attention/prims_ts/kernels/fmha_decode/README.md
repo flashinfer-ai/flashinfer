@@ -257,7 +257,7 @@ requires its captured address and shape to remain stable.
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
 | [`block_sparse_prepare.py`](block_sparse_prepare.py) | Prepare of a block-sparse plan's compact route records from BSR or bitmask inputs |
 | [`block_sparse_inspect.py`](block_sparse_inspect.py) | One-shot validation of canonical BSR and live paged metadata |
-| [`sage_prepare.py`](sage_prepare.py) | Gather of a Sage plan's scales into the buffer the attention kernel reads |
+| [`../../sage/`](../../sage/) | Sage attention shared with the context kernel: recipe and scale validation, the names of the K transport and score scaling, the prepared-scale layout and its prepare kernel, index math, INT32 scores |
 
 ## Example
 

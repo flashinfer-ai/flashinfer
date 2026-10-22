@@ -51,6 +51,7 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 
+from ...sage.modes import SageScoreScaling
 from ..stage import FmhaStage
 from ..task_compat import task_context_kwargs
 from .direct_sparse_metadata import DirectSparseMetadataView
@@ -3184,7 +3185,9 @@ def _softmax_schedule_body(
     # with each tile. They are read in place, so the ring stage stays held
     # through the last pass that reads them: the max pass for dequantized
     # scores, else the P pass.
-    releases_sage_stage_after_max = cfg.sage_scores_dequantized()
+    releases_sage_stage_after_max = (
+        cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
+    )
     compute_softmax_loop = {
         (False, False): tmem_s.compute_softmax_loop,
         (False, True): tmem_s.compute_sage_softmax_loop,
