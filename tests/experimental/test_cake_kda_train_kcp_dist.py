@@ -43,6 +43,7 @@ from tests.test_helpers.cake_package import cake_package
 cake_kcp = cake_package("cake_kda_train", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_train", "cake_kcp_plan")
 cake_jit = cake_package("cake_kda_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 TENSORS = ("out",) + GRAD_NAMES
@@ -68,16 +69,23 @@ def _row_id(row) -> str:
 
 
 def _programs_exported() -> bool:
-    """The KCP programs are part of the package's build.json (H3's registry) -- else the kernel path cannot run."""
+    """Every shipped KCP record of ``cake_kcp_jit.MODULES`` has a library in the
+    package's ``build.json`` -- else the kernel path cannot run."""
     manifest = PACKAGE_DIR / "build.json"
     if not manifest.exists():
         return False
     try:
         with open(manifest) as fh:
-            names = json.dumps(json.load(fh))
-    except (OSError, ValueError):
+            libraries = {lib["name"] for lib in json.load(fh)["libraries"]}
+    except (OSError, ValueError, KeyError, TypeError):
         return False
-    return "kda_chunk_kcp" in names
+    return all(
+        any(
+            cake_kcp_jit.library_name(name, arch) in libraries
+            for arch in record["arches"]
+        )
+        for name, record in cake_kcp_jit.MODULES.items()
+    )
 
 
 def _partition(lengths, W: int, layout: str):
