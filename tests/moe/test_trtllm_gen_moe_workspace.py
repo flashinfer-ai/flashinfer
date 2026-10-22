@@ -416,6 +416,121 @@ def test_workspace_size_rejects_invalid_arguments():
 
 
 @pytest.mark.parametrize("case", list(CASES))
+def test_workspace_size_explicit_tactic(case: str, monkeypatch):
+    """Measure and execute actual configurations from each supported tile."""
+    quant_mode, factory = CASES[case]
+    launch = factory(seed=0)
+    tactics = []
+    selected = None
+
+    def choose_one(self, name, runners, config, inputs, **kwargs):
+        nonlocal tactics
+        if not tactics:
+            tactics = [tuple(t) for t in runners[0].get_valid_tactics(inputs, None)]
+        assert tactics
+        return runners[0], selected or tactics[0]
+
+    monkeypatch.setattr(AutoTuner, "choose_one", choose_one)
+    n = 32
+    launch(n)  # Collect the real runner's valid configurations.
+    # Cover distinct tiles and non-default configuration indices without running
+    # every GEMM combination in the kernel catalog.
+    by_tile = {}
+    for tactic in tactics:
+        by_tile.setdefault(tactic[0], []).append(tactic)
+    largest = _workspace(quant_mode, max_num_tokens=n)
+    sizes = []
+
+    def allocated(workspace):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        out = launch(n, workspace_buffer=workspace)
+        torch.cuda.synchronize()
+        count = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+        return out, count
+
+    for tile_tactics in by_tile.values():
+        for selected in dict.fromkeys(
+            ((tile_tactics[0][0], -1), tile_tactics[0], tile_tactics[-1])
+        ):
+            size = trtllm_fused_moe_workspace_size(
+                n,
+                HIDDEN,
+                INTER,
+                NUM_EXPERTS,
+                TOP_K,
+                quant_mode=quant_mode,
+                tactic=selected,
+            )
+            assert 0 < size <= largest.numel()
+            sizes.append(size)
+            workspace = torch.empty(size, dtype=torch.uint8, device="cuda")
+            expected = launch(n)
+            launch(n, workspace_buffer=workspace)  # Warm this configuration.
+            actual, count = allocated(workspace)
+            _, largest_count = allocated(largest)
+            _assert_bitwise_equal(actual, expected)
+            # An exact-sized buffer must not fall back to per-call scratch.
+            assert count == largest_count
+    assert min(sizes) < largest.numel()
+
+
+@pytest.mark.parametrize("quant_mode", QUANT_MODES)
+def test_workspace_size_explicit_tile_default_config(quant_mode):
+    args = (32, HIDDEN, INTER, NUM_EXPERTS, TOP_K)
+    maximum = trtllm_fused_moe_workspace_size(*args, quant_mode=quant_mode)
+    tiles = [8, 16, 32, 64]
+    if quant_mode != "mxfp4_bf16":
+        tiles.append(128)
+    if quant_mode in ("nvfp4", "mxfp4_mxfp8"):
+        tiles.append(192)
+    if quant_mode in ("mxfp8", "nvfp4", "mxfp4_mxfp8"):
+        tiles.append(256)
+    sizes = [
+        trtllm_fused_moe_workspace_size(*args, quant_mode=quant_mode, tactic=(tile, -1))
+        for tile in tiles
+    ]
+    # Unsupported tiles may have no valid config and return zero. The others
+    # must preserve tile-dependent sizes, rather than all returning the maximum.
+    valid_sizes = [size for size in sizes if size > 0]
+    assert valid_sizes
+    assert max(valid_sizes) == maximum
+    assert min(valid_sizes) < maximum
+
+
+@pytest.mark.parametrize("quant_mode", QUANT_MODES)
+@pytest.mark.parametrize("config", [-1, 0])
+def test_workspace_size_rejects_unsupported_tile(quant_mode, config):
+    with pytest.raises((ValueError, RuntimeError)):
+        trtllm_fused_moe_workspace_size(
+            32,
+            HIDDEN,
+            INTER,
+            NUM_EXPERTS,
+            TOP_K,
+            quant_mode=quant_mode,
+            tactic=(7, config),
+        )
+
+
+@pytest.mark.parametrize(
+    "tactic",
+    [-1, (), (32,), (32, 0, 1), (-1, -1), (32, -2), (0, 0), (32, 0.5), (True, 0)],
+)
+def test_workspace_size_rejects_malformed_tactic(tactic):
+    with pytest.raises(ValueError, match="tactic must be"):
+        trtllm_fused_moe_workspace_size(
+            32,
+            HIDDEN,
+            INTER,
+            NUM_EXPERTS,
+            TOP_K,
+            quant_mode="bf16",
+            tactic=tactic,
+        )
+
+
+@pytest.mark.parametrize("case", list(CASES))
 def test_workspace_buffer_matches_per_call_allocation(case: str):
     """One buffer sized for MAX_TOKENS serves every smaller batch, bit for bit."""
     quant_mode, factory = CASES[case]

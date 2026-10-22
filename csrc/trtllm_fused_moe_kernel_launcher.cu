@@ -1125,13 +1125,14 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
   const int64_t tile_N = config_index[0];
   const int64_t config = config_index[1];
 
-  if (tile_N == -1 || config == -1) {
+  if (tile_N == -1) {
     // Use fallback tactic
     auto const default_tile_N =
         selectDefaultTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts);
     return {default_tile_N, -1};
   }
 
+  // Preserve an explicit tile even when its default configuration is requested.
   return {tile_N, config};
 }
 
@@ -1318,13 +1319,12 @@ class FusedMoeLauncher {
 
   /**
    * Scratch footprint of an ordinary run() of this tile, measured by the allocation code itself.
-   * It depends on the tile, not the tactic: every shipped batched-GEMM config needs a zero-byte
-   * workspace, so the tile's default tactic stands for all of them, and a tactic that ever needs
-   * more allocates the excess per call (see TensorAllocator). Returns 0 when the tile has no
-   * runnable tactic, since such a tile can never be selected.
+   * With tactic=-1, use the tile's default configuration and return 0 for unsupported tiles.
+   * An explicit tactic measures that configuration, returning 0 if it cannot run.
+   * Every shipped batched-GEMM config needs a zero-byte workspace, so the default
+   * configuration currently represents all configurations of a tile.
    */
-  int64_t measure_workspace_size() {
-    int64_t tactic = -1;
+  int64_t measure_workspace_size(int64_t tactic = -1) {
     scratch_.begin_measure();
     // Routing initializes mode flags (including DeepSeek FP8) used to select the runner.
     // Match run()'s ordering, while counting routing scratch without device work.
@@ -5386,15 +5386,18 @@ Array<Tensor> moe_workspace_size_result(int64_t bytes) {
 
 /**
  * Apply the workspace arguments shared by the ordinary MoE entry points. A size query returns
- * the largest scratch footprint over every tile at this token count, so one buffer fits
- * whichever tactic the autotuner (or the default heuristic) later selects.
+ * the selected configuration's footprint when explicit, otherwise the maximum over tiles.
  * Otherwise the caller-owned buffer, if any, is attached to the selected launcher.
  */
 template <typename Launcher>
 Optional<Array<Tensor>> apply_moe_workspace_args(
     std::unordered_map<int32_t, std::unique_ptr<Launcher>> const& launchers, Launcher& selected,
-    Optional<TensorView> const& workspace_buffer, bool query_workspace_size, bool is_da_launch) {
+    Optional<TensorView> const& workspace_buffer, int64_t config, bool explicit_tile,
+    bool query_workspace_size, bool is_da_launch) {
   if (query_workspace_size) {
+    if (explicit_tile) {
+      return moe_workspace_size_result(selected.measure_workspace_size(config));
+    }
     int64_t bytes = 0;
     for (auto const& entry : launchers) {
       bytes = std::max(bytes, entry.second->measure_workspace_size());
@@ -5500,7 +5503,7 @@ Array<Tensor> trtllm_bf16_moe(
                    "Internal error: missing BF16 MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, moe_tactic[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -5619,7 +5622,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -5744,7 +5747,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -5816,7 +5819,16 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     return launcher;
   };
 
+  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, supported_tile_nums,
+                                                        num_tokens, top_k, local_num_experts);
   if (query_workspace_size) {
+    if (config_index[0] != -1) {
+      TVM_FFI_ICHECK(std::find(supported_tile_nums.begin(), supported_tile_nums.end(), tile_N) !=
+                     supported_tile_nums.end())
+          << "Unsupported MoE tile_N=" << tile_N;
+      return moe_workspace_size_result(
+          make_launcher(static_cast<int32_t>(tile_N))->measure_workspace_size(config));
+    }
     // Same bound as apply_moe_workspace_args(): the largest footprint over every tile.
     int64_t bytes = 0;
     for (int32_t tile : supported_tile_nums) {
@@ -5825,8 +5837,6 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     return moe_workspace_size_result(bytes);
   }
 
-  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, supported_tile_nums,
-                                                        num_tokens, top_k, local_num_experts);
   auto launcher = make_launcher(static_cast<int32_t>(tile_N));
   launcher->set_workspace_buffer(workspace_buffer);
   return launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
@@ -5988,7 +5998,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
                    "Internal error: missing FP8 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -6188,7 +6198,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
                    "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -6327,7 +6337,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
                    "Internal error: missing MXINT4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
