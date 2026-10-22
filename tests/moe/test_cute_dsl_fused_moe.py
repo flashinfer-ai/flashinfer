@@ -1136,6 +1136,42 @@ class TestInputsHelperContract:
             "generate_token_selected_experts is broken."
         )
 
+    @pytest.mark.parametrize("ep_size", [1, 4, 8, 32])
+    @pytest.mark.parametrize("num_tokens", [1, 4, 64])
+    def test_generated_routes_match_requested_counts(
+        self, ep_size: int, num_tokens: int
+    ):
+        """Every local expert must receive exactly the number of tokens the
+        helper requested for it, on every EP rank. Experts with a zero count
+        must stay inactive: assigning them a token inflates the profiled
+        routed rows at decode sizes and skews tactic picks."""
+        from flashinfer.fused_moe.cute_dsl._inputs_helper import (
+            CuteDslMoEInputsHelper,
+        )
+
+        num_experts, top_k = 512, 22
+        num_local_experts = num_experts // ep_size
+        for rank in (0, ep_size - 1):
+            offset = rank * num_local_experts
+            helper = CuteDslMoEInputsHelper(
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=offset,
+            )
+            per_expert = helper.generate_num_tokens_per_expert(
+                num_tokens, approx_max_load=True
+            )
+            tse = helper.generate_token_selected_experts(
+                num_tokens, per_expert, torch.device("cpu"), torch.int32
+            )
+            routed = tse[tse >= 0]
+            assert bool(
+                ((routed >= offset) & (routed < offset + num_local_experts)).all()
+            )
+            counts = torch.bincount(routed - offset, minlength=num_local_experts)
+            assert counts.tolist() == per_expert
+
 
 # =============================================================================
 # Test: routing PDL forwarding (no GPU required)

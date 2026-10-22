@@ -137,19 +137,18 @@ class CuteDslMoEInputsHelper:
             ]
 
         for j, num_tokens_j in enumerate(num_tokens_per_expert):
+            # Experts with no requested tokens stay inactive; assigning them
+            # a token inflates the profiled rows (e.g. 22 instead of 9 local
+            # routes at 1 token, top_k=22, EP4) and skews tactic picks.
+            if num_tokens_j <= 0:
+                continue
             selection_order_j = selection_orders[j].tolist()
+            global_j = j + self.local_expert_offset
             # Prioritize tokens that risk not hitting top_k before all
-            # experts are exhausted. (For typical MoE configs with
-            # num_local_experts < num_experts the prioritized list is
-            # empty; preserved for parity with trt's algorithm.)
-            #
-            # `j` is the local expert index. Using it (instead of the
-            # global `j + self.local_expert_offset`) makes `prioritized`
-            # always empty on any rank with `local_expert_offset > 0`,
-            # so the prioritization is effectively dead code on multi-rank
-            # EP. Faithful port of trt-llm's implementation; tracked
-            # upstream at https://github.com/NVIDIA/TensorRT-LLM/issues/14146.
-            limit = self.top_k - (self.num_experts - j)
+            # experts are exhausted. The threshold uses the global expert
+            # index; the local index keeps it negative on every rank but
+            # the first, which disables the prioritization under EP.
+            limit = self.top_k - (self.num_experts - global_j)
             prioritized = (
                 torch.nonzero(num_selected_experts <= limit).squeeze(-1).tolist()
             )
@@ -158,15 +157,10 @@ class CuteDslMoEInputsHelper:
                 selection_order_j = prioritized + [
                     i for i in selection_order_j if i not in p_set
                 ]
-            # When `num_tokens_per_expert[j] == 0`, the inner loop still
-            # enters and assigns one "ghost" token to expert `j` before
-            # the `num_tokens_j <= 0` break fires. Faithful port of trt-
-            # llm's behavior; tracked upstream at
-            # https://github.com/NVIDIA/TensorRT-LLM/issues/14146.
             for i in selection_order_j:
                 if num_selected_experts[i] < self.top_k:
                     slot = int(num_selected_experts[i])
-                    token_selected_experts[i, slot] = j + self.local_expert_offset
+                    token_selected_experts[i, slot] = global_j
                     num_selected_experts[i] += 1
                     num_tokens_j -= 1
                     if num_tokens_j <= 0:
