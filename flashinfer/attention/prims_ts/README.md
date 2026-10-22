@@ -17,6 +17,31 @@ Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but is not yet signoff-qualified.
 The QToken-KvBlock-Sparse-Attention extension is separately validated on SM103/GB300.
 
+## Compilation cache
+
+Attention adapters use FlashInfer's persistent CuTe DSL object cache across
+processes, including context, paged decode, MLA, sparse/Sage preparation, and
+sparse metadata inspection. Specializations include compile options and static
+kernel configuration; device indices are excluded so ranks on equivalent GPUs
+can share artifacts. Physical GPU capability, compile target, installed DSL
+stack, and attention source changes invalidate the cache. Device-specific
+occupancy probes run once per device and cluster size in each process.
+
+By default, object files and `meta.json` are stored under
+`~/.cache/flashinfer/<flashinfer-version>/<cuda-archs>/cached_ops/prims_ts_<family>_<compile-arch>_cute_dsl/`.
+For example, FlashInfer 0.7.2 on a GB300 uses
+`~/.cache/flashinfer/0.7.2/103a/cached_ops/prims_ts_decode_sm103a_cute_dsl/`
+for decode. Inspect the resolved `cached_ops` directory for the current process:
+
+```bash
+python -c 'from flashinfer.jit import env; print(env.FLASHINFER_JIT_DIR)'
+```
+
+Setting `FLASHINFER_WORKSPACE_BASE=/path` places this cache under
+`/path/.cache/flashinfer/`. Set `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` to compile
+without disk persistence.
+Warm up plans before CUDA graph capture as usual.
+
 ## Guides and public APIs
 
 Import all entries below from `flashinfer.attention.prims_ts`.
@@ -538,7 +563,7 @@ pytest -q \
   tests/attention/test_attention_ts_decode.py \
   tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
   tests/attention/test_attention_ts_block_sparse.py \
-  tests/attention/test_attention_ts_mask.py \
+  tests/attention/test_attention_ts_features.py \
   tests/attention/test_attention_ts_mla_decode.py \
   tests/attention/test_attention_ts_sage.py \
   tests/attention/test_attention_ts_vc.py

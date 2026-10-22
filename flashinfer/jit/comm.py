@@ -291,11 +291,12 @@ def gen_pcie_ipc_ag_rs_module() -> JitSpec:
 
 
 def gen_ulysses_a2a_module() -> JitSpec:
-    from .cake_ulysses import generated_ulysses_spec
+    """The portable NVLink Ulysses all-to-all (``csrc/ulysses_all_to_all.cu``).
 
-    generated = generated_ulysses_spec()
-    if generated is not None:
-        return generated
+    The exported Cake programs for SM100 / SM103 live in the self-contained
+    package ``flashinfer.cake_ulysses_backend`` and are loaded by its own
+    ``cake_build`` loader, not through this spec.
+    """
     return gen_jit_spec(
         "ulysses_a2a",
         [

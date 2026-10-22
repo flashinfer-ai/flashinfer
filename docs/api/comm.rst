@@ -626,7 +626,8 @@ The producer build is selected per architecture and world size
 of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
 operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
 build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
-``ow256``; groups of 2 ranks, SM90 and SM107 run the baseline build.  Every build
+``ow256``; on SM107 a group of 4 ranks runs the build with bulk row stores
+(``bulk``); groups of 2 ranks and SM90 run the baseline build.  Every build
 stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
 and norm-weight tensors (a misaligned view raises and names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /

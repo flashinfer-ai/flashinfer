@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -175,7 +176,9 @@ def validate_forward_metadata(
         raise MoEEpConfigError("SM107 inputs must be on the current CUDA device")
 
 
-def validate_routing_values(topk_ids, topk_weights, num_experts: int) -> None:
+def validate_routing_values(
+    topk_ids, topk_weights, num_experts: int, *, workspace=None
+) -> None:
     """Device assertions run before dispatch, including during graph replay.
 
     Duplicate valid routes violate the router's workspace capacity proof.
@@ -183,6 +186,18 @@ def validate_routing_values(topk_ids, topk_weights, num_experts: int) -> None:
     assertion invalidates that worker's CUDA context, as with invalid indices
     in other CUDA indexing operations.
     """
+    if (
+        topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and topk_ids.shape[1] <= 32
+        and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and os.environ.get("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1") != "0"
+    ):
+        from .routing_validation import check_routing
+
+        check_routing(topk_ids, topk_weights, num_experts, workspace)
+        return
     ordered = topk_ids.sort(dim=1).values
     unique = (ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)
     valid = ((topk_ids >= -1) & (topk_ids < num_experts)).all()

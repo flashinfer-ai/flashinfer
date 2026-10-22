@@ -22,11 +22,16 @@ in FP32 with document-local shifts (``dweight`` accumulated in FP64): BF16
 element outside, FP32 ``dweight`` within ``atol 5e-2 + rtol 1e-4``.  The
 matrix covers token counts 1, 5, 63, 64, 65, 1000 and 4097 with documents of
 lengths 1, 2 and 3 and empty documents before, between and after others,
-channel counts 128, 136, 256, 384, 512, 1024 and 2048, the ``[1, S, C]``
+channel counts 128, 136, 256, 384, 512, 768, 1024 and 2048, the ``[1, S, C]``
 layout, document isolation (a change inside one document moves no output of
 another), bitwise reproducibility of ``dweight``, CUDA Graph capture and
 replay of changing shapes, argument validation, the workspace helpers and one
-``S x C > 2^31`` case guarded by free device memory.
+``S x C > 2^31`` case guarded by free device memory.  An architecture whose
+backward route ships several programs selects one by the channel count: the
+suite checks that exactly one runs per call, that every program of the route
+runs for some channel count on both sides of its threshold (with a
+NaN-poisoned workspace), that the workspace is sized for the largest grid of
+the route, and that a routed row's ``dx`` equals the fallback program's bits.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
@@ -78,7 +83,9 @@ SEED = 2033
 # (S, C, documents): documents of lengths 1, 2 and 3; empty documents before,
 # between and after others; C = 136 (forward: 17 channel vectors, 7 sub-tiles of 17
 # threads, 9 threads idle); boundaries inside a sub-tile and at S = 64 and 65;
-# the perf packing at S = 1000; 38 documents (a six-step device-side search).
+# the perf packing at S = 1000; 38 documents (a six-step device-side search);
+# S = 5 at the backward's channel thresholds 512 and 1024 (fewer tokens than
+# one eight-token stage of the big-channel backward program).
 CASES = (
     (1, 128, None),
     (5, 136, (2, 0, 3)),
@@ -89,6 +96,9 @@ CASES = (
     (1000, 256, (27,) * 37 + (1,)),
     (4097, 1024, (0, 4097, 0)),
     (4097, 2048, (1000, 0, 3, 3094)),
+    (4097, 768, (1000, 0, 3, 3094)),
+    (5, 512, (2, 0, 3)),
+    (5, 1024, (2, 0, 3)),
 )
 LARGE_CASE = (262401, 8192, "perf")
 LARGE_CASE_FREE_BYTES = 40 * 2**30
@@ -141,6 +151,34 @@ def _case_id(case) -> str:
     S, C, docs = case
     tag = "one" if docs is None else ("perf" if docs == "perf" else f"{len(docs)}docs")
     return f"S{S}-C{C}-{tag}"
+
+
+def _arch() -> str:
+    return loader.arch_for_capability(_capability())
+
+
+def _backward_thresholds(arch: str) -> tuple[int, ...]:
+    """The channel thresholds of the backward programs ``arch`` selects by channel count (empty when the
+    route ships the fallback program only)."""
+
+    thresholds = set()
+    for name in loader.route_modules(arch, "bwd"):
+        rule = loader.select_rule(loader.MODULES[name])
+        if rule is not None and arch in rule["channels"]:
+            thresholds.add(int(rule["channels"][arch]))
+    return tuple(sorted(thresholds))
+
+
+def _fallback_program(arch: str) -> str:
+    """The backward program of ``arch`` without a selection rule: the one every unrouted channel count runs."""
+
+    names = [
+        name
+        for name in loader.route_modules(arch, "bwd")
+        if loader.select_rule(loader.MODULES[name]) is None
+    ]
+    assert len(names) == 1, f"{arch}: fallback backward programs {names}"
+    return names[0]
 
 
 def _generator(*keys: int) -> torch.Generator:
@@ -304,7 +342,16 @@ def _assert_within(
 
 
 def _check(
-    S: int, C: int, docs, *, x=None, w=None, cu=None, dy=None, label: str = ""
+    S: int,
+    C: int,
+    docs,
+    *,
+    x=None,
+    w=None,
+    cu=None,
+    dy=None,
+    workspace=None,
+    label: str = "",
 ) -> None:
     if x is None:
         x, w, cu, dy = _inputs(S, C, docs)
@@ -318,7 +365,7 @@ def _check(
     _assert_within(
         y, reference_forward(x, w, cu), atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}"
     )
-    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
+    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy, workspace=workspace)
     assert (
         dx.dtype == torch.bfloat16
         and tuple(dx.shape) == tuple(x.shape)
@@ -419,6 +466,86 @@ def test_dweight_is_bitwise_identical_over_three_launches(case) -> None:
     assert torch.equal(fresh_dw, results[0][1]), "a fresh workspace changed dweight"
     assert torch.equal(fresh_dx, results[0][0])
     assert torch.isfinite(results[0][1]).all()
+
+
+def test_backward_programs_switch_on_channel_count() -> None:
+    """Exactly one backward program runs per call, every program of the route runs for some channel count,
+    and each matches the reference on both sides of its channel threshold with a NaN-poisoned workspace."""
+
+    arch = _arch()
+    names = loader.route_modules(arch, "bwd")
+    thresholds = _backward_thresholds(arch)
+    if not thresholds:
+        pytest.skip(
+            f"the backward route on {arch} ships one program ({names[0]}); nothing switches"
+        )
+    channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
+    launched = set()
+    for S, docs in ((5, (2, 0, 3)), (1000, "perf")):
+        for C in channels:
+            selected = loader.selected_modules(arch, "bwd", C=C, S=S)
+            assert len(selected) == 1, f"S={S} C={C}: {selected}"
+            launched.add(selected[0])
+            workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
+            # Poison the whole buffer (sized for the largest grid of the route): the selected program must
+            # rewrite every partial row it reduces.
+            workspace.view(torch.float32).fill_(float("nan"))
+            _check(
+                S,
+                C,
+                docs,
+                workspace=workspace,
+                label=f"S={S} C={C} docs={docs} program={selected[0]}",
+            )
+    assert launched == set(names), f"never launched {set(names) - launched}"
+
+
+@pytest.mark.parametrize("case", CASES, ids=_case_id)
+def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
+    """A row the channel count routes to a selected program gets the same ``dx`` bits as the fallback program
+    launched on its own grid and partial rows; whether ``dweight`` agrees too (the fixed-order partition
+    follows each grid) is reported, not asserted."""
+
+    S, C, docs = case
+    arch = _arch()
+    fallback = _fallback_program(arch)
+    selected = loader.selected_modules(arch, "bwd", C=C, S=S)[0]
+    if selected == fallback:
+        pytest.skip(f"S={S} C={C} runs the fallback program {fallback} on {arch}")
+    device = _device()
+    x, w, cu, dy = _inputs(S, C, docs)
+    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
+    record = loader.MODULES[fallback]
+    scalars = loader.plan(
+        S, C, int(cu.numel()) - 1, geometry=record["grid_rule"]["geometry"]
+    )
+    grid_x = loader.launch_grid(record, device_index=device.index)[0]
+    rows = loader.partial_rows(grid_x, scalars["n_ch_tiles"])
+    dx_fallback = torch.full_like(dx, float("nan"))
+    dw_fallback = torch.full_like(dw, float("nan"))
+    partial = torch.full(
+        (rows, C, WIDTH), float("nan"), dtype=torch.float32, device=device
+    )
+    values = {
+        "x": x,
+        "w": w,
+        "cu": cu,
+        "dy": dy,
+        "dx": dx_fallback,
+        "dw": dw_fallback,
+        "partial": partial,
+        **{key: int(scalars[key]) for key in loader.LOGICAL_SCALARS},
+    }
+    loader.run_module(fallback, values, device_index=device.index)
+    torch.cuda.synchronize(device)
+    assert torch.equal(dx, dx_fallback), (
+        f"dx of {selected} differs from the fallback program {fallback} at S={S} C={C}"
+    )
+    same_dw = torch.equal(dw, dw_fallback)
+    print(
+        f"dweight of {selected} vs {fallback} at S={S} C={C}: "
+        + ("identical" if same_dw else "differs (each grid's fixed-order partition)")
+    )
 
 
 def test_preallocated_outputs_are_written_in_place() -> None:
@@ -527,13 +654,19 @@ def test_autograd_end_to_end() -> None:
 
 
 def test_changing_shapes_in_one_process_do_not_rebuild() -> None:
-    _check(64, 128, None)
+    arch = _arch()
+    # One shape per backward program of the route: C = 128 runs the fallback program, each channel threshold
+    # its own program.  The shape loop below must then load nothing.
+    for C in (128, *_backward_thresholds(arch)):
+        _check(64, C, None)
     loaded_before = loader.load.cache_info().misses
     for S, C, docs in (
         (1, 128, None),
         (65, 256, (64, 1)),
         (5, 136, (2, 0, 3)),
         (1000, 512, "perf"),
+        (4097, 2048, (1000, 0, 3, 3094)),
+        (4097, 1024, (0, 4097, 0)),
     ):
         _check(S, C, docs)
     assert loader.load.cache_info().misses == loaded_before, (
@@ -543,9 +676,20 @@ def test_changing_shapes_in_one_process_do_not_rebuild() -> None:
 
 def test_workspace_bytes_and_layout() -> None:
     device = _device()
-    arch = loader.arch_for_capability(_capability())
+    arch = _arch()
+    # The capacity owner: the backward program with the largest grid of the route sizes the public buffer.
     record = loader.workspace_record(arch)
+    owners = loader.workspace_owners(arch)
+    assert record in owners
+    assert record is loader.MODULES[_fallback_program(arch)], (
+        "the public workspace size is the fallback program's, unchanged by the"
+        " programs a channel count selects"
+    )
+    assert record["grid_rule"]["ctas_per_sm"] == max(
+        owner["grid_rule"]["ctas_per_sm"] for owner in owners
+    )
     geometry = record["grid_rule"]["geometry"]
+    assert all(owner["grid_rule"]["geometry"] == geometry for owner in owners)
     grid = loader.launch_grid(record, device_index=device.index)[0]
     assert grid == record["grid_rule"]["ctas_per_sm"] * loader.sm_count(device.index)
     for C in (128, 136, 8192):
@@ -561,8 +705,30 @@ def test_workspace_bytes_and_layout() -> None:
             == -(-grid // n_ch_tiles)
         )
         assert small == layout["total_bytes"] == 4 * WIDTH * C * layout["rows"]
-    # One channel tile holds up to threads x vec channels (a partial row per CTA): 512 for the backward's four
-    # channels per thread; 8192 channels are sixteen tiles; C = 136 is 34 channel vectors (three sub-tiles of 34).
+        assert small == max(
+            loader.workspace_layout(owner, C, device_index=device.index)["total_bytes"]
+            for owner in owners
+        )
+    # The program a channel count selects writes the leading rows of its own grid inside that buffer, never
+    # more than the capacity owner's rows (both sides of every threshold and the widest perf row).
+    for T in _backward_thresholds(arch):
+        for C in (T - 8, T, 8192):
+            selected = loader.MODULES[loader.selected_modules(arch, "bwd", C=C)[0]]
+            _, _, n_ch_tiles = loader.channel_split(
+                C, geometry=selected["grid_rule"]["geometry"]
+            )
+            rows = loader.partial_rows(
+                loader.launch_grid(selected, device_index=device.index)[0], n_ch_tiles
+            )
+            capacity = loader.workspace_layout(record, C, device_index=device.index)
+            assert rows <= capacity["rows"], (C, selected["library"])
+            assert (
+                loader.partial_bytes(selected, C, rows)
+                <= cake_causal_conv1d_train_backward_workspace_bytes(1, C, device)
+                == capacity["total_bytes"]
+            )
+    # One channel tile holds up to threads x vec channels (a partial row per CTA): 1024 for the backward's eight
+    # channels per thread; 8192 channels are eight tiles; C = 136 is 17 channel vectors (seven sub-tiles of 17).
     vec, threads = geometry["vec"], geometry["threads"]
     assert loader.channel_split(threads * vec, geometry=geometry) == (threads, 1, 1)
     assert loader.channel_split(8192, geometry=geometry) == (
@@ -675,6 +841,18 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert set(record["logical"].values()) <= set(loader.LOGICAL_TENSORS) | set(
             loader.LOGICAL_SCALARS
         )
+        # The selection vocabulary: forward records carry no rule; a backward rule is
+        # ``channels_at_least`` with one positive multiple-of-8 threshold per architecture it names.
+        rule = loader.select_rule(record)
+        if record["role"] == "fwd":
+            assert rule is None, name
+        if rule is not None:
+            assert record["role"] == "bwd", name
+            assert set(rule) == {"kind", "channels"}, name
+            assert rule["kind"] in loader.SELECT_KINDS, name
+            assert set(rule["channels"]) <= set(record["arches"]), name
+            for threshold in rule["channels"].values():
+                assert threshold > 0 and threshold % loader.CHANNEL_MULTIPLE == 0, name
         for arch in record["arches"]:
             library = loader.library_name(name, arch)
             referenced.add(library)
@@ -696,3 +874,35 @@ def test_registry_records_reference_the_build_manifest() -> None:
     backward = loader.workspace_record("sm_100a")
     assert backward["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
     assert backward["launch"]["cooperative"] is True
+    # Every backward route: exactly one fallback record, at most one record whose rule names the
+    # architecture, one program selected per channel count, and the forward route selects nothing.
+    for arch in loader.ARCHES:
+        names = loader.route_modules(arch, "bwd")
+        rules = {name: loader.select_rule(loader.MODULES[name]) for name in names}
+        fallbacks = [name for name, rule in rules.items() if rule is None]
+        positives = [
+            name
+            for name, rule in rules.items()
+            if rule is not None and arch in rule["channels"]
+        ]
+        assert len(fallbacks) == 1, (arch, fallbacks)
+        assert len(positives) <= 1, (arch, positives)
+        for name in positives:
+            threshold = int(rules[name]["channels"][arch])
+            assert loader.selected_modules(arch, "bwd", C=threshold) == (name,)
+            assert loader.selected_modules(arch, "bwd", C=threshold - 8) == (
+                fallbacks[0],
+            )
+        for C in (8, 128, 512, 1024, 8192):
+            selected = loader.selected_modules(arch, "bwd", C=C, S=1)
+            assert len(selected) == 1 and selected[0] in names, (arch, C, selected)
+        assert loader.selected_modules(arch, "fwd", C=512) == loader.route_modules(
+            arch, "fwd"
+        )
+        owners = loader.workspace_owners(arch)
+        assert [owner["library"] for owner in owners] == list(names)
+        for owner in owners:
+            assert owner["role"] == "bwd"
+            assert owner["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
+            assert owner["launch"]["cooperative"] is True
+        assert loader.workspace_record(arch) in owners

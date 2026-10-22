@@ -43,6 +43,9 @@ import numbers
 import struct
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
+from ._compile_cache import build_and_load_attention_kernel
+from ._hardware import get_max_active_clusters
+
 import torch
 
 from .vc_attention import (
@@ -1479,7 +1482,6 @@ def _make_context_scheduler_probe(
     """Build the common static probe and logical work count for policy."""
 
     import cutlass
-    import cutlass.utils as utils
 
     dtype_map = {
         torch.float16: cutlass.Float16,
@@ -1506,7 +1508,7 @@ def _make_context_scheduler_probe(
         max_kv_len=max_kv_len,
     )
     with torch.cuda.device(geometry.device_index):
-        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+        max_active_clusters = get_max_active_clusters(1)
     num_seq_tiles = (
         geometry.max_seq_len_q + probe.cfg.cta_tiler[0] - 1
     ) // probe.cfg.cta_tiler[0]
@@ -1787,7 +1789,6 @@ def _get_compiled_context(
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
-    import cutlass.utils as utils
 
     dtype_map = {
         "float16": cutlass.Float16,
@@ -1799,7 +1800,7 @@ def _get_compiled_context(
     output_dtype = dtype_map[output_dtype_key]
     has_variable_window = mask_type == "variable_window"
     with torch.cuda.device(device_index):
-        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+        max_active_clusters = get_max_active_clusters(1)
     fmha = _make_context_kernel(
         device_index=device_index,
         input_qk_dtype=input_qk_dtype,
@@ -1982,8 +1983,8 @@ def _get_compiled_context(
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
-    with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
+    def compile_kernel():
+        return cute.compile[cute.FrontendNext](
             tensor_adapter,
             q_fake,
             k_fake,
@@ -2004,6 +2005,16 @@ def _get_compiled_context(
             max_seq_len_k,
             compile_spec.vc.repair_tiles if vc_attention else 0,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled = build_and_load_attention_kernel(
+            "context",
+            "main",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(max_active_clusters,),
         )
     policy = (
         ("scheduler", scheduler),
@@ -2044,7 +2055,6 @@ def _get_compiled_paged_context(
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
-    import cutlass.utils as utils
 
     dtype_map = {
         "float16": cutlass.Float16,
@@ -2055,7 +2065,7 @@ def _get_compiled_paged_context(
     input_pv_dtype = dtype_map[pv_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     with torch.cuda.device(device_index):
-        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+        max_active_clusters = get_max_active_clusters(1)
     fmha = _make_context_kernel(
         device_index=device_index,
         input_qk_dtype=input_qk_dtype,
@@ -2159,8 +2169,8 @@ def _get_compiled_paged_context(
     seq_lens_fake = fake_compact(cutlass.Int32, (batch_size,), 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
+    def compile_kernel():
+        return cute.compile[cute.FrontendNext](
             tensor_adapter,
             q_fake,
             k_fake,
@@ -2176,6 +2186,16 @@ def _get_compiled_paged_context(
             max_seq_len_q,
             max_kv_len,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled = build_and_load_attention_kernel(
+            "context",
+            "paged",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(max_active_clusters,),
         )
     policy = (
         ("scheduler", scheduler),

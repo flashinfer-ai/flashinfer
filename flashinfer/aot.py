@@ -174,9 +174,8 @@ from .jit.cake_minimax_h3_nvfp4 import (
     MiniMaxH3Nvfp4Target,
     gen_minimax_h3_nvfp4_aot_modules,
 )
-from .jit.cake_minimax_h3_qkv_pack import (
-    MiniMaxH3QkvPackTarget,
-    gen_minimax_h3_qkv_pack_aot_modules,
+from .jit.cake_minimax_h3_qkv_quantize_pack import (
+    aot_specs as gen_cake_minimax_h3_qkv_quantize_pack_aot_modules,
 )
 from .jit.mla import (
     gen_mla_module,
@@ -194,6 +193,13 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
 from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
+from .jit.cake_fused_qk_rope_fp8_append import (
+    # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
+    aot_specs as gen_cake_fused_qk_rope_fp8_append_aot_modules,
+)
+from .jit.cake_grouped_mxfp8_quantize import (
+    aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
+)
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
@@ -735,6 +741,16 @@ def gen_all_modules(
     # programs (other targets JIT it on first use).
     if has_sm100a_exact or has_sm103a_exact:
         jit_specs.append(gen_mla_kv_pack_fp8_module())
+    # Cake fused QK RMSNorm + NeoX RoPE + FP8 E4M3 quantize + paged KV append: one
+    # program, one library per exact target (module ``<program>_<target>_<digest>``).
+    # The sm_90a row follows the fa3 precedent (``has_sm90``: no exact sm90a flag
+    # exists); the Blackwell rows use the exact flags like the Cake programs above.
+    if has_sm90:
+        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_90a"))
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
@@ -764,15 +780,20 @@ def gen_all_modules(
         if enabled:
             jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
 
-    minimax_h3_qkv_pack_targets: tuple[tuple[MiniMaxH3QkvPackTarget, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_qkv_pack_target, enabled in minimax_h3_qkv_pack_targets:
-        if enabled:
-            jit_specs.extend(
-                gen_minimax_h3_qkv_pack_aot_modules(minimax_h3_qkv_pack_target)
-            )
+    # Cake MiniMax-H3 QKV quantize-and-pack: eight generated programs (NVFP4 /
+    # MXFP8 x P in 1, 2, 4, 8), each an exact sm_100a / sm_103a library.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_103a"))
+
+    # Cake grouped MXFP8 quantize (backend="cake" of mxfp8_grouped_quantize):
+    # the bfloat16 and float16 programs, one library each per exact Blackwell
+    # target; the loader spells the targets "sm_100a" / "sm_103a".
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_103a"))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.

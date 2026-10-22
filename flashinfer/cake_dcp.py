@@ -413,18 +413,28 @@ def dcp_balanced_n_rows(kind: str, q_len: int) -> int:
 
 
 def dcp_balanced_program(
-    kind: str, *, batch_size: int, num_kv_heads: int, sm_count: int
+    kind: str,
+    *,
+    batch_size: int,
+    num_kv_heads: int,
+    max_pages_per_seq: int,
+    sm_count: int,
 ) -> Optional[int]:
     """The traced program a balanced family's launch runs, or ``None`` for a one-program family.
 
-    The E4M3 head_dim-128 family ships its program with and without the
-    idle-CTA eight-slice fold of split tiles.  That fold needs chunk tickets
-    plus eight reduce tickets per split tile within the grid (one persistent
-    CTA per multiprocessor), and every (request, KV head) pair is at least one
-    chunk ticket, so a launch with ``batch_size * num_kv_heads >= sm_count``
-    can never take it and runs the program without that fold body (identical
-    plan and fold order).  Mirrors the manifest's ``program_variants`` rule from
-    host metadata only.
+    The E4M3 head_dim-128 family ships three programs.  At or above the grid
+    (``batch_size * num_kv_heads >= sm_count``: one persistent CTA per
+    multiprocessor and every (request, KV head) pair at least one chunk ticket)
+    the idle-CTA eight-slice fold of split tiles can never be taken, so the
+    launch runs the program without that fold body (``at_or_above_grid``;
+    identical plan and fold order).  Below the grid, a launch whose page-table
+    width (``max_pages_per_seq``, the ``block_tables`` width) bounds every pair
+    to ``n_max >= min_chunks`` chunks of ``chunk_tokens`` and whose
+    ``batch_size * num_kv_heads * (n_max + reduce_tickets_per_tile)`` tickets
+    fit the grid runs the plan-free static one-wave program
+    (``static_one_wave``: ticket = CTA index, no device planner); every other
+    launch runs the default planner program (``below_grid``).  Mirrors the
+    manifest's ``program_variants`` rule from host metadata only.
     """
 
     _check_dcp_balanced_kind(kind)
@@ -442,8 +452,22 @@ def dcp_balanced_program(
         raise ValueError(f"sm_count must be positive, got {sm_count}")
     if int(batch_size) <= 0 or int(num_kv_heads) <= 0:
         raise ValueError("batch_size and num_kv_heads must be positive")
-    below_grid = int(batch_size) * int(num_kv_heads) < int(sm_count)
-    return int(variants["below_grid"] if below_grid else variants["at_or_above_grid"])
+    if int(max_pages_per_seq) <= 0:
+        raise ValueError(f"max_pages_per_seq must be positive, got {max_pages_per_seq}")
+    tiles = int(batch_size) * int(num_kv_heads)
+    if tiles >= int(sm_count):
+        return int(variants["at_or_above_grid"])
+    regime = variants["static_one_wave_regime"]
+    n_max = -(
+        -int(max_pages_per_seq)
+        * int(regime["page_size"])
+        // int(regime["chunk_tokens"])
+    )
+    if n_max >= int(regime["min_chunks"]) and tiles * (
+        n_max + int(regime["reduce_tickets_per_tile"])
+    ) <= int(sm_count):
+        return int(variants["static_one_wave"])
+    return int(variants["below_grid"])
 
 
 def dcp_balanced_items_bound(
@@ -706,7 +730,11 @@ def _run_dcp_spec_balanced(
         target,
         dcp_balanced_n_rows(kind, q_len_per_req),
         dcp_balanced_program(
-            kind, batch_size=batch_size, num_kv_heads=num_kv_heads, sm_count=sm_count
+            kind,
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+            max_pages_per_seq=int(block_tables.shape[1]),
+            sm_count=sm_count,
         ),
     )
     if kind == "bf16_p16":

@@ -566,6 +566,7 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
+        self._routing_checks: dict[tuple, Any] = {}
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
         # Per-call NVFP4 epilogue scalars bound straight into the launch (no copy
@@ -813,6 +814,7 @@ class Sm107BlockScaledSymmBuffer:
         self._compiled = None
         self._launch_kwargs = None
         self._launch_weights = None
+        self._routing_checks.clear()
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
         self._bound_scalars = {}
@@ -823,6 +825,10 @@ class Sm107BlockScaledSymmBuffer:
             comm.free_sym_tensor(self.output_activation)
         self.output_activation = None
         self.local_workspace = None
+        if self.config.quant_kind == "nvfp4":
+            from ....sm100.cutedsl_megamoe.shim.quant_stage import forget_staged_tokens
+
+            forget_staged_tokens(self.topk_idx)
         self.topk_idx = None
         self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
         self._destroyed = True

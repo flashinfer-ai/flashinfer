@@ -358,6 +358,35 @@ def bsa_attn_sm120_blk64_fwd(
     return out, lse if return_lse else None
 
 
+def _sm120_module_key(
+    *,
+    has_block_nums: bool,
+    block_sizes_mode: int,
+    seqlen_k: int,
+    uniform_block_count: bool,
+    contiguous_block_indices: bool,
+    block_sparse_num: int,
+) -> tuple[int, int, int, int, int]:
+    """Select the generated SM120 kernel specialization for one call.
+
+    The key is ``(HAS_BLOCK_NUMS, BLOCK_SIZES_MODE, FULL_K64_TILES,
+    UNIFORM_NONEMPTY, CONTIGUOUS_BLOCK_INDICES)``.  Per-row counts are unused
+    under a uniform count, whole 64-token K tiles are only assumed without
+    declared block sizes, and a contiguous selection only changes the kernel
+    once a row has a block to load: with ``block_sparse_num == 0`` every
+    specialization writes zeros, so the contiguous flag is cleared together
+    with ``UNIFORM_NONEMPTY``.
+    """
+    uniform_nonempty = int(uniform_block_count and block_sparse_num > 0)
+    return (
+        int(has_block_nums and not uniform_block_count),
+        int(block_sizes_mode),
+        int(block_sizes_mode == 0 and seqlen_k % _BLOCK_SIZE == 0),
+        uniform_nonempty,
+        int(contiguous_block_indices and uniform_nonempty),
+    )
+
+
 def _bsa_attn_sm120_blk64_sage_fwd_cake(
     q_int8: torch.Tensor,
     k_int8: torch.Tensor,
@@ -489,7 +518,6 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
         ):
             raise ValueError("q2k_block_nums must be contiguous int32 [B,H,Q64]")
     q2k_nums_arg = q2k_block_index if q2k_block_nums is None else q2k_block_nums
-    has_block_nums = int(q2k_block_nums is not None and not uniform_block_count)
 
     block_sizes_mode = 0
     if block_sizes is not None:
@@ -514,14 +542,15 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
     if not math.isfinite(float(softmax_scale)) or float(softmax_scale) <= 0.0:
         raise ValueError("softmax_scale must be finite and positive")
 
-    full_k64_tiles = int(block_sizes_mode == 0 and seqlen_k % _BLOCK_SIZE == 0)
-    uniform_nonempty = int(uniform_block_count and block_sparse_num > 0)
     module = load_cake_sage_block_sparse_attention_module(
-        has_block_nums,
-        block_sizes_mode,
-        full_k64_tiles,
-        uniform_nonempty,
-        int(contiguous_block_indices),
+        *_sm120_module_key(
+            has_block_nums=q2k_block_nums is not None,
+            block_sizes_mode=block_sizes_mode,
+            seqlen_k=seqlen_k,
+            uniform_block_count=uniform_block_count,
+            contiguous_block_indices=contiguous_block_indices,
+            block_sparse_num=block_sparse_num,
+        )
     )
     with tvm_ffi.use_torch_stream():
         module.run(

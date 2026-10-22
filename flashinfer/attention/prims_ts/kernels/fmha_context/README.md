@@ -421,5 +421,5 @@ output state.
 
 ```bash
 pytest -q tests/attention/test_attention_ts_context.py
-pytest -q tests/attention/test_attention_ts_mask.py
+pytest -q tests/attention/test_attention_ts_features.py
 ```
