@@ -392,10 +392,11 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   (`cake_lm_head_loss_<unit>_kernel.cu`, one architecture-neutral unit per
   kernel family shared by the records of both architectures, the sibling
   forms of a family selected by compile definitions and the per-architecture
-  lowering under `__CUDA_ARCH__` guards -- except the four logits GEMM forms,
-  whose sm_103a lowering stages the C tile in shared memory for a TMA store
-  behind a six-stage operand pipeline while sm_100a stores from registers
-  behind seven, so each of those has one unit per architecture) and their launch stubs
+  lowering under `__CUDA_ARCH__` guards -- the four logits GEMM forms share
+  one unit across both architectures, and their sm_103a lowering, which
+  stages the C tile in shared memory for a TMA store behind a six-stage
+  operand pipeline while sm_100a stores from registers behind seven, sits in
+  a definition-keyed arm of it) and their launch stubs
   (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL`, the compile definitions the
   shared launcher reads for that kernel, + the include of the shared
   launcher); `csrc/cake_lm_head_loss/shim/` -- the shared tvm-ffi launchers
