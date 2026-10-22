@@ -711,7 +711,7 @@ void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView g
   if (producer_family >= 0) {
     nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
         x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, producer_family, tiling0, tiling1,
-        tiling2, address_policy, producer_family == 4 && enable_pdl);
+        tiling2, address_policy, (producer_family == 4 || producer_family == 1) && enable_pdl);
     return;
   }
   nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,

@@ -286,7 +286,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   // a CTA's fragments, shared accumulator and K split do not depend on it.
   static_assert(Rank == 32 || Rank == 64 || Rank == 128);
   static_assert(!PackedL2T || Rank == 32);
-  static_assert(!SignalLaunch || PackedL2T, "launch signaling requires packed L2T");
+  static_assert(!SignalLaunch || PackedL2T || Rank == 128,
+                "launch signaling is built for packed L2T and rank 128 only");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   if constexpr (SignalLaunch) {
     // The PDL consumer can set up early, but waits for this grid before reading outputs.
@@ -1581,10 +1582,18 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   // The small-M kernel tiles the rank into DownTileCols-wide column tiles, so
   // every compiled rank reuses the same tilings.
   if (family == 1) {
-#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                            \
-  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                      \
-    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(    \
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
+    // At rank 128 the linear route lets the PDL-launched GEMM start its prologue
+    // while this prefix runs; the GEMM waits on the grid before reading outputs.
+#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                               \
+  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                         \
+    if constexpr (Rank == 128) {                                                        \
+      if (signal_launch) {                                                              \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank>(    \
+            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
+      }                                                                                 \
+    }                                                                                   \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(       \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);    \
   }
     FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
 #undef FI_SVDQ_SMALL_CASE
