@@ -2256,6 +2256,7 @@ def qsa_sparse_paged_attention(
     output_gate: torch.Tensor,
     k_sf: torch.Tensor,
     v_sf: torch.Tensor,
+    backend: str = "default",
 ) -> torch.Tensor:
     r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM90.
 
@@ -2287,12 +2288,40 @@ def qsa_sparse_paged_attention(
         ``bf16(attention) * sigmoid(output_gate)``.
     k_sf, v_sf : torch.Tensor
         E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16 dims.
+    backend : str
+        ``"default"`` runs the reference implementation; ``"cake"`` runs the Cake
+        kernels of :mod:`flashinfer.experimental.cake_qsa_nvfp4` (the same contract,
+        its own split and merge plan). Any other value raises ``ValueError``.
 
     Returns
     -------
     torch.Tensor
         ``out`` when given, otherwise a new tensor.
     """
+    if backend == "cake":
+        from .experimental.cake_qsa_nvfp4.cake_backend import (
+            qsa_sparse_paged_attention as run_cake,
+        )
+
+        return run_cake(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config,
+            out,
+            k_scale,
+            v_scale,
+            output_gate=output_gate,
+            k_sf=k_sf,
+            v_sf=v_sf,
+        )
+    if backend != "default":
+        raise ValueError(
+            f"unsupported qsa_sparse_paged_attention backend: {backend!r}"
+        )
     from .experimental.qsa_nvfp4.backend import qsa_sparse_paged_attention as run
 
     return run(
