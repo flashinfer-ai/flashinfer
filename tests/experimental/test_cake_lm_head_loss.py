@@ -889,11 +889,8 @@ def test_grid_dims_holds_no_reference_to_the_host_values():
             "out": None,
         }
         assert grid_dims(
-            ["max(1, min(m_tiles//4*24, resident))*4", "rows_c/8", "num_vecs"],
-            scalars,
-            148,
-            resident=30,
-        ) == (120, 513, 9)
+            ["max(1, m_tiles//4*24)*4", "rows_c/8", "num_vecs"], scalars, 148
+        ) == (768, 513, 9)
         del scalars, acc
         assert ref() is None, (
             "grid_dims left a reference cycle over the host values (freed only by the cyclic GC)"
@@ -949,19 +946,6 @@ def test_grid_dims():
 
 def test_grid_dims_resident():
     scalars = {"m_tiles": 32}
-    # a persistent four-CTA cluster grid is capped by the co-resident clusters (the occupancy answer, not sms // 4)
-    assert grid_dims(
-        ["max(1, min(m_tiles//4*24, resident))*4", 1, 1], scalars, 148, resident=33
-    ) == (132, 1, 1)
-    assert grid_dims(
-        ["max(1, min(m_tiles//4*24, resident))*4", 1, 1],
-        {"m_tiles": 4},
-        148,
-        resident=33,
-    ) == (96, 1, 1)
-    assert grid_dims(
-        ["max(1, min(m_tiles//2*24, resident))*2", 1, 1], scalars, 148, resident=74
-    ) == (148, 1, 1)
     # a dynamically scheduled kernel launches its whole work-item domain
     assert grid_dims(["max(1, m_tiles//2*605)*2", 1, 1], scalars, 148) == (19360, 1, 1)
     with pytest.raises(
@@ -2107,7 +2091,7 @@ def test_cluster_resident_rule():
         and cluster_resident(None, 2, 152) == 76
         and cluster_resident(None, 1, 5) == 5
     )
-    with pytest.raises(ValueError):  # wider clusters take the device's occupancy answer
+    with pytest.raises(ValueError):  # only one- and two-CTA clusters are supported
         cluster_resident(None, 4, 148)
     with pytest.raises(ValueError):
         cluster_resident(torch.device("cpu"), 4, 148)
@@ -2127,23 +2111,6 @@ def test_wave_efficiency_uses_the_dx_cluster():
     assert recommended_k_slices(4096, 6144, 148, 4, g2) == recommended_k_slices(
         4096, 6144, 148, 4, g2, resident=74
     )
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="the cluster occupancy probe needs a CUDA device",
-)
-def test_device_cluster_resident_probe():
-    device = torch.device("cuda", torch.cuda.current_device())
-    if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
-        pytest.skip(
-            "thread-block clusters of four CTAs are probed on the supported parts only"
-        )
-    sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
-    four = cluster_resident(device, 4, sms)
-    assert 1 <= four <= sms // 4
-    assert cluster_resident(device, 4, sms) == four  # cached per (device, width)
-    assert cluster_resident(device, 2, sms) == sms // 2
 
 
 def test_stage_values_names():

@@ -351,12 +351,11 @@ Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 host from the chunk scalars.  A GEMM stage runs in thread-block clusters whose
 CTA count the record's geometry declares per GEMM (`logits_cluster_ctas`,
 `dx_cluster_ctas`, `dw_cluster_ctas`; the host rounds `m_tiles` up to it and
-checks it against the module's launch cluster): a statically scheduled
-instance launches a persistent grid capped by `resident`, the device's
-co-resident clusters of that width (`cluster_resident`: the SM pairs for a
-two-CTA cluster, the driver's occupancy answer for wider ones), while a
-dynamically scheduled instance launches its whole work-item domain.  The
-`dX` K-slice rule uses the same co-resident count.  A GEMM compiled for the
+checks it against the module's launch cluster): every registered GEMM
+instance launches a grid over its whole work-item domain (no grid rule reads
+a co-resident cluster count), and the `dX` K-slice rule uses the device's
+co-resident two-CTA clusters (`cluster_resident`: the SM pair
+count).  A GEMM compiled for the
 preferred-cluster launch (the generated host binding passes the preferred
 cluster dimension next to the required one, so the hardware forms the wider
 clusters where the GPC topology allows and the required ones elsewhere)

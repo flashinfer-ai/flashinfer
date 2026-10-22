@@ -1042,94 +1042,18 @@ def recommended_k_slices(
     return best
 
 
-# --------------------------------------------------------------------------- co-resident clusters
-
-_PROBE_KERNEL = "cake_lm_head_loss_cluster_probe"
-_PROBE_SOURCE = f'extern "C" __global__ void {_PROBE_KERNEL}() {{}}\n'
-
-
-@functools.lru_cache(maxsize=None)
-def _probe_cluster_capacity(device_index: int, cluster_ctas: int) -> int:
-    """``cuOccupancyMaxActiveClusters`` of an empty probe kernel launched with the device's maximum opt-in dynamic shared
-    memory (one CTA per SM) in ``cluster_ctas``-wide clusters.  The part's GPC topology after floorsweeping decides the
-    answer, not ``SMs // cluster_ctas`` (a 148-SM B200 holds 33 four-CTA clusters, a 152-SM GB300 36)."""
-    from ...cuda_utils import checkCudaErrors, driver, nvrtc
-
-    with torch.cuda.device(device_index):
-        torch.empty(1, device="cuda")  # primary context
-        major, minor = torch.cuda.get_device_capability(device_index)
-        prog = checkCudaErrors(
-            nvrtc.nvrtcCreateProgram(_PROBE_SOURCE.encode(), b"probe.cu", 0, [], [])
-        )
-        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
-        checkCudaErrors(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
-        size = checkCudaErrors(nvrtc.nvrtcGetCUBINSize(prog))
-        cubin = b" " * size
-        checkCudaErrors(nvrtc.nvrtcGetCUBIN(prog, cubin))
-        checkCudaErrors(nvrtc.nvrtcDestroyProgram(prog))
-        ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(device_index))
-        try:
-            checkCudaErrors(driver.cuCtxSetCurrent(ctx))
-            module = checkCudaErrors(driver.cuModuleLoadData(cubin))
-            try:
-                func = checkCudaErrors(
-                    driver.cuModuleGetFunction(module, _PROBE_KERNEL.encode())
-                )
-                smem = checkCudaErrors(
-                    driver.cuDeviceGetAttribute(
-                        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-                        device_index,
-                    )
-                )
-                checkCudaErrors(
-                    driver.cuFuncSetAttribute(
-                        func,
-                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        smem,
-                    )
-                )
-                attr = driver.CUlaunchAttribute()
-                attr.id = (
-                    driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
-                )
-                attr.value.clusterDim.x = int(cluster_ctas)
-                attr.value.clusterDim.y = 1
-                attr.value.clusterDim.z = 1
-                config = driver.CUlaunchConfig()
-                config.gridDimX = int(cluster_ctas)
-                config.gridDimY = 1
-                config.gridDimZ = 1
-                config.blockDimX = 128
-                config.blockDimY = 1
-                config.blockDimZ = 1
-                config.sharedMemBytes = smem
-                config.attrs = [attr]
-                config.numAttrs = 1
-                count = int(
-                    checkCudaErrors(driver.cuOccupancyMaxActiveClusters(func, config))
-                )
-            finally:
-                checkCudaErrors(driver.cuModuleUnload(module))
-        finally:
-            checkCudaErrors(driver.cuDevicePrimaryCtxRelease(device_index))
-    return max(1, count)
-
-
 def cluster_resident(
     device: Optional[torch.device], cluster_ctas: int, num_sms: int
 ) -> int:
     """Co-resident clusters of ``cluster_ctas`` CTAs at one CTA per SM on ``device``: the SM pairs for the two-CTA
-    cluster (the source launcher's rule), the driver's occupancy answer (:func:`_probe_cluster_capacity`) for wider
-    clusters.  The persistent GEMM grids and the dX slice rule take it as ``resident``."""
+    cluster (the source launcher's rule).  Every registered launch is one or two CTAs wide; a wider cluster is
+    rejected.  The dX slice rule takes it as ``resident``."""
     cluster_ctas = int(cluster_ctas)
     if cluster_ctas <= 2:
         return max(1, int(num_sms) // max(1, cluster_ctas))
-    if device is None or device.type != "cuda":
-        raise ValueError(
-            f"the co-resident count of {cluster_ctas}-CTA clusters needs a CUDA device"
-        )
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return _probe_cluster_capacity(int(index), cluster_ctas)
+    raise ValueError(
+        f"the co-resident count of {cluster_ctas}-CTA clusters is not supported: every registered launch is one or two CTAs wide"
+    )
 
 
 def _dx_reduce(values: dict[str, Any]) -> None:
@@ -2468,21 +2392,15 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
 _GRID_FUNCTIONS = {"min": min, "max": max}
 
 
-def grid_dims(
-    rule, scalars: dict[str, Any], num_sms: int, resident: Optional[int] = None
-) -> tuple[int, int, int]:
+def grid_dims(rule, scalars: dict[str, Any], num_sms: int) -> tuple[int, int, int]:
     """Evaluate a registry grid rule.
 
     Each of the three entries is an integer or an integer expression over the
     scalar names of the stage's host values (``rows_c``, ``m_tiles``, ``V``,
-    ``num_vecs``, ...), ``sms`` (the SM count) and ``resident`` (the co-resident
-    clusters of the stage's cluster width, :func:`cluster_resident`; only a
-    clustered stage provides it) with ``+``, ``-``, ``*``, ``/`` (rounds up),
-    ``//`` (rounds down), parentheses and ``min`` / ``max``: ``"rows_c/8"`` (one
-    CTA per eight rows), ``"max(1, min(m_tiles//4*24, resident))*4"`` (a
-    persistent four-CTA cluster grid capped by the co-resident clusters),
-    ``"max(1, m_tiles//2*605)*2"`` (the whole work-item domain of a dynamically
-    scheduled kernel).
+    ``num_vecs``, ...) and ``sms`` (the SM count) with ``+``, ``-``, ``*``,
+    ``/`` (rounds up), ``//`` (rounds down), parentheses and ``min`` / ``max``:
+    ``"rows_c/8"`` (one CTA per eight rows), ``"max(1, m_tiles//2*605)*2"`` (the
+    whole work-item domain of a dynamically scheduled kernel).
     """
     if len(rule) != 3:
         raise ValueError("grid rule must have three entries")
@@ -2495,8 +2413,6 @@ def grid_dims(
         if isinstance(value, int) and not isinstance(value, bool)
     }
     names["sms"] = int(num_sms)
-    if resident is not None:
-        names["resident"] = int(resident)
     x, y, z = (_grid_term(value, names) for value in rule)
     return max(1, x), max(1, y), max(1, z)
 
@@ -3522,16 +3438,10 @@ def _bind_all(
             raise ValueError(
                 f"stage {stage!r}: the record's geometry declares {declared}-CTA clusters, its module launches {tuple(cluster)}"
             )
-        resident = (
-            cluster_resident(device, cluster_ctas, num_sms)
-            if cluster_ctas > 1
-            else None
-        )
         grid = grid_dims(
             physical.get("grid", ["rows_c", 1, 1]),
             values[key],
             num_sms,
-            resident=resident,
         )
         if cluster_ctas > 1 and any(g % c for g, c in zip(grid, cluster, strict=True)):
             raise ValueError(
