@@ -1181,8 +1181,14 @@ class MegaMoEHopperFp8Frontend:
         )
         gin_kwargs = {}
         if c.enable_nccl_gin:
+            import cutlass
+
             gin_dev_comm, gin_window = self._gin_arena.kernel_handles()
-            gin_kwargs = dict(gin_dev_comm=gin_dev_comm, gin_window=gin_window)
+            gin_kwargs = dict(
+                gin_dev_comm=gin_dev_comm,
+                gin_window=gin_window,
+                gin_window_base=cutlass.Int64(self._gin_arena.base),
+            )
 
         return dict(
             activation=self._to_cute(inputs.activation),

@@ -889,6 +889,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # arena (every peer-visible buffer above lives inside that window).
         gin_dev_comm=None,
         gin_window=None,
+        # Int64 allocator address of the window start (window offsets of the
+        # arena regions are ``address - gin_window_base``).
+        gin_window_base=None,
     ) -> None:
         """Launch the FP8 MegaMoE-complete fused kernel.
 
@@ -1061,6 +1064,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             gin_views = dict(
                 gin_dev_comm=gin_dev_comm,
                 gin_window=gin_window,
+                gin_window_base=gin_window_base,
                 gin_recv_topk_idx=self._view_shared(
                     shared_workspace, "gin_recv_topk_idx",
                 ),

@@ -226,6 +226,7 @@ _MLIR_VALUE_FIELDS = (
     # drop out of the kernel ABI there.
     "gin_dev_comm",
     "gin_window",
+    "gin_window_base",
     "gin_recv_topk_idx",
     "gin_recv_topk_weights",
     "gin_recv_token",
@@ -297,6 +298,7 @@ class TokenCommArgs:
         fc2_output_sf: cute.Tensor = None,
         gin_dev_comm: Any = None,
         gin_window: Any = None,
+        gin_window_base: Any = None,
         gin_recv_topk_idx: cute.Tensor = None,
         gin_recv_topk_weights: cute.Tensor = None,
         gin_recv_token: cute.Tensor = None,
@@ -309,6 +311,7 @@ class TokenCommArgs:
     ):
         self.gin_dev_comm = gin_dev_comm
         self.gin_window = gin_window
+        self.gin_window_base = gin_window_base
         self.gin_recv_topk_idx = gin_recv_topk_idx
         self.gin_recv_topk_weights = gin_recv_topk_weights
         self.gin_recv_token = gin_recv_token
@@ -1083,21 +1086,19 @@ class TokenInPullTokenBackPush:
 
     @cute.jit
     def _gin_bytes(self, token_comm_args, addr, nbytes):
-        """Byte view of an arena address as a ``gin.put`` operand.
+        """``nbytes`` window bytes at arena address ``addr`` as a ``gin.put`` operand.
 
-        ``gin.put`` derives the window offset as ``iterator - win.local_pointer(0)``,
-        and the window's local pointer is NCCL's LSA alias of this rank's
-        buffer, not the allocator address the kernel otherwise uses.  The
-        node peer table maps an arena address to every node rank's LSA alias,
-        so mapping it to this rank's own slot yields the address the window
-        offset is measured from.
+        Same construction as the Blackwell path: the operand is a
+        ``Window.tensor`` view at a window byte offset.  The arena regions are
+        carved at runtime, so the offset is ``addr - gin_window_base`` (the
+        allocator address of the window start) instead of a layout constant.
+        ``Window.tensor`` resolves it through ``win.local_pointer``, NCCL's
+        own view of the registered buffer.
         """
-        alias = token_comm_args.peer_rank_ptr_mapper.map(
-            addr, Int32(self.local_rank_in_node), Int64(0)
-        )
-        return cute.make_tensor(
-            cute.make_ptr(Uint8, alias, AddressSpace.gmem, assumed_align=16),
+        return token_comm_args.gin_window.tensor(
+            Uint8,
             cute.make_layout(nbytes),
+            offset=addr - token_comm_args.gin_window_base,
         )
 
     @cute.jit
