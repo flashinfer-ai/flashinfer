@@ -136,14 +136,18 @@ class MegaMoEBf16Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated BF16 tuning configuration and invalidate its compile."""
-        from .tuner import describe_invalid_knobs, is_valid_bf16_for_config, with_knobs
+        from .tuner import (
+            describe_invalid_knobs,
+            is_valid_bf16_for_config,
+            with_checked_knobs,
+        )
 
         if not is_valid_bf16_for_config(self.config, knobs):
             raise ValueError(
                 f"unsupported BF16 MegaMoE knobs {knobs}: "
                 f"{describe_invalid_knobs(self.config, knobs, is_valid_bf16_for_config)}."
             )
-        new_config = with_knobs(self.config, knobs)
+        new_config = with_checked_knobs(self.config, knobs)
         if new_config != self._config:
             ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
@@ -465,6 +469,7 @@ def get_symm_buffer_for_bf16_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    apply_routing_weights_before_fc2: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
     use_custom_finalize: bool = False,
     knobs: Optional[dict] = None,
@@ -476,7 +481,7 @@ def get_symm_buffer_for_bf16_mega_moe(
     from .tuner import (
         describe_invalid_knobs,
         is_valid_bf16_for_config,
-        with_knobs,
+        with_checked_knobs,
     )
 
     if knobs is None:
@@ -500,6 +505,7 @@ def get_symm_buffer_for_bf16_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         use_custom_finalize=use_custom_finalize,
     )
@@ -508,7 +514,7 @@ def get_symm_buffer_for_bf16_mega_moe(
             f"unsupported BF16 MegaMoE knobs {knobs}: "
             f"{describe_invalid_knobs(cfg, knobs, is_valid_bf16_for_config)}."
         )
-    cfg = with_knobs(cfg, knobs)
+    cfg = with_checked_knobs(cfg, knobs)
 
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)

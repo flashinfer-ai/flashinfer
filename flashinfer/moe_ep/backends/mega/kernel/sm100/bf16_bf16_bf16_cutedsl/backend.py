@@ -131,6 +131,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
+            apply_routing_weights_before_fc2=config.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             knobs=self._workspace_knobs(fleet_params),
@@ -141,10 +142,9 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
                 dtype=torch.int32,
                 device=workspace.topk_idx.device,
             ).view(fleet_params.max_tokens_per_rank, config.top_k)
-            # Default BF16 folds routing into FC1; respect pinned frontend knobs.
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if workspace._frontend.config.apply_routing_weights_before_fc2
+                if config.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
         return workspace
@@ -291,6 +291,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             config.intermediate_size,
             _clamp(config),
+            config.apply_routing_weights_before_fc2,
             config.enable_in_kernel_fc2_reduce,
             config.finalize_mode,
             knobs_pool_key(self._workspace_knobs(fleet_params)),

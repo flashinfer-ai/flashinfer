@@ -173,7 +173,7 @@ class MegaMoEBf16Mxfp8Frontend:
         from .tuner import (
             describe_invalid_knobs,
             is_valid_bf16_mxfp8_for_config,
-            with_knobs,
+            with_checked_knobs,
         )
 
         if not is_valid_bf16_mxfp8_for_config(self.config, knobs):
@@ -181,7 +181,7 @@ class MegaMoEBf16Mxfp8Frontend:
                 f"unsupported mixed MegaMoE knobs {knobs}: "
                 f"{describe_invalid_knobs(self.config, knobs, is_valid_bf16_mxfp8_for_config)}."
             )
-        new_config = with_knobs(self._config, knobs)
+        new_config = with_checked_knobs(self._config, knobs)
         if new_config != self._config:
             ensure_not_capturing("apply_knobs (config change)")
             self.release()
@@ -539,7 +539,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     from .tuner import (
         describe_invalid_knobs,
         is_valid_bf16_mxfp8_for_config,
-        with_knobs,
+        with_checked_knobs,
     )
 
     if knobs is None:
@@ -575,7 +575,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
             f"unsupported mixed MegaMoE knobs {knobs}: "
             f"{describe_invalid_knobs(config, knobs, is_valid_bf16_mxfp8_for_config)}."
         )
-    config = with_knobs(config, knobs)
+    config = with_checked_knobs(config, knobs)
 
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)

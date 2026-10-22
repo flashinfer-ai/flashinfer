@@ -211,6 +211,7 @@ class MegaMoEBf16Nvfp4Frontend:
                 f"unsupported BF16/NVFP4 MegaMoE knobs {knobs}: "
                 f"{tuner.describe_invalid_knobs(self.config, knobs, tuner.is_valid_bf16_nvfp4_for_config)}."
             )
+        tuner.reject_explicit_knobs(knobs)
         # Numerical behavior belongs to the session, not the tuner.
         new_config = with_knobs(
             self.config,
@@ -839,6 +840,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         )
     else:
         resolved_knobs = {}
+    tuner.reject_explicit_knobs(knobs)
     optional_config = {
         **resolved_knobs,
         **({"token_back_mode": token_back_mode} if token_back_mode is not None else {}),

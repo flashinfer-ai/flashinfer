@@ -234,9 +234,9 @@ class MegaMoEMxfp8Frontend:
         ``token_back_mode`` is translated to this config's
         ``token_back_by_dispatch`` bool by ``with_knobs``.
         """
-        from .tuner import with_knobs
+        from .tuner import with_checked_knobs
 
-        new_config = with_knobs(self.config, knobs)
+        new_config = with_checked_knobs(self.config, knobs)
         if new_config == self._config:
             return
         ensure_not_capturing("apply_knobs (config change)")
@@ -962,7 +962,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         use_custom_finalize=use_custom_finalize,
     )
     from .knob_cache import resolve_knobs
-    from .tuner import with_knobs
+    from .tuner import with_checked_knobs
 
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the measured MXFP8 heuristic (dtype="mxfp8"; no
@@ -981,7 +981,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             use_custom_finalize=use_custom_finalize,
         )
     # TODO Add explicit validity checks
-    cfg = with_knobs(cfg, knobs)
+    cfg = with_checked_knobs(cfg, knobs)
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
     #   despite the autotuner supporting disabling ikr if it would be faster.
     #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine

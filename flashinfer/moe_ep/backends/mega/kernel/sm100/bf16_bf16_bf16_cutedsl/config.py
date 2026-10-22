@@ -18,6 +18,8 @@ class Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConfi
     kernel_name: str = "sm100_bf16_bf16_bf16_cutedsl"
     # NONE makes MoEEpMegaLayer.forward return per-route outputs.
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
+    # False multiplies the completed FP32 FC2 output by the routing weight instead.
+    apply_routing_weights_before_fc2: bool = True
 
     def __post_init__(self) -> None:
         validate_finalize_mode(

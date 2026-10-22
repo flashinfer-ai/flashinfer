@@ -354,9 +354,9 @@ class MegaMoENvfp4Frontend:
         Invalidates the compile cache when the effective config changes; the
         next ``run()``/``warmup()`` recompiles.  Used by :mod:`.autotune`.
         """
-        from .tuner import with_knobs
+        from .tuner import with_checked_knobs
 
-        new_config = with_knobs(self.config, knobs)
+        new_config = with_checked_knobs(self.config, knobs)
         if new_config == self._config:
             return
         ensure_not_capturing("apply_knobs (config change)")
@@ -1324,7 +1324,7 @@ def get_symm_buffer_for_mega_moe(
     num_experts_per_rank = num_total_experts // world_size
 
     from .knob_cache import resolve_knobs
-    from .tuner import with_knobs
+    from .tuner import with_checked_knobs
 
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the built-in token-count heuristic.  An explicit
@@ -1372,9 +1372,7 @@ def get_symm_buffer_for_mega_moe(
             "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
         ),
     )
-    cfg = with_knobs(cfg, knobs)
-    if defer_topk_reduce and not cfg.defer_topk_reduce:
-        raise ValueError("defer_topk_reduce=True cannot be disabled by knobs")
+    cfg = with_checked_knobs(cfg, knobs)
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
     #   despite the autotuner supporting disabling ikr if it would be faster.
     #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine

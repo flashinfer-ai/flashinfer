@@ -2162,8 +2162,8 @@ def test_w4a16_deferred_frontend_preserves_mode_when_applying_knobs():
     with pytest.raises(ValueError, match="use_custom_finalize requires"):
         dataclasses.replace(config, enable_in_kernel_fc2_reduce=True)
     frontend = bf16_nvfp4.MegaMoEBf16Nvfp4Frontend(config)
-    frontend.apply_knobs({"use_custom_finalize": False})
-    assert frontend.config.use_custom_finalize
+    with pytest.raises(ValueError, match="explicit config fields"):
+        frontend.apply_knobs({"use_custom_finalize": False})
     with pytest.raises(ValueError, match="unsupported BF16/NVFP4 MegaMoE knobs"):
         frontend.apply_knobs({"in_kernel_fc2_reduce": True})
 

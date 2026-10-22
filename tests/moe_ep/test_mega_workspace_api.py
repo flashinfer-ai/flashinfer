@@ -601,69 +601,21 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     assert launch.call_count == 3
 
 
-@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
-def test_nvfp4_unfinalized_weights_follow_resolved_knobs(
-    monkeypatch, apply_topk_in_fc1
-):
-    import torch
-
-    from flashinfer import moe_ep
-    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import nvfp4
-
-    def byte_view(shape, dtype):
-        tensor = torch.zeros(shape, dtype=torch.uint8)
-        return tensor, tensor
-
-    monkeypatch.setattr(nvfp4, "_sym_zeros_byte_view", byte_view)
-    monkeypatch.setattr(
-        nvfp4, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
-    )
-    monkeypatch.setattr(
-        nvfp4,
-        "_resolve_per_expert_epilogue",
-        lambda name, value, count: torch.ones(count),
-    )
-    kernel = create_mega_kernel(
-        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=128,
-            top_k=2,
-            do_finalize=False,
-            apply_topk_in_fc1=apply_topk_in_fc1,
-            knobs={"apply_topk_in_fc1": not apply_topk_in_fc1},
-        )
-    )
-    kernel.bind_ep_bootstrap(
-        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
-    )
-    workspace = kernel._allocate_workspace(moe_ep.FleetParams(2, 1, 128))
-    frontend = workspace._frontend
-    assert frontend.config.apply_topk_in_fc1 is not apply_topk_in_fc1
-    workspace.topk_weights.copy_(torch.tensor([[0.25, 0.75]]))
-    partials = torch.tensor([1.0, 2.0]).view(1, 2, 1).expand(1, 2, 128).clone()
-    if frontend.config.apply_topk_in_fc1:
-        partials *= workspace.topk_weights.unsqueeze(-1)
-    monkeypatch.setattr(
-        frontend, "deferred_topk_reduce_workspace", lambda: (partials, partials, None)
-    )
-    monkeypatch.setattr(
-        kernel, "_prepared_thunk_state", lambda *args: (None, lambda: None, None)
-    )
-    monkeypatch.setattr(cutedsl_megamoe, "staged_tokens", lambda _: 1)
-
-    rows, weights, indices = kernel.compute_unfinalized(workspace, ())
-    reduced = (rows[indices.long()] * weights.unsqueeze(-1)).sum(dim=1)
-    torch.testing.assert_close(reduced, torch.full((1, 128), 1.75))
-
-
-def test_nvfp4_deferred_output_rejects_knobs_that_disable_it(monkeypatch):
+@pytest.mark.parametrize(
+    "knobs",
+    [
+        {"apply_routing_weights_before_fc2": False},
+        {"use_custom_finalize": False},
+        {"use_persistent_finalize_kernel": True},
+    ],
+)
+def test_nvfp4_knobs_reject_explicit_config_fields(monkeypatch, knobs):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import nvfp4
 
     allocate = mock.Mock(
-        side_effect=AssertionError("allocation before mode validation")
+        side_effect=AssertionError("allocation before knob validation")
     )
     monkeypatch.setattr(nvfp4, "_sym_zeros_byte_view", allocate)
     kernel = create_mega_kernel(
@@ -671,15 +623,13 @@ def test_nvfp4_deferred_output_rejects_knobs_that_disable_it(monkeypatch):
             intermediate_size=128,
             top_k=2,
             do_finalize=False,
-            knobs={"defer_topk_reduce": False},
+            knobs=knobs,
         )
     )
     kernel.bind_ep_bootstrap(
         moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
     )
-    with pytest.raises(
-        ValueError, match="defer_topk_reduce=True cannot be disabled by knobs"
-    ):
+    with pytest.raises(ValueError, match="explicit config fields"):
         kernel._allocate_workspace(moe_ep.FleetParams(2, 1, 128))
     allocate.assert_not_called()
 
