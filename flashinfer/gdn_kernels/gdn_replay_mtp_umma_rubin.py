@@ -163,8 +163,10 @@ _PZ_CC = ((10, 7),)
 # T = 1 0.94-1.03x (its prologue reorder already starts the state stream early): not automatic;
 # one whole-GPU launch over die-interleaved memory: 0.88-0.98x.
 _PZ_AUTO_T = (2, 3, 4, 5, 6, 7, 8)
-# flush_hint "none": any size; flush rows possible (None / "some" / "flush_first"): >= 8 items
-_PZ_AUTO_MIN_ITEMS = {"none": 0, "some": 8}
+# flush_hint "none": from half an item per CTA slot (uGPU, H = 16: B >= 27; below that the
+# non-persistent kernel measured up to 1.5x faster per die); flush rows possible (None /
+# "some" / "flush_first"): >= 8 items
+_PZ_AUTO_MIN_ITEMS = {"none": 0.5, "some": 8}
 
 
 def _use_regsplit(T: int, hpc: int, sr: str) -> bool:
@@ -4460,6 +4462,22 @@ def persistent_counter_reset() -> None:
             c.zero_()
 
 
+def _pz_arena_topup(device: torch.device) -> None:
+    """Eager: make sure the arena of captured launches' claim counters has free slots (a capture
+    may pick the persistent kernel where the eager calls before it did not: small eager uGPU
+    calls run non-persistent launches back to back on the whole GPU)."""
+    a = _PZ_ARENA.get(device.index)
+    if _PZ_ARENA_SLOTS and (
+        a is None or a["chunks"][-1].shape[0] - a["next"] < _PZ_ARENA_SLOTS // 4
+    ):
+        chunk = torch.zeros(_PZ_ARENA_SLOTS, 2, dtype=torch.int32, device=device)
+        if a is None:
+            _PZ_ARENA[device.index] = {"chunks": [chunk], "next": 0}
+        else:
+            a["chunks"].append(chunk)
+            a["next"] = 0
+
+
 def _pz_counter(device: torch.device) -> torch.Tensor:
     """The persistent launch's claim counter (int32[2], zero between launches: the launch's last
     CTA resets it). Eager: one per (device, stream), so concurrent launches on two streams never
@@ -4474,15 +4492,7 @@ def _pz_counter(device: torch.device) -> torch.Tensor:
             a["next"] += 1
             return c
         return torch.zeros(2, dtype=torch.int32, device=device)
-    if _PZ_ARENA_SLOTS and (
-        a is None or a["chunks"][-1].shape[0] - a["next"] < _PZ_ARENA_SLOTS // 4
-    ):
-        chunk = torch.zeros(_PZ_ARENA_SLOTS, 2, dtype=torch.int32, device=device)
-        if a is None:
-            _PZ_ARENA[device.index] = {"chunks": [chunk], "next": 0}
-        else:
-            a["chunks"].append(chunk)
-            a["next"] = 0
+    _pz_arena_topup(device)
     key = (device.index, torch._C._cuda_getCurrentRawStream(device.index))
     c = _PZ_CTR.get(key)
     if c is None:
@@ -4580,15 +4590,15 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     0.94-1.03x; one whole-GPU launch over die-interleaved memory 0.88-0.98x. Automatic (None):
     the persistent kernel on sm_107a for T = 2-8 with all value heads per CTA when ``num_sms``
     is given and below the device's SM count (a die-restricted stream, e.g. a green context),
-    ``grid_override`` is unset and, unless ``flush_hint`` is "none", there are at least 8
-    (key head, row) items per CTA slot (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at
-    H = 16); the non-persistent kernel otherwise.
+    ``grid_override`` is unset and there are at least 8 (key head, row) items per CTA slot
+    (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at H = 16), or half an item with
+    ``flush_hint`` "none" (H x B >= 2 x ``num_sms``); the non-persistent kernel otherwise.
 
     ``flush_hint`` (performance only, never changes results: both kernels are bit-identical on
     every row mix) tells the host which flush rows the launch has, since it cannot read
-    ``hist_len`` (a device tensor) without a sync. "none" lifts the automatic choice's
-    8-items-per-slot minimum. With Philox rounding at T = 6-8 and few items per CTA slot a
-    persistent launch (chosen or forced, without ``grid_override``) runs the non-persistent
+    ``hist_len`` (a device tensor) without a sync. "none" lowers the automatic choice's
+    minimum from 8 items per CTA slot to half an item. With Philox rounding at T = 6-8 and
+    few items per CTA slot a persistent launch (chosen or forced, without ``grid_override``) runs the non-persistent
     kernel instead (measured faster there); how few depends on the hint:
 
     * None (default) or "some": flush rows may be present, in any order: H x B <= 40 x
@@ -5060,10 +5070,12 @@ def _launch_ugpu(
             return
         # created by the first call (make one eager call before CUDA graph capture)
         streams, sm_counts = _ugpu_streams(q.device.index)
-        if (
-            B * HV < _UGPU_EAGER_MIN_STATES
-            and not torch.cuda.is_current_stream_capturing()
-        ):
+        capturing = torch.cuda.is_current_stream_capturing()
+        if not capturing and (common["target"].major, common["target"].minor) in _PZ_CC:
+            _pz_arena_topup(
+                q.device
+            )  # for the per-die persistent launches of a later capture
+        if B * HV < _UGPU_EAGER_MIN_STATES and not capturing:
             for t in range(n):
                 part(t, num_sms)
             return
