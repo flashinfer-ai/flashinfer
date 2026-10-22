@@ -11,7 +11,8 @@ Both the API and the backend are experimental: no compatibility guarantee.
 The feature does not participate in automatic backend selection, autotuning
 or trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
 ships them and JIT-built by FlashInfer from `build.json` otherwise (see
-"Layout of this package"). Toolkit requirement: CUDA 13.0 or newer.
+"Layout of this package"). Toolkit requirement: CUDA 12.8 or newer
+(`build.json` `min_cuda`; FlashInfer's supported toolkits apply).
 
 ## Public entry point (`flashinfer/sparse.py`)
 
@@ -73,13 +74,15 @@ head per CTA above four splits, four at or below).
 **Workspace.** `partial_out` FP32 `[splits, rows, num_qo_heads, 256]`,
 `partial_lse` FP32 `[splits, rows, num_qo_heads]` and the fused form's
 counters uint32 `[rows * num_kv_heads]`. With `workspace_buffer` (a
-contiguous uint8 CUDA tensor of at least `qsa_workspace_bytes(rows,
-num_qo_heads, num_kv_heads, splits)` bytes, 256-byte aligned) they are
-carved from the caller's buffer: the call allocates nothing and is
-CUDA-graph capturable with a replay-stable layout. The counters are zeroed
-once, the first time a buffer is seen for a `rows * num_kv_heads`, and reset
-themselves after every launch; `reset_workspace(buffer)` forgets a buffer
-whose bytes another use overwrote. Without a workspace the partials and
+contiguous uint8 tensor on the device of `q`, of at least
+`qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)` bytes,
+256-byte aligned; checked on every call that passes one) they are carved
+from the caller's buffer: the call allocates nothing and is CUDA-graph
+capturable with a replay-stable layout. The counters are zeroed once, the
+first time a buffer's storage is seen for a `rows * num_kv_heads` (a new
+buffer at a freed buffer's address is a new storage and is zeroed again), and
+reset themselves after every launch; `reset_workspace(buffer)` forgets a
+buffer whose bytes another use overwrote. Without a workspace the partials and
 counters are allocated per call, as the default implementation does; that
 path is outside the zero-allocation guarantee (a CUDA graph still captures
 it through its private memory pool).
@@ -89,8 +92,9 @@ and tensor metadata.
 
 ## Kernel structure of one call
 
-- `decode` (plain build): grid `(rows, num_kv_heads, splits)`, 128 threads,
-  static shared memory, `__launch_bounds__(128, 2)`. Each CTA gathers its
+- `decode` (plain build): grid `(rows, num_kv_heads, splits)`, 128 threads, a
+  49,792-byte shared-memory pool passed as dynamic shared memory (opt-in above
+  48 KB), `__launch_bounds__(128, 2)`. Each CTA gathers its
   tiles' K / V rows through a two-stage `cp.async` ring, computes the scores
   and the normalised partial output of its group's heads in FP32 and, above
   one split, writes `partial_out` / `partial_lse`; with one split it writes
@@ -123,4 +127,6 @@ The registry's derived leaves and everything under `csrc/`, `build.json` and
 ## Status
 
 Experimental. Validated against the default implementation's test suite with
-`backend="cake"` on SM80 and SM90.
+`backend="cake"` on compute capability 9.0 (`sm_90a`, H100). The `sm_80`
+libraries build from `build.json` but have not been run on a compute
+capability 8.x device.
