@@ -4638,7 +4638,9 @@ def trtllm_batch_decode_with_kv_cache(
 
         if backend == "cake":
             from .cake_fmha import (
+                CakeFmhaAlignedDecodeModule,
                 _resolve_cake_fmha_decode_module,
+                _run_cake_fmha_aligned_decode,
                 select_cake_fmha_decode_route,
             )
 
@@ -4679,6 +4681,23 @@ def trtllm_batch_decode_with_kv_cache(
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
             )
+            if isinstance(cake_module, CakeFmhaAlignedDecodeModule):
+                # Aligned hd128 q1 decode: a generated in-tree program whose
+                # binding takes the kernel's host parameters positionally plus
+                # the grid.  The route admits only BF16 / FP16 output in the
+                # query dtype without LSE, so ``out`` is the whole result; it
+                # needs no workspace or counter buffer and ignores enable_pdl.
+                _run_cake_fmha_aligned_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
             if not optimized_loaded:
                 # compat_v1 takes host scalar scales; only the optimized
                 # scale-pointer specialization preserves the device binding.
