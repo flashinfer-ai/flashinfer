@@ -604,9 +604,9 @@ try:
         ranked_key = tuner._get_cache_key("test::ranked", runners[0],
             (inputs[0].shape,), config, runners[0].get_cache_key_extras(inputs))
         if rank == 0:
-            tuner._ranked_tactics_cache[ranked_key] = (policy, (1, 0))
+            tuner._ranked_cache()[ranked_key] = (policy, (1, 0))
         elif case in ("ranked_different_order", "ranked_all_hit"):
-            tuner._ranked_tactics_cache[ranked_key] = (
+            tuner._ranked_cache()[ranked_key] = (
                 policy, (0, 1) if case == "ranked_different_order" else (1, 0))
         ranked = tuner.rank_tactics("test::ranked", [runners[0]], config, inputs, k=2)
         expected_ranked = ([-1] if case == "failed_profile" else
@@ -658,6 +658,80 @@ finally:
 """
 
 
+_REJECTED_CACHE_WORKER_SRC = r"""
+import datetime, json, os
+from pathlib import Path
+import torch
+import torch.distributed as dist
+from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune, set_autotune_process_group
+from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload
+
+rank = int(os.environ["RANK"])
+world = int(os.environ["WORLD_SIZE"])
+case = os.environ["CACHE_CASE"]
+root = Path(os.environ["CASE_ROOT"])
+
+class Runner(TunableRunner):
+    def get_valid_tactics(self, inputs, profile):
+        return [0, 1]
+    def forward(self, inputs, tactic=-1):
+        return inputs[0]
+
+torch.cuda.is_current_stream_capturing = lambda: False
+tuner, runner, config, inputs = AutoTuner.get(), Runner(), TuningConfig(), [torch.zeros(1)]
+op = "test::rejected_cache"
+key = tuner._get_cache_key(op, runner, ((1,),), config)
+calls = []
+def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+    calls.append(tactic)
+    elapsed = torch.tensor([float("inf")])
+    dist.all_reduce(elapsed)
+    return elapsed.item()
+AutoTuner._profile_single_kernel = profile
+dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous"),
+    rank=rank, world_size=world, timeout=datetime.timedelta(seconds=30))
+try:
+    legacy = case == "rejected_legacy"
+    managed = case != "rejected_shortlist_v1"
+    if legacy and rank == 0:
+        path = root / "legacy.json"
+        path.write_text(json.dumps({key.file_key: ["Runner", 0]}))
+        assert tuner.load_configs(str(path))
+    context = autotune_v2(cache_root=root / "cache") if managed else autotune(True)
+    with context:
+        if not legacy:
+            policy = tuner._profiling_policy(config)
+            winner = rank % 2
+            tuner._winner_cache()[key] = (winner, None)
+            tuner._profiling_cache_policies[(tuner._winner_cache_identity(), key)] = policy
+            tuner._ranked_cache()[key] = (policy, (winner, 1 - winner))
+        dist.barrier()
+        set_autotune_process_group(dist.group.WORLD)
+        if legacy:
+            assert tuner.choose_one(op, [runner], config, inputs)[1] == -1
+        else:
+            assert tuner.rank_tactics(op, [runner], config, inputs, k=2) == [-1]
+        assert calls
+        set_autotune_process_group(None)
+    # Serving and finalization must not revive either rejected cache source.
+    assert tuner.choose_one(op, [runner], config, inputs)[1] == -1
+    if managed:
+        dist.barrier()
+        autotune_v2_reload()
+        assert tuner.choose_one(op, [runner], config, inputs)[1] == -1
+    if legacy:
+        # Rejection belongs to this managed identity, not the global v1 file.
+        with autotune_v2(mode="replay", cache_root=root / "other"):
+            assert tuner.choose_one(op, [runner], config, inputs)[1] == (0 if rank == 0 else -1)
+        with autotune_v2(mode="replay", cache_root=root / "cache"):
+            assert tuner.choose_one(op, [runner], config, inputs)[1] == -1
+    print("cache agreement OK", rank, case, flush=True)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -673,6 +747,9 @@ finally:
         "partial_managed",
         "concurrent_publish",
         "failed_profile",
+        "rejected_legacy",
+        "rejected_shortlist_v1",
+        "rejected_shortlist_managed",
     ],
 )
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -692,7 +769,13 @@ def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
             )
             processes.append(
                 subprocess.Popen(
-                    [sys.executable, "-c", _CACHE_HIT_WORKER_SRC],
+                    [
+                        sys.executable,
+                        "-c",
+                        _REJECTED_CACHE_WORKER_SRC
+                        if case.startswith("rejected_")
+                        else _CACHE_HIT_WORKER_SRC,
+                    ],
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

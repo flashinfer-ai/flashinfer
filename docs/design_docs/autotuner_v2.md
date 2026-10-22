@@ -172,10 +172,18 @@ cache. A missing or different policy is a profiling miss, not deletion; replay, 
 and direct `search_cache` lookups still accept the winner, even inside a tuning context.
 Entries without provenance are retuned by `choose_one` even under the default policy, including
 after a same-version build upgrade that leaves the environment directory unchanged.
-Retuning updates the same entry and its decoded memo only when the winning runner's key is
-unchanged. If a different runner wins, it is published under that runner's key; the previous
-runner's entry remains, as before. This is an additive v2 field, not a new schema, manifest
-identity, or operation key. Legacy v1 file-policy gating is unchanged.
+Successful retuning retires the previous candidates before publishing the new winner, including
+when the winning runner changes. Single-process retuning preserves the previous winner if no
+candidate succeeds. Coordinated tuning must retire rejected selections before profiling, so a
+failed retune cannot restore a selection that the group already rejected (§2.7).
+
+`rank_tactics` uses the same measurement overrides, store/policy partition, and winner publication
+as `choose_one`. Full shortlists remain memory-only and are rebuilt after reload; their first
+tactic is persisted as the serving winner. Loaded v1 or bundled entries remain compatibility
+fallbacks unless that key has been retired in the active identity. This exclusion is local to
+the process and identity, survives `autotune_v2_reload`, and resets with `clear_cache`; it does
+not delete global v1 entries used by another identity. This is an additive v2 field, not a new
+schema, manifest identity, or operation key. Legacy v1 file-policy gating is unchanged.
 
 `"auto"` currently preserves legacy behavior. Flipping the default to `"cuda_graph"` (the
 dominant serving mode) is gated on validating capture-safety across the op suite.

@@ -1588,6 +1588,7 @@ class AutoTuner:
         self._ranked_tactics_cache: dict[
             ProfilingCacheKey, tuple[tuple[Any, ...], tuple[Any, ...]]
         ] = {}
+        self._ranked_tactics_partitions: dict[tuple, dict] = {}
         # Keep measurement provenance separate from the runtime cache key.
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
@@ -1629,6 +1630,9 @@ class AutoTuner:
         # Keep disk merges from reviving superseded runners, including when
         # exporting the same cache to more than one path. Reset by clear_cache.
         self._invalidated_file_keys: set[str] = set()
+        # Reject legacy entries within one managed/policy identity without
+        # deleting the user's global v1 configs. Keep these across v2 reload.
+        self._excluded_file_keys: dict[tuple, set[str]] = {}
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -1876,6 +1880,13 @@ class AutoTuner:
         fields = tuple(sorted(policy.manifest_fields().items())) if policy else ()
         return ("__policy__", *fields) if fields else None
 
+    def _ranked_cache(self) -> dict:
+        """Shortlists share the winner's store/policy ownership."""
+        identity = self._winner_cache_identity()
+        if identity is None:
+            return self._ranked_tactics_cache
+        return self._ranked_tactics_partitions.setdefault(identity, {})
+
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
         """Return the per-thread skip_ops stack, creating it on first access."""
         local = self._skip_ops_local
@@ -2008,6 +2019,7 @@ class AutoTuner:
             # 1. In-memory winners and provenance share the same partition.
             winners = self._winner_cache()
             winner_identity = self._winner_cache_identity()
+            excluded_file_keys = self._excluded_file_keys.get(winner_identity, ())
             check_memory_policy = require_profiling_policy or (
                 self.is_tuning_mode and self._active_managed_store is None
             )
@@ -2043,6 +2055,8 @@ class AutoTuner:
             if self._file_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
+                    if file_key in excluded_file_keys:
+                        continue
                     if file_key in self._file_configs:
                         if (
                             self.is_tuning_mode
@@ -2123,6 +2137,11 @@ class AutoTuner:
                 and not self.is_tuning_mode
             ):
                 for r_id, cache_key in runner_keys:
+                    if cache_key.file_key in excluded_file_keys or (
+                        winner_identity is None
+                        and cache_key.file_key in self._invalidated_file_keys
+                    ):
+                        continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
                         return True, r_id, file_tactic, None
@@ -2409,13 +2428,14 @@ class AutoTuner:
                         else None
                     )
                     if not _all_ranks_hit_cache(is_cache_hit, selection):
-                        self._discard_profile_cache(
-                            custom_op,
-                            runners,
-                            p.get_opt_shapes(),
-                            tuning_config,
-                            inputs,
-                        )
+                        if _tune_process_group is not None:
+                            self._discard_profile_cache(
+                                custom_op,
+                                runners,
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                inputs,
+                            )
                         input_preparation_oom = False
                         try:
                             # Active capture is safe for skipped operations and warm cache hits, but
@@ -2452,6 +2472,15 @@ class AutoTuner:
 
                         assert tensors is not None
                         assert prepared_input_batches is not None
+                        if _tune_process_group is not None:
+                            self._discard_profile_cache(
+                                custom_op,
+                                runners,
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                inputs,
+                                profile_inputs=tensors,
+                            )
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -2596,40 +2625,23 @@ class AutoTuner:
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
-                            cache_key = AutoTuner._get_cache_key(
+                            if _tune_process_group is None:
+                                self._discard_profile_cache(
+                                    custom_op,
+                                    runners,
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    inputs,
+                                    profile_inputs=tensors,
+                                )
+                            cache_key = self._cache_profile_result(
                                 custom_op,
                                 runners[runner_id],
-                                p.get_opt_shapes(),
+                                p,
                                 tuning_config,
-                                runners[runner_id].get_cache_key_extras(tensors),
+                                tensors,
+                                tactic,
                             )
-                            self._winner_cache()[cache_key] = (tactic, p)
-                            profiling_policy = self._profiling_policy(tuning_config)
-                            self._profiling_cache_policies[
-                                (self._winner_cache_identity(), cache_key)
-                            ] = profiling_policy
-                            self._dirty = True
-                            self._dirty_seq += 1
-                            publish_store = self._active_managed_store
-                            if publish_store is not None:
-                                # Eager atomic publish; best-effort, never raises.
-                                publish_store.publish(
-                                    cache_key.file_key,
-                                    cache_key.runner_class_name,
-                                    _tactic_to_json(tactic),
-                                    key_fields=cache_key.key_fields,
-                                    profiling_policy=profiling_policy,
-                                )
-                                memo_key = (
-                                    str(publish_store.root),
-                                    publish_store.env_hash,
-                                    cache_key.key_fields,
-                                )
-                                self._managed_decoded[memo_key] = ManagedCacheEntry(
-                                    cache_key.runner_class_name,
-                                    tactic,
-                                    profiling_policy,
-                                )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -2665,38 +2677,88 @@ class AutoTuner:
             return runners[runner_id], tactic
 
     def _discard_profile_cache(
-        self, custom_op, runners, input_shapes, tuning_config, inputs
+        self,
+        custom_op,
+        runners,
+        input_shapes,
+        tuning_config,
+        inputs,
+        *,
+        profile_inputs=None,
     ) -> None:
-        """Remove old candidates before re-profiling.
+        """Retire old winners and shortlists within the active identity.
 
-        Another runner may win this time. Its new entry must take precedence
-        both now and after reloading the store, including on ranks that hit.
+        Distributed rejection runs before profiling so failure cannot revive
+        divergent winners. Single-process retuning commits only on success.
         """
         winners = self._winner_cache()
+        ranked = self._ranked_cache()
         identity = self._winner_cache_identity()
         store = self._active_managed_store
         for runner in runners:
-            key = self._get_cache_key(
-                custom_op,
-                runner,
-                input_shapes,
-                tuning_config,
-                runner.get_cache_key_extras(inputs),
-            )
-            winners.pop(key, None)
-            self._profiling_cache_policies.pop((identity, key), None)
-            if identity is None:
-                self._file_configs.pop(key.file_key, None)
-                self._file_config_policies.pop(key.file_key, None)
-                self._invalidated_file_keys.add(key.file_key)
-            if store is not None:
-                self._managed_decoded.pop(
-                    (str(store.root), store.env_hash, key.key_fields), None
+            # Older runners may include exact dimensions in their extras.
+            # Retire both the lookup key and the synthesized bucket's key.
+            keys = {
+                self._get_cache_key(
+                    custom_op,
+                    runner,
+                    input_shapes,
+                    tuning_config,
+                    runner.get_cache_key_extras(tensors),
                 )
-                store.discard(key.file_key)
+                for tensors in (inputs, profile_inputs)
+                if tensors is not None
+            }
+            for key in keys:
+                winners.pop(key, None)
+                ranked.pop(key, None)
+                self._profiling_cache_policies.pop((identity, key), None)
+                if identity is None:
+                    self._file_configs.pop(key.file_key, None)
+                    self._file_config_policies.pop(key.file_key, None)
+                    self._invalidated_file_keys.add(key.file_key)
+                else:
+                    self._excluded_file_keys.setdefault(identity, set()).add(
+                        key.file_key
+                    )
+                if store is not None:
+                    self._managed_decoded.pop(
+                        (str(store.root), store.env_hash, key.key_fields), None
+                    )
+                    store.discard(key.file_key)
         if identity is None:
             self._dirty = True
             self._dirty_seq += 1
+
+    def _cache_profile_result(
+        self, custom_op, runner, profile, tuning_config, inputs, tactic
+    ) -> ProfilingCacheKey:
+        """Publish a winner and its provenance through one ownership path."""
+        key = self._get_cache_key(
+            custom_op,
+            runner,
+            profile.get_opt_shapes(),
+            tuning_config,
+            runner.get_cache_key_extras(inputs),
+        )
+        policy = self._profiling_policy(tuning_config)
+        self._winner_cache()[key] = (tactic, profile)
+        self._profiling_cache_policies[(self._winner_cache_identity(), key)] = policy
+        self._dirty = True
+        self._dirty_seq += 1
+        store = self._active_managed_store
+        if store is not None:
+            store.publish(
+                key.file_key,
+                key.runner_class_name,
+                _tactic_to_json(tactic),
+                key_fields=key.key_fields,
+                profiling_policy=policy,
+            )
+            self._managed_decoded[(str(store.root), store.env_hash, key.key_fields)] = (
+                ManagedCacheEntry(key.runner_class_name, tactic, policy)
+            )
+        return key
 
     def rank_tactics(
         self,
@@ -2738,8 +2800,16 @@ class AutoTuner:
             return [-1]
 
         with self._lock:
-            if self._override_tuning_buckets is not None or self._override_round_up:
+            if (
+                self._override_tuning_buckets is not None
+                or self._override_round_up
+                or self._override_cuda_graph_profile_replays is not None
+            ):
                 tuning_config = self._apply_tuning_overrides(tuning_config)
+            if self._effective_measure_policy is not None:
+                tuning_config = self._apply_measure_policy(
+                    tuning_config, self._effective_measure_policy
+                )
 
             input_shapes = tuple(self._get_input_sizes(inputs))
             profiles = self._generate_optimization_profiles(tuning_config, inputs)
@@ -2773,14 +2843,19 @@ class AutoTuner:
                 runner.get_cache_key_extras(inputs),
             )
             policy = self._profiling_policy(tuning_config)
-            cached = self._ranked_tactics_cache.get(cache_key)
+            ranked_cache = self._ranked_cache()
+            cached = ranked_cache.get(cache_key)
             if _all_ranks_hit_cache(
                 cached is not None and cached[0] == policy,
                 (type(runner).__name__, k, cached[1][:k]) if cached else None,
             ):
                 assert cached is not None
                 return list(cached[1][:k])
-            self._ranked_tactics_cache.pop(cache_key, None)
+            ranked_cache.pop(cache_key, None)
+            if _tune_process_group is not None:
+                self._discard_profile_cache(
+                    custom_op, runners, profile.get_opt_shapes(), tuning_config, inputs
+                )
 
             tensors = None
             input_preparation_oom = False
@@ -2801,6 +2876,15 @@ class AutoTuner:
                 raise MemoryError("OOM during tactic-ranking input preparation")
 
             assert tensors is not None
+            if _tune_process_group is not None:
+                self._discard_profile_cache(
+                    custom_op,
+                    runners,
+                    profile.get_opt_shapes(),
+                    tuning_config,
+                    inputs,
+                    profile_inputs=tensors,
+                )
             runner_preparation_oom = False
             try:
                 valid_tactics = runner.get_valid_tactics(tensors, profile)
@@ -2845,15 +2929,19 @@ class AutoTuner:
             if not ranked:
                 return [-1]
 
-            # Populate the choose_one cache with the winner so stage lookups
-            # remain consistent between rank_tactics and choose_one.
-            self.profiling_cache[cache_key] = (ranked[0], profile)
-            # profiling_cache is the unpartitioned winner cache, so its
-            # provenance lives under the None winner identity.
-            self._profiling_cache_policies[(None, cache_key)] = policy
-            self._ranked_tactics_cache[cache_key] = (policy, tuple(ranked))
-            self._dirty = True
-            self._dirty_seq += 1
+            if _tune_process_group is None:
+                self._discard_profile_cache(
+                    custom_op,
+                    runners,
+                    profile.get_opt_shapes(),
+                    tuning_config,
+                    inputs,
+                    profile_inputs=tensors,
+                )
+            cache_key = self._cache_profile_result(
+                custom_op, runner, profile, tuning_config, tensors, ranked[0]
+            )
+            ranked_cache[cache_key] = (policy, tuple(ranked))
 
             return ranked[:k]
 
@@ -4030,10 +4118,12 @@ class AutoTuner:
         with self._lock:
             self.profiling_cache.clear()
             self._ranked_tactics_cache.clear()
+            self._ranked_tactics_partitions.clear()
             self._profiling_cache_policies.clear()
             self._file_configs.clear()
             self._file_config_policies.clear()
             self._invalidated_file_keys.clear()
+            self._excluded_file_keys.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
             self._observed_cache_generations.clear()
