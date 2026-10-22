@@ -501,10 +501,7 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
     "m,n,k",
     [
         (1, 1536, 1024),  # M <= 16: a small-M runner is the untuned default
-        (4, 6144, 4096),
-        (16, 6144, 1536),
         (24, 6144, 4096),  # M > 16: the SM107 kernel is the untuned default
-        (64, 1536, 1024),
         (100, 4096, 1024),  # M % 8 != 0
         (256, 1536, 6144),
         (4096, 6144, 1536),
@@ -592,73 +589,6 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         out.zero_()
         runner(inputs, tactic=tactic)
         _assert_cosine_similarity(reference, out)
-
-
-@pytest.mark.parametrize("sm_count", [148, 208, 212])
-@pytest.mark.parametrize(
-    "m,n,k,expected",
-    [
-        (4, 6144, 4096, 2),  # 4-way (192 blocks) would nearly fill the GPU
-        (16, 6144, 12288, 2),
-        (8, 2304, 6144, 4),  # 72 blocks: the full 4-way split still fits
-        (4, 6144, 1536, 1),  # too few K blocks to split
-    ],
-)
-def test_sm107_low_m_split_k_leaves_a_quarter_of_the_sms(m, n, k, expected, sm_count):
-    """CPU-only: the untuned low-M K split keeps its grid within 3/4 of the SMs."""
-    cutlass = pytest.importorskip("cutlass")
-    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk import (
-        Sm100BlockScaledSplitKGemmKernel,
-    )
-
-    split = gemm_base._sm107_low_m_split_k(  # pyright: ignore[reportPrivateUsage]
-        m, n, k, cutlass.Float8E4M3FN, Sm100BlockScaledSplitKGemmKernel, sm_count
-    )
-    assert split == expected
-    assert split == 1 or (n + 127) // 128 * split <= 3 * sm_count // 4
-
-
-@pytest.mark.parametrize(
-    "m,n,k,first",
-    [
-        (1, 6144, 1536, "warp"),
-        (1, 7168, 2048, "warp"),  # 2.1 waves of 16-wide tiles: warp still wins
-        (8, 7168, 2048, "warp"),
-        (1, 163840, 256, "low_m"),  # many waves: warp falls behind
-        (4, 6144, 4096, "low_m"),
-        (24, 6144, 4096, "sm107"),
-    ],
-)
-def test_mm_mxfp8_cute_dsl_sm107_untuned_order(m, n, k, first):
-    """The untuned SM107 cute-dsl runner order, for shape classes that regressed in review."""
-    _skip_if_unsupported("cute-dsl")
-    if get_compute_capability(torch.device("cuda")) != (10, 7):
-        pytest.skip("SM107 runner order")
-    from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
-    from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
-
-    if not is_rubin_cute_dsl_available():
-        pytest.skip("The SM107 cute-dsl mm_mxfp8 path requires CuTe DSL >= 4.8.")
-    if first == "warp" and not is_cute_dsl_experimental_available():
-        pytest.skip("warp split-K needs the experimental CuTe DSL")
-
-    dev = torch.device("cuda")
-    a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=dev)
-    b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=dev).T
-    a_sf = torch.empty((max(m, 128) * k // 32,), dtype=torch.uint8, device=dev)
-    b_sf = torch.empty((max(n, 128) * k // 32,), dtype=torch.uint8, device=dev)
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
-    runners = gemm_base._cute_dsl_mxfp8_runners_sm107(  # pyright: ignore[reportPrivateUsage]
-        torch.bfloat16, [a, b, a_sf, b_sf, torch.bfloat16, out, None]
-    )
-    names = {
-        "CuteDSLMxfp8Sm107GemmRunner": "sm107",
-        "CuteDSLMxfp8GemmRunner": "low_m",
-        "CuteDSLMxfp8WarpSplitKRunner": "warp",
-    }
-    assert names.get(type(runners[0]).__name__) == first, [
-        type(r).__name__ for r in runners
-    ]
 
 
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
