@@ -768,8 +768,8 @@ def _program_cases() -> list:
     sms = loader.sm_count(_device().index or 0)
     cases = []
     for name, record in sorted(loader.MODULES.items()):
-        if arch not in record["arches"]:
-            continue
+        if arch not in record["arches"] or record["role"] != "decode":
+            continue  # the prefill records: tests/gdp/test_cake_gdp_prefill.py
         build = record["build"]
         n = build["num_householder"]
         T = build["t_steps"] if build["t_steps"] is not None else build["max_t_steps"]
@@ -928,7 +928,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
             record
         ), name
         assert set(record["arches"]) <= set(manifest["arch_flags"]), name
-        assert record["build"]["num_householder"] in NUM_HOUSEHOLDER, name
+        assert record["role"] in ("decode", "prefill"), name
+        if record["role"] == "decode":
+            assert record["build"]["num_householder"] in NUM_HOUSEHOLDER, name
         # The launch block is the built kernel's (the exporter writes it): the shape only is checked here.
         block = list(record["launch"]["block"])
         assert len(block) == 3, name
@@ -947,7 +949,10 @@ def test_registry_records_reference_the_build_manifest() -> None:
             for source in entry["sources"]:
                 assert (package / source).is_file(), source
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
-            assert "--use_fast_math" in entry["nvcc_flags"]
+            # Every decode entry compiles with fast math (the prefill records carry their own flags,
+            # checked by tests/gdp/test_cake_gdp_prefill.py).
+            if record["role"] == "decode":
+                assert "--use_fast_math" in entry["nvcc_flags"]
     assert referenced == set(libraries)
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
@@ -979,11 +984,20 @@ def test_route_tables_are_consistent() -> None:
     """Every route name lists exported modules of its architecture; static programs of a route own disjoint
     state-head bands per token count; ``ARCH_BY_CAPABILITY`` names the supported capabilities only."""
 
-    assert set(loader.ARCH_BY_CAPABILITY) == set(SUPPORTED_CAPABILITIES)
+    # The capability map names the decode capabilities and may name further ones of the prefill role
+    # (tests/gdp/test_cake_gdp_prefill.py); exactly the decode capabilities carry a decode route.
+    assert set(SUPPORTED_CAPABILITIES) <= set(loader.ARCH_BY_CAPABILITY)
+    assert {
+        capability
+        for capability, arch in loader.ARCH_BY_CAPABILITY.items()
+        if any(key.startswith("decode_") for key in loader.ROUTES.get(arch, {}))
+    } == set(SUPPORTED_CAPABILITIES)
     assert set(loader.ARCH_BY_CAPABILITY.values()) <= set(loader.ARCHES)
     for arch, routes in loader.ROUTES.items():
         assert arch in loader.ARCHES
         for key, names in routes.items():
+            if key == loader.PREFILL_ROUTE:
+                continue  # the prefill route: tests/gdp/test_cake_gdp_prefill.py
             assert re.fullmatch(r"decode_nh[1-4](?:_raw)?", key), key
             n = int(key[len("decode_nh")])
             for name in names:
@@ -1176,7 +1190,9 @@ def test_t4_band_follows_the_architecture(sm: int) -> None:
             )
         variants = {
             loader.MODULES[name]["build"]["variant"]
-            for names in loader.ROUTES[arch].values()
+            for key, names in loader.ROUTES[arch].items()
+            if key
+            != loader.PREFILL_ROUTE  # the prefill route: tests/gdp/test_cake_gdp_prefill.py
             for name in names
         }
         assert ("l4r2" in variants) == (arch == "sm_90a"), (arch, sorted(variants))
