@@ -327,6 +327,9 @@ def sm120_small_m_tiling_is_valid(
         return False
     if k % down_warps or (k // down_warps) % 16:
         return False
+    # The rank-128 down loop consumes K in 32-element chunks.
+    if rank > 64 and (k // down_warps) % 32:
+        return False
     if k % (4 * _GEOMETRY_SF_VEC):
         return False
     if down_tile_cols % _GEOMETRY_MMA_N or down_tile_cols // _GEOMETRY_MMA_N <= 0:

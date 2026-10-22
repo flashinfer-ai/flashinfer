@@ -377,43 +377,51 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   int const a_row = tile_m * 16 + group;
   int const b_col = tile_n * DownTileCols + group;
   if constexpr (Rank > 64) {
-    // Rank 128 reads K-major L2T (l2[rank][K]), so a B fragment is two 32-bit
-    // loads instead of four 16-bit ones. A warp owns only K / warps (a few
-    // k16 steps), so a step-by-step loop pays one global-load latency per step:
-    // issue every load of a kDownPrefetch-step group before its MMAs instead.
-    constexpr int kDownPrefetch = 4;
+    // Rank 128 reads K-major L2T (l2[rank][K]). The MMA sums over k, so A and
+    // B only have to agree on which physical k sits in each k slot: lane t of a
+    // quad takes k 8t..8t+7 of a 32-k chunk with one 16-byte load per operand
+    // row, feeding two k16 steps (slots {2t,2t+1} and {2t+8,2t+9} get k 8t..8t+3
+    // in the first step, 8t+4..8t+7 in the second). That is a quarter of the
+    // load instructions of per-step 32-bit loads and whole 32-byte sectors per
+    // quad, and every chunk of a kDownPrefetch group is loaded before its MMAs.
+    // The launcher requires K / warps to be a multiple of 32.
+    constexpr int kDownPrefetch = 2;
     bool const has_low = a_row < M;
     bool const has_high = a_row + 8 < M;
-    quant::Type const* const a_low = x + static_cast<std::int64_t>(a_row) * K + pair_col;
+    int const quad_k = (lane % 4) * 8;
+    quant::Type const* const a_low = x + static_cast<std::int64_t>(a_row) * K + quad_k;
     quant::Type const* const a_high = a_low + static_cast<std::int64_t>(8) * K;
+    quant::Type const* const b_lane = l2t_smoothed + static_cast<std::int64_t>(b_col) * K + quad_k;
 #pragma unroll 1
-    for (int group_base = k_begin; group_base < k_end; group_base += kDownPrefetch * 16) {
-      std::uint32_t a[kDownPrefetch][4];
-      std::uint32_t b[kDownPrefetch][kNFragments][2];
+    for (int group_base = k_begin; group_base < k_end; group_base += kDownPrefetch * 32) {
+      uint4 a_lo[kDownPrefetch];
+      uint4 a_hi[kDownPrefetch];
+      uint4 b[kDownPrefetch][kNFragments];
 #pragma unroll
-      for (int s = 0; s < kDownPrefetch; ++s) {
-        int const k_base = group_base + s * 16;
+      for (int c = 0; c < kDownPrefetch; ++c) {
+        int const k_base = group_base + c * 32;
         bool const live = k_base < k_end;
-        a[s][0] = live && has_low ? base::load_bf16_pair(a_low + k_base) : 0u;
-        a[s][2] = live && has_low ? base::load_bf16_pair(a_low + k_base + 8) : 0u;
-        a[s][1] = live && has_high ? base::load_bf16_pair(a_high + k_base) : 0u;
-        a[s][3] = live && has_high ? base::load_bf16_pair(a_high + k_base + 8) : 0u;
+        uint4 const zero = make_uint4(0u, 0u, 0u, 0u);
+        a_lo[c] = live && has_low ? *reinterpret_cast<uint4 const*>(a_low + k_base) : zero;
+        a_hi[c] = live && has_high ? *reinterpret_cast<uint4 const*>(a_high + k_base) : zero;
 #pragma unroll
         for (int fragment = 0; fragment < kNFragments; ++fragment) {
-          quant::Type const* b_base = l2t_smoothed +
-                                      static_cast<std::int64_t>(b_col + fragment * kMmaN) * K +
-                                      k_base + pair_col;
-          b[s][fragment][0] = live ? base::load_bf16_pair(b_base) : 0u;
-          b[s][fragment][1] = live ? base::load_bf16_pair(b_base + 8) : 0u;
+          b[c][fragment] =
+              live ? *reinterpret_cast<uint4 const*>(
+                         b_lane + static_cast<std::int64_t>(fragment * kMmaN) * K + k_base)
+                   : zero;
         }
       }
 #pragma unroll
-      for (int s = 0; s < kDownPrefetch; ++s) {
+      for (int c = 0; c < kDownPrefetch; ++c) {
 #pragma unroll
         for (int fragment = 0; fragment < kNFragments; ++fragment) {
           base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2],
-                                     d[fragment][3], a[s][0], a[s][1], a[s][2], a[s][3],
-                                     b[s][fragment][0], b[s][fragment][1]);
+                                     d[fragment][3], a_lo[c].x, a_hi[c].x, a_lo[c].y,
+                                     a_hi[c].y, b[c][fragment].x, b[c][fragment].y);
+          base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2],
+                                     d[fragment][3], a_lo[c].z, a_hi[c].z, a_lo[c].w,
+                                     a_hi[c].w, b[c][fragment].z, b[c][fragment].w);
         }
       }
     }
@@ -515,6 +523,8 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
       return cudaErrorInvalidValue;
     }
     if (k % kDownWarps || (k / kDownWarps) % 16) return cudaErrorInvalidValue;
+    // The rank-128 down loop consumes K in 32-element chunks.
+    if (kRank > 64 && (k / kDownWarps) % 32) return cudaErrorInvalidValue;
     if (k % (4 * quant::SF_VEC_SIZE)) return cudaErrorInvalidValue;
     int const padded_m = (m + 127) / 128 * 128;
     int const quant_blocks = (m + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
