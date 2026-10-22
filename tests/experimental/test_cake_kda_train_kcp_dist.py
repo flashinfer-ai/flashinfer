@@ -221,9 +221,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "repeat": all(torch.equal(res[n], res_repeat[n]) for n in TENSORS),
         "autograd_eq_saved": all(torch.equal(res[n], res_auto[n]) for n in TENSORS),
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
-        "save_transfer_eq": all(
-            torch.equal(res[n], res_recompute[n]) for n in TENSORS
-        ),
+        "save_transfer_eq": all(torch.equal(res[n], res_recompute[n]) for n in TENSORS),
         "ring_eq_a2a": ring_ok,
         # a backend with local stages must have run the SPEC-3 assertion (unless disabled) and passed it; a rank
         # without tokens launches no local stage, so it has nothing to check
