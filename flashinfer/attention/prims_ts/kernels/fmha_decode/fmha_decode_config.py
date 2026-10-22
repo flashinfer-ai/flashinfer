@@ -447,26 +447,22 @@ _GROUPED_Q_MMA_TILES = (
 # The selector reuses the measured relative costs but resolves its own legal
 # profiles, Q geometry, split fanout, and cluster promotion instead of copying
 # a final shape policy.
+# Both tables are keyed by a K/V width (``_grouped_q_cost_kv_width``), then by
+# TileQ. Width 16 scores 16-bit K and V at head dim 128, the one head dim whose
+# TileQ64 candidate is promoted to the Q64/KV256 CTA; every other profile,
+# 16-bit D192 included, takes width 8. The widths share every factor but one:
+# a 16-bit D128 Keeps Q128 CTA runs its MMAs at half the 8-bit rate, so
+# TileQ128 is scored against the Q64/KV256 CTA that the Q64 factor stands for
+# after the KV256 promotion rather than with the shared TileQ128 factor.
 _GROUPED_Q_MAINLOOP_COST = {
-    8: 1.0,
-    16: 1.2,
-    32: 1.48,
-    64: 1.68,
-    128: 2.2,
+    8: {8: 1.0, 16: 1.2, 32: 1.48, 64: 1.68, 128: 2.2},
+    16: {8: 1.0, 16: 1.2, 32: 1.48, 64: 1.68, 128: 3.2},
 }
 _GROUPED_Q_REDUCTION_COST = {
-    8: 1.0,
-    16: 1.03,
-    32: 1.08,
-    64: 1.2,
-    128: 1.32,
+    8: {8: 1.0, 16: 1.03, 32: 1.08, 64: 1.2, 128: 1.32},
+    16: {8: 1.0, 16: 1.03, 32: 1.08, 64: 1.2, 128: 1.32},
 }
 _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
-# 16-bit D128 K/V: a Keeps Q128 CTA runs its MMAs at half the 8-bit rate, so
-# TileQ128 is scored against the Q64/KV256 CTA that the Q64 factor stands for
-# after the KV256 promotion rather than with the shared TileQ128 factor. The
-# smaller tiles, and head dims without a KV256 profile, keep the shared factors.
-_GROUPED_Q_16BIT_MAINLOOP_COST = {**_GROUPED_Q_MAINLOOP_COST, 128: 3.2}
 
 
 def enumerate_grouped_q_mma_candidates(
@@ -514,18 +510,17 @@ def make_grouped_q_launch_candidate(
     batch_size: int,
     num_heads_kv: int,
     service_capacity: int,
-    mainloop_cost: float,
+    cost_kv_width: int,
 ) -> GroupedQLaunchCandidate:
     """Build one empirical grouped-Q launch-cost record.
 
     The model follows the measured GQA-generation cost structure:
 
-    ``(mainloop_cost * seq_len_per_cta_kv +``
+    ``(mainloop_factor[TileQ] * seq_len_per_cta_kv +``
     `` reduction_factor[TileQ] * 128 * splits_kv) * waves``.
 
-    This is a small deterministic default heuristic. ``mainloop_cost`` is the
-    TileQ factor of the K/V element width and head dim
-    (``_GROUPED_Q_MAINLOOP_COST`` or ``_GROUPED_Q_16BIT_MAINLOOP_COST``); the
+    This is a small deterministic default heuristic. Both factors come from
+    the tables of ``cost_kv_width`` (``_grouped_q_cost_kv_width``); the
     production profile validator still determines which actual-dtype recipes
     are legal.
     """
@@ -549,8 +544,9 @@ def make_grouped_q_launch_candidate(
     launched_ctas = base_ctas * splits_kv
     waves = (launched_ctas + service_capacity - 1) // service_capacity
     modeled_time = (
-        mainloop_cost * seq_len_per_cta_kv
-        + _GROUPED_Q_REDUCTION_COST[candidate.tile_size_q]
+        _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
+        * seq_len_per_cta_kv
+        + _GROUPED_Q_REDUCTION_COST[cost_kv_width][candidate.tile_size_q]
         * _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR
         * splits_kv
     ) * waves
@@ -3183,49 +3179,26 @@ class FmhaDecodeConfig:
                 and not self.use_cluster_smem_reduction
             )
 
-        if self.use_paged_kv and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
-            fixed_q1 = (
-                self.max_seq_len_q == 1 and 1 <= self.heads_q_per_kv <= self.tile_size_q
-            )
-            fixed_grouped_q = self.max_seq_len_q > 1
-            return (
-                (fixed_q1 or fixed_grouped_q)
-                and not self.use_variable_seqlens_q
-                and self.use_paged_kv
-                and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
-                and self.mask_type in (DENSE, CAUSAL)
-                and not any(
-                    (
-                        self.use_cluster_smem_reduction,
-                        self.use_sliding_window_causal,
-                        self.use_attention_sinks,
-                    )
-                )
-                and (
-                    direct
-                    or (
-                        self.use_split_kv
-                        and self.splits_kv > 1
-                        and self.max_splits_kv >= self.splits_kv
-                    )
-                )
-            )
-
-        if (
-            self.use_paged_kv
-            and self.tile_size_q == 128
+        paged_16bit_q128 = (
+            self.tile_size_q == 128
             and profile in _GROUPED_KEEPS_PAGED_16BIT_Q128_PROFILES
+        )
+        if self.use_paged_kv and (
+            paged_16bit_q128 or profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
         ):
+            # Paged grouped Keeps recipes exclude sliding windows and attention
+            # sinks. The 16-bit Q128 recipe, which reuses the contiguous 16-bit
+            # resources, runs fixed or packed Q in direct nonpersistent
+            # launches; the FP8 recipes run fixed Q, direct or split.
+            if self.use_sliding_window_causal or self.use_attention_sinks:
+                return False
+            if paged_16bit_q128:
+                return direct and not self.use_persistent_scheduler
             return (
-                direct
-                and self.mask_type in (DENSE, CAUSAL)
-                and not any(
-                    (
-                        self.use_persistent_scheduler,
-                        self.use_sliding_window_causal,
-                        self.use_attention_sinks,
-                    )
-                )
+                (self.max_seq_len_q > 1 or self.grouped_q_fits_tile)
+                and not self.use_variable_seqlens_q
+                and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
+                and (direct or self.has_valid_split_kv_fanout)
             )
 
         if profile in _GROUPED_KEEPS_STATIC_ONLY_PROFILES:
@@ -4437,6 +4410,18 @@ def _apply_grouped_q_mma_candidate(
     cfg.mma_tile_n_bmm2 = candidate.tile_size_q
 
 
+def _grouped_q_cost_kv_width(cfg: FmhaDecodeConfig) -> int:
+    """Return the cost-table width that scores ``cfg``'s grouped-Q candidates.
+
+    Only 16-bit K and V at head dim 128 take width 16, since only that head
+    dim promotes its TileQ64 candidate to KV256. Every other profile takes
+    width 8, under which D192 picks its faster Q128 tile.
+    """
+    if cfg.headdim == 128 and cfg.k_dtype.width == 16 and cfg.v_dtype.width == 16:
+        return 16
+    return 8
+
+
 def _resolve_grouped_q_launch_candidates(
     cfg: FmhaDecodeConfig,
     candidate: GroupedQMmaCandidate,
@@ -4496,14 +4481,7 @@ def _resolve_grouped_q_launch_candidates(
         )
     except ValueError:
         return ()
-    mainloop_costs = (
-        _GROUPED_Q_16BIT_MAINLOOP_COST
-        if probe.headdim == 128
-        and probe.k_dtype.width == 16
-        and probe.v_dtype.width == 16
-        else _GROUPED_Q_MAINLOOP_COST
-    )
-    mainloop_cost = mainloop_costs[candidate.tile_size_q]
+    cost_kv_width = _grouped_q_cost_kv_width(probe)
 
     split_candidates = enumerate_auto_splits_kv(
         seq_len_kv=seq_len_kv,
@@ -4542,7 +4520,7 @@ def _resolve_grouped_q_launch_candidates(
                 batch_size=batch_size,
                 num_heads_kv=num_heads_kv,
                 service_capacity=service_capacity,
-                mainloop_cost=mainloop_cost,
+                cost_kv_width=cost_kv_width,
             )
         )
     return tuple(recipes)

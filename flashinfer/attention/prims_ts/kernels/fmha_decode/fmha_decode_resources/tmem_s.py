@@ -906,9 +906,14 @@ class TmemSResource(DecodeGenResourceBase):
     def _masked_score(self) -> Float32:
         """Return the score a complete-row mask writes.
 
-        Sage writes ``-inf``: the max pass dequantizes the row with positive
-        ``sfK`` scales, which keep ``-inf`` but would move ``-FLT_MAX`` off
-        the fully masked row's sentinel. Other profiles write ``-FLT_MAX``.
+        A fully masked row must reach the P pass with the ``-FLT_MAX``
+        maximum, which ``SmemPResource._exponent_addend`` anchors on zero so
+        that its masked scores exponentiate to zero. Most profiles write that
+        sentinel directly. Sage writes ``-inf``: its max pass dequantizes each
+        score with a positive ``sfK`` and scales the maximum by ``sfQ``, which
+        keeps ``-inf`` but can move ``-FLT_MAX`` off the sentinel, and it maps
+        an all ``-inf`` maximum back to the sentinel
+        (``_dequantize_sage_keeps_row``).
         """
         if self.cfg.use_sage_attention:
             return Float32(float("-inf"))

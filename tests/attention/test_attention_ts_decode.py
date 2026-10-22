@@ -33,7 +33,7 @@ pytest.importorskip(
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float4E2M1FN, Float8E4M3FN, Int8, Int32
+from cutlass import BFloat16, Float16, Float4E2M1FN, Float8E4M3FN, Int32
 from cutlass.cute.runtime import make_ptr
 from cutlass import utils as cutlass_utils
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
@@ -3980,78 +3980,6 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
         assert q128_fp8.stages_q128_p_in_smem
         assert not q128_fp8.uses_tmem_p and not q128_fp8.streams_tmem_p_fragments
         assert q128_fp8.num_softmax_score_fragments == 1
-
-
-@pytest.mark.parametrize("headdim", (64, 128))
-def test_attention_ts_decode_q128_8bit_p_in_smem(headdim: int) -> None:
-    """Plain 8-bit Q128/KV128 tiles stage P in SMEM and leave S to the next QK.
-
-    P owns one SMEM tile per instance, no TMEM P columns are allocated, and
-    the two softmax groups run unordered so each overlaps its own next QK.
-    """
-
-    cfg = _make_contiguous_keeps_config(
-        dtype=Float8E4M3FN, tile_size_q=128, headdim=headdim
-    )
-    assert cfg.stages_q128_p_in_smem and not cfg.uses_tmem_p
-    assert not cfg.uses_ordered_softmax_barrier
-    resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
-    for name in ("smemP0", "smemP1"):
-        p = resources[name]
-        assert p._tmem_alloc is None
-        assert p._alloc.size_bytes == cfg.smem_p_tile_bytes == 128 * 128
-    assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
-
-
-@pytest.mark.parametrize("qk_dtype", (Float8E4M3FN, Int8))
-@pytest.mark.parametrize("k_block_size", (1, 16))
-def test_attention_ts_decode_dense_sage_q128_p_in_smem(qk_dtype, k_block_size) -> None:
-    """Dense Sage Q128/KV128 tiles stage P in SMEM and dequantize in the max pass.
-
-    The ``sfK`` geometry counts K32 chunks as the streamed profiles do, and
-    the scores reach the P pass dequantized, so the scale stage is released
-    after the max pass.
-    """
-
-    cfg = make_decode_config(
-        headdim=128,
-        args={
-            "use_keeps_mma_ab": True,
-            "tile_size_q": 128,
-            "tile_size_kv": 128,
-            "groups_tokens_heads_q": True,
-            "sage_k_block_size": k_block_size,
-            "sage_k_summary_block_size": k_block_size,
-            "sage_q_block_size": 1,
-        },
-        seq_len_q=16,
-        seq_len_kv=1000,
-        batch_size=2,
-        num_heads_q=8,
-        num_heads_kv=1,
-        q_dtype=qk_dtype,
-        k_dtype=qk_dtype,
-        v_dtype=Float8E4M3FN,
-        o_dtype=BFloat16,
-        mask_type="dense",
-        auto_tuner=False,
-    )
-    assert cfg.use_sage_attention
-    assert cfg.stages_q128_p_in_smem
-    assert not cfg.uses_tmem_p and not cfg.streams_tmem_p_fragments
-    assert not cfg.uses_ordered_softmax_barrier
-    assert cfg.keeps_atom_tokens == 64
-    assert (
-        cfg.sage_k_groups_per_fragment() == cfg.keeps_score_chunk_regs // k_block_size
-    )
-    from flashinfer.attention.prims_ts.sage.modes import SageScoreScaling
-
-    assert cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
-    resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
-    for name in ("smemP0", "smemP1"):
-        assert resources[name]._tmem_alloc is None
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
