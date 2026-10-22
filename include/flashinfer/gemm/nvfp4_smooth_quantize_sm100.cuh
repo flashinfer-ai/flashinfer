@@ -344,7 +344,7 @@ static_assert(sizeof(Bf16x8) == 16);
 
 // trtllm's PadUpFn is a function-like macro (quantization.h); use a plain
 // host+device helper here instead.
-__host__ __device__ inline int padUp(int x, int y) { return (x + y - 1) / y * y; }
+__host__ __device__ inline int64_t padUp(int64_t x, int64_t y) { return (x + y - 1) / y * y; }
 
 __device__ __forceinline__ void loadBf16x8(Type const* ptr, Bf16x8& result) {
   result.bits = *reinterpret_cast<uint4 const*>(ptr);
@@ -412,15 +412,15 @@ __global__ void __launch_bounds__(512, 4)
 
   // Hot path: map a fixed number of complete rows onto each CTA. K=3072 uses two rows and 384
   // threads, so every thread owns exactly one 16-value scale block without a warp shuffle.
-  for (int rowBase = blockIdx.x * RowsPerCta; rowBase < numRows;
-       rowBase += gridDim.x * RowsPerCta) {
-    int const rowsRemaining = numRows - rowBase;
+  for (int64_t rowBase = static_cast<int64_t>(blockIdx.x) * RowsPerCta; rowBase < numRows;
+       rowBase += static_cast<int64_t>(gridDim.x) * RowsPerCta) {
+    int const rowsRemaining = static_cast<int>(numRows - rowBase);
     int const rowsThisCta = rowsRemaining < RowsPerCta ? rowsRemaining : RowsPerCta;
     int const workItems = rowsThisCta * NumSfCols;
     for (int item = threadIdx.x; item < workItems; item += blockDim.x) {
       int const rowOffset = item / NumSfCols;
       int const sfCol = item - rowOffset * NumSfCols;
-      int const row = rowBase + rowOffset;
+      int const row = static_cast<int>(rowBase) + rowOffset;
       int64_t const vecOffset = static_cast<int64_t>(row) * NumSfCols + sfCol;
 
       Type const* xPtr = in + vecOffset * FAST_ELTS_PER_THREAD;
@@ -441,8 +441,8 @@ __global__ void __launch_bounds__(512, 4)
 
   // Cold path: only scale factors have padded rows. Four consecutive SF columns are contiguous in
   // the 128x4 layout, so initialize them with one aligned 32-bit store instead of four byte stores.
-  int const numPaddedRows = padUp(numRows, 128);
-  int64_t const numPaddingStores = static_cast<int64_t>(numPaddedRows - numRows) * NumSfGroups;
+  int64_t const numPaddedRows = padUp(numRows, 128);
+  int64_t const numPaddingStores = (numPaddedRows - numRows) * NumSfGroups;
   for (int64_t item = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        item < numPaddingStores; item += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     int const paddingRow = static_cast<int>(item / NumSfGroups);
@@ -470,18 +470,18 @@ __global__ void __launch_bounds__(512, 4)
                                   uint32_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
-  int const numPaddedRowsForSf = padUp(numRows, 128);
-  int const numColsForSf = padUp(numPaddedCols, 4 * SF_VEC_SIZE);
+  int64_t const numPaddedRowsForSf = padUp(numRows, 128);
+  int64_t const numColsForSf = padUp(numPaddedCols, 4 * SF_VEC_SIZE);
   int const numColThreads = numCols / ELTS_PER_THREAD;
   int const numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
-  int const numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
+  int const numColThreadsForSf = static_cast<int>(numColsForSf / ELTS_PER_THREAD);
 
   cudaGridDependencySynchronize();
-  for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
+  for (int64_t rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
     bool const isRowPadding = (rowIdx >= numRows);
     for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
       auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
-          rowIdx, colIdx, numPaddedCols / SF_VEC_SIZE, SFout);
+          static_cast<int>(rowIdx), colIdx, numPaddedCols / SF_VEC_SIZE, SFout);
 
       if (isRowPadding || colIdx >= numColThreads) {
         if (sf_out != nullptr) sf_out[0] = 0x00;
@@ -518,7 +518,7 @@ void launchSmoothQuantizeFast(void* out, void* sfOut, void const* in, void const
                               int blockThreads, int blocksPerSm, bool enablePDL,
                               cudaStream_t stream) {
   constexpr int NumSfGroups = NumCols / (4 * SF_VEC_SIZE);
-  int const numPaddedRows = padUp(numRows, 128);
+  int64_t const numPaddedRows = padUp(numRows, 128);
   int64_t const hotCtas = (static_cast<int64_t>(numRows) + RowsPerCta - 1) / RowsPerCta;
   int64_t const numPaddingStores = static_cast<int64_t>(numPaddedRows - numRows) * NumSfGroups;
   int64_t const paddingCtas = (numPaddingStores + blockThreads - 1) / blockThreads;
@@ -576,7 +576,8 @@ inline void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void 
 
   dim3 block(std::min(n / ELTS_PER_THREAD, 512));
   int const numBlocksPerSM = std::max(1, 2048 / int(block.x));
-  dim3 grid(std::min(padUp(m, 128), multiProcessorCount * numBlocksPerSM));
+  dim3 grid(static_cast<unsigned int>(
+      std::min(padUp(m, 128), static_cast<int64_t>(multiProcessorCount) * numBlocksPerSM)));
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = grid;
   cfg.blockDim = block;
