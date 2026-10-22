@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -206,19 +207,23 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     res_repeat = saved_pass()
     res_auto = autograd_pass(False)
     res_ckpt = autograd_pass(True)
-    res_transfer = saved_pass(save_transfer=True)
+    # the shipped default keeps the owner's c1 receive tensor for the backward (save_transfer=True); the recompute
+    # form (save_transfer=False) re-sends it and must be bitwise the same
+    res_recompute = saved_pass(save_transfer=False)
     ring_ok = True
     if (
         W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS
-    ):  # gate 5: the ring path is bitwise the a2a path
-        res_ring = saved_pass(exchange="ring")
-        ring_ok = all(torch.equal(res[n], res_ring[n]) for n in TENSORS)
+    ):  # gate 5: the ring path is bitwise the a2a path; the ring receives no c1 tensor, so recompute form only
+        res_ring = saved_pass(exchange="ring", save_transfer=False)
+        ring_ok = all(torch.equal(res_recompute[n], res_ring[n]) for n in TENSORS)
     flags = {
         "saved_eq_replay": all(torch.equal(res[n], res_replay[n]) for n in TENSORS),
         "repeat": all(torch.equal(res[n], res_repeat[n]) for n in TENSORS),
         "autograd_eq_saved": all(torch.equal(res[n], res_auto[n]) for n in TENSORS),
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
-        "save_transfer_eq": all(torch.equal(res[n], res_transfer[n]) for n in TENSORS),
+        "save_transfer_eq": all(
+            torch.equal(res[n], res_recompute[n]) for n in TENSORS
+        ),
         "ring_eq_a2a": ring_ok,
         # a backend with local stages must have run the SPEC-3 assertion (unless disabled) and passed it
         "spec3": (not backend.local_stages)
@@ -279,24 +284,25 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
                 "max_abs": float(err.abs().max()),
             }
             report["pass"] &= mism == 0 and bool(torch.isfinite(cand).all())
-        if result_dir:
-            os.makedirs(result_dir, exist_ok=True)
-            with open(os.path.join(result_dir, _row_id(row) + ".json"), "w") as fh:
-                json.dump(report, fh, indent=1)
     if W > 1:
         verdict = [None] * W
         dist.all_gather_object(verdict, report["pass"])
         report["pass"] = all(verdict)
         dist.barrier()
+    if rank == 0 and result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(os.path.join(result_dir, _row_id(row) + ".json"), "w") as fh:
+            json.dump(report, fh, indent=1, default=str)
     return report
 
 
-def _spawn_entry(
-    rank: int, W: int, row, port: int, result_dir: str | None, queue
-) -> None:
+def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
+    """One spawned rank: the verdict travels through rank 0's report file (no synchronization primitive is
+    pickled into the children); a failing rank raises so the parent sees its report."""
     try:
         report = _run_rank(rank, W, row, port, result_dir)
-        queue.put((rank, report))
+        if not report["pass"]:
+            raise AssertionError(f"rank {rank}: {report}")
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -341,21 +347,18 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
         assert report["pass"], report
         return
     _skip_unless_runnable(W)
-    ctx = mp.get_context("spawn")
-    queue = ctx.SimpleQueue()
-    mp.start_processes(
-        _spawn_entry,
-        args=(W, row, _free_port(), os.environ.get("KCP_TEST_RESULT_DIR"), queue),
-        nprocs=W,
-        join=True,
-        start_method="spawn",
-    )
-    reports = {}
-    while not queue.empty():
-        rank, report = queue.get()
-        reports[rank] = report
-    assert len(reports) == W, f"{len(reports)} of {W} ranks reported"
-    assert reports[0]["pass"], reports[0]
+    with tempfile.TemporaryDirectory(prefix="cake_kcp_dist_") as tmp:
+        result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
+        mp.start_processes(
+            _spawn_entry,
+            args=(W, row, _free_port(), result_dir),
+            nprocs=W,
+            join=True,
+            start_method="spawn",
+        )
+        with open(os.path.join(result_dir, _row_id(row) + ".json")) as fh:
+            report = json.load(fh)
+    assert report["pass"], report
 
 
 def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
