@@ -18,6 +18,7 @@ from flashinfer.norm import rmsnorm
 
 # Test helpers
 from tests.test_helpers.comm import (
+    _get_rank_info_from_env,
     init_torch_distributed_from_mpi,
 )
 from tests.test_helpers.utils_fp4 import (
@@ -37,6 +38,16 @@ def fp8_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def dequant(x: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return (x.to(torch.float32) * scale).to(dtype)
+
+
+def _set_device_from_launcher_local_rank() -> None:
+    """Select this rank's GPU from the launcher's node-local rank.
+
+    ``rank % device_count`` is wrong when ranks are spread across nodes, and
+    torch's default NCCL backend binds the process group to LOCAL_RANK's GPU.
+    """
+    _, _, local_rank = _get_rank_info_from_env()
+    torch.cuda.set_device(local_rank % torch.cuda.device_count())
 
 
 def _mnnvl_nvfp4_supported_on_all_ranks(device: torch.device) -> bool:
@@ -436,6 +447,8 @@ def run_mnnvl_ar_full(
     if gpus_per_node == 0:
         pytest.skip("MNNVL allreduce test requires at least one CUDA device per node")
 
+    _set_device_from_launcher_local_rank()
+
     # Initialize torch.distributed (safe to call if already initialized)
     init_torch_distributed_from_mpi()
 
@@ -452,9 +465,6 @@ def run_mnnvl_ar_full(
         gpus_per_node=gpus_per_node,
         tp_size=world_size,
     )
-
-    # Set CUDA device based on rank
-    torch.cuda.set_device(mapping.local_rank)
 
     # Create TorchDistBackend for workspace creation (non-MPI based)
     comm_backend = TorchDistBackend()
@@ -831,6 +841,7 @@ def test_mnnvl_allreduce_quant_unified(
     if torch.cuda.device_count() == 0:
         pytest.skip("MNNVL quant test requires CUDA")
 
+    _set_device_from_launcher_local_rank()
     init_torch_distributed_from_mpi()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -843,7 +854,6 @@ def test_mnnvl_allreduce_quant_unified(
         gpus_per_node=torch.cuda.device_count(),
         tp_size=world_size,
     )
-    torch.cuda.set_device(mapping.local_rank)
     is_fp4 = pattern in (
         comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
         comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
@@ -956,6 +966,7 @@ def test_mnnvl_nvfp4_rejects_fp32(
     if torch.cuda.device_count() == 0:
         pytest.skip("MNNVL quant test requires CUDA")
 
+    _set_device_from_launcher_local_rank()
     init_torch_distributed_from_mpi()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -968,7 +979,6 @@ def test_mnnvl_nvfp4_rejects_fp32(
         gpus_per_node=torch.cuda.device_count(),
         tp_size=world_size,
     )
-    torch.cuda.set_device(mapping.local_rank)
     workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
         mapping,
         max_num_tokens=4,
