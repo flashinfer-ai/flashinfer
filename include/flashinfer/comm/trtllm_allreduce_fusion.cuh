@@ -1967,7 +1967,12 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
                          params.layout == QuantizationSFLayout::LINEAR,
                      "MXFP8 quant supports the SWIZZLED_128x4 and LINEAR scale layouts");
     // A 32-element scale group spans kMXFP8SFVecSize / VEC_SIZE consecutive threads; keep
-    // every group inside one block (and therefore inside one warp).
+    // every group inside one block (and therefore inside one warp) by widening the block.
+    while (cluster_size > 1 && (threads_per_block * VEC_SIZE) % details::kMXFP8SFVecSize != 0) {
+      threads_per_block *= 2;
+      cluster_size /= 2;
+    }
+    block_size = threads_per_block;
     FLASHINFER_CHECK((block_size * VEC_SIZE) % details::kMXFP8SFVecSize == 0,
                      "block elements must be a multiple of 32 for MXFP8 quant");
   }

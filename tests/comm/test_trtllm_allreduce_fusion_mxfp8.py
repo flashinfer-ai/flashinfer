@@ -199,9 +199,17 @@ def _check_case(
     if not torch.equal(residual_out, ref_residual):
         print(f"FAIL residual {tag}")
         ok = False
-    if with_norm_out and not torch.equal(norm_out, ref_norm):
-        print(f"FAIL norm_out {tag}")
-        ok = False
+    if with_norm_out:
+        # The reference norm comes from a separate launch whose grid can differ (the
+        # MXFP8 variant keeps scale groups inside one CTA), so its RMS reduction order
+        # can differ: allow one ulp. The quant is checked exactly against the kernel's
+        # own norm output above.
+        ulps = (
+            norm_out.view(torch.int16).int() - ref_norm.view(torch.int16).int()
+        ).abs()
+        if not bool((ulps <= 1).all()):
+            print(f"FAIL norm_out {tag}: max {ulps.max().item()} ulp")
+            ok = False
     q_bytes, ref_q_bytes = quant_out.view(torch.uint8), ref_q.view(torch.uint8)
     if not torch.equal(q_bytes, ref_q_bytes):
         # The reference norm comes from the kARResidualRMSNorm kernel. When the
@@ -385,7 +393,7 @@ def test_trtllm_allreduce_fusion_mxfp8(world_size, dtype):
         pytest.skip(f"needs {world_size} GPUs")
     if get_compute_capability(torch.device("cuda:0"))[0] < 10:
         pytest.skip("mxfp8_quantize(cute-dsl) reference needs SM100+")
-    _multi_process(world_size, _run_worker, dtype, [6144, 2048, 7168, 1056])
+    _multi_process(world_size, _run_worker, dtype, [6144, 2048, 7168, 1056, 2080])
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -401,6 +409,6 @@ def test_allreduce_fusion_mxfp8_unified_api(dtype):
 if __name__ == "__main__":
     ws = int(sys.argv[1]) if len(sys.argv) > 1 else 4
     for dt in (torch.bfloat16, torch.float16):
-        _multi_process(ws, _run_worker, dt, [6144, 2048, 7168, 1056])
+        _multi_process(ws, _run_worker, dt, [6144, 2048, 7168, 1056, 2080])
         _multi_process(2, _run_unified_api_worker, dt)
     print("ALL PASSED")
