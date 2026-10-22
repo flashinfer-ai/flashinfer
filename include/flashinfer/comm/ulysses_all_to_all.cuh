@@ -157,6 +157,21 @@ __device__ __forceinline__ void ulysses_a2a_move(const T* __restrict__ local_in,
       Vec* d4 = reinterpret_cast<Vec*>((T*)out_ptrs.ptrs[peer] + dst_off);
       d4[unit] = s4[unit];
     }
+  } else if ((row_bytes % 8) == 0 && (reinterpret_cast<uintptr_t>(local_in) % 8) == 0) {
+    // Flatten 8B-aligned rows when 16B vectorization is unavailable.
+    using Vec8 = int2;
+    const int64_t units_per_row = row_bytes / sizeof(Vec8);
+    const int64_t total_units = (row_hi - row_lo) * units_per_row;
+    for (int64_t u = tid; u < total_units; u += nthr) {
+      const int64_t local_row = u / units_per_row;
+      const int64_t unit = u - local_row * units_per_row;
+      const int64_t row = row_lo + local_row;
+      int64_t src_off, dst_off;
+      const int64_t peer = offsets(row, src_off, dst_off);
+      const Vec8* s8 = reinterpret_cast<const Vec8*>(local_in + src_off);
+      Vec8* d8 = reinterpret_cast<Vec8*>((T*)out_ptrs.ptrs[peer] + dst_off);
+      d8[unit] = s8[unit];
+    }
   } else {
     // Scalar fallback (unaligned / odd shapes).
     for (int64_t row = row_lo; row < row_hi; ++row) {
