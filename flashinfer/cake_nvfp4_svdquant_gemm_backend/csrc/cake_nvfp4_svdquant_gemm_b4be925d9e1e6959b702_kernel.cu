@@ -477,7 +477,6 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
             unsigned int load_thr_stage = 0;
             unsigned int load_valid = 1;
             unsigned int load_next = 0;
-            unsigned int load_tiles = 0;
             asm volatile("griddepcontrol.wait;" ::: "memory");
             int rank_chunks = 1;
             unsigned int load_lead = 0;
@@ -489,7 +488,7 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
             unsigned int _phase_tma_empty = 1;
             unsigned int _phase_clc_full = 0;
             #pragma unroll 1
-            for (unsigned int _p = 0; _p < num_tiles; _p++) {
+            for (unsigned int load_tiles = 0; load_tiles < num_tiles; load_tiles++) {
                 if (cta_rank == 0) {
                     mbarrier_wait(thr_empty_addr + (load_thr_stage) * 8, _phase_thr_empty);
                     mbarrier_arrive(thr_full_addr + (load_thr_stage) * 8);
@@ -501,8 +500,8 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                 if (raster_group != 0) {
                     int _min_0 = ((raster_group) < (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group));
                     w_idx = (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_0;
-                    int _min_1 = ((raster_group) < (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group));
-                    tok_idx = tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)raster_group + (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) - (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_1 * (unsigned int)_min_1;
+                    int _min_0_1 = ((raster_group) < (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group));
+                    tok_idx = tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)raster_group + (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) - (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_0_1 * (unsigned int)_min_0_1;
                 }
                 int a_rows = tok_idx * 256 + cta_rank * 128;
                 int a_atom = a_rows / 128;
@@ -584,10 +583,10 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                 int w_idx_0 = tile_l / (unsigned int)tok_tiles;
                 int tok_idx_1 = tile_l - (unsigned int)(w_idx_0 * tok_tiles);
                 if (raster_group != 0) {
-                    int _min_2 = ((raster_group) < (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group));
-                    w_idx_0 = (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_2;
-                    int _min_3 = ((raster_group) < (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group));
-                    tok_idx_1 = tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)raster_group + (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) - (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_3 * (unsigned int)_min_3;
+                    int _min_1 = ((raster_group) < (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group));
+                    w_idx_0 = (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_1;
+                    int _min_1_1 = ((raster_group) < (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_l / (unsigned int)(raster_group * w_tiles)) * raster_group));
+                    tok_idx_1 = tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)raster_group + (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) - (tile_l - tile_l / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_1_1 * (unsigned int)_min_1_1;
                 }
                 int d_rows = tok_idx_1 * 256 + cta_rank * 128;
                 int lb_pre = w_idx_0 * 256 + buf_l * 64 + cta_rank * 96;
@@ -611,7 +610,6 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                     load_stage += 1;
                     if (load_stage == 5) { load_stage = 0; _phase_tma_empty ^= 1; }
                 }
-                load_tiles = load_tiles + 1;
                 if (load_valid == 0) {
                     break;
                 }
@@ -643,7 +641,7 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
             unsigned int _phase_acc_empty = 1;
             unsigned int _phase_clc_full_1 = 0;
             #pragma unroll 1
-            for (unsigned int _p_1 = 0; _p_1 < num_tiles; _p_1++) {
+            for (unsigned int _p = 0; _p < num_tiles; _p++) {
                 int buf = (int)(completed & 1);
                 int acc_base = buf * 192;
                 #pragma unroll 1
@@ -686,45 +684,45 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                             mbarrier_wait(acc_empty_addr + (acc_stage) * 8, _phase_acc_empty);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                         }
-                        int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
-                        int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                         if (elect_sync()) {
                             {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_0) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (acc_base)), a_desc + 0, b_desc + 0,
                                     0x10400480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1));
                             }
                         }
-                        int _mma_a_lo_1 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 2432;
-                        int _mma_b_lo_1 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_2 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_3 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                         if (elect_sync()) {
                             {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_1) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_3) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (acc_base)), a_desc + 0, b_desc + 0,
                                     0x10400480U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 8 + 0, 1);
                             }
                         }
-                        int _mma_a_lo_2 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (mma_stage) * 2432;
-                        int _mma_b_lo_2 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_4 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_5 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                         if (elect_sync()) {
                             {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_2) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_2) | ((uint64_t)0x40004040 << 32);
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_4) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_5) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (acc_base)), a_desc + 0, b_desc + 0,
                                     0x10400480U, tmem_tmem_sfa + 8 + 0, tmem_tmem_sfb + 16 + 0, 1);
                             }
                         }
-                        int _mma_a_lo_3 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (mma_stage) * 2432;
-                        int _mma_b_lo_3 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_6 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                        int _smem_desc_lo_7 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                         if (elect_sync()) {
                             {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_3) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_3) | ((uint64_t)0x40004040 << 32);
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_6) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_7) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf4nvf4_bs_cta2((tmem_accum + (acc_base)), a_desc + 0, b_desc + 0,
                                     0x10400480U, tmem_tmem_sfa + 12 + 0, tmem_tmem_sfb + 24 + 0, 1);
@@ -790,8 +788,8 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                         int init_c = 0;
                         int rank_cols_left = 32 - (int)rank_chunk_1 * 64;
                         if (rank_cols_left == 32) {
-                            int _mma_a_lo_4 = (((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
-                            int _mma_b_lo_4 = (((smem_l1_tail_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                            int _smem_desc_lo_8 = (((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                            int _smem_desc_lo_9 = (((smem_l1_tail_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -815,10 +813,10 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)) : "memory");
                         } else {
-                            int _mma_a_lo_5 = (((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
-                            int _mma_b_lo_5 = (((smem_l1_tail_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                            int _smem_desc_lo_10 = (((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
+                            int _smem_desc_lo_11 = (((smem_l1_tail_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -852,7 +850,7 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_5), "r"(_mma_b_lo_5), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)) : "memory");
                         }
                     }
                     mma_stage += 1;
@@ -869,8 +867,8 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                         int init_c_1 = 0;
                         int rank_cols_left_1 = 32 - (int)rank_chunk_2 * 64;
                         if (rank_cols_left_1 == 32) {
-                            int _mma_a_lo_6 = (((smem_d_addr) >> 4) & 0x3FFF) + (hs) * 2432;
-                            int _mma_b_lo_6 = (((smem_l1_pre_addr) >> 4) & 0x3FFF) + (hs) * 2432;
+                            int _smem_desc_lo_12 = (((smem_d_addr) >> 4) & 0x3FFF) + (hs) * 2432;
+                            int _smem_desc_lo_13 = (((smem_l1_pre_addr) >> 4) & 0x3FFF) + (hs) * 2432;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -894,10 +892,10 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_6), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_12), "r"(_smem_desc_lo_13), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)) : "memory");
                         } else {
-                            int _mma_a_lo_7 = (((smem_d_addr) >> 4) & 0x3FFF) + (hs) * 2432;
-                            int _mma_b_lo_7 = (((smem_l1_pre_addr) >> 4) & 0x3FFF) + (hs) * 2432;
+                            int _smem_desc_lo_14 = (((smem_d_addr) >> 4) & 0x3FFF) + (hs) * 2432;
+                            int _smem_desc_lo_15 = (((smem_l1_pre_addr) >> 4) & 0x3FFF) + (hs) * 2432;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -931,7 +929,7 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_7), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_14), "r"(_smem_desc_lo_15), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)) : "memory");
                         }
                     }
                     elect_commit_cg2_multicast(acc_full_addr + (accf_stage) * 8, (uint16_t)(3));
@@ -997,7 +995,7 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                 unsigned int sched_clc_stage = 0;
                 unsigned int sched_thr_stage = 0;
                 #pragma unroll 1
-                for (unsigned int _p_2 = 0; _p_2 < num_tiles; _p_2++) {
+                for (unsigned int _p_1 = 0; _p_1 < num_tiles; _p_1++) {
                     mbarrier_wait(thr_full_addr + (sched_thr_stage) * 8, _phase_thr_full);
                     mbarrier_arrive(thr_empty_addr + (sched_thr_stage) * 8);
                     sched_thr_stage += 1;
@@ -1064,7 +1062,6 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
             int epi_tid = epi_warp * 32 + lane;
             unsigned int acc_stage_1 = 0;
             unsigned int accf_stage_1 = 0;
-            unsigned int tiles_done = 0;
             unsigned int store_stage = 0;
             asm volatile("griddepcontrol.wait;" ::: "memory");
             float alpha_value = alpha[0];
@@ -1083,7 +1080,7 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
             unsigned int _phase_acc_ovl_full = 0;
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
-            for (unsigned int _p_3 = 0; _p_3 < num_tiles; _p_3++) {
+            for (unsigned int tiles_done = 0; tiles_done < num_tiles; tiles_done++) {
                 mbarrier_wait(clc_full_addr + (epi_clc_stage) * 8, _phase_clc_full_3);
                 uint32_t _clc_valid_3 = 0;
                 asm volatile(
@@ -1122,10 +1119,10 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                 int w_idx_1 = tile_e / (unsigned int)tok_tiles;
                 int tok_idx_2 = tile_e - (unsigned int)(w_idx_1 * tok_tiles);
                 if (raster_group != 0) {
-                    int _min_4 = ((raster_group) < (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group));
-                    w_idx_1 = (tile_e - tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_4;
-                    int _min_5 = ((raster_group) < (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group));
-                    tok_idx_2 = tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)raster_group + (tile_e - tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) - (tile_e - tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_5 * (unsigned int)_min_5;
+                    int _min_0_2 = ((raster_group) < (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group));
+                    w_idx_1 = (tile_e - tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_0_2;
+                    int _min_2 = ((raster_group) < (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(tile_e / (unsigned int)(raster_group * w_tiles)) * raster_group));
+                    tok_idx_2 = tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)raster_group + (tile_e - tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) - (tile_e - tile_e / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_2 * (unsigned int)_min_2;
                 }
                 int off_tok = tok_idx_2 * 256 + cta_rank * 128;
                 int off_w = w_idx_1 * 256;
@@ -1138,9 +1135,9 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                         if (bias_col < N) {
                             unsigned int _vec_load_0[2];
                             {
-                                uint32_t _bf16x2_bits_0;
-                                _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(bias + bias_col);
-                                _vec_load_0[0] = _bf16x2_bits_0;
+                                uint32_t _bf16x2_bits_1;
+                                _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(bias + bias_col);
+                                _vec_load_0[0] = _bf16x2_bits_1;
                             }
                             staged_bias_pair = _vec_load_0[0];
                         }
@@ -1216,9 +1213,7 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                         bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
                         bias_hi_bits = bias_pair & 4294901760u;
                         bias_hi = reinterpret_cast<float*>(&bias_hi_bits)[0];
-                        float2 _f2_1 = make_float2(_tmem_load_0[2 * jj], _tmem_load_0[2 * jj + 1]);
-                        float2 _f2_2 = make_float2(bias_lo, bias_hi);
-                        float2 result_pair = fma_f32x2_rn_ftz(_f2_1, _f2_0, _f2_2);
+                        float2 result_pair = fma_f32x2_rn_ftz(make_float2(_tmem_load_0[2 * jj], _tmem_load_0[2 * jj + 1]), _f2_0, make_float2(bias_lo, bias_hi));
                         result[2 * jj] = result_pair.x;
                         result[2 * jj + 1] = result_pair.y;
                     }
@@ -1303,7 +1298,6 @@ kernel_cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702(const __grid_constant__ CUt
                 _phase_acc_ovl_full ^= 1;
                 accf_stage_1 += 1;
                 if (accf_stage_1 == 2) { accf_stage_1 = 0; _phase_acc_full ^= 1; }
-                tiles_done = tiles_done + 1;
                 if (_clc_valid_3 == 0) {
                     break;
                 }
