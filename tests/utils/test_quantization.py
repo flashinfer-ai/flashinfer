@@ -24,7 +24,7 @@ import flashinfer
 
 
 def numpy_packbits_ref(x_cpu: torch.Tensor, bitorder: Literal["big", "little"]):
-    x_np = x_cpu.numpy()
+    x_np = (x_cpu != 0).numpy()
     x_packed = numpy.packbits(x_np, bitorder=bitorder)
     return torch.tensor(x_packed)
 
@@ -60,10 +60,12 @@ def test_segment_packbits(batch_size, bitorder):
         assert torch.equal(y_gpu[new_indptr[i] : new_indptr[i + 1]], y_segment_i_ref)
 
 
-@pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "dtype", [torch.bool, torch.uint8, torch.int32, torch.int64, torch.float16]
+)
 @pytest.mark.parametrize("bitorder", ["big", "little"])
 def test_segment_packbits_input_dtype(dtype, bitorder):
-    x_cpu = torch.tensor([1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 0, 1], dtype=dtype)
+    x_cpu = torch.tensor([2, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 0, 1], dtype=dtype)
     offsets = [0, 0, 3, 11, 13]
     expected_segments = [
         numpy_packbits_ref(x_cpu[start:end], bitorder)
