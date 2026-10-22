@@ -370,23 +370,26 @@ def launch_dsa_sparse_kernel(
     lse_kernel = lse.view(total_q, phys_sq, phys_heads).permute(2, 1, 0)
     descriptors = gather4_descriptors(kv_pool, nvfp4_data_pool)
     scale_pool_kernel = None if nvfp4_scale_pool is None else nvfp4_scale_pool.view(-1)
-    compiled(
-        q_latent,
-        q_rope,
-        c_latent,
-        c_rope,
-        page_offsets,
-        out_kernel,
-        lse_kernel,
-        workspace,
-        split_kv,
-        top_k_lens,
-        None,
-        None,
-        float(bmm1_scale),
-        float(bmm2_scale),
-        float(skip_corr_threshold),
-        descriptors,
-        scale_pool_kernel,
-        float(nvfp4_dequant_scale),
-    )
+    # TVM-FFI takes the stream from the device of the first CUDA argument
+    # (q_latent); keep the current device on it for any host-side CUDA call.
+    with torch.cuda.device(query.device):
+        compiled(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_offsets,
+            out_kernel,
+            lse_kernel,
+            workspace,
+            split_kv,
+            top_k_lens,
+            None,
+            None,
+            float(bmm1_scale),
+            float(bmm2_scale),
+            float(skip_corr_threshold),
+            descriptors,
+            scale_pool_kernel,
+            float(nvfp4_dequant_scale),
+        )

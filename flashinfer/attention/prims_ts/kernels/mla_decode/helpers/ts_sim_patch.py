@@ -18,7 +18,7 @@
 round-robin to prove the pipelines cannot deadlock.  Its step budget is the
 longest per-task list plus 100 steps, which assumes the critical dependency
 chain is about as long as the busiest task.  The native FP4 QK graph
-serializes MMA -> correction (SFB token) -> MMA per tile through single-stage
+serializes MMA -> dequant (SFB token) -> MMA per tile through single-stage
 TMEM pipelines, so its chain is longer than any single task list and the
 simulation stops early with a false "ProducerCommit not consumed" report (it
 passes with a 4-tile domain and fails from 8 tiles on).  This widens the

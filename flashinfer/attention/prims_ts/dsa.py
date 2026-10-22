@@ -119,6 +119,14 @@ def _require(cond: bool, msg: str) -> None:
         raise ValueError(msg)
 
 
+def _require_on_device(device: torch.device, **tensors: Optional[torch.Tensor]) -> None:
+    for name, tensor in tensors.items():
+        _require(
+            tensor is None or tensor.device == device,
+            f"{name} must be on {device} (the query's device), got {tensor.device if tensor is not None else None}",
+        )
+
+
 def _validate_common_inputs(
     query: torch.Tensor,
     block_tables: torch.Tensor,
@@ -218,6 +226,15 @@ def _validate_common_inputs(
             and lse.is_contiguous(),
             "lse must be contiguous FP32 [T, H]",
         )
+    _require_on_device(
+        device,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        cum_seq_lens_q=cum_seq_lens_q,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        out=out,
+        lse=lse,
+    )
     return top_k_lens, out, lse
 
 
@@ -349,6 +366,7 @@ def prims_ts_dsa_sparse_mla_fp8(
         kv_cache.data_ptr() % 16 == 0,
         "kv_cache must start at a 16-byte-aligned address",
     )
+    _require_on_device(query.device, kv_cache=kv_cache)
     kv_pool = kv_cache.view(-1, _HEAD_DIM)
     device_index = _device_index(query.device)
     _require_supported_device(device_index)
@@ -479,6 +497,9 @@ def prims_ts_dsa_sparse_mla_nvfp4(
         and kv_scale_pool.is_contiguous()
         and kv_scale_pool.shape[-1] == scale_row,
         f"kv_scale_pool must be a contiguous CUDA E4M3/uint8 tensor with {scale_row}-byte rows",
+    )
+    _require_on_device(
+        query.device, kv_data_pool=kv_data_pool, kv_scale_pool=kv_scale_pool
     )
     data_pool = kv_data_pool.view(-1, data_row)
     scale_pool = kv_scale_pool.view(torch.uint8).view(-1, scale_row)

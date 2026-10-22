@@ -100,7 +100,8 @@ def scaled_e4m3_pair_broadcast(
     ``(s_lo, s_hi)`` hold an 8-byte scale word pair; ``pair_sel`` is the ``prmt``
     selector ``(2c) | ((2c + 1) << 4)`` picking bytes ``2c`` and ``2c + 1``.  Both
     scales are converted and multiplied as one f16x2 and rounded once to E4M3;
-    this is exact for a power-of-two ``factor``, which is how the per-tensor
+    for a power-of-two ``factor`` this is an exponent shift, exact unless the
+    scaled block scale leaves the E4M3 normal range, which is how the per-tensor
     dequantization scale folds into the block scales without a second rounding.
     Returns ``(sc0, sc1)`` as e4m3x4 words.
     """
