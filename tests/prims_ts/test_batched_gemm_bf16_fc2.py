@@ -46,8 +46,7 @@ BF16_FC2_BASE = dict(
     tile_scheduler=0,
     act_kind=0,
     sf_layout_b=1,
-    cluster_m=1,
-    tile_m=128,
+    umma_cta_count=1,
     mma_m=128,
     mma_k=16,
     dtype_a=int(DType.BF16),
@@ -66,7 +65,7 @@ BF16_FC2_BASE = dict(
 def _run_bf16_fc2(
     *,
     tile_n,
-    tile_k=64,
+    tile_k=128,
     pipeline_stages=4,
     num_experts=1,
     num_tokens=128,
@@ -104,7 +103,24 @@ def _run_bf16_fc2(
 
 
 class TestScheduleValidation:
-    def test_validate_bf16_fc2_tile128(self):
+    def test_validate_bf16_fc2_tile8(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+            build_batched_gemm_task_manager,
+        )
+
+        build_batched_gemm_task_manager(
+            num_experts=1,
+            num_tokens=128,
+            top_k=1,
+            tile_n=8,
+            tile_k=128,
+            mma_n=8,
+            epi_tile_n=8,
+            **uniform_pipeline_stage_overrides(4),
+            **BF16_FC2_BASE,
+        )
+
+    def test_validate_bf16_fc2_tile16(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -113,16 +129,16 @@ class TestScheduleValidation:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             **BF16_FC2_BASE,
         )
 
     def test_validate_pdl_wait_for_num_non_exiting_ctas(self):
-        from cutlass.experimental.task_scheduling.resources import (
+        from flashinfer.prims_ts.batched_gemm.pdl_resources import (
             PdlLaunchBarrier,
             PdlWaitBarrier,
         )
@@ -135,14 +151,13 @@ class TestScheduleValidation:
             num_experts=1,
             num_tokens=160,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(4),
             use_pdl=1,
             use_early_exit=1,
-            do_pdl_wait_for_num_non_exiting_ctas=1,
             **BF16_FC2_BASE,
         )
 
@@ -162,51 +177,26 @@ class TestScheduleValidation:
             isinstance(resource, PdlLaunchBarrier) for resource in all_task_resources
         )
 
-    def test_validate_pdl_wait_for_num_non_exiting_ctas_requires_pdl(self):
+    @pytest.mark.parametrize(("pdl", "early_exit"), [(0, 1), (1, 0)])
+    def test_count_wait_is_only_required_for_pdl_early_exit(self, pdl, early_exit):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
 
-        with pytest.raises(
-            ValueError,
-            match="do_pdl_wait_for_num_non_exiting_ctas requires use_pdl=1",
-        ):
-            build_batched_gemm_task_manager(
-                num_experts=1,
-                num_tokens=160,
-                top_k=1,
-                tile_n=128,
-                tile_k=64,
-                mma_n=128,
-                epi_tile_n=128,
-                **uniform_pipeline_stage_overrides(4),
-                use_early_exit=1,
-                do_pdl_wait_for_num_non_exiting_ctas=1,
-                **BF16_FC2_BASE,
-            )
-
-    def test_validate_pdl_wait_for_num_non_exiting_ctas_requires_early_exit(self):
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
-            build_batched_gemm_task_manager,
+        task_manager = build_batched_gemm_task_manager(
+            num_experts=1,
+            num_tokens=160,
+            top_k=1,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
+            **uniform_pipeline_stage_overrides(4),
+            use_pdl=pdl,
+            use_early_exit=early_exit,
+            **BF16_FC2_BASE,
         )
-
-        with pytest.raises(
-            ValueError,
-            match="do_pdl_wait_for_num_non_exiting_ctas requires use_early_exit=1",
-        ):
-            build_batched_gemm_task_manager(
-                num_experts=1,
-                num_tokens=160,
-                top_k=1,
-                tile_n=128,
-                tile_k=64,
-                mma_n=128,
-                epi_tile_n=128,
-                **uniform_pipeline_stage_overrides(4),
-                use_pdl=1,
-                do_pdl_wait_for_num_non_exiting_ctas=1,
-                **BF16_FC2_BASE,
-            )
+        assert not task_manager._assume_pdl_wait_completed
 
 
 class TestBf16Fc2ReferenceCheck:
@@ -220,19 +210,28 @@ class TestBf16Fc2ReferenceCheck:
     )
     def test_plain_output_dtype(self, dtype_c, expected_output_dtype):
         _run_bf16_fc2(
-            tile_n=128,
+            tile_n=16,
             pipeline_stages=4,
             dtype_c=dtype_c,
             expected_output_dtype=expected_output_dtype,
         )
 
-    def test_tile_n128_stages4(self):
-        _run_bf16_fc2(tile_n=128, pipeline_stages=4)
+    def test_tile_n8_stages4(self):
+        _run_bf16_fc2(tile_n=8, pipeline_stages=4)
 
-    def test_tma_store_tile_n128(self):
-        _run_bf16_fc2(tile_n=128, use_tma_store=1)
+    def test_tile_n16_stages4(self):
+        _run_bf16_fc2(tile_n=16, pipeline_stages=4)
 
-    def test_bias_m_tile_n128(self):
+    def test_tile_n32_stages4(self):
+        _run_bf16_fc2(tile_n=32, pipeline_stages=4)
+
+    def test_tma_store_tile_n8(self):
+        _run_bf16_fc2(tile_n=8, use_tma_store=1)
+
+    def test_tma_store_tile_n32(self):
+        _run_bf16_fc2(tile_n=32, use_tma_store=1)
+
+    def test_bias_m_tile_n16(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -241,10 +240,10 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=1,
             num_tokens=128,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(4),
             bias_type=1,
             **BF16_FC2_BASE,
@@ -260,10 +259,10 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=4,
             num_tokens=160,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(4),
             use_tma_oob_opt=1,
             **BF16_FC2_BASE,
@@ -279,10 +278,10 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=1,
             num_tokens=160,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(4),
             use_early_exit=1,
             **BF16_FC2_BASE,
@@ -298,24 +297,23 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=1,
             num_tokens=160,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(4),
             use_pdl=1,
             use_early_exit=1,
-            do_pdl_wait_for_num_non_exiting_ctas=1,
             **BF16_FC2_BASE,
         )
         assert result
 
     def test_nonrounded_topk_expanded_layout(self):
-        _run_bf16_fc2(tile_n=128, num_experts=3, num_tokens=130, top_k=2)
+        _run_bf16_fc2(tile_n=16, num_experts=3, num_tokens=130, top_k=2)
 
 
 class TestBf16Fc2LargerProblem:
-    def test_tile_n128_problem_n256_k256(self):
+    def test_tile_n16_problem_n256_k256(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -326,16 +324,16 @@ class TestBf16Fc2LargerProblem:
             top_k=1,
             problem_n=256,
             problem_k=256,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             **BF16_FC2_BASE,
         )
         assert result
 
-    def test_tile_n128_problem_n1024_k1024(self):
+    def test_tile_n16_problem_n1024_k1024(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -346,10 +344,10 @@ class TestBf16Fc2LargerProblem:
             top_k=1,
             problem_n=1024,
             problem_k=1024,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             **BF16_FC2_BASE,
         )
@@ -358,10 +356,10 @@ class TestBf16Fc2LargerProblem:
 
 class TestBf16Fc2MultiExpert:
     def test_2_experts(self):
-        _run_bf16_fc2(tile_n=128, num_experts=2, num_tokens=256)
+        _run_bf16_fc2(tile_n=16, num_experts=2, num_tokens=256)
 
     def test_4_experts(self):
-        _run_bf16_fc2(tile_n=128, num_experts=4, num_tokens=512)
+        _run_bf16_fc2(tile_n=16, num_experts=4, num_tokens=512)
 
 
 class TestBf16Fc2Persistent:
@@ -371,7 +369,7 @@ class TestBf16Fc2Persistent:
         "num_stages_tmem_acc": 2,
     }
 
-    def test_validate_persistent_tile128(self):
+    def test_validate_persistent_tile16(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -380,17 +378,17 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             **self.PERSISTENT_CFG,
         )
 
     def test_validate_persistent_pdl_uses_split_barriers(self):
         from cutlass.experimental.task_scheduling.enums import ScheduleStage
-        from cutlass.experimental.task_scheduling.resources import (
+        from flashinfer.prims_ts.batched_gemm.pdl_resources import (
             PdlLaunchBarrier,
             PdlWaitBarrier,
         )
@@ -403,10 +401,10 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             use_pdl=1,
             **self.PERSISTENT_CFG,
@@ -454,7 +452,7 @@ class TestBf16Fc2Persistent:
         assert dep_graph["GmemA"] == ["PdlWait"]
         assert dep_graph["PdlLaunch"] == []
 
-    def test_persistent_tile128_stages5(self):
+    def test_persistent_tile16_stages5(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -463,16 +461,17 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             **self.PERSISTENT_CFG,
         )
         assert result
 
-    def test_persistent_tile128_stages5_pdl(self):
+    def test_persistent_tile16_mixed_cga(self):
+        """BF16 FC2 TMA pipelines with preferred and fallback CGAs."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -481,10 +480,38 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            problem_n=4096,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
+            **uniform_pipeline_stage_overrides(5),
+            require_mixed_cga_runtime=True,
+            **{
+                **self.PERSISTENT_CFG,
+                "umma_cta_count": 2,
+                "mma_m": 256,
+                "cluster_dim_x": 4,
+                "cluster_dim_y": 2,
+                "fallback_cluster_dim_x": 2,
+                "fallback_cluster_dim_y": 1,
+            },
+        )
+        assert result
+
+    def test_persistent_tile16_stages5_pdl(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             use_pdl=1,
             **self.PERSISTENT_CFG,
@@ -500,17 +527,17 @@ class TestBf16Fc2Persistent:
             num_experts=4,
             num_tokens=160,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             use_early_exit=1,
             **self.PERSISTENT_CFG,
         )
         assert result
 
-    def test_persistent_tile128_stages4(self):
+    def test_persistent_tile8_stages4(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -519,16 +546,16 @@ class TestBf16Fc2Persistent:
             num_experts=4,
             num_tokens=512,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=8,
+            tile_k=128,
+            mma_n=8,
+            epi_tile_n=8,
             **uniform_pipeline_stage_overrides(4),
             **self.PERSISTENT_CFG,
         )
         assert result
 
-    def test_persistent_tile128_generated_rows(self):
+    def test_persistent_tile32_generated_rows(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -543,10 +570,10 @@ class TestBf16Fc2Persistent:
                     num_experts=2,
                     num_tokens=256,
                     top_k=1,
-                    tile_n=128,
-                    tile_k=64,
-                    mma_n=128,
-                    epi_tile_n=128,
+                    tile_n=32,
+                    tile_k=128,
+                    mma_n=32,
+                    epi_tile_n=32,
                     **uniform_pipeline_stage_overrides(pipeline_stages),
                     **cfg,
                 )
@@ -567,7 +594,7 @@ class TestBf16Fc2DoubleBufferedAcc:
             num_tokens=num_tokens,
             top_k=1,
             tile_n=tile_n,
-            tile_k=64,
+            tile_k=128,
             mma_n=tile_n,
             epi_tile_n=tile_n,
             **uniform_pipeline_stage_overrides(pipeline_stages),
@@ -575,12 +602,15 @@ class TestBf16Fc2DoubleBufferedAcc:
         )
         assert result
 
-    def test_tile_n128_stages5_mma2(self):
-        self._run_double_buf(tile_n=128, pipeline_stages=5)
+    def test_tile_n8_stages5_mma2(self):
+        self._run_double_buf(tile_n=8, pipeline_stages=5)
 
-    def test_tile_n128_stages5_mma2_multi_expert(self):
+    def test_tile_n16_stages5_mma2(self):
+        self._run_double_buf(tile_n=16, pipeline_stages=5)
+
+    def test_tile_n16_stages5_mma2_multi_expert(self):
         self._run_double_buf(
-            tile_n=128, pipeline_stages=5, num_experts=4, num_tokens=512
+            tile_n=16, pipeline_stages=5, num_experts=4, num_tokens=512
         )
 
 
@@ -600,7 +630,7 @@ class TestBf16Fc2SwapAB:
             num_tokens=256,
             top_k=1,
             tile_n=16,
-            tile_k=64,
+            tile_k=128,
             mma_n=16,
             epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
@@ -618,10 +648,10 @@ class TestBf16Fc2SwapAB:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             **cfg,
         )
@@ -642,7 +672,7 @@ class TestBf16Fc2SwapAB:
             num_tokens=512,
             top_k=1,
             tile_n=8,
-            tile_k=64,
+            tile_k=128,
             mma_n=8,
             epi_tile_n=8,
             **uniform_pipeline_stage_overrides(4),
@@ -654,7 +684,7 @@ class TestBf16Fc2SwapAB:
 class TestBf16Fc2HighThroughput:
     HT_CFG = {
         **BF16_FC2_BASE,
-        "cluster_m": 2,
+        "umma_cta_count": 2,
         "mma_m": 256,
         "tile_scheduler": 1,
         "num_stages_tmem_acc": 2,
@@ -673,8 +703,8 @@ class TestBf16Fc2HighThroughput:
         )
 
         for tile_n, tile_k, epi_tile_n, pipeline_stages in (
-            (128, 64, 128, 4),
-            (128, 64, 128, 6),
+            (64, 128, 64, 4),
+            (128, 64, 64, 8),
         ):
             cfg = {**self.HT_CFG}
             build_batched_gemm_task_manager(
@@ -695,8 +725,8 @@ class TestBf16Fc2HighThroughput:
         )
 
         for tile_n, tile_k, epi_tile_n, pipeline_stages in (
-            (128, 64, 128, 4),
-            (128, 64, 128, 6),
+            (64, 128, 64, 4),
+            (128, 64, 64, 8),
         ):
             for unroll in (0,):
                 cfg = {
@@ -716,6 +746,61 @@ class TestBf16Fc2HighThroughput:
                 )
                 assert result
 
+    @pytest.mark.parametrize("tile_n", [128, 256])
+    def test_ht_batch_m_epi128_two_accumulator_stages(self, tile_n):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **self.HT_CFG,
+            "use_shuffled_matrix": 1,
+            "use_tma_store": 1,
+            "cta_raster_order": 1,
+        }
+        assert reference_check(
+            num_experts=3,
+            num_tokens=769,
+            top_k=2,
+            problem_n=1024,
+            problem_k=512,
+            repeat_launches=3,
+            output_guard_elements=256,
+            tile_n=tile_n,
+            tile_k=64,
+            mma_n=tile_n,
+            epi_tile_n=128,
+            **uniform_pipeline_stage_overrides(4),
+            **cfg,
+        )
+
+    def test_ht_batch_m_bf16_max_tmem_overlap(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **self.HT_CFG,
+            "num_stages_tmem_acc": 1,
+            "use_max_tmem_overlap": 1,
+            "use_tma_store": 1,
+        }
+        assert reference_check(
+            num_experts=3,
+            num_tokens=769,
+            top_k=2,
+            problem_n=1024,
+            problem_k=512,
+            repeat_launches=3,
+            output_guard_elements=256,
+            tile_n=256,
+            tile_k=64,
+            mma_n=256,
+            epi_tile_n=64,
+            **uniform_pipeline_stage_overrides(4),
+            **cfg,
+        )
+
     def test_ht_tile64_stages4_swap_ab(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -731,7 +816,7 @@ class TestBf16Fc2HighThroughput:
             num_tokens=256,
             top_k=1,
             tile_n=64,
-            tile_k=64,
+            tile_k=128,
             mma_n=64,
             epi_tile_n=64,
             **uniform_pipeline_stage_overrides(4),
@@ -762,7 +847,7 @@ class TestBf16Fc2HighThroughput:
             del workspace
             gc.collect()
             torch.cuda.synchronize()
-            return 0.0
+            return 1.0
 
         monkeypatch.setattr(testing, "benchmark", direct_benchmark)
 
@@ -794,10 +879,10 @@ class TestBf16Fc2HighThroughput:
             warmup_iters=1,
             bench_iters=1,
             num_rotated_buffers=0,
-            tile_n=128,
-            tile_k=64,
-            mma_n=128,
-            epi_tile_n=128,
+            tile_n=64,
+            tile_k=128,
+            mma_n=64,
+            epi_tile_n=64,
             **uniform_pipeline_stage_overrides(5),
             **pred_cfg,
         )
@@ -810,8 +895,8 @@ class TestBf16Fc2HighThroughput:
             tile_n=128,
             tile_k=64,
             mma_n=128,
-            epi_tile_n=128,
-            **uniform_pipeline_stage_overrides(6),
+            epi_tile_n=64,
+            **uniform_pipeline_stage_overrides(8),
             **target_cfg,
         )
         assert result
@@ -828,10 +913,10 @@ class TestBf16Fc2RepeatedLaunch:
                 num_experts=1,
                 num_tokens=128,
                 top_k=1,
-                tile_n=128,
-                tile_k=64,
-                mma_n=128,
-                epi_tile_n=128,
+                tile_n=16,
+                tile_k=128,
+                mma_n=16,
+                epi_tile_n=16,
                 **uniform_pipeline_stage_overrides(4),
                 **BF16_FC2_BASE,
             )

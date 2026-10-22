@@ -55,6 +55,7 @@ HAS_PRIMS_TS_RUNTIME = ensure_cutlass_dsl_experimental()
 if not HAS_PRIMS_TS_RUNTIME:
     collect_ignore_glob = ["test_batched_gemm_*.py"]
     collect_ignore = [
+        "test_moe_arch_configs.py",
         "test_moe_bf16_prefill_tiles.py",
         "test_moe_bf16_support.py",
         "test_moe_compile_cache.py",

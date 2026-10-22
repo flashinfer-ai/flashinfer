@@ -129,11 +129,15 @@ from .runners import (  # noqa: F401
 # Scheduling and applying its process-wide WorkTileInfo customization.
 _PRIMS_TS_LAZY_EXPORTS = {
     "prims_ts_bf16_moe": ".backends.prims_ts.bf16_op",
+    "prims_ts_bf16_moe_partitioned": ".backends.prims_ts.bf16_op",
     "prims_ts_bf16_routed_moe": ".backends.prims_ts.bf16_op",
     "prims_ts_fp8_block_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_block_scale_moe_partitioned": ".backends.prims_ts.fp8_op",
     "prims_ts_fp8_block_scale_routed_moe": ".backends.prims_ts.fp8_op",
     "prims_ts_fp8_per_tensor_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_per_tensor_scale_moe_partitioned": ".backends.prims_ts.fp8_op",
     "prims_ts_fp4_block_scale_moe": ".backends.prims_ts.fp4_op",
+    "prims_ts_fp4_block_scale_moe_partitioned": ".backends.prims_ts.fp4_op",
     "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
 }
 
@@ -429,12 +433,16 @@ __all__ = [
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",
     "prims_ts_bf16_moe",
+    "prims_ts_bf16_moe_partitioned",
     "prims_ts_bf16_routed_moe",
     "prims_ts_fp4_block_scale_moe",
+    "prims_ts_fp4_block_scale_moe_partitioned",
     "prims_ts_fp4_block_scale_routed_moe",
     "prims_ts_fp8_block_scale_moe",
+    "prims_ts_fp8_block_scale_moe_partitioned",
     "prims_ts_fp8_block_scale_routed_moe",
     "prims_ts_fp8_per_tensor_scale_moe",
+    "prims_ts_fp8_per_tensor_scale_moe_partitioned",
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",

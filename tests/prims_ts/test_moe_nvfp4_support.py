@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -22,7 +24,10 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
 )
 from flashinfer.prims_ts.moe.config_mapper import (
     _DType,
+    _json_config_by_global_index,
+    _json_config_kwargs,
     _make_json_moe_config_pair,
+    _pdl_overrides,
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_nvfp4_moe_tactics,
 )
@@ -30,14 +35,15 @@ from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import is_sm100a_supported
 
 
-_requires_non_sm107_prims_ts = pytest.mark.skipif(
+_requires_sm100_or_sm103_tactic = pytest.mark.skipif(
     torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
-    reason="NVFP4 Prims-TS kernels support SM100 and SM103, not SM107",
+    reason="This test asserts SM100/SM103 tactic geometry; SM107 uses Rubin tactics",
 )
 
 
-def _find_bs1_ldgsts_persistent_pair():
+def _find_bs1_ldgsts_persistent_pair(sm_arch: int = 100, *, enable_pdl: bool = False):
     tactics = valid_prims_ts_nvfp4_moe_tactics(
+        sm_arch=sm_arch,
         num_tokens=1,
         top_k=8,
         num_local_experts=256,
@@ -45,6 +51,7 @@ def _find_bs1_ldgsts_persistent_pair():
 
     for tactic in tactics:
         pair = _make_json_moe_config_pair(
+            sm_arch=sm_arch,
             tile_n=tactic[0],
             moe_config_index=tactic[1],
             activation_type=int(ActivationType.Swiglu),
@@ -53,6 +60,7 @@ def _find_bs1_ldgsts_persistent_pair():
             fc1_dtype_c=int(_DType.E2M1),
             fc2_dtype_c=int(_DType.BF16),
             dtype_label="NVFP4xNVFP4",
+            enable_pdl=enable_pdl,
         )
         if pair is None:
             continue
@@ -61,7 +69,7 @@ def _find_bs1_ldgsts_persistent_pair():
         if (
             fc1["tile_n"] == 8
             and fc1["tile_k"] == 512
-            and fc1["cluster_m"] == 1
+            and fc1["umma_cta_count"] == 1
             and fc1["route_act"] == int(RouteImpl.LDGSTS)
             and fc1["route_sfs_act"] == int(RouteImpl.LDGSTS)
             and fc1["tile_scheduler"] == int(TileScheduler.PERSISTENT)
@@ -69,7 +77,7 @@ def _find_bs1_ldgsts_persistent_pair():
             and fc1["use_work_throttle"] == 1
             and fc2["tile_n"] == 8
             and fc2["tile_k"] == 512
-            and fc2["cluster_m"] == 1
+            and fc2["umma_cta_count"] == 1
             and fc2["num_stages_a"] == 4
             and fc2["tile_scheduler"] == int(TileScheduler.PERSISTENT)
             and fc2["use_clc_fast_drain"] == 0
@@ -84,12 +92,79 @@ def test_nvfp4_search_contains_bs1_ldgsts_persistent_pair():
     assert _find_bs1_ldgsts_persistent_pair() is not None
 
 
+@pytest.mark.parametrize("enable_pdl", (False, True))
+def test_nvfp4_moe_pair_derives_skip_early_exit_pdl(enable_pdl):
+    pair = _find_bs1_ldgsts_persistent_pair(enable_pdl=enable_pdl)
+    assert pair is not None
+
+    fc1 = pair.fc1.cfg.kwargs
+    fc2 = pair.fc2.cfg.kwargs
+    assert fc1["use_pdl"] == int(enable_pdl)
+    assert fc1["skip_early_exit_pdl"] == 0
+    assert fc2["use_pdl"] == int(enable_pdl)
+    assert fc2["skip_early_exit_pdl"] == int(enable_pdl)
+
+
+def test_fc2_without_early_exit_does_not_skip_pdl_wait():
+    overrides = _pdl_overrides(
+        {"use_early_exit": 0},
+        enable_pdl=True,
+        skip_early_exit_pdl=True,
+    )
+    assert overrides == {"use_pdl": 1, "skip_early_exit_pdl": 0}
+
+
+@pytest.mark.parametrize(
+    ("json_value", "raises"),
+    (
+        pytest.param(False, False, id="false-opt-out"),
+        pytest.param(True, True, id="true-rejected"),
+    ),
+)
+def test_nvfp4_fc2_json_can_only_opt_out_of_skip_early_exit_pdl(json_value, raises):
+    pair = _find_bs1_ldgsts_persistent_pair()
+    assert pair is not None
+    json_cfg = _json_config_by_global_index(
+        pair.fc2.prims_ts_gemm_config_index,
+        sm_arch=100,
+    )
+    json_cfg = replace(
+        json_cfg,
+        options={**json_cfg.options, "skip_early_exit_pdl": json_value},
+    )
+
+    def mapped_kwargs():
+        return _json_config_kwargs(
+            json_cfg,
+            sm_arch=100,
+            fc="fc2",
+            activation_type=int(ActivationType.Swiglu),
+            has_bias=False,
+            default_dtype_a=int(_DType.E2M1),
+            default_dtype_b=int(_DType.E2M1),
+            default_dtype_c=int(_DType.BF16),
+        )
+
+    if raises:
+        with pytest.raises(ValueError, match="may only set it to false"):
+            mapped_kwargs()
+        return
+
+    kwargs = mapped_kwargs()
+    assert kwargs["skip_early_exit_pdl"] == 0
+    assert _pdl_overrides(
+        kwargs,
+        enable_pdl=True,
+        skip_early_exit_pdl=True,
+    ) == {"use_pdl": 1, "skip_early_exit_pdl": 0}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 @pytest.mark.skipif(
     torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
 )
-@_requires_non_sm107_prims_ts
+@_requires_sm100_or_sm103_tactic
 @pytest.mark.parametrize(
     (
         "stage",
@@ -144,23 +219,41 @@ def test_bs1_deepseek_persistent_pair_gpu_correctness(
     )
 
 
-def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns():
+@pytest.mark.parametrize("sm_arch", (100, 107))
+def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns(sm_arch):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         _build_schedule_validate,
     )
 
-    pair = map_trtllm_nvfp4_moe_tactic(
-        [128, 1],
+    kwargs = dict(
+        sm_arch=sm_arch,
         num_tokens=8192,
         top_k=8,
         num_local_experts=256,
         activation_type=int(ActivationType.Swiglu),
     )
-    cfg = pair.fc1.cfg.build()
+    for tactic in valid_prims_ts_nvfp4_moe_tactics(**kwargs):
+        if tactic[0] != 128:
+            continue
+        cfg = map_trtllm_nvfp4_moe_tactic(tactic, **kwargs).fc1.cfg.build()
+        if (
+            cfg.fuse_sf_copy_to_mma
+            and not cfg.use_combined_sfab_copy
+            and not cfg.use_tile256_tmem_overlap
+        ):
+            break
+    else:
+        pytest.fail(f"no tile-128 NVFP4 FC1 tactic with fused SF copy for sm_{sm_arch}")
+
     _, _, _, tmem_allocator = _build_schedule_validate(cfg)
 
-    assert cfg.fuse_sf_copy_to_mma
-    assert tmem_allocator.total_tmem_columns == cfg.tmem_required_cols == 320
+    # A single SF slot follows the accumulator stages instead of per-stage SF rings.
+    assert tmem_allocator.total_tmem_columns == cfg.tmem_required_cols
+    assert cfg.tmem_required_cols == (
+        cfg.tmem_c_cols_per_stage * cfg.num_stages_tmem_acc
+        + cfg.tmem_sfa_cols
+        + cfg.tmem_sfb_cols
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
@@ -168,7 +261,7 @@ def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns():
     torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
 )
-@_requires_non_sm107_prims_ts
+@_requires_sm100_or_sm103_tactic
 @pytest.mark.parametrize(
     ("problem_k", "dtype_c_override"),
     (
@@ -205,6 +298,7 @@ def test_nvfp4_tile128_fused_fc1_gpu_correctness(problem_k, dtype_c_override):
 
 def test_nvfp4_bs256_has_matching_gen_tile32_pair():
     tactics = valid_prims_ts_nvfp4_moe_tactics(
+        sm_arch=100,
         num_tokens=256,
         top_k=8,
         num_local_experts=256,
@@ -214,6 +308,7 @@ def test_nvfp4_bs256_has_matching_gen_tile32_pair():
     for tactic in tactics:
         pair = map_trtllm_nvfp4_moe_tactic(
             tactic,
+            sm_arch=100,
             num_tokens=256,
             top_k=8,
             num_local_experts=256,
@@ -229,7 +324,7 @@ def test_nvfp4_bs256_has_matching_gen_tile32_pair():
             and fc1.num_stages_a == 4
             and fc2.tile_n == 32
             and fc2.tile_k == 512
-            and fc2.cluster_m == 2
+            and fc2.umma_cta_count == 2
             and fc2.num_stages_a == 4
             and fc2.use_unroll_loop_2x_for_mma
             and fc1.tile_scheduler == int(TileScheduler.PERSISTENT)

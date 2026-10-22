@@ -51,6 +51,34 @@ def _fc1_out_hidden(intermediate_size: int, activation_type: int) -> int:
     )
 
 
+def _validate_swap_ab_cluster_span(cfg, out_hidden: int) -> None:
+    """Reject output widths that cannot fill each physical Batch-N CGA.
+
+    In swap-AB mode physical cluster X spans ``out_hidden`` and therefore
+    needs this divisibility check. Cluster Y spans routed token tiles instead;
+    routing metadata capacity is computed from ``cfg.token_cluster_dim`` and
+    validated by the launch-capacity path.
+    """
+
+    if not cfg.is_swap_ab:
+        return
+    if out_hidden % cfg.tile_m:
+        raise ValueError(
+            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
+            f"got {out_hidden}"
+        )
+    cluster_dim_x = int(cfg.preferred_cluster_shape[0])
+    if cluster_dim_x <= int(cfg.umma_cta_count):
+        return
+    cluster_span = int(cfg.tile_m) * cluster_dim_x
+    if out_hidden % cluster_span:
+        raise ValueError(
+            "swapAB wider CGA requires out_hidden to be a multiple of "
+            f"cluster span {cluster_span} (tile_m={cfg.tile_m}, "
+            f"cluster_dim_x={cluster_dim_x}), got {out_hidden}"
+        )
+
+
 def _check_fp8_scale_storage(
     name: str, tensor: torch.Tensor, *, min_numel: int | None = None
 ) -> None:
@@ -176,6 +204,178 @@ def _logical_token_capacity(
     return logical_capacity
 
 
+def _validate_c_output_layout(
+    *,
+    fc: Literal["fc1", "fc2"],
+    output_buf: torch.Tensor,
+    logical_output_m: int,
+    output_n: int,
+    c_row_stride: int | None,
+    logical_elements_per_storage_element: int = 1,
+) -> int:
+    """Validate a possibly strided swap-AB C view and return its logical pitch."""
+    pitch = int(c_row_stride) if c_row_stride else int(logical_output_m)
+    if pitch < logical_output_m:
+        raise ValueError(
+            f"{fc} c_row_stride={pitch} is narrower than this launch's "
+            f"output width {logical_output_m}"
+        )
+    if pitch % 32:
+        raise ValueError(
+            f"{fc} c_row_stride={pitch} must be a multiple of 32 "
+            "(the C layout applies cute.assume(stride, 32))"
+        )
+    packing = int(logical_elements_per_storage_element)
+    if pitch % packing:
+        raise ValueError(
+            f"{fc} c_row_stride={pitch} is not divisible by the C storage "
+            f"packing factor {packing}"
+        )
+    storage_pitch = pitch // packing
+    if c_row_stride and output_buf.dim() == 2:
+        if output_buf.stride(1) != 1 or output_buf.stride(0) != storage_pitch:
+            raise ValueError(
+                f"{fc} output layout {tuple(output_buf.stride())} does not match "
+                f"c_row_stride={pitch}; expected storage row stride "
+                f"{storage_pitch} with unit column stride"
+            )
+    # A strided output is a column slice, so its own numel covers only its
+    # columns; the bound that matters is from its base to the end of storage.
+    required_width = (int(logical_output_m) + packing - 1) // packing
+    if output_buf.dim() == 2 and int(output_buf.shape[1]) < required_width:
+        raise ValueError(
+            f"{fc} output buffer width too small: need {required_width} storage "
+            f"elements, got {output_buf.shape[1]}"
+        )
+    if output_buf.data_ptr() % 16:
+        raise ValueError(f"{fc} output buffer pointer must be 16-byte aligned")
+    need = (int(output_n) - 1) * storage_pitch + required_width
+    avail = (
+        output_buf.untyped_storage().nbytes() // output_buf.element_size()
+        - output_buf.storage_offset()
+    )
+    if avail < need:
+        raise ValueError(
+            f"{fc} output buffer too small for row stride {pitch}: "
+            f"need {need} storage elements from its base, got {avail}"
+        )
+    return pitch
+
+
+def _validate_sf_c_m_offset(
+    *,
+    fc: Literal["fc1", "fc2"],
+    cfg,
+    sf_c_m_offset: int,
+    logical_output_m: int,
+    pitch: int,
+) -> int:
+    """Validate a logical swap-AB SF-C column offset and return it."""
+
+    offset = int(sf_c_m_offset)
+    if offset < 0:
+        raise ValueError(f"{fc} sf_c_m_offset must be non-negative, got {offset}")
+    if offset and (not cfg.is_swap_ab or not cfg.has_output_block_scaling):
+        raise ValueError(f"{fc} sf_c_m_offset requires swapAB block-scaled C output")
+    if cfg.has_output_block_scaling:
+        block_size = int(cfg.output_sf_block_size_c)
+        if not cfg.has_gated_epilogue and int(logical_output_m) % block_size:
+            raise ValueError(
+                f"{fc} non-gated block-scaled output width "
+                f"{logical_output_m} must be a multiple of the SF block width "
+                f"{block_size}"
+            )
+        if offset % block_size:
+            raise ValueError(
+                f"{fc} sf_c_m_offset={offset} must be a multiple of the "
+                f"SF block width {block_size}"
+            )
+        if offset % 32:
+            raise ValueError(
+                f"{fc} sf_c_m_offset={offset} must be a multiple of 32 "
+                "to satisfy the block-scaled epilogue alignment"
+            )
+    if offset + int(logical_output_m) > int(pitch):
+        raise ValueError(
+            f"{fc} SF-C partition at offset {offset} with width "
+            f"{logical_output_m} does not fit inside pitch {pitch}"
+        )
+    return offset
+
+
+def _block_scaled_sf_required_span(
+    *,
+    output_m: int,
+    output_n: int,
+    pitch: int,
+    sf_block_size: int,
+    sf_layout: int,
+    m_offset: int = 0,
+) -> int:
+    """Number of SF-C elements addressable from the unshifted base pointer."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
+
+    groups = (int(pitch) + int(sf_block_size) * 4 - 1) // (int(sf_block_size) * 4)
+    last_n = int(output_n) - 1
+    last_block = (int(m_offset) + int(output_m) - 1) // int(sf_block_size)
+    if int(sf_layout) == int(SfLayout.R8c4):
+        return (
+            (last_n // 8) * groups * 32
+            + (last_block // 4) * 32
+            + (last_n % 8) * 4
+            + last_block % 4
+            + 1
+        )
+    if int(sf_layout) == int(SfLayout.R128c4):
+        last_n_in_tile = last_n % 128
+        n_subtile = last_n_in_tile // 32
+        current_subtile_max = (last_n_in_tile % 32) * 16 + n_subtile * 4
+        previous_subtile_max = 31 * 16 + (n_subtile - 1) * 4 if n_subtile else 0
+        n_inner_max = max(current_subtile_max, previous_subtile_max)
+        return (
+            (last_n // 128) * groups * 512
+            + (last_block // 4) * 512
+            + n_inner_max
+            + last_block % 4
+            + 1
+        )
+    raise ValueError(f"Unsupported SF-C layout {sf_layout}")
+
+
+def _validate_block_scaled_sf_output(
+    *,
+    fc: Literal["fc1", "fc2"],
+    output_scale: torch.Tensor,
+    logical_output_m: int,
+    output_n: int,
+    pitch: int,
+    sf_block_size: int,
+    sf_layout: int,
+    m_offset: int = 0,
+) -> None:
+    if output_scale.element_size() != 1:
+        raise ValueError(f"{fc} SF-C output must use byte-sized storage")
+    if output_scale.data_ptr() % 16:
+        raise ValueError(f"{fc} SF-C output pointer must be 16-byte aligned")
+    need = _block_scaled_sf_required_span(
+        output_m=logical_output_m,
+        output_n=output_n,
+        pitch=pitch,
+        sf_block_size=sf_block_size,
+        sf_layout=sf_layout,
+        m_offset=m_offset,
+    )
+    avail = (
+        output_scale.untyped_storage().nbytes() // output_scale.element_size()
+        - output_scale.storage_offset()
+    )
+    if avail < need:
+        raise ValueError(
+            f"{fc} SF-C buffer too small for row stride {pitch}: "
+            f"need {need} elements from its base, got {avail}"
+        )
+
+
 def _launch_early_exit_max_token_ctas(
     *,
     cfg,
@@ -193,8 +393,8 @@ def _launch_early_exit_max_token_ctas(
         compute_max_num_ctas_in_token_dim_for_moe,
     )
 
-    token_tile_size = int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m)
-    cluster_dim_in_token = cfg.token_metadata_stride
+    token_tile_size = int(cfg.token_tile_size)
+    cluster_dim_in_token = int(cfg.token_cluster_dim)
     launch_token_ctas = compute_max_num_ctas_in_token_dim_for_moe(
         num_tokens=int(num_tokens),
         num_experts=int(num_routed_experts),
@@ -203,8 +403,8 @@ def _launch_early_exit_max_token_ctas(
         cluster_dim_in_token=cluster_dim_in_token,
     )
     required_metadata = (
-        launch_token_ctas + cfg.token_metadata_stride - 1
-    ) // cfg.token_metadata_stride
+        launch_token_ctas + cluster_dim_in_token - 1
+    ) // cluster_dim_in_token
     if required_metadata > int(metadata_token_ctas):
         raise ValueError(
             "routing metadata capacity is smaller than the required token CTA "
@@ -359,6 +559,8 @@ def build_bf16_launch_io(
     route_map: torch.Tensor,
     num_non_exiting_ctas: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
+    c_row_stride: int | None = None,
+    sf_c_m_offset: int = 0,
     routed_token_capacity: int | None = None,
     activation_type: int,
     num_experts: int,
@@ -427,11 +629,8 @@ def build_bf16_launch_io(
         top_k=top_k,
         metadata_token_ctas=tile_idx.numel(),
     )
-    if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    if cfg.is_swap_ab:
+        _validate_swap_ab_cluster_span(cfg, out_hidden)
     if output_buf.shape[1] < out_hidden and not cfg.has_gated_epilogue:
         raise ValueError(
             f"{fc} output buffer hidden dim too small: need {out_hidden}, "
@@ -467,11 +666,32 @@ def build_bf16_launch_io(
     logical_output_n = (
         n_val // 2 if not cfg.is_swap_ab and cfg.has_gated_epilogue else n_val
     )
-    if output_buf.numel() < logical_output_m * logical_output_n:
-        raise ValueError(
-            f"{fc} output buffer too small: need {logical_output_m * logical_output_n}, "
-            f"got {output_buf.numel()}"
+    if cfg.is_swap_ab:
+        c_row_stride_val = _validate_c_output_layout(
+            fc=fc,
+            output_buf=output_buf,
+            logical_output_m=logical_output_m,
+            output_n=n_val,
+            c_row_stride=c_row_stride,
         )
+    else:
+        # Batch-M C rows are tokens with a contiguous hidden dimension, so the
+        # strided swap-AB column-slice layout does not apply.
+        if c_row_stride:
+            raise ValueError(f"{fc} c_row_stride requires a swapAB config")
+        if output_buf.numel() < logical_output_m * logical_output_n:
+            raise ValueError(
+                f"{fc} output buffer too small: need "
+                f"{logical_output_m * logical_output_n}, got {output_buf.numel()}"
+            )
+        c_row_stride_val = int(logical_output_m)
+    sf_c_m_offset_val = _validate_sf_c_m_offset(
+        fc=fc,
+        cfg=cfg,
+        sf_c_m_offset=sf_c_m_offset,
+        logical_output_m=logical_output_m,
+        pitch=c_row_stride_val,
+    )
 
     act_torch = activation_compact
     bias_torch = _select_bias(
@@ -611,6 +831,8 @@ def build_bf16_launch_io(
         "sfa_dp": a_dp,
         "sfb_dp": b_dp,
         "c0_dp": c0_dp,
+        "c_row_stride": c_row_stride_val,
+        "sf_c_m_offset": sf_c_m_offset_val,
         "sf_c_dp": sf_c_dp,
         "tile_idx_dp": tile_idx_dp,
         "route_map_dp": route_map_dp,
@@ -655,6 +877,8 @@ def build_nvfp4_launch_io(
     route_map: torch.Tensor,
     num_non_exiting_ctas: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
+    c_row_stride: int | None = None,
+    sf_c_m_offset: int = 0,
     routed_token_capacity: int | None = None,
     activation_type: int,
     num_experts: int,
@@ -734,6 +958,11 @@ def build_nvfp4_launch_io(
         ("num_non_exiting_ctas", num_non_exiting_ctas),
         ("total_num_padded_tokens", total_num_padded_tokens),
     ):
+        if c_row_stride and (
+            tensor is output_buf
+            or (cfg.has_output_block_scaling and tensor is output_scale)
+        ):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     if hidden_states.dtype != torch.uint8:
@@ -772,11 +1001,7 @@ def build_nvfp4_launch_io(
         top_k=top_k,
         metadata_token_ctas=tile_idx.numel(),
     )
-    if out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_cluster_span(cfg, out_hidden)
 
     m_val, n_val, k_val, l_val = (
         out_hidden,
@@ -785,6 +1010,39 @@ def build_nvfp4_launch_io(
         num_experts,
     )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
+    if cfg.has_output_block_scaling:
+        if output_buf.dtype != torch.uint8:
+            raise ValueError(f"{fc} NVFP4 C output must use packed uint8 storage")
+        if output_scale.dtype not in (torch.float8_e4m3fn, torch.uint8):
+            raise ValueError(
+                f"{fc} NVFP4 SF-C output must use float8_e4m3fn or uint8 storage"
+            )
+    c_row_stride_val = _validate_c_output_layout(
+        fc=fc,
+        output_buf=output_buf,
+        logical_output_m=logical_output_m,
+        output_n=n_val,
+        c_row_stride=c_row_stride,
+        logical_elements_per_storage_element=(2 if cfg.has_output_block_scaling else 1),
+    )
+    sf_c_m_offset_val = _validate_sf_c_m_offset(
+        fc=fc,
+        cfg=cfg,
+        sf_c_m_offset=sf_c_m_offset,
+        logical_output_m=logical_output_m,
+        pitch=c_row_stride_val,
+    )
+    if cfg.has_output_block_scaling:
+        _validate_block_scaled_sf_output(
+            fc=fc,
+            output_scale=output_scale,
+            logical_output_m=logical_output_m,
+            output_n=n_val,
+            pitch=c_row_stride_val,
+            sf_block_size=cfg.output_sf_block_size_c,
+            sf_layout=cfg.sf_layout_c,
+            m_offset=sf_c_m_offset_val,
+        )
     kernel_a = weights
     kernel_b = activation_compact
     sf_a = weights_scale
@@ -813,7 +1071,7 @@ def build_nvfp4_launch_io(
     sfb_dp = make_ptr(
         sf_dtype, sf_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
-    if cfg.has_epilogue_quant:
+    if cfg.has_output_block_scaling:
         c0_dp = make_ptr(
             data_dtype,
             output_buf.data_ptr(),
@@ -971,6 +1229,8 @@ def build_nvfp4_launch_io(
         "sfa_dp": sfa_dp,
         "sfb_dp": sfb_dp,
         "c0_dp": c0_dp,
+        "c_row_stride": c_row_stride_val,
+        "sf_c_m_offset": sf_c_m_offset_val,
         "sf_c_dp": sf_c_dp,
         "tile_idx_dp": tile_idx_dp,
         "route_map_dp": route_map_dp,
@@ -1016,6 +1276,8 @@ def build_mxfp4_mxfp8_launch_io(
     route_map: torch.Tensor,
     num_non_exiting_ctas: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
+    c_row_stride: int | None = None,
+    sf_c_m_offset: int = 0,
     routed_token_capacity: int | None = None,
     activation_type: int,
     num_experts: int,
@@ -1092,6 +1354,11 @@ def build_mxfp4_mxfp8_launch_io(
         ("num_non_exiting_ctas", num_non_exiting_ctas),
         ("total_num_padded_tokens", total_num_padded_tokens),
     ):
+        if c_row_stride and (
+            tensor is output_buf
+            or (cfg.has_output_block_scaling and tensor is output_scale)
+        ):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     if hidden_states.dtype != torch.float8_e4m3fn:
@@ -1129,11 +1396,7 @@ def build_mxfp4_mxfp8_launch_io(
         top_k=top_k,
         metadata_token_ctas=tile_idx.numel(),
     )
-    if out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_cluster_span(cfg, out_hidden)
 
     m_val, n_val, k_val, l_val = (
         out_hidden,
@@ -1142,6 +1405,36 @@ def build_mxfp4_mxfp8_launch_io(
         num_experts,
     )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
+    if cfg.has_output_block_scaling and output_buf.dtype not in (
+        torch.float8_e4m3fn,
+        torch.uint8,
+    ):
+        raise ValueError(f"{fc} MXFP8 C output must use float8_e4m3fn or uint8 storage")
+    c_row_stride_val = _validate_c_output_layout(
+        fc=fc,
+        output_buf=output_buf,
+        logical_output_m=logical_output_m,
+        output_n=n_val,
+        c_row_stride=c_row_stride,
+    )
+    sf_c_m_offset_val = _validate_sf_c_m_offset(
+        fc=fc,
+        cfg=cfg,
+        sf_c_m_offset=sf_c_m_offset,
+        logical_output_m=logical_output_m,
+        pitch=c_row_stride_val,
+    )
+    if cfg.has_output_block_scaling:
+        _validate_block_scaled_sf_output(
+            fc=fc,
+            output_scale=output_scale,
+            logical_output_m=logical_output_m,
+            output_n=n_val,
+            pitch=c_row_stride_val,
+            sf_block_size=cfg.output_sf_block_size_c,
+            sf_layout=cfg.sf_layout_c,
+            m_offset=sf_c_m_offset_val,
+        )
     data_a_dtype = cutlass.Float4E2M1FN
     data_b_dtype = cutlass.Float8E4M3FN
     sf_dtype = cutlass.Float8E8M0FNU
@@ -1173,7 +1466,7 @@ def build_mxfp4_mxfp8_launch_io(
         cutlass.AddressSpace.gmem,
         assumed_align=32,
     )
-    if cfg.has_epilogue_quant:
+    if cfg.has_output_block_scaling:
         c0_dp = make_ptr(
             cutlass.Float8E4M3FN,
             output_buf.data_ptr(),
@@ -1310,6 +1603,8 @@ def build_mxfp4_mxfp8_launch_io(
         "sfa_dp": sfa_dp,
         "sfb_dp": sfb_dp,
         "c0_dp": c0_dp,
+        "c_row_stride": c_row_stride_val,
+        "sf_c_m_offset": sf_c_m_offset_val,
         "sf_c_dp": sf_c_dp,
         "tile_idx_dp": tile_idx_dp,
         "route_map_dp": route_map_dp,
@@ -1354,6 +1649,8 @@ def build_fp8_block_scale_launch_io(
     route_map: torch.Tensor,
     num_non_exiting_ctas: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
+    c_row_stride: int | None = None,
+    sf_c_m_offset: int = 0,
     routed_token_capacity: int | None = None,
     activation_type: int,
     num_experts: int,
@@ -1415,13 +1712,19 @@ def build_fp8_block_scale_launch_io(
         routed_token_capacity=routed_token_capacity,
     )
     if is_deepseek:
-        # DeepSeek staged buffers can have different storage capacities:
-        # output tensors are rounded up for TRT-LLM workspace minima, while
-        # scale tensors keep their own row stride. The TS kernel uses N as the
-        # FP32 scale stride, so use the relevant scale-buffer width here.
+        # The TS kernel uses N as both the token extent and the FP32 scale
+        # stride, so derive it from the relevant scale buffer. The staged
+        # allocator must give every DeepSeek buffer at least this many rows.
         scale_stride_tensor = output_scale if fc == "fc1" else activation_scale
         if scale_stride_tensor.ndim >= 2:
             logical_token_capacity = int(scale_stride_tensor.shape[1])
+        output_token_capacity = int(output_buf.shape[0])
+        if output_token_capacity < logical_token_capacity:
+            raise ValueError(
+                f"{fc} DeepSeek staged-buffer token-axis invariant violated: "
+                f"scale stride requires {logical_token_capacity} rows, but the "
+                f"output buffer has {output_token_capacity}"
+            )
     if logical_token_capacity <= 0:
         raise ValueError(f"{fc} logical token capacity is empty")
     if not cfg.is_swap_ab:
@@ -1449,6 +1752,11 @@ def build_fp8_block_scale_launch_io(
         ("num_non_exiting_ctas", num_non_exiting_ctas),
         ("total_num_padded_tokens", total_num_padded_tokens),
     ):
+        if c_row_stride and (
+            tensor is output_buf
+            or (cfg.has_output_block_scaling and tensor is output_scale)
+        ):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     if hidden_states.dtype != torch.float8_e4m3fn:
@@ -1512,11 +1820,7 @@ def build_fp8_block_scale_launch_io(
         top_k=top_k,
         metadata_token_ctas=tile_idx.numel(),
     )
-    if out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_cluster_span(cfg, out_hidden)
 
     m_val, n_val, k_val, l_val = (
         out_hidden,
@@ -1525,6 +1829,31 @@ def build_fp8_block_scale_launch_io(
         num_experts,
     )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
+    c_row_stride_val = _validate_c_output_layout(
+        fc=fc,
+        output_buf=output_buf,
+        logical_output_m=logical_output_m,
+        output_n=n_val,
+        c_row_stride=c_row_stride,
+    )
+    sf_c_m_offset_val = _validate_sf_c_m_offset(
+        fc=fc,
+        cfg=cfg,
+        sf_c_m_offset=sf_c_m_offset,
+        logical_output_m=logical_output_m,
+        pitch=c_row_stride_val,
+    )
+    if cfg.has_output_block_scaling:
+        _validate_block_scaled_sf_output(
+            fc=fc,
+            output_scale=output_scale,
+            logical_output_m=logical_output_m,
+            output_n=n_val,
+            pitch=c_row_stride_val,
+            sf_block_size=cfg.output_sf_block_size_c,
+            sf_layout=cfg.sf_layout_c,
+            m_offset=sf_c_m_offset_val,
+        )
     data_dtype = cutlass.Float8E4M3FN
     sf_dtype = cutlass.Float32 if is_deepseek else cutlass.Float8E8M0FNU
     dummy_data_ptr = output_buf.data_ptr()
@@ -1564,7 +1893,7 @@ def build_fp8_block_scale_launch_io(
         cutlass.AddressSpace.gmem,
         assumed_align=32,
     )
-    if cfg.uses_fp8_output or cfg.has_epilogue_quant:
+    if cfg.uses_fp8_output or cfg.has_output_block_scaling:
         c0_dp = make_ptr(
             data_dtype,
             output_buf.data_ptr(),
@@ -1705,6 +2034,8 @@ def build_fp8_block_scale_launch_io(
         "sfa_dp": sfa_dp,
         "sfb_dp": sfb_dp,
         "c0_dp": c0_dp,
+        "c_row_stride": c_row_stride_val,
+        "sf_c_m_offset": sf_c_m_offset_val,
         "sf_c_dp": sf_c_dp,
         "tile_idx_dp": tile_idx_dp,
         "route_map_dp": route_map_dp,
@@ -1748,6 +2079,8 @@ def build_mxfp4_bf16_launch_io(
     route_map: torch.Tensor,
     num_non_exiting_ctas: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
+    c_row_stride: int | None = None,
+    sf_c_m_offset: int = 0,
     routed_token_capacity: int | None = None,
     activation_type: int,
     num_experts: int,
@@ -1818,6 +2151,8 @@ def build_mxfp4_bf16_launch_io(
         ("num_non_exiting_ctas", num_non_exiting_ctas),
         ("total_num_padded_tokens", total_num_padded_tokens),
     ):
+        if c_row_stride and tensor is output_buf:
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     if hidden_states.dtype != torch.bfloat16:
@@ -1850,11 +2185,7 @@ def build_mxfp4_bf16_launch_io(
         top_k=top_k,
         metadata_token_ctas=tile_idx.numel(),
     )
-    if out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_cluster_span(cfg, out_hidden)
 
     m_val, n_val, k_val, l_val = (
         out_hidden,
@@ -1863,6 +2194,20 @@ def build_mxfp4_bf16_launch_io(
         num_experts,
     )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
+    c_row_stride_val = _validate_c_output_layout(
+        fc=fc,
+        output_buf=output_buf,
+        logical_output_m=logical_output_m,
+        output_n=n_val,
+        c_row_stride=c_row_stride,
+    )
+    sf_c_m_offset_val = _validate_sf_c_m_offset(
+        fc=fc,
+        cfg=cfg,
+        sf_c_m_offset=sf_c_m_offset,
+        logical_output_m=logical_output_m,
+        pitch=c_row_stride_val,
+    )
     data_a_dtype = cutlass.Float4E2M1FN
     data_b_dtype = cutlass.BFloat16
     sf_dtype = cutlass.Float8E8M0FNU
@@ -2015,6 +2360,8 @@ def build_mxfp4_bf16_launch_io(
         "sfa_dp": sfa_dp,
         "sfb_dp": sfb_dp,
         "c0_dp": c0_dp,
+        "c_row_stride": c_row_stride_val,
+        "sf_c_m_offset": sf_c_m_offset_val,
         "sf_c_dp": sf_c_dp,
         "tile_idx_dp": tile_idx_dp,
         "route_map_dp": route_map_dp,
@@ -2055,6 +2402,8 @@ def build_fp8_per_tensor_launch_io(
     route_map: torch.Tensor,
     num_non_exiting_ctas: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
+    c_row_stride: int | None = None,
+    sf_c_m_offset: int = 0,
     routed_token_capacity: int | None = None,
     activation_type: int,
     num_experts: int,
@@ -2124,6 +2473,10 @@ def build_fp8_per_tensor_launch_io(
         ("num_non_exiting_ctas", num_non_exiting_ctas),
         ("total_num_padded_tokens", total_num_padded_tokens),
     ):
+        # A strided output is a column slice, non-contiguous by construction;
+        # its layout is checked against the declared stride below instead.
+        if c_row_stride and name in ("gemm1_output", "gemm2_output"):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     if hidden_states.dtype != torch.float8_e4m3fn:
@@ -2179,11 +2532,7 @@ def build_fp8_per_tensor_launch_io(
         top_k=top_k,
         metadata_token_ctas=tile_idx.numel(),
     )
-    if out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_cluster_span(cfg, out_hidden)
 
     m_val, n_val, k_val, l_val = (
         out_hidden,
@@ -2192,6 +2541,20 @@ def build_fp8_per_tensor_launch_io(
         num_experts,
     )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
+    c_row_stride_val = _validate_c_output_layout(
+        fc=fc,
+        output_buf=output_buf,
+        logical_output_m=logical_output_m,
+        output_n=n_val,
+        c_row_stride=c_row_stride,
+    )
+    sf_c_m_offset_val = _validate_sf_c_m_offset(
+        fc=fc,
+        cfg=cfg,
+        sf_c_m_offset=sf_c_m_offset,
+        logical_output_m=logical_output_m,
+        pitch=c_row_stride_val,
+    )
     data_dtype = cutlass.Float8E4M3FN
     dummy_ptr = output_buf.data_ptr()
     bias_torch = _select_bias(
@@ -2360,6 +2723,8 @@ def build_fp8_per_tensor_launch_io(
         "sfa_dp": sfa_dp,
         "sfb_dp": sfb_dp,
         "c0_dp": c0_dp,
+        "c_row_stride": c_row_stride_val,
+        "sf_c_m_offset": sf_c_m_offset_val,
         "sf_c_dp": sf_c_dp,
         "tile_idx_dp": tile_idx_dp,
         "route_map_dp": route_map_dp,

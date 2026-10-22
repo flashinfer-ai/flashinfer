@@ -6797,8 +6797,14 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
-        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+            SwiGLU,
+            GeGLU,
+            SiTU,
+            ReLU2,
+            SiLU,
+        ),
+        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2, SiLU),
     }
 
     def _check_support(self) -> None:

@@ -57,6 +57,11 @@ DEFAULT_INTERMEDIATE_SIZE = 2048
 DS_R1_NUM_EXPERTS = DEFAULT_NUM_EXPERTS
 DS_R1_TOP_K = DEFAULT_TOP_K
 
+# trtllm-gen's ldgPlusSts route, which the TS kernel does not implement and
+# RouteImpl therefore omits. Generated configs may still request it, so it is
+# forwarded to trtllm-gen while the TS run is skipped.
+_ROUTE_LDG_PLUS_STS = 3
+
 # Module-level shape state, set by configure_shapes() before variant construction.
 _FC1_N = 2 * DEFAULT_INTERMEDIATE_SIZE
 _FC1_K = DEFAULT_HIDDEN_SIZE
@@ -130,11 +135,9 @@ def _ts_kwargs(kwargs: dict) -> dict:
 
 def _ts_unsupported_reason(kwargs: dict) -> str | None:
     reasons = []
-    if int(kwargs.get("route_act", int(RouteImpl.NONE))) == int(RouteImpl.LDG_PLUS_STS):
+    if int(kwargs.get("route_act", int(RouteImpl.NONE))) == _ROUTE_LDG_PLUS_STS:
         reasons.append("Kernel does not implement routeAct=LDG_PLUS_STS")
-    if int(kwargs.get("route_sfs_act", int(RouteImpl.NONE))) == int(
-        RouteImpl.LDG_PLUS_STS
-    ):
+    if int(kwargs.get("route_sfs_act", int(RouteImpl.NONE))) == _ROUTE_LDG_PLUS_STS:
         reasons.append("Kernel does not implement routeSfsAct=LDG_PLUS_STS")
     use_per_token_sf_b = int(kwargs.get("use_per_token_sf_b", 0))
     if use_per_token_sf_b and int(kwargs.get("transpose_mma_output", 1)) != 1:
@@ -166,13 +169,13 @@ def _sf_layout_arg(layout: int) -> str:
 
 
 def _route_arg(route: int) -> str:
-    if route == int(RouteImpl.NONE):
+    if route in (int(RouteImpl.NONE), int(RouteImpl.AUTO)):
         return "false"
     if route == int(RouteImpl.TMA):
         return "tma"
     if route == int(RouteImpl.LDGSTS):
         return "ldgsts"
-    if route == int(RouteImpl.LDG_PLUS_STS):
+    if route == _ROUTE_LDG_PLUS_STS:
         return "ldgPlusSts"
     raise ValueError(f"Unsupported generated route: {route}")
 
@@ -255,7 +258,7 @@ def _route_value(value: object) -> int:
         if lowered == "ldgsts":
             return int(RouteImpl.LDGSTS)
         if lowered == "ldgplussts":
-            return int(RouteImpl.LDG_PLUS_STS)
+            return _ROUTE_LDG_PLUS_STS
     raise ValueError(f"Unsupported route value: {value}")
 
 
@@ -289,10 +292,10 @@ def _act_value(
             return int(ActKind.SWIGLU)
         if act == "geglu":
             return int(ActKind.GEGLU)
-        if act == "silu":
-            return int(ActKind.SILU)
     if eltwise_act == "relu2":
         return int(ActKind.RELU2)
+    if eltwise_act == "silu":
+        return int(ActKind.SILU)
     return int(ActKind.NONE)
 
 
@@ -337,7 +340,7 @@ def _oa_clamp_kwargs(options: dict, kwargs: dict) -> dict:
 
 
 def _generated_fused_act_default(act_kind: int) -> bool:
-    return act_kind in (int(ActKind.SWIGLU), int(ActKind.GEGLU), int(ActKind.SILU))
+    return act_kind in (int(ActKind.SWIGLU), int(ActKind.GEGLU))
 
 
 def _generated_act_arg(act_kind: int) -> str | None:
@@ -345,6 +348,12 @@ def _generated_act_arg(act_kind: int) -> str | None:
         return "swiglu"
     if act_kind == int(ActKind.GEGLU):
         return "geglu"
+    return None
+
+
+def _generated_eltwise_act_arg(act_kind: int) -> str | None:
+    if act_kind == int(ActKind.RELU2):
+        return "relu2"
     if act_kind == int(ActKind.SILU):
         return "silu"
     return None
@@ -396,17 +405,17 @@ def _trtllm_gen_command(
     kwargs = variant.kwargs
     generated_options = variant.generated_options or {}
     has_activation_semantics = _has_activation_semantics(kwargs)
-    dtype_a_kind = int(kwargs["dtype_a"])
-    dtype_b_kind = int(kwargs["dtype_b"])
-    dtype_c_kind = int(kwargs["dtype_c"])
+    dtype_a = int(kwargs["dtype_a"])
+    dtype_b = int(kwargs["dtype_b"])
+    dtype_c = int(kwargs["dtype_c"])
     act_kind = int(kwargs["act_kind"])
     uses_input_block_scaling = _uses_input_block_scaling(kwargs)
     route_act = int(kwargs["route_act"])
     route_sfs_act = int(kwargs["route_sfs_act"])
     scheduler = int(kwargs["tile_scheduler"])
-    dtype_a = str(generated_options.get("dtypeA", _dtype_arg(dtype_a_kind)))
-    dtype_b = str(generated_options.get("dtypeB", _dtype_arg(dtype_b_kind)))
-    default_dtype_c = _dtype_arg(dtype_c_kind)
+    dtype_a = str(generated_options.get("dtypeA", _dtype_arg(dtype_a)))
+    dtype_b = str(generated_options.get("dtypeB", _dtype_arg(dtype_b)))
+    default_dtype_c = _dtype_arg(dtype_c)
     dtype_c = str(generated_options.get("dtypeC", default_dtype_c))
     num_stages = int(kwargs["num_stages_a"])
     stage_fields = {
@@ -481,6 +490,8 @@ def _trtllm_gen_command(
     )
     if "eltwiseActType" in generated_options:
         _append_option(cmd, "-eltwiseActType", generated_options["eltwiseActType"])
+    elif (eltwise_arg := _generated_eltwise_act_arg(act_kind)) is not None:
+        _append_option(cmd, "-eltwiseActType", eltwise_arg)
     elif has_activation_semantics:
         _append_option(cmd, "-eltwiseActType", "none")
     _append_option(cmd, "-verbLvl", 30)
@@ -511,9 +522,9 @@ def _trtllm_gen_command(
     _append_optional_option(
         cmd, "-perTokenSfDtype", generated_options, "perTokenSfDtype"
     )
-    if dtype_a_kind == int(DType.E4M3) and dtype_b_kind == int(DType.E4M3):
+    if dtype_a == "e4m3" and dtype_b == "e4m3":
         _append_option(cmd, "-quantScaleC", generated_options.get("quantScaleC", 1))
-    _append_option(cmd, "-tileM", kwargs["tile_m"])
+    _append_option(cmd, "-tileM", 128)
     _append_option(cmd, "-tileN", kwargs["tile_n"])
     _append_option(cmd, "-tileK", kwargs["tile_k"])
     _append_option(cmd, "-mmaM", kwargs["mma_m"])
@@ -602,8 +613,12 @@ def _trtllm_gen_command(
             _append_option(cmd, "-layoutA", "B")
 
     _append_bool_option(cmd, "-useTmaOobOpt", bool(kwargs.get("use_tma_oob_opt", 0)))
-    _append_option(cmd, "-clusterDimX", kwargs["cluster_m"])
-    _append_option(cmd, "-clusterDimY", generated_options.get("clusterDimY", 1))
+    _append_option(
+        cmd,
+        "-clusterDimX",
+        kwargs.get("cluster_dim_x", 0) or kwargs["umma_cta_count"],
+    )
+    _append_option(cmd, "-clusterDimY", kwargs.get("cluster_dim_y", 1))
     _append_optional_option(cmd, "-ctaSwizzleType", generated_options, "ctaSwizzleType")
     _append_optional_option(
         cmd, "-numRegsPerThreadLoadA", generated_options, "numRegsPerThreadLoadA"
@@ -758,7 +773,6 @@ def _fp4_base() -> dict:
         "dtype_a": int(DType.E2M1),
         "dtype_b": int(DType.E2M1),
         "dtype_c": int(DType.BF16),
-        "sf_bits": 8,
         "mma_k": 64,
         "use_tma_oob_opt": 1,
         "use_early_exit": 1,
@@ -780,8 +794,7 @@ def _bf16_base() -> dict:
         "use_clc_fast_drain": 0,
         **uniform_pipeline_stage_overrides(6, tmem_acc_stages=2),
         "tile_scheduler": int(TileScheduler.PERSISTENT),
-        "cluster_m": 2,
-        "tile_m": 128,
+        "umma_cta_count": 2,
         "tile_n": 128,
         "tile_k": 64,
         "epi_tile_m": 128,
@@ -794,6 +807,38 @@ def _bf16_base() -> dict:
         "load_regs": 96,
         "padding_regs": 96,
         "workid_regs": 96,
+    }
+
+
+def _rubin_mmak_base(dtype_a: DType, dtype_b: DType, *, mma_k: int) -> dict:
+    """Curated Rubin FC2 configuration for MX and plain FP8."""
+    is_mx = dtype_a in (DType.MXE2M1, DType.MXE4M3)
+    return {
+        "sm_arch": 107,
+        "batch_mode": int(BatchMode.BATCH_N),
+        "transpose_mma_output": 1,
+        "dtype_a": int(dtype_a),
+        "dtype_b": int(dtype_b),
+        "dtype_c": int(DType.BF16),
+        "mma_k": mma_k,
+        "mma_m": 128,
+        "mma_n": 8,
+        "tile_n": 8,
+        "tile_k": 256,
+        "epi_tile_n": 8,
+        "route_act": int(RouteImpl.NONE),
+        "route_sfs_act": int(RouteImpl.AUTO),
+        "act_kind": int(ActKind.NONE),
+        "sf_layout_a": int(SfLayout.R128c4),
+        "sf_layout_b": int(SfLayout.R8c4),
+        "tile_scheduler": int(TileScheduler.STATIC),
+        "umma_cta_count": 1,
+        "use_tma_oob_opt": 1,
+        "use_early_exit": 1,
+        "use_clc_fast_drain": 0,
+        "use_global_scales": int(not is_mx),
+        "use_unroll_loop_2x_for_mma": 0,
+        **uniform_pipeline_stage_overrides(4, tmem_acc_stages=1),
     }
 
 
@@ -832,7 +877,9 @@ def _fp4_json_variant(
         **_fp4_base(),
         "dtype_c": _dtype_value(options.get("dtypeC"), default="bf16"),
         "route_act": _route_value(options.get("routeAct", False)),
-        "route_sfs_act": _route_value(options.get("routeSfsAct", False)),
+        "route_sfs_act": (
+            _route_value(options.get("routeSfsAct", False)) or int(RouteImpl.AUTO)
+        ),
         "tile_scheduler": scheduler,
         "act_kind": _act_value(
             generated_fused_act=generated_fused_act,
@@ -842,8 +889,9 @@ def _fp4_json_variant(
         "sf_layout_a": _sf_layout_value(options.get("sfLayoutA")),
         "sf_layout_b": _sf_layout_value(options.get("sfLayoutB")),
         "sf_layout_c": _sf_layout_value(sf_layout_c),
-        "cluster_m": int(options.get("clusterDimX", 1)),
-        "tile_m": int(options.get("tileM", 128)),
+        "umma_cta_count": min(2, int(options.get("clusterDimX", 1))),
+        "cluster_dim_x": int(options.get("clusterDimX", 1)),
+        "cluster_dim_y": int(options.get("clusterDimY", 1)),
         "tile_n": tile_n,
         "tile_k": tile_k,
         "epi_tile_m": int(options.get("epilogueTileM", 128)),
@@ -861,7 +909,9 @@ def _fp4_json_variant(
         "transpose_mma_output": int(
             _bool_value(options.get("transpose_mma_output", True))
         ),
+        "use_shuffled_matrix": int(_bool_value(options.get("useShuffledMatrix", True))),
         "use_max_tmem_overlap": use_max_tmem_overlap,
+        "fuse_sf_copy_to_mma": use_max_tmem_overlap,
         "use_tma_oob_opt": int(_bool_value(options.get("useTmaOobOpt", True))),
         "use_tma_store": int(_bool_value(options.get("useTmaStore", False))),
         "use_per_token_sf_a": int(use_per_token_sf_a),
@@ -940,13 +990,11 @@ def _mx_json_variant(
         "dtype_a": dtype_a,
         "dtype_b": dtype_b,
         "dtype_c": dtype_c,
-        "sf_bits": 8,
-        "sf_block_size_a": int(options.get("sfBlockSizeA", 32)),
-        "sf_block_size_b": int(options.get("sfBlockSizeB", 32)),
-        "sf_block_size_c": int(options.get("sfBlockSizeC", 32)),
         "mma_k": int(options.get("mmaK", 32)),
         "route_act": _route_value(options.get("routeAct", False)),
-        "route_sfs_act": _route_value(options.get("routeSfsAct", False)),
+        "route_sfs_act": (
+            _route_value(options.get("routeSfsAct", False)) or int(RouteImpl.AUTO)
+        ),
         "tile_scheduler": scheduler,
         "act_kind": _act_value(
             generated_fused_act=generated_fused_act,
@@ -957,8 +1005,9 @@ def _mx_json_variant(
         "sf_layout_a": _sf_layout_value(options.get("sfLayoutA")),
         "sf_layout_b": _sf_layout_value(options.get("sfLayoutB")),
         "sf_layout_c": _sf_layout_value(options.get("sfLayoutC"), default="8x4"),
-        "cluster_m": int(options.get("clusterDimX", 1)),
-        "tile_m": int(options.get("tileM", 128)),
+        "umma_cta_count": min(2, int(options.get("clusterDimX", 1))),
+        "cluster_dim_x": int(options.get("clusterDimX", 1)),
+        "cluster_dim_y": int(options.get("clusterDimY", 1)),
         "tile_n": tile_n,
         "tile_k": tile_k,
         "epi_tile_m": int(options.get("epilogueTileM", 128)),
@@ -975,7 +1024,9 @@ def _mx_json_variant(
         "transpose_mma_output": int(
             _bool_value(options.get("transpose_mma_output", True))
         ),
+        "use_shuffled_matrix": int(_bool_value(options.get("useShuffledMatrix", True))),
         "use_max_tmem_overlap": use_max_tmem_overlap,
+        "fuse_sf_copy_to_mma": use_max_tmem_overlap,
         "use_tma_oob_opt": int(_bool_value(options.get("useTmaOobOpt", True))),
         "use_early_exit": 1,
         "use_clc_fast_drain": 0,
@@ -984,12 +1035,13 @@ def _mx_json_variant(
         "mma_regs": non_epi_regs,
         "load_regs": non_epi_regs,
         "load_sf_regs": non_epi_regs,
-        "load_b_regs": load_b_regs,
+        "load_b_regs": non_epi_regs
+        if options.get("routeAct") == "ldgsts"
+        else load_b_regs,
         "load_sfb_regs": load_sfb_regs,
         "copy_sf_regs": non_epi_regs,
         "workid_regs": non_epi_regs,
         "padding_regs": non_epi_regs,
-        "gather_regs": non_epi_regs,
     }
     kwargs.update(_oa_clamp_kwargs(options, kwargs))
     if "numWarpsLoadB" in options:
@@ -1043,11 +1095,9 @@ def _mxfp4_bf16_json_variant(
         "dtype_a": dtype_a,
         "dtype_b": dtype_b,
         "dtype_c": dtype_c,
-        "sf_bits": 8,
-        "sf_block_size_a": int(options.get("sfBlockSizeA", 32)),
         "mma_k": int(options.get("mmaK", 16)),
         "route_act": _route_value(options.get("routeAct", False)),
-        "route_sfs_act": int(RouteImpl.NONE),
+        "route_sfs_act": int(RouteImpl.AUTO),
         "tile_scheduler": scheduler,
         "act_kind": _act_value(
             generated_fused_act=generated_fused_act,
@@ -1058,8 +1108,9 @@ def _mxfp4_bf16_json_variant(
         "sf_layout_a": _sf_layout_value(options.get("sfLayoutA")),
         "sf_layout_b": int(SfLayout.R8c4),
         "sf_layout_c": _sf_layout_value(options.get("sfLayoutC"), default="8x4"),
-        "cluster_m": int(options.get("clusterDimX", 1)),
-        "tile_m": int(options.get("tileM", 128)),
+        "umma_cta_count": min(2, int(options.get("clusterDimX", 1))),
+        "cluster_dim_x": int(options.get("clusterDimX", 1)),
+        "cluster_dim_y": int(options.get("clusterDimY", 1)),
         "tile_n": tile_n,
         "tile_k": tile_k,
         "epi_tile_m": int(options.get("epilogueTileM", 128)),
@@ -1076,6 +1127,7 @@ def _mxfp4_bf16_json_variant(
         "transpose_mma_output": int(
             _bool_value(options.get("transpose_mma_output", True))
         ),
+        "use_shuffled_matrix": int(_bool_value(options.get("useShuffledMatrix", True))),
         "use_tma_oob_opt": int(_bool_value(options.get("useTmaOobOpt", True))),
         "use_early_exit": 1,
         "use_clc_fast_drain": 0,
@@ -1089,7 +1141,7 @@ def _mxfp4_bf16_json_variant(
         "copy_sf_regs": non_epi_regs,
         "workid_regs": non_epi_regs,
         "padding_regs": non_epi_regs,
-        "gather_regs": non_epi_regs,
+        "load_b_regs": non_epi_regs,
     }
     kwargs.update(_oa_clamp_kwargs(options, kwargs))
     return BenchVariant(
@@ -1135,7 +1187,7 @@ def _bf16_json_variant(
         "dtype_c": _dtype_value(options.get("dtypeC"), default="bf16"),
         "mma_k": int(options.get("mmaK", 16)),
         "route_act": _route_value(options.get("routeAct", False)),
-        "route_sfs_act": int(RouteImpl.NONE),
+        "route_sfs_act": int(RouteImpl.AUTO),
         "tile_scheduler": scheduler,
         "act_kind": _act_value(
             generated_fused_act=generated_fused_act,
@@ -1143,8 +1195,9 @@ def _bf16_json_variant(
             eltwise_act=options.get("eltwiseActType"),
         ),
         "bias_type": int(BiasType.M) if bias_type == "m" else int(BiasType.NONE),
-        "cluster_m": int(options.get("clusterDimX", 1)),
-        "tile_m": int(options.get("tileM", 128)),
+        "umma_cta_count": min(2, int(options.get("clusterDimX", 1))),
+        "cluster_dim_x": int(options.get("clusterDimX", 1)),
+        "cluster_dim_y": int(options.get("clusterDimY", 1)),
         "tile_n": tile_n,
         "tile_k": tile_k,
         "epi_tile_m": int(options.get("epilogueTileM", 128)),
@@ -1165,6 +1218,7 @@ def _bf16_json_variant(
         "transpose_mma_output": int(
             _bool_value(options.get("transpose_mma_output", True))
         ),
+        "use_shuffled_matrix": int(_bool_value(options.get("useShuffledMatrix", True))),
         "use_tma_oob_opt": int(_bool_value(options.get("useTmaOobOpt", True))),
         "use_early_exit": 1,
         "use_clc_fast_drain": 0,
@@ -1180,7 +1234,7 @@ def _bf16_json_variant(
             "load_regs": non_epi_regs,
             "padding_regs": non_epi_regs,
             "workid_regs": non_epi_regs,
-            "gather_regs": non_epi_regs,
+            "load_b_regs": non_epi_regs,
         }
     )
 
@@ -1238,15 +1292,16 @@ def _fp8_json_variant(
         "dtype_c": dtype_c,
         "mma_k": int(options.get("mmaK", 32)),
         "route_act": _route_value(options.get("routeAct", False)),
-        "route_sfs_act": int(RouteImpl.NONE),
+        "route_sfs_act": int(RouteImpl.AUTO),
         "tile_scheduler": scheduler,
         "act_kind": _act_value(
             generated_fused_act=generated_fused_act,
             act=options.get("act"),
             eltwise_act=options.get("eltwiseActType"),
         ),
-        "cluster_m": int(options.get("clusterDimX", 1)),
-        "tile_m": int(options.get("tileM", 128)),
+        "umma_cta_count": min(2, int(options.get("clusterDimX", 1))),
+        "cluster_dim_x": int(options.get("clusterDimX", 1)),
+        "cluster_dim_y": int(options.get("clusterDimY", 1)),
         "tile_n": tile_n,
         "tile_k": int(options["tileK"]),
         "epi_tile_m": int(options.get("epilogueTileM", 128)),
@@ -1263,6 +1318,7 @@ def _fp8_json_variant(
         "transpose_mma_output": int(
             _bool_value(options.get("transpose_mma_output", True))
         ),
+        "use_shuffled_matrix": int(_bool_value(options.get("useShuffledMatrix", True))),
         "use_global_scales": int(_bool_value(options.get("useGlobalScales", True))),
         "use_per_token_sf_a": int(use_per_token_sf_a),
         "use_per_token_sf_b": int(use_per_token_sf_b),
@@ -1281,7 +1337,7 @@ def _fp8_json_variant(
         "load_regs": non_epi_regs,
         "padding_regs": non_epi_regs,
         "workid_regs": non_epi_regs,
-        "gather_regs": non_epi_regs,
+        "load_b_regs": non_epi_regs,
     }
     kwargs.update(_oa_clamp_kwargs(options, kwargs))
     if "numEpilogueWarps" in options:
@@ -1403,14 +1459,13 @@ def _variants() -> dict[str, BenchVariant]:
             kwargs={
                 **fp4_base,
                 "route_act": int(RouteImpl.NONE),
-                "route_sfs_act": int(RouteImpl.NONE),
+                "route_sfs_act": int(RouteImpl.AUTO),
                 "tile_scheduler": int(TileScheduler.STATIC),
                 "act_kind": int(ActKind.NONE),
                 "sf_layout_a": int(SfLayout.R128c4),
                 "sf_layout_b": int(SfLayout.R8c4),
                 "sf_layout_c": int(SfLayout.R8c4),
-                "cluster_m": 1,
-                "tile_m": 128,
+                "umma_cta_count": 1,
                 "tile_n": 8,
                 "tile_k": 512,
                 "epi_tile_m": 128,
@@ -1431,14 +1486,13 @@ def _variants() -> dict[str, BenchVariant]:
             kwargs={
                 **fp4_base,
                 "route_act": int(RouteImpl.NONE),
-                "route_sfs_act": int(RouteImpl.NONE),
+                "route_sfs_act": int(RouteImpl.AUTO),
                 "tile_scheduler": int(TileScheduler.PERSISTENT),
                 "act_kind": int(ActKind.NONE),
                 "sf_layout_a": int(SfLayout.R128c4),
                 "sf_layout_b": int(SfLayout.R8c4),
                 "sf_layout_c": int(SfLayout.R128c4),
-                "cluster_m": 2,
-                "tile_m": 128,
+                "umma_cta_count": 2,
                 "tile_n": 64,
                 "tile_k": 512,
                 "epi_tile_m": 128,
@@ -1466,8 +1520,7 @@ def _variants() -> dict[str, BenchVariant]:
                 "sf_layout_a": int(SfLayout.R128c4),
                 "sf_layout_b": int(SfLayout.LINEAR),
                 "sf_layout_c": int(SfLayout.R8c4),
-                "cluster_m": 1,
-                "tile_m": 128,
+                "umma_cta_count": 1,
                 "tile_n": 8,
                 "tile_k": 512,
                 "epi_tile_m": 128,
@@ -1495,8 +1548,7 @@ def _variants() -> dict[str, BenchVariant]:
                 "sf_layout_a": int(SfLayout.R128c4),
                 "sf_layout_b": int(SfLayout.LINEAR),
                 "sf_layout_c": int(SfLayout.R128c4),
-                "cluster_m": 2,
-                "tile_m": 128,
+                "umma_cta_count": 2,
                 "tile_n": 128,
                 "tile_k": 256,
                 "epi_tile_m": 128,
@@ -1512,7 +1564,7 @@ def _variants() -> dict[str, BenchVariant]:
                 "copy_sf_regs": 48,
                 "workid_regs": 48,
                 "padding_regs": 48,
-                "gather_regs": 48,
+                "load_b_regs": 48,
             },
         ),
         "bf16_fc1_ht_t128_k64": BenchVariant(
@@ -1522,10 +1574,10 @@ def _variants() -> dict[str, BenchVariant]:
             kwargs={
                 **bf16_base,
                 "route_act": int(RouteImpl.TMA),
-                "route_sfs_act": int(RouteImpl.NONE),
+                "route_sfs_act": int(RouteImpl.AUTO),
                 "act_kind": int(ActKind.SWIGLU),
                 "epi_tile_n": 128,
-                "gather_regs": 96,
+                "load_b_regs": 96,
             },
         ),
         "bf16_fc2_ht_t128_k64": BenchVariant(
@@ -1535,11 +1587,55 @@ def _variants() -> dict[str, BenchVariant]:
             kwargs={
                 **bf16_base,
                 "route_act": int(RouteImpl.NONE),
-                "route_sfs_act": int(RouteImpl.NONE),
+                "route_sfs_act": int(RouteImpl.AUTO),
                 "act_kind": int(ActKind.NONE),
                 "epi_tile_n": 64,
                 **uniform_pipeline_stage_overrides(8, tmem_acc_stages=2),
             },
+        ),
+        "rubin_mxfp8_fc2_1x_mmak_t8_k256": BenchVariant(
+            name="rubin_mxfp8_fc2_1x_mmak_t8_k256",
+            problem_n=_FC2_N,
+            problem_k=_FC2_K,
+            trtllm_gen_sf_layout_a="128x4",
+            trtllm_gen_sf_layout_b="8x4",
+            kwargs=_rubin_mmak_base(DType.MXE4M3, DType.MXE4M3, mma_k=32),
+        ),
+        "rubin_mxfp8_fc2_2x_mmak_t8_k256": BenchVariant(
+            name="rubin_mxfp8_fc2_2x_mmak_t8_k256",
+            problem_n=_FC2_N,
+            problem_k=_FC2_K,
+            trtllm_gen_sf_layout_a="128x4",
+            trtllm_gen_sf_layout_b="8x4",
+            kwargs=_rubin_mmak_base(DType.MXE4M3, DType.MXE4M3, mma_k=64),
+        ),
+        "rubin_mixed_mx_fc2_1x_mmak_t8_k256": BenchVariant(
+            name="rubin_mixed_mx_fc2_1x_mmak_t8_k256",
+            problem_n=_FC2_N,
+            problem_k=_FC2_K,
+            trtllm_gen_sf_layout_a="128x4",
+            trtllm_gen_sf_layout_b="8x4",
+            kwargs=_rubin_mmak_base(DType.MXE2M1, DType.MXE4M3, mma_k=32),
+        ),
+        "rubin_mixed_mx_fc2_2x_mmak_t8_k256": BenchVariant(
+            name="rubin_mixed_mx_fc2_2x_mmak_t8_k256",
+            problem_n=_FC2_N,
+            problem_k=_FC2_K,
+            trtllm_gen_sf_layout_a="128x4",
+            trtllm_gen_sf_layout_b="8x4",
+            kwargs=_rubin_mmak_base(DType.MXE2M1, DType.MXE4M3, mma_k=64),
+        ),
+        "rubin_fp8_fc2_1x_mmak_t8_k256": BenchVariant(
+            name="rubin_fp8_fc2_1x_mmak_t8_k256",
+            problem_n=_FC2_N,
+            problem_k=_FC2_K,
+            kwargs=_rubin_mmak_base(DType.E4M3, DType.E4M3, mma_k=32),
+        ),
+        "rubin_fp8_fc2_2x_mmak_t8_k256": BenchVariant(
+            name="rubin_fp8_fc2_2x_mmak_t8_k256",
+            problem_n=_FC2_N,
+            problem_k=_FC2_K,
+            kwargs=_rubin_mmak_base(DType.E4M3, DType.E4M3, mma_k=64),
         ),
     }
     return {name: _with_ts_skip_reason(variant) for name, variant in variants.items()}
