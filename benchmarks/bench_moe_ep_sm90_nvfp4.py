@@ -16,13 +16,16 @@
 
 Run with torchrun --standalone --nproc-per-node=4. Weight preparation, input
 staging, allocation, cooldown and padding are outside CUDA events. The measured
-region is compute_staged(): MegaMoE plus top-k reduction. This portable packed
-synthetic fixture is NOT the private fixture used for historical tuning tables.
+region is compute_staged(): MegaMoE plus top-k reduction. The deterministic
+common-BF16 fixture follows the historical input/weight recipe. Exact saved
+bytes across PyTorch/CUDA versions require a separate check.
+Initialization and quantization are outside the measured interval.
 """
 
 import argparse
 from datetime import timedelta
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -32,6 +35,109 @@ import time
 TOKENS = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
 
+def quantize_weight(torch, weight, mode):
+    """RN-even E2M1; NVFP4 uses per-expert G and nearest E4M3 K16 scales."""
+    assert weight.ndim == 2 and mode in ("nvfp4", "mxfp4")
+    group = 16 if mode == "nvfp4" else 32
+    rows, k = weight.shape
+    blocks = weight.float().reshape(rows, k // group, group)
+    amax = blocks.abs().amax(-1)
+    if mode == "nvfp4":
+        global_scale = (amax.amax() / (6 * 448)).clamp_min(1e-30)
+        scale = (amax / (6 * global_scale)).clamp(0, 448).to(torch.float8_e4m3fn)
+        decoded = scale.float() * global_scale
+        scale_bytes = scale.view(torch.uint8)
+    else:
+        exponent = torch.ceil(torch.log2((amax / 6).clamp_min(2.0**-126)))
+        scale_bytes = (exponent + 127).to(torch.uint8)
+        decoded = torch.exp2(exponent)
+        global_scale = torch.ones((), device=weight.device)
+    normalized = blocks / decoded.clamp_min(1e-30).unsqueeze(-1)
+    magnitude = normalized.abs().contiguous()
+    boundaries = torch.tensor(
+        (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0), device=weight.device
+    )
+    codes = torch.bucketize(magnitude, boundaries).to(torch.uint8)
+    # bucketize picks the lower code at a midpoint; choose the even code.
+    ties = magnitude == boundaries[codes.clamp_max(6).long()]
+    codes += (ties & ((codes & 1) != 0)).to(torch.uint8)
+    codes |= torch.signbit(normalized).to(torch.uint8) << 3
+    codes = codes.reshape(rows, k)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous()
+    return packed, scale_bytes.contiguous(), global_scale.float()
+
+
+def bf16_weight(torch, expert, rows, k, leg, device):
+    # Per-expert seed is independent of rank/chunking and format.
+    generator = torch.Generator(device=device).manual_seed(
+        20260914 + expert * 17 + leg * 100003
+    )
+    return (
+        torch.randn((rows, k), generator=generator, device=device) / math.sqrt(k)
+    ).to(torch.bfloat16)
+
+
+def make_weight_packs(torch, args, rank, world, device, nv_pack, mx_pack):
+    """Quantize one shared BF16 expert at a time; initialization is untimed."""
+    local_experts = args.experts // world
+    legs, summaries = [], []
+    for leg, (rows, k) in enumerate(
+        ((2 * args.intermediate, args.hidden), (args.hidden, args.intermediate))
+    ):
+        nv_raw = torch.empty(
+            (local_experts, rows, k // 2), dtype=torch.uint8, device=device
+        )
+        mx_raw = torch.empty_like(nv_raw)
+        nv_scale = torch.empty(
+            (local_experts, rows, k // 16), dtype=torch.uint8, device=device
+        )
+        mx_scale = torch.empty(
+            (local_experts, rows, k // 32), dtype=torch.uint8, device=device
+        )
+        nv_global = torch.empty(local_experts, dtype=torch.float32, device=device)
+        for expert in range(local_experts):
+            weight = bf16_weight(
+                torch, rank * local_experts + expert, rows, k, leg, device
+            )
+            raw, scale, global_decode = quantize_weight(torch, weight, "nvfp4")
+            nv_raw[expert].copy_(raw)
+            nv_scale[expert].copy_(scale)
+            nv_global[expert].copy_(global_decode)
+            raw, scale, _ = quantize_weight(torch, weight, "mxfp4")
+            mx_raw[expert].copy_(raw)
+            mx_scale[expert].copy_(scale)
+        summaries.append(
+            {
+                "leg": leg,
+                "nv_scale_code_min": int(nv_scale.min().item()),
+                "nv_scale_code_max": int(nv_scale.max().item()),
+                "mx_scale_code_min": int(mx_scale.min().item()),
+                "mx_scale_code_max": int(mx_scale.max().item()),
+                "nv_global_decode_min": float(nv_global.min().item()),
+                "nv_global_decode_max": float(nv_global.max().item()),
+            }
+        )
+        legs.append((nv_raw, nv_scale, nv_global, mx_raw, mx_scale))
+    first, second = legs
+    packs = {
+        "nv": nv_pack(
+            w13=first[0],
+            w2=second[0],
+            w13_scale=first[1].view(torch.float8_e4m3fn),
+            w2_scale=second[1].view(torch.float8_e4m3fn),
+            w13_global_scale=first[2],
+            w2_global_scale=second[2],
+        ),
+        "mx": mx_pack(
+            w13=first[3],
+            w2=second[3],
+            w13_scale=first[4],
+            w2_scale=second[4],
+        ),
+    }
+    return packs, summaries
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, nargs="+", default=TOKENS)
@@ -39,7 +145,12 @@ def parse_args():
     parser.add_argument("--intermediate", type=int, default=3072)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--top-k", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="Routing seed; weight/input seeds are fixed",
+    )
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
@@ -231,6 +342,7 @@ def main():
         MegaConfig,
         MoEEpLayer,
         MoEEpTensors,
+        Nvfp4WeightPack,
         PrequantizedMoEWeights,
         Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig as NVConfig,
         Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig as MXConfig,
@@ -246,52 +358,24 @@ def main():
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     host_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
     device = torch.device("cuda", local_rank)
-    generator = torch.Generator(device=device).manual_seed(args.seed + rank)
-    local_experts = args.experts // world
-    # Same E2M1 payload and exact 2^-5 scales represent the same weights in both
-    # formats. NV has a scale per K16; MX has one per K32. Global scale is one.
-    payloads = [
-        torch.randint(
-            0,
-            256,
-            (local_experts, rows, k // 2),
-            dtype=torch.uint8,
-            device=device,
-            generator=generator,
-        )
-        for rows, k in (
-            (2 * args.intermediate, args.hidden),
-            (args.hidden, args.intermediate),
-        )
-    ]
-    nv_scales = [
-        torch.full((local_experts, rows, k // 16), 2.0**-5, device=device).to(
-            torch.float8_e4m3fn
-        )
-        for rows, k in (
-            (2 * args.intermediate, args.hidden),
-            (args.hidden, args.intermediate),
-        )
-    ]
-    mx_scales = [
-        torch.full(
-            (local_experts, rows, k // 32), 122, dtype=torch.uint8, device=device
-        )
-        for rows, k in (
-            (2 * args.intermediate, args.hidden),
-            (args.hidden, args.intermediate),
-        )
-    ]
-    packs = {
-        "nv": PrequantizedMoEWeights(*payloads, *nv_scales),
-        "mx": PrequantizedMoEWeights(*payloads, *mx_scales),
-    }
+    packs, weight_summary = make_weight_packs(
+        torch, args, rank, world, device, Nvfp4WeightPack, PrequantizedMoEWeights
+    )
     prepared_nv = {}
     prepared_mx = prepare_mx(
         packs["mx"], intermediate_size=args.intermediate, hidden_size=args.hidden
     )
     results = {
-        "fixture": "public_packed_constant_scale_v1_not_historical",
+        "fixture": "common_bf16_historical_recipe_v1",
+        "fixture_recipe": {
+            "weight_seed": "20260914 + global_expert * 17 + leg * 100003",
+            "weights": "BF16(randn / sqrt(K)); separate NV K16 and MX K32 quantization",
+            "input_and_score_seed": "42 + rank, reset for each token bucket",
+            "scores": "softmax(randn)",
+            "routing_seed": args.seed,
+            "byte_identity": "recipe-compatible; cross-version saved-fixture bytes not asserted",
+        },
+        "weight_scale_summary_by_rank": None,
         "arguments": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
@@ -309,12 +393,16 @@ def main():
     metadata = [None] * world
     dist.all_gather_object(metadata, rank_metadata, group=host_group)
     results["ranks"] = metadata
+    weight_summaries = [None] * world
+    dist.all_gather_object(weight_summaries, weight_summary, group=host_group)
+    results["weight_scale_summary_by_rank"] = weight_summaries
     cycles, calibration = calibrate_padding(torch, args.padding_us)
     calibrations = [None] * world
     dist.all_gather_object(calibrations, calibration, group=host_group)
     results["padding_calibration"] = calibrations
     try:
         for tokens in args.tokens:
+            generator = torch.Generator(device=device).manual_seed(42 + rank)
             hidden = torch.randn(
                 (tokens, args.hidden),
                 dtype=torch.bfloat16,
@@ -329,10 +417,10 @@ def main():
                 seed=args.seed,
             )
             ids = torch.as_tensor(routes[rank], dtype=torch.int64, device=device)
-            scores = torch.rand(
-                (tokens, args.top_k), device=device, generator=generator
-            )
-            scores /= scores.sum(dim=1, keepdim=True)
+            scores = torch.softmax(
+                torch.randn((tokens, args.top_k), device=device, generator=generator),
+                dim=-1,
+            ).to(torch.float32)
             tensors = MoEEpTensors(
                 hidden_states=hidden, topk_ids=ids, topk_weights=scores
             )

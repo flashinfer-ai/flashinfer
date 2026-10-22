@@ -124,11 +124,14 @@ torchrun --standalone --nproc-per-node=4 \
   --cooldown-seconds 5 --mx-compact --output results.json
 ```
 
-The portable fixture uses seed 1234, shared natural-order BF16 inputs and
-block-permutation routes, shared packed E2M1 weights, equivalent constant
-`2^-5` scales in each format, and normalized routing scores. It differs from
-the dedicated historical tuning fixture; this command reproduces the public
-execution path and measurement protocol, **not its exact historical µs**.
+The portable fixture follows the historical deterministic recipe: both formats
+quantize the same BF16 Gaussian weights divided by `sqrt(K)`, with per-expert
+seed `20260914 + global_expert * 17 + leg * 100003`. NV uses variable K16 E4M3
+scales and per-expert global scales; MX uses K32 E8M0 scales. Each token bucket
+resets the input/score generator to `42 + rank`, uses softmax-normalized Gaussian
+routing scores, and uses block-permutation route seed 1234. Weight preparation
+is outside timing. Matching the recipe does not establish saved tensor byte
+identity across PyTorch/CUDA versions or promise identical historical latency.
 NV and MX use their respective configuration defaults; `--mx-compact` is an
 explicit MX configuration choice, not a new MX autotuning axis.
 
