@@ -116,7 +116,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
     float* part_sm = reinterpret_cast<float*>(smem_raw + 5376);
     const int part_sm_addr = smem + 5376;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     long long g_stride = g_stride_p0;
@@ -171,8 +171,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
     unsigned int ghwB[12];
     float rrB[1];
     if (n_iters > 0) {
-        int _min_0 = ((row_begin + rg) < (last_row) ? (row_begin + rg) : (last_row));
-        int row0 = _min_0;
+        int row0 = ((row_begin + rg) < (last_row) ? (row_begin + rg) : (last_row));
         unsigned long long g_base = (unsigned long long)row0 * (unsigned long long)g_stride;
         unsigned long long x_base = (unsigned long long)row0 * (unsigned long long)x_stride;
         rrA[0] = r[row0];
@@ -203,8 +202,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
             int rowa = row_begin + it + rg;
             int rowb = rowa + 1;
             if (n_iters > it + 1) {
-                int _min_1 = ((rowb) < (last_row) ? (rowb) : (last_row));
-                int rowb_ld = _min_1;
+                int rowb_ld = ((rowb) < (last_row) ? (rowb) : (last_row));
                 unsigned long long g_base_0 = (unsigned long long)rowb_ld * (unsigned long long)g_stride;
                 unsigned long long x_base_1 = (unsigned long long)rowb_ld * (unsigned long long)x_stride;
                 rrB[0] = r[rowb_ld];
@@ -243,18 +241,16 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                     float g1 = __uint_as_float(gwd & 4294901760u);
                     float x0 = __uint_as_float(xwd << 16);
                     float x1 = __uint_as_float(xwd & 4294901760u);
-                    float _fma_0 = __fmaf_rn(g0 * __uint_as_float(ww[v_3 * 4 + e] << 16), x0, dq);
-                    dq = _fma_0;
-                    float _fma_1 = __fmaf_rn(g1 * __uint_as_float(ww[v_3 * 4 + e] & 4294901760u), x1, dq);
-                    dq = _fma_1;
+                    dq = __fmaf_rn(g0 * __uint_as_float(ww[v_3 * 4 + e] << 16), x0, dq);
+                    dq = __fmaf_rn(g1 * __uint_as_float(ww[v_3 * 4 + e] & 4294901760u), x1, dq);
                 }
             }
             float dots[1];
-            float _warp_reduce_0 = dq;
+            float _warp_reduce_5 = dq;
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-            dots[0] = _warp_reduce_0;
+                _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
+            dots[0] = _warp_reduce_5;
             float rq = rrA[0];
             if (lane == 0) {
                 dot_slots[warp] = dots[0];
@@ -267,8 +263,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                 tot += d;
             }
             dots[0] = tot;
-            float _fdiv_rn_0 = __fdiv_rn(dots[0], 6144.0f);
-            float cq = _fdiv_rn_0;
+            float cq = __fdiv_rn(dots[0], 6144.0f);
             float kx = rq * rq * rq * cq;
             float nkx = -kx;
             unsigned long long dx_base = (unsigned long long)rowa * 6144;
@@ -284,14 +279,10 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                     float g1_1 = __uint_as_float(gwd_1 & 4294901760u);
                     float x0_1 = __uint_as_float(xwd_1 << 16);
                     float x1_1 = __uint_as_float(xwd_1 & 4294901760u);
-                    float _fma_2 = __fmaf_rn(g0_1 * x0_1, rq, acc[v_4 * 8 + 2 * e_1]);
-                    acc[v_4 * 8 + 2 * e_1] = _fma_2;
-                    float _fma_3 = __fmaf_rn(g1_1 * x1_1, rq, acc[v_4 * 8 + 2 * e_1 + 1]);
-                    acc[v_4 * 8 + 2 * e_1 + 1] = _fma_3;
-                    float _fma_4 = __fmaf_rn(nkx, x0_1, rq * (g0_1 * __uint_as_float(ww[v_4 * 4 + e_1] << 16)));
-                    out[2 * e_1] = _fma_4;
-                    float _fma_5 = __fmaf_rn(nkx, x1_1, rq * (g1_1 * __uint_as_float(ww[v_4 * 4 + e_1] & 4294901760u)));
-                    out[2 * e_1 + 1] = _fma_5;
+                    acc[v_4 * 8 + 2 * e_1] = __fmaf_rn(g0_1 * x0_1, rq, acc[v_4 * 8 + 2 * e_1]);
+                    acc[v_4 * 8 + 2 * e_1 + 1] = __fmaf_rn(g1_1 * x1_1, rq, acc[v_4 * 8 + 2 * e_1 + 1]);
+                    out[2 * e_1] = __fmaf_rn(nkx, x0_1, rq * (g0_1 * __uint_as_float(ww[v_4 * 4 + e_1] << 16)));
+                    out[2 * e_1 + 1] = __fmaf_rn(nkx, x1_1, rq * (g1_1 * __uint_as_float(ww[v_4 * 4 + e_1] & 4294901760u)));
                 }
                 int col = (v_4 * 256 + tir) * 8;
                 {
@@ -313,8 +304,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
             }
             if (n_iters > it + 1) {
                 if (n_iters > it + 2) {
-                    int _min_2 = ((rowa + 2) < (last_row) ? (rowa + 2) : (last_row));
-                    int rowa2_ld = _min_2;
+                    int rowa2_ld = ((rowa + 2) < (last_row) ? (rowa + 2) : (last_row));
                     unsigned long long g_base_0_1 = (unsigned long long)rowa2_ld * (unsigned long long)g_stride;
                     unsigned long long x_base_1_1 = (unsigned long long)rowa2_ld * (unsigned long long)x_stride;
                     rrA[0] = r[rowa2_ld];
@@ -322,21 +312,21 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                     for (int v_5 = 0; v_5 < 3; v_5++) {
                         int coln_2 = (v_5 * 256 + tir) * 8;
                         {
-                            const uint4* _vptr_5 = reinterpret_cast<const uint4*>(g + g_base_0_1 + (unsigned long long)coln_2);
-                            uint4* _vdst_5 = reinterpret_cast<uint4*>(&gwA[v_5 * 4]);
-                            #pragma unroll
-                            for (int _blk = 0; _blk < 1; _blk++) {
-                                asm volatile("ld.global.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
-                                    : "=r"(_vdst_5[_blk].x), "=r"(_vdst_5[_blk].y), "=r"(_vdst_5[_blk].z), "=r"(_vdst_5[_blk].w) : "l"((const void*)(_vptr_5 + _blk)), "l"(0x12F0000000000000ULL) : "memory");
-                            }
-                        }
-                        {
-                            const uint4* _vptr_6 = reinterpret_cast<const uint4*>(x + x_base_1_1 + (unsigned long long)coln_2);
-                            uint4* _vdst_6 = reinterpret_cast<uint4*>(&xwA[v_5 * 4]);
+                            const uint4* _vptr_6 = reinterpret_cast<const uint4*>(g + g_base_0_1 + (unsigned long long)coln_2);
+                            uint4* _vdst_6 = reinterpret_cast<uint4*>(&gwA[v_5 * 4]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
                                 asm volatile("ld.global.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
                                     : "=r"(_vdst_6[_blk].x), "=r"(_vdst_6[_blk].y), "=r"(_vdst_6[_blk].z), "=r"(_vdst_6[_blk].w) : "l"((const void*)(_vptr_6 + _blk)), "l"(0x12F0000000000000ULL) : "memory");
+                            }
+                        }
+                        {
+                            const uint4* _vptr_7 = reinterpret_cast<const uint4*>(x + x_base_1_1 + (unsigned long long)coln_2);
+                            uint4* _vdst_7 = reinterpret_cast<uint4*>(&xwA[v_5 * 4]);
+                            #pragma unroll
+                            for (int _blk = 0; _blk < 1; _blk++) {
+                                asm volatile("ld.global.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
+                                    : "=r"(_vdst_7[_blk].x), "=r"(_vdst_7[_blk].y), "=r"(_vdst_7[_blk].z), "=r"(_vdst_7[_blk].w) : "l"((const void*)(_vptr_7 + _blk)), "l"(0x12F0000000000000ULL) : "memory");
                             }
                         }
                     }
@@ -353,18 +343,16 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                         float g1_2 = __uint_as_float(gwd_2 & 4294901760u);
                         float x0_2 = __uint_as_float(xwd_2 << 16);
                         float x1_2 = __uint_as_float(xwd_2 & 4294901760u);
-                        float _fma_6 = __fmaf_rn(g0_2 * __uint_as_float(ww[v_6 * 4 + e_2] << 16), x0_2, dq_0);
-                        dq_0 = _fma_6;
-                        float _fma_7 = __fmaf_rn(g1_2 * __uint_as_float(ww[v_6 * 4 + e_2] & 4294901760u), x1_2, dq_0);
-                        dq_0 = _fma_7;
+                        dq_0 = __fmaf_rn(g0_2 * __uint_as_float(ww[v_6 * 4 + e_2] << 16), x0_2, dq_0);
+                        dq_0 = __fmaf_rn(g1_2 * __uint_as_float(ww[v_6 * 4 + e_2] & 4294901760u), x1_2, dq_0);
                     }
                 }
                 float dots_1[1];
-                float _warp_reduce_1 = dq_0;
+                float _warp_reduce_8 = dq_0;
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
-                    _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
-                dots_1[0] = _warp_reduce_1;
+                    _warp_reduce_8 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_8, offset);
+                dots_1[0] = _warp_reduce_8;
                 float rq_2 = rrB[0];
                 if (lane == 0) {
                     dot_slots[8 + warp] = dots_1[0];
@@ -377,8 +365,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                     tot_3 += d_1;
                 }
                 dots_1[0] = tot_3;
-                float _fdiv_rn_1 = __fdiv_rn(dots_1[0], 6144.0f);
-                float cq_4 = _fdiv_rn_1;
+                float cq_4 = __fdiv_rn(dots_1[0], 6144.0f);
                 float kx_5 = rq_2 * rq_2 * rq_2 * cq_4;
                 float nkx_6 = -kx_5;
                 unsigned long long dx_base_7 = (unsigned long long)rowb * 6144;
@@ -394,14 +381,10 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                         float g1_3 = __uint_as_float(gwd_3 & 4294901760u);
                         float x0_3 = __uint_as_float(xwd_3 << 16);
                         float x1_3 = __uint_as_float(xwd_3 & 4294901760u);
-                        float _fma_8 = __fmaf_rn(g0_3 * x0_3, rq_2, acc[v_7 * 8 + 2 * e_3]);
-                        acc[v_7 * 8 + 2 * e_3] = _fma_8;
-                        float _fma_9 = __fmaf_rn(g1_3 * x1_3, rq_2, acc[v_7 * 8 + 2 * e_3 + 1]);
-                        acc[v_7 * 8 + 2 * e_3 + 1] = _fma_9;
-                        float _fma_10 = __fmaf_rn(nkx_6, x0_3, rq_2 * (g0_3 * __uint_as_float(ww[v_7 * 4 + e_3] << 16)));
-                        out_1[2 * e_3] = _fma_10;
-                        float _fma_11 = __fmaf_rn(nkx_6, x1_3, rq_2 * (g1_3 * __uint_as_float(ww[v_7 * 4 + e_3] & 4294901760u)));
-                        out_1[2 * e_3 + 1] = _fma_11;
+                        acc[v_7 * 8 + 2 * e_3] = __fmaf_rn(g0_3 * x0_3, rq_2, acc[v_7 * 8 + 2 * e_3]);
+                        acc[v_7 * 8 + 2 * e_3 + 1] = __fmaf_rn(g1_3 * x1_3, rq_2, acc[v_7 * 8 + 2 * e_3 + 1]);
+                        out_1[2 * e_3] = __fmaf_rn(nkx_6, x0_3, rq_2 * (g0_3 * __uint_as_float(ww[v_7 * 4 + e_3] << 16)));
+                        out_1[2 * e_3 + 1] = __fmaf_rn(nkx_6, x1_3, rq_2 * (g1_3 * __uint_as_float(ww[v_7 * 4 + e_3] & 4294901760u)));
                     }
                     int col_1 = (v_7 * 256 + tir) * 8;
                     {
@@ -434,17 +417,17 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
     for (int v_8 = 0; v_8 < 3; v_8++) {
         int pcolv = (v_8 * 256 + tir) * 8;
         {
-            unsigned _stv8_7_0 = __float_as_uint(acc[v_8 * 8 + 0]);
-            unsigned _stv8_7_1 = __float_as_uint(acc[v_8 * 8 + 1]);
-            unsigned _stv8_7_2 = __float_as_uint(acc[v_8 * 8 + 2]);
-            unsigned _stv8_7_3 = __float_as_uint(acc[v_8 * 8 + 3]);
-            unsigned _stv8_7_4 = __float_as_uint(acc[v_8 * 8 + 4]);
-            unsigned _stv8_7_5 = __float_as_uint(acc[v_8 * 8 + 5]);
-            unsigned _stv8_7_6 = __float_as_uint(acc[v_8 * 8 + 6]);
-            unsigned _stv8_7_7 = __float_as_uint(acc[v_8 * 8 + 7]);
+            unsigned _stv8_9_0 = __float_as_uint(acc[v_8 * 8 + 0]);
+            unsigned _stv8_9_1 = __float_as_uint(acc[v_8 * 8 + 1]);
+            unsigned _stv8_9_2 = __float_as_uint(acc[v_8 * 8 + 2]);
+            unsigned _stv8_9_3 = __float_as_uint(acc[v_8 * 8 + 3]);
+            unsigned _stv8_9_4 = __float_as_uint(acc[v_8 * 8 + 4]);
+            unsigned _stv8_9_5 = __float_as_uint(acc[v_8 * 8 + 5]);
+            unsigned _stv8_9_6 = __float_as_uint(acc[v_8 * 8 + 6]);
+            unsigned _stv8_9_7 = __float_as_uint(acc[v_8 * 8 + 7]);
             asm volatile(
                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                :: "l"((void*)(partial + (pbase + (unsigned long long)pcolv))), "r"(_stv8_7_0), "r"(_stv8_7_1), "r"(_stv8_7_2), "r"(_stv8_7_3), "r"(_stv8_7_4), "r"(_stv8_7_5), "r"(_stv8_7_6), "r"(_stv8_7_7) : "memory");
+                :: "l"((void*)(partial + (pbase + (unsigned long long)pcolv))), "r"(_stv8_9_0), "r"(_stv8_9_1), "r"(_stv8_9_2), "r"(_stv8_9_3), "r"(_stv8_9_4), "r"(_stv8_9_5), "r"(_stv8_9_6), "r"(_stv8_9_7) : "memory");
         }
     }
     cooperative_groups::this_grid().sync();
@@ -475,8 +458,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                 }
                 #pragma unroll
                 for (int e_5 = 0; e_5 < 4; e_5++) {
-                    float _fma_12 = __fmaf_rn(_vec_load_0[e_5], 1.0f, -c4[e_5]);
-                    float y = _fma_12;
+                    float y = __fmaf_rn(_vec_load_0[e_5], 1.0f, -c4[e_5]);
                     float t = a4[e_5] + y;
                     c4[e_5] = t - a4[e_5] - y;
                     a4[e_5] = t;
@@ -501,8 +483,7 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
                 #pragma unroll
                 for (int e_8 = 0; e_8 < 4; e_8++) {
                     float d_2 = red_fold[k_3 * 32 + tid * 4 + e_8];
-                    float _fma_13 = __fmaf_rn(d_2, 1.0f, -oc4[e_8]);
-                    float y_1 = _fma_13;
+                    float y_1 = __fmaf_rn(d_2, 1.0f, -oc4[e_8]);
                     float t_1 = o4[e_8] + y_1;
                     oc4[e_8] = t_1 - o4[e_8] - y_1;
                     o4[e_8] = t_1;
@@ -523,4 +504,3 @@ kernel_cake_rmsnorm_train_572c3db0d5edee753f29(__nv_bfloat16* __restrict__ g, __
 }
 
 } // extern "C"
-

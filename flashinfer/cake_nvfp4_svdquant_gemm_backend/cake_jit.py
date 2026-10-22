@@ -47,11 +47,15 @@ Tensor maps travel by value in the kernel parameters: the binding encodes a
 CUDA-graph capturable, and two layers never share descriptor storage.  Python
 passes plain tensors and views; the scale factors are re-viewed per the
 record's ``scale_elems`` (``uint8`` 5-D, ``uint16`` 4-D or ``uint32`` 3-D
-boxes of 128 rows).
+boxes of 128 rows).  The register-direct store programs take the raw ``out``
+pointer as a trailing ``out_ptr`` parameter beside the ``out`` tensor map; the
+host passes ``out`` for both.
 
 Routing is data: :data:`ROUTE_TABLE` is an ordered tuple of predicate rows
-over the host scalars ``(M, N, K, rank, has_bias)`` resolved once per call by
-:func:`select_record`; the last row is the unconditional fallback.  The named
+over the host scalars ``(M, N, K, rank, has_bias)`` and the device's exported
+architecture (a row's optional ``arches``; absent applies everywhere), resolved
+once per call by :func:`select_record`; the last row is the unconditional
+fallback.  The named
 shape violations (``M >= 128``, ``N`` a multiple of 128, ``K`` a multiple of
 the selected program's K tile, ``rank`` a multiple of 32 up to 128) raise
 ``ValueError`` after routing, so the K-tile message names the program that
@@ -118,7 +122,9 @@ SCALE_ELEMS = ("uint8", "uint16", "uint32")
 # kernel never reads it then, but the binding needs a valid CUDA tensor).
 # The ``D_tail`` / ``L1_tail`` descriptors of the rank-96 tail programs and
 # the ``B_half`` descriptor of the tail-split pair program are second tensor
-# maps over the same ``d`` / ``l1`` / ``b`` tensors.
+# maps over the same ``d`` / ``l1`` / ``b`` tensors; the ``out_ptr`` parameter
+# of the register-direct store programs (``out_store`` ``v8`` / ``v8hint``) is
+# the raw pointer of the same ``out`` tensor the ``out`` tensor map views.
 LOGICAL_TENSORS = (
     "a",
     "b",
@@ -162,6 +168,7 @@ PARAMETER_LOGICAL: dict[str, str] = {
     "alpha": "alpha",
     "bias": "bias",
     "out": "out",
+    "out_ptr": "out",
     "M": "M",
     "N": "N",
     "K_tiles": "K_tiles",
@@ -464,9 +471,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    # Two-CTA persistent 256x256x256 (cta_group::2) with a static rank, one CTA
-    # pair per scheduled tile claimed through cluster launch control; 32-bit
-    # scale-factor view; programmatic dependent launch.
+    # The shipped (cake_r1) build of the 2cta_persistent program with
+    # {"rank": 32}: kept for the exact-dispatch rows below.
     "cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
@@ -540,7 +546,92 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    "cake_nvfp4_svdquant_gemm_787f1282c52b91cba8d3": {
+    # Two-CTA persistent 256x256x256 (cta_group::2) with a static rank, one CTA
+    # pair per scheduled tile claimed through cluster launch control; 32-bit
+    # scale-factor view; programmatic dependent launch.  cake_r2: the output
+    # leaves the epilogue registers through four 256-bit stores per thread and
+    # subtile (``out_store="v8"``; the raw ``out`` pointer is the trailing
+    # ``out_ptr`` parameter beside the ``out`` tensor map), on the launches
+    # without an L2 store hint (``K_tiles < 24`` and ``w_tiles < 24`` in
+    # 256-wide tiles: K < 6144 and N < 6016).  One build per rank.
+    "cake_nvfp4_svdquant_gemm_63c7c8683df10c75591b": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8", "rank": 32},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_63c7c8683df10c75591b",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_63c7c8683df10c75591b",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_63c7c8683df10c75591b",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 32,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The 2cta_persistent program built with {"bias_path": "regs", "rank": 32}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``63c7c8683df10c75591b``).
+    "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -567,10 +658,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"rank": 64},
+        "build": {"bias_path": "regs", "rank": 32},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_787f1282c52b91cba8d3",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_787f1282c52b91cba8d3",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -578,7 +669,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 228992,
             "use_pdl": True,
         },
-        "library": "cake_nvfp4_svdquant_gemm_787f1282c52b91cba8d3",
+        "library": "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -608,12 +699,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "block_k": 256,
             "grid_rule": "pair_persistent",
             "pdl": True,
-            "rank_storage": 64,
+            "rank_storage": 32,
             "scale_elems": "uint32",
             "variant": "bias",
         },
     },
-    "cake_nvfp4_svdquant_gemm_b5c494322821362fc968": {
+    # The 2cta_persistent program built with {"clc_lead_kb": 8, "rank": 32}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``63c7c8683df10c75591b``).
+    "cake_nvfp4_svdquant_gemm_1d78f2bd5722fb02b75a": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -640,10 +733,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"rank": 96},
+        "build": {"clc_lead_kb": 8, "rank": 32},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_b5c494322821362fc968",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_b5c494322821362fc968",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_1d78f2bd5722fb02b75a",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_1d78f2bd5722fb02b75a",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -651,7 +744,232 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 228992,
             "use_pdl": True,
         },
-        "library": "cake_nvfp4_svdquant_gemm_b5c494322821362fc968",
+        "library": "cake_nvfp4_svdquant_gemm_1d78f2bd5722fb02b75a",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 32,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    "cake_nvfp4_svdquant_gemm_f57f1cbd289ee50c237e": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8", "rank": 64},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_f57f1cbd289ee50c237e",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_f57f1cbd289ee50c237e",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_f57f1cbd289ee50c237e",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 64,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    "cake_nvfp4_svdquant_gemm_be138d4583b02c247633": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8", "rank": 96},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_be138d4583b02c247633",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_be138d4583b02c247633",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_be138d4583b02c247633",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 96,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The 2cta_persistent program built with {"bias_path": "regs", "rank": 96}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``be138d4583b02c247633``).
+    "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"bias_path": "regs", "rank": 96},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -686,7 +1004,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    "cake_nvfp4_svdquant_gemm_7dbf52ef12c97f9723d2": {
+    "cake_nvfp4_svdquant_gemm_84b1b76b4ef917592df0": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -709,14 +1027,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "SFB"],
             ["buffer", "L1"],
             ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"rank": 128},
+        "build": {"out_store": "v8", "rank": 128},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_7dbf52ef12c97f9723d2",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_7dbf52ef12c97f9723d2",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_84b1b76b4ef917592df0",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_84b1b76b4ef917592df0",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -724,7 +1043,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 228992,
             "use_pdl": True,
         },
-        "library": "cake_nvfp4_svdquant_gemm_7dbf52ef12c97f9723d2",
+        "library": "cake_nvfp4_svdquant_gemm_84b1b76b4ef917592df0",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -742,6 +1061,619 @@ MODULES: dict[str, dict[str, Any]] = {
             "has_bias": "has_bias",
             "num_tiles": "num_tiles",
             "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 128,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The same program in its hinted store form (``out_store="v8hint"``: the
+    # ``.L1::no_allocate.L2::evict_first`` 256-bit stores on sm_103a, the plain
+    # ones on sm_100a) for the launches with ``K_tiles >= 24`` or ``w_tiles >=
+    # 24`` (K >= 6144 or N >= 6016).  One build per rank.
+    "cake_nvfp4_svdquant_gemm_3880e0aea2ecbe59106a": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8hint", "rank": 32},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_3880e0aea2ecbe59106a",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_3880e0aea2ecbe59106a",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_3880e0aea2ecbe59106a",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 32,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The 2cta_persistent program built with {"out_hint": "on", "out_store": "v8hint", "rank": 32}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``3880e0aea2ecbe59106a``).
+    "cake_nvfp4_svdquant_gemm_fdcf777b3acd972f8841": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_hint": "on", "out_store": "v8hint", "rank": 32},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_fdcf777b3acd972f8841",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_fdcf777b3acd972f8841",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_fdcf777b3acd972f8841",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 32,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    "cake_nvfp4_svdquant_gemm_99be5794f0107a539d27": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8hint", "rank": 64},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_99be5794f0107a539d27",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_99be5794f0107a539d27",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_99be5794f0107a539d27",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 64,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The 2cta_persistent program built with {"out_hint": "on", "out_store": "v8hint", "rank": 64}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``99be5794f0107a539d27``).
+    "cake_nvfp4_svdquant_gemm_d16d801db12c7bdde4dc": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_hint": "on", "out_store": "v8hint", "rank": 64},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_d16d801db12c7bdde4dc",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_d16d801db12c7bdde4dc",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_d16d801db12c7bdde4dc",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 64,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    "cake_nvfp4_svdquant_gemm_a474f70abaf1b70ca4fe": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8hint", "rank": 96},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_a474f70abaf1b70ca4fe",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_a474f70abaf1b70ca4fe",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_a474f70abaf1b70ca4fe",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 96,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The 2cta_persistent program built with {"out_hint": "on", "out_store": "v8hint", "rank": 96}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``a474f70abaf1b70ca4fe``).
+    "cake_nvfp4_svdquant_gemm_5dc32691ea15528b11be": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_hint": "on", "out_store": "v8hint", "rank": 96},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_5dc32691ea15528b11be",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_5dc32691ea15528b11be",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_5dc32691ea15528b11be",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 96,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    "cake_nvfp4_svdquant_gemm_9f7d814ace4cd94fc4d6": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8hint", "rank": 128},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_9f7d814ace4cd94fc4d6",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_9f7d814ace4cd94fc4d6",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_9f7d814ace4cd94fc4d6",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_persistent",
+            "pdl": True,
+            "rank_storage": 128,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The 2cta_persistent program built with {"out_hint": "on", "out_store": "v8hint", "rank": 128}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``9f7d814ace4cd94fc4d6``).
+    "cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_hint": "on", "out_store": "v8hint", "rank": 128},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_ptr": "out",
             "rank": "rank",
             "raster_group": "raster_group",
             "tok_tiles": "tok_tiles",
@@ -828,9 +1760,13 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # tactic 14 on 64-row M tiles with the fused bias: 128x64x128 MMAs streaming
     # the live 64-row half of A, clusters of two N-adjacent CTAs, grid
-    # ``(ceil(M / 64), N / 64)``; 16-bit scale-factor view.  Built with the
+    # ``(ceil(M / 64), N / 64)``; 16-bit scale-factor view.  cake_r2 form A: the
+    # overlap prologue (``prologue="overlap"``: barriers published by one relaxed
+    # cluster rendezvous, the TMEM allocation overlapped with the first load
+    # stages) and the fused 64-column epilogue (``epi="fused64"``), for the
+    # M 129 rows the K12288-class rows below do not take.  Built with the
     # shared-memory bias epilogue (``bias=True``).
-    "cake_nvfp4_svdquant_gemm_f6182ce3562146e0d237": {
+    "cake_nvfp4_svdquant_gemm_e6789ee4eaed1dff09ae": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -853,10 +1789,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"bias": True},
+        "build": {"bias": True, "epi": "fused64", "prologue": "overlap"},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_f6182ce3562146e0d237",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_f6182ce3562146e0d237",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_e6789ee4eaed1dff09ae",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_e6789ee4eaed1dff09ae",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (1, 2, 1),
@@ -864,7 +1800,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 210048,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_svdquant_gemm_f6182ce3562146e0d237",
+        "library": "cake_nvfp4_svdquant_gemm_e6789ee4eaed1dff09ae",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -895,10 +1831,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    # The same 64-row program built without the bias epilogue (``bias=False``):
-    # the ``bias`` pointer and ``has_bias`` stay in the ABI and are never read,
-    # so only bias-free problems are routed to it.
-    "cake_nvfp4_svdquant_gemm_cab40cec2bae7961cf91": {
+    # The tactic14_m64_bias program built with {"bias": True, "epi": "fused64", "prologue": "overlap", "stages": 15}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``e6789ee4eaed1dff09ae``).
+    "cake_nvfp4_svdquant_gemm_2270204930b79b8caef7": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -921,10 +1856,151 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"bias": False},
+        "build": {"bias": True, "epi": "fused64", "prologue": "overlap", "stages": 15},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_cab40cec2bae7961cf91",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_cab40cec2bae7961cf91",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_2270204930b79b8caef7",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_2270204930b79b8caef7",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_2270204930b79b8caef7",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "bias",
+        },
+    },
+    # The tactic14_m64_bias program built with {"bias": True, "epi": "fused64", "epi_alias": True, "prologue": "overlap", "stages": 16}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``e6789ee4eaed1dff09ae``).
+    "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "bias": True,
+            "epi": "fused64",
+            "epi_alias": True,
+            "prologue": "overlap",
+            "stages": 16,
+        },
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 230528,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "bias",
+        },
+    },
+    # Form A built without the bias epilogue (``bias=False``): the ``bias``
+    # pointer and ``has_bias`` stay in the ABI and are never read, so only
+    # bias-free problems are routed to it.
+    "cake_nvfp4_svdquant_gemm_8dc2b79ff158918dd5c8": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"bias": False, "epi": "fused64", "prologue": "overlap"},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_8dc2b79ff158918dd5c8",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_8dc2b79ff158918dd5c8",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (1, 2, 1),
@@ -932,7 +2008,296 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 210048,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_svdquant_gemm_cab40cec2bae7961cf91",
+        "library": "cake_nvfp4_svdquant_gemm_8dc2b79ff158918dd5c8",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "nobias",
+        },
+    },
+    # The tactic14_m64_bias program built with {"bias": False, "epi": "fused64", "epi_alias": True, "prologue": "overlap", "stages": 16}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``8dc2b79ff158918dd5c8``).
+    "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "bias": False,
+            "epi": "fused64",
+            "epi_alias": True,
+            "prologue": "overlap",
+            "stages": 16,
+        },
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 230528,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "nobias",
+        },
+    },
+    # The tactic14_m64_bias program built with {"bias": False, "epi": "fused64", "prologue": "overlap", "stages": 15}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``8dc2b79ff158918dd5c8``).
+    "cake_nvfp4_svdquant_gemm_8c21118cf9b080867cf1": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"bias": False, "epi": "fused64", "prologue": "overlap", "stages": 15},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_8c21118cf9b080867cf1",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_8c21118cf9b080867cf1",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_8c21118cf9b080867cf1",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "nobias",
+        },
+    },
+    # cake_r2 form B for the M 129 rows with K >= 12288 and K % 256 == 0 (the
+    # K12288-class rows): form A on 256-wide K boxes (``k_box=256``, four K64
+    # MMA steps per stage), an 11-stage ring (``stages=11``) and the epilogue
+    # staging aliased onto the drained ring (``epi_alias=True``).  Bias build.
+    "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "bias": True,
+            "epi": "fused64",
+            "epi_alias": True,
+            "k_box": 256,
+            "prologue": "overlap",
+            "stages": 11,
+        },
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226432,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "bias",
+        },
+    },
+    # Form B without the bias epilogue (``bias=False``); bias-free problems only.
+    "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "bias": False,
+            "epi": "fused64",
+            "epi_alias": True,
+            "k_box": 256,
+            "prologue": "overlap",
+            "stages": 11,
+        },
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226432,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -967,8 +2332,11 @@ MODULES: dict[str, dict[str, Any]] = {
     # last partial wave run as two 256x128 half units each (``B_half``: a 64-row
     # box over the same ``b`` tensor), scheduled by :func:`tailsplit_units`;
     # otherwise the ``2cta_persistent`` program's whole-tile path.  One build per
-    # rank; routed only to the shapes where the split measured faster.
-    "cake_nvfp4_svdquant_gemm_9ff3aa18deb3fcf68201": {
+    # rank; routed only to the shapes where the split measured faster.  cake_r2:
+    # every tail-split route is a hinted launch (``K_tiles`` or ``w_tiles`` 48),
+    # so the program ships in its ``out_store="v8hint"`` form (the trailing
+    # ``out_ptr`` parameter is the raw ``out`` pointer).
+    "cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -995,14 +2363,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "SFB"],
             ["buffer", "L1"],
             ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"rank": 32},
+        "build": {"out_store": "v8hint", "rank": 32},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_9ff3aa18deb3fcf68201",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_9ff3aa18deb3fcf68201",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -1010,7 +2379,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 228992,
             "use_pdl": True,
         },
-        "library": "cake_nvfp4_svdquant_gemm_9ff3aa18deb3fcf68201",
+        "library": "cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -1031,6 +2400,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_tiles": "num_tiles",
             "num_units": "num_units",
             "out": "out",
+            "out_ptr": "out",
             "rank": "rank",
             "raster_group": "raster_group",
             "tail_split": "tail_split",
@@ -1049,7 +2419,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    "cake_nvfp4_svdquant_gemm_ee03ffeedc946ec3267d": {
+    # The 2cta_tailsplit program built with {"load_order": "b_first", "out_store": "v8hint", "rank": 32}
+    # (round-3 final of the exact-dispatch rows below; the plan of ``e4f1cd01b65bed25c4f1``).
+    "cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -1076,14 +2448,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "SFB"],
             ["buffer", "L1"],
             ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"rank": 64},
+        "build": {"load_order": "b_first", "out_store": "v8hint", "rank": 32},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_ee03ffeedc946ec3267d",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_ee03ffeedc946ec3267d",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -1091,7 +2464,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 228992,
             "use_pdl": True,
         },
-        "library": "cake_nvfp4_svdquant_gemm_ee03ffeedc946ec3267d",
+        "library": "cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -1112,6 +2485,90 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_tiles": "num_tiles",
             "num_units": "num_units",
             "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tail_split": "tail_split",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_tailsplit",
+            "pdl": True,
+            "rank_storage": 32,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    "cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["parameter", "num_units"],
+            ["parameter", "full_units"],
+            ["parameter", "tail_split"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "B_half"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8hint", "rank": 64},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "B_half": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "full_units": "full_units",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "num_units": "num_units",
+            "out": "out",
+            "out_ptr": "out",
             "rank": "rank",
             "raster_group": "raster_group",
             "tail_split": "tail_split",
@@ -1130,7 +2587,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    "cake_nvfp4_svdquant_gemm_3c870d4578b91c2d2310": {
+    "cake_nvfp4_svdquant_gemm_a867c135c6da108b5f82": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -1157,14 +2614,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "SFB"],
             ["buffer", "L1"],
             ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"rank": 96},
+        "build": {"out_store": "v8hint", "rank": 96},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_3c870d4578b91c2d2310",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_3c870d4578b91c2d2310",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_a867c135c6da108b5f82",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_a867c135c6da108b5f82",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -1172,7 +2630,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 228992,
             "use_pdl": True,
         },
-        "library": "cake_nvfp4_svdquant_gemm_3c870d4578b91c2d2310",
+        "library": "cake_nvfp4_svdquant_gemm_a867c135c6da108b5f82",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -1193,6 +2651,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_tiles": "num_tiles",
             "num_units": "num_units",
             "out": "out",
+            "out_ptr": "out",
             "rank": "rank",
             "raster_group": "raster_group",
             "tail_split": "tail_split",
@@ -1211,7 +2670,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    "cake_nvfp4_svdquant_gemm_7c10d18c4c6dff954f2e": {
+    "cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -1238,14 +2697,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "SFB"],
             ["buffer", "L1"],
             ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"rank": 128},
+        "build": {"out_store": "v8hint", "rank": 128},
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_7c10d18c4c6dff954f2e",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_7c10d18c4c6dff954f2e",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -1253,7 +2713,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 228992,
             "use_pdl": True,
         },
-        "library": "cake_nvfp4_svdquant_gemm_7c10d18c4c6dff954f2e",
+        "library": "cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -1274,6 +2734,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_tiles": "num_tiles",
             "num_units": "num_units",
             "out": "out",
+            "out_ptr": "out",
             "rank": "rank",
             "raster_group": "raster_group",
             "tail_split": "tail_split",
@@ -1298,19 +2759,256 @@ MODULES: dict[str, dict[str, Any]] = {
 # admitting row wins and the last row admits everything.  A row's optional
 # keys: ``m_min`` / ``m_max``, ``n_min`` / ``n_max``, ``k_min`` / ``k_max``
 # (inclusive bounds), ``k_multiple`` (``K`` divisible by it), ``ranks`` (the
-# admitted ranks) and ``bias`` (``True`` / ``False``; absent or ``None`` admits
-# both); the target is ``record`` or ``records_by_rank`` (rank -> record).
+# admitted ranks), ``bias`` (``True`` / ``False``; absent or ``None`` admits
+# both) and ``arches`` (the exported architectures the row applies to; absent
+# applies to every architecture, so one problem may dispatch to different
+# programs on ``sm_100a`` and ``sm_103a``); the target is ``record`` or
+# ``records_by_rank`` (rank -> record).
 # A row never widens the named shape violations: :func:`select_record`
 # validates ``M``, ``N``, ``K`` against the selected program and ``rank`` after
-# routing.  The head rows are the measured routes of the convergence round
-# (the tail-split and whole-tile pair programs, the 64-row tactic-14 builds of
-# the M 129 rows); the tail rows reproduce the previous dispatcher for every
-# other problem.
+# routing.  The head rows are the measured routes of the convergence rounds
+# (the tail-split and whole-tile pair programs in the store form of the
+# launch, the 64-row tactic-14 builds of the M 129 rows per K class); the
+# tail rows reproduce the previous dispatcher for every other problem.
 ROUTE_TABLE: tuple[dict[str, Any], ...] = (
+    # Exact-dispatch rows of the convergence finals, first so that each names the
+    # program of exactly one (M, N, K, rank, bias), per architecture where the two
+    # architectures measured different winners (``arches``; absent = both):
+    #   (129, 3072, 3072, 96, True) on sm_103a -> 44ec820136bf5bcde86e
+    #   (129, 3072, 3072, 128, False) on sm_100a -> 8c21118cf9b080867cf1
+    #   (129, 3072, 3072, 128, False) on sm_103a -> fed389c9e9cb9293bd29
+    #   (129, 3072, 3072, 128, True) on sm_100a -> 2270204930b79b8caef7
+    #   (129, 3072, 3072, 128, True) on sm_103a -> 44ec820136bf5bcde86e
+    #   (4096, 3072, 3072, 32, True) on sm_100a -> 1d78f2bd5722fb02b75a
+    #   (4096, 3072, 3072, 32, True) on sm_103a -> b4be925d9e1e6959b702 (held: the shipped cake_r1 build)
+    #   (4096, 12288, 3072, 32, True) on sm_100a -> 2ca0cf40f7bbfca9df92
+    #   (6889, 3072, 3072, 32, True) on both -> fdcf777b3acd972f8841
+    #   (6912, 3072, 3072, 32, True) on both -> fdcf777b3acd972f8841
+    #   (6912, 3072, 3072, 64, True) on both -> d16d801db12c7bdde4dc
+    #   (6912, 3072, 3072, 96, True) on sm_100a -> 96eddeb7b3a643b34a21
+    #   (6912, 3072, 3072, 96, True) on sm_103a -> 5dc32691ea15528b11be
+    #   (6912, 3072, 3072, 128, True) on both -> aa5225a75028cbb32391
+    #   (9216, 3072, 3072, 32, True) on sm_100a -> b4be925d9e1e6959b702 (held: the shipped cake_r1 build)
+    #   (16384, 3072, 3072, 32, True) on sm_100a -> c832b08a912e4c58112b
+    #   (16384, 3072, 3072, 32, True) on sm_103a -> fdcf777b3acd972f8841
+    #   (16384, 12288, 3072, 32, True) on sm_100a -> b4be925d9e1e6959b702 (held: the shipped cake_r1 build)
+    {
+        "arches": ("sm_103a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (96,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (128,),
+        "bias": False,
+        "record": "cake_nvfp4_svdquant_gemm_8c21118cf9b080867cf1",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (128,),
+        "bias": False,
+        "record": "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (128,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_2270204930b79b8caef7",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (128,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 4096,
+        "m_max": 4096,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_1d78f2bd5722fb02b75a",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 4096,
+        "m_max": 4096,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 4096,
+        "m_max": 4096,
+        "n_min": 12288,
+        "n_max": 12288,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92",
+    },
+    {
+        "m_min": 6889,
+        "m_max": 6889,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_fdcf777b3acd972f8841",
+    },
+    {
+        "m_min": 6912,
+        "m_max": 6912,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_fdcf777b3acd972f8841",
+    },
+    {
+        "m_min": 6912,
+        "m_max": 6912,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (64,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_d16d801db12c7bdde4dc",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 6912,
+        "m_max": 6912,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (96,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 6912,
+        "m_max": 6912,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (96,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_5dc32691ea15528b11be",
+    },
+    {
+        "m_min": 6912,
+        "m_max": 6912,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (128,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 9216,
+        "m_max": 9216,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 16384,
+        "m_max": 16384,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 16384,
+        "m_max": 16384,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_fdcf777b3acd972f8841",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 16384,
+        "m_max": 16384,
+        "n_min": 12288,
+        "n_max": 12288,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702",
+    },
     # The wave-quantized rows where the tail split measured faster than the
     # whole-tile pair program: 324 pair tiles of (M 6889..6912,
     # N 3072, K 12288), 768 of (M 16384, N 3072, K 12288) and (M 4096, N 12288,
-    # K 3072); the tail-split program of the rank.
+    # K 3072); the tail-split program of the rank (hinted store form: every
+    # row here has ``K_tiles`` or ``w_tiles`` 48).
     {
         "m_min": 6889,
         "m_max": 6912,
@@ -1321,10 +3019,10 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "ranks": (32, 64, 96, 128),
         "bias": None,
         "records_by_rank": {
-            32: "cake_nvfp4_svdquant_gemm_9ff3aa18deb3fcf68201",
-            64: "cake_nvfp4_svdquant_gemm_ee03ffeedc946ec3267d",
-            96: "cake_nvfp4_svdquant_gemm_3c870d4578b91c2d2310",
-            128: "cake_nvfp4_svdquant_gemm_7c10d18c4c6dff954f2e",
+            32: "cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1",
+            64: "cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4",
+            96: "cake_nvfp4_svdquant_gemm_a867c135c6da108b5f82",
+            128: "cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de",
         },
     },
     {
@@ -1337,10 +3035,10 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "ranks": (32, 64, 96, 128),
         "bias": None,
         "records_by_rank": {
-            32: "cake_nvfp4_svdquant_gemm_9ff3aa18deb3fcf68201",
-            64: "cake_nvfp4_svdquant_gemm_ee03ffeedc946ec3267d",
-            96: "cake_nvfp4_svdquant_gemm_3c870d4578b91c2d2310",
-            128: "cake_nvfp4_svdquant_gemm_7c10d18c4c6dff954f2e",
+            32: "cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1",
+            64: "cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4",
+            96: "cake_nvfp4_svdquant_gemm_a867c135c6da108b5f82",
+            128: "cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de",
         },
     },
     {
@@ -1353,35 +3051,85 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "ranks": (32, 64, 96, 128),
         "bias": None,
         "records_by_rank": {
-            32: "cake_nvfp4_svdquant_gemm_9ff3aa18deb3fcf68201",
-            64: "cake_nvfp4_svdquant_gemm_ee03ffeedc946ec3267d",
-            96: "cake_nvfp4_svdquant_gemm_3c870d4578b91c2d2310",
-            128: "cake_nvfp4_svdquant_gemm_7c10d18c4c6dff954f2e",
+            32: "cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1",
+            64: "cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4",
+            96: "cake_nvfp4_svdquant_gemm_a867c135c6da108b5f82",
+            128: "cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de",
         },
     },
-    # Large M on 256-deep K tiles: the two-CTA persistent program of the rank.
+    # Large M on 256-deep K tiles: the two-CTA persistent program of the rank in
+    # the store form of the launch -- the hinted form where the kernel hints its
+    # output stores (``K_tiles >= 24`` or ``w_tiles >= 24`` in 256-wide tiles:
+    # K >= 6144, or N >= 6016 for a multiple of 128), the plain form otherwise.
+    {
+        "m_min": 4096,
+        "k_min": 6144,
+        "k_multiple": 256,
+        "ranks": (32, 64, 96, 128),
+        "bias": None,
+        "records_by_rank": {
+            32: "cake_nvfp4_svdquant_gemm_3880e0aea2ecbe59106a",
+            64: "cake_nvfp4_svdquant_gemm_99be5794f0107a539d27",
+            96: "cake_nvfp4_svdquant_gemm_a474f70abaf1b70ca4fe",
+            128: "cake_nvfp4_svdquant_gemm_9f7d814ace4cd94fc4d6",
+        },
+    },
+    {
+        "m_min": 4096,
+        "n_min": 6016,
+        "k_multiple": 256,
+        "ranks": (32, 64, 96, 128),
+        "bias": None,
+        "records_by_rank": {
+            32: "cake_nvfp4_svdquant_gemm_3880e0aea2ecbe59106a",
+            64: "cake_nvfp4_svdquant_gemm_99be5794f0107a539d27",
+            96: "cake_nvfp4_svdquant_gemm_a474f70abaf1b70ca4fe",
+            128: "cake_nvfp4_svdquant_gemm_9f7d814ace4cd94fc4d6",
+        },
+    },
     {
         "m_min": 4096,
         "k_multiple": 256,
         "ranks": (32, 64, 96, 128),
         "bias": None,
         "records_by_rank": {
-            32: "cake_nvfp4_svdquant_gemm_b4be925d9e1e6959b702",
-            64: "cake_nvfp4_svdquant_gemm_787f1282c52b91cba8d3",
-            96: "cake_nvfp4_svdquant_gemm_b5c494322821362fc968",
-            128: "cake_nvfp4_svdquant_gemm_7dbf52ef12c97f9723d2",
+            32: "cake_nvfp4_svdquant_gemm_63c7c8683df10c75591b",
+            64: "cake_nvfp4_svdquant_gemm_f57f1cbd289ee50c237e",
+            96: "cake_nvfp4_svdquant_gemm_be138d4583b02c247633",
+            128: "cake_nvfp4_svdquant_gemm_84b1b76b4ef917592df0",
         },
     },
-    # The M 129 / N 3072 rows (K 3072 and 12288, every rank): the 64-row tactic
-    # 14 program, 144 CTAs in one wave; the biased build for biased problems,
-    # the bias-free build otherwise.
+    # The M 129 / N 3072 rows: the 64-row tactic 14 program, 144 CTAs in one
+    # wave, in the form of the K class -- form B for K >= 12288 with K % 256 == 0,
+    # form A for every other K (a multiple of 128); the biased build for biased
+    # problems, the bias-free build otherwise.
+    {
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 12288,
+        "k_multiple": 256,
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",
+    },
+    {
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 12288,
+        "k_multiple": 256,
+        "bias": False,
+        "record": "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",
+    },
     {
         "m_min": 129,
         "m_max": 129,
         "n_min": 3072,
         "n_max": 3072,
         "bias": True,
-        "record": "cake_nvfp4_svdquant_gemm_f6182ce3562146e0d237",
+        "record": "cake_nvfp4_svdquant_gemm_e6789ee4eaed1dff09ae",
     },
     {
         "m_min": 129,
@@ -1389,7 +3137,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "n_min": 3072,
         "n_max": 3072,
         "bias": False,
-        "record": "cake_nvfp4_svdquant_gemm_cab40cec2bae7961cf91",
+        "record": "cake_nvfp4_svdquant_gemm_8dc2b79ff158918dd5c8",
     },
     # Small biased problems: the biased 128x64 cluster program.
     {
@@ -1478,10 +3226,22 @@ def raster_group(*, m: int, n: int, k: int, rank: int) -> int:
     raise RuntimeError("the Cake NVFP4 SVDQuant raster-group table has no fallback row")
 
 
-def _route(*, m: int, n: int, k: int, rank: int, has_bias: bool) -> str:
+def _route(
+    *, m: int, n: int, k: int, rank: int, has_bias: bool, arch: str | None = None
+) -> str:
     for row in ROUTE_TABLE:
         if not _admits(row, m=m, n=n, k=k, rank=rank, has_bias=has_bias):
             continue
+        arches = row.get("arches")
+        if arches is not None:
+            if arch is None:
+                raise TypeError(
+                    "the Cake NVFP4 SVDQuant route table routes "
+                    f"(M={m}, N={n}, K={k}, rank={rank}, bias={has_bias}) per "
+                    "architecture; select_record() needs arch=device_arch(index)"
+                )
+            if arch not in tuple(arches):
+                continue
         by_rank = row.get("records_by_rank")
         if by_rank is not None:
             name = by_rank.get(rank)
@@ -1492,19 +3252,37 @@ def _route(*, m: int, n: int, k: int, rank: int, has_bias: bool) -> str:
     raise RuntimeError("the Cake NVFP4 SVDQuant route table has no fallback row")
 
 
-def select_record(*, m: int, n: int, k: int, rank: int, has_bias: bool) -> str:
-    """The record name of the program that serves ``(M, N, K, rank, has_bias)``,
-    or ``ValueError`` naming the violated shape rule.
+def select_record(
+    *, m: int, n: int, k: int, rank: int, has_bias: bool, arch: str | None = None
+) -> str:
+    """The record name of the program that serves ``(M, N, K, rank, has_bias)``
+    on ``arch``, or ``ValueError`` naming the violated shape rule.
 
-    Routing is the first admitting row of :data:`ROUTE_TABLE`; the shape rules
-    are checked afterwards against the selected program (``M >= 128``, ``N`` a
+    Routing is the first admitting row of :data:`ROUTE_TABLE` on ``arch`` (the
+    device's exported architecture, :func:`device_arch`; a row that names
+    ``arches`` applies on those architectures only); the shape rules are
+    checked afterwards against the selected program (``M >= 128``, ``N`` a
     positive multiple of 128, ``K`` a positive multiple of the program's K
     tile, ``rank`` a multiple of 32 in ``[32, 128]``).  A problem with a bias
-    is never routed to a bias-free program.
+    is never routed to a bias-free program.  Without ``arch`` only the
+    architecture-blind rows resolve: a per-architecture row that admits the
+    problem is a ``TypeError``, so no caller reads a route the device would
+    not take.
     """
     m, n, k, rank, has_bias = int(m), int(n), int(k), int(rank), bool(has_bias)
-    name = _route(m=m, n=n, k=k, rank=rank, has_bias=has_bias)
-    plan = MODULES[name]["plan"]
+    if arch is not None and arch not in ARCHES:
+        raise RuntimeError(
+            f"{arch!r} is not an exported Cake NVFP4 SVDQuant GEMM target; the "
+            f"exported architectures are {ARCHES}"
+        )
+    name = _route(m=m, n=n, k=k, rank=rank, has_bias=has_bias, arch=arch)
+    record = MODULES[name]
+    if arch is not None and arch not in tuple(record["arches"]):
+        raise RuntimeError(
+            f"the Cake NVFP4 SVDQuant route table sends a problem on {arch} to "
+            f"program {name}, which ships for {tuple(record['arches'])}"
+        )
+    plan = record["plan"]
     if m < BLOCK_M:
         raise ValueError(
             "Cake NVFP4 SVDQuant requires M >= 128 (every tensor map carries a "
