@@ -135,6 +135,20 @@ since a fresh checkout rebuilds nvcc modules anyway. Each test job's
 `FLASHINFER_JIT_BUILD_LOG` is summarized per toolchain by
 `scripts/summarize_jit_builds.py` in the job summary.
 
+A shared S3 layer sits under it (`ci/compile_cache_s3.sh`), so new EC2 leases and
+new runners do not start cold: one tarball per CI image, GPU and lane under
+`s3://<SCCACHE_BUCKET>/compile-cache/main/`, readable anonymously by every job.
+Pull request jobs merge it into the per-runner cache: a CuTe-DSL module is taken
+whole when absent, and gets missing objects only when its `meta.json` is
+identical. Only pushes to `main` write, through the OIDC role in the
+`COMPILE_CACHE_S3_ROLE_ARN` repository variable, whose IAM trust policy accepts
+only `refs/heads/main`. Uploads stay off until that variable is set. A writer job
+skips the per-runner cache, which pull request jobs write into: it compiles in a
+fresh `runner.temp` directory on top of the S3 tarball alone, then uploads it as
+one object, so concurrent writers never interleave a module. A tarball over
+`CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to that job's own builds.
+Restore and upload failures only warn.
+
 ## cuDNN linear attention
 
 Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
