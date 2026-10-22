@@ -97,6 +97,8 @@ void Run(TensorView a_g, TensorView a_x, TensorView a_w, TensorView a_r, TensorV
   CheckRank(a_g_h, "g_h", 1);
   CheckUnitInnerStride(a_g_h, "g_h");
   check_same_device(a_g_h, a_g, "g_h", "g");
+  TVM_FFI_CHECK((a_n_chunks >= 1), ValueError)
+      << KERNEL_NAME << ": requires (n_chunks >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

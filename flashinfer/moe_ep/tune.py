@@ -327,6 +327,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             ".backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_tuner", __package__
         )
         return tuner.run_tuning(args)
+    if args.shared_expert:
+        print("--shared-expert requires --dtype sm120_mxfp4_mxfp8", file=sys.stderr)
+        return 2
     if args.dtype == "sm90_mxfp4":
         if args.arch not in ("auto", "sm90"):
             print("sm90_mxfp4 requires --arch auto or sm90", file=sys.stderr)

@@ -137,6 +137,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
+    gen_gemm_sm120_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm103_module_cutlass_fp4,
@@ -170,9 +171,8 @@ from .jit.cake_minimax_h3_mxfp8 import (
     MiniMaxH3Mxfp8Target,
     gen_minimax_h3_mxfp8_aot_modules,
 )
-from .jit.cake_minimax_h3_nvfp4 import (
-    MiniMaxH3Nvfp4Target,
-    gen_minimax_h3_nvfp4_aot_modules,
+from .jit.cake_minimax_h3_nvfp4_pre_attention import (
+    aot_specs as gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules,
 )
 from .jit.cake_minimax_h3_qkv_quantize_pack import (
     aot_specs as gen_cake_minimax_h3_qkv_quantize_pack_aot_modules,
@@ -221,10 +221,6 @@ from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
-from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
-    cake_sm120_megamoe_available,
-    gen_cake_sm120_megamoe_aot_modules,
-)
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -762,13 +758,12 @@ def gen_all_modules(
         if enabled:
             jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
 
-    minimax_h3_nvfp4_targets: tuple[tuple[MiniMaxH3Nvfp4Target, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_nvfp4_target, enabled in minimax_h3_nvfp4_targets:
-        if enabled:
-            jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
+    # Cake MiniMax-H3 NVFP4 pre-attention: the norm stage and, per output
+    # format, the fused GEMM of each exact sm_100a / sm_103a target.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules("sm_103a"))
 
     # Cake MiniMax-H3 QKV quantize-and-pack: eight generated programs (NVFP4 /
     # MXFP8 x P in 1, 2, 4, 8), each an exact sm_100a / sm_103a library.
@@ -1023,11 +1018,21 @@ def gen_all_modules(
                 gen_cudnn_frost_moe_module(dtype, "sm_120a") for dtype in FROST_DTYPES
             )
             jit_specs.append(gen_fp4_quantization_sm120_module())
+            # Imported here: the package import initializes flashinfer.moe_ep (every
+            # MegaMoE backend), which builds without SM120 do not need.
+            from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+                cake_sm120_megamoe_available,
+                gen_cake_sm120_megamoe_aot_modules,
+            )
+
             # Cake SM120 MXFP4 x MXFP8 MegaMoE (moe_ep backend sm120_mxfp4_mxfp8_bf16_cake):
             # the binding and the default DeepSeek-V4-Flash device instances.  Both need
             # the NCCL 2.30.7 Device API (headers + library) at build time.
             if cake_sm120_megamoe_available():
                 jit_specs.extend(gen_cake_sm120_megamoe_aot_modules())
+            # SM120 only: the CUTLASS SVDQuant kernel is compiled for sm120a and
+            # is not shared with SM121, unlike the modules in the branch below.
+            jit_specs.append(gen_gemm_sm120_module_cutlass_nvfp4_svdquant())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:

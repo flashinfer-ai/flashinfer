@@ -25,7 +25,8 @@ layout, ``2 randn`` low-rank factors, ``4 randn`` bias): every element within
 ``atol 1 + rtol 0.1`` and a signal-to-quantization-noise ratio above 40 dB.
 The matrix covers the family's 28 performance rows (every shipped program),
 the off-table rows ``M in {128, 129, 135, 191, 200, 333, 2048, 4097}`` x
-``rank in {32, 64, 96, 128}`` x bias at ``N = K = 3072``, the named
+``rank in {32, 64, 96, 128}`` x bias at ``N = K = 3072``, the per-K routing of
+the M 129 rows and the output-store form of the 2-CTA routes, the named
 ``ValueError`` of each shape rule, the host plan (route table, grid rules,
 raster groups, scale-factor views), CUDA Graph capture and replay (bitwise
 equal to eager, two layers interleaved in one graph and in alternating
@@ -116,13 +117,17 @@ CONTRACT_N = 3072
 CONTRACT_K = 3072
 RANKS = (32, 64, 96, 128)
 # Coverage rows: the programs the two lists above do not reach under the
-# current route table (tactic 25: K 12288 at rank 32 between M 256 and 4095).
-# Update them when the route table changes; ``test_matrix_reaches_every_program``
-# says when a program is missed.
+# current route table (tactic 25: K 12288 at rank 32 between M 256 and 4095;
+# the rank 64 / 96 tail-split builds; the hinted-store persistent builds of
+# ranks 64 / 96 / 128 at a deep K).  Update them when the route table changes;
+# ``test_matrix_reaches_every_program`` says when a program is missed.
 COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (333, 3072, 12288, 32, True),
     (6912, 3072, 12288, 64, True),
     (6912, 3072, 12288, 96, True),
+    (4096, 3072, 12288, 64, True),
+    (4096, 3072, 12288, 96, True),
+    (4096, 3072, 12288, 128, True),
 )
 CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     (m, CONTRACT_N, CONTRACT_K, rank, bias)
@@ -130,6 +135,122 @@ CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     for rank in RANKS
     for bias in (False, True)
 )
+# The exact-dispatch rows of the convergence finals per architecture:
+# (M, N, K, rank, bias) -> the program it dispatches to there (the shipped
+# cake_r1 two-CTA r32 build on the held rows), the build keywords of those
+# programs, and the programs only one architecture's rows reach.
+_P = "cake_nvfp4_svdquant_gemm_"
+EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
+    "sm_100a": {
+        (129, 3072, 3072, 128, False): _P + "8c21118cf9b080867cf1",
+        (129, 3072, 3072, 128, True): _P + "2270204930b79b8caef7",
+        (4096, 3072, 3072, 32, True): _P + "1d78f2bd5722fb02b75a",
+        (4096, 12288, 3072, 32, True): _P + "2ca0cf40f7bbfca9df92",
+        (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
+        (6912, 3072, 3072, 96, True): _P + "96eddeb7b3a643b34a21",
+        (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
+        (9216, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
+        (16384, 3072, 3072, 32, True): _P + "c832b08a912e4c58112b",
+        (16384, 12288, 3072, 32, True): _P + "b4be925d9e1e6959b702",
+    },
+    "sm_103a": {
+        (129, 3072, 3072, 96, True): _P + "44ec820136bf5bcde86e",
+        (129, 3072, 3072, 128, False): _P + "fed389c9e9cb9293bd29",
+        (129, 3072, 3072, 128, True): _P + "44ec820136bf5bcde86e",
+        (4096, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
+        (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
+        (6912, 3072, 3072, 96, True): _P + "5dc32691ea15528b11be",
+        (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
+        (16384, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+    },
+}
+EXACT_BUILDS: dict[str, dict[str, object]] = {
+    _P + "1d78f2bd5722fb02b75a": {
+        "clc_lead_kb": 8,
+        "rank": 32,
+    },
+    _P + "2270204930b79b8caef7": {
+        "bias": True,
+        "epi": "fused64",
+        "prologue": "overlap",
+        "stages": 15,
+    },
+    _P + "2ca0cf40f7bbfca9df92": {
+        "load_order": "b_first",
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "44ec820136bf5bcde86e": {
+        "bias": True,
+        "epi": "fused64",
+        "epi_alias": True,
+        "prologue": "overlap",
+        "stages": 16,
+    },
+    _P + "5dc32691ea15528b11be": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 96,
+    },
+    _P + "8c21118cf9b080867cf1": {
+        "bias": False,
+        "epi": "fused64",
+        "prologue": "overlap",
+        "stages": 15,
+    },
+    _P + "96eddeb7b3a643b34a21": {
+        "bias_path": "regs",
+        "rank": 96,
+    },
+    _P + "aa5225a75028cbb32391": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 128,
+    },
+    _P + "b4be925d9e1e6959b702": {
+        "rank": 32,
+    },
+    _P + "c832b08a912e4c58112b": {
+        "bias_path": "regs",
+        "rank": 32,
+    },
+    _P + "d16d801db12c7bdde4dc": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 64,
+    },
+    _P + "fdcf777b3acd972f8841": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "fed389c9e9cb9293bd29": {
+        "bias": False,
+        "epi": "fused64",
+        "epi_alias": True,
+        "prologue": "overlap",
+        "stages": 16,
+    },
+}
+ARCH_ONLY: dict[str, set[str]] = {
+    "sm_100a": {
+        _P + "1d78f2bd5722fb02b75a",
+        _P + "2270204930b79b8caef7",
+        _P + "2ca0cf40f7bbfca9df92",
+        _P + "8c21118cf9b080867cf1",
+        _P + "96eddeb7b3a643b34a21",
+        _P + "c832b08a912e4c58112b",
+    },
+    "sm_103a": {
+        _P + "44ec820136bf5bcde86e",
+        _P + "5dc32691ea15528b11be",
+        _P + "fed389c9e9cb9293bd29",
+    },
+}
 # (M, N, K, rank, bias) -> the substring of the ValueError the shape rule raises.
 REJECTED_SHAPES = (
     ((65, 3072, 3072, 32, True), "M >= 128"),
@@ -154,6 +275,23 @@ GRAPH_ROWS = (
     (6912, 3072, 12288, 32, True),
 )
 GRAPH_REPLAYS = 3
+# The build keywords of the 64-row tactic-14 program per K class of the M 129
+# rows: the K12288 class (K >= 12288, K % 256 == 0) and every other K.
+M129_FORM_K3072 = {"prologue": "overlap", "epi": "fused64"}
+M129_FORM_K12288 = {
+    "prologue": "overlap",
+    "epi": "fused64",
+    "k_box": 256,
+    "stages": 11,
+    "epi_alias": True,
+}
+# The 2-CTA programs' output-store forms by launch: the kernel hints its stores
+# when ``K_tiles >= 24`` or ``w_tiles >= 24`` on 256-wide tiles.
+OUT_HINT_MIN_TILES = 24
+
+
+def _hinted_launch(n: int, k: int) -> bool:
+    return k // 256 >= OUT_HINT_MIN_TILES or -(-n // 256) >= OUT_HINT_MIN_TILES
 
 
 def _device() -> torch.device:
@@ -331,9 +469,17 @@ def _check(reference: torch.Tensor, out: torch.Tensor, what: str) -> None:
     assert sqnr > MIN_SQNR_DB, f"{what}: SQNR {sqnr:.2f} dB <= {MIN_SQNR_DB} dB"
 
 
+def _arch() -> str:
+    return loader.device_arch(_device().index)
+
+
+def _other_arch() -> str:
+    return next(arch for arch in loader.ARCHES if arch != _arch())
+
+
 def _route(row) -> str:
     m, n, k, rank, bias = row
-    return loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias)
+    return loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch())
 
 
 # --------------------------------------------------------------------------- host plan
@@ -415,12 +561,15 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
 
 def test_route_table_is_total_and_reaches_every_program() -> None:
-    """The last route row admits everything, every row names shipped records, and
-    every shipped record is the target of some row."""
+    """The last route row admits everything, every row names shipped records
+    (and, when it names architectures, some but not all of the exported ones),
+    and every shipped record is the target of some row."""
     table = loader.ROUTE_TABLE
     assert set(table[-1]) == {"record"}
     targets = set()
     for row in table:
+        arches = row.get("arches")
+        assert arches is None or (arches and set(arches) < set(loader.ARCHES))
         if "records_by_rank" in row:
             assert "record" not in row
             for rank, name in row["records_by_rank"].items():
@@ -445,16 +594,74 @@ def test_perf_rows_route_to_an_admitting_program(row) -> None:
 
 
 def test_matrix_reaches_every_program() -> None:
-    """The perf, off-table and coverage rows together exercise every shipped program."""
+    """The perf, off-table and coverage rows together exercise every shipped program
+    this device's architecture routes to (the other architecture's exact rows
+    send their problems elsewhere here)."""
     reached = {_route(row) for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS)}
-    assert reached == set(loader.MODULES), sorted(set(loader.MODULES) - reached)
+    expected = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
+    assert reached == expected, sorted(expected ^ reached)
+
+
+def test_route_rows_may_name_their_architectures(monkeypatch) -> None:
+    """A row with ``arches`` applies on those architectures only: one problem
+    dispatches per architecture, an architecture-blind call that meets such a
+    row is refused, and an unexported architecture is refused."""
+    m, n, k, rank, bias = 4096, 3072, 3072, 32, True
+    before = {
+        arch: loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+        for arch in loader.ARCHES
+    }
+    beside = {
+        arch: loader.select_record(
+            m=m + 1, n=n, k=k, rank=rank, has_bias=bias, arch=arch
+        )
+        for arch in loader.ARCHES
+    }
+    other = next(
+        name
+        for name, record in loader.MODULES.items()
+        if name not in before.values()
+        and record["plan"]["variant"] == "bias"
+        and record["plan"]["rank_storage"] in (None, rank)
+        and k % record["plan"]["block_k"] == 0
+    )
+    scoped = {
+        "m_min": m,
+        "m_max": m,
+        "n_min": n,
+        "n_max": n,
+        "k_min": k,
+        "k_max": k,
+        "ranks": (rank,),
+        "bias": True,
+        "arches": ("sm_103a",),
+        "record": other,
+    }
+    monkeypatch.setattr(loader, "ROUTE_TABLE", (scoped, *loader.ROUTE_TABLE))
+    routed = {
+        arch: loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+        for arch in loader.ARCHES
+    }
+    assert routed == {"sm_100a": before["sm_100a"], "sm_103a": other}
+    # A neighbouring problem the scoped row does not admit routes as before.
+    for arch in loader.ARCHES:
+        assert (
+            loader.select_record(m=m + 1, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+            == beside[arch]
+        )
+    with pytest.raises(TypeError, match="per architecture"):
+        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias)
+    with pytest.raises(RuntimeError, match="not an exported"):
+        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch="sm_120a")
+    assert pkg.is_supported(m=m, n=n, k=k, rank=rank, has_bias=bias, device=_device())
+    assert _route((m, n, k, rank, bias)) == routed[_arch()]
 
 
 @pytest.mark.parametrize("case", REJECTED_SHAPES, ids=lambda case: _row_id(case[0]))
 def test_shape_rule_names_the_violated_constraint(case) -> None:
     (m, n, k, rank, bias), message = case
     with pytest.raises(ValueError, match=re.escape(message)):
-        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias)
+        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch())
     assert not pkg.is_supported(
         m=m, n=n, k=k, rank=rank, has_bias=bias, device=_device()
     )
@@ -564,6 +771,112 @@ def test_raster_group_follows_its_table() -> None:
     assert loader.raster_group(m=16384, n=12288, k=12288, rank=32) == 2
     assert loader.raster_group(m=4096, n=3072, k=3072, rank=32) == 8
     assert loader.raster_group(m=6912, n=3072, k=3072, rank=128) == 8
+
+
+def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
+    """Every 2-CTA route (whole-tile and tail-split) outside the exact-dispatch rows
+    lands on the build whose ``out_store`` matches the kernel's hint rule for that
+    launch, and both forms are reached by the rows."""
+    forms = set()
+    exact = EXACT_ROWS[_arch()]
+    for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS):
+        m, n, k, rank, bias = row
+        name = _route(row)
+        if row in exact:  # the finals' own build; pinned by the exact-rows test
+            assert name == exact[row], _row_id(row)
+            continue
+        record = loader.MODULES[name]
+        if record["plan"]["grid_rule"] not in ("pair_persistent", "pair_tailsplit"):
+            continue
+        build = record["build"]
+        assert build["rank"] == rank, _row_id(row)
+        expected = "v8hint" if _hinted_launch(n, k) else "v8"
+        assert build["out_store"] == expected, (_row_id(row), build)
+        forms.add(build["out_store"])
+    assert forms == {"v8", "v8hint"}
+    # The boundary of the hint rule on the whole-tile program: 23 vs 24 tiles.
+    for (n, k), form in (
+        ((3072, 5888), "v8"),
+        ((3072, 6144), "v8hint"),
+        ((5888, 3072), "v8"),
+        ((6016, 3072), "v8hint"),
+    ):
+        name = loader.select_record(
+            m=4096, n=n, k=k, rank=32, has_bias=True, arch=_arch()
+        )
+        record = loader.MODULES[name]
+        assert record["plan"]["grid_rule"] == "pair_persistent", (n, k)
+        assert record["build"]["out_store"] == form, (n, k, record["build"])
+    # Every tail-split route is a hinted launch, so the program ships hinted only.
+    for record in loader.MODULES.values():
+        if record["plan"]["grid_rule"] == "pair_tailsplit":
+            assert record["build"]["out_store"] == "v8hint"
+
+
+def test_exact_rows_dispatch_per_architecture() -> None:
+    """The exact-dispatch rows of the convergence finals: on this device's
+    architecture each lands on its own build (the build the finals adopted, or
+    the shipped cake_r1 build on a held row); every exact row is a performance row."""
+    for row, name in EXACT_ROWS[_arch()].items():
+        assert row in PERF_ROWS, _row_id(row)
+        assert _route(row) == name, _row_id(row)
+        assert loader.MODULES[name]["build"] == EXACT_BUILDS[name], (_row_id(row), name)
+    reachable = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
+    assert reachable >= set(EXACT_ROWS[_arch()].values())
+
+
+@pytest.mark.parametrize("bias", [False, True], ids=["nobias", "bias"])
+def test_m129_rows_route_by_k_class(bias) -> None:
+    """The M 129 / N 3072 rows take the 64-row tactic-14 build of their K class:
+    the K12288 form for K >= 12288 with K % 256 == 0, the K3072 form otherwise
+    (including K % 256 != 0 and the K between the two classes); the bias form
+    follows the problem."""
+    for k, form in (
+        (3072, M129_FORM_K3072),
+        (3200, M129_FORM_K3072),
+        (6144, M129_FORM_K3072),
+        (12288, M129_FORM_K12288),
+        (12416, M129_FORM_K3072),
+        (24576, M129_FORM_K12288),
+    ):
+        name = loader.select_record(
+            m=129, n=3072, k=k, rank=32, has_bias=bias, arch=_arch()
+        )
+        record = loader.MODULES[name]
+        assert record["build"] == {"bias": bias, **form}, (k, bias, record["build"])
+        assert record["plan"]["variant"] == ("bias" if bias else "nobias")
+        assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128
+
+
+def test_out_ptr_binds_the_out_tensor() -> None:
+    """The register-direct store builds take the raw ``out`` pointer as the
+    trailing ``out_ptr`` parameter after ``L1_tail``; its logical name is ``out``,
+    so the host passes the ``out`` tensor twice (as the tensor map and the
+    pointer).  No other record has the parameter."""
+    assert loader.PARAMETER_LOGICAL["out_ptr"] == "out"
+    with_ptr = {
+        name
+        for name, record in loader.MODULES.items()
+        if "out_ptr" in record["logical"]
+    }
+    assert with_ptr
+    for name, record in loader.MODULES.items():
+        direct = record["build"].get("out_store") in ("v8", "v8hint")
+        assert (name in with_ptr) == direct, name
+        if not direct:
+            continue
+        assert record["logical"]["out_ptr"] == "out"
+        plan = [tuple(pair) for pair in record["arg_plan"]]
+        assert (
+            plan.index(("buffer", "out_ptr")) == plan.index(("buffer", "L1_tail")) + 1
+        )
+        assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
+        logical = [
+            logical
+            for logical, _axis in loader._argument_plan(name)
+            if logical is not None
+        ]
+        assert logical.count("out") == 2, name
 
 
 @pytest.mark.parametrize("has_bias", [False, True])

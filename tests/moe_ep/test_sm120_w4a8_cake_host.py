@@ -786,54 +786,125 @@ def test_geometry_rejects_outside_the_supported_region() -> None:
         G.KernelParams(2, 258, 6, 1024, 4096, 2048, False),  # 129 experts per rank
         G.KernelParams(33, 264, 6, 1024, 4096, 2048, False),  # EP 33
         G.KernelParams(1, 256, 6, 1024, 4096, 2048, False),  # EP 1
-        G.KernelParams(2, 256, 1, 65536, 512, 128, False),  # 16-bit active_rows field
+        G.KernelParams(2, 256, 1, 32768, 512, 128, False),  # 15-bit active_rows field
     ):
         with pytest.raises(G.GeometryError):
             G.describe_kernel(params)
-    G.describe_kernel(G.KernelParams(2, 256, 1, 65408, 512, 128, False))
+    G.describe_kernel(G.KernelParams(2, 256, 1, 32640, 512, 128, False))
     G.describe_kernel(
         G.KernelParams(8, 1024, 8, 512, 4096, 2048, False)
     )  # 128 per rank
     G.describe_kernel(G.KernelParams(32, 256, 8, 1024, 7168, 2048, True))
 
 
-def test_device_resource_check_rejects_spills_above_the_verified_ranks() -> None:
+@pytest.mark.parametrize("ranks", [4, 8, 16, 32])
+def test_device_resource_check_rejects_spills_at_every_rank_count(ranks: int) -> None:
     G = _geometry()
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
         LOCAL_BYTES_LIMIT,
-        REGISTER_BUDGET_VERIFIED_MAX_RANKS,
+        VALIDATED_NVCC_VERSIONS,
         candidate_instances,
         check_device_resources,
     )
 
     assert candidate_instances("all_gin") == (2, 3)
     assert candidate_instances(None) == candidate_instances("all_lsa") == (0, 1, 2, 3)
-    calls: list[tuple[tuple[int, ...], int]] = []
+    calls: list[tuple[tuple[int, ...], int, str]] = []
 
-    def clean(parameters, instance):
-        calls.append((parameters, instance))
+    def clean(parameters, instance, gin_backend):
+        calls.append((parameters, instance, gin_backend))
         return {"reg": 168, "stack": 8, "local": 0}
 
-    inside = G.KernelParams(
-        REGISTER_BUDGET_VERIFIED_MAX_RANKS, 256, 8, 1024, 7168, 2048, False
-    )
-    assert check_device_resources(inside, (0, 1, 2, 3), resource_usage=clean) == {}
-    assert calls == []  # verified region: nothing is compiled
-    wide = G.KernelParams(32, 256, 8, 1024, 7168, 2048, False)
-    report = check_device_resources(wide, (2, 3), resource_usage=clean)
-    assert sorted(report) == [2, 3]
-    assert [i for _, i in calls] == [2, 3]
-    assert all(p == wide.device_parameters() for p, _ in calls)
+    def nvcc() -> str:
+        return "13.3.73"
 
-    def spills(parameters, instance):
+    # DeepSeek-V4.1-Flash routed experts (the #6755 geometry).
+    params = G.KernelParams(ranks, 384, 6, 2048, 5120, 2304, False)
+    report = check_device_resources(params, (2, 3), resource_usage=clean, nvcc=nvcc)
+    # Every GIN backend's build is checked: the session (hence the backend) does not exist yet.
+    expected = {(b, i) for b in ("proxy", "gdaki", "gpi") for i in (2, 3)}
+    assert set(report) == expected
+    assert {(b, i) for _, i, b in calls} == expected
+    assert all(p == params.device_parameters() for p, _, _ in calls)
+
+    def spills(parameters, instance, gin_backend):
         del parameters
-        stack = LOCAL_BYTES_LIMIT + 8 if instance == 2 else 8
-        return {"reg": 168, "stack": stack, "local": 0}
+        stack = LOCAL_BYTES_LIMIT + 8 if (instance, gin_backend) == (1, "gpi") else 8
+        return {"reg": 166, "stack": stack, "local": 0}
 
-    with pytest.raises(G.GeometryError, match="m128_nocopier"):
-        check_device_resources(wide, (0, 1, 2, 3), resource_usage=spills)
-    # The copier-only flavors of the same build are fine.
-    check_device_resources(wide, (0, 1), resource_usage=spills)
+    with pytest.raises(G.GeometryError) as error:
+        check_device_resources(params, (0, 1, 2, 3), resource_usage=spills, nvcc=nvcc)
+    message = str(error.value)
+    assert "m64_copier (gpi GIN)" in message
+    assert "REG 166, stack 16 B, local 0 B" in message
+    assert "nvcc 13.3.73" in message
+    assert all(version in message for version in VALIDATED_NVCC_VERSIONS)
+    # The copier-free flavor of the same build, and the other backends, are fine.
+    check_device_resources(params, (2, 3), resource_usage=spills, nvcc=nvcc)
+    check_device_resources(
+        params,
+        (0, 1, 2, 3),
+        resource_usage=spills,
+        nvcc=nvcc,
+        gin_backends=("proxy", "gdaki"),
+    )
+
+
+def test_gin_backend_builds(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+        AOT_DEVICE_PARAMETERS,
+        GIN_BACKENDS,
+        gen_cake_sm120_megamoe_aot_modules,
+        gen_cake_sm120_megamoe_kernel_module,
+        gin_backend_name,
+    )
+    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim import cake_jit
+
+    # ncclGinType_t values: 2 proxy, 3 GDAKI, 4 GPI; anything else fails closed.
+    assert [gin_backend_name(t) for t in (2, 3, 4)] == ["proxy", "gdaki", "gpi"]
+    with pytest.raises(RuntimeError, match="no device build for NCCL GIN type 5"):
+        gin_backend_name(5)
+    # Each backend build compiles the other two out and is its own JIT module.
+    for name, (_, defines) in GIN_BACKENDS.items():
+        assert len(defines) == 2 and all(name.upper() not in d for d in defines)
+    names = {
+        gen_cake_sm120_megamoe_kernel_module(AOT_DEVICE_PARAMETERS[0], False, b).name
+        for b in GIN_BACKENDS
+    }
+    assert len(names) == len(GIN_BACKENDS)
+    # AOT packages every backend's build of the default parameter sets.  The binding spec
+    # records the NCCL 2.30.7 include and library paths; without the wheel (CI's CUDA 12.9
+    # image carries NCCL 2.29.7) stand-ins serve, as the spec is generated here, not built.
+    try:
+        cake_jit.nccl_installation()
+    except RuntimeError:
+        monkeypatch.setattr(
+            cake_jit,
+            "nccl_installation",
+            lambda: (tmp_path / "include", tmp_path / "libnccl.so.2"),
+        )
+    assert len(gen_cake_sm120_megamoe_aot_modules()) == 1 + len(
+        AOT_DEVICE_PARAMETERS
+    ) * len(GIN_BACKENDS)
+
+
+def test_device_resource_check_without_cuobjdump_defers_to_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    G = _geometry()
+    import flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe as package
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
+        check_device_resources,
+    )
+
+    def no_build(*args):
+        raise AssertionError("nothing is compiled without cuobjdump")
+
+    monkeypatch.setattr(package, "cuobjdump_path", lambda: None)
+    monkeypatch.setattr(package, "device_cubin_resource_usage", no_build)
+    params = G.KernelParams(8, 384, 6, 2048, 5120, 2304, False)
+    with pytest.warns(RuntimeWarning, match="cuobjdump not found"):
+        assert check_device_resources(params, (0, 1, 2, 3)) == {}
 
 
 def test_static_residency_grid_is_a_routing_independent_lower_bound() -> None:
@@ -937,6 +1008,114 @@ def test_rows_residency_grid_needs_no_routing_and_stays_in_the_valid_range() -> 
                     local_experts=local,
                     **common,
                 )
+
+
+# One cuda::atomic_ref operation on a pointer of unknown address space, as in NCCL's Device API.
+_ATOMIC_REF_PROBE = r"""
+#include <cuda/atomic>
+extern "C" __global__ void probe(unsigned* const* pointers) {
+  cuda::atomic_ref<unsigned, cuda::thread_scope_system> a(*pointers[threadIdx.x]);
+  a.fetch_add(1u, cuda::memory_order_relaxed);
+}
+"""
+
+
+def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
+    tmp_path,
+) -> None:
+    """The device build's flags must remove libcu++'s automatic-storage test from cuda::atomic_ref.
+
+    The libcu++ headers of CUDA >= 13.2 give every atomic on a generic pointer an
+    ``isspacep.local`` test plus a local-memory fallback, which spills the persistent kernel
+    (#6755).  ``_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE`` is an internal libcu++ macro: if a later
+    release renames it, this test fails on that toolkit.  Toolkits whose headers have no such
+    test (CUDA 13.0 / 13.1) skip, as do CUDA 12 toolkits, which the device build does not
+    support (their libcu++ spells the macro ``_LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE``).
+    """
+    import subprocess
+
+    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim import cake_jit
+
+    nvcc = cake_jit._nvcc()
+    source = tmp_path / "atomic_ref_probe.cu"
+    source.write_text(_ATOMIC_REF_PROBE)
+    device_defines = [f for f in cake_jit._NVCC_FLAGS if f.startswith("-D")]
+    assert "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE" in device_defines
+    release = cake_jit.nvcc_version()
+    if release != "unknown" and int(release.split(".")[0]) < 13:
+        pytest.skip(
+            f"nvcc {release}: the device build needs a CUDA 13 toolkit (CUDA 12's libcu++ "
+            "spells the macro _LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE)"
+        )
+
+    def ptx(*defines: str) -> str:
+        try:
+            completed = subprocess.run(
+                [
+                    nvcc,
+                    "-ptx",
+                    "-arch=compute_120a",
+                    "-std=c++17",
+                    "-O3",
+                    *defines,
+                    str(source),
+                    "-o",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            pytest.skip(f"nvcc not runnable: {nvcc}")
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout
+
+    if "isspacep.local" not in ptx():
+        pytest.skip(
+            f"nvcc {cake_jit.nvcc_version()}: libcu++ has no automatic-storage check"
+        )
+    assert "isspacep.local" not in ptx(*device_defines), (
+        f"nvcc {cake_jit.nvcc_version()}: the device flags no longer compile out libcu++'s "
+        "automatic-storage check (was _CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE renamed?)"
+    )
+
+
+def test_transport_session_close_after_process_group_destroyed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the EP process group gone, close() must not run collectives or touch NCCL."""
+    import torch.distributed as dist
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_session import (
+        TransportSession,
+    )
+
+    closed_handles: list[int] = []
+
+    class _Module:
+        def transport_session_close(self, handle: int) -> None:
+            closed_handles.append(handle)
+
+    def unexpected_barrier(*args, **kwargs) -> None:
+        raise AssertionError("close() ran a collective on a destroyed process group")
+
+    def destroyed_group(group=None) -> int:
+        raise ValueError("Group is not registered")
+
+    monkeypatch.setattr(dist, "barrier", unexpected_barrier)
+    for initialized in (False, True):  # default group destroyed / EP subgroup destroyed
+        monkeypatch.setattr(dist, "is_initialized", lambda: initialized)
+        monkeypatch.setattr(dist, "get_rank", destroyed_group)
+        session = TransportSession.__new__(TransportSession)
+        session.module, session.group, session.handle, session.closed = (
+            _Module(),
+            object(),
+            7,
+            False,
+        )
+        session.close()
+        assert session.closed
+    assert closed_handles == []
 
 
 def test_knob_cache_round_trip_and_bucket_choice(tmp_path, monkeypatch) -> None:

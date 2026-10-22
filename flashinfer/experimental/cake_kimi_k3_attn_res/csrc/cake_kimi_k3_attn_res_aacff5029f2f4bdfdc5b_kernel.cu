@@ -251,8 +251,7 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                 mbarrier_wait(ready_addr + (consumer_stage) * 8, consumer_phase);
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float updated[28];
-                float2 _f2_0 = make_float2(0.0f, 0.0f);
-                float2 local_sum_pair = _f2_0;
+                float2 local_sum_pair = make_float2(0.0f, 0.0f);
                 #pragma unroll
                 for (int slice_idx = 0; slice_idx < 4; slice_idx++) {
                     if (slice_idx == 3) {
@@ -291,15 +290,9 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                         for (int pair_idx = 0; pair_idx < 2; pair_idx++) {
                             const int value_idx = pair_idx * 2;
                             const int acc_idx = slice_idx * 8 + value_idx;
-                            float2 _f2_1 = make_float2(_unpack_bf16_0[value_idx], _unpack_bf16_0[value_idx + 1]);
-                            float2 _f2_2 = make_float2(_unpack_bf16_1[value_idx], _unpack_bf16_1[value_idx + 1]);
-                            float2 updated_pair = add_f32x2_noftz(_f2_1, _f2_2);
-                            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)updated_pair.x;
-                            float _cvt_f32_0 = (float)_cvt_bf16_0;
-                            updated[acc_idx] = _cvt_f32_0;
-                            __nv_bfloat16 _cvt_bf16_1 = (__nv_bfloat16)updated_pair.y;
-                            float _cvt_f32_1 = (float)_cvt_bf16_1;
-                            updated[acc_idx + 1] = _cvt_f32_1;
+                            float2 updated_pair = add_f32x2_noftz(make_float2(_unpack_bf16_0[value_idx], _unpack_bf16_0[value_idx + 1]), make_float2(_unpack_bf16_1[value_idx], _unpack_bf16_1[value_idx + 1]));
+                            updated[acc_idx] = (float)(__nv_bfloat16)updated_pair.x;
+                            updated[acc_idx + 1] = (float)(__nv_bfloat16)updated_pair.y;
                         }
                         {
                             uint2 _pk2;
@@ -311,8 +304,7 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                         #pragma unroll
                         for (int pair_idx_1 = 0; pair_idx_1 < 2; pair_idx_1++) {
                             const int acc_idx_1 = slice_idx * 8 + pair_idx_1 * 2;
-                            float2 _f2_3 = make_float2(updated[acc_idx_1], updated[acc_idx_1 + 1]);
-                            float2 value_pair = _f2_3;
+                            float2 value_pair = make_float2(updated[acc_idx_1], updated[acc_idx_1 + 1]);
                             local_sum_pair = fma_f32x2_rn_ftz(value_pair, value_pair, local_sum_pair);
                         }
                     } else {
@@ -352,15 +344,9 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                         for (int pair_idx_2 = 0; pair_idx_2 < 4; pair_idx_2++) {
                             const int value_idx_1 = pair_idx_2 * 2;
                             const int acc_idx_2 = slice_idx * 8 + value_idx_1;
-                            float2 _f2_4 = make_float2(_unpack_bf16_2[value_idx_1], _unpack_bf16_2[value_idx_1 + 1]);
-                            float2 _f2_5 = make_float2(_unpack_bf16_3[value_idx_1], _unpack_bf16_3[value_idx_1 + 1]);
-                            float2 updated_pair_1 = add_f32x2_noftz(_f2_4, _f2_5);
-                            __nv_bfloat16 _cvt_bf16_2 = (__nv_bfloat16)updated_pair_1.x;
-                            float _cvt_f32_2 = (float)_cvt_bf16_2;
-                            updated[acc_idx_2] = _cvt_f32_2;
-                            __nv_bfloat16 _cvt_bf16_3 = (__nv_bfloat16)updated_pair_1.y;
-                            float _cvt_f32_3 = (float)_cvt_bf16_3;
-                            updated[acc_idx_2 + 1] = _cvt_f32_3;
+                            float2 updated_pair_1 = add_f32x2_noftz(make_float2(_unpack_bf16_2[value_idx_1], _unpack_bf16_2[value_idx_1 + 1]), make_float2(_unpack_bf16_3[value_idx_1], _unpack_bf16_3[value_idx_1 + 1]));
+                            updated[acc_idx_2] = (float)(__nv_bfloat16)updated_pair_1.x;
+                            updated[acc_idx_2 + 1] = (float)(__nv_bfloat16)updated_pair_1.y;
                         }
                         {
                             __nv_bfloat162 _pk[4];
@@ -373,8 +359,7 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                         #pragma unroll
                         for (int pair_idx_3 = 0; pair_idx_3 < 4; pair_idx_3++) {
                             const int acc_idx_3 = slice_idx * 8 + pair_idx_3 * 2;
-                            float2 _f2_6 = make_float2(updated[acc_idx_3], updated[acc_idx_3 + 1]);
-                            float2 value_pair_1 = _f2_6;
+                            float2 value_pair_1 = make_float2(updated[acc_idx_3], updated[acc_idx_3 + 1]);
                             local_sum_pair = fma_f32x2_rn_ftz(value_pair_1, value_pair_1, local_sum_pair);
                         }
                     }
@@ -396,19 +381,19 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
                 float total_sum_sq = ((lane < 8) ? stats[lane] : 0.0f);
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
-                float _shfl_down_0 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq, 4, 8);
-                total_sum_sq += _shfl_down_0;
-                float _shfl_down_1 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq, 2, 8);
-                total_sum_sq += _shfl_down_1;
-                float _shfl_down_2 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq, 1, 8);
-                total_sum_sq += _shfl_down_2;
+                float _shfl_down_sync_1 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq, 4, 8);
+                total_sum_sq += _shfl_down_sync_1;
+                float _shfl_down_sync_2 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq, 2, 8);
+                total_sum_sq += _shfl_down_sync_2;
+                float _shfl_down_sync_3 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq, 1, 8);
+                total_sum_sq += _shfl_down_sync_3;
                 float output_rsigma = 0.0f;
                 if (lane == 0) {
-                    float _rsqrt_0 = rsqrtf(total_sum_sq / 7168.0f + output_norm_eps);
-                    output_rsigma = _rsqrt_0;
+                    float _rsqrt_4 = rsqrtf(total_sum_sq / 7168.0f + output_norm_eps);
+                    output_rsigma = _rsqrt_4;
                 }
-                float _shfl_0 = __shfl_sync(0xFFFFFFFF, output_rsigma, 0);
-                output_rsigma = _shfl_0;
+                float _shfl_sync_5 = __shfl_sync(0xFFFFFFFF, output_rsigma, 0);
+                output_rsigma = _shfl_sync_5;
                 #pragma unroll
                 for (int slice_idx_1 = 0; slice_idx_1 < 4; slice_idx_1++) {
                     if (slice_idx_1 == 3) {
@@ -428,18 +413,17 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                                 : "=f"((&_unpack_bf16_4[_pair * 2])[0]), "=f"((&_unpack_bf16_4[_pair * 2])[1])
                                 : "r"(smem_bf16x2_2[_pair]));
                         }
-                        float2 _f2_7 = make_float2(output_rsigma, output_rsigma);
-                        float2 output_rsigma_pair = _f2_7;
+                        float2 output_rsigma_pair = make_float2(output_rsigma, output_rsigma);
                         #pragma unroll
                         for (int pair_idx_4 = 0; pair_idx_4 < 2; pair_idx_4++) {
                             const int value_idx_2 = pair_idx_4 * 2;
                             const int acc_idx_4 = slice_idx_1 * 8 + value_idx_2;
-                            float2 _f2_8 = make_float2(updated[acc_idx_4], updated[acc_idx_4 + 1]);
+                            float2 _f32x2_mul_a_6 = make_float2(updated[acc_idx_4], updated[acc_idx_4 + 1]);
                             float2 scaled_pair;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair) : "l"(*(const unsigned long long*)&_f2_8), "l"(*(const unsigned long long*)&output_rsigma_pair));
-                            float2 _f2_9 = make_float2(_unpack_bf16_4[value_idx_2], _unpack_bf16_4[value_idx_2 + 1]);
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair) : "l"(*(const unsigned long long*)&_f32x2_mul_a_6), "l"(*(const unsigned long long*)&output_rsigma_pair));
+                            float2 _f32x2_mul_b_7 = make_float2(_unpack_bf16_4[value_idx_2], _unpack_bf16_4[value_idx_2 + 1]);
                             float2 normalized_pair;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair) : "l"(*(const unsigned long long*)&scaled_pair), "l"(*(const unsigned long long*)&_f2_9));
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair) : "l"(*(const unsigned long long*)&scaled_pair), "l"(*(const unsigned long long*)&_f32x2_mul_b_7));
                             updated[acc_idx_4] = normalized_pair.x;
                             updated[acc_idx_4 + 1] = normalized_pair.y;
                         }
@@ -468,18 +452,17 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                                 : "=f"((&_unpack_bf16_5[_pair * 2])[0]), "=f"((&_unpack_bf16_5[_pair * 2])[1])
                                 : "r"(smem_bf16x2_3[_pair]));
                         }
-                        float2 _f2_10 = make_float2(output_rsigma, output_rsigma);
-                        float2 output_rsigma_pair_1 = _f2_10;
+                        float2 output_rsigma_pair_1 = make_float2(output_rsigma, output_rsigma);
                         #pragma unroll
                         for (int pair_idx_5 = 0; pair_idx_5 < 4; pair_idx_5++) {
                             const int value_idx_3 = pair_idx_5 * 2;
                             const int acc_idx_5 = slice_idx_1 * 8 + value_idx_3;
-                            float2 _f2_11 = make_float2(updated[acc_idx_5], updated[acc_idx_5 + 1]);
+                            float2 _f32x2_mul_a_8 = make_float2(updated[acc_idx_5], updated[acc_idx_5 + 1]);
                             float2 scaled_pair_1;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1) : "l"(*(const unsigned long long*)&_f2_11), "l"(*(const unsigned long long*)&output_rsigma_pair_1));
-                            float2 _f2_12 = make_float2(_unpack_bf16_5[value_idx_3], _unpack_bf16_5[value_idx_3 + 1]);
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_8), "l"(*(const unsigned long long*)&output_rsigma_pair_1));
+                            float2 _f32x2_mul_b_9 = make_float2(_unpack_bf16_5[value_idx_3], _unpack_bf16_5[value_idx_3 + 1]);
                             float2 normalized_pair_1;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1) : "l"(*(const unsigned long long*)&scaled_pair_1), "l"(*(const unsigned long long*)&_f2_12));
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1) : "l"(*(const unsigned long long*)&scaled_pair_1), "l"(*(const unsigned long long*)&_f32x2_mul_b_9));
                             updated[acc_idx_5] = normalized_pair_1.x;
                             updated[acc_idx_5 + 1] = normalized_pair_1.y;
                         }

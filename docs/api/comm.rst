@@ -193,6 +193,76 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+MNNVL CuTe DSL backend
+~~~~~~~~~~~~~~~~~~~~~~
+
+``create_allreduce_fusion_workspace(backend="mnnvl-cutedsl", ...)`` builds an
+:class:`~flashinfer.comm.mnnvl_cutedsl_ar.MNNVLCuteDSLAllReduceFusionWorkspace`:
+CuTe DSL kernels for the ranks of one NVLink multicast domain, compiled for
+one static problem. ``backend="auto"`` never selects it. The keyword-only
+arguments of the factory (``top_k``, ``rms_eps``, ``weight_bias``,
+``routed_scaling_factor``, ``include_shared_expert``, ``add_residual``,
+``write_residual_output``, ``apply_rms_norm``, ``output_dtype``,
+``dynamic_fp8``, ``write_norm_output`` and ``config``) are compile-time
+settings: every :func:`allreduce_fusion` call on the workspace must use the
+same epsilon, weight bias, residual, norm and output mode, and at most
+``max_token_num`` tokens of ``hidden_dim`` BF16 elements. Other backends
+reject these arguments. ``residual_in`` must be identical on every rank, as
+under tensor parallelism: most kernels add the residual once, on the rank that
+owns a token or a hidden-dimension shard.
+
+The kernels spin on data written by the other ranks and some of them occupy
+every SM. Do not run two of these collectives (for example from two
+workspaces) concurrently on different streams: a rank whose SMs are all held
+by one collective cannot start the other, which the peers may be waiting on.
+
+The workspace picks a static profile for ``(world_size, hidden_dim, top_k,
+dtype)`` and the device's compute capability, then routes each token count to
+a low-latency (LL), balanced (BT) or high-throughput (HT) kernel. Construction
+fails when no profile matches; :func:`is_mnnvl_cutedsl_supported` runs the same
+checks without raising. It describes the local rank only, and construction is
+collective, so agree on the result across ranks first:
+
+.. code-block:: python
+
+    ok = is_mnnvl_cutedsl_supported(
+        4, 8192, torch.bfloat16, max_token_num=2048, apply_rms_norm=False
+    )
+    flag = torch.tensor(int(ok), device="cuda")
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    if flag.item():
+        workspace = create_allreduce_fusion_workspace(
+            backend="mnnvl-cutedsl",
+            world_size=4,
+            rank=rank,
+            max_token_num=2048,
+            hidden_dim=8192,
+            dtype=torch.bfloat16,
+            apply_rms_norm=False,
+            add_residual=False,
+        )
+        out = allreduce_fusion(
+            input=x, workspace=workspace, pattern=AllReduceFusionPattern.kAllReduce
+        )
+
+A workspace built with ``apply_rms_norm=False`` and ``add_residual=False``
+serves ``kAllReduce``; the default norm-on workspace serves
+``kARResidualRMSNorm`` and the MoE finalize pattern. An
+``output_dtype=torch.float8_e4m3fn`` workspace serves the static FP8 patterns
+(2 and 12, or 4 with ``write_norm_output=True``); one that also sets
+``dynamic_fp8=True`` serves only the dynamic patterns (10, or 11 with
+``write_norm_output=True``), not the static ones.
+
+.. autosummary::
+    :toctree: ../generated
+
+    is_mnnvl_cutedsl_supported
+
+.. autoclass:: flashinfer.comm.mnnvl_cutedsl_ar.MNNVLCuteDSLAllReduceFusionWorkspace
+    :show-inheritance:
+
+    .. automethod:: __init__
+
 Cake NVFP4-Transport AllReduce
 ------------------------------
 
@@ -649,16 +719,30 @@ once per destination run of its tile table (the first launch carrying the
 folded rendezvous); on SM90 a call with at most 4096 rows per rank publishes one
 readiness word per destination, a call with at least 16384 rows per rank runs the
 persistent producer grid over every SM (no reserved SMs), and the per-destination
-launch gate is off; on SM107 every gate is off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
-(``auto`` / ``off`` /
-``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``)
-overrides them per session, rank-uniformly; ``describe()`` reports the resolved
+launch gate is off; on SM107 every gate is off.  One cell differs from these
+per-architecture tables (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``):
+a group of 8 ranks on SM90 publishes one readiness word per destination for
+every row count (``words_capacity_small_m = all``).  A fourth gate,
+``pair_off_large_m``, is off on every architecture: switched on
+(``pair_off_large_m=N``) it runs a 256-column call with at least ``N`` rows per
+rank on the single-CTA producer instead of the 2-CTA pair tile (the tile order
+is unchanged); it needs that producer delivered for the architecture -- no
+delivered Blackwell route ships it today, so the session refuses at
+construction when a 256-column call can reach the gate (``max_tokens >= N``),
+naming the gate -- and is refused on SM90, which builds no pair tile.  The
+environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
+``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N``)
+overrides them per session, rank-uniformly (``words_capacity_small_m=4096`` on
+SM90 with 8 ranks restores the previous plan); ``describe()`` reports the resolved
 build (``producer_variant``), scale (``group_m_scale``) and gates
 (``shape_gates``) with their sources, and every prepared row's verdict
-(``prepared_row_plans``, including its ``reserved_sms``).  The gates change
-neither the tile table nor the stored bits.  The largest 2-rank shape of the
-evaluation grid (``S_global = 131072``, ``hidden = 8192``) is not supported on
-an 80 GB H100: its operands and receive slots exceed the device memory.
+(``prepared_row_plans``, including its ``reserved_sms``).  The first three gates
+change the host plan only -- neither the tile table nor the stored bits; the
+pair-tile gate changes the producer program and the tile table (no lockstep
+pads) of the rows it selects; no gate changes the stored bits.  The largest
+2-rank shape of the evaluation grid (``S_global = 131072``, ``hidden = 8192``)
+is not supported on an 80 GB H100: its operands and receive slots exceed the
+device memory.
 
 The session is prepared eagerly (symmetric slots, readiness pad, barrier
 flags, JIT programs, the tile plan of ``max_tokens`` rows) and a prepared call
