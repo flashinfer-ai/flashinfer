@@ -8,7 +8,7 @@ import torch
 from packaging.version import Version
 
 from ....autotuner import TuningConfig
-from ...api import FrostLowLatencyConfig, QuantFormat, RoutingInputMode, SwiGLU
+from ...api import FrostLowLatencyConfig, QuantFormat, RoutingInputMode
 from ...runners import MoERunner, _validate_prerouted_inputs
 from .fma.activation_config import ACTIVATIONS, lower_activation
 
@@ -23,14 +23,18 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.BF16, QuantFormat.BF16),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
     )
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = tuple(ACTIVATIONS)
     supported_activation_classes_by_quant = {
-        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU,),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU,),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): tuple(ACTIVATIONS),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): tuple(ACTIVATIONS),
         (QuantFormat.BF16, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): tuple(ACTIVATIONS),
     }
     supports_expert_parallelism = False
+    # This path honors an explicit disabled recipe; 4over6 is rejected below.
+    supports_nvfp4_4over6 = True
 
     def __init__(self, config, device):
         super().__init__()
@@ -61,18 +65,27 @@ class FrostLowLatencyRunner(MoERunner):
             raise NotImplementedError(
                 "frost_low_latency requires SM100, SM103 or SM107"
             )
+        name, _ = lower_activation(self.config.activation)
         if self.config.quant.weight is QuantFormat.BF16:
-            name, _ = lower_activation(self.config.activation)
             if self.config.routing.top_k > 32:
                 raise NotImplementedError("Frost BF16 FMA requires top_k <= 32")
-            if name in ("geglu", "gelu"):
-                from cutlass import cute
+        if self.config.quant.weight is QuantFormat.NVFP4:
+            self._check_nvfp4_recipe()
+            if (
+                self.config.routing.top_k > 32
+                or self.config.experts.intermediate_size % 128
+            ):
+                raise NotImplementedError(
+                    "Frost NVFP4 requires top_k <= 32 and I divisible by 128"
+                )
+        if name in ("geglu", "gelu"):
+            from cutlass import cute
 
-                if not callable(getattr(cute.math, "erf", None)):
-                    raise NotImplementedError("Frost GELU/GeGLU requires cute.math.erf")
+            if not callable(getattr(cute.math, "erf", None)):
+                raise NotImplementedError("Frost GELU/GeGLU requires cute.math.erf")
         if self.config.quant.swizzled_scale_factors:
             raise NotImplementedError(
-                "frost_low_latency requires linear UE8M0 activation scales"
+                "frost_low_latency requires linear activation scales"
             )
         if (
             self.config.experts.intermediate_size <= 0
@@ -85,7 +98,22 @@ class FrostLowLatencyRunner(MoERunner):
     def _build(self):
         pass
 
+    def _check_nvfp4_recipe(self):
+        from ....quantization.nvfp4_quantization_utils import resolve_nvfp4_4over6
+
+        if resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6) is not None:
+            raise NotImplementedError(
+                "Frost NVFP4 does not implement the 4over6 intermediate quantizer"
+            )
+
     def _accepts_shape(self, act):
+        if self.config.quant.weight is QuantFormat.NVFP4:
+            return (
+                act.hidden_states_q.ndim == 2
+                and 1 <= act.num_tokens <= self.options.max_num_tokens
+                and act.hidden_states_q.shape[1] >= 256
+                and act.hidden_states_q.shape[1] % 256 == 0
+            )
         return (
             act.hidden_states_q.ndim == 2
             and 1 <= act.num_tokens <= self.options.max_num_tokens
@@ -103,6 +131,8 @@ class FrostLowLatencyRunner(MoERunner):
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
+        if self.config.quant.weight is QuantFormat.NVFP4:
+            return [("nvfp4_ffma", width) for width in (2, 4)]
         if self.config.quant.weight is QuantFormat.BF16:
             return [
                 ("ffma", first, second)
@@ -131,11 +161,19 @@ class FrostLowLatencyRunner(MoERunner):
         )
         if self.config.quant.weight is QuantFormat.BF16:
             return self._pack_bf16(act, weights)
+        if self.config.quant.weight is QuantFormat.NVFP4:
+            self._check_nvfp4_recipe()
+            from .nvfp4 import pack_inputs
+
+            return pack_inputs(
+                act, weights.get_view(self.backend_key), self.config, self.device
+            )
         q, sf = act.hidden_states_q, act.hidden_states_scale
         t, h = q.shape
         e, k = self.config.routing.num_experts, self.config.routing.top_k
         i = self.config.experts.intermediate_size
         p = (i + 127) // 128 * 128
+        branches = 2 if self.config.activation.is_gated else 1
         if (
             q.device != self.device
             or not q.is_cuda
@@ -162,8 +200,8 @@ class FrostLowLatencyRunner(MoERunner):
         )
         pack = 2 if wd is torch.uint8 else 1
         specs = (
-            ("w1_weight", (e, 2 * p, h // pack), wd),
-            ("w1_weight_sf", (e, 2 * p // 128, h // 128, 32, 4, 4), torch.uint8),
+            ("w1_weight", (e, branches * p, h // pack), wd),
+            ("w1_weight_sf", (e, branches * p // 128, h // 128, 32, 4, 4), torch.uint8),
             ("w2_weight", (e, h, p // pack), wd),
             ("w2_weight_sf", (e, h // 128, p // 128, 32, 4, 4), torch.uint8),
         )
@@ -204,7 +242,7 @@ class FrostLowLatencyRunner(MoERunner):
             routing_weights,
             *(v[name] for name, _, _ in specs),
             empty(t * 128 * (h // 32), torch.uint8),
-            empty((t * k, 2 * p), torch.float32),
+            empty((t * k, branches * p), torch.float32),
             empty((t * k, p), torch.float8_e4m3fn),
             empty(t * k * 128 * (p // 32), torch.uint8),
             empty((t * k, h), torch.bfloat16),
@@ -271,7 +309,10 @@ class FrostLowLatencyRunner(MoERunner):
         from .runtime import execute
 
         if tactic == -1:
-            tactic = (
-                ("ffma", 1) if self.config.quant.weight is QuantFormat.BF16 else 128
-            )
+            if self.config.quant.weight is QuantFormat.NVFP4:
+                tactic = ("nvfp4_ffma", 2)
+            else:
+                tactic = (
+                    ("ffma", 1) if self.config.quant.weight is QuantFormat.BF16 else 128
+                )
         return execute(inputs, self.config, tactic)

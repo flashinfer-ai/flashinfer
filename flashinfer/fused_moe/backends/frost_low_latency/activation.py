@@ -6,6 +6,7 @@ import cutlass
 from cutlass import cute
 
 from .quantization import _mul
+from .fma.activations import apply_activation
 
 
 @cute.jit
@@ -27,3 +28,21 @@ def swiglu(
     if cutlass.const_expr(beta != 0.0):
         up = up + cutlass.Float32(beta)
     return _mul(gate / (1.0 + cute.math.exp(-gate_exp, fastmath=False)), up)
+
+
+@cute.jit
+def activate(
+    up,
+    gate,
+    name: cutlass.Constexpr,
+    limit: cutlass.Constexpr,
+    alpha: cutlass.Constexpr,
+    beta: cutlass.Constexpr,
+    parameters: cutlass.Constexpr = None,
+):
+    # Preserve the published MX SwiGLU arithmetic. Other activations reuse the
+    # shared FP32 bodies, without the legacy adapter's BF16 intermediate round.
+    if cutlass.const_expr(name == "swiglu"):
+        return swiglu(up, gate, limit, alpha, beta)
+    else:
+        return apply_activation(up, gate, name, False, parameters)

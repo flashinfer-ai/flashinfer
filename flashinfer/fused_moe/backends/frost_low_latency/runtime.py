@@ -14,12 +14,17 @@ from cuda.bindings import driver
 from ...api import QuantFormat
 from .pipeline import Geometry, Pipeline
 from .io import pack_scale, combine
+from .fma.activation_config import lower_activation
 
 _COMPILED: dict[tuple, Any] = {}
 _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
+    if config.quant.weight is QuantFormat.NVFP4:
+        from .nvfp4 import execute as execute_nvfp4
+
+        return execute_nvfp4(inputs, config, tile_k)
     if config.quant.weight is QuantFormat.BF16:
         from .fma.bf16.runtime import execute as execute_bf16
 
@@ -53,6 +58,7 @@ def _execute(inputs, config, tile_k):
     t, h = q.shape
     p = midq.shape[1]
     a = config.activation
+    name, parameters = lower_activation(a)
     geometry = Geometry(
         t,
         h,
@@ -60,9 +66,12 @@ def _execute(inputs, config, tile_k):
         config.experts.intermediate_size,
         config.routing.num_experts,
         config.routing.top_k,
-        a.limit,
-        a.alpha,
-        a.beta,
+        getattr(a, "limit", None),
+        getattr(a, "alpha", 1.0),
+        getattr(a, "beta", 0.0),
+        name,
+        parameters,
+        a.is_gated,
     )
     pdl = config.execution.enable_pdl is not False
     stream = driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
@@ -93,7 +102,17 @@ def _execute(inputs, config, tile_k):
             from_dlpack(ids.view(-1)),
         )
 
-    p1 = args(w1, s1, q, packed_sf, partials, 2 * p, h, t, cutlass.Float32)
+    p1 = args(
+        w1,
+        s1,
+        q,
+        packed_sf,
+        partials,
+        (2 if a.is_gated else 1) * p,
+        h,
+        t,
+        cutlass.Float32,
+    )
     p2 = args(w2, s2, midq, midsf, routes, h, p, t * geometry.top_k, cutlass.BFloat16)
     activation = tuple(from_dlpack(v) for v in (partials, midq, midsf))
     sfargs = tuple(from_dlpack(v) for v in (sf, packed_sf, midsf))

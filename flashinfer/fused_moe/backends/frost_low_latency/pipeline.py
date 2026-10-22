@@ -15,7 +15,7 @@ from .quantization import (
     float_to_ue8m0_fast,
     cvt_f32_to_e4m3,
 )
-from .activation import swiglu
+from .activation import activate
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,9 @@ class Geometry:
     clamp_limit: Optional[float] = None
     alpha: float = 1.0
     beta: float = 0.0
+    activation: str = "swiglu"
+    activation_parameters: Optional[Tuple] = None
+    gated: bool = True
 
     def __post_init__(self):
         if not 1 <= self.tokens <= 8:
@@ -63,6 +66,9 @@ def activate_tile(
     limit: cutlass.Constexpr,
     alpha: cutlass.Constexpr,
     beta: cutlass.Constexpr,
+    name: cutlass.Constexpr,
+    parameters: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
     tile: cutlass.Int32,
     route: cutlass.Int32,
 ):
@@ -70,14 +76,19 @@ def activate_tile(
     lane = cute.arch.lane_idx()
     # The producing CTA owns adjacent 64-channel gate and up tiles. The
     # GEMM body ends with a CTA barrier before these FP32 values are read.
-    if tid < 64:
-        col = tile * 64 + tid
+    width = 64 if cutlass.const_expr(gated) else 128
+    if tid < width:
+        col = tile * width + tid
         if col < physical:
-            gate = partials[route, tile * 128 + tid]
-            up = partials[route, tile * 128 + tid + 64]
+            gate = cutlass.Float32(0)
+            if cutlass.const_expr(gated):
+                gate = partials[route, tile * 128 + tid]
+                up = partials[route, tile * 128 + tid + 64]
+            else:
+                up = partials[route, col]
             value = cutlass.Float32(0)
             if col < logical:
-                value = swiglu(up, gate, limit, alpha, beta)
+                value = activate(up, gate, name, limit, alpha, beta, parameters)
             maximum = cute.arch.warp_reduction_max(abs(value))
             scale = float_to_ue8m0_fast(_mul(maximum, cutlass.Float32(1.0 / 448.0)))
             code = cvt_f32_to_e4m3(_mul(value, _inverse_scale(scale)))
@@ -138,6 +149,9 @@ class Pipeline:
             self.geometry.clamp_limit,
             self.geometry.alpha,
             self.geometry.beta,
+            self.geometry.activation,
+            self.geometry.activation_parameters,
+            self.geometry.gated,
             tile,
             route,
         )
