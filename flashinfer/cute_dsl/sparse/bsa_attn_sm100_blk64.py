@@ -96,6 +96,9 @@ def bsa_attn_sm100_blk64_fwd(
         use_clc: Optional scheduler override (True forces the CLC persistent
             scheduler, False forces the static scheduler, None uses the
             shape-based heuristic).
+        out: Optional BSHD output buffer. Aligned, unit-channel-stride,
+            non-overlapping buffers are written directly by non-split Sage
+            attention. Other layouts and split-KV retain the copy-back path.
         q_scale, k_scale, v_scale: Sage FP8 quantization scales. All three
             must be provided together to enable the FP8 path (q/k/v must then
             be float8_e4m3fn); otherwise all three must be None and q/k/v must
@@ -313,6 +316,63 @@ def bsa_attn_sm100_blk64_fwd(
     is_persistent = use_clc_scheduler
     pack_gqa = False
 
+    # Sage's non-split register epilogue uses the supplied dynamic strides.
+    # A packed-channel BSHD destination can therefore be written directly.
+    direct_output = (
+        is_sage_fp8
+        and kv_splits_i == 1
+        and requested_out is not None
+        and requested_out.stride(-1) == 1
+        and all(
+            stride > 0 and stride % 8 == 0 for stride in requested_out.stride()[:-1]
+        )
+        and requested_out.data_ptr() % 16 == 0
+    )
+
+    if direct_output:
+        # Prove that independent kernel stores cannot overlap each other.
+        span = 1
+        for stride, size in sorted(
+            zip(requested_out.stride(), requested_out.shape, strict=True)
+        ):
+            if size <= 1:
+                continue
+            if stride < span:
+                direct_output = False
+                break
+            span += (size - 1) * stride
+
+    if direct_output:
+
+        def byte_range(tensor):
+            begin = tensor.data_ptr()
+            span = 1 + sum(
+                (size - 1) * stride
+                for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            )
+            return begin, begin + span * tensor.element_size()
+
+        out_begin, out_end = byte_range(requested_out)
+        # The old copy-back path permits shared storage. Preserve it when a
+        # direct store could overwrite an operand needed by another CTA.
+        for operand in (
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            v_scale,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+        ):
+            if operand is None or operand.numel() == 0:
+                continue
+            begin, end = byte_range(operand)
+            if out_begin < end and begin < out_end:
+                direct_output = False
+                break
+
     split_offsets = None
     if kv_splits_i > 1:
         if has_variable_block_nums or use_clc_scheduler:
@@ -336,14 +396,14 @@ def bsa_attn_sm100_blk64_fwd(
             device=q_bhsd.device,
         )
     else:
-        # Always allocate a fresh contiguous BHSD output for the kernel (even
-        # when the caller pre-allocated a BSHD `out`); a transposed view of
-        # `out` would hand the kernel a non-contiguous destination, which the
-        # upstream kernel does not expect. Copy back into `out` at the end.
-        out_bhsd = torch.empty(
-            (batch_size, num_head, seqlen_q, head_dim_v),
-            dtype=output_dtype,
-            device=q_bhsd.device,
+        out_bhsd = (
+            requested_out.transpose(1, 2)
+            if direct_output
+            else torch.empty(
+                (batch_size, num_head, seqlen_q, head_dim_v),
+                dtype=output_dtype,
+                device=q_bhsd.device,
+            )
         )
         lse = (
             requested_lse
@@ -491,7 +551,9 @@ def bsa_attn_sm100_blk64_fwd(
             ),
         )
 
-    result_out = out_bhsd.transpose(1, 2).contiguous()
+    result_out = (
+        requested_out if direct_output else out_bhsd.transpose(1, 2).contiguous()
+    )
     if requested_out is not None and result_out is not requested_out:
         requested_out.copy_(result_out)
         result_out = requested_out
