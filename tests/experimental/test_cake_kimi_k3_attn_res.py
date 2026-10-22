@@ -12,9 +12,19 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Tests of the Cake Kimi-K3 AttnRes backend package (SM100 / SM103): the host policy
+and its route tables, the registry and the generated sources, the launch plans and,
+on a supported device, the numerical contract against the independent FP32 reference
+(output within atol 8e-2 / rtol 3e-2, prefix and snapshot bank bit-exact).
+
+This suite exercises the backend package alone: it names the package once, through
+``tests.test_helpers.cake_package``, and imports nothing else from flashinfer, so a
+build that vendors the package under another import path runs it unchanged after
+pointing that table entry at its package.  The ``flashinfer.kimi_k3_attn_res`` facade
+is covered by ``test_cake_kimi_k3_attn_res_api.py``.
 """
 
-import hashlib
 import inspect
 import json
 import pathlib
@@ -23,20 +33,23 @@ import re
 import pytest
 import torch
 
-from flashinfer.experimental.cake_kimi_k3_attn_res import cake_backend as cb
-from flashinfer.experimental.cake_kimi_k3_attn_res import cake_jit
-from flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend import (
-    ARCHES,
-    HIDDEN_SIZE,
-    MAX_BLOCKS,
-    NATIVE_SM_COUNTS,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    common_path_eligible,
-    plan_route,
-    reference_kimi_k3_attn_res,
-)
-from flashinfer.experimental.cake_kimi_k3_attn_res.cake_jit import KERNELS, MODULES
-from flashinfer.kimi_k3_attn_res import prepare_kimi_k3_attn_res
+from tests.test_helpers.cake_package import cake_package
+
+cb = cake_package("cake_kimi_k3_attn_res", "cake_backend")
+cake_build = cake_package("cake_kimi_k3_attn_res", "cake_build")
+cake_jit = cake_package("cake_kimi_k3_attn_res", "cake_jit")
+ARCHES = cb.ARCHES
+HIDDEN_SIZE = cb.HIDDEN_SIZE
+MAX_BLOCKS = cb.MAX_BLOCKS
+NATIVE_SM_COUNTS = cb.NATIVE_SM_COUNTS
+SUPPORTED_COMPUTE_CAPABILITIES = cb.SUPPORTED_COMPUTE_CAPABILITIES
+common_path_eligible = cb.common_path_eligible
+plan_route = cb.plan_route
+prepare_kimi_k3_attn_res = cb.prepare_kimi_k3_attn_res
+reference_kimi_k3_attn_res = cb.reference_kimi_k3_attn_res
+KERNELS = cake_jit.KERNELS
+MODULES = cake_jit.MODULES
+ROUTES = cake_jit.ROUTES
 
 # The Kimi-K3 AttnRes evaluation contract: output within (atol 8e-2, rtol 3e-2)
 # of the independent FP32 reference; prefix / snapshot bank bit-exact.
@@ -177,6 +190,13 @@ POLICY_ROWS = [
 ]
 
 
+# Round 2 (the ``R2_*`` route tables): the POLICY_ROWS cells whose program depends on the SM count,
+# (arch, M, K, sm_count) -> (kind, schedule_id, grid_x).  Empty after the step-3 acceptance table: the
+# dense cluster-4 small-M cells of sm_103a (the only SM-count-dependent dense cells of round 2) were
+# withdrawn, so every POLICY_ROWS cell takes the same program at 148 and 152 SMs.
+_ROUND_2_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {}
+
+
 def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
     """The (grid, schedule id) a POLICY_ROWS cell takes on ``sm_count`` SMs: the native ports and the
     SM-count-multiple grids scale with the count (148 -> sm_count, 444 -> 3 x sm_count); the token-bound,
@@ -192,6 +212,9 @@ def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
 @pytest.mark.parametrize("arch,M,K,pdl,kind,schedule_id,grid_x", POLICY_ROWS)
 def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
     grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
+    kind, schedule_id, grid_x = _ROUND_2_ROWS.get(
+        (arch, M, K, sm_count), (kind, schedule_id, grid_x)
+    )
     plan = plan_route(arch, sm_count, M, K, pdl)
     assert plan.kind == kind
     # Round r5: --use_fast_math is a program axis of the small-M / persistent programs (schedule id
@@ -199,7 +222,9 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
     assert plan.schedule_id.removesuffix("_fastmath") == schedule_id
     assert plan.schedule_id.endswith("_fastmath") is ("_fm" in plan.kernel_key)
     if kind in ("small_m", "persistent"):
-        assert plan.schedule_id.endswith("_fastmath") is cb._fast_math(arch, M, K, kind)
+        assert plan.schedule_id.endswith("_fastmath") is cb._fast_math(
+            arch, M, K, kind, sm_count
+        )
     assert plan.grid_x == grid_x
     assert plan.use_pdl is pdl
     # PDL is a launch argument of every generated program, not a program axis.
@@ -213,10 +238,13 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
     "M,K,early",
     (
         # K2: the early-release band M768..2048 (+ the M4096 cell); held below, between and above.
+        # Round 2 at 148 SMs: M768 / M1536 run the early register-carry programs, M2048 the held one
+        # (``persistent:k2_nc4_d2_f011010000000000``; early again at 152 SMs), M3072 / M6144 the held
+        # register-carry program.
         (767, 2, False),
         (768, 2, True),
         (1536, 2, True),
-        (2048, 2, True),
+        (2048, 2, False),
         (2049, 2, False),
         (3072, 2, False),
         (4096, 2, True),
@@ -246,6 +274,234 @@ def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
     # round r5: the fast-math axis (``_fm``) follows the flag tuple in the kernel key
     flags = plan.kernel_key.removesuffix("_fm").rsplit("_f", 1)[1]
     assert (flags[0] == "1") is early, (plan.kernel_key, early)
+    if (M, K) == (2048, 2):
+        at_152 = plan_route("sm_103a", 152, M, K, pdl)
+        assert at_152.kernel_key == "persistent:k2_nc4_d2_f111010000000000"
+
+
+def _r2_cells(table_name):
+    """(arch, sm_count, M, K, value) of every cell of a round-2 ``ROUTES`` table."""
+    for arch, by_sm in ROUTES[table_name].items():
+        for sm_count, pairs in by_sm.items():
+            for cell in pairs:
+                if isinstance(cell[0], (list, tuple)):
+                    (M, K), value = cell
+                else:
+                    (M, K), value = cell, None
+                yield arch, int(sm_count), int(M), int(K), value
+
+
+def test_round_2_cells_take_their_table_program():
+    """Every cell of the round-2 tables (``ROUTES["R2_*"]``) resolves to the program the table names,
+    exactly (no registered-variant fallback), with the launch geometry of its kind."""
+    seen = 0
+    for arch, sm_count, M, K, value in _r2_cells("R2_PERSISTENT_KEY_CELLS"):
+        for pdl in (False, True):
+            key = value[int(pdl)] if isinstance(value, (list, tuple)) else value
+            plan = plan_route(arch, sm_count, M, K, pdl)
+            assert plan.kind == "persistent" and plan.fallback_from is None, (plan, key)
+            assert plan.kernel_key == key, (
+                arch,
+                sm_count,
+                M,
+                K,
+                pdl,
+                plan.kernel_key,
+                key,
+            )
+            assert plan.threads == cb.PERSISTENT_THREADS and 1 <= plan.grid_x <= max(
+                M, sm_count
+            )
+            flags = cb._PERSISTENT_KEY.match(key).group(4)
+            if flags[cb._PERSISTENT_FLAG_REGISTER_CARRY_ONLY] == "1":
+                assert flags[cb._PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1"
+                assert plan.schedule_id.split("_fastmath")[0].endswith(
+                    "_register_carry_only"
+                )
+            seen += 1
+    for arch, sm_count, M, K, port in _r2_cells("R2_NATIVE_CELLS"):
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, M, K, pdl)
+            assert (plan.kind, plan.kernel_key, plan.grid_x) == (
+                "native",
+                f"native_{port}",
+                sm_count,
+            )
+            assert plan.fallback_from is None and plan.threads == cb.PERSISTENT_THREADS
+            seen += 1
+    for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS"):
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, M, K, pdl)
+            assert (plan.kind, plan.kernel_key, plan.grid_x) == ("pair", key, sm_count)
+            assert plan.threads == cb.PAIR_THREADS == 320 and plan.fallback_from is None
+            assert (
+                plan.schedule_id
+                == f"pair_ws320_nc2_prefix_bf16_add_fastmath_grid{sm_count}"
+            )
+            seen += 1
+    for name, write in (
+        ("R2_SMALL_M_CLUSTER_CELLS", False),
+        ("R2_SMALL_M_WRITE_CLUSTER_CELLS", True),
+    ):
+        for arch, sm_count, M, K, cluster in _r2_cells(name):
+            for pdl in (False, True):
+                plan = plan_route(
+                    arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
+                )
+                assert plan.kind == "small_m" and plan.fallback_from is None, plan
+                assert plan.kernel_key.startswith(f"small_m_cluster{cluster}:k{K}"), (
+                    plan
+                )
+                assert plan.kernel_key.endswith("_write") is write
+                assert (plan.grid_x, plan.threads) == (M * cluster, 256 // cluster)
+                seen += 1
+    for name, write in (
+        ("R2_SMALL_M_FAST_MATH_CELLS", False),
+        ("R2_SMALL_M_WRITE_FAST_MATH_CELLS", True),
+    ):
+        for arch, sm_count, M, K, _none in _r2_cells(name):
+            for pdl in (False, True):
+                plan = plan_route(
+                    arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
+                )
+                assert plan.kind == "small_m" and plan.fallback_from is None, plan
+                assert "_fm" in plan.kernel_key and "_fastmath" in plan.schedule_id, (
+                    plan
+                )
+                seen += 1
+    assert seen > 0
+    if MODULES:
+        for arch, _sm, _m, _k, value in _r2_cells("R2_PERSISTENT_KEY_CELLS"):
+            for key in value if isinstance(value, (list, tuple)) else (value,):
+                assert key in KERNELS[arch], (arch, key)
+    # The K1 M6144 cell of sm_103a names one key per PDL mode (the packed output-norm cache at PDL off).
+    for sm_count in SM_COUNTS:
+        off = plan_route("sm_103a", sm_count, 6144, 1, False).kernel_key
+        on = plan_route("sm_103a", sm_count, 6144, 1, True).kernel_key
+        assert (off, on) == (
+            "persistent:k1_nc4_d2_f110000000000010",
+            "persistent:k1_nc4_d2_f110000000000000",
+        )
+    # Cells round 2 left alone keep the legacy program: the GB300 K6 M3 small-M cell, the B300 K6 M192
+    # (pair) cell, the record-only K2 M8192 (152) / M4096 (148) cells.
+    assert (
+        plan_route("sm_103a", 152, 3, 6, False).kernel_key == "small_m_cluster2:k6_fm"
+    )
+    assert plan_route("sm_103a", 148, 192, 6, False).kind == "persistent"
+    assert (
+        plan_route("sm_103a", 152, 8192, 2, False).kernel_key
+        == "persistent:k2_nc4_d2_f011000000000000"
+    )
+    assert (
+        plan_route("sm_103a", 148, 4096, 2, False).kernel_key
+        == "persistent:k2_nc4_d2_f110000000000000"
+    )
+    # Round 3: the sm_103a K5 cells M = 192 / 256 / 768 and the sm_100a K5 cells M = 192 / 256 / 384 /
+    # 768 / 1024 / 1536 / 2048 run the native K5 port (one CTA per SM, one two-architecture program)
+    # at the qualified SM counts and both PDL modes; M = 384 on sm_103a keeps its round-2 persistent
+    # key and M = 512 on sm_100a its legacy one.
+    for sm_count in SM_COUNTS:
+        for M in (192, 256, 768):
+            for pdl in (False, True):
+                plan = plan_route("sm_103a", sm_count, M, 5, pdl)
+                assert (
+                    plan.kind,
+                    plan.kernel_key,
+                    plan.grid_x,
+                    plan.fallback_from,
+                ) == (
+                    "native",
+                    "native_k5",
+                    sm_count,
+                    None,
+                ), (sm_count, M, pdl, plan)
+                assert plan.schedule_id == f"native_k5_nc3_d2_ws288_grid{sm_count}"
+        assert (
+            plan_route("sm_103a", sm_count, 384, 5, False).kernel_key
+            == "persistent:k5_nc4_d2_f111000000000000"
+        )
+    for M in (192, 256, 384, 768, 1024, 1536, 2048):
+        for pdl in (False, True):
+            plan = plan_route("sm_100a", 148, M, 5, pdl)
+            assert (plan.kind, plan.kernel_key, plan.grid_x, plan.fallback_from) == (
+                "native",
+                "native_k5",
+                148,
+                None,
+            ), (M, pdl, plan)
+            assert plan.schedule_id == "native_k5_nc3_d2_ws288_grid148"
+    assert (
+        plan_route("sm_100a", 148, 512, 5, False).kernel_key
+        == "persistent:k5_nc4_d2_f110000000000000"
+    )
+    # Round 3: twelve sm_100a K2 / K3 cells run the fence-authored twins of their early-release
+    # persistent programs: the key of the fenced program plus ``_crfnone`` (a registered program of
+    # its own, never a fallback across that suffix), the schedule label plus ``_authored_fences``,
+    # the same grid; K3 M = 1024 / 1536 and the band interiors keep the fenced programs, and no
+    # ``_crfnone`` key exists on sm_103a.
+    for M, K in (
+        (2048, 3),
+        (3072, 3),
+        (6144, 3),
+        (8192, 3),
+        (12288, 3),
+        (16384, 3),
+        (3072, 2),
+        (4096, 2),
+        (6144, 2),
+        (8192, 2),
+        (12288, 2),
+        (16384, 2),
+    ):
+        fenced = f"persistent:k{K}_nc4_d2_f110000000000000"
+        fenced_label = cb._persistent_schedule_id(4, 2, "110000000000000")
+        for pdl in (False, True):
+            plan = plan_route("sm_100a", 148, M, K, pdl)
+            assert (plan.kind, plan.kernel_key, plan.fallback_from) == (
+                "persistent",
+                fenced + "_crfnone",
+                None,
+            ), (M, K, pdl, plan)
+            assert plan.schedule_id == fenced_label + "_authored_fences"
+            assert (plan.grid_x, plan.threads) == (
+                cb._grid(M, 148, 4)[0],
+                cb.PERSISTENT_THREADS,
+            )
+    for M, K in ((1024, 3), (1536, 3), (2560, 3), (5000, 2)):
+        for pdl in (False, True):
+            plan = plan_route("sm_100a", 148, M, K, pdl)
+            assert plan.kind == "persistent" and plan.fallback_from is None, (
+                M,
+                K,
+                pdl,
+                plan,
+            )
+            assert not plan.kernel_key.endswith("_crfnone"), (M, K, pdl, plan)
+            assert not plan.schedule_id.endswith("_authored_fences")
+    for pdl in (False, True):
+        assert (
+            plan_route("sm_100a", 148, 1024, 3, pdl).kernel_key
+            == "persistent:k3_nc4_d2_f110000000000000"
+        )
+    for sm_count in SM_COUNTS:
+        for M in (2048, 3072, 4096, 6144, 8192, 12288, 16384):
+            for K in (2, 3):
+                assert not plan_route(
+                    "sm_103a", sm_count, M, K, False
+                ).kernel_key.endswith("_crfnone")
+    if MODULES:
+        assert KERNELS["sm_100a"]["native_k5"] == KERNELS["sm_103a"]["native_k5"]
+        assert MODULES[KERNELS["sm_103a"]["native_k5"]]["arches"] == [
+            "sm_100a",
+            "sm_103a",
+        ]
+        for K in (2, 3):
+            key = f"persistent:k{K}_nc4_d2_f110000000000000_crfnone"
+            assert key in KERNELS["sm_100a"] and key not in KERNELS["sm_103a"]
+            assert MODULES[KERNELS["sm_100a"][key]]["arches"] == ["sm_100a"]
+            assert MODULES[KERNELS["sm_100a"][key]]["schedule_id"].endswith(
+                "_authored_fences"
+            )
 
 
 @pytest.mark.parametrize("pdl", (False, True))
@@ -253,8 +509,11 @@ def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
     "arch,M,nc,depth",
     (
         # sm_100a: nc4 depth 3 from the band edge (round r4 closing screening); the r1 M4096 cell keeps nc3 depth 3.
+        # The M1536 cell itself runs the native K5 port since round 3 phase C (asserted exactly in
+        # test_round_2_cells_take_their_table_program); M1537 is the first persistent row of the depth-3 band.
         ("sm_100a", 1535, 4, 2),
-        ("sm_100a", 1536, 4, 3),
+        ("sm_100a", 1537, 4, 3),
+        ("sm_100a", 2049, 4, 3),
         ("sm_100a", 3072, 4, 3),
         ("sm_100a", 4096, 3, 3),
         ("sm_100a", 8192, 4, 3),
@@ -269,7 +528,9 @@ def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
 def test_plan_route_k5_depth3_bands(arch, M, nc, depth, pdl):
     """Round r4: the persistent K5 program runs four sources per chunk with a depth-3 pipeline from the
     per-architecture band edge (same-GPU ABBA, bit-identical, 1.3-3.8 % faster than depth 2); the band
-    edges are the dispatcher / evaluator / FI mirror constants."""
+    edges are the dispatcher / evaluator / FI mirror constants. Since round 3 phase C the sm_100a exact
+    cells M 192 / 256 / 384 / 768 / 1024 / 1536 / 2048 (K = 5) run the native K5 port instead (asserted
+    in test_round_2_cells_take_their_table_program), so the sm_100a rows here sit beside those cells."""
     plan = plan_route(arch, SM_COUNT, M, 5, pdl)
     assert plan.kind == "persistent", plan
     assert f"_nc{nc}_d{depth}_" in plan.schedule_id, (plan.schedule_id, nc, depth)
@@ -293,10 +554,10 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
     assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id
     assert plan.schedule_id.endswith("_write") and plan.kernel_key.endswith("_write")
     if max_m is not None and max_m >= M:
-        cluster = cb._small_m_cluster(arch, M, K)
+        cluster = cb._small_m_cluster(arch, M, K, num_sms=SM_COUNT, write=True)
         nc = cb._small_m_sources_per_chunk(arch, M, K)
         nc_suffix = "" if nc is None else f"_nc{nc}"
-        fm = cb._fast_math(arch, M, K, "small_m_write")
+        fm = cb._fast_math(arch, M, K, "small_m_write", SM_COUNT)
         family = "direct" if cluster == 1 else f"cluster{cluster}"
         assert plan.kind == "small_m"
         assert (
@@ -397,6 +658,27 @@ def test_native_ports_route_on_the_qualified_sm_counts():
     assert plan.grid_x <= 132
 
 
+_CSRC = pathlib.Path(cake_build.__file__).resolve().parent / "csrc"
+_TMEM_PROGRAMS = sorted(
+    name
+    for name in MODULES
+    if "tcgen05.dealloc" in (_CSRC / f"{name}_kernel.cu").read_text()
+)
+
+
+@pytest.mark.parametrize("name", _TMEM_PROGRAMS)
+def test_tmem_programs_drain_loads_before_the_dealloc(name):
+    # The persistent and native programs read TMEM with tcgen05.ld and free the columns
+    # with tcgen05.dealloc after the cleanup barrier. A register dependency on a tcgen05.ld
+    # result does not complete the load; only tcgen05.wait::ld does (PTX ISA, tcgen05 memory
+    # consistency model), so a wait::ld must come before the barrier that precedes the dealloc.
+    text = (_CSRC / f"{name}_kernel.cu").read_text()
+    dealloc = text.index("tcgen05.dealloc")
+    cleanup = text.rindex("barrier.sync", 0, dealloc)
+    assert "tcgen05.ld." in text[:cleanup]
+    assert "tcgen05.wait::ld" in text[text.rindex("tcgen05.ld.", 0, cleanup) : cleanup]
+
+
 def test_small_m_table_boundary():
     for arch in ("sm_100a", "sm_103a"):
         for K in range(MAX_BLOCKS + 1):
@@ -422,9 +704,9 @@ def test_small_m_table_boundary():
                     # round r5: the dense cell left the table for its persistent program
                     assert at.kind == "persistent"
                     continue
-                cluster = cb._small_m_cluster(arch, m, K)
+                cluster = cb._small_m_cluster(arch, m, K, num_sms=SM_COUNT)
                 nc = cb._small_m_sources_per_chunk(arch, m, K)
-                fm = cb._fast_math(arch, m, K, "small_m")
+                fm = cb._fast_math(arch, m, K, "small_m", SM_COUNT)
                 suffix = ("" if nc is None else f"_nc{nc}") + ("_fm" if fm else "")
                 key = (
                     f"small_m_direct:k{K}{suffix}"
@@ -486,126 +768,79 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch, sm_co
                     plan.kernel_key,
                 )
     for record in MODULES.values():
-        assert record["arg_plan"] in cake_jit.ARG_PLANS
+        pairs = [tuple(pair) for pair in record["arg_plan"]]
+        assert pairs[-4:] == [
+            ("launch", cake_jit.LAUNCH_ARGUMENT),
+            ("grid", "grid_x"),
+            ("grid", "grid_y"),
+            ("grid", "grid_z"),
+        ], record["library"]
+        assert all(kind in ("buffer", "parameter") for kind, _ in pairs[:-4]), record[
+            "library"
+        ]
+        assert {name for kind, name in pairs[:-4]} <= set(record["logical"]), record[
+            "library"
+        ]
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
 
 
-_PROGRAM_MACRO_DEFAULT = re.compile(
-    r"^#define (CAKE_PROGRAM_KERNEL|CAKE_PROGRAM_SHIM) (\w+)$", re.M
-)
+def test_registry_records_reference_the_build_manifest():
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
 
-
-def _program_identity(name, record):
-    """(kernel symbol, declared kernel symbol, host-shim namespace) of a record's build.
-
-    A ``-DCAKE_PROGRAM_*`` entry of ``compile_flags`` wins, else the ``#ifndef``
-    default of the translation unit, else the literal the exported source spells.
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel and binding sources
+    under ``csrc/`` of this package, their digests and a closure digest; the registry
+    itself records the host plan only.  ``--use_fast_math`` is an entry flag exactly
+    for the fast-math programs (an ``_fm`` key, the native ports and the pair kernel).
     """
-    root = pathlib.Path(cake_jit.__file__).resolve().parent / "csrc"
-    kernel, binding = (root / relative for relative in record["sources"])
-    assert kernel.is_file() and binding.is_file(), (name, record["sources"])
-    kernel_text = kernel.read_text(encoding="utf-8")
-    binding_text = binding.read_text(encoding="utf-8")
-    flags = dict(
-        flag[2:].split("=", 1)
-        for flag in record["compile_flags"]
-        if flag.startswith("-DCAKE_PROGRAM_")
-    )
-    kernel_defaults = dict(_PROGRAM_MACRO_DEFAULT.findall(kernel_text))
-    binding_defaults = dict(_PROGRAM_MACRO_DEFAULT.findall(binding_text))
-    defined = re.search(r"^(kernel_\w+)\(", kernel_text, re.M)
-    declared = re.search(r'^extern "C" __global__ void (\w+)\(', binding_text, re.M)
-    namespace = re.search(r"^namespace (\w+) \{$", binding_text, re.M)
-    return (
-        flags.get(
-            "CAKE_PROGRAM_KERNEL",
-            kernel_defaults.get("CAKE_PROGRAM_KERNEL", defined and defined.group(1)),
-        ),
-        flags.get(
-            "CAKE_PROGRAM_KERNEL",
-            binding_defaults.get("CAKE_PROGRAM_KERNEL", declared and declared.group(1)),
-        ),
-        flags.get(
-            "CAKE_PROGRAM_SHIM",
-            binding_defaults.get("CAKE_PROGRAM_SHIM", namespace and namespace.group(1)),
-        ),
-    )
-
-
-def test_shared_sources_keep_distinct_program_symbols():
-    """Every JIT library of the family loads into one process, so no two records may
-    export one kernel symbol or host-shim namespace.  Every record selects its own
-    through ``-DCAKE_PROGRAM_KERNEL`` / ``-DCAKE_PROGRAM_SHIM`` in ``compile_flags``
-    (the launch bindings take nothing else); a shared kernel file's ``#ifndef``
-    default names the program that owns it."""
-    shims = set()
+    if not MODULES:
+        pytest.skip("no generated programs registered in this checkout")
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == cake_jit.__name__.rsplit(".", 1)[0]
+    libraries = cake_build.libraries_by_name()
+    package = pathlib.Path(cake_build.__file__).parent
+    referenced = set()
     for name, record in MODULES.items():
-        defined, declared, shim = _program_identity(name, record)
-        assert defined == declared == f"kernel_{name}", (name, defined, declared)
-        assert shim and shim.startswith("cake_host_shim_"), (name, shim)
-        shims.add(shim)
-    assert len(shims) == len(MODULES)
-
-
-_BINDING_REQUIRED_MACRO = re.compile(r"^#ifndef (\w+)\n#error ", re.M)
-_KERNEL_LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\((\d+)")
-_KERNEL_CLUSTER_DIMS = re.compile(r"__cluster_dims__\((\d+),")
-_KERNEL_SMEM_TOTAL = re.compile(r"^#define SMEM_TOTAL (\d+)$", re.M)
-
-
-def test_launch_bindings_take_each_record_from_its_compile_flags():
-    """One launch binding per argument plan.  Every record selects its program through
-    the ``-D`` flags the registry derives from its rows: kernel symbol, host-shim
-    namespace, dynamic shared memory bytes, CTA threads and cluster size, which must
-    agree with the record's device source.  ``TVM_FFI_CHECK`` stringises its condition
-    unexpanded, so the bindings keep those macros out of its conditions."""
-    root = pathlib.Path(cake_jit.__file__).resolve().parent / "csrc"
-    required = {}
-    for plan in cake_jit.ARG_PLANS:
-        binding = f"cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_{plan}_binding.cu"
-        text = (root / binding).read_text(encoding="utf-8")
-        required[binding] = set(_BINDING_REQUIRED_MACRO.findall(text))
-        assert required[binding] == {
-            "CAKE_PROGRAM_KERNEL",
-            "CAKE_PROGRAM_SHIM",
-            "CAKE_BIND_SMEM",
-            "CAKE_BIND_THREADS",
-            "CAKE_BIND_CLUSTER",
-        }, binding
-        for line in text.splitlines():
-            if line.lstrip().startswith("TVM_FFI_CHECK("):
-                assert not set(re.findall(r"\w+", line)) & required[binding], line
-    for name, record in MODULES.items():
-        kernel, binding = record["sources"]
-        assert binding.endswith(f"_{record['arg_plan']}_binding.cu"), name
-        defines = dict(
-            flag[2:].split("=", 1)
-            for flag in record["compile_flags"]
-            if flag.startswith("-D")
+        assert record["library"] == name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
+        assert record["kind"] in (
+            "direct",
+            "small_m",
+            "persistent",
+            "k0_tma",
+            "native",
+            "pair",
         )
-        missing = required[binding] - set(defines)
-        assert not missing, (name, missing)
-        assert defines["CAKE_PROGRAM_KERNEL"] == f"kernel_{name}", name
-        kernel_text = (root / kernel).read_text(encoding="utf-8")
-        bounds = {int(n) for n in _KERNEL_LAUNCH_BOUNDS.findall(kernel_text)}
-        cluster = {int(n) for n in _KERNEL_CLUSTER_DIMS.findall(kernel_text)} or {1}
-        totals = _KERNEL_SMEM_TOTAL.findall(kernel_text)
-        assert bounds == {int(defines["CAKE_BIND_THREADS"])}, (name, bounds)
-        assert cluster == {int(defines["CAKE_BIND_CLUSTER"])}, (name, cluster)
-        assert totals == [defines["CAKE_BIND_SMEM"]], (name, totals)
-
-
-def test_registry_rows_expand_to_the_pinned_records():
-    """``MODULES`` is built from the ``_PROGRAMS`` and ``_BINDINGS`` rows.  This digest
-    of its canonical JSON pins the expanded dict (91 records), so neither a row nor
-    the builder can drift silently.  After an intended registry change, recompute it
-    as the sha256 of ``json.dumps(MODULES, sort_keys=True, separators=(",", ":"))``."""
-    assert len(MODULES) == 91
-    canonical = json.dumps(MODULES, sort_keys=True, separators=(",", ":"))
-    assert (
-        hashlib.sha256(canonical.encode()).hexdigest()
-        == "5532eeed7f2c964b21841e177b1c29c98917e4a894ff003ac6477fbc3f96664c"
-    )
+        assert record["ffi_entry"] == "run" and record["launch"]["use_pdl"] == "runtime"
+        fast_math = record["kernel_key"].endswith(("_fm", "_fm_write")) or record[
+            "kind"
+        ] in ("native", "pair")
+        for arch in record["arches"]:
+            library = cake_jit.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            assert entry["sources"] == [
+                f"csrc/{name}_kernel.cu",
+                f"csrc/{name}_binding.cu",
+            ]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (package / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert ("--use_fast_math" in entry["nvcc_flags"]) is fast_math, (name, arch)
+    assert referenced == set(libraries)
+    assert (package / "csrc" / "cake_ffi_checks.h").is_file()
+    for arch, table in KERNELS.items():
+        for key, name in table.items():
+            assert (
+                MODULES[name]["kernel_key"] == key and arch in MODULES[name]["arches"]
+            )
 
 
 # Every token count a decoder step can present in the small / mid range, plus the measured
@@ -637,7 +872,13 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
                 plan = plan_route(arch, sm_count, M, K, pdl)
                 cell = (arch, sm_count, M, K, pdl, exact.kernel_key, plan.kernel_key)
                 assert plan.kernel_key in registered, cell
-                assert plan.kind in ("small_m", "native", "k0_tma", "persistent"), cell
+                assert plan.kind in (
+                    "small_m",
+                    "native",
+                    "pair",
+                    "k0_tma",
+                    "persistent",
+                ), cell
                 if exact.kernel_key in registered:
                     # a registered variant always runs exactly as the tables say
                     assert plan == exact and plan.fallback_from is None, cell
@@ -658,10 +899,6 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
                         else f"small_m_cluster{cluster}:"
                     ), cell
                     assert plan.grid_x == M * cluster, cell
-                elif plan.schedule_id.endswith("_one_token_per_cta"):
-                    assert (plan.grid_x, plan.threads) == (M, cb.PERSISTENT_THREADS), (
-                        cell
-                    )
                 else:
                     assert plan.threads == cb.PERSISTENT_THREADS and plan.grid_x >= 1, (
                         cell
@@ -680,23 +917,35 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the release bands, the nc / depth edges, the two native cells) and, for K8 on sm_100a, the SM
-# count itself (the release flips at M = SMs + 1).  ``test_gpu_rows_are_the_route_band_starts``
-# recomputes the set from the tables.
+# the round-2 / round-3 cells, the release bands, the nc / depth edges, the native and pair cells) and, for
+# K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
+# ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
 # fmt: off
 _ROUTE_BAND_START_ROWS = {
-    0: (1, 257, 513),
+    0: (1, 6, 8, 9, 16, 17, 32, 33, 257, 513),
     1: (
-        1, 513, 768, 1024, 1025, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 8192, 8193,
-        12288, 12289, 16384,
+        1, 513, 768, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192,
+        8193, 12288, 12289, 16384,
     ),
-    2: (1, 192, 193, 257, 384, 385, 512, 513, 768, 769, 1537, 2049, 4096, 4097),
-    3: (1, 3, 256, 257, 385, 769, 4096, 4097),
-    4: (1, 5, 17, 129, 256, 257, 512, 513, 1024, 1025, 1537, 2048, 2049, 4096, 4097),
-    5: (1, 5, 17, 33, 129, 192, 193, 384, 512, 513, 768, 769, 1024, 1025, 1536, 4096, 4097),
+    2: (
+        1, 192, 193, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072,
+        3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289, 16384,
+    ),
+    3: (
+        1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 256, 257, 385, 769,
+        2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289, 16384,
+    ),
+    4: (
+        1, 5, 17, 129, 192, 193, 256, 257, 384, 385, 512, 513, 1024, 1025, 1537, 2048, 2049, 4096,
+        4097,
+    ),
+    5: (
+        1, 5, 9, 12, 13, 16, 17, 33, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024,
+        1025, 1536, 1537, 2048, 2049, 4096, 4097,
+    ),
     6: (1, 2, 5, 17, 33, 129, 192, 193, 384, 513),
-    7: (1, 5, 17, 33, 65, 129, 193, 385, 513, 768, 769),
-    8: (1, 3, 6, 7, 17, 65, 149, 153, 256, 257, 512, 769, 1536, 1537),
+    7: (1, 5, 17, 33, 65, 129, 192, 193, 256, 257, 385, 513, 768, 769),
+    8: (1, 3, 6, 7, 17, 65, 149, 153, 192, 193, 256, 257, 384, 385, 512, 769, 1536, 1537),
 }
 # fmt: on
 
@@ -709,6 +958,31 @@ GPU_ROWS = sorted(
         (64, 4),
         (256, 1),
         (512, 1),
+        # round-2 cells: the pair kernel, the native K7 / K8 / M128 ports, the register-carry and
+        # early + packed-add persistent programs, the per-PDL K1 M6144 cell; round 3: the sm_103a
+        # K5 M192 / M256 / M768 and sm_100a K5 M192 ... M2048 cells of the native K5 port and the
+        # twelve sm_100a K2 / K3 fence-authored cells (every one of them a band start above)
+        (192, 4),
+        (192, 6),
+        (192, 7),
+        (192, 8),
+        (384, 8),
+        (256, 5),
+        (256, 7),
+        (384, 4),
+        (384, 5),
+        (768, 2),
+        (768, 5),
+        (1024, 2),
+        (1536, 1),
+        (1536, 2),
+        (2048, 2),
+        (3072, 2),
+        (4096, 2),
+        (6144, 1),
+        (6144, 2),
+        (8192, 2),
+        (12288, 2),
         # off-grid token counts (registered-variant fallback where this checkout lacks the exact program)
         (7, 5),
         (64, 6),
@@ -730,6 +1004,7 @@ def _table_edge_token_counts(m_max: int = TOKEN_COUNTS[-1]) -> list[int]:
     maximum M, the balanced-grid bounds) and the SM counts.  A band can only start at one of
     these, so sweeping them finds every band start of M 1..``m_max``."""
     literals = {int(n) for n in re.findall(r"\b\d+\b", inspect.getsource(cb))}
+    literals |= {int(n) for n in re.findall(r"\b\d+\b", json.dumps(ROUTES))}
     counts = set(range(1, 601)) | {m_max}
     for edge in literals | set(TOKEN_COUNTS) | set(SM_COUNTS):
         counts |= {edge - 1, edge, edge + 1}
@@ -855,7 +1130,7 @@ def test_matches_reference(M, K, pdl):
         num_blocks=K,
         enable_pdl=pdl,
     )
-    assert runner.plan.kind in ("small_m", "native", "k0_tma", "persistent")
+    assert runner.plan.kind in ("small_m", "native", "pair", "k0_tma", "persistent")
     assert runner.plan.kernel_key in KERNELS[arch]
     if runner.plan.fallback_from is not None:
         assert runner.plan.fallback_from not in KERNELS[arch]
@@ -909,7 +1184,19 @@ def test_semantic_variants_take_the_bootstrap(
 
 
 @pytest.mark.parametrize(
-    "M,K", [(17, 4), (3, 7), (1, 1), (300, 4), (1024, 1), (1024, 4)]
+    "M,K",
+    [
+        (17, 4),
+        (3, 7),
+        (1, 1),
+        (300, 4),
+        (1024, 1),
+        (1024, 4),
+        (1, 4),
+        (4, 7),
+        (16, 4),
+        (16, 7),
+    ],
 )
 @pytest.mark.parametrize("pdl", [False, True])
 def test_snapshot_write_matches_reference_on_the_write_variants(M, K, pdl):
@@ -1019,10 +1306,4 @@ def test_prepare_rejects_bad_bindings():
             **{k: v for k, v in inputs.items() if k != "num_blocks"},
             num_blocks=4,
             block_write_idx=8,
-        )
-    with pytest.raises(ValueError):
-        prepare_kimi_k3_attn_res(
-            **{k: v for k, v in inputs.items() if k != "num_blocks"},
-            num_blocks=4,
-            backend="triton",
         )

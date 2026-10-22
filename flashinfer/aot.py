@@ -137,6 +137,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
+    gen_gemm_sm120_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm103_module_cutlass_fp4,
@@ -170,13 +171,11 @@ from .jit.cake_minimax_h3_mxfp8 import (
     MiniMaxH3Mxfp8Target,
     gen_minimax_h3_mxfp8_aot_modules,
 )
-from .jit.cake_minimax_h3_nvfp4 import (
-    MiniMaxH3Nvfp4Target,
-    gen_minimax_h3_nvfp4_aot_modules,
+from .jit.cake_minimax_h3_nvfp4_pre_attention import (
+    aot_specs as gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules,
 )
-from .jit.cake_minimax_h3_qkv_pack import (
-    MiniMaxH3QkvPackTarget,
-    gen_minimax_h3_qkv_pack_aot_modules,
+from .jit.cake_minimax_h3_qkv_quantize_pack import (
+    aot_specs as gen_cake_minimax_h3_qkv_quantize_pack_aot_modules,
 )
 from .jit.mla import (
     gen_mla_module,
@@ -194,7 +193,13 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     cake_sparse_mla_sm120_dsv41_mixed_available,
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
-from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
+from .jit.cake_concat_mla_kv_quant_fp8 import (
+    # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
+    aot_specs as gen_cake_concat_mla_kv_quant_fp8_aot_modules,
+)
+from .jit.cake_grouped_mxfp8_quantize import (
+    aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
+)
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
@@ -217,10 +222,6 @@ from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
-from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
-    cake_sm120_megamoe_available,
-    gen_cake_sm120_megamoe_aot_modules,
-)
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -725,12 +726,13 @@ def gen_all_modules(
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
     # Fused MLA context K/V pack (attention side, not MoE), two backends behind
-    # concat_mla_kv_quant_fp8: the Cake programs, one build per (exact target,
-    # head group) ...
+    # concat_mla_kv_quant_fp8: the Cake programs, one per head group, one
+    # library each per exact target (the loader spells the targets "sm_100a" /
+    # "sm_103a") ...
     if has_sm100a_exact:
-        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
+        jit_specs.extend(gen_cake_concat_mla_kv_quant_fp8_aot_modules("sm_100a"))
     if has_sm103a_exact:
-        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
+        jit_specs.extend(gen_cake_concat_mla_kv_quant_fp8_aot_modules("sm_103a"))
     # ... and the specialized kernel (auto's pick for 12 local heads), one
     # module, pre-built for the same exact Blackwell targets as the Cake
     # programs (other targets JIT it on first use).
@@ -757,23 +759,27 @@ def gen_all_modules(
         if enabled:
             jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
 
-    minimax_h3_nvfp4_targets: tuple[tuple[MiniMaxH3Nvfp4Target, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_nvfp4_target, enabled in minimax_h3_nvfp4_targets:
-        if enabled:
-            jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
+    # Cake MiniMax-H3 NVFP4 pre-attention: the norm stage and, per output
+    # format, the fused GEMM of each exact sm_100a / sm_103a target.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules("sm_103a"))
 
-    minimax_h3_qkv_pack_targets: tuple[tuple[MiniMaxH3QkvPackTarget, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_qkv_pack_target, enabled in minimax_h3_qkv_pack_targets:
-        if enabled:
-            jit_specs.extend(
-                gen_minimax_h3_qkv_pack_aot_modules(minimax_h3_qkv_pack_target)
-            )
+    # Cake MiniMax-H3 QKV quantize-and-pack: eight generated programs (NVFP4 /
+    # MXFP8 x P in 1, 2, 4, 8), each an exact sm_100a / sm_103a library.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_103a"))
+
+    # Cake grouped MXFP8 quantize (backend="cake" of mxfp8_grouped_quantize):
+    # the bfloat16 and float16 programs, one library each per exact Blackwell
+    # target; the loader spells the targets "sm_100a" / "sm_103a".
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_103a"))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.
@@ -1013,11 +1019,21 @@ def gen_all_modules(
                 gen_cudnn_frost_moe_module(dtype, "sm_120a") for dtype in FROST_DTYPES
             )
             jit_specs.append(gen_fp4_quantization_sm120_module())
+            # Imported here: the package import initializes flashinfer.moe_ep (every
+            # MegaMoE backend), which builds without SM120 do not need.
+            from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+                cake_sm120_megamoe_available,
+                gen_cake_sm120_megamoe_aot_modules,
+            )
+
             # Cake SM120 MXFP4 x MXFP8 MegaMoE (moe_ep backend sm120_mxfp4_mxfp8_bf16_cake):
             # the binding and the default DeepSeek-V4-Flash device instances.  Both need
             # the NCCL 2.30.7 Device API (headers + library) at build time.
             if cake_sm120_megamoe_available():
                 jit_specs.extend(gen_cake_sm120_megamoe_aot_modules())
+            # SM120 only: the CUTLASS SVDQuant kernel is compiled for sm120a and
+            # is not shared with SM121, unlike the modules in the branch below.
+            jit_specs.append(gen_gemm_sm120_module_cutlass_nvfp4_svdquant())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:
@@ -1035,11 +1051,11 @@ def gen_all_modules(
 
     if add_comm:
         from .jit.comm import (
-            gen_comm_alltoall_module,
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
-            gen_moe_alltoall_module,
-            gen_moe_ep_nvlink_one_sided_module,
+            gen_cake_alltoall_module,
+            gen_nvlink_one_sided_alltoall_module,
+            gen_nvlink_two_sided_alltoall_module,
             gen_pcie_ipc_ag_rs_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
@@ -1047,7 +1063,7 @@ def gen_all_modules(
             gen_vllm_comm_module,
         )
 
-        jit_specs.append(gen_comm_alltoall_module())
+        jit_specs.append(gen_nvlink_two_sided_alltoall_module())
         if (
             has_sm90
             or has_sm100
@@ -1078,9 +1094,9 @@ def gen_all_modules(
         ):
             jit_specs.append(gen_dcp_lse_reduce_module())
         if has_sm100a_exact:
-            jit_specs.append(gen_moe_alltoall_module("sm100a"))
+            jit_specs.append(gen_cake_alltoall_module("sm100a"))
         if has_sm103a_exact:
-            jit_specs.append(gen_moe_alltoall_module("sm103a"))
+            jit_specs.append(gen_cake_alltoall_module("sm103a"))
         # Cake NVFP4-transport tensor-parallel all-reduce: exact-architecture
         # programs, one module per (program, exact target); never a family
         # target.
@@ -1093,7 +1109,7 @@ def gen_all_modules(
         # NVLink one-sided MoE all-to-all behind flashinfer.moe_ep. The fence path
         # needs SM90+; the CFT path compiles only for SM100+ and traps elsewhere.
         if has_sm90 or has_sm100 or has_sm100f or has_sm103 or has_sm107:
-            jit_specs.append(gen_moe_ep_nvlink_one_sided_module())
+            jit_specs.append(gen_nvlink_one_sided_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is

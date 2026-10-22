@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import warnings
 import weakref
@@ -206,51 +206,6 @@ def _moe_hidden_size(w2_weight: torch.Tensor, localized_weights: Optional[list])
             f"localized FC2 shards must have equal positive widths, got {widths}"
         )
     return sum(widths)
-
-
-def _execute_on_streams(streams: list, fn: Callable[[int], None]) -> None:
-    """Call ``fn(i)`` with ``streams[i]`` current, forking from and joining to
-    the caller stream.
-
-    Mirrors ``torch.cuda.execute_on_streams`` (proposed in PyTorch PR 199128)
-    for PyTorch builds without it. Each stream first waits for work already
-    queued on the caller stream; the caller stream then waits for every
-    callback's queued work, including work queued before a callback raised.
-    The host is never synchronized. Ordinary and green-context streams on the
-    caller's device are both supported.
-    """
-    if not streams:
-        raise ValueError("Need at least one CUDA stream to execute on")
-    caller_stream = torch.cuda.current_stream()
-    start = torch.cuda.Event()
-    start.record(caller_stream)
-    done_events = []
-    try:
-        for index, stream in enumerate(streams):
-            with torch.cuda.stream(stream):
-                stream.wait_event(start)
-                try:
-                    fn(index)
-                finally:
-                    done = torch.cuda.Event()
-                    done.record(stream)
-                    done_events.append(done)
-    finally:
-        for done in done_events:
-            caller_stream.wait_event(done)
-
-
-def _resolve_stream_executor() -> Callable[[list, Callable[[int], None]], None]:
-    """Prefer PyTorch's fork/join helper; fall back to the in-repo mirror."""
-    executor = getattr(torch.cuda, "execute_on_streams", None)
-    if executor is not None:
-        return executor
-    try:
-        # Name used by earlier revisions of the PyTorch proposal.
-        from torch.cuda.green_contexts import execute_in_green_contexts
-    except ImportError:
-        return _execute_on_streams
-    return execute_in_green_contexts
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -522,7 +477,11 @@ def _moe_core_impl(
                 "locality-domain localization requires use_fused_finalize=True; the "
                 "deterministic path's moe_unpermute reduction is not split-aware."
             )
-        execute_on_streams = _resolve_stream_executor()
+        if not hasattr(torch.cuda, "execute_on_streams"):
+            raise RuntimeError(
+                "Localized MoE execution requires torch.cuda.execute_on_streams. "
+                "Please install a PyTorch build that provides this API."
+            )
         # The generic async-memset path cannot be composed with the localized
         # fork/join. The localized path orders its optional memset stream
         # explicitly below.
@@ -660,7 +619,8 @@ def _moe_core_impl(
         # The join also orders buffer reuse; record_stream is unnecessary and
         # could leave allocator events referencing destroyed green streams.
         # Per-expert/global scales are shared because only N is partitioned.
-        def _fc1_die(i, _ctx=None):
+        def _fc1_die(i):
+            """Compute domain i's FC1 shard on its current CUDA stream."""
             shard = localized_weights[i]
             blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 a=x,
@@ -708,7 +668,9 @@ def _moe_core_impl(
                 localized_memset_done.record(localized_memset_stream)
 
         try:
-            execute_on_streams(localized_streams, _fc1_die)
+            torch.cuda.execute_on_streams(
+                localized_streams, _fc1_die, range(len(localized_streams))
+            )
         except BaseException:
             # Older executors skip the join when a callback raises.
             for stream in localized_streams:
@@ -806,7 +768,8 @@ def _moe_core_impl(
     if use_localized_path:
         # Both domains read the joined FC1 output and write disjoint hidden
         # columns. Each contracts the full intermediate, so no reduction is needed.
-        def _fc2_die(i, _ctx=None):
+        def _fc2_die(i):
+            """Compute domain i's output columns using the full intermediate."""
             shard = localized_weights[i]
             blockscaled_contiguous_grouped_gemm_finalize_fusion(
                 a=intermediate,
@@ -837,7 +800,9 @@ def _moe_core_impl(
             )
 
         try:
-            execute_on_streams(localized_streams, _fc2_die)
+            torch.cuda.execute_on_streams(
+                localized_streams, _fc2_die, range(len(localized_streams))
+            )
         except BaseException:
             for stream in localized_streams:
                 localization_main_stream.wait_stream(stream)
@@ -1179,6 +1144,7 @@ class CuteDslMoEWrapper:
         per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
         use_async_memset: bool = True,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -1225,6 +1191,7 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            nvfp4_4over6=nvfp4_4over6,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1244,6 +1211,7 @@ class CuteDslMoEWrapper:
         tactic: Optional[Tuple] = None,
         *,
         per_token_scale: Optional[torch.Tensor] = None,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL fused-MoE forward pass.
 
@@ -1284,6 +1252,11 @@ class CuteDslMoEWrapper:
             tuner.
         per_token_scale : Optional[torch.Tensor]
             Optional W4A4 per-token input row scale for GEMM1.
+        nvfp4_4over6 : NVFP44Over6Config or None
+            NVFP4 4over6 recipe for the W4A4 per-token requantization of the
+            GEMM2 input; see :func:`cute_dsl_fused_moe`. Unset reads the
+            environment, ``None`` turns 4over6 off, a pinned recipe requires
+            ``per_token_scale`` and a matching ``fc2_input_scale``.
 
         Returns
         -------
@@ -1370,14 +1343,18 @@ class CuteDslMoEWrapper:
 
         if runner is None:
             raise RuntimeError(f"{self.quant_mode} runner was not initialized")
+        recipe_kwargs = _cute_dsl_recipe_kwargs(
+            nvfp4_4over6, self.quant_mode, per_token_scale
+        )
         if tactic is not None:
-            return runner(inputs, tactic=tactic)
+            return runner(inputs, tactic=tactic, **recipe_kwargs)
 
         _, best_tactic = tuner.choose_one(
             op_name,
             [runner],
             runner.tuning_config,
             inputs,
+            **recipe_kwargs,
         )
         if self.quant_mode in ("w4a4", "w4a8"):
             # Timed tactic runs retain the default async path; only this
@@ -1387,7 +1364,7 @@ class CuteDslMoEWrapper:
             runner_kwargs = {}
         else:
             raise RuntimeError(f"Unexpected quant_mode {self.quant_mode!r}")
-        return runner(inputs, tactic=best_tactic, **runner_kwargs)
+        return runner(inputs, tactic=best_tactic, **runner_kwargs, **recipe_kwargs)
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
@@ -1406,6 +1383,30 @@ class CuteDslMoEWrapper:
 # =============================================================================
 # Functional API (Simple Function Call)
 # =============================================================================
+
+
+def _cute_dsl_recipe_kwargs(
+    nvfp4_4over6: Optional[NVFP44Over6Config],
+    quant_mode: str,
+    per_token_scale: Optional[torch.Tensor],
+) -> dict:
+    """Forward kwargs for the public ``nvfp4_4over6=``; empty when unset.
+
+    A pinned recipe is only honored on the W4A4 per-token path, the one path
+    whose GEMM2-input quantizer has a 4over6 variant; elsewhere it is rejected
+    rather than dropped. ``None`` is forwarded only where it means anything.
+    """
+    if nvfp4_4over6 is _UNSET:
+        return {}
+    pinned = resolve_nvfp4_4over6(nvfp4_4over6) is not None
+    on_per_token_w4a4 = quant_mode == "w4a4" and per_token_scale is not None
+    if pinned and not on_per_token_w4a4:
+        raise ValueError(
+            "nvfp4_4over6 requires quant_mode='w4a4' with per_token_scale; no "
+            "other CuTe-DSL path has a 4over6 requantization. Pass None to turn "
+            "4over6 off, or omit it to read the environment."
+        )
+    return {"nvfp4_4over6": nvfp4_4over6} if quant_mode == "w4a4" else {}
 
 
 def _cute_dsl_fused_moe_impl(
@@ -1540,6 +1541,7 @@ def cute_dsl_fused_moe(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
@@ -1618,6 +1620,16 @@ def cute_dsl_fused_moe(
         Optional SiTU tanh clamp for the up branch.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 4over6 recipe for the W4A4 per-token requantization of the
+        GEMM2 input (the GEMM1 input is quantized by the caller).
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off, environment ignored.
+        - :class:`NVFP44Over6Config`: that recipe. Requires ``quant_mode="w4a4"``
+          with ``per_token_scale``, otherwise :class:`ValueError`;
+          ``fc2_input_scale`` must have been built for the same recipe.
     tactic : Optional[Tuple]
         Tactic tuple, or ``None`` for auto-selection via the runtime tuner.
     localized_weights : Optional[list]
@@ -1670,8 +1682,9 @@ def cute_dsl_fused_moe(
         One long-lived green-context CUDA stream for each locality domain
         (for example ``GreenContext.Stream()``). Work is forked from and
         joined to the caller's current stream with
-        ``torch.cuda.execute_on_streams`` when PyTorch provides it, otherwise
-        with an equivalent in-repo helper.
+        ``torch.cuda.execute_on_streams``. Localized execution requires a
+        PyTorch build providing this API and raises ``RuntimeError`` if it
+        is unavailable. Non-localized execution does not require this API.
     localized_sm_count : Optional[int]
         Number of SMs available to each locality-domain stream, used to size
         the persistent kernel grid.
@@ -1689,9 +1702,10 @@ def cute_dsl_fused_moe(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
+    quant_mode = _canonicalize_quant_mode(quant_mode)
+    recipe_kwargs = _cute_dsl_recipe_kwargs(nvfp4_4over6, quant_mode, per_token_scale)
     _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
-    quant_mode = _canonicalize_quant_mode(quant_mode)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     if quant_mode == "w4a8":
@@ -1845,7 +1859,7 @@ def cute_dsl_fused_moe(
         )
 
     if tactic is not None:
-        return runners[0](inputs, tactic=tactic, aux_stream=aux_stream)
+        return runners[0](inputs, tactic=tactic, aux_stream=aux_stream, **recipe_kwargs)
 
     best_runner, best_tactic = tuner.choose_one(
         op_name,
@@ -1853,8 +1867,9 @@ def cute_dsl_fused_moe(
         runners[0].tuning_config,
         inputs,
         aux_stream=aux_stream,
+        **recipe_kwargs,
     )
-    call_kwargs = {"aux_stream": aux_stream}
+    call_kwargs = {"aux_stream": aux_stream, **recipe_kwargs}
     if quant_mode != "w4a16":
         call_kwargs["use_async_memset"] = not tuner.is_tuning_mode
     return best_runner(inputs, tactic=best_tactic, **call_kwargs)
@@ -1898,6 +1913,7 @@ def cute_dsl_fused_moe_nvfp4(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -1950,6 +1966,7 @@ def cute_dsl_fused_moe_nvfp4(
         localized_memset_stream=localized_memset_stream,
         localized_allow_nonlocalized=localized_allow_nonlocalized,
         autotune_use_cuda_graph=autotune_use_cuda_graph,
+        nvfp4_4over6=nvfp4_4over6,
     )
 
 

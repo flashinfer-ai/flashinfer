@@ -19,7 +19,7 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.attention import (
     block_sparse_attention_run_trace,
     variable_block_sparse_attention_run_trace,
@@ -2238,3 +2238,75 @@ class VariableBlockSparseAttentionWrapper:
             ).contiguous()
 
         return (out, lse) if return_lse else out
+
+
+@flashinfer_experimental_api(feature="QSA NVFP4 sparse paged attention")
+def qsa_sparse_paged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    use_prefill_config: bool,
+    out: Optional[torch.Tensor] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    *,
+    output_gate: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_sf: torch.Tensor,
+) -> torch.Tensor:
+    r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM90.
+
+    This is vLLM's ``qsa_sparse_paged_attention`` (Qwen QSA) contract for an NVFP4 main KV
+    cache: the same arguments in the same order, plus the block scales ``k_sf`` / ``v_sf``.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        BF16 queries ``[rows, num_qo_heads, 256]``.
+    k_cache, v_cache : torch.Tensor
+        Packed E2M1 data, uint8 ``[num_blocks, page_size, num_kv_heads, 128]``. Any strides with
+        a contiguous last dim and 16-byte alignment, so NHD and HND (transposed) views both work.
+    logical_indices : torch.Tensor
+        int32 ``[rows, selection_width + 1]``: logical token indices of each row's selection;
+        the last column holds the row's valid-entry count.
+    block_table : torch.Tensor
+        int32 ``[num_requests, max_blocks]`` mapping logical pages to cache blocks.
+    token_to_req : torch.Tensor
+        int32 ``[rows]`` request of each row.
+    use_prefill_config : bool
+        Accepted for signature compatibility; it does not change the result.
+    out : Optional[torch.Tensor]
+        Optional BF16 output with the shape of ``q``.
+    k_scale, v_scale : float
+        NVFP4 global scales of K and V.
+    output_gate : torch.Tensor
+        Contiguous BF16 gate with the shape of ``q``; the output is
+        ``bf16(attention) * sigmoid(output_gate)``.
+    k_sf, v_sf : torch.Tensor
+        E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16 dims.
+
+    Returns
+    -------
+    torch.Tensor
+        ``out`` when given, otherwise a new tensor.
+    """
+    from .experimental.qsa_nvfp4.backend import qsa_sparse_paged_attention as run
+
+    return run(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config,
+        out,
+        k_scale,
+        v_scale,
+        output_gate=output_gate,
+        k_sf=k_sf,
+        v_sf=v_sf,
+    )

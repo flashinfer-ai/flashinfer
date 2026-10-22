@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the build manifests of the Cake-exported packages (flashinfer-ai/flashinfer#6553).
 
-Seven packages ship generated CUDA sources under ``csrc/`` together with a build
+The Cake packages below ship generated CUDA sources under ``csrc/`` together with a build
 manifest ``build.json`` (schema ``cake-build/1``) -- the only record of what to
 compile -- and a byte-identical ``cake_build.py`` loader that loads the prebuilt
 library under ``aot/`` when present and otherwise JIT-builds the manifest entry
@@ -205,6 +205,18 @@ def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
+def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
+    """Compact rows keyed by the 20-hex program digest (``_PROGRAMS``; the library stem is
+    ``_PREFIX + digest``), every program built for every architecture of ``ARCHES``."""
+    literals = module_literals(package_dir / loader)
+    prefix, arches = literals["_PREFIX"], literals["ARCHES"]
+    return {
+        f"{prefix}{digest}_{arch}"
+        for digest in literals["_PROGRAMS"]
+        for arch in arches
+    }
+
+
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
     """``sources.json``: role -> {library, arches, arguments}."""
     registry = json.loads((package_dir / loader).read_text())
@@ -223,14 +235,52 @@ class Package:
     refs: Callable[[Path, str], set[str]]
 
 
-# dsa_train, dsa_indexer and the rmsnorm backend are read with the generic walker (a mapping
-# carrying ``library`` under an ``arches`` / ``arch`` scope).  Their exporters' registry shapes
-# fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS, rmsnorm
-# MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# dsa_train, kda_train, dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
+# block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention, the SM90 VSA,
+# the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm) and the experimental batched FP8 projection (deepgemm_batched_gemm) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
+# ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
+# (dsa_indexer PROGRAMS, rmsnorm, mhc, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
+# nvfp4_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm and deepgemm_batched_gemm MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_train_backend",
         "flashinfer/cake_rmsnorm_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_causal_conv1d_train_backend",
+        "flashinfer/cake_causal_conv1d_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_ulysses_backend",
+        "flashinfer/cake_ulysses_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_fused_qk_rope_append_backend",
+        "flashinfer/cake_fused_qk_rope_append_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_sage_block_sparse_attention_backend",
+        "flashinfer/cake_sage_block_sparse_attention_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_vsa_sm90_backend",
+        "flashinfer/cake_vsa_sm90_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_mhc_train_backend",
+        "flashinfer/cake_mhc_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
@@ -243,6 +293,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.cake_dsa_indexer",
         "flashinfer/experimental/cake_dsa_indexer",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_kda_train",
+        "flashinfer/experimental/cake_kda_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -267,6 +323,54 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.dense_projection_gemm",
         "flashinfer/experimental/dense_projection_gemm",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_stepfun_moe",
+        "flashinfer/experimental/cake_stepfun_moe",
+        "cake_jit.py",
+        refs_stepfun,
+    ),
+    Package(
+        "flashinfer.cake_nvfp4_svdquant_gemm_backend",
+        "flashinfer/cake_nvfp4_svdquant_gemm_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.deepgemm_fp8_gemm",
+        "flashinfer/experimental/deepgemm_fp8_gemm",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_fused_qk_rope_fp8_append_backend",
+        "flashinfer/cake_fused_qk_rope_fp8_append_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.nvfp4_attention",
+        "flashinfer/experimental/nvfp4_attention",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_kimi_k3_attn_res",
+        "flashinfer/experimental/cake_kimi_k3_attn_res",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.deepgemm_batched_gemm",
+        "flashinfer/experimental/deepgemm_batched_gemm",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.sm110_xqa",
+        "flashinfer/experimental/sm110_xqa",
         "cake_jit.py",
         refs_generic,
     ),

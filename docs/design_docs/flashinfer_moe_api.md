@@ -175,7 +175,7 @@ NVFP4 "4over6" is a two-candidate block-scale search inside the quantizer: next 
 
 - **One public type.** The field is `Optional[NVFP44Over6Config]`; "defer to the environment" is the default value (a private `_UNSET` sentinel that callers never spell), not a third public type. Retiring the shim later means flipping the default to `None` with no signature change.
 - **One resolution boundary.** `resolve_nvfp4_4over6()` is the only Python code that reads the variables. Below it every kernel driver takes the resolved value under the name `nvfp4_4over6_config`, so an unresolved value cannot reach a `@functools.cache`-d kernel getter unnoticed. The FFI receives a packed `int64`, decoded by `resolveNVFP4Recipe()` in `csrc/nv_internal/tensorrt_llm/kernels/nvfp4Recipe.h`.
-- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` honours a pinned recipe only with `per_token_scale=True`, the one path where it quantizes the GEMM2 input itself. `MoELayer` names the runners that do support it in its "no usable backend" error.
+- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` and `TrtllmFp4RoutedRunner` honour a pinned recipe only for NVFP4×NVFP4 with `per_token_scale=True`, the one path where each quantizes the GEMM2 input itself; `CutlassNvfp4Runner` honours it on its standard path, whose activation quantizers have 4over6 variants. `PrimsTsRunner` has no GEMM2-input requantization step (its FC1 epilogue emits NVFP4 on every tactic), so it keeps rejecting explicit values. `MoELayer` names the runners that do support it in its "no usable backend" error.
 - **Activations only.** The field governs the runtime activation quantization; weights are quantized by the caller ahead of the call. `QuantConfig.__post_init__` rejects an explicit setting when `activation` is not `QuantFormat.NVFP4`, so the mistake is named where the config is written rather than swallowed by the candidate filter.
 - **Flat and unified APIs take the same value.** `nvfp4_quantize(..., nvfp4_4over6=...)`, `make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`, `CuteDslConfig.prepare_weights(..., nvfp4_4over6=...)` and `QuantConfig.nvfp4_4over6` all accept one `NVFP44Over6Config` object.
 
@@ -779,8 +779,8 @@ Key mechanisms (and where they live):
 
 The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
 `SwiGLU(alpha, beta, limit)`, `SiTU(gate_scale, linear_scale, clamp_limit)`,
-`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, `Identity()`,
-`GELU()`, `ReLU()`, and `SiLU()`.
+`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, `PowLU(m, limit)`,
+`Identity()`, `GELU()`, `ReLU()`, and `SiLU()`.
 Every value exposes `.type` and `.is_gated`; scalar fields participate in
 equality, hashing, repr serialization, and tactic-cache identity. Per-expert
 controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
@@ -833,6 +833,12 @@ order. MXFP8 and NVFP4 additionally use 128x4 weight-scale layouts. BF16 and
 MXFP8 traces retain `use_shuffled_weight` to select the row order. Serialized
 references restore these layouts using PyTorch.
 
+`PowLU` (CUTLASS only) rides the generic slots with changed meaning:
+`gemm1_alpha` carries the exponent `m` (not a sigmoid slope) and
+`gemm1_clamp_limit` the post-activation clamp on the gate plus the symmetric
+clamp on the linear branch; `gemm1_beta` has no PowLU meaning and per-expert
+overrides naming it are rejected.
+
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
 unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
@@ -845,19 +851,26 @@ silently dropping the parameter.
 `CakeStepFunConfig(backend="cake_stepfun")` is an opt-in Blackwell (exact SM100 /
 SM103) backend for the StepFun fused MoE: `SwiGLUStep(limit)` with a per-expert
 `gemm1_clamp_limit`, over `BF16×BF16`, `FP8PerTensor×FP8PerTensor`, `MXFP8×MXFP8`
-and `NVFP4×NVFP4` (also with `per_token_scale`). It runs the trtllm-gen
-fused-MoE pipeline with exported Cake kernels in the FC1 stage and, when the
-generated inventory covers them (`fused_moe_cake_stepfun_full_*`), in the
-routing, FC2, requantization and finalize stages as well. It is not in the
-default backend list; weights must come from `CakeStepFunConfig.prepare_weights`
-(view `cake_stepfun`). A tactic is the FC1 tile x GEMM configuration; the
-module restricts the trtllm-gen tile ladder to the tiles with exported Cake
-kernels in every Cake stage, so neither the tactic windows nor `tactic=-1` (the
-smallest exported tile of the token window) can name a tile without a kernel.
-The full path routes `Renormalize` from logits or from unpacked pre-computed
-top-k ids + weights (each when the inventory exports that routing variant) and
-has no fused shared experts. The host contract lives in
-`csrc/fused_moe/cake_stepfun/README.md`.
+and `NVFP4×NVFP4` (also with `per_token_scale`). Every stage of the forward --
+routing (`Renormalize`), FC1 with the StepFun epilogue, the NVFP4 per-token
+requantization, FC2 and finalize -- is an exported Cake kernel of the cake-build/1
+package `flashinfer.experimental.cake_stepfun_moe` (`build.json` + the shared
+`cake_build.py` loader + a TVM-FFI binding per kernel, shared where only its
+compile definitions differ); the stage sequence,
+the launch grids, the buffer set and the tile choice are the package's Python
+`cake_backend.py`, and `flashinfer.fused_moe` keeps a thin facade
+(`CakeStepFunConfig`, `CakeStepFunRunner` and its four family runners). It is not
+in the default backend list; weights must come from
+`CakeStepFunConfig.prepare_weights` (view `cake_stepfun`). A tactic is the FC1 /
+FC2 tile, enumerated over the tiles the package exports for the family and the
+shape (`tactic=-1` selects the planner's centre tile). Routing reads logits
+(`RoutingInputMode.FromLogits`) or unpacked pre-computed top-k ids + bf16 / fp32
+weights (`RoutingInputMode.UnpackedPrecomputed`); fused shared experts, LoRA
+deltas and routing biases are rejected. `FLASHINFER_CAKE_STEPFUN_FULL_PATH` is read
+only by the `flashinfer.fused_moe` entry (`auto` / `1`); the FC1-only hybrid of
+#6046 was removed by the cake-build/1 migration, so `0` raises
+`NotImplementedError`. The host contract lives in
+`flashinfer/experimental/cake_stepfun_moe/README.md`.
 
 The class-level matrix below is generated from the registered runner classes.
 The Quantization column is always the MMA pair ``weight×activation``
@@ -900,15 +913,18 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutile_mxfp8` | `CuTileMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_nvfp4` | `CuTileNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_bf16` | `CutlassBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_humming` | `CutlassHummingConfig` | `MXFP4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_mxfp8_mxfp4` | `CutlassMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_bf16` | `CutlassBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_humming` | `CutlassHummingConfig` | `MXFP4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8_mxfp4` | `CutlassMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
@@ -929,6 +945,9 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
+
+For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
+[usage, qualification and extension guide](../frost_low_latency_moe.md).
 
 This table records activation classes, not every accepted scalar value. For
 example, TRT-LLM FP8 per-tensor and b12x accept only default-scalar `SwiGLU`,
