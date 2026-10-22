@@ -79,7 +79,7 @@ kernel_cake_rmsnorm_train_3d20ab4a432bddf7349a(__nv_bfloat16* __restrict__ x, __
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;

@@ -95,7 +95,7 @@ kernel_cake_rmsnorm_train_7de1e51089d432dbc26b(__nv_bfloat16* __restrict__ x, __
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;

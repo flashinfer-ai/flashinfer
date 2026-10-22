@@ -116,7 +116,7 @@ kernel_cake_rmsnorm_train_b32a9f113e2997aed735(__nv_bfloat16* __restrict__ g, __
     float* part_sm = reinterpret_cast<float*>(smem_raw + 21120);
     const int part_sm_addr = smem + 21120;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     long long g_stride = g_stride_p0;
