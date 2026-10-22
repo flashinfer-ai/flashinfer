@@ -66,16 +66,14 @@ for K4's states (c1 / b1 pairs, ``tile_stride`` 2) and the carry plane; under ``
 from __future__ import annotations
 
 import dataclasses
-import math
 import os
-import types
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from . import cake_backend, cake_jit, cake_kcp_plan
+from . import cake_backend, cake_kcp_plan
 
 D = cake_backend.D  # head dimension (128)
 BT = cake_backend.BT  # tokens per chunk (64)
@@ -87,14 +85,28 @@ BOUNDARY_MODES = ("saved", "replay")
 EXCHANGES = ("auto", "a2a", "ring")
 OFFSET_CLASSES = ("fla", "fp32")
 RING_MAX_HOPS = 2
-TRANSFER_WALKS = ("tf32_hilo", "bf16x3", "bf16x3_hw64")  # K3 program family (P1-R15; non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
+TRANSFER_WALKS = (
+    "tf32_hilo",
+    "bf16x3",
+    "bf16x3_hw64",
+)  # K3 program family (P1-R15; non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
 KCP_SAVED_VERSION = 1  # saved set {Aqk, Akk, tables, S_in [, c1 receive tensor, M_seg]}
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 # Round-1 host / plan levers (P2-R1, P2-R4; P1-R15 test knob class: reachable only through _kcp_test_knobs):
-SCHEDULES = ("overlap", "wait_first")  # L-A: "wait_first" (shipped) = merges and tape walks after each wait; "overlap" = the round-0 R7 overlaps of FINAL_DESIGN §3.5 / §6.5 (test knob)
-COLS_RULES = ("fixed", "by_chains")  # D1: K4 cols_per_cta of the 128-column state launches: the backend's, or 8 up to COLS_RULE_CHAINS chains else 16
+SCHEDULES = (
+    "overlap",
+    "wait_first",
+)  # L-A: "wait_first" (shipped) = merges and tape walks after each wait; "overlap" = the round-0 R7 overlaps of FINAL_DESIGN §3.5 / §6.5 (test knob)
+COLS_RULES = (
+    "fixed",
+    "by_chains",
+)  # D1: K4 cols_per_cta of the 128-column state launches: the backend's, or 8 up to COLS_RULE_CHAINS chains else 16
 COLS_RULE_CHAINS = 24  # D1 threshold (DECISIONS.md D1: <= 24 concurrent chains -> c8, otherwise c16; map launches stay c16)
-P2_KNOBS = {"schedule": SCHEDULES, "fused_walks": (0, 1), "cols_rule": COLS_RULES}  # knob -> admitted values
+P2_KNOBS = {
+    "schedule": SCHEDULES,
+    "fused_walks": (0, 1),
+    "cols_rule": COLS_RULES,
+}  # knob -> admitted values
 # Shipped defaults of the round-1 pair (adoption of levers L-A + L-B together, rulings P2-R1 / P2-R4, lane LAB's keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
 # selectable through the test knobs for the A/B record; cols_rule stays "fixed" (D1 in band everywhere: not adopted,
@@ -132,33 +144,49 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def _alloc(shape: Sequence[int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _alloc(
+    shape: Sequence[int], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
     """Every per-call tensor (outputs, saved set, collective outputs) comes from here: ``torch.empty`` for buffers
     every element of which a kernel or a collective of the same call writes."""
     return torch.empty(tuple(shape), dtype=dtype, device=device)
 
 
-def _zeros(shape: Sequence[int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _zeros(
+    shape: Sequence[int], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
     return torch.zeros(tuple(shape), dtype=dtype, device=device)
 
 
 def _squeeze_batch(x: torch.Tensor, name: str, rank: int) -> torch.Tensor:
     if x.dim() == rank + 1:
         if x.shape[0] != 1:
-            raise ValueError(f"{name}: the batch axis must be 1, got shape {tuple(x.shape)}")
+            raise ValueError(
+                f"{name}: the batch axis must be 1, got shape {tuple(x.shape)}"
+            )
         x = x.squeeze(0)
     if x.dim() != rank:
-        raise ValueError(f"{name}: expected {rank}-D (or a leading batch axis of 1), got shape {tuple(x.shape)}")
+        raise ValueError(
+            f"{name}: expected {rank}-D (or a leading batch axis of 1), got shape {tuple(x.shape)}"
+        )
     return x
 
 
-def _check(x: torch.Tensor, name: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device) -> None:
+def _check(
+    x: torch.Tensor,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
     if tuple(x.shape) != shape:
         raise ValueError(f"{name}: expected shape {shape}, got {tuple(x.shape)}")
     if x.dtype != dtype:
         raise ValueError(f"{name}: expected {dtype}, got {x.dtype}")
     if x.numel() and not x.is_contiguous():
-        raise ValueError(f"{name}: must be contiguous (strides {x.stride()}); the kernels take no strided operands")
+        raise ValueError(
+            f"{name}: must be contiguous (strides {x.stride()}); the kernels take no strided operands"
+        )
     if x.device != device:
         raise ValueError(f"{name}: on {x.device}, expected {device}")
 
@@ -172,8 +200,10 @@ def _operands(q, k, v, g, beta, ctx, *, dtypes: dict[str, torch.dtype]):
     batched = q.dim() == 4
     q, k, g = (_squeeze_batch(x, n, 3) for x, n in ((q, "q"), (k, "k"), (g, "g")))
     beta = _squeeze_batch(beta, "beta", 2)
-    if T != int(ctx.T_r):
-        raise ValueError(f"operands carry {T} tokens, the KcpContext of rank {ctx.rank} holds T_r={ctx.T_r}")
+    if int(ctx.T_r) != T:
+        raise ValueError(
+            f"operands carry {T} tokens, the KcpContext of rank {ctx.rank} holds T_r={ctx.T_r}"
+        )
     if not 1 <= H <= 64:
         raise ValueError(f"H={H}: the Cake KDA kernels take 1..64 heads")
     _check(q, "q", (T, H, D), dtypes["q"], device)
@@ -227,10 +257,14 @@ class Backend:
     local_stages = True
     path = "fi-rendered"  # recorded with every result: fake (emulation), direct (bring-up), fi-rendered (the package)
 
-    def run(self, name: str, args: dict[str, Any]) -> None:  # pragma: no cover - interface
+    def run(
+        self, name: str, args: dict[str, Any]
+    ) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def stage(self, name: str, call: KcpCall, **extra: Any) -> None:  # pragma: no cover - interface
+    def stage(
+        self, name: str, call: KcpCall, **extra: Any
+    ) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
     def begin_call(self, call: KcpCall) -> None:
@@ -241,17 +275,33 @@ class Backend:
         """Hook at the end of a call."""
 
     @staticmethod
-    def transpose_tiles(*, src: torch.Tensor, src_tiles: torch.Tensor, dst: torch.Tensor, dst_tiles: torch.Tensor) -> None:
+    def transpose_tiles(
+        *,
+        src: torch.Tensor,
+        src_tiles: torch.Tensor,
+        dst: torch.Tensor,
+        dst_tiles: torch.Tensor,
+    ) -> None:
         """``dst`` tiles ``dst_tiles[i]`` <- the transposes of the ``src`` tiles ``src_tiles[i]`` (torch; bitwise;
         shared by every backend: the ``M_f`` -> ``M_f^T`` step of the segmented summaries)."""
         dst.view(-1, D, D)[dst_tiles] = src.view(-1, D, D)[src_tiles].transpose(1, 2)
 
 
-_SPEC3_ROWS = ("gk", "kg", "qg", "w", "u")  # the prep rows SPEC-3 compares (FINAL_DESIGN §6.4)
+_SPEC3_ROWS = (
+    "gk",
+    "kg",
+    "qg",
+    "w",
+    "u",
+)  # the prep rows SPEC-3 compares (FINAL_DESIGN §6.4)
 SPEC3_ENV = "CAKE_KCP_SPEC3"  # "0": skip the debug assertion; "warn": record a failure without raising; default: assert
 _PROGRAM_OF = {
-    "kcp_fwdh_offset": "fwdh_offset", "kcp_fwdh_tape": "fwdh_tape", "kcp_dhu_offset": "dhu_offset",
-    "kcp_dhu_tape": "dhu_tape", "kcp_transfer_walk": "transfer_walk", "kcp_affine_merge": "affine_merge",
+    "kcp_fwdh_offset": "fwdh_offset",
+    "kcp_fwdh_tape": "fwdh_tape",
+    "kcp_dhu_offset": "dhu_offset",
+    "kcp_dhu_tape": "dhu_tape",
+    "kcp_transfer_walk": "transfer_walk",
+    "kcp_affine_merge": "affine_merge",
 }
 
 
@@ -296,7 +346,13 @@ class KernelBackend(Backend):
 
     name = "kernels"
 
-    def __init__(self, programs: Any | None = None, *, cols_per_cta: int = 8, path: str = "fi-rendered") -> None:
+    def __init__(
+        self,
+        programs: Any | None = None,
+        *,
+        cols_per_cta: int = 8,
+        path: str = "fi-rendered",
+    ) -> None:
         self._programs = programs
         if cols_per_cta not in (8, 16, 32) or D % cols_per_cta:
             raise ValueError(f"cols_per_cta must be 8, 16 or 32, got {cols_per_cta}")
@@ -316,7 +372,13 @@ class KernelBackend(Backend):
         return self._programs
 
     # -- device tables (small int tables, cached by content)
-    def _dev_table(self, kind: str, values: Sequence[int], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _dev_table(
+        self,
+        kind: str | tuple[Any, ...],
+        values: Sequence[int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         key = (kind, str(device), dtype, tuple(int(v) for v in values))
         t = self._dev.get(key)
         if t is None:
@@ -329,16 +391,27 @@ class KernelBackend(Backend):
         if call.local is None:
             return
         ws, ctx, p = call.local, call.ctx, call.local.plan
-        if (p.S, p.N, p.H) != (call.T_r, int(ctx.n_frag), call.H):
-            raise ValueError(f"local arena planned for (S, N, H) = {(p.S, p.N, p.H)}, the call is {(call.T_r, ctx.n_frag, call.H)}")
+        if (call.T_r, int(ctx.n_frag), call.H) != (p.S, p.N, p.H):
+            raise ValueError(
+                f"local arena planned for (S, N, H) = {(p.S, p.N, p.H)}, the call is {(call.T_r, ctx.n_frag, call.H)}"
+            )
         if (p.NC_pad, p.R) != (int(ctx.NC_pad), int(ctx.R)):
-            raise ValueError(f"local plan geometry (NC_pad, R) = {(p.NC_pad, p.R)} differs from the KCP context's {(ctx.NC_pad, ctx.R)}")
+            raise ValueError(
+                f"local plan geometry (NC_pad, R) = {(p.NC_pad, p.R)} differs from the KCP context's {(ctx.NC_pad, ctx.R)}"
+            )
         views = ws.views("bwd" if call.backward else "fwd")
         values: dict[str, Any] = dict(vars(views))
         for name in cake_backend.TABLE_NAMES[:4]:
             values[name] = ctx.tables[name]
         values["seg_chunk_start"] = call.tb.hp.device_tables["seg_chunk_start"]
-        values.update(num_seqs=p.N, num_chunks_pad=p.NC_pad, num_heads=p.H, group=1, num_segments=p.NSEG, segments=p.P)
+        values.update(
+            num_seqs=p.N,
+            num_chunks_pad=p.NC_pad,
+            num_heads=p.H,
+            group=1,
+            num_segments=p.NSEG,
+            segments=p.P,
+        )
         values.update(call.ops)
         values.update(h2d=views.h.view(-1, D), scale=call.scale)
         if call.backward:
@@ -352,7 +425,9 @@ class KernelBackend(Backend):
             values["out"] = call.out
         if call.grads is not None:
             values.update(call.grads)
-        if name == "fwd_prep" and call.backward:  # replay: the backward layout's prep without the saved copies
+        if (
+            name == "fwd_prep" and call.backward
+        ):  # replay: the backward layout's prep without the saved copies
             name, extra = "bwd_prep", {"saved": None}
         if name == "bwd_prep":
             saved = extra.pop("saved", None)
@@ -360,16 +435,36 @@ class KernelBackend(Backend):
                 extra.update(aqk_src=views.akk_int, akk_src=views.akk_int, copy_saved=0)
             else:
                 if saved.Aqk is None or saved.Akk is None:
-                    raise ValueError("saved: the saved set has no Aqk / Akk rows (forward without save_for_backward?)")
-                _check(saved.Aqk, "saved.Aqk", (call.T_r, call.H, BT), torch.bfloat16, call.device)
-                _check(saved.Akk, "saved.Akk", (call.T_r, call.H, BT), torch.bfloat16, call.device)
+                    raise ValueError(
+                        "saved: the saved set has no Aqk / Akk rows (forward without save_for_backward?)"
+                    )
+                _check(
+                    saved.Aqk,
+                    "saved.Aqk",
+                    (call.T_r, call.H, BT),
+                    torch.bfloat16,
+                    call.device,
+                )
+                _check(
+                    saved.Akk,
+                    "saved.Akk",
+                    (call.T_r, call.H, BT),
+                    torch.bfloat16,
+                    call.device,
+                )
                 extra.update(aqk_src=saved.Aqk, akk_src=saved.Akk, copy_saved=1)
                 if self._spec3_pending:
-                    self._spec3_forward_rows(call)  # before the backward's prep: the layouts share the arena
+                    self._spec3_forward_rows(
+                        call
+                    )  # before the backward's prep: the layouts share the arena
         elif name == "fwd_intra":
             if int(extra.get("write_ext", 0)):
-                aqk = call.scratch["Aqk"] = _alloc((call.T_r, call.H, BT), torch.bfloat16, call.device)
-                akk = call.scratch["Akk"] = _alloc((call.T_r, call.H, BT), torch.bfloat16, call.device)
+                aqk = call.scratch["Aqk"] = _alloc(
+                    (call.T_r, call.H, BT), torch.bfloat16, call.device
+                )
+                akk = call.scratch["Akk"] = _alloc(
+                    (call.T_r, call.H, BT), torch.bfloat16, call.device
+                )
                 extra.update(aqk_ext=aqk, akk_ext=akk)
             else:  # not written: any BF16 tensor serves as the unused pointer (as cake_backend does)
                 extra.update(aqk_ext=views.akk_int, akk_ext=views.akk_int)
@@ -383,7 +478,12 @@ class KernelBackend(Backend):
         ws = call.local
         a = ws.views("fwd")
         vals = {**call.local_values, **vars(a)}
-        vals.update(h2d=a.h.view(-1, D), aqk_ext=a.akk_int, akk_ext=a.akk_int, out=call.grads["dv"])
+        vals.update(
+            h2d=a.h.view(-1, D),
+            aqk_ext=a.akk_int,
+            akk_ext=a.akk_int,
+            out=call.grads["dv"],
+        )
         ws.run("fwd_prep", vals)
         ws.run("fwd_intra", {**vals, "write_ext": 0, "write_int": 1})
         ws.run("wy", vals)
@@ -396,7 +496,14 @@ class KernelBackend(Backend):
         rows = torch.arange(R, device=call.device)
         lens = torch.tensor(list(ctx.chunk_len), dtype=torch.int64, device=call.device)
         real = (rows % BT) < lens[rows // BT]
-        result: dict[str, Any] = {"checked": True, "T_r": call.T_r, "H": call.H, "R": R, "rows": {}, "equal": True}
+        result: dict[str, Any] = {
+            "checked": True,
+            "T_r": call.T_r,
+            "H": call.H,
+            "R": R,
+            "rows": {},
+            "equal": True,
+        }
         for n in _SPEC3_ROWS:
             x, y = getattr(b, n), ref[n]
             it = torch.int32 if x.dtype == torch.float32 else torch.int16
@@ -407,10 +514,14 @@ class KernelBackend(Backend):
                 result["equal"] = False
         self.spec3 = call.scratch["spec3"] = result
         if not result["equal"] and os.environ.get(SPEC3_ENV, "1") != "warn":
-            raise KcpPreconditionError(f"SPEC-3: bwd_prep + wy differ from fwd_prep + wy on real rows: {result['rows']}")
+            raise KcpPreconditionError(
+                f"SPEC-3: bwd_prep + wy differ from fwd_prep + wy on real rows: {result['rows']}"
+            )
 
     # -- KCP programs (positional ABI of FINAL_DESIGN §14 with rulings P1-R1 / P1-R3)
-    def abi(self, name: str, args: dict[str, Any]) -> tuple[str, list[Any], int, dict[str, Any]]:
+    def abi(
+        self, name: str, args: dict[str, Any]
+    ) -> tuple[str, list[Any], int, dict[str, Any]]:
         """``(program, positional ABI arguments, grid x, variant)`` of one abstract launch ``args`` of program
         ``name`` (the integration contract with the registry: ``program`` in ``fwdh_offset`` / ``fwdh_tape`` /
         ``dhu_offset`` / ``dhu_tape`` / ``transfer_walk`` / ``affine_merge``; ``variant`` = the K3 test knobs)."""
@@ -424,34 +535,71 @@ class KernelBackend(Backend):
             abi, grid = self._transfer_args(call, args)
         else:
             abi, grid = self._merge_args(call, args)
-        variant = {"precision_mode": call.precision_mode, "transfer_walk": call.transfer_walk} if prog == "transfer_walk" else {}
+        variant = (
+            {"precision_mode": call.precision_mode, "transfer_walk": call.transfer_walk}
+            if prog == "transfer_walk"
+            else {}
+        )
         if prog == "affine_merge" and args["cols_per_cta"] is not None:
-            variant = {"cols_per_cta": int(args["cols_per_cta"])}  # D1: an explicit record instead of the registry's choice
+            variant = {
+                "cols_per_cta": int(args["cols_per_cta"])
+            }  # D1: an explicit record instead of the registry's choice
         return prog, abi, int(grid), variant
 
     def run(self, name: str, args: dict[str, Any]) -> None:
         call: KcpCall = args["_call"]
         prog, abi, grid, variant = self.abi(name, args)
-        self.programs().launch(prog, abi, grid=grid, device_index=call.device.index, name=name, args=args, **variant)
+        self.programs().launch(
+            prog,
+            abi,
+            grid=grid,
+            device_index=call.device.index,
+            name=name,
+            args=args,
+            **variant,
+        )
 
-    def _walk_common(self, call: KcpCall, args: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, int, Any]:
+    def _walk_common(
+        self, call: KcpCall, args: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, int, Any]:
         walk = args["walk"]
         walk_seg = self._dev_table("walk", walk, call.device, torch.int32)
-        return walk_seg, call.tb.hp.device_tables["seg_chunk_start"], int(call.tb.NSEG), call.scratch["views"]
+        return (
+            walk_seg,
+            call.tb.hp.device_tables["seg_chunk_start"],
+            int(call.tb.NSEG),
+            call.scratch["views"],
+        )
 
     def _block(self, call: KcpCall, ix: Indexed | None) -> _Block:
         """The kernel's view of an :class:`Indexed` pool; ``None`` (or no slot) = the zero state: every index ``-1``
         and a never-read base pointer."""
         nseg = int(call.tb.NSEG)
         if ix is None or ix.n_slots == 0:
-            return _Block(call.buf("eye"), self._dev_table("neg", [-1] * nseg, call.device, torch.int32), call.H, 1, 1)
+            return _Block(
+                call.buf("eye"),
+                self._dev_table("neg", [-1] * nseg, call.device, torch.int32),
+                call.H,
+                1,
+                1,
+            )
         base_tile, hg, n, stride = ix.addressing(call.H)
         if len(ix.index) != nseg:
-            raise ValueError(f"Indexed: {len(ix.index)} segment entries, the plan has NSEG = {nseg}")
-        ptr = ix.pool.view(-1)[base_tile * TILE:] if base_tile else ix.pool.view(-1)
-        return _Block(ptr, self._dev_table("index", ix.index, call.device, torch.int32), int(hg), int(n), int(stride))
+            raise ValueError(
+                f"Indexed: {len(ix.index)} segment entries, the plan has NSEG = {nseg}"
+            )
+        ptr = ix.pool.view(-1)[base_tile * TILE :] if base_tile else ix.pool.view(-1)
+        return _Block(
+            ptr,
+            self._dev_table("index", ix.index, call.device, torch.int32),
+            int(hg),
+            int(n),
+            int(stride),
+        )
 
-    def _fwdh_args(self, call: KcpCall, args: dict[str, Any], *, tape: bool) -> tuple[list[Any], int]:
+    def _fwdh_args(
+        self, call: KcpCall, args: dict[str, Any], *, tape: bool
+    ) -> tuple[list[Any], int]:
         walk_seg, seg_table, nseg, v = self._walk_common(call, args)
         if tape:  # reads h0, writes the tapes; the out block is unused
             h0 = self._block(call, args.get("h0"))
@@ -459,12 +607,32 @@ class KernelBackend(Backend):
         else:  # walks from zero, writes the indexed final states; the h0 block is unused
             out = self._block(call, args.get("out"))
             h0 = out
-        abi = [v.w, v.kg, v.u, v.gk, call.H, seg_table, nseg, walk_seg,
-               h0.ptr, h0.index, h0.hg, h0.n, out.ptr, out.index, out.hg, out.n, out.stride if not tape else h0.stride,
-               v.h, v.v_new]
+        abi = [
+            v.w,
+            v.kg,
+            v.u,
+            v.gk,
+            call.H,
+            seg_table,
+            nseg,
+            walk_seg,
+            h0.ptr,
+            h0.index,
+            h0.hg,
+            h0.n,
+            out.ptr,
+            out.index,
+            out.hg,
+            out.n,
+            out.stride if not tape else h0.stride,
+            v.h,
+            v.v_new,
+        ]
         return abi, len(args["walk"]) * call.H
 
-    def _dhu_args(self, call: KcpCall, args: dict[str, Any], *, tape: bool) -> tuple[list[Any], int]:
+    def _dhu_args(
+        self, call: KcpCall, args: dict[str, Any], *, tape: bool
+    ) -> tuple[list[Any], int]:
         walk_seg, seg_table, nseg, v = self._walk_common(call, args)
         if tape:
             dht = self._block(call, args.get("dht"))
@@ -472,16 +640,55 @@ class KernelBackend(Backend):
         else:
             out = self._block(call, args.get("out"))
             dht = out
-        abi = [v.kg, v.qg, v.w, v.do_int, v.dv1, v.gk, call.H, seg_table, nseg, float(call.scale), walk_seg,
-               dht.ptr, dht.index, dht.hg, dht.n, out.ptr, out.index, out.hg, out.n, out.stride if not tape else dht.stride,
-               v.dh, v.dv2]
+        abi = [
+            v.kg,
+            v.qg,
+            v.w,
+            v.do_int,
+            v.dv1,
+            v.gk,
+            call.H,
+            seg_table,
+            nseg,
+            float(call.scale),
+            walk_seg,
+            dht.ptr,
+            dht.index,
+            dht.hg,
+            dht.n,
+            out.ptr,
+            out.index,
+            out.hg,
+            out.n,
+            out.stride if not tape else dht.stride,
+            v.dh,
+            v.dv2,
+        ]
         return abi, len(args["walk"]) * call.H
 
-    def _transfer_args(self, call: KcpCall, args: dict[str, Any]) -> tuple[list[Any], int]:
+    def _transfer_args(
+        self, call: KcpCall, args: dict[str, Any]
+    ) -> tuple[list[Any], int]:
         walk_seg, seg_table, nseg, v = self._walk_common(call, args)
         out = self._block(call, args["out"])
-        abi = [v.w, v.kg, v.u, v.gk, call.H, seg_table, nseg, walk_seg, out.ptr, out.index, out.hg, out.n, out.stride,
-               int(args["init_mode"]), int(args["use_u"]), int(args["write_transposed"])]
+        abi = [
+            v.w,
+            v.kg,
+            v.u,
+            v.gk,
+            call.H,
+            seg_table,
+            nseg,
+            walk_seg,
+            out.ptr,
+            out.index,
+            out.hg,
+            out.n,
+            out.stride,
+            int(args["init_mode"]),
+            int(args["use_u"]),
+            int(args["write_transposed"]),
+        ]
         return abi, len(args["walk"]) * call.H
 
     def _merge_args(self, call: KcpCall, args: dict[str, Any]) -> tuple[list[Any], int]:
@@ -489,25 +696,43 @@ class KernelBackend(Backend):
         if id(ch) not in self._checked_chains:
             ch.check_alignment()
             self._checked_chains.add(id(ch))
-        args["cols_per_cta"] = cols = merge_cols_per_cta(ch.ncols, ch.n_chains, call.cols_rule)
-        call.merge_log.append((str(args.get("family")), int(ch.ncols), int(ch.n_chains), cols))  # D1 evidence: None = registry record
+        args["cols_per_cta"] = cols = merge_cols_per_cta(
+            ch.ncols, ch.n_chains, call.cols_rule
+        )
+        call.merge_log.append(
+            (str(args.get("family")), int(ch.ncols), int(ch.n_chains), cols)
+        )  # D1 evidence: None = registry record
         cols = self.cols_per_cta if cols is None else cols
         if ch.ncols % cols:
-            raise ValueError(f"ncols {ch.ncols} is not a multiple of cols_per_cta {cols}")
+            raise ValueError(
+                f"ncols {ch.ncols} is not a multiple of cols_per_cta {cols}"
+            )
         dev = call.device
         y = args["y"]
         m = args["m"]
-        c = args["c"] if args.get("c") is not None else y  # never read when every elem_c is -1
-        x0 = args["x0"] if args.get("x0") is not None else y  # never read when every x0_index is -1
+        c = (
+            args["c"] if args.get("c") is not None else y
+        )  # never read when every elem_c is -1
+        x0 = (
+            args["x0"] if args.get("x0") is not None else y
+        )  # never read when every x0_index is -1
         tag = ("chain", id(ch))
-        abi = [m, c, x0, y,
-               self._dev_table(tag + ("start",), ch.chain_start, dev, torch.int32),
-               self._dev_table(tag + ("m",), ch.elem_m, dev, torch.int64),
-               self._dev_table(tag + ("c",), ch.elem_c, dev, torch.int64),
-               self._dev_table(tag + ("y",), ch.elem_y, dev, torch.int64),
-               self._dev_table(tag + ("x0",), ch.x0_index, dev, torch.int64),
-               self._dev_table(tag + ("yf",), ch.y_final, dev, torch.int64),
-               int(ch.ncols), int(args["transpose_m"]), int(args["write_states"]), cols]
+        abi = [
+            m,
+            c,
+            x0,
+            y,
+            self._dev_table(tag + ("start",), ch.chain_start, dev, torch.int32),
+            self._dev_table(tag + ("m",), ch.elem_m, dev, torch.int64),
+            self._dev_table(tag + ("c",), ch.elem_c, dev, torch.int64),
+            self._dev_table(tag + ("y",), ch.elem_y, dev, torch.int64),
+            self._dev_table(tag + ("x0",), ch.x0_index, dev, torch.int64),
+            self._dev_table(tag + ("yf",), ch.y_final, dev, torch.int64),
+            int(ch.ncols),
+            int(args["transpose_m"]),
+            int(args["write_states"]),
+            cols,
+        ]
         return abi, ch.n_chains * (ch.ncols // cols)
 
 
@@ -524,15 +749,85 @@ def merge_cols_per_cta(ncols: int, n_chains: int, rule: str) -> int | None:
 # Kernel parameter names of the frozen ABIs (K1 a217181fa, K2 a217181fa, K3 0637ec9f4, K4 eaa97cf5e): the logical
 # vocabulary of the registry records when the FI-rendered provider launches by name.
 ABI_PARAMS = {
-    "fwdh_offset": ("w_tma", "kg_tma", "u", "gk", "num_heads", "seq_chunk_start", "num_seqs", "walk_seg", "h0", "h0_index",
-                    "h0_hg", "h0_n", "out", "out_index", "out_hg", "out_n", "tile_stride", "h_tape", "v_new"),
-    "dhu_offset": ("kg_tma", "qg_tma", "w_tma", "do_tma", "dv1", "gk", "num_heads", "seq_chunk_start", "num_seqs", "scale",
-                   "walk_seg", "dht", "dht_index", "dht_hg", "dht_n", "out", "out_index", "out_hg", "out_n", "tile_stride",
-                   "dh_tape", "dv2"),
-    "transfer_walk": ("w_tma", "kg_tma", "u", "gk", "num_heads", "seq_chunk_start", "num_seqs", "walk_seg", "out", "out_index",
-                      "out_hg", "out_n", "tile_stride", "init_mode", "use_u", "write_transposed"),
-    "affine_merge": ("m", "c", "x0", "y", "chain_start", "elem_m", "elem_c", "elem_y", "x0_index", "y_final", "ncols",
-                     "transpose_m", "write_states", "cols_per_cta"),
+    "fwdh_offset": (
+        "w_tma",
+        "kg_tma",
+        "u",
+        "gk",
+        "num_heads",
+        "seq_chunk_start",
+        "num_seqs",
+        "walk_seg",
+        "h0",
+        "h0_index",
+        "h0_hg",
+        "h0_n",
+        "out",
+        "out_index",
+        "out_hg",
+        "out_n",
+        "tile_stride",
+        "h_tape",
+        "v_new",
+    ),
+    "dhu_offset": (
+        "kg_tma",
+        "qg_tma",
+        "w_tma",
+        "do_tma",
+        "dv1",
+        "gk",
+        "num_heads",
+        "seq_chunk_start",
+        "num_seqs",
+        "scale",
+        "walk_seg",
+        "dht",
+        "dht_index",
+        "dht_hg",
+        "dht_n",
+        "out",
+        "out_index",
+        "out_hg",
+        "out_n",
+        "tile_stride",
+        "dh_tape",
+        "dv2",
+    ),
+    "transfer_walk": (
+        "w_tma",
+        "kg_tma",
+        "u",
+        "gk",
+        "num_heads",
+        "seq_chunk_start",
+        "num_seqs",
+        "walk_seg",
+        "out",
+        "out_index",
+        "out_hg",
+        "out_n",
+        "tile_stride",
+        "init_mode",
+        "use_u",
+        "write_transposed",
+    ),
+    "affine_merge": (
+        "m",
+        "c",
+        "x0",
+        "y",
+        "chain_start",
+        "elem_m",
+        "elem_c",
+        "elem_y",
+        "x0_index",
+        "y_final",
+        "ncols",
+        "transpose_m",
+        "write_states",
+        "cols_per_cta",
+    ),
 }
 ABI_PARAMS["fwdh_tape"] = ABI_PARAMS["fwdh_offset"]
 ABI_PARAMS["dhu_tape"] = ABI_PARAMS["dhu_offset"]
@@ -550,17 +845,40 @@ class _FiPrograms:
     def __init__(self, jit: Any) -> None:
         self.jit = jit
 
-    def launch(self, program: str, abi: list[Any], *, grid: int, device_index: int, precision_mode: int = 0,
-               transfer_walk: str = "tf32_hilo", name: str | None = None, args: dict[str, Any] | None = None,
-               cols_per_cta: int | None = None) -> None:
+    def launch(
+        self,
+        program: str,
+        abi: list[Any],
+        *,
+        grid: int,
+        device_index: int,
+        precision_mode: int = 0,
+        transfer_walk: str = "tf32_hilo",
+        name: str | None = None,
+        args: dict[str, Any] | None = None,
+        cols_per_cta: int | None = None,
+    ) -> None:
         jit = self.jit
-        if program == "affine_merge" and cols_per_cta is not None:  # D1 cols_rule: the explicit `_c<cols>` record
+        if (
+            program == "affine_merge" and cols_per_cta is not None
+        ):  # D1 cols_rule: the explicit `_c<cols>` record
             values = dict(zip(ABI_PARAMS[program], abi, strict=True))
-            jit.run_module(f"kcp_affine_merge_c{int(cols_per_cta)}", values, grid=(int(grid), 1, 1), device_index=device_index)
+            jit.run_module(
+                f"kcp_affine_merge_c{int(cols_per_cta)}",
+                values,
+                grid=(int(grid), 1, 1),
+                device_index=device_index,
+            )
             return
         if hasattr(jit, "launch_kcp"):
-            jit.launch_kcp(program, abi, grid=grid, device_index=device_index, precision_mode=precision_mode,
-                           transfer_walk=transfer_walk)
+            jit.launch_kcp(
+                program,
+                abi,
+                grid=grid,
+                device_index=device_index,
+                precision_mode=precision_mode,
+                transfer_walk=transfer_walk,
+            )
             return
         if hasattr(jit, "run_program") and name is not None and args is not None:
             jit.run_program(name, args, device_index=device_index)
@@ -568,13 +886,19 @@ class _FiPrograms:
         record = f"kcp_{program}"
         if program == "transfer_walk":
             if transfer_walk != "tf32_hilo":
-                record = "kcp_transfer_walk_bf16x3" + ("_hw64" if transfer_walk == "bf16x3_hw64" else "")
+                record = "kcp_transfer_walk_bf16x3" + (
+                    "_hw64" if transfer_walk == "bf16x3_hw64" else ""
+                )
             elif precision_mode:
                 record += {1: "_three_mma", 2: "_plain_tf32"}[int(precision_mode)]
         elif program == "affine_merge":
-            record += "_c8" if int(abi[ABI_PARAMS[program].index("ncols")]) == D else "_c16"
+            record += (
+                "_c8" if int(abi[ABI_PARAMS[program].index("ncols")]) == D else "_c16"
+            )
         values = dict(zip(ABI_PARAMS[program], abi, strict=True))
-        jit.run_module(record, values, grid=(int(grid), 1, 1), device_index=device_index)
+        jit.run_module(
+            record, values, grid=(int(grid), 1, 1), device_index=device_index
+        )
 
 
 _BACKEND: Backend = KernelBackend()
@@ -620,7 +944,7 @@ class Indexed:
         base = self.tiles[0][0]
         for stride in (1, 2):
             for hg in range(1, H + 1):
-                if H > hg:
+                if hg < H:
                     span = self.tiles[0][hg] - base
                     if span <= 0 or span % (hg * stride):
                         continue
@@ -630,7 +954,9 @@ class Indexed:
                 else:
                     n = n_slots
                 if all(
-                    self.tiles[s][h] == base + tile_index(h, s, hg, n) * stride for s in range(n_slots) for h in range(H)
+                    self.tiles[s][h] == base + tile_index(h, s, hg, n) * stride
+                    for s in range(n_slots)
+                    for h in range(H)
                 ):
                     return base, hg, n, stride
         raise ValueError("Indexed: the tile table has no two-integer (hg, n) form")
@@ -660,10 +986,14 @@ class Chains:
     def n_elems(self) -> int:
         return len(self.elem_m)
 
-    def add(self, elems: Sequence[tuple[int, int, int]], *, x0: int = -1, y_final: int = -1) -> None:
+    def add(
+        self, elems: Sequence[tuple[int, int, int]], *, x0: int = -1, y_final: int = -1
+    ) -> None:
         for m, c, y in elems:
             if m < 0:
-                raise ValueError("Chains: every element needs an operator tile (elem_m >= 0)")
+                raise ValueError(
+                    "Chains: every element needs an operator tile (elem_m >= 0)"
+                )
             self.elem_m.append(int(m))
             self.elem_c.append(int(c))
             self.elem_y.append(int(y))
@@ -674,13 +1004,20 @@ class Chains:
     def check_alignment(self) -> None:
         for name in ("elem_m", "elem_c", "elem_y", "x0_index", "y_final"):
             if any(v % 4 for v in getattr(self, name) if v >= 0):
-                raise ValueError(f"Chains: {name} holds an offset that is not a multiple of 4 floats")
+                raise ValueError(
+                    f"Chains: {name} holds an offset that is not a multiple of 4 floats"
+                )
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "ncols": self.ncols, "n_chains": self.n_chains, "chain_start": list(self.chain_start),
-            "elem_m": list(self.elem_m), "elem_c": list(self.elem_c), "elem_y": list(self.elem_y),
-            "x0_index": list(self.x0_index), "y_final": list(self.y_final),
+            "ncols": self.ncols,
+            "n_chains": self.n_chains,
+            "chain_start": list(self.chain_start),
+            "elem_m": list(self.elem_m),
+            "elem_c": list(self.elem_c),
+            "elem_y": list(self.elem_y),
+            "x0_index": list(self.x0_index),
+            "y_final": list(self.y_final),
         }
 
 
@@ -711,24 +1048,43 @@ class _Tables:
     adjoint carries); each is one launch (ruling P1-R3 fixes the pair orientations ``[B_f | M_f^T]`` and ``[d_f | M_f]``).
     """
 
-    def __init__(self, ctx: Any, H: int, *, fused_walks: int = FUSED_WALKS_DEFAULT) -> None:
+    _ring: _Ring | None = None  # the ring-exchange tables, derived on first use
+
+    def __init__(
+        self, ctx: Any, H: int, *, fused_walks: int = FUSED_WALKS_DEFAULT
+    ) -> None:
         self.ctx = ctx
         self.H = H = int(H)
-        self.fused_walks = int(fused_walks)  # lever L-B (P2-R1 / P2-R4 bundle): one base pointer per tape phase
+        self.fused_walks = int(
+            fused_walks
+        )  # lever L-B (P2-R1 / P2-R4 bundle): one base pointer per tape phase
         hp = self.hp = ctx.heads(H)
         self.P, self.NSEG = int(hp.P), int(hp.NSEG)
         self.Hg, self.Hg_r = int(hp.Hg), int(hp.Hg_r)
         self.n_frag, self.T_r = int(ctx.n_frag), int(ctx.T_r)
         self.n_in, self.n_out = int(ctx.n_in), int(ctx.n_out)
         self.max_hops = max(int(ctx.n_d_max) - 1, 0)
-        defaults = {"fwd_m_off": SUMMARY_TILE, "fwd_b_off": SUMMARY_TILE, "fwd_out_off": TILE, "adj_d_off_d": TILE,
-                    "adj_d_off_dm": SUMMARY_TILE, "adj_m_off_b1": SUMMARY_TILE, "adj_m_off_c1": SUMMARY_TILE, "adj_out_off": TILE}
-        self.hg_stride = {**defaults, **{k: int(v) for k, v in (getattr(hp, "hg_stride", None) or {}).items()}}
+        defaults = {
+            "fwd_m_off": SUMMARY_TILE,
+            "fwd_b_off": SUMMARY_TILE,
+            "fwd_out_off": TILE,
+            "adj_d_off_d": TILE,
+            "adj_d_off_dm": SUMMARY_TILE,
+            "adj_m_off_b1": SUMMARY_TILE,
+            "adj_m_off_c1": SUMMARY_TILE,
+            "adj_out_off": TILE,
+        }
+        self.hg_stride = {
+            **defaults,
+            **{k: int(v) for k, v in (getattr(hp, "hg_stride", None) or {}).items()},
+        }
         P, NSEG = self.P, self.NSEG
         self.frags = frags = list(ctx.fragments)
         in_slot, out_slot = list(ctx.in_slot), list(ctx.out_slot)
         live = [f for f in frags if f.length > 0]
-        starts = [f for f in live if not f.crossing_in]  # document-start fragments (single-fragment documents too)
+        starts = [
+            f for f in live if not f.crossing_in
+        ]  # document-start fragments (single-fragment documents too)
         ins = [f for f in live if f.crossing_in]
         outs = [f for f in live if f.crossing_out]
         ends = [f for f in live if not f.crossing_out]  # document-last fragments
@@ -742,16 +1098,26 @@ class _Tables:
             return sorted(out, key=lambda s: (-(seg_table[s + 1] - seg_table[s]), s))
 
         # -- walk lists (segments)
-        self.walk_offset = [int(s) for s in hp.walk_seg_offset]  # K1 / K3 offset walks (crossing-out frags at P = 1, all at P > 1)
+        self.walk_offset = [
+            int(s) for s in hp.walk_seg_offset
+        ]  # K1 / K3 offset walks (crossing-out frags at P = 1, all at P > 1)
         self.walk_all = list(range(NSEG))
-        self.walk_start = segs(starts, range(P))  # tape under c1: zero (p = 0) / carried (p >= 1) initial states
+        self.walk_start = segs(
+            starts, range(P)
+        )  # tape under c1: zero (p = 0) / carried (p >= 1) initial states
         self.walk_in_p0 = segs(ins, [0])  # tape after c2 from S_in
         self.walk_in_p1 = segs(ins, range(1, P))  # tape after c2 from the carry plane
-        self.walk_end = segs(ends, range(P))  # adjoint tape under b2: zero (p = P - 1) / carried final adjoints
+        self.walk_end = segs(
+            ends, range(P)
+        )  # adjoint tape under b2: zero (p = P - 1) / carried final adjoints
         self.walk_cross_last = segs(outs, [P - 1])  # adjoint tape after b2 from dS_out
-        self.walk_cross_rest = segs(outs, range(P - 1))  # adjoint tape after b2 from the adjoint carries
+        self.walk_cross_rest = segs(
+            outs, range(P - 1)
+        )  # adjoint tape after b2 from the adjoint carries
         self.walk_in = segs(ins, [0]) if P == 1 else self.walk_all  # K2 offset walk
-        self.walk_m_b1 = segs([f for f in ins if f.crossing_out], [0]) if P == 1 else self.walk_all  # K3 M-only (b1)
+        self.walk_m_b1 = (
+            segs([f for f in ins if f.crossing_out], [0]) if P == 1 else self.walk_all
+        )  # K3 M-only (b1)
         # fused_walks (L-B): one launch per tape phase -- every live segment after wait(c2) / wait(b2) (schedule
         # wait_first), or the crossing-in (crossing-out) fragments' segments when the document-start (document-last)
         # walk stays under the collective (schedule overlap)
@@ -763,18 +1129,29 @@ class _Tables:
         self.carry_index = tuple(int(i) for i in hp.carry_index)
         self.dht_index = tuple(int(i) for i in hp.dht_index)
         self.dcarry_index = tuple(int(i) for i in hp.dcarry_index)
-        self.h0_index_fused = tuple(int(i) for i in hp.h0_index_fused)  # L-B: the carry plane (P > 1) / S_in (P = 1)
-        self.dht_index_fused = tuple(int(i) for i in hp.dht_index_fused)  # L-B: the carry plane (P > 1) / dS_out (P = 1)
+        self.h0_index_fused = tuple(
+            int(i) for i in hp.h0_index_fused
+        )  # L-B: the carry plane (P > 1) / S_in (P = 1)
+        self.dht_index_fused = tuple(
+            int(i) for i in hp.dht_index_fused
+        )  # L-B: the carry plane (P > 1) / dS_out (P = 1)
         self.out_index = tuple(int(i) for i in hp.out_index)
-        self.in_index = tuple(in_slot[s // P] if (s % P == 0 and frags[s // P].crossing_in) else -1 for s in range(NSEG))
+        self.in_index = tuple(
+            in_slot[s // P] if (s % P == 0 and frags[s // P].crossing_in) else -1
+            for s in range(NSEG)
+        )
         self.m_b1_index = tuple(
-            in_slot[s // P] if (s % P == 0 and frags[s // P].crossing_in and frags[s // P].crossing_out) else -1
+            in_slot[s // P]
+            if (s % P == 0 and frags[s // P].crossing_in and frags[s // P].crossing_out)
+            else -1
             for s in range(NSEG)
         )
         self.seg_index = tuple(range(NSEG))
         # -- tile tables [slot][h]
         self.c1_b_tiles = tuple(tuple(2 * int(t) for t in row) for row in hp.out_tile)
-        self.c1_m_tiles = tuple(tuple(2 * int(t) + 1 for t in row) for row in hp.out_tile)
+        self.c1_m_tiles = tuple(
+            tuple(2 * int(t) + 1 for t in row) for row in hp.out_tile
+        )
         self.s_in_tiles = tuple(tuple(int(t) for t in row) for row in hp.h0_tile)
         self.ds_out_tiles = tuple(tuple(int(t) for t in row) for row in hp.dht_tile)
         self.b1_d_tiles = {
@@ -782,50 +1159,155 @@ class _Tables:
             "dm": tuple(tuple(int(t) for t in row) for row in hp.b1_d_tile_dm),
         }
         self.b1_m_tiles = tuple(tuple(int(t) for t in row) for row in hp.b1_m_tile_dm)
-        self.stage_tiles = tuple(tuple(s * H + h for h in range(H)) for s in range(NSEG))
+        self.stage_tiles = tuple(
+            tuple(s * H + h for h in range(H)) for s in range(NSEG)
+        )
         c1_tiles = int(hp.numel["c1_send"]) // TILE
-        self.mf_tiles = tuple(tuple(c1_tiles + o * H + h for h in range(H)) for o in range(self.n_out)) if P > 1 else ()
+        self.mf_tiles = (
+            tuple(
+                tuple(c1_tiles + o * H + h for h in range(H)) for o in range(self.n_out)
+            )
+            if P > 1
+            else ()
+        )
         n_carry = self.n_frag * (P - 1) if P > 1 else 0
-        if self.fused_walks and P > 1:  # L-B: + one slot per crossing fragment for the S_in / dS_out copies
+        if (
+            self.fused_walks and P > 1
+        ):  # L-B: + one slot per crossing fragment for the S_in / dS_out copies
             n_carry += max(self.n_in, self.n_out)
-        self.carry_tiles = tuple(tuple(c * H + h for h in range(H)) for c in range(n_carry))
+        self.carry_tiles = tuple(
+            tuple(c * H + h for h in range(H)) for c in range(n_carry)
+        )
         # -- splits (elements) and pool sizes (elements)
         self.splits = {k: tuple(int(x) for x in v) for k, v in hp.splits.items()}
         numel = {k: int(v) for k, v in hp.numel.items()}
         self.numel = numel
         self.sizes = {
-            "c1_send": numel["c1_send"] + (self.n_out * H * TILE if P > 1 else 0), "c1_recv": numel["c1_recv"], "c2_send": numel["c2_send"], "S_in": numel["c2_recv"],
-            "b1_send": max(numel["b1_send_d"], numel["b1_send_dm"]), "b1_recv": max(numel["b1_recv_d"], numel["b1_recv_dm"]),
-            "b2_send": numel["b2_send"], "b2_recv": numel["b2_recv"],
-            "stage_b": NSEG * H * TILE if P > 1 else 0, "stage_m": NSEG * H * TILE if P > 1 else 0,
-            "carry": n_carry * H * TILE, "eye": TILE,
-            "ring_out": max(self.n_in, self.n_out) * H * TILE, "ring_in": max(self.n_in, self.n_out) * H * TILE,
+            "c1_send": numel["c1_send"] + (self.n_out * H * TILE if P > 1 else 0),
+            "c1_recv": numel["c1_recv"],
+            "c2_send": numel["c2_send"],
+            "S_in": numel["c2_recv"],
+            "b1_send": max(numel["b1_send_d"], numel["b1_send_dm"]),
+            "b1_recv": max(numel["b1_recv_d"], numel["b1_recv_dm"]),
+            "b2_send": numel["b2_send"],
+            "b2_recv": numel["b2_recv"],
+            "stage_b": NSEG * H * TILE if P > 1 else 0,
+            "stage_m": NSEG * H * TILE if P > 1 else 0,
+            "carry": n_carry * H * TILE,
+            "eye": TILE,
+            "ring_out": max(self.n_in, self.n_out) * H * TILE,
+            "ring_in": max(self.n_in, self.n_out) * H * TILE,
         }
         self._check_tiles()
         self._build_chains(starts, ins, outs, ends, in_slot, out_slot)
 
     # K4 chain families: the pools their offsets index, the operator orientation and the state publication.
     FAMILIES: dict[str, dict[str, Any]] = {
-        "fwd": {"m": "c1_recv", "c": "c1_recv", "x0": "c1_recv", "y": "c2_send", "tm": 0, "ws": 1},
-        "adj_b1": {"m": "b1_recv", "c": "b1_recv", "x0": "b1_recv", "y": "b2_send", "tm": 0, "ws": 1},
-        "adj_c1": {"m": "c1_recv", "c": "b1_recv", "x0": "b1_recv", "y": "b2_send", "tm": 1, "ws": 1},
-        "map": {"m": "stage_m", "c": "stage_b", "x0": "eye", "y": "c1_send", "tm": 0, "ws": 0},
-        "carry_start": {"m": "stage_m", "c": "stage_b", "x0": None, "y": "carry", "tm": 0, "ws": 1},
-        "carry_in": {"m": "stage_m", "c": "stage_b", "x0": "S_in", "y": "carry", "tm": 0, "ws": 1},
-        "tmap_d_d": {"m": "stage_m", "c": "stage_b", "x0": None, "y": "b1_send", "tm": 1, "ws": 0},
-        "tmap_d_dm": {"m": "stage_m", "c": "stage_b", "x0": None, "y": "b1_send", "tm": 1, "ws": 0},
-        "tmap_m": {"m": "stage_m", "c": None, "x0": "eye", "y": "b1_send", "tm": 0, "ws": 0},
-        "dcarry_end": {"m": "stage_m", "c": "stage_b", "x0": None, "y": "carry", "tm": 1, "ws": 1},
-        "dcarry_cross": {"m": "stage_m", "c": "stage_b", "x0": "b2_recv", "y": "carry", "tm": 1, "ws": 1},
+        "fwd": {
+            "m": "c1_recv",
+            "c": "c1_recv",
+            "x0": "c1_recv",
+            "y": "c2_send",
+            "tm": 0,
+            "ws": 1,
+        },
+        "adj_b1": {
+            "m": "b1_recv",
+            "c": "b1_recv",
+            "x0": "b1_recv",
+            "y": "b2_send",
+            "tm": 0,
+            "ws": 1,
+        },
+        "adj_c1": {
+            "m": "c1_recv",
+            "c": "b1_recv",
+            "x0": "b1_recv",
+            "y": "b2_send",
+            "tm": 1,
+            "ws": 1,
+        },
+        "map": {
+            "m": "stage_m",
+            "c": "stage_b",
+            "x0": "eye",
+            "y": "c1_send",
+            "tm": 0,
+            "ws": 0,
+        },
+        "carry_start": {
+            "m": "stage_m",
+            "c": "stage_b",
+            "x0": None,
+            "y": "carry",
+            "tm": 0,
+            "ws": 1,
+        },
+        "carry_in": {
+            "m": "stage_m",
+            "c": "stage_b",
+            "x0": "S_in",
+            "y": "carry",
+            "tm": 0,
+            "ws": 1,
+        },
+        "tmap_d_d": {
+            "m": "stage_m",
+            "c": "stage_b",
+            "x0": None,
+            "y": "b1_send",
+            "tm": 1,
+            "ws": 0,
+        },
+        "tmap_d_dm": {
+            "m": "stage_m",
+            "c": "stage_b",
+            "x0": None,
+            "y": "b1_send",
+            "tm": 1,
+            "ws": 0,
+        },
+        "tmap_m": {
+            "m": "stage_m",
+            "c": None,
+            "x0": "eye",
+            "y": "b1_send",
+            "tm": 0,
+            "ws": 0,
+        },
+        "dcarry_end": {
+            "m": "stage_m",
+            "c": "stage_b",
+            "x0": None,
+            "y": "carry",
+            "tm": 1,
+            "ws": 1,
+        },
+        "dcarry_cross": {
+            "m": "stage_m",
+            "c": "stage_b",
+            "x0": "b2_recv",
+            "y": "carry",
+            "tm": 1,
+            "ws": 1,
+        },
     }
     # the b1 pool bound of a family depends on the layout form it addresses
-    _B1_BOUND = {"tmap_d_d": "b1_send_d", "tmap_d_dm": "b1_send_dm", "tmap_m": "b1_send_dm", "adj_b1": "b1_recv_dm", "adj_c1": "b1_recv_d"}
+    _B1_BOUND = {
+        "tmap_d_d": "b1_send_d",
+        "tmap_d_dm": "b1_send_dm",
+        "tmap_m": "b1_send_dm",
+        "adj_b1": "b1_recv_dm",
+        "adj_c1": "b1_recv_d",
+    }
 
     def _check_tiles(self) -> None:
         def bound(name: str, tiles, limit_elems: int) -> None:
             top = max((t for row in tiles for t in row), default=-1)
             if (top + 1) * TILE > limit_elems:
-                raise ValueError(f"kcp tables: {name} addresses tile {top} beyond its pool of {limit_elems // TILE} tiles")
+                raise ValueError(
+                    f"kcp tables: {name} addresses tile {top} beyond its pool of {limit_elems // TILE} tiles"
+                )
 
         n = self.numel
         bound("c1 B tiles", self.c1_b_tiles, n["c1_send"])
@@ -838,20 +1320,37 @@ class _Tables:
         # the L-B tables address the fused carry plane (n_frag (P - 1) + max(n_in, n_out) slots; allocated only when
         # fused_walks is set, inert otherwise) at P > 1 and the S_in / dS_out pools at P = 1
         n_fused = self.n_frag * (self.P - 1) + max(self.n_in, self.n_out)
-        fused_pool = (n_fused, n_fused) if self.P > 1 else (len(self.s_in_tiles), len(self.ds_out_tiles))
-        for name, idx, n_slots in (("h0_index", self.h0_index, len(self.s_in_tiles)), ("dht_index", self.dht_index, len(self.ds_out_tiles)),
-                                   ("carry_index", self.carry_index, len(self.carry_tiles)), ("dcarry_index", self.dcarry_index, len(self.carry_tiles)),
-                                   ("in_index", self.in_index, len(self.b1_d_tiles["d"])), ("m_b1_index", self.m_b1_index, len(self.b1_m_tiles)),
-                                   ("h0_index_fused", self.h0_index_fused, fused_pool[0]), ("dht_index_fused", self.dht_index_fused, fused_pool[1])):
+        fused_pool = (
+            (n_fused, n_fused)
+            if self.P > 1
+            else (len(self.s_in_tiles), len(self.ds_out_tiles))
+        )
+        for name, idx, n_slots in (
+            ("h0_index", self.h0_index, len(self.s_in_tiles)),
+            ("dht_index", self.dht_index, len(self.ds_out_tiles)),
+            ("carry_index", self.carry_index, len(self.carry_tiles)),
+            ("dcarry_index", self.dcarry_index, len(self.carry_tiles)),
+            ("in_index", self.in_index, len(self.b1_d_tiles["d"])),
+            ("m_b1_index", self.m_b1_index, len(self.b1_m_tiles)),
+            ("h0_index_fused", self.h0_index_fused, fused_pool[0]),
+            ("dht_index_fused", self.dht_index_fused, fused_pool[1]),
+        ):
             if len(idx) != self.NSEG or any(i >= n_slots for i in idx):
-                raise ValueError(f"kcp tables: {name} is not a valid [NSEG] slot table of its pool")
+                raise ValueError(
+                    f"kcp tables: {name} is not a valid [NSEG] slot table of its pool"
+                )
         if self.P == 1 and any(i >= len(self.c1_b_tiles) for i in self.out_index):
             raise ValueError("kcp tables: out_index exceeds the c1 slots")
-        if self.P > 1 and (any(i >= self.NSEG for i in self.out_index) or len(self.walk_offset) != self.NSEG):
-            raise ValueError("kcp tables: at P > 1 the offset walk must visit every segment into its staging slot")
+        if self.P > 1 and (
+            any(i >= self.NSEG for i in self.out_index)
+            or len(self.walk_offset) != self.NSEG
+        ):
+            raise ValueError(
+                "kcp tables: at P > 1 the offset walk must visit every segment into its staging slot"
+            )
 
     def _build_chains(self, starts, ins, outs, ends, in_slot, out_slot) -> None:
-        hp, H, P = self.hp, self.H, self.P
+        H, P = self.H, self.P
         st = self.stage_tiles
         ch: dict[str, Chains] = {name: Chains() for name in self.FAMILIES}
         ch["fwd"] = self._owner_fwd()
@@ -868,40 +1367,90 @@ class _Tables:
             for f in outs:
                 S = [f.slot * P + p for p in range(P)]
                 for h in range(H):
-                    ch["map"].add([(mt(s, h), mt(s, h), -1) for s in S], y_final=self.c1_b_tiles[out_slot[f.slot]][h] * TILE)
-                    ch["map"].add([(mt(s, h), -1, -1) for s in S], x0=0, y_final=self.mf_tiles[out_slot[f.slot]][h] * TILE)
-            extra = self.n_frag * (P - 1)  # L-B: the extra carry slots hold the S_in (dS_out) copies of the fused form
+                    ch["map"].add(
+                        [(mt(s, h), mt(s, h), -1) for s in S],
+                        y_final=self.c1_b_tiles[out_slot[f.slot]][h] * TILE,
+                    )
+                    ch["map"].add(
+                        [(mt(s, h), -1, -1) for s in S],
+                        x0=0,
+                        y_final=self.mf_tiles[out_slot[f.slot]][h] * TILE,
+                    )
+            extra = (
+                self.n_frag * (P - 1)
+            )  # L-B: the extra carry slots hold the S_in (dS_out) copies of the fused form
 
-            def copy_slot(f, h: int, slot: int) -> int:  # elem_y of the first element = publish the entering state (P1-R1)
-                return self.carry_tiles[extra + slot][h] * TILE if self.fused_walks else -1
+            def copy_slot(
+                f, h: int, slot: int
+            ) -> (
+                int
+            ):  # elem_y of the first element = publish the entering state (P1-R1)
+                return (
+                    self.carry_tiles[extra + slot][h] * TILE if self.fused_walks else -1
+                )
 
             for name, fs in (("carry_start", starts), ("carry_in", ins)):
                 for f in fs:
                     for h in range(H):
-                        elems = [(mt(f.slot * P + p, h), mt(f.slot * P + p, h), carry(f, p - 1, h) if p >= 1 else -1) for p in range(P - 1)]
-                        x0 = self.s_in_tiles[in_slot[f.slot]][h] * TILE if name == "carry_in" else -1
+                        elems = [
+                            (
+                                mt(f.slot * P + p, h),
+                                mt(f.slot * P + p, h),
+                                carry(f, p - 1, h) if p >= 1 else -1,
+                            )
+                            for p in range(P - 1)
+                        ]
+                        x0 = (
+                            self.s_in_tiles[in_slot[f.slot]][h] * TILE
+                            if name == "carry_in"
+                            else -1
+                        )
                         if name == "carry_in":
-                            elems[0] = (elems[0][0], elems[0][1], copy_slot(f, h, in_slot[f.slot]))
+                            elems[0] = (
+                                elems[0][0],
+                                elems[0][1],
+                                copy_slot(f, h, in_slot[f.slot]),
+                            )
                         ch[name].add(elems, x0=x0, y_final=carry(f, P - 2, h))
             for form in ("d", "dm"):
                 for f in ins:
                     S = [f.slot * P + p for p in range(P)]
                     for h in range(H):
-                        ch[f"tmap_d_{form}"].add([(mt(s, h), mt(s, h), -1) for s in reversed(S)],
-                                                 y_final=self.b1_d_tiles[form][in_slot[f.slot]][h] * TILE)
+                        ch[f"tmap_d_{form}"].add(
+                            [(mt(s, h), mt(s, h), -1) for s in reversed(S)],
+                            y_final=self.b1_d_tiles[form][in_slot[f.slot]][h] * TILE,
+                        )
             for f in ins:
                 if f.crossing_out:
                     S = [f.slot * P + p for p in range(P)]
                     for h in range(H):
-                        ch["tmap_m"].add([(mt(s, h), -1, -1) for s in S], x0=0, y_final=self.b1_m_tiles[in_slot[f.slot]][h] * TILE)
+                        ch["tmap_m"].add(
+                            [(mt(s, h), -1, -1) for s in S],
+                            x0=0,
+                            y_final=self.b1_m_tiles[in_slot[f.slot]][h] * TILE,
+                        )
             for name, fs in (("dcarry_end", ends), ("dcarry_cross", outs)):
                 for f in fs:
                     for h in range(H):
-                        elems = [(mt(f.slot * P + p, h), mt(f.slot * P + p, h), carry(f, p, h) if p <= P - 2 else -1)
-                                 for p in range(P - 1, 0, -1)]
-                        x0 = self.ds_out_tiles[out_slot[f.slot]][h] * TILE if name == "dcarry_cross" else -1
+                        elems = [
+                            (
+                                mt(f.slot * P + p, h),
+                                mt(f.slot * P + p, h),
+                                carry(f, p, h) if p <= P - 2 else -1,
+                            )
+                            for p in range(P - 1, 0, -1)
+                        ]
+                        x0 = (
+                            self.ds_out_tiles[out_slot[f.slot]][h] * TILE
+                            if name == "dcarry_cross"
+                            else -1
+                        )
                         if name == "dcarry_cross":
-                            elems[0] = (elems[0][0], elems[0][1], copy_slot(f, h, out_slot[f.slot]))
+                            elems[0] = (
+                                elems[0][0],
+                                elems[0][1],
+                                copy_slot(f, h, out_slot[f.slot]),
+                            )
                         ch[name].add(elems, x0=x0, y_final=carry(f, 0, h))
         for name, c in ch.items():
             c.check_alignment()
@@ -910,19 +1459,35 @@ class _Tables:
 
     def _check_chain(self, name: str, c: Chains) -> None:
         spec = self.FAMILIES[name]
-        limits = {"c1_send": self.sizes["c1_send"], "c1_recv": self.numel["c1_recv"], "c2_send": self.numel["c2_send"],
-                  "S_in": self.numel["c2_recv"], "b2_send": self.numel["b2_send"], "b2_recv": self.numel["b2_recv"],
-                  "stage_b": self.sizes["stage_b"], "stage_m": self.sizes["stage_m"], "carry": self.sizes["carry"], "eye": TILE}
+        limits = {
+            "c1_send": self.sizes["c1_send"],
+            "c1_recv": self.numel["c1_recv"],
+            "c2_send": self.numel["c2_send"],
+            "S_in": self.numel["c2_recv"],
+            "b2_send": self.numel["b2_send"],
+            "b2_recv": self.numel["b2_recv"],
+            "stage_b": self.sizes["stage_b"],
+            "stage_m": self.sizes["stage_m"],
+            "carry": self.sizes["carry"],
+            "eye": TILE,
+        }
         b1 = self._B1_BOUND.get(name)
         if b1 is not None:
             limits["b1_send"] = limits["b1_recv"] = self.numel[b1]
-        for key, values in (("m", c.elem_m), ("c", c.elem_c), ("x0", c.x0_index), ("y", c.elem_y + c.y_final)):
+        for key, values in (
+            ("m", c.elem_m),
+            ("c", c.elem_c),
+            ("x0", c.x0_index),
+            ("y", c.elem_y + c.y_final),
+        ):
             pool = spec[key]
             top = max((v for v in values if v >= 0), default=-1)
             if top < 0:
                 continue
             if pool is None or top + TILE > limits[pool]:
-                raise ValueError(f"kcp tables: chain family {name}: {key} offset {top} beyond pool {pool}")
+                raise ValueError(
+                    f"kcp tables: chain family {name}: {key} offset {top} beyond pool {pool}"
+                )
 
     def _owner_fwd(self) -> Chains:
         """The owner's forward chains (FINAL_DESIGN §3.5): per document and owned head, from ``X0 = B_{f1}`` (the
@@ -930,14 +1495,28 @@ class _Tables:
         tiles, ``transpose_m = 0``); the state entering each element and the final state are the ``S_in`` of the
         element's fragment and of ``fn``, published into the c2 send layout."""
         hp, ch = self.hp, Chains()
-        sm, sb, so = self.hg_stride["fwd_m_off"], self.hg_stride["fwd_b_off"], self.hg_stride["fwd_out_off"]
+        sm, sb, so = (
+            self.hg_stride["fwd_m_off"],
+            self.hg_stride["fwd_b_off"],
+            self.hg_stride["fwd_out_off"],
+        )
         starts = [int(x) for x in hp.fwd_chain_start]
         for ci in range(len(starts) - 1):
             e0, e1 = starts[ci], starts[ci + 1]
             for hg in range(self.Hg_r):
-                elems = [(int(hp.fwd_m_off[e]) + hg * sm, int(hp.fwd_b_off[e]) + hg * sb, int(hp.fwd_out_off[e - 1]) + hg * so)
-                         for e in range(e0 + 1, e1)]
-                ch.add(elems, x0=int(hp.fwd_b_off[e0]) + hg * sb, y_final=int(hp.fwd_out_off[e1 - 1]) + hg * so)
+                elems = [
+                    (
+                        int(hp.fwd_m_off[e]) + hg * sm,
+                        int(hp.fwd_b_off[e]) + hg * sb,
+                        int(hp.fwd_out_off[e - 1]) + hg * so,
+                    )
+                    for e in range(e0 + 1, e1)
+                ]
+                ch.add(
+                    elems,
+                    x0=int(hp.fwd_b_off[e0]) + hg * sb,
+                    y_final=int(hp.fwd_out_off[e1 - 1]) + hg * so,
+                )
         return ch
 
     def _owner_adj(self, d_key: str, m_key: str) -> Chains:
@@ -949,14 +1528,28 @@ class _Tables:
         c1 ``M_f^T`` tiles); the head strides come from ``hp.hg_stride``."""
         hp, ch = self.hp, Chains()
         d_off, m_off = getattr(hp, d_key), getattr(hp, m_key)
-        sd, sm, so = self.hg_stride[d_key], self.hg_stride[m_key], self.hg_stride["adj_out_off"]
+        sd, sm, so = (
+            self.hg_stride[d_key],
+            self.hg_stride[m_key],
+            self.hg_stride["adj_out_off"],
+        )
         starts = [int(x) for x in hp.adj_chain_start]
         for ci in range(len(starts) - 1):
             e0, e1 = starts[ci], starts[ci + 1]
             for hg in range(self.Hg_r):
-                elems = [(int(m_off[e]) + hg * sm, int(d_off[e]) + hg * sd, int(hp.adj_out_off[e - 1]) + hg * so)
-                         for e in range(e0 + 1, e1)]
-                ch.add(elems, x0=int(d_off[e0]) + hg * sd, y_final=int(hp.adj_out_off[e1 - 1]) + hg * so)
+                elems = [
+                    (
+                        int(m_off[e]) + hg * sm,
+                        int(d_off[e]) + hg * sd,
+                        int(hp.adj_out_off[e - 1]) + hg * so,
+                    )
+                    for e in range(e0 + 1, e1)
+                ]
+                ch.add(
+                    elems,
+                    x0=int(d_off[e0]) + hg * sd,
+                    y_final=int(hp.adj_out_off[e1 - 1]) + hg * so,
+                )
         return ch
 
     def segment_tokens(self, seg: int) -> tuple[int, int]:
@@ -973,7 +1566,9 @@ class _Tables:
         """``(input_split_sizes, output_split_sizes)`` in elements of ``c1``, ``c2``, ``b1_d``, ``b1_dm`` or ``b2``."""
         if coll.startswith("b1_"):
             form = coll[3:]
-            return list(self.splits[f"b1_send_{form}"]), list(self.splits[f"b1_recv_{form}"])
+            return list(self.splits[f"b1_send_{form}"]), list(
+                self.splits[f"b1_recv_{form}"]
+            )
         return list(self.splits[f"{coll}_send"]), list(self.splits[f"{coll}_recv"])
 
     def device_tiles(self, tiles, device: torch.device) -> torch.Tensor:
@@ -988,18 +1583,48 @@ class _Tables:
         return t
 
     def pool_sizes(self, backward: bool) -> dict[str, int]:
-        names = ["c1_send", "c1_recv", "c2_send", "stage_b", "stage_m", "carry", "eye", "ring_out", "ring_in"]
+        names = [
+            "c1_send",
+            "c1_recv",
+            "c2_send",
+            "stage_b",
+            "stage_m",
+            "carry",
+            "eye",
+            "ring_out",
+            "ring_in",
+        ]
         if backward:
             names += ["b1_send", "b1_recv", "b2_send", "b2_recv"]
-        return {n: self.sizes[n] for n in names}  # zero-size pools included: every buffer name resolves
+        return {
+            n: self.sizes[n] for n in names
+        }  # zero-size pools included: every buffer name resolves
 
     def describe(self) -> dict[str, Any]:
         return {
-            "P": self.P, "NSEG": self.NSEG, "Hg": self.Hg, "Hg_r": self.Hg_r, "n_frag": self.n_frag, "T_r": self.T_r,
-            "n_in": self.n_in, "n_out": self.n_out, "max_hops": self.max_hops, "fused_walks": self.fused_walks,
-            "walks": {"live": len(self.walk_live), "start": len(self.walk_start), "in_p0": len(self.walk_in_p0), "in_p1": len(self.walk_in_p1),
-                      "end": len(self.walk_end), "cross_last": len(self.walk_cross_last), "cross_rest": len(self.walk_cross_rest)},
-            "chains": {k: {"n_chains": c.n_chains, "n_elems": c.n_elems} for k, c in self.chains.items()},
+            "P": self.P,
+            "NSEG": self.NSEG,
+            "Hg": self.Hg,
+            "Hg_r": self.Hg_r,
+            "n_frag": self.n_frag,
+            "T_r": self.T_r,
+            "n_in": self.n_in,
+            "n_out": self.n_out,
+            "max_hops": self.max_hops,
+            "fused_walks": self.fused_walks,
+            "walks": {
+                "live": len(self.walk_live),
+                "start": len(self.walk_start),
+                "in_p0": len(self.walk_in_p0),
+                "in_p1": len(self.walk_in_p1),
+                "end": len(self.walk_end),
+                "cross_last": len(self.walk_cross_last),
+                "cross_rest": len(self.walk_cross_rest),
+            },
+            "chains": {
+                k: {"n_chains": c.n_chains, "n_elems": c.n_elems}
+                for k, c in self.chains.items()
+            },
             "sizes": dict(self.sizes),
         }
 
@@ -1032,20 +1657,24 @@ class KcpWorkspace:
         save_mode: str = "light",
     ) -> None:
         if save_mode not in SAVE_MODES:
-            raise ValueError(f"KcpWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}")
+            raise ValueError(
+                f"KcpWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
+            )
         self.state_dtype = state_dtype
         self.with_local = bool(local)
         self.save_mode = save_mode
         self.device: torch.device | None = None
         self._pools: dict[str, torch.Tensor] = {}
-        self._tables: dict[tuple[Any, int], _Tables] = {}
+        self._tables: dict[tuple[Any, int, int], _Tables] = {}
         self.local: Any | None = None
         if ctx is not None:
             if H is None:
                 raise ValueError("KcpWorkspace: H is required with ctx")
             self.ensure(ctx, H, device=device, backward=backward)
 
-    def tables(self, ctx: Any, H: int, *, fused_walks: int = FUSED_WALKS_DEFAULT) -> _Tables:
+    def tables(
+        self, ctx: Any, H: int, *, fused_walks: int = FUSED_WALKS_DEFAULT
+    ) -> _Tables:
         key = (ctx, int(H), int(fused_walks))
         tb = self._tables.get(key)
         if tb is None:
@@ -1053,26 +1682,48 @@ class KcpWorkspace:
             self._tables[key] = tb
         return tb
 
-    def ensure(self, ctx: Any, H: int, *, device: torch.device | str | None = None, backward: bool = True,
-               fused_walks: int = FUSED_WALKS_DEFAULT) -> _Tables:
+    def ensure(
+        self,
+        ctx: Any,
+        H: int,
+        *,
+        device: torch.device | str | None = None,
+        backward: bool = True,
+        fused_walks: int = FUSED_WALKS_DEFAULT,
+    ) -> _Tables:
         """Size the pools (and the local arena) for ``(ctx, H)``; returns the tables."""
-        device = torch.device(device) if device is not None else torch.device(ctx.device)
+        device = (
+            torch.device(device) if device is not None else torch.device(ctx.device)
+        )
         if self.device is None:
             self.device = device
         elif self.device != device:
-            raise ValueError(f"KcpWorkspace: lives on {self.device}, the call is on {device}")
+            raise ValueError(
+                f"KcpWorkspace: lives on {self.device}, the call is on {device}"
+            )
         tb = self.tables(ctx, H, fused_walks=fused_walks)
         for name, n in tb.pool_sizes(backward).items():
             cur = self._pools.get(name)
             if cur is None or cur.numel() < n:
                 self._pools[name] = _alloc((n,), self.state_dtype, device)
                 if name == "eye":
-                    self._pools[name].view(D, D).copy_(torch.eye(D, dtype=self.state_dtype, device=device))
-        if self.with_local and ctx.T_r > 0 and device.type == "cuda":
+                    self._pools[name].view(D, D).copy_(
+                        torch.eye(D, dtype=self.state_dtype, device=device)
+                    )
+        if self.with_local and ctx.T_r > 0 and torch.device(device).type == "cuda":
             p = self.local.plan if self.local is not None else None
-            if p is None or (p.S, p.N, p.H) != (ctx.T_r, ctx.n_frag, int(H)) or (backward and not self.local.backward):
+            if (
+                p is None
+                or (ctx.T_r, ctx.n_frag, int(H)) != (p.S, p.N, p.H)
+                or (backward and not self.local.backward)
+            ):
                 self.local = cake_backend.KdaWorkspace.for_problem(
-                    ctx.T_r, ctx.n_frag, int(H), device, backward=backward, save_mode=self.save_mode
+                    ctx.T_r,
+                    ctx.n_frag,
+                    int(H),
+                    device,
+                    backward=backward,
+                    save_mode=self.save_mode,
                 )
         return tb
 
@@ -1080,7 +1731,9 @@ class KcpWorkspace:
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
-                raise KeyError(f"KcpWorkspace: pool {name!r} was not sized for this call (ensure() first)")
+                raise KeyError(
+                    f"KcpWorkspace: pool {name!r} was not sized for this call (ensure() first)"
+                )
             t = self._pools[name] = _alloc((0,), self.state_dtype, self.device)
         return t if n is None else t[:n]
 
@@ -1131,24 +1784,44 @@ class KcpSaved:
     _OPTIONAL = ("c1_recv", "M_seg", "Aqk", "Akk")
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
-        return (self.S_in,) + tuple(t for t in (self.c1_recv, self.M_seg, self.Aqk, self.Akk) if t is not None)
+        return (self.S_in,) + tuple(
+            t for t in (self.c1_recv, self.M_seg, self.Aqk, self.Akk) if t is not None
+        )
 
     def flags(self) -> tuple[bool, ...]:
         return tuple(getattr(self, n) is not None for n in self._OPTIONAL)
 
     def meta(self) -> dict[str, Any]:
         return {
-            "version": self.version, "T_r": self.T_r, "H": self.H, "n_frag": self.n_frag, "P": self.P, "Hg": self.Hg,
-            "scale": self.scale, "save_mode": self.save_mode, "save_transfer": self.save_transfer,
-            "offset_class": self.offset_class, "exchange": self.exchange, "precision_mode": self.precision_mode,
+            "version": self.version,
+            "T_r": self.T_r,
+            "H": self.H,
+            "n_frag": self.n_frag,
+            "P": self.P,
+            "Hg": self.Hg,
+            "scale": self.scale,
+            "save_mode": self.save_mode,
+            "save_transfer": self.save_transfer,
+            "offset_class": self.offset_class,
+            "exchange": self.exchange,
+            "precision_mode": self.precision_mode,
             "transfer_walk": self.transfer_walk,
         }
 
     @classmethod
-    def from_tensors(cls, tensors: Sequence[torch.Tensor], flags: Sequence[bool], meta: dict[str, Any], ctx: Any) -> KcpSaved:
+    def from_tensors(
+        cls,
+        tensors: Sequence[torch.Tensor],
+        flags: Sequence[bool],
+        meta: dict[str, Any],
+        ctx: Any,
+    ) -> KcpSaved:
         it = iter(tensors)
         S_in = next(it)
-        opt = {n: (next(it) if f else None) for n, f in zip(cls._OPTIONAL, flags, strict=True)}
+        opt = {
+            n: (next(it) if f else None)
+            for n, f in zip(cls._OPTIONAL, flags, strict=True)
+        }
         return cls(S_in=S_in, ctx=ctx, **opt, **meta)
 
     @property
@@ -1166,41 +1839,67 @@ class KcpOptions:
     ``offset_class`` (``fla``: K1 / K2 offsets; ``fp32`` is a Phase-2 knob), ``debug_sequence`` (R7: all-gather the
     collective issue order and assert it), ``precision_mode`` (K3's static program; set only through ``_kcp_test_knobs``)."""
 
-    save_transfer: bool = cake_kcp_plan.SAVE_TRANSFER_DEFAULT  # P2-R3: True shipped; False = round-0 recompute form
+    save_transfer: bool = (
+        cake_kcp_plan.SAVE_TRANSFER_DEFAULT
+    )  # P2-R3: True shipped; False = round-0 recompute form
     exchange: str = "auto"
     head_groups: int = 1
     offset_class: str = "fla"
     debug_sequence: bool = False
     precision_mode: int = 0
-    transfer_walk: str = "tf32_hilo"  # K3 program family (P1-R15); set only through _kcp_test_knobs
-    p_rule: str | None = None  # plan P rule named by _kcp_test_knobs (lever L-C); None = the context's; must equal ctx.p_rule
+    transfer_walk: str = (
+        "tf32_hilo"  # K3 program family (P1-R15); set only through _kcp_test_knobs
+    )
+    p_rule: str | None = (
+        None  # plan P rule named by _kcp_test_knobs (lever L-C); None = the context's; must equal ctx.p_rule
+    )
     schedule: str = SCHEDULE_DEFAULT  # L-A (P2-R1): "wait_first" (shipped) issues the merges and tape walks after each wait; "overlap" via _kcp_test_knobs
     fused_walks: int = FUSED_WALKS_DEFAULT  # L-B (shipped 1): one tape launch per phase from the carry plane (+ the S_in / dS_out copies); 0 via _kcp_test_knobs
     cols_rule: str = "fixed"  # D1 (P2-R4): "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
 
     def check(self) -> KcpOptions:
         if self.exchange not in EXCHANGES:
-            raise ValueError(f"exchange must be one of {EXCHANGES}, got {self.exchange!r}")
+            raise ValueError(
+                f"exchange must be one of {EXCHANGES}, got {self.exchange!r}"
+            )
         if self.offset_class not in OFFSET_CLASSES:
-            raise ValueError(f"offset_class must be one of {OFFSET_CLASSES}, got {self.offset_class!r}")
+            raise ValueError(
+                f"offset_class must be one of {OFFSET_CLASSES}, got {self.offset_class!r}"
+            )
         if self.offset_class != "fla":
-            raise NotImplementedError("offset_class='fp32' (K3's offset program) is a Phase-2 knob")
+            raise NotImplementedError(
+                "offset_class='fp32' (K3's offset program) is a Phase-2 knob"
+            )
         if int(self.head_groups) != 1:
-            raise NotImplementedError("head_groups > 1 (lever L3) is not part of Phase 1")
+            raise NotImplementedError(
+                "head_groups > 1 (lever L3) is not part of Phase 1"
+            )
         self.save_transfer = bool(self.save_transfer)
         self.debug_sequence = bool(self.debug_sequence)
         self.precision_mode = int(self.precision_mode)
         if self.transfer_walk not in TRANSFER_WALKS:
-            raise ValueError(f"transfer_walk must be one of {TRANSFER_WALKS}, got {self.transfer_walk!r}")
+            raise ValueError(
+                f"transfer_walk must be one of {TRANSFER_WALKS}, got {self.transfer_walk!r}"
+            )
         if self.precision_mode and self.transfer_walk != "tf32_hilo":
-            raise ValueError("precision_mode selects a program of the tf32_hilo family; it cannot combine with transfer_walk")
+            raise ValueError(
+                "precision_mode selects a program of the tf32_hilo family; it cannot combine with transfer_walk"
+            )
         for key, allowed in P2_KNOBS.items():
             if getattr(self, key) not in allowed:
-                raise ValueError(f"{key} must be one of {allowed}, got {getattr(self, key)!r}")
+                raise ValueError(
+                    f"{key} must be one of {allowed}, got {getattr(self, key)!r}"
+                )
         return self
 
 
-_OPTION_KEYS = ("save_transfer", "exchange", "head_groups", "offset_class", "debug_sequence")
+_OPTION_KEYS = (
+    "save_transfer",
+    "exchange",
+    "head_groups",
+    "offset_class",
+    "debug_sequence",
+)
 
 
 def _options(kwargs: dict[str, Any]) -> KcpOptions:
@@ -1219,9 +1918,13 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
         raw = dict(raw)
         transfer_walk = str(raw.pop("transfer_walk"))
         if transfer_walk not in TRANSFER_WALKS:
-            raise ValueError(f"_kcp_test_knobs: transfer_walk must be one of {TRANSFER_WALKS}, got {transfer_walk!r}")
+            raise ValueError(
+                f"_kcp_test_knobs: transfer_walk must be one of {TRANSFER_WALKS}, got {transfer_walk!r}"
+            )
     p2: dict[str, Any] = {}
-    if isinstance(raw, dict) and any(k in raw for k in P2_KNOBS):  # round-1 levers (P2-R1 / P2-R4): the same gate
+    if isinstance(raw, dict) and any(
+        k in raw for k in P2_KNOBS
+    ):  # round-1 levers (P2-R1 / P2-R4): the same gate
         if os.environ.get(cake_kcp_plan.TEST_KNOBS_ENV) != "1":
             raise ValueError(
                 f"_kcp_test_knobs is a private test hook: it is accepted only with {cake_kcp_plan.TEST_KNOBS_ENV}=1 in the environment"
@@ -1229,13 +1932,25 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
         raw = dict(raw)
         for key in P2_KNOBS:
             if key in raw:
-                p2[key] = int(raw.pop(key)) if key == "fused_walks" else str(raw.pop(key))
+                p2[key] = (
+                    int(raw.pop(key)) if key == "fused_walks" else str(raw.pop(key))
+                )
     knobs = cake_kcp_plan.validate_test_knobs(raw)
-    p_rule = knobs["p_rule"] if isinstance(raw, dict) and "p_rule" in raw else None  # lever L-C: the context carries the rule
+    p_rule = (
+        knobs["p_rule"] if isinstance(raw, dict) and "p_rule" in raw else None
+    )  # lever L-C: the context carries the rule
     unknown = sorted(set(kwargs) - set(_OPTION_KEYS))
     if unknown:
-        raise TypeError(f"unexpected keyword argument(s) {unknown}; known options: {list(_OPTION_KEYS)} and _kcp_test_knobs")
-    return KcpOptions(**kwargs, precision_mode=int(knobs["precision_mode"]), transfer_walk=transfer_walk, p_rule=p_rule, **p2).check()
+        raise TypeError(
+            f"unexpected keyword argument(s) {unknown}; known options: {list(_OPTION_KEYS)} and _kcp_test_knobs"
+        )
+    return KcpOptions(
+        **kwargs,
+        precision_mode=int(knobs["precision_mode"]),
+        transfer_walk=transfer_walk,
+        p_rule=p_rule,
+        **p2,
+    ).check()
 
 
 def _exchange_scheme(tb: _Tables, opts: KcpOptions) -> str:
@@ -1243,9 +1958,13 @@ def _exchange_scheme(tb: _Tables, opts: KcpOptions) -> str:
     ``ring`` needs every document chain within ``RING_MAX_HOPS`` hops."""
     if opts.exchange == "ring":
         if tb.max_hops > RING_MAX_HOPS:
-            raise ValueError(f"exchange='ring' needs n_d_max - 1 <= {RING_MAX_HOPS}, this partition has {tb.max_hops}")
+            raise ValueError(
+                f"exchange='ring' needs n_d_max - 1 <= {RING_MAX_HOPS}, this partition has {tb.max_hops}"
+            )
         if opts.save_transfer:
-            raise NotImplementedError("exchange='ring' receives no c1 tensor: save_transfer=True has no ring form")
+            raise NotImplementedError(
+                "exchange='ring' receives no c1 tensor: save_transfer=True has no ring form"
+            )
         return "ring"
     return "a2a"
 
@@ -1258,34 +1977,72 @@ class KcpCall:
     """The state of one forward or backward call on one rank: tables, buffers (workspace pools and the call's fresh
     tensors), operands, backend, the launch / collective counters and the issue sequence (R7 debug counter)."""
 
-    def __init__(self, *, ctx: Any, H: int, ws: KcpWorkspace, tb: _Tables, backend: Backend, opts: KcpOptions,
-                 scale: float, ops: dict[str, torch.Tensor], backward: bool) -> None:
-        self.ctx, self.H, self.ws, self.tb, self.backend, self.opts = ctx, int(H), ws, tb, backend, opts
+    def __init__(
+        self,
+        *,
+        ctx: Any,
+        H: int,
+        ws: KcpWorkspace,
+        tb: _Tables,
+        backend: Backend,
+        opts: KcpOptions,
+        scale: float,
+        ops: dict[str, torch.Tensor],
+        backward: bool,
+    ) -> None:
+        self.ctx, self.H, self.ws, self.tb, self.backend, self.opts = (
+            ctx,
+            int(H),
+            ws,
+            tb,
+            backend,
+            opts,
+        )
         self.scale = float(scale)
         self.device = ws.device
-        self.rank, self.world, self.group = int(ctx.rank), int(ctx.world_size), ctx.group
+        self.rank, self.world, self.group = (
+            int(ctx.rank),
+            int(ctx.world_size),
+            ctx.group,
+        )
         self.state_dtype = ws.state_dtype
         self.ops = ops
         self.T_r = int(ctx.T_r)
         self.backward = bool(backward)
-        self.counters = {"launches": 0, "collectives": 0, "walks": 0, "merges": 0, "stages": 0}
+        self.counters = {
+            "launches": 0,
+            "collectives": 0,
+            "walks": 0,
+            "merges": 0,
+            "stages": 0,
+        }
         self.sequence: list[str] = []
-        self.merge_log: list[tuple[str, int, int, int | None]] = []  # (family, ncols, n_chains, explicit cols_per_cta) per K4 launch
+        self.merge_log: list[
+            tuple[str, int, int, int | None]
+        ] = []  # (family, ncols, n_chains, explicit cols_per_cta) per K4 launch
         self.scratch: dict[str, Any] = {}
         self.bufs: dict[str, torch.Tensor] = {}
-        self.local = ws.local if (backend.local_stages and ws.local is not None) else None
+        self.local = (
+            ws.local if (backend.local_stages and ws.local is not None) else None
+        )
         self.local_values: dict[str, Any] | None = None
         self.out: torch.Tensor | None = None
         self.grads: dict[str, torch.Tensor] | None = None
         self.exchange = _exchange_scheme(tb, opts)
         self.precision_mode = int(opts.precision_mode)
         self.transfer_walk = str(opts.transfer_walk)
-        if opts.p_rule is not None and opts.p_rule != getattr(ctx, "p_rule", cake_kcp_plan.P_RULE_DEFAULT):
-            raise ValueError(f"_kcp_test_knobs p_rule {opts.p_rule!r} differs from the context's plan rule {getattr(ctx, 'p_rule', cake_kcp_plan.P_RULE_DEFAULT)!r}: give the knob to build_kcp_context")
+        if opts.p_rule is not None and opts.p_rule != getattr(
+            ctx, "p_rule", cake_kcp_plan.P_RULE_DEFAULT
+        ):
+            raise ValueError(
+                f"_kcp_test_knobs p_rule {opts.p_rule!r} differs from the context's plan rule {getattr(ctx, 'p_rule', cake_kcp_plan.P_RULE_DEFAULT)!r}: give the knob to build_kcp_context"
+            )
         self.schedule = str(opts.schedule)  # L-A
         self.cols_rule = str(opts.cols_rule)  # D1
         if int(tb.fused_walks) != int(opts.fused_walks):
-            raise ValueError(f"tables built with fused_walks={tb.fused_walks}, the call asks for {opts.fused_walks}")
+            raise ValueError(
+                f"tables built with fused_walks={tb.fused_walks}, the call asks for {opts.fused_walks}"
+            )
 
     # -- buffers
     def buf(self, name: str) -> torch.Tensor:
@@ -1298,8 +2055,14 @@ class KcpCall:
         self.bufs[name] = t
         return t
 
-    def indexed(self, pool: str, index: Sequence[int], tiles: Sequence[Sequence[int]]) -> Indexed:
-        return Indexed(self.buf(pool), tuple(int(i) for i in index), tuple(tuple(int(t) for t in row) for row in tiles))
+    def indexed(
+        self, pool: str, index: Sequence[int], tiles: Sequence[Sequence[int]]
+    ) -> Indexed:
+        return Indexed(
+            self.buf(pool),
+            tuple(int(i) for i in index),
+            tuple(tuple(int(t) for t in row) for row in tiles),
+        )
 
     # -- launches
     def kernel(self, name: str, **args: Any) -> None:
@@ -1315,7 +2078,13 @@ class KcpCall:
         self.counters["walks"] += 1
         self.kernel(name, walk=[int(s) for s in walk], **args)
 
-    def merge(self, family: str, *, chains: Chains | None = None, spec: dict[str, Any] | None = None) -> None:
+    def merge(
+        self,
+        family: str,
+        *,
+        chains: Chains | None = None,
+        spec: dict[str, Any] | None = None,
+    ) -> None:
         """One K4 launch of chain family ``family`` (nothing when it has no chain); ``chains`` / ``spec`` replace the
         table's family (the ring exchange's one-element chains)."""
         ch = self.tb.chains[family] if chains is None else chains
@@ -1324,9 +2093,15 @@ class KcpCall:
         spec = _Tables.FAMILIES[family] if spec is None else spec
         self.counters["merges"] += 1
         self.kernel(
-            "kcp_affine_merge", family=family, m=self.buf(spec["m"]), c=self.buf(spec["c"]) if spec["c"] else None,
-            x0=self.buf(spec["x0"]) if spec["x0"] else None, y=self.buf(spec["y"]), chains=ch,
-            transpose_m=int(spec["tm"]), write_states=int(spec["ws"]),
+            "kcp_affine_merge",
+            family=family,
+            m=self.buf(spec["m"]),
+            c=self.buf(spec["c"]) if spec["c"] else None,
+            x0=self.buf(spec["x0"]) if spec["x0"] else None,
+            y=self.buf(spec["y"]),
+            chains=ch,
+            transpose_m=int(spec["tm"]),
+            write_states=int(spec["ws"]),
         )
 
     def transpose_tiles(self, src: str, src_tiles, dst: str, dst_tiles) -> None:
@@ -1337,8 +2112,12 @@ class KcpCall:
             return
         self.counters["launches"] += 1
         self.sequence.append("kcp_transpose_tiles")
-        self.backend.transpose_tiles(src=self.buf(src), src_tiles=self.tb.device_tiles(src_tiles, self.device),
-                                     dst=self.buf(dst), dst_tiles=self.tb.device_tiles(dst_tiles, self.device))
+        self.backend.transpose_tiles(
+            src=self.buf(src),
+            src_tiles=self.tb.device_tiles(src_tiles, self.device),
+            dst=self.buf(dst),
+            dst_tiles=self.tb.device_tiles(dst_tiles, self.device),
+        )
 
     def stage(self, name: str, **extra: Any) -> None:
         """A token-side stage of the existing backend (skipped without a local arena or tokens)."""
@@ -1350,23 +2129,42 @@ class KcpCall:
         self.backend.stage(name, self, **extra)
 
     # -- collectives
-    def a2a(self, tag: str, send_name: str, recv_name: str, send_splits: Sequence[int], recv_splits: Sequence[int]):
+    def a2a(
+        self,
+        tag: str,
+        send_name: str,
+        recv_name: str,
+        send_splits: Sequence[int],
+        recv_splits: Sequence[int],
+    ):
         """Issue ``all_to_all_single`` (async) from pool ``send_name`` into ``recv_name`` with element splits per
         peer; returns the work handle (``None`` on a single rank)."""
-        send_splits, recv_splits = [int(x) for x in send_splits], [int(x) for x in recv_splits]
+        send_splits, recv_splits = (
+            [int(x) for x in send_splits],
+            [int(x) for x in recv_splits],
+        )
         if len(send_splits) != self.world or len(recv_splits) != self.world:
-            raise ValueError(f"{tag}: split lists must have one entry per rank ({self.world})")
+            raise ValueError(
+                f"{tag}: split lists must have one entry per rank ({self.world})"
+            )
         send = self.buf(send_name)[: sum(send_splits)]
         recv = self.buf(recv_name)[: sum(recv_splits)]
         self.counters["collectives"] += 1
         self._sequence(tag)
         if self.world == 1 or not (dist.is_available() and dist.is_initialized()):
             if send.numel() != recv.numel():
-                raise ValueError(f"{tag}: a single rank must send exactly what it receives")
+                raise ValueError(
+                    f"{tag}: a single rank must send exactly what it receives"
+                )
             recv.copy_(send)
             return None
         return dist.all_to_all_single(
-            recv, send, output_split_sizes=recv_splits, input_split_sizes=send_splits, group=self.group, async_op=True
+            recv,
+            send,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=self.group,
+            async_op=True,
         )
 
     @staticmethod
@@ -1378,11 +2176,18 @@ class KcpCall:
         self.sequence.append(f"{kind}:{tag}")
         seq = getattr(self.ctx, "sequence", None)
         n = seq.next(tag) if seq is not None else len(self.sequence)
-        if self.opts.debug_sequence and self.world > 1 and dist.is_available() and dist.is_initialized():
+        if (
+            self.opts.debug_sequence
+            and self.world > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
             gathered: list[Any] = [None] * self.world
             dist.all_gather_object(gathered, (tag, n), group=self.group)
             if any(g != (tag, n) for g in gathered):
-                raise RuntimeError(f"debug_sequence: the collective issue order differs across ranks: {gathered}")
+                raise RuntimeError(
+                    f"debug_sequence: the collective issue order differs across ranks: {gathered}"
+                )
 
 
 LAST_CALL: dict[str, dict[str, Any]] = {}
@@ -1392,14 +2197,29 @@ def _record(kind: str, call: KcpCall) -> None:
     """The launch inventory of the last forward / backward (FINAL_DESIGN §10.5; M1 reads it)."""
     LAST_CALL[kind] = {
         **{f"n_{k}": v for k, v in call.counters.items()},
-        "sequence": list(call.sequence), "exchange": call.exchange, "backend": call.backend.name,
-        "P": call.tb.P, "NSEG": call.tb.NSEG, "Hg": call.tb.Hg, "Hg_r": call.tb.Hg_r, "n_in": call.tb.n_in,
-        "n_out": call.tb.n_out, "workspace_bytes": call.ws.bytes, "pool_bytes": call.ws.pool_bytes,
+        "sequence": list(call.sequence),
+        "exchange": call.exchange,
+        "backend": call.backend.name,
+        "P": call.tb.P,
+        "NSEG": call.tb.NSEG,
+        "Hg": call.tb.Hg,
+        "Hg_r": call.tb.Hg_r,
+        "n_in": call.tb.n_in,
+        "n_out": call.tb.n_out,
+        "workspace_bytes": call.ws.bytes,
+        "pool_bytes": call.ws.pool_bytes,
         "fresh_bytes": {k: t.numel() * t.element_size() for k, t in call.bufs.items()},
-        "precision_mode": call.precision_mode, "transfer_walk": call.transfer_walk,
-        "schedule": call.schedule, "fused_walks": call.tb.fused_walks, "cols_rule": call.cols_rule,  # round-1 knobs (P2-R1 / P2-R4)
-        "merges": list(call.merge_log),  # D1 evidence: (family, ncols, n_chains, explicit cols_per_cta or None = registry)
-        "spec3": call.scratch.get("spec3"),  # the SPEC-3 debug assertion's result (first saved-mode backward)
+        "precision_mode": call.precision_mode,
+        "transfer_walk": call.transfer_walk,
+        "schedule": call.schedule,
+        "fused_walks": call.tb.fused_walks,
+        "cols_rule": call.cols_rule,  # round-1 knobs (P2-R1 / P2-R4)
+        "merges": list(
+            call.merge_log
+        ),  # D1 evidence: (family, ncols, n_chains, explicit cols_per_cta or None = registry)
+        "spec3": call.scratch.get(
+            "spec3"
+        ),  # the SPEC-3 debug assertion's result (first saved-mode backward)
     }
 
 
@@ -1426,7 +2246,9 @@ class _Ring:
         ctx = tb.ctx
         rank = int(ctx.rank)
         self.hops = tb.max_hops
-        pos: dict[int, tuple[int, int]] = {}  # slot -> (position in its document chain, chain length)
+        pos: dict[
+            int, tuple[int, int]
+        ] = {}  # slot -> (position in its document chain, chain length)
         for f in tb.frags:
             if f.length <= 0:
                 continue
@@ -1435,52 +2257,108 @@ class _Ring:
         self.pos = pos
         in_slot, out_slot = list(ctx.in_slot), list(ctx.out_slot)
         # forward hop h: senders at position h - 1 (crossing out), receivers at position h (crossing in)
-        self.fwd_send = {h: [f for f in tb.frags if f.length > 0 and f.crossing_out and pos[f.slot][0] == h - 1] for h in range(1, self.hops + 1)}
-        self.fwd_recv = {h: [f for f in tb.frags if f.length > 0 and f.crossing_in and pos[f.slot][0] == h] for h in range(1, self.hops + 1)}
+        self.fwd_send = {
+            h: [
+                f
+                for f in tb.frags
+                if f.length > 0 and f.crossing_out and pos[f.slot][0] == h - 1
+            ]
+            for h in range(1, self.hops + 1)
+        }
+        self.fwd_recv = {
+            h: [
+                f
+                for f in tb.frags
+                if f.length > 0 and f.crossing_in and pos[f.slot][0] == h
+            ]
+            for h in range(1, self.hops + 1)
+        }
         # backward hop h: senders at position n_d - h (crossing in), receivers at position n_d - h - 1 (crossing out)
-        self.bwd_send = {h: [f for f in tb.frags if f.length > 0 and f.crossing_in and pos[f.slot][0] == pos[f.slot][1] - h] for h in range(1, self.hops + 1)}
-        self.bwd_recv = {h: [f for f in tb.frags if f.length > 0 and f.crossing_out and pos[f.slot][0] == pos[f.slot][1] - h - 1] for h in range(1, self.hops + 1)}
+        self.bwd_send = {
+            h: [
+                f
+                for f in tb.frags
+                if f.length > 0
+                and f.crossing_in
+                and pos[f.slot][0] == pos[f.slot][1] - h
+            ]
+            for h in range(1, self.hops + 1)
+        }
+        self.bwd_recv = {
+            h: [
+                f
+                for f in tb.frags
+                if f.length > 0
+                and f.crossing_out
+                and pos[f.slot][0] == pos[f.slot][1] - h - 1
+            ]
+            for h in range(1, self.hops + 1)
+        }
         self.in_slot, self.out_slot = in_slot, out_slot
 
         def peer(f, step):
             chain = ctx.chains[f.doc]
             return int(chain[pos[f.slot][0] + step][0])
 
-        self.next_rank = {f.slot: peer(f, 1) for f in tb.frags if f.length > 0 and f.crossing_out}
-        self.prev_rank = {f.slot: peer(f, -1) for f in tb.frags if f.length > 0 and f.crossing_in}
+        self.next_rank = {
+            f.slot: peer(f, 1) for f in tb.frags if f.length > 0 and f.crossing_out
+        }
+        self.prev_rank = {
+            f.slot: peer(f, -1) for f in tb.frags if f.length > 0 and f.crossing_in
+        }
 
 
 def _ring_tables(tb: _Tables) -> _Ring:
-    r = getattr(tb, "_ring", None)
-    if r is None:
-        r = tb._ring = _Ring(tb)
-    return r
+    if tb._ring is None:
+        tb._ring = _Ring(tb)
+    return tb._ring
 
 
 def _ring_block(pool: torch.Tensor, slot: int, H: int) -> torch.Tensor:
     """The contiguous ``[H, D, D]`` block of ``slot`` in a ring staging pool (tiles ``slot * H + h``)."""
-    return pool.view(-1)[slot * H * TILE:(slot + 1) * H * TILE].view(H, D, D)
+    return pool.view(-1)[slot * H * TILE : (slot + 1) * H * TILE].view(H, D, D)
 
 
-def _ring_copy_in(call: KcpCall, tb: _Tables, src: torch.Tensor, src_tiles, slot_src: int, dst: torch.Tensor, slot_dst: int) -> None:
+def _ring_copy_in(
+    call: KcpCall,
+    tb: _Tables,
+    src: torch.Tensor,
+    src_tiles,
+    slot_src: int,
+    dst: torch.Tensor,
+    slot_dst: int,
+) -> None:
     """``dst`` ring block ``slot_dst`` <- the ``H`` tiles ``src_tiles[slot_src][h]`` of pool ``src`` (bitwise copy)."""
     idx = tb.device_tiles([src_tiles[slot_src]], call.device)
     _ring_block(dst, slot_dst, call.H).copy_(src.view(-1, D, D)[idx.view(-1)])
 
 
-def _ring_scatter(call: KcpCall, tb: _Tables, src: torch.Tensor, slot_src: int, dst: torch.Tensor, dst_tiles, slot_dst: int) -> None:
+def _ring_scatter(
+    call: KcpCall,
+    tb: _Tables,
+    src: torch.Tensor,
+    slot_src: int,
+    dst: torch.Tensor,
+    dst_tiles,
+    slot_dst: int,
+) -> None:
     """Pool ``dst`` tiles ``dst_tiles[slot_dst][h]`` <- the ring block ``slot_src`` of ``src`` (bitwise copy)."""
     idx = tb.device_tiles([dst_tiles[slot_dst]], call.device)
     dst.view(-1, D, D)[idx.view(-1)] = _ring_block(src, slot_src, call.H)
 
 
-def _ring_p2p(call: KcpCall, hop: int, sends: list[tuple[torch.Tensor, int]], recvs: list[tuple[torch.Tensor, int]]):
+def _ring_p2p(
+    call: KcpCall,
+    hop: int,
+    sends: list[tuple[torch.Tensor, int]],
+    recvs: list[tuple[torch.Tensor, int]],
+):
     """One ``batch_isend_irecv`` of the hop (sends then receives, each list in ``(doc, slot)`` order); returns the
     works (empty when the rank has nothing to exchange)."""
     call.counters["collectives"] += 1
     call._sequence(f"hop{hop}", kind="ring")
     if call.world == 1 or not dist.is_initialized():
-        for (t, _r) in sends:  # a one-rank chain cannot exist (no crossing); defensive
+        for _t, _r in sends:  # a one-rank chain cannot exist (no crossing); defensive
             raise RuntimeError("ring exchange on a single rank")
         return []
     ops = [dist.P2POp(dist.isend, t, peer, group=call.group) for t, peer in sends]
@@ -1493,10 +2371,19 @@ def _ring_wait(works) -> None:
         w.wait()
 
 
-def _ring_chain(tb: _Tables, family: str, elems: list[tuple[int, int, int, int]]) -> Chains:
+def _ring_chain(
+    tb: _Tables, family: str, elems: list[tuple[int, int, int, int]]
+) -> Chains:
     """One-element chains per (fragment, head) from tile numbers ``(x0, m, c, y)`` (K4 state step on one fragment)."""
     ch = Chains(ncols=D)
-    for x0, m, c, y in elems:  # tile numbers -> element offsets (the chain tables address pools in elements)
+    for (
+        x0,
+        m,
+        c,
+        y,
+    ) in (
+        elems
+    ):  # tile numbers -> element offsets (the chain tables address pools in elements)
         ch.add([(m * TILE, c * TILE, -1)], x0=x0 * TILE, y_final=y * TILE)
     return ch
 
@@ -1510,26 +2397,78 @@ def _ring_forward(call: KcpCall) -> None:
     s_in = call.buf("S_in")
     for h in range(1, ring.hops + 1):
         senders, receivers = ring.fwd_send[h], ring.fwd_recv[h]
-        if h == 1:  # S_out of a document-start fragment is its B_f: copy the c1 B tiles into the contiguous block
+        if (
+            h == 1
+        ):  # S_out of a document-start fragment is its B_f: copy the c1 B tiles into the contiguous block
             for f in senders:
-                _ring_copy_in(call, tb, c1, tb.c1_b_tiles, ring.out_slot[f.slot], out_pool, ring.out_slot[f.slot])
+                _ring_copy_in(
+                    call,
+                    tb,
+                    c1,
+                    tb.c1_b_tiles,
+                    ring.out_slot[f.slot],
+                    out_pool,
+                    ring.out_slot[f.slot],
+                )
         else:  # S_out = M_f S_in + B_f: one K4 element per sender (forward family: c1 tiles hold M_f^T)
-            elems = [(tb.s_in_tiles[ring.in_slot[f.slot]][hh], tb.c1_m_tiles[ring.out_slot[f.slot]][hh],
-                      tb.c1_b_tiles[ring.out_slot[f.slot]][hh], ring.out_slot[f.slot] * H + hh) for f in senders for hh in range(H)]
+            elems = [
+                (
+                    tb.s_in_tiles[ring.in_slot[f.slot]][hh],
+                    tb.c1_m_tiles[ring.out_slot[f.slot]][hh],
+                    tb.c1_b_tiles[ring.out_slot[f.slot]][hh],
+                    ring.out_slot[f.slot] * H + hh,
+                )
+                for f in senders
+                for hh in range(H)
+            ]
             if elems:
-                call.merge(f"ring_fwd_{h}", chains=_ring_chain(tb, f"ring_fwd_{h}", elems),
-                           spec={"m": "c1_send", "c": "c1_send", "x0": "S_in", "y": "ring_out", "tm": 0, "ws": 0})
+                call.merge(
+                    f"ring_fwd_{h}",
+                    chains=_ring_chain(tb, f"ring_fwd_{h}", elems),
+                    spec={
+                        "m": "c1_send",
+                        "c": "c1_send",
+                        "x0": "S_in",
+                        "y": "ring_out",
+                        "tm": 0,
+                        "ws": 0,
+                    },
+                )
         works = _ring_p2p(
-            call, h,
-            [(_ring_block(out_pool, ring.out_slot[f.slot], H), ring.next_rank[f.slot]) for f in senders],
-            [(_ring_block(in_pool, ring.in_slot[f.slot], H), ring.prev_rank[f.slot]) for f in receivers],
+            call,
+            h,
+            [
+                (
+                    _ring_block(out_pool, ring.out_slot[f.slot], H),
+                    ring.next_rank[f.slot],
+                )
+                for f in senders
+            ],
+            [
+                (_ring_block(in_pool, ring.in_slot[f.slot], H), ring.prev_rank[f.slot])
+                for f in receivers
+            ],
         )
         if h == 1 and call.schedule == "overlap":
-            carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
-            call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out)  # document starts: under hop 1 (R7)
+            carry = (
+                call.indexed("carry", tb.carry_index, tb.carry_tiles)
+                if tb.P > 1
+                else None
+            )
+            call.walk(
+                "kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out
+            )  # document starts: under hop 1 (R7)
         _ring_wait(works)
         for f in receivers:
-            _ring_scatter(call, tb, in_pool, ring.in_slot[f.slot], s_in, tb.s_in_tiles, ring.in_slot[f.slot])
+            _ring_scatter(
+                call,
+                tb,
+                in_pool,
+                ring.in_slot[f.slot],
+                s_in,
+                tb.s_in_tiles,
+                ring.in_slot[f.slot],
+            )
 
 
 def _ring_backward(call: KcpCall) -> None:
@@ -1544,26 +2483,73 @@ def _ring_backward(call: KcpCall) -> None:
         senders, receivers = ring.bwd_send[h], ring.bwd_recv[h]
         if h == 1:  # the document-last fragment's dS_in is its d_f
             for f in senders:
-                _ring_copy_in(call, tb, b1, d_tiles, ring.in_slot[f.slot], out_pool, ring.in_slot[f.slot])
+                _ring_copy_in(
+                    call,
+                    tb,
+                    b1,
+                    d_tiles,
+                    ring.in_slot[f.slot],
+                    out_pool,
+                    ring.in_slot[f.slot],
+                )
         else:  # dS_in = M_f^T dS_out + d_f (adjoint step; the b1 M_f tiles hold Mop^T under Mop = M_f^T)
-            elems = [(tb.ds_out_tiles[ring.out_slot[f.slot]][hh], m_tiles[ring.in_slot[f.slot]][hh],
-                      d_tiles[ring.in_slot[f.slot]][hh], ring.in_slot[f.slot] * H + hh) for f in senders for hh in range(H)]
+            elems = [
+                (
+                    tb.ds_out_tiles[ring.out_slot[f.slot]][hh],
+                    m_tiles[ring.in_slot[f.slot]][hh],
+                    d_tiles[ring.in_slot[f.slot]][hh],
+                    ring.in_slot[f.slot] * H + hh,
+                )
+                for f in senders
+                for hh in range(H)
+            ]
             if elems:
-                call.merge(f"ring_bwd_{h}", chains=_ring_chain(tb, f"ring_bwd_{h}", elems),
-                           spec={"m": "b1_send", "c": "b1_send", "x0": "b2_recv", "y": "ring_out", "tm": 0, "ws": 0})
+                call.merge(
+                    f"ring_bwd_{h}",
+                    chains=_ring_chain(tb, f"ring_bwd_{h}", elems),
+                    spec={
+                        "m": "b1_send",
+                        "c": "b1_send",
+                        "x0": "b2_recv",
+                        "y": "ring_out",
+                        "tm": 0,
+                        "ws": 0,
+                    },
+                )
         works = _ring_p2p(
-            call, h,
-            [(_ring_block(out_pool, ring.in_slot[f.slot], H), ring.prev_rank[f.slot]) for f in senders],
-            [(_ring_block(in_pool, ring.out_slot[f.slot], H), ring.next_rank[f.slot]) for f in receivers],
+            call,
+            h,
+            [
+                (_ring_block(out_pool, ring.in_slot[f.slot], H), ring.prev_rank[f.slot])
+                for f in senders
+            ],
+            [
+                (_ring_block(in_pool, ring.out_slot[f.slot], H), ring.next_rank[f.slot])
+                for f in receivers
+            ],
         )
         if h == 1 and call.schedule == "overlap":
-            dcarry = call.indexed("carry", tb.dcarry_index, tb.carry_tiles) if tb.P > 1 else None
+            dcarry = (
+                call.indexed("carry", tb.dcarry_index, tb.carry_tiles)
+                if tb.P > 1
+                else None
+            )
             if tb.P > 1:
                 call.merge("dcarry_end")
-            call.walk("kcp_dhu_tape", tb.walk_end, dht=dcarry)  # document ends: under hop 1 (R7)
+            call.walk(
+                "kcp_dhu_tape", tb.walk_end, dht=dcarry
+            )  # document ends: under hop 1 (R7)
         _ring_wait(works)
         for f in receivers:
-            _ring_scatter(call, tb, in_pool, ring.out_slot[f.slot], b2, tb.ds_out_tiles, ring.out_slot[f.slot])
+            _ring_scatter(
+                call,
+                tb,
+                in_pool,
+                ring.out_slot[f.slot],
+                b2,
+                tb.ds_out_tiles,
+                ring.out_slot[f.slot],
+            )
 
 
 def _summaries(call: KcpCall) -> None:
@@ -1572,18 +2558,46 @@ def _summaries(call: KcpCall) -> None:
     composes the crossing-out fragments' segments (forward family -> ``B_f``, adjoint family -> ``M_f^T``)."""
     tb = call.tb
     if tb.P == 1:
-        call.walk("kcp_fwdh_offset", tb.walk_offset, h0=None, out=call.indexed("c1_send", tb.out_index, tb.c1_b_tiles))
-        call.walk("kcp_transfer_walk", tb.walk_offset, out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
-                  init_mode=0, use_u=0, write_transposed=0)
+        call.walk(
+            "kcp_fwdh_offset",
+            tb.walk_offset,
+            h0=None,
+            out=call.indexed("c1_send", tb.out_index, tb.c1_b_tiles),
+        )
+        call.walk(
+            "kcp_transfer_walk",
+            tb.walk_offset,
+            out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
+            init_mode=0,
+            use_u=0,
+            write_transposed=0,
+        )
         return
-    call.walk("kcp_fwdh_offset", tb.walk_offset, h0=None, out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles))
-    call.walk("kcp_transfer_walk", tb.walk_offset, out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-              init_mode=0, use_u=0, write_transposed=0)
-    call.merge("map")  # B_f (from 0) and M_f (from I) of every crossing-out fragment, forward family
-    call.transpose_tiles("c1_send", tb.mf_tiles, "c1_send", tb.c1_m_tiles)  # M_f^T into the c1 pairs (bitwise)
+    call.walk(
+        "kcp_fwdh_offset",
+        tb.walk_offset,
+        h0=None,
+        out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+    )
+    call.walk(
+        "kcp_transfer_walk",
+        tb.walk_offset,
+        out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
+        init_mode=0,
+        use_u=0,
+        write_transposed=0,
+    )
+    call.merge(
+        "map"
+    )  # B_f (from 0) and M_f (from I) of every crossing-out fragment, forward family
+    call.transpose_tiles(
+        "c1_send", tb.mf_tiles, "c1_send", tb.c1_m_tiles
+    )  # M_f^T into the c1 pairs (bitwise)
 
 
-def _fwd_tapes(call: KcpCall, *, out: torch.Tensor | None, carry: Indexed | None, wait_first: bool) -> None:
+def _fwd_tapes(
+    call: KcpCall, *, out: torch.Tensor | None, carry: Indexed | None, wait_first: bool
+) -> None:
     """The forward tape walk(s) after ``S_in`` is complete.  ``fused_walks`` (L-B): one launch from one pool -- the
     carry plane at ``P > 1`` (``h0_index_fused``: carries, the ``S_in`` copies of ``carry_in``, ``-1`` zero states),
     ``S_in`` itself at ``P = 1`` -- over every live segment (``wait_first``) or the crossing-in fragments' segments
@@ -1592,11 +2606,22 @@ def _fwd_tapes(call: KcpCall, *, out: torch.Tensor | None, carry: Indexed | None
     tb = call.tb
     h0_in = call.indexed("S_in", tb.h0_index, tb.s_in_tiles)
     if tb.fused_walks:
-        h0 = call.indexed("carry", tb.h0_index_fused, tb.carry_tiles) if tb.P > 1 else h0_in
-        call.walk("kcp_fwdh_tape", tb.walk_live if wait_first else tb.walk_in_fused, h0=h0, out=out)
+        h0 = (
+            call.indexed("carry", tb.h0_index_fused, tb.carry_tiles)
+            if tb.P > 1
+            else h0_in
+        )
+        call.walk(
+            "kcp_fwdh_tape",
+            tb.walk_live if wait_first else tb.walk_in_fused,
+            h0=h0,
+            out=out,
+        )
         return
     if wait_first:
-        call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=out)  # document starts: after wait(c2) (L-A)
+        call.walk(
+            "kcp_fwdh_tape", tb.walk_start, h0=carry, out=out
+        )  # document starts: after wait(c2) (L-A)
     call.walk("kcp_fwdh_tape", tb.walk_in_p0, h0=h0_in, out=out)
     if tb.P > 1:
         call.walk("kcp_fwdh_tape", tb.walk_in_p1, h0=carry, out=out)
@@ -1608,11 +2633,19 @@ def _adj_tapes(call: KcpCall, *, dcarry: Indexed | None, wait_first: bool) -> No
     tb = call.tb
     dht_cross = call.indexed("b2_recv", tb.dht_index, tb.ds_out_tiles)
     if tb.fused_walks:
-        dht = call.indexed("carry", tb.dht_index_fused, tb.carry_tiles) if tb.P > 1 else dht_cross
-        call.walk("kcp_dhu_tape", tb.walk_live if wait_first else tb.walk_cross_fused, dht=dht)
+        dht = (
+            call.indexed("carry", tb.dht_index_fused, tb.carry_tiles)
+            if tb.P > 1
+            else dht_cross
+        )
+        call.walk(
+            "kcp_dhu_tape", tb.walk_live if wait_first else tb.walk_cross_fused, dht=dht
+        )
         return
     if wait_first:
-        call.walk("kcp_dhu_tape", tb.walk_end, dht=dcarry)  # document ends: after wait(b2) (L-A)
+        call.walk(
+            "kcp_dhu_tape", tb.walk_end, dht=dcarry
+        )  # document ends: after wait(b2) (L-A)
     call.walk("kcp_dhu_tape", tb.walk_cross_last, dht=dht_cross)
     if tb.P > 1:
         call.walk("kcp_dhu_tape", tb.walk_cross_rest, dht=dcarry)
@@ -1638,16 +2671,24 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
     call.stage("wy")
     _summaries(call)
     carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
-    if call.exchange == "ring":  # SPEC-2: per-document hops; S_in filled as c2 would (bitwise)
+    if (
+        call.exchange == "ring"
+    ):  # SPEC-2: per-document hops; S_in filled as c2 would (bitwise)
         if tb.P > 1 and not wait_first:
             call.merge("carry_start")
-        _ring_forward(call)  # the document-start tape walk runs under hop 1 (overlap schedule only)
+        _ring_forward(
+            call
+        )  # the document-start tape walk runs under hop 1 (overlap schedule only)
     else:
         w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_elems("c1"))
         if not wait_first:
             if tb.P > 1:
-                call.merge("carry_start")  # reads the staging planes only (R7: no collective buffer)
-            call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out)  # document starts: under c1 (R7)
+                call.merge(
+                    "carry_start"
+                )  # reads the staging planes only (R7: no collective buffer)
+            call.walk(
+                "kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out
+            )  # document starts: under c1 (R7)
         call.wait(w1)
         call.merge("fwd")  # the owner's chains: S_in slices into the c2 send layout
         w2 = call.a2a("c2", "c2_send", "S_in", *tb.split_elems("c2"))
@@ -1655,7 +2696,9 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
     if tb.P > 1:
         if wait_first:
             call.merge("carry_start")
-        call.merge("carry_in")  # with fused_walks also the S_in copies into the extra carry slots (P1-R1 write_states)
+        call.merge(
+            "carry_in"
+        )  # with fused_walks also the S_in copies into the extra carry slots (P1-R1 write_states)
     _fwd_tapes(call, out=call.out, carry=carry, wait_first=wait_first)
     if not replay:
         call.stage("fwd_o")
@@ -1667,7 +2710,7 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
     ``S_in`` and the owner's adjoint reads ``M_f`` from b1 (``save_transfer=False``) or ``M_f^T`` from the saved c1
     receive tensor.  ``schedule="wait_first"`` (L-A; the shipped default since round 1): ``b1 -> wait -> adjoint merge -> b2 -> wait -> dcarry merges ->
     adjoint tape walk(s)`` (the R7 overlap of the document-last walk under b2 is dropped)."""
-    tb, opts = call.tb, call.opts
+    tb = call.tb
     wait_first = call.schedule == "wait_first"
     replay = saved is None
     if replay:
@@ -1683,51 +2726,114 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
             call.bufs["stage_m"] = saved.M_seg
         call.stage("bwd_prep", saved=saved)
         call.stage("wy")
-        if tb.P > 1:  # the forward carries again: b_seg (and M_seg^T unless saved) -> K4 carries from 0 / S_in
-            call.walk("kcp_fwdh_offset", tb.walk_all, h0=None, out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles))
+        if (
+            tb.P > 1
+        ):  # the forward carries again: b_seg (and M_seg^T unless saved) -> K4 carries from 0 / S_in
+            call.walk(
+                "kcp_fwdh_offset",
+                tb.walk_all,
+                h0=None,
+                out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+            )
             if saved.M_seg is None:
-                call.walk("kcp_transfer_walk", tb.walk_all, out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-                          init_mode=0, use_u=0, write_transposed=0)
+                call.walk(
+                    "kcp_transfer_walk",
+                    tb.walk_all,
+                    out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
+                    init_mode=0,
+                    use_u=0,
+                    write_transposed=0,
+                )
             call.merge("carry_start")
             call.merge("carry_in")
-        if tb.fused_walks and tb.P > 1:  # L-B: the whole tape replay from the carry plane in one launch
-            call.walk("kcp_fwdh_tape", tb.walk_live, h0=call.indexed("carry", tb.h0_index_fused, tb.carry_tiles), out=None)
+        if (
+            tb.fused_walks and tb.P > 1
+        ):  # L-B: the whole tape replay from the carry plane in one launch
+            call.walk(
+                "kcp_fwdh_tape",
+                tb.walk_live,
+                h0=call.indexed("carry", tb.h0_index_fused, tb.carry_tiles),
+                out=None,
+            )
         else:
             p0 = [s for s in tb.walk_all if s % tb.P == 0]
-            call.walk("kcp_fwdh_tape", p0, h0=call.indexed("S_in", tb.h0_index, tb.s_in_tiles), out=None)
+            call.walk(
+                "kcp_fwdh_tape",
+                p0,
+                h0=call.indexed("S_in", tb.h0_index, tb.s_in_tiles),
+                out=None,
+            )
             if tb.P > 1:
-                call.walk("kcp_fwdh_tape", [s for s in tb.walk_all if s % tb.P != 0],
-                          h0=call.indexed("carry", tb.carry_index, tb.carry_tiles), out=None)
+                call.walk(
+                    "kcp_fwdh_tape",
+                    [s for s in tb.walk_all if s % tb.P != 0],
+                    h0=call.indexed("carry", tb.carry_index, tb.carry_tiles),
+                    out=None,
+                )
     call.stage("dav")
     ring = call.exchange == "ring"
-    form = "dm" if (m_source == "b1" or ring) else "d"  # the ring's adjoint step needs M_f on the fragment's own rank
+    form = (
+        "dm" if (m_source == "b1" or ring) else "d"
+    )  # the ring's adjoint step needs M_f on the fragment's own rank
     if tb.P == 1:
-        call.walk("kcp_dhu_offset", tb.walk_in, dht=None, out=call.indexed("b1_send", tb.in_index, tb.b1_d_tiles[form]))
-        if form == "dm":  # the maps travel with the offsets: M_f (untransposed) beside d_f
-            call.walk("kcp_transfer_walk", tb.walk_m_b1, out=call.indexed("b1_send", tb.m_b1_index, tb.b1_m_tiles),
-                      init_mode=0, use_u=0, write_transposed=1)
+        call.walk(
+            "kcp_dhu_offset",
+            tb.walk_in,
+            dht=None,
+            out=call.indexed("b1_send", tb.in_index, tb.b1_d_tiles[form]),
+        )
+        if (
+            form == "dm"
+        ):  # the maps travel with the offsets: M_f (untransposed) beside d_f
+            call.walk(
+                "kcp_transfer_walk",
+                tb.walk_m_b1,
+                out=call.indexed("b1_send", tb.m_b1_index, tb.b1_m_tiles),
+                init_mode=0,
+                use_u=0,
+                write_transposed=1,
+            )
     else:
-        call.walk("kcp_dhu_offset", tb.walk_all, dht=None, out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles))
-        call.merge(f"tmap_d_{form}")  # d_f of the crossing-in fragments (adjoint family)
+        call.walk(
+            "kcp_dhu_offset",
+            tb.walk_all,
+            dht=None,
+            out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+        )
+        call.merge(
+            f"tmap_d_{form}"
+        )  # d_f of the crossing-in fragments (adjoint family)
         if form == "dm":
-            call.merge("tmap_m")  # M_f of the fragments whose map travels (forward family)
-    dcarry = call.indexed("carry", tb.dcarry_index, tb.carry_tiles) if tb.P > 1 else None
+            call.merge(
+                "tmap_m"
+            )  # M_f of the fragments whose map travels (forward family)
+    dcarry = (
+        call.indexed("carry", tb.dcarry_index, tb.carry_tiles) if tb.P > 1 else None
+    )
     if ring:  # SPEC-2: adjoint hops from the document end; b2_recv filled as b2 would (bitwise)
-        _ring_backward(call)  # dcarry_end + the document-end tape walk run under hop 1 (overlap schedule only)
+        _ring_backward(
+            call
+        )  # dcarry_end + the document-end tape walk run under hop 1 (overlap schedule only)
     else:
         wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_elems(f"b1_{form}"))
         call.wait(wb1)
-        call.merge("adj_b1" if m_source == "b1" else "adj_c1")  # dS_out slices into the b2 send layout
+        call.merge(
+            "adj_b1" if m_source == "b1" else "adj_c1"
+        )  # dS_out slices into the b2 send layout
         wb2 = call.a2a("b2", "b2_send", "b2_recv", *tb.split_elems("b2"))
         if not wait_first:
             if tb.P > 1:
                 call.merge("dcarry_end")  # reads the staging planes only (R7)
-            call.walk("kcp_dhu_tape", tb.walk_end, dht=dcarry)  # document ends: under b2 (R7)
+            call.walk(
+                "kcp_dhu_tape", tb.walk_end, dht=dcarry
+            )  # document ends: under b2 (R7)
         call.wait(wb2)
     if tb.P > 1:
         if wait_first:
             call.merge("dcarry_end")
-        call.merge("dcarry_cross")  # with fused_walks also the dS_out copies into the extra carry slots
+        call.merge(
+            "dcarry_cross"
+        )  # with fused_walks also the dS_out copies into the extra carry slots
     _adj_tapes(call, dcarry=dcarry, wait_first=wait_first)
     call.stage("dqkg")
     call.stage("glm_intra")
@@ -1738,30 +2844,53 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
 # Entry points (GOAL §3.2 / FINAL_DESIGN §10.1)
 
 
-def _prepare(q, k, v, g, beta, ctx, *, scale, save_mode, workspace, options, backward, dout=None):
+def _prepare(
+    q, k, v, g, beta, ctx, *, scale, save_mode, workspace, options, backward, dout=None
+):
     backend = get_backend()
     opts = options if isinstance(options, KcpOptions) else _options(options)
     if save_mode not in SAVE_MODES:
         raise ValueError(f"save_mode must be one of {SAVE_MODES}, got {save_mode!r}")
     if save_mode != "light":
-        raise NotImplementedError("save_mode='tape' is not part of Phase 1 of the KCP route (light only)")
-    q, k, v, g, beta, T, H, batched = _operands(q, k, v, g, beta, ctx, dtypes=backend.dtypes)
+        raise NotImplementedError(
+            "save_mode='tape' is not part of Phase 1 of the KCP route (light only)"
+        )
+    q, k, v, g, beta, T, H, batched = _operands(
+        q, k, v, g, beta, ctx, dtypes=backend.dtypes
+    )
     device = q.device
     if dout is not None:
         dout = _squeeze_batch(dout, "dout", 3)
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
     if workspace is None:
-        workspace = KcpWorkspace(state_dtype=backend.dtypes["state"], local=backend.local_stages, save_mode=save_mode)
+        workspace = KcpWorkspace(
+            state_dtype=backend.dtypes["state"],
+            local=backend.local_stages,
+            save_mode=save_mode,
+        )
     elif not isinstance(workspace, KcpWorkspace):
         raise TypeError("workspace must be a KcpWorkspace")
     if workspace.state_dtype != backend.dtypes["state"]:
-        raise ValueError(f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}")
-    tb = workspace.ensure(ctx, H, device=device, backward=backward, fused_walks=opts.fused_walks)
+        raise ValueError(
+            f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
+        )
+    tb = workspace.ensure(
+        ctx, H, device=device, backward=backward, fused_walks=opts.fused_walks
+    )
     ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
     if dout is not None:
         ops["dout"] = dout
-    call = KcpCall(ctx=ctx, H=H, ws=workspace, tb=tb, backend=backend, opts=opts,
-                   scale=SCALE if scale is None else float(scale), ops=ops, backward=backward)
+    call = KcpCall(
+        ctx=ctx,
+        H=H,
+        ws=workspace,
+        tb=tb,
+        backend=backend,
+        opts=opts,
+        scale=SCALE if scale is None else float(scale),
+        ops=ops,
+        backward=backward,
+    )
     backend.begin_call(call)
     return call, batched
 
@@ -1786,9 +2915,22 @@ def chunk_kda_kcp_fwd(
     ``KcpContext``; the token operands are its ``T_r`` local tokens in fragment order; ``**options`` are the
     keywords of :class:`KcpOptions` (+ ``_kcp_test_knobs``)."""
     if boundary_mode not in BOUNDARY_MODES:
-        raise ValueError(f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}")
-    call, batched = _prepare(q, k, v, g, beta, ctx, scale=scale, save_mode=save_mode, workspace=workspace,
-                             options=options, backward=False)
+        raise ValueError(
+            f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
+        )
+    call, batched = _prepare(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale=scale,
+        save_mode=save_mode,
+        workspace=workspace,
+        options=options,
+        backward=False,
+    )
     save = bool(save_for_backward) and boundary_mode == "saved"
     call.out = _alloc((call.T_r, call.H, D), call.backend.dtypes["out"], call.device)
     _forward(call, save=save, replay=False)
@@ -1796,11 +2938,27 @@ def chunk_kda_kcp_fwd(
     if save:
         tb, opts = call.tb, call.opts
         saved = KcpSaved(
-            version=KCP_SAVED_VERSION, S_in=call.bufs["S_in"], c1_recv=call.bufs.get("c1_recv") if opts.save_transfer else None,
-            M_seg=call.bufs.get("stage_m") if (opts.save_transfer and tb.P > 1) else None,
-            Aqk=call.scratch.get("Aqk"), Akk=call.scratch.get("Akk"), T_r=call.T_r, H=call.H, n_frag=tb.n_frag, P=tb.P,
-            Hg=tb.Hg, scale=call.scale, save_mode=save_mode, save_transfer=opts.save_transfer, offset_class=opts.offset_class,
-            exchange=call.exchange, precision_mode=call.precision_mode, ctx=ctx, transfer_walk=call.transfer_walk,
+            version=KCP_SAVED_VERSION,
+            S_in=call.bufs["S_in"],
+            c1_recv=call.bufs.get("c1_recv") if opts.save_transfer else None,
+            M_seg=call.bufs.get("stage_m")
+            if (opts.save_transfer and tb.P > 1)
+            else None,
+            Aqk=call.scratch.get("Aqk"),
+            Akk=call.scratch.get("Akk"),
+            T_r=call.T_r,
+            H=call.H,
+            n_frag=tb.n_frag,
+            P=tb.P,
+            Hg=tb.Hg,
+            scale=call.scale,
+            save_mode=save_mode,
+            save_transfer=opts.save_transfer,
+            offset_class=opts.offset_class,
+            exchange=call.exchange,
+            precision_mode=call.precision_mode,
+            ctx=ctx,
+            transfer_walk=call.transfer_walk,
         )
     _record("fwd", call)
     call.backend.end_call(call)
@@ -1813,22 +2971,51 @@ def _check_saved(saved: KcpSaved, call: KcpCall) -> None:
         raise ValueError(f"saved: version {saved.version} is not {KCP_SAVED_VERSION}")
     if saved.ctx is not call.ctx:
         raise ValueError("saved: the saved set belongs to another KcpContext")
-    if (saved.T_r, saved.H, saved.n_frag, saved.P) != (call.T_r, call.H, tb.n_frag, tb.P):
-        raise ValueError("saved: the saved set describes another problem (T_r, H, n_frag, P)")
+    if (saved.T_r, saved.H, saved.n_frag, saved.P) != (
+        call.T_r,
+        call.H,
+        tb.n_frag,
+        tb.P,
+    ):
+        raise ValueError(
+            "saved: the saved set describes another problem (T_r, H, n_frag, P)"
+        )
     if saved.scale != call.scale:
-        raise ValueError(f"saved: scale {saved.scale} differs from the call's {call.scale}")
-    if (saved.save_transfer != opts.save_transfer or saved.exchange != call.exchange
-            or saved.precision_mode != call.precision_mode or saved.transfer_walk != call.transfer_walk):
-        raise ValueError("saved: save_transfer / exchange / precision_mode / transfer_walk differ from the forward's")
+        raise ValueError(
+            f"saved: scale {saved.scale} differs from the call's {call.scale}"
+        )
+    if (
+        saved.save_transfer != opts.save_transfer
+        or saved.exchange != call.exchange
+        or saved.precision_mode != call.precision_mode
+        or saved.transfer_walk != call.transfer_walk
+    ):
+        raise ValueError(
+            "saved: save_transfer / exchange / precision_mode / transfer_walk differ from the forward's"
+        )
     _check(saved.S_in, "saved.S_in", (tb.sizes["S_in"],), call.state_dtype, call.device)
     if opts.save_transfer:
         if saved.c1_recv is None:
-            raise ValueError("saved: save_transfer needs the forward's c1 receive tensor")
-        _check(saved.c1_recv, "saved.c1_recv", (tb.sizes["c1_recv"],), call.state_dtype, call.device)
+            raise ValueError(
+                "saved: save_transfer needs the forward's c1 receive tensor"
+            )
+        _check(
+            saved.c1_recv,
+            "saved.c1_recv",
+            (tb.sizes["c1_recv"],),
+            call.state_dtype,
+            call.device,
+        )
         if tb.P > 1:
             if saved.M_seg is None:
                 raise ValueError("saved: save_transfer at P > 1 needs M_seg")
-            _check(saved.M_seg, "saved.M_seg", (tb.sizes["stage_m"],), call.state_dtype, call.device)
+            _check(
+                saved.M_seg,
+                "saved.M_seg",
+                (tb.sizes["stage_m"],),
+                call.state_dtype,
+                call.device,
+            )
 
 
 def chunk_kda_kcp_bwd(
@@ -1847,21 +3034,37 @@ def chunk_kda_kcp_bwd(
     **options: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The KCP backward (GOAL §3.2): ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward."""
-    call, batched = _prepare(q, k, v, g, beta, ctx, scale=scale, save_mode=save_mode, workspace=workspace,
-                             options=options, backward=True, dout=dout)
+    call, batched = _prepare(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale=scale,
+        save_mode=save_mode,
+        workspace=workspace,
+        options=options,
+        backward=True,
+        dout=dout,
+    )
     if saved is not None:
         _check_saved(saved, call)
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
     call.grads = {
-        "dq": _alloc((T, H, D), dt["dq"], call.device), "dk": _alloc((T, H, D), dt["dk"], call.device),
-        "dv": _alloc((T, H, D), dt["dv"], call.device), "dg": _alloc((T, H, D), dt["dg"], call.device),
+        "dq": _alloc((T, H, D), dt["dq"], call.device),
+        "dk": _alloc((T, H, D), dt["dk"], call.device),
+        "dv": _alloc((T, H, D), dt["dv"], call.device),
+        "dg": _alloc((T, H, D), dt["dg"], call.device),
         "dbeta": _alloc((T, H), dt["dbeta"], call.device),
     }
     _backward(call, saved)
     _record("bwd", call)
     call.backend.end_call(call)
-    return tuple(_ranked(call.grads[n], batched) for n in ("dq", "dk", "dv", "dbeta", "dg"))
+    return tuple(
+        _ranked(call.grads[n], batched) for n in ("dq", "dk", "dv", "dbeta", "dg")
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1875,23 +3078,60 @@ class ChunkKDAKcpFunction(torch.autograd.Function):
     on every rank, so the collectives match (R7)."""
 
     @staticmethod
-    def forward(fctx, q, k, v, g, beta, ctx, scale, save_mode, boundary_mode, workspace, options):
-        out, saved = chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, scale=scale, save_for_backward=True, save_mode=save_mode,
-                                       boundary_mode=boundary_mode, workspace=workspace, **options)
+    def forward(
+        fctx, q, k, v, g, beta, ctx, scale, save_mode, boundary_mode, workspace, options
+    ):
+        out, saved = chunk_kda_kcp_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            scale=scale,
+            save_for_backward=True,
+            save_mode=save_mode,
+            boundary_mode=boundary_mode,
+            workspace=workspace,
+            **options,
+        )
         tensors = saved.tensors() if saved is not None else ()
         fctx.save_for_backward(q, k, v, g, beta, *tensors)
-        fctx.kcp = (ctx, scale, save_mode, workspace, dict(options), None if saved is None else (saved.flags(), saved.meta()))
+        fctx.kcp = (
+            ctx,
+            scale,
+            save_mode,
+            workspace,
+            dict(options),
+            None if saved is None else (saved.flags(), saved.meta()),
+        )
         return out
 
     @staticmethod
     def backward(fctx, dout):
         q, k, v, g, beta, *tensors = fctx.saved_tensors
         ctx, scale, save_mode, workspace, options, meta = fctx.kcp
-        saved = None if meta is None else KcpSaved.from_tensors(tensors, meta[0], meta[1], ctx)
+        saved = (
+            None
+            if meta is None
+            else KcpSaved.from_tensors(tensors, meta[0], meta[1], ctx)
+        )
         if not dout.is_contiguous():
             dout = dout.contiguous()
-        dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q, k, v, g, beta, ctx, dout, saved=saved, scale=scale,
-                                                  save_mode=save_mode, workspace=workspace, **options)
+        dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            dout,
+            saved=saved,
+            scale=scale,
+            save_mode=save_mode,
+            workspace=workspace,
+            **options,
+        )
         return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
 
 
@@ -1911,8 +3151,12 @@ def chunk_kda_kcp(
     """The differentiable KCP forward (GOAL §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``."""
     _options(options)  # validate on the caller's frame
     if boundary_mode not in BOUNDARY_MODES:
-        raise ValueError(f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}")
-    return ChunkKDAKcpFunction.apply(q, k, v, g, beta, ctx, scale, save_mode, boundary_mode, workspace, dict(options))
+        raise ValueError(
+            f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
+        )
+    return ChunkKDAKcpFunction.apply(
+        q, k, v, g, beta, ctx, scale, save_mode, boundary_mode, workspace, dict(options)
+    )
 
 
 # the plan module's byte queries, re-exported for the GOAL §3.2 literal forms

@@ -903,7 +903,7 @@ def _halo_sources(part: KcpPartition, halo: int):
     for frs in part.fragments:
         for f in frs:
             if f.length > 0 and f.off > 0:
-                rows = []
+                rows: list[tuple[int, int, int] | None] = []
                 for k in range(halo):
                     t = f.off - halo + k
                     if t < 0:

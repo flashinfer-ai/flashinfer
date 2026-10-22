@@ -553,9 +553,10 @@ def kcp_comm_bytes(
     C: int = 8192,
     save_transfer: bool = False,
     boundary_mode: str = "saved",
-) -> int:
+) -> dict:
     """Bytes this rank sends and receives in one training step (forward and backward) for ``H`` heads and ``C``
-    convolution channels: the state summaries, the boundary states and the halo rows of the context's collectives."""
+    convolution channels: the state summaries, the boundary states and the halo rows of the context's collectives,
+    as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``)."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
     return cake_kcp_plan.kcp_comm_bytes(

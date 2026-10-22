@@ -113,19 +113,26 @@ def _local_slices(part, rank: int, cu: list[int], tensors: dict) -> dict:
     for name, t in tensors.items():
         if name == "cu_seqlens":
             continue
-        parts = [t[cu[f.doc] + f.off: cu[f.doc] + f.off + f.length] for f in part.fragments[rank]]
+        parts = [
+            t[cu[f.doc] + f.off : cu[f.doc] + f.off + f.length]
+            for f in part.fragments[rank]
+        ]
         out[name] = torch.cat(parts, 0) if parts else t[:0].clone()
     return out
 
 
-def _to_global(part, rank_tensors: list[torch.Tensor], cu: list[int], total: int) -> torch.Tensor:
+def _to_global(
+    part, rank_tensors: list[torch.Tensor], cu: list[int], total: int
+) -> torch.Tensor:
     ref = rank_tensors[0]
     g = torch.empty((total,) + tuple(ref.shape[1:]), dtype=ref.dtype, device=ref.device)
     for r, t in enumerate(rank_tensors):
         pos = 0
         for f in part.fragments[r]:
             if f.length:
-                g[cu[f.doc] + f.off: cu[f.doc] + f.off + f.length] = t[pos: pos + f.length]
+                g[cu[f.doc] + f.off : cu[f.doc] + f.off + f.length] = t[
+                    pos : pos + f.length
+                ]
             pos += f.length
     return g
 
@@ -143,14 +150,20 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     part, cu = _partition(lengths, W, layout)
     ctx = cake_kcp_plan.build_kcp_context(part, group, rank, device)
     total = cu[-1]
-    glob = make_inputs(lengths, H, device)  # the same seeded operands on every rank; each takes its slices
+    glob = make_inputs(
+        lengths, H, device
+    )  # the same seeded operands on every rank; each takes its slices
     ops = _local_slices(part, rank, cu, glob)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
     ws = cake_kcp.KcpWorkspace()
 
     def saved_pass(**opts):
-        out, saved = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws, **opts)
-        dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **opts)
+        out, saved = cake_kcp.chunk_kda_kcp_fwd(
+            q, k, v, g, beta, ctx, workspace=ws, **opts
+        )
+        dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(
+            q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **opts
+        )
         return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
 
     def autograd_pass(ckpt: bool):
@@ -166,10 +179,15 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         else:
             out = fn(*leaves)
         out.backward(dout)
-        return {"out": out.detach(), **{f"d{n}": lf.grad for n, lf in zip(("q", "k", "v", "g", "beta"), leaves)}}
+        return {
+            "out": out.detach(),
+            **{f"d{n}": lf.grad for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)},
+        }
 
     res = saved_pass()
-    spec3 = (cake_kcp.LAST_CALL.get("bwd") or {}).get("spec3")  # SPEC-3 debug assertion of the first saved-mode backward
+    spec3 = (cake_kcp.LAST_CALL.get("bwd") or {}).get(
+        "spec3"
+    )  # SPEC-3 debug assertion of the first saved-mode backward
     backend = cake_kcp.get_backend()
     res_replay = saved_pass(boundary_mode="replay")
     res_repeat = saved_pass()
@@ -177,7 +195,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     res_ckpt = autograd_pass(True)
     res_transfer = saved_pass(save_transfer=True)
     ring_ok = True
-    if W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS:  # gate 5: the ring path is bitwise the a2a path
+    if (
+        W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS
+    ):  # gate 5: the ring path is bitwise the a2a path
         res_ring = saved_pass(exchange="ring")
         ring_ok = all(torch.equal(res[n], res_ring[n]) for n in TENSORS)
     flags = {
@@ -188,7 +208,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "save_transfer_eq": all(torch.equal(res[n], res_transfer[n]) for n in TENSORS),
         "ring_eq_a2a": ring_ok,
         # a backend with local stages must have run the SPEC-3 assertion (unless disabled) and passed it
-        "spec3": (not backend.local_stages) or (spec3 is None and os.environ.get(cake_kcp.SPEC3_ENV, "1") == "0") or bool(spec3 and spec3.get("equal")),
+        "spec3": (not backend.local_stages)
+        or (spec3 is None and os.environ.get(cake_kcp.SPEC3_ENV, "1") == "0")
+        or bool(spec3 and spec3.get("equal")),
     }
     gathered = {}
     for n in TENSORS:
@@ -203,15 +225,31 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         dist.all_gather_object(flag_list, flags)
     else:
         flag_list = [flags]
-    report = {"rank": rank, "world": W, "pass": True, "flags": {}, "metrics": {}, "backend": backend.name,
-              "backend_path": getattr(backend, "path", None), "spec3": spec3}
+    report = {
+        "rank": rank,
+        "world": W,
+        "pass": True,
+        "flags": {},
+        "metrics": {},
+        "backend": backend.name,
+        "backend_path": getattr(backend, "path", None),
+        "spec3": spec3,
+    }
     for key in flags:
         report["flags"][key] = all(f[key] for f in flag_list)
         report["pass"] &= report["flags"][key]
     if rank == 0:
         cu_t = torch.tensor(cu, dtype=torch.int32)
-        ref_out, ref_grads = kda_exact_with_grads(glob["q"].cpu(), glob["k"].cpu(), glob["v"].cpu(), glob["g"].cpu(),
-                                                  glob["beta"].cpu(), glob["dout"].cpu(), cu_t, SCALE)
+        ref_out, ref_grads = kda_exact_with_grads(
+            glob["q"].cpu(),
+            glob["k"].cpu(),
+            glob["v"].cpu(),
+            glob["g"].cpu(),
+            glob["beta"].cpu(),
+            glob["dout"].cpu(),
+            cu_t,
+            SCALE,
+        )
         refs = {"out": ref_out, **ref_grads}
         for n in TENSORS:
             cand = _to_global(part, gathered[n], cu, total).to(torch.float64)
@@ -219,8 +257,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
             excess = (cand - ref).abs() - (ATOL + RTOL * ref.abs())
             mism = int((excess > 0).sum())
             err = cand - ref
-            rel = float(err.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-300))
-            report["metrics"][n] = {"mismatch": mism, "rel_rms": rel, "max_abs": float(err.abs().max())}
+            rel = float(
+                err.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-300)
+            )
+            report["metrics"][n] = {
+                "mismatch": mism,
+                "rel_rms": rel,
+                "max_abs": float(err.abs().max()),
+            }
             report["pass"] &= mism == 0 and bool(torch.isfinite(cand).all())
         if result_dir:
             os.makedirs(result_dir, exist_ok=True)
@@ -234,7 +278,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     return report
 
 
-def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str | None, queue) -> None:
+def _spawn_entry(
+    rank: int, W: int, row, port: int, result_dir: str | None, queue
+) -> None:
     try:
         report = _run_rank(rank, W, row, port, result_dir)
         queue.put((rank, report))
@@ -263,19 +309,34 @@ def _skip_unless_runnable(W: int) -> None:
 @pytest.mark.parametrize("row", ROWS, ids=_row_id)
 def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
     lengths, H, W, layout = row
-    if os.environ.get("SLURM_PROCID") is not None and int(os.environ.get("SLURM_NTASKS", "1")) == W:
+    if (
+        os.environ.get("SLURM_PROCID") is not None
+        and int(os.environ.get("SLURM_NTASKS", "1")) == W
+    ):
         # one process per Slurm task: the body runs here (rendezvous from MASTER_ADDR / MASTER_PORT)
         if not _programs_exported():
-            pytest.skip("the KCP programs are not exported in the package's build.json yet")
-        report = _run_rank(int(os.environ["SLURM_PROCID"]), W, row, int(os.environ.get("MASTER_PORT", "29500")),
-                           os.environ.get("KCP_TEST_RESULT_DIR"))
+            pytest.skip(
+                "the KCP programs are not exported in the package's build.json yet"
+            )
+        report = _run_rank(
+            int(os.environ["SLURM_PROCID"]),
+            W,
+            row,
+            int(os.environ.get("MASTER_PORT", "29500")),
+            os.environ.get("KCP_TEST_RESULT_DIR"),
+        )
         assert report["pass"], report
         return
     _skip_unless_runnable(W)
     ctx = mp.get_context("spawn")
     queue = ctx.SimpleQueue()
-    mp.start_processes(_spawn_entry, args=(W, row, _free_port(), os.environ.get("KCP_TEST_RESULT_DIR"), queue),
-                       nprocs=W, join=True, start_method="spawn")
+    mp.start_processes(
+        _spawn_entry,
+        args=(W, row, _free_port(), os.environ.get("KCP_TEST_RESULT_DIR"), queue),
+        nprocs=W,
+        join=True,
+        start_method="spawn",
+    )
     reports = {}
     while not queue.empty():
         rank, report = queue.get()
@@ -294,7 +355,10 @@ def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
         cake_kcp._options({"precision_mode": 1})
     assert cake_kcp._options({}).precision_mode == 0
     monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
-    assert cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).precision_mode == 1
+    assert (
+        cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).precision_mode
+        == 1
+    )
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 7}})
 
@@ -309,13 +373,30 @@ def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
         cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "bf16x3"}})
     assert cake_kcp._options({}).transfer_walk == "tf32_hilo"
     monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
-    assert cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "bf16x3"}}).transfer_walk == "bf16x3"
-    assert cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "bf16x3_hw64"}}).transfer_walk == "bf16x3_hw64"
-    assert cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).transfer_walk == "tf32_hilo"
+    assert (
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"transfer_walk": "bf16x3"}}
+        ).transfer_walk
+        == "bf16x3"
+    )
+    assert (
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"transfer_walk": "bf16x3_hw64"}}
+        ).transfer_walk
+        == "bf16x3_hw64"
+    )
+    assert (
+        cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).transfer_walk
+        == "tf32_hilo"
+    )
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "fp64"}})
-    with pytest.raises(ValueError):  # a K3 precision_mode program belongs to the tf32_hilo family
-        cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1, "transfer_walk": "bf16x3"}})
+    with pytest.raises(
+        ValueError
+    ):  # a K3 precision_mode program belongs to the tf32_hilo family
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"precision_mode": 1, "transfer_walk": "bf16x3"}}
+        )
 
 
 def test_module_imports_only_torch_and_its_package() -> None:
@@ -324,7 +405,19 @@ def test_module_imports_only_torch_and_its_package() -> None:
 
     src = Path(cake_kcp.__file__).read_text()
     tree = ast.parse(src)
-    allowed = {"__future__", "dataclasses", "math", "os", "types", "typing", "collections", "collections.abc", "torch", "torch.distributed", "tvm_ffi"}
+    allowed = {
+        "__future__",
+        "dataclasses",
+        "math",
+        "os",
+        "types",
+        "typing",
+        "collections",
+        "collections.abc",
+        "torch",
+        "torch.distributed",
+        "tvm_ffi",
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
