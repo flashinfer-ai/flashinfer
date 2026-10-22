@@ -68,6 +68,27 @@ def _derive(route):
             causal=causal,
             max_pages=max_pages,
         )
+    if kind == "decode_m16" and len(fields) == 4:
+        # the L2 evict-first form of the paged BF16 decode program: an
+        # under-filled long-context batch on compute capability 10.3 (eight
+        # requests of eight queries over four KV heads = 256 work items at
+        # 152 SMs, a 465-page table)
+        q_dtype, kv_dtype, layout, form = fields
+        assert form == "l2ef", route
+        return backend._decode_route(
+            q_dtype=_DTYPES[q_dtype],
+            k_dtype=_DTYPES[kv_dtype],
+            paged=layout == "paged",
+            l2ef=backend._use_decode_l2ef(
+                target="sm103a",
+                paged=layout == "paged",
+                q_dtype=_DTYPES[q_dtype],
+                k_dtype=_DTYPES[kv_dtype],
+                items=256,
+                num_sms=152,
+                max_pages=465,
+            ),
+        )
     if kind == "decode_m16":
         q_dtype, kv_dtype, layout = fields
         return backend._decode_route(
@@ -351,6 +372,116 @@ def test_persistent_route_keys_and_plans_are_registered():
     assert "partial_scale" not in main and "num_work_items" in main
     reduce = [name for _kind, name in loader.ARG_PLANS["kmaj_p_reduce"]]
     assert "partial_scale" not in reduce and "split_counts" in reduce
+
+
+def _l2ef(batch, seqlen_q, num_kv_heads, kv_len, **over):
+    # items = batch x seqlen_q x KV heads (the persistent work items of the M16
+    # decode); pages = ceil(kv / 128), the width of a tight page table
+    inputs = dict(
+        target="sm103a",
+        paged=True,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        items=batch * seqlen_q * num_kv_heads,
+        num_sms=152,
+        max_pages=-(-kv_len // backend._BLOCK_SIZE),
+    )
+    return backend._use_decode_l2ef(**{**inputs, **over})
+
+
+def _l2ef_100(batch, seqlen_q, num_kv_heads, kv_len, **over):
+    # the same launch judged for compute capability 10.0 (148 SMs)
+    over = {"target": "sm100a", "num_sms": 148, **over}
+    return _l2ef(batch, seqlen_q, num_kv_heads, kv_len, **over)
+
+
+def test_decode_l2ef_constants_and_truth_table():
+    assert backend._DECODE_L2EF_TARGETS == ("sm100a", "sm103a")
+    assert backend._DECODE_L2EF_ITEMS_FACTOR == (2, 1)
+    assert backend._DECODE_L2EF_MIN_KV_LEN == 40960
+    assert backend._BLOCK_SIZE == 128
+    assert backend._DECODE_L2EF_MIN_PAGES == 320
+    # (batch, seqlen_q, KV heads, longest context): the decode rows the hinted
+    # program was measured on; at 152 SMs (compute capability 10.3) and at 148
+    # (10.0) alike it takes the under-filled rows whose longest context reaches
+    # 40960 tokens (three of nineteen) and no other
+    universe = [
+        *((8, 8, 4, kv) for kv in (1250, 4633, 6185, 12229, 59482, 119999, 243998)),
+        *((1, 8, 4, kv) for kv in (1000, 4000, 8000, 32000)),
+        *((2, 8, 4, kv) for kv in (1200, 4294, 8727, 37720)),
+        *((4, 8, 4, kv) for kv in (1234, 4415, 9550, 37800)),
+    ]
+    for batch, seqlen_q, kv_heads, kv in universe:
+        items = batch * seqlen_q * kv_heads
+        expected = items <= 2 * 152 and -(-kv // 128) >= 320
+        assert _l2ef(batch, seqlen_q, kv_heads, kv) is expected, (batch, kv)
+        expected_100 = items <= 2 * 148 and -(-kv // 128) >= 320
+        assert _l2ef_100(batch, seqlen_q, kv_heads, kv) is expected_100, (batch, kv)
+    assert sum(_l2ef(*row) for row in universe) == 3
+    assert sum(_l2ef_100(*row) for row in universe) == 3
+    # batches deeper than two waves never take it, whatever the context
+    for batch, seqlen_q, kv_heads, kv in (
+        (16, 8, 4, 243998),
+        (32, 8, 4, 244115),
+        (32, 8, 4, 12245),
+        (64, 8, 4, 249393),
+        (128, 8, 4, 249728),
+        (32, 8, 4, 8192),
+        (64, 8, 4, 16384),
+        (128, 8, 4, 65536),
+        (32, 8, 4, 65536),
+        (64, 8, 4, 65536),
+    ):
+        assert _l2ef(batch, seqlen_q, kv_heads, kv) is False, (batch, kv)
+
+
+def test_decode_l2ef_items_and_pages_boundaries():
+    # items at twice the SM count (inclusive) ...
+    assert _l2ef(1, 1, 304, 200000) is True
+    assert _l2ef(1, 1, 305, 200000) is False
+    assert _l2ef(8, 8, 4, 200000) is True  # 256 items: the measured row
+    assert _l2ef(16, 8, 4, 200000) is False  # 512 items
+    assert _l2ef_100(1, 1, 296, 200000) is True  # 148 SMs
+    assert _l2ef_100(1, 1, 297, 200000) is False
+    # ... and the page-table width at the 40960-token floor (320 pages)
+    assert _l2ef(8, 8, 4, 40960) is True
+    assert _l2ef(8, 8, 4, 40833) is True  # 320 pages, the last one partial
+    assert _l2ef(8, 8, 4, 40832) is False  # 319 pages
+    assert _l2ef(8, 8, 4, 0) is False
+    assert _l2ef(8, 8, 4, 200000, max_pages=320) is True
+    assert _l2ef(8, 8, 4, 200000, max_pages=319) is False
+
+
+def test_decode_l2ef_target_layout_and_dtype_exclude():
+    assert _l2ef(8, 8, 4, 200000) is True
+    assert _l2ef_100(8, 8, 4, 200000) is True
+    assert _l2ef(8, 8, 4, 200000, target="sm107a") is False
+    assert _l2ef(8, 8, 4, 200000, paged=False) is False
+    assert _l2ef(8, 8, 4, 200000, k_dtype=torch.float8_e4m3fn) is False
+    assert _l2ef(8, 8, 4, 200000, q_dtype=torch.float16, k_dtype=torch.float16) is False
+    for bad in ({"items": 0}, {"items": -8}, {"num_sms": 0}, {"max_pages": -1}):
+        with pytest.raises(ValueError):
+            _l2ef(8, 8, 4, 200000, **bad)
+
+
+def test_decode_l2ef_key_and_program_are_registered_on_both_targets():
+    bf16 = dict(q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, paged=True)
+    plain = backend._decode_route(**bf16)
+    hinted = backend._decode_route(**bf16, l2ef=True)
+    assert plain == "decode_m16:bfloat16:bfloat16:paged"
+    assert hinted == "decode_m16:bfloat16:bfloat16:paged:l2ef"
+    assert backend._decode_route(**bf16, l2ef=False) == plain
+    for target in ("sm100a", "sm103a"):
+        keys = _route_keys(target)
+        assert f"{plain}:main" in keys and f"{hinted}:main" in keys
+        unhinted = loader.route_program(f"{plain}:main", target)
+        program = loader.route_program(f"{hinted}:main", target)
+        # a program of its own, with the paged program's argument plan, built
+        # for both targets and selected on both by the predicate alone
+        assert program != unhinted
+        assert loader.MODULES[program]["arg_plan"] == "decode_m16"
+        assert loader.MODULES[unhinted]["arg_plan"] == "decode_m16"
+        assert loader.MODULES[program]["arches"] == ["sm_100a", "sm_103a"]
 
 
 def test_uniform_fp8_grid_uses_the_full_even_wave_when_available():
