@@ -168,10 +168,16 @@ def test_download_cubin_flag_mocked(monkeypatch):
     assert "All cubin download tasks completed successfully" in out
 
 
-def test_download_cubin_cmd_mocked(monkeypatch):
+def test_download_cubin_cmd_mocked(monkeypatch, tmp_path):
     """
     Test that download-cubin downloads raw cubin artifacts using a mocked cubin path.
     """
+    # download_artifacts() prunes every cached file missing from the (mocked)
+    # manifest, so keep it off the shared cubin cache that concurrent JIT
+    # builds read from.
+    monkeypatch.setattr(
+        "flashinfer.artifacts.FLASHINFER_CUBIN_DIR", tmp_path / "cubins"
+    )
     fmha_cubin = "fmhaSm100aKernel_QE4m3KvE2m1OE4m3H128PagedKvCausalP32VarSeqQ128Kv128PersistentContext.cubin"
 
     def mock_get_subdir_file_list():
