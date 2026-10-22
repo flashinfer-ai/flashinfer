@@ -72,7 +72,7 @@ if TYPE_CHECKING:
 
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
-_SUPPORTED_HEAD_DIMS = (128, 256)
+_SUPPORTED_HEAD_DIMS = (128, 192, 256)
 _DEFAULT_PAGED_KV_PAGE_SIZE = 32
 _SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
 _SUPPORTED_DTYPES = (
@@ -834,7 +834,7 @@ def _read_indptr(
     *,
     expected_total: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Read cumulative offsets and validate strictly positive row lengths."""
+    """Read cumulative offsets and validate nonnegative row lengths."""
 
     values = tuple(int(value) for value in indptr.tolist())
     if values[0] != 0:
@@ -845,8 +845,8 @@ def _read_indptr(
             f"expected {expected_total}, got {values[-1]}"
         )
     lengths = tuple(curr - prev for prev, curr in itertools.pairwise(values))
-    if any(length <= 0 for length in lengths):
-        raise ValueError(f"{name} offsets must be strictly increasing")
+    if any(length < 0 for length in lengths):
+        raise ValueError(f"{name} offsets must be nondecreasing")
     return values, lengths
 
 
@@ -1246,13 +1246,13 @@ def _resolve_geometry(
         for batch_idx, (q_length, k_length) in enumerate(
             zip(q_lengths, k_lengths, strict=True)
         ):
-            if q_length > k_length:
+            if k_length > 0 and q_length > k_length:
                 raise ValueError(
                     "bottom-right causal context requires Sq <= Sk for each "
                     f"request; got batch {batch_idx}: Sq={q_length}, Sk={k_length}"
                 )
 
-    if q_head_dim == 192 and window_left > 0:
+    if (q_head_dim, int(v.shape[-1])) == (192, 128) and window_left > 0:
         raise NotImplementedError("192/128 context does not support a left window")
     head_paired = window_left > 0
     if head_paired and (head_ratio <= 1 or head_ratio % 2 != 0):
@@ -1355,7 +1355,7 @@ def _resolve_context_plan_geometry(
     _validate_padded_data_extent(batch_size * max_kv_len, "batch_size * max_kv_len")
     head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
     _validate_head_dim(head_dim, head_dim, head_dim_vo)
-    if head_dim == 192 and window_left > 0:
+    if (head_dim, head_dim_vo) == (192, 128) and window_left > 0:
         raise NotImplementedError(
             "QK/V=(192, 128) does not support a positive left window"
         )
@@ -1464,8 +1464,10 @@ def _resolve_paged_geometry(
         )
     _validate_head_dim(q_head_dim, kv_head_dim)
     _validate_compact(q, "q", "[total_q, Hq, D]")
-    _validate_compact(k_cache, "k_cache", "[num_pages, Hkv, page_size, D]")
-    _validate_compact(v_cache, "v_cache", "[num_pages, Hkv, page_size, D]")
+    from .decode import _validate_native_hnd_tma_strides
+
+    _validate_native_hnd_tma_strides(k_cache, "k_cache")
+    _validate_native_hnd_tma_strides(v_cache, "v_cache")
 
     _validate_indptr_tensor(qo_indptr, "qo_indptr", device=device)
     batch_size = int(qo_indptr.numel()) - 1
@@ -1478,9 +1480,9 @@ def _resolve_paged_geometry(
         expected_count=batch_size,
     )
     for batch_idx, k_length in enumerate(k_lengths):
-        if k_length <= 0:
+        if k_length < 0:
             raise ValueError(
-                "seq_lens_kv entries must be positive; "
+                "seq_lens_kv entries must be nonnegative; "
                 f"batch {batch_idx} has {k_length}"
             )
     max_seq_len_q = max(q_lengths)
@@ -2301,8 +2303,17 @@ def _get_compiled_paged_context(
         page_size,
         head_dim,
     )
-    k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
-    v_fake = fake_compact(input_pv_dtype, kv_shape, 16)
+
+    def fake_paged_cache(dtype):
+        return cute.runtime.make_fake_tensor(
+            dtype,
+            kv_shape,
+            stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64(), 1),
+            assumed_align=16,
+        )
+
+    k_fake = fake_paged_cache(input_qk_dtype)
+    v_fake = fake_paged_cache(input_pv_dtype)
     out_fake = fake_compact(output_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
@@ -2407,20 +2418,16 @@ def _validate_runtime_inputs(
         total_k = int(k.shape[0])
         _validate_padded_data_extent(total_q, "total_q")
         _validate_padded_data_extent(total_k, "total_k")
-        if total_q < geometry.batch_size or total_q > (
-            geometry.batch_size * geometry.max_seq_len_q
-        ):
+        if total_q > (geometry.batch_size * geometry.max_seq_len_q):
             raise ValueError(
-                "q must contain between batch_size and "
+                "q must contain no more than "
                 "batch_size * max_seq_len_q rows; got "
                 f"{total_q} for batch_size={geometry.batch_size} and "
                 f"max_seq_len_q={geometry.max_seq_len_q}"
             )
-        if total_k < geometry.batch_size or total_k > (
-            geometry.batch_size * geometry.max_seq_len_k
-        ):
+        if total_k > (geometry.batch_size * geometry.max_seq_len_k):
             raise ValueError(
-                "k and v must contain between batch_size and "
+                "k and v must contain no more than "
                 "batch_size * max_kv_len rows; got "
                 f"{total_k} for batch_size={geometry.batch_size} and "
                 f"max_kv_len={geometry.max_seq_len_k}"
@@ -2461,7 +2468,7 @@ def _validate_runtime_inputs(
             for batch_idx, (q_length, k_length) in enumerate(
                 zip(q_lengths, k_lengths, strict=True)
             ):
-                if q_length > k_length:
+                if k_length > 0 and q_length > k_length:
                     raise ValueError(
                         "bottom-right causal context requires Sq <= Sk for each "
                         f"request; got batch {batch_idx}: Sq={q_length}, "
@@ -2537,18 +2544,18 @@ def _validate_paged_runtime_inputs(
         )
     total_q = int(q.shape[0])
     _validate_padded_data_extent(total_q, "total_q")
-    if total_q < geometry.batch_size or total_q > (
-        geometry.batch_size * geometry.max_seq_len_q
-    ):
+    if total_q > (geometry.batch_size * geometry.max_seq_len_q):
         raise ValueError(
-            "q must contain between batch_size and batch_size * max_seq_len_q "
+            "q must contain no more than batch_size * max_seq_len_q "
             f"rows; got {total_q} rows for batch_size={geometry.batch_size} and "
             f"max_seq_len_q={geometry.max_seq_len_q}"
         )
     _validate_extent(int(k_cache.shape[0]), "num_physical_pages")
     _validate_compact(q, "q", "[total_q, Hq, D]")
-    _validate_compact(k_cache, "k_cache", "[num_pages, Hkv, page_size, D]")
-    _validate_compact(v_cache, "v_cache", "[num_pages, Hkv, page_size, D]")
+    from .decode import _validate_native_hnd_tma_strides
+
+    _validate_native_hnd_tma_strides(k_cache, "k_cache")
+    _validate_native_hnd_tma_strides(v_cache, "v_cache")
 
 
 def _validate_paged_runtime_metadata(
@@ -2608,9 +2615,9 @@ def _validate_paged_runtime_metadata(
                 f"to equal max_seq_len_q={geometry.max_seq_len_q}; batch "
                 f"{batch_idx} has {q_length}"
             )
-        if kv_length <= 0 or kv_length > geometry.max_kv_len:
+        if kv_length < 0 or kv_length > geometry.max_kv_len:
             raise ValueError(
-                "seq_lens_kv entries must be positive and not exceed "
+                "seq_lens_kv entries must be nonnegative and not exceed "
                 f"max_kv_len={geometry.max_kv_len}; batch {batch_idx} has "
                 f"{kv_length}"
             )
@@ -2621,7 +2628,7 @@ def _validate_paged_runtime_metadata(
                 f"{batch_idx} has {kv_length}"
             )
         required_pages = (kv_length + geometry.page_size - 1) // geometry.page_size
-        if geometry.mask_type == "causal" and q_length > kv_length:
+        if geometry.mask_type == "causal" and kv_length > 0 and q_length > kv_length:
             raise ValueError(
                 "bottom-right causal context requires Sq <= Sk for each "
                 f"request; got batch {batch_idx}: Sq={q_length}, Sk={kv_length}"
@@ -2690,7 +2697,8 @@ def _prepare_out(
 class BatchPrefillTSWrapper:
     """Compile and reuse fixed or packed-ragged contiguous context attention.
 
-    Supports equal QK/V dimensions 128 and 256, and separate QK=192/V=128
+    Supports equal QK/V dimensions 128, 192, and 256 with the common
+    input/output dtype contract, and separate QK=192/V=128
     for non-absorbed MLA. Output has Q's leading dimensions and V's head
     dimension. The 192/128 geometry does not support a positive left window.
 
@@ -2745,7 +2753,7 @@ class BatchPrefillTSWrapper:
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        Packed plans conservatively support any positive per-request Q and K/V
+        Packed plans conservatively support nonnegative per-request Q and K/V
         lengths bounded by ``max_seq_len_q`` and ``max_kv_len``. Fixed plans
         use those bounds as their exact tensor extents. ``batch_size`` is exact.
         Calling ``plan`` again replaces all plan-owned tensors and invalidates
@@ -2840,11 +2848,11 @@ class BatchPrefillTSWrapper:
         scale_softmax_log2 = _validate_scale(
             sm_scale * math.log2(math.e), "sm_scale * log2(e)"
         )
-        scale_tensor = torch.tensor(
-            [scale_softmax_log2], dtype=torch.float32, device=geometry.device
+        scale_tensor = torch.full(
+            (1,), scale_softmax_log2, dtype=torch.float32, device=geometry.device
         )
-        output_scale_tensor = torch.tensor(
-            [output_scale], dtype=torch.float32, device=geometry.device
+        output_scale_tensor = torch.full(
+            (1,), output_scale, dtype=torch.float32, device=geometry.device
         )
         empty_i32 = torch.empty(1, dtype=torch.int32, device=geometry.device)
         if geometry.mask_type == "variable_window":
@@ -3149,7 +3157,7 @@ class BatchPrefillPagedTSWrapper:
         """Compile one reusable specialization from explicit static geometry.
 
         Sequence lengths and page indices are deliberately absent. By default,
-        the plan supports dynamic positive lengths bounded by
+        the plan supports dynamic nonnegative lengths bounded by
         ``max_seq_len_q`` and ``max_kv_len``. ``uniform_packed_lengths=True``
         instead promises that every runtime Q length equals ``max_seq_len_q``
         and every runtime K/V length equals ``max_kv_len``.
@@ -3253,11 +3261,11 @@ class BatchPrefillPagedTSWrapper:
         scale_softmax_log2 = _validate_scale(
             sm_scale * math.log2(math.e), "sm_scale * log2(e)"
         )
-        scale_tensor = torch.tensor(
-            [scale_softmax_log2], dtype=torch.float32, device=geometry.device
+        scale_tensor = torch.full(
+            (1,), scale_softmax_log2, dtype=torch.float32, device=geometry.device
         )
-        output_scale_tensor = torch.tensor(
-            [output_scale], dtype=torch.float32, device=geometry.device
+        output_scale_tensor = torch.full(
+            (1,), output_scale, dtype=torch.float32, device=geometry.device
         )
 
         # Keep the two plan-owned scalar allocations ahead of CUTLASS JIT,
@@ -3297,12 +3305,12 @@ class BatchPrefillPagedTSWrapper:
         with shape ``[B]``. Their values must satisfy the capacities documented
         by ``plan``:
 
-        * ``qo_indptr`` starts at zero, increases strictly, ends at the packed
+        * ``qo_indptr`` starts at zero, is nondecreasing, ends at the packed
           Q extent, and has deltas no greater than ``max_seq_len_q``;
         * ``C`` is at least ``ceil(max_kv_len / page_size)``;
-        * ``seq_lens_kv`` entries are positive and do not exceed
+        * ``seq_lens_kv`` entries are nonnegative and do not exceed
           ``max_kv_len``;
-        * causal launches additionally satisfy ``Sq[b] <= Sk[b]``; and
+        * active causal requests additionally satisfy ``Sq[b] <= Sk[b]``; and
         * every active page-table entry is a valid physical page ID in both
           separate, isomorphic K and V pools. Padding entries beyond the
           logical K/V length are not dereferenced.
@@ -3427,7 +3435,8 @@ def batch_prefill(
 
     Fixed tensors use ``[B, S, H, D]`` storage. Providing both cumulative
     int32 offset tensors selects packed ``[total_tokens, H, D]`` storage.
-    Equal Q/K/V head dimensions may be 128 or 256. Separate Q/K=192 and
+    Equal Q/K/V head dimensions may be 128, 192, or 256. The dtype contract
+    is shared by all three dimensions. Separate Q/K=192 and
     V=128 supports non-absorbed MLA; O uses V's head dimension.
     Causal masking is bottom-right aligned.  ``window_left=-1`` disables the
     left window; a positive value selects the private head-paired GQA policy

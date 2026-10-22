@@ -587,6 +587,7 @@ _MLA_CASES = (
         },
         "mixed",
         True,
+        exercise_all_paths=True,
         id="fp8-1cta-parallel-reduction",
     ),
     _param(
@@ -594,6 +595,7 @@ _MLA_CASES = (
         {"kernel": "throughput_latency_1cta", "split_kv": 1},
         None,
         False,
+        exercise_all_paths=True,
         id="bf16-1cta-direct",
     ),
     _param(
@@ -601,6 +603,7 @@ _MLA_CASES = (
         {"kernel": "throughput_latency_1cta", "split_kv": 1},
         "identity",
         False,
+        exercise_all_paths=True,
         id="fp8-1cta-direct",
     ),
     _param(
@@ -679,6 +682,7 @@ _MLA_CASES = (
         },
         None,
         False,
+        exercise_all_paths=True,
         id="bf16-2cta-persistent-direct",
     ),
     _param(
@@ -971,6 +975,28 @@ def _exercise_public_paths(
     torch.cuda.synchronize()
     _assert_case_correct(graph_out, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+    if qo_indptr is None:
+        saved_length = case.seq_lens[0].clone()
+        saved_pages = case.block_tables[0].clone()
+        case.seq_lens[0] = 0
+        case.block_tables[0].fill_(-1)
+        graph_out.fill_(8)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_out[0].float(),
+            torch.full_like(graph_out[0].float(), 8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            graph_out[1:].float(), eager[1:].float(), rtol=0, atol=0
+        )
+        case.seq_lens[0].copy_(saved_length)
+        case.block_tables[0].copy_(saved_pages)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_out.float(), eager.float(), rtol=0, atol=0)
     _CUDA_GRAPH_ANCHOR_OWNERS.append((graph, graph_out, wrapper, case))
     return eager
 
@@ -1736,25 +1762,25 @@ def test_attention_ts_mla_block_table_stride_contract():
 @pytest.mark.parametrize(
     ("seq_lens", "max_kv_len", "message"),
     (
-        ((0, 1), 64, "at least one KV token"),
-        ((-1, 1), 64, "at least one KV token"),
+        ((0, 1), 64, None),
+        ((-1, 1), 64, None),
         ((65, 32), 64, r"longer than max_kv_len \(64\): got 65"),
     ),
     ids=("zero-length", "negative-length", "exceeds-explicit-bound"),
 )
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
+def test_attention_ts_mla_run_validates_kv_lengths(
     seq_lens,
     max_kv_len,
     message,
 ):
-    """Validate every runtime MLA K/V length against the static plan bound."""
+    """Inactive rows preserve output; active lengths must fit the plan bound."""
 
     device = torch.device("cuda")
     block_tables = torch.zeros((2, 3), dtype=torch.int32, device=device)
     runtime_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    query = torch.empty((2, 1, 8, _QK_DIM), dtype=torch.bfloat16, device=device)
-    kv_cache = torch.empty(
+    query = torch.zeros((2, 1, 8, _QK_DIM), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(
         (1, _DEFAULT_PAGE_SIZE, _QK_DIM), dtype=torch.bfloat16, device=device
     )
     wrapper = BatchMLADecodePagedTSWrapper()
@@ -1772,13 +1798,17 @@ def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
     )
-    with pytest.raises(ValueError, match=message):
-        wrapper.run(
-            query,
-            kv_cache,
-            block_tables,
-            runtime_seq_lens,
+    if message is not None:
+        with pytest.raises(ValueError, match=message):
+            wrapper.run(query, kv_cache, block_tables, runtime_seq_lens)
+    else:
+        block_tables[0].fill_(-1)
+        output = torch.full(
+            (2, 1, 8, _LATENT_DIM), 8, dtype=torch.bfloat16, device=device
         )
+        wrapper.run(query, kv_cache, block_tables, runtime_seq_lens, out=output)
+        torch.testing.assert_close(output[0], torch.full_like(output[0], 8))
+        torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
 
 
 @_REQUIRES_PRIMTS_GPU

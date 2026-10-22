@@ -1134,15 +1134,12 @@ def build_context_task_manager(
             "pipeline_config": work_queue_pipeline_cfg,
             "name": "work_queue",
         }
-        if (
-            cfg.is_causal
-            and cfg.has_varlen
-            and not cfg.has_uniform_varlen
-            and cum_seqlen_q is not None
-        ):
+        if (cfg.has_varlen and not cfg.has_uniform_varlen) or g_seq_lens_kv is not None:
             work_queue = PackedContextWorkQueue(
                 cfg=cfg,
                 cum_seqlen_q=cum_seqlen_q,
+                cum_seqlen_k=cum_seqlen_k,
+                seq_lens_kv=g_seq_lens_kv,
                 **work_queue_kwargs,
             )
         else:
@@ -1157,15 +1154,12 @@ def build_context_task_manager(
             "tile_scheduler_config": tile_scheduler_config,
             "name": "work_queue",
         }
-        if (
-            cfg.is_causal
-            and cfg.has_varlen
-            and not cfg.has_uniform_varlen
-            and cum_seqlen_q is not None
-        ):
+        if (cfg.has_varlen and not cfg.has_uniform_varlen) or g_seq_lens_kv is not None:
             work_queue = PackedContextWorkQueue(
                 cfg=cfg,
                 cum_seqlen_q=cum_seqlen_q,
+                cum_seqlen_k=cum_seqlen_k,
+                seq_lens_kv=g_seq_lens_kv,
                 **work_queue_kwargs,
             )
         else:
@@ -2249,8 +2243,10 @@ def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
     )
 
 
-def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
-    """Stage K/V in 128-wide slices and size O staging to the paired footprint."""
+def _configure_head_dim_staging(
+    cfg: FmhaConfig, *, head_dim_per_stage: int = 128
+) -> None:
+    """Stage K/V by head slices and keep O staging within the SMEM budget."""
     cfg.head_dim_per_stage_kv = 0
     cfg.num_head_dim_stages_k = 1
     cfg.num_head_dim_stages_v = 1
@@ -2265,25 +2261,43 @@ def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
         return
     if cfg.num_qkv_instances != 1 and cfg.logical_head_dim_qk != 192:
         return
-    cfg.head_dim_per_stage_kv = 128
+    if head_dim_per_stage not in (128, 192):
+        raise ValueError("head staging must use 128 or 192 channels")
+    if head_dim_per_stage == 192:
+        if not (
+            cfg.logical_head_dim_qk == 192
+            and cfg.single_qkv_instance
+            and cfg.q_dtype.width == cfg.v_dtype.width == 16
+        ):
+            raise ValueError(
+                "Full D192 staging requires single-instance D192 with 16-bit Q/K/V"
+            )
+        cfg.qk_mma_tiler = (*cfg.qk_mma_tiler[:2], 192)
+        cfg.pv_mma_tiler = (cfg.pv_mma_tiler[0], 192, cfg.pv_mma_tiler[2])
+        cfg.epi_tile = cfg.pv_mma_tiler[:2]
+    cfg.head_dim_per_stage_kv = head_dim_per_stage
     cfg.num_head_dim_stages_k = cfg.qk_mma_tiler[2] // cfg.head_dim_per_stage_kv
-    cfg.num_head_dim_stages_v = cfg.pv_mma_tiler[1] // cfg.head_dim_per_stage_kv
-    # K/V transfers remain 128-wide. Unlike the single-query schedule, paired
+    cfg.num_head_dim_stages_v = (
+        cfg.pv_mma_tiler[1] + cfg.head_dim_per_stage_kv - 1
+    ) // cfg.head_dim_per_stage_kv
+    # Output staging can use narrower head bands. Unlike the single-query schedule, paired
     # 16-bit Q/O needs two 64-wide O buffers to leave room for both Q tiles
     # and a complete K/K/V cadence. FP8 can retain 128-wide O stores.
     cfg.head_dim_per_stage_o = (
         64
         if (
-            not cfg.single_qkv_instance
+            (not cfg.single_qkv_instance or head_dim_per_stage == 192)
             and cfg.q_dtype.width == 16
             and cfg.o_dtype.width == 16
         )
         else 128
     )
-    cfg.num_o_head_dim_stages = cfg.epi_tile[1] // cfg.head_dim_per_stage_o
+    cfg.num_o_head_dim_stages = (
+        cfg.epi_tile[1] + cfg.head_dim_per_stage_o - 1
+    ) // cfg.head_dim_per_stage_o
     cfg.stage_kv_by_head_dim = True
     cfg.stage_o_by_head_dim = cfg.single_qkv_instance or cfg.num_o_head_dim_stages > 1
-    # K/V stays 128-wide. Smaller O stages let paired 16-bit geometry
+    # Default K/V staging stays 128-wide. Smaller O stages let paired geometry
     # retain its K/V ring without exceeding Blackwell's SMEM budget.
 
 
@@ -2312,13 +2326,13 @@ def _configure_head_paired_tma_copy_metadata(
     o_dtype: type,
 ) -> None:
     """Derive TMA copy granularities for head-paired Q/K/V/O tensors."""
-    inner_dim_size = cfg.qk_mma_tiler[2] * q_dtype.width // 8
+    inner_dim_size = cfg.smem_q_head_dim * q_dtype.width // 8
     cfg.tma_copy_qkv_iters = 1
     if inner_dim_size % 128 == 0:
         cfg.tma_copy_qkv_iters = inner_dim_size // 128
     elif inner_dim_size != 64 and inner_dim_size != 32:
         raise RuntimeError(f"Unsupported inner dimension size: {inner_dim_size}")
-    tma_copy_qkv_granu_inner = cfg.qk_mma_tiler[2] // cfg.tma_copy_qkv_iters
+    tma_copy_qkv_granu_inner = cfg.smem_q_head_dim // cfg.tma_copy_qkv_iters
 
     cfg.q_tile_m = cfg.qk_mma_tiler[0]
     cfg.tma_copy_q_elements = cfg.sQ_shape[1]
@@ -2339,18 +2353,18 @@ def _configure_head_paired_tma_copy_metadata(
     )
     cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
 
-    v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+    v_inner_dim_size = cfg.smem_v_head_dim * v_dtype.width // 8
     cfg.tma_copy_v_iters = 1
     if v_inner_dim_size % 128 == 0:
         cfg.tma_copy_v_iters = v_inner_dim_size // 128
     elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
         raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
-    cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+    cfg.tma_copy_v_granu_inner = cfg.smem_v_head_dim // cfg.tma_copy_v_iters
     cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
     cfg.tma_copy_v_granu_elems = cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
     cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
-    output_inner_dim_size = cfg.epi_tile[1] * o_dtype.width // 8
+    output_inner_dim_size = cfg.smem_o_head_dim * o_dtype.width // 8
     cfg.tma_copy_o_iters = 1
     if output_inner_dim_size % 128 == 0:
         cfg.tma_copy_o_iters = output_inner_dim_size // 128
@@ -2358,7 +2372,7 @@ def _configure_head_paired_tma_copy_metadata(
         raise RuntimeError(
             f"Unsupported output inner dimension size: {output_inner_dim_size}"
         )
-    cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
+    cfg.tma_copy_o_granu_inner = cfg.smem_o_head_dim // cfg.tma_copy_o_iters
     o_head_dim = (
         cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
     )
@@ -2941,9 +2955,9 @@ class FmhaTs:
 
         # Validate the logical Q/K and V head dimensions before choosing tiles.
         d_v = d if d_v is None else d_v
-        if (d_v != d or d == 192) and (d, d_v) != (192, 128):
+        if d_v != d and (d, d_v) != (192, 128):
             raise ValueError("asymmetric context requires QK=192 and V=128")
-        if d == 192 and (head_paired or use_paged_kv):
+        if (d, d_v) == (192, 128) and (head_paired or use_paged_kv):
             raise NotImplementedError(
                 "192/128 requires contiguous query-paired context"
             )
@@ -2973,7 +2987,7 @@ class FmhaTs:
         self.cfg = cfg
         # Compact Q and staged O fit two resident query tiles plus the K/V
         # ring. Pairing overlaps the two softmax groups with MMA work.
-        paired_mla = d == 192 and not has_variable_window
+        paired_mla = (d, d_v) == (192, 128) and not has_variable_window
         if d > 128 and not paired_mla:
             cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
@@ -3019,7 +3033,9 @@ class FmhaTs:
         )
 
         if head_paired:
-            _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
+            _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=padded_d)
+            cfg.pv_mma_tiler = (cfg.pv_mma_tiler[0], d_v, cfg.pv_mma_tiler[2])
+            cfg.epi_tile = cfg.pv_mma_tiler[:2]
             _configure_head_dim_staging(cfg)
             _configure_pipeline_stages(
                 cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
@@ -3099,13 +3115,13 @@ class FmhaTs:
         cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
 
         # TMA copy granularity for V
-        v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+        v_inner_dim_size = cfg.smem_v_head_dim * v_dtype.width // 8
         cfg.tma_copy_v_iters = 1
         if v_inner_dim_size % 128 == 0:
             cfg.tma_copy_v_iters = v_inner_dim_size // 128
         elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
             raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
-        cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+        cfg.tma_copy_v_granu_inner = cfg.smem_v_head_dim // cfg.tma_copy_v_iters
         cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
         if cfg.two_cta_umma:
             cfg.tma_copy_v_iters = 1
@@ -3117,8 +3133,8 @@ class FmhaTs:
         cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
         # TMA copy granularity for O
-        cfg.tma_copy_o_iters = (cfg.epi_tile[1] * o_dtype.width) // 1024
-        cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
+        cfg.tma_copy_o_iters = (cfg.smem_o_head_dim * o_dtype.width) // 1024
+        cfg.tma_copy_o_granu_inner = cfg.smem_o_head_dim // cfg.tma_copy_o_iters
         o_head_dim = (
             cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
         )
@@ -3270,7 +3286,7 @@ class FmhaTs:
                 v_box_dims = (
                     cfg.pv_mma_tiler[2],
                     1,
-                    cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters,
+                    cfg.tma_copy_v_granu_inner,
                 )
                 kv_stride_order = stride_order
         if cutlass.const_expr(cum_seqlen_q is not None):
@@ -3708,7 +3724,17 @@ class FmhaTs:
             r.tmem_addr_cached = tmem_addr_cached
 
         # 7. Execute all tasks via the TS scheduler
-        task_manager.run()
+        active_request = cutlass.Boolean(True)
+        if cutlass.const_expr(not is_persistent):
+            batch_coord = cute.arch.block_idx()[cfg.work_tile_coord_indices[2]]
+            if cutlass.const_expr(seq_lens_kv is not None):
+                active_request = Int32(seq_lens_kv[batch_coord]) > Int32(0)
+            elif cutlass.const_expr(cfg.has_varlen and not cfg.has_uniform_varlen):
+                active_request = (
+                    cum_seqlen_k[batch_coord + Int32(1)] > cum_seqlen_k[batch_coord]
+                )
+        if active_request:
+            task_manager.run()
 
         # 8. TMEM deallocation
         is_softmax_warp = (

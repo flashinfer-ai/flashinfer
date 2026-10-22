@@ -65,21 +65,27 @@ from .fmha_resources import (
 
 @dataclass(kw_only=True)
 class PackedContextWorkQueue(WorkQueue):
-    """Persistent queue that skips Q tiles outside a live packed request."""
+    """Persistent queue that skips empty Q/KV requests and padded Q tiles."""
 
     cfg: cutlass.Constexpr[FmhaConfig] = field(init=False, default=None)
     cum_seqlen_q: Any = field(init=False, default=None)
+    cum_seqlen_k: Any = field(init=False, default=None)
+    seq_lens_kv: Any = field(init=False, default=None)
 
     def __init__(
         self,
         cfg: FmhaConfig,
-        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_q: cute.Tensor | None,
+        cum_seqlen_k: cute.Tensor | None = None,
+        seq_lens_kv: cute.Pointer | None = None,
         **kwargs: Any,
     ) -> None:
         """Attach the live packed-Q metadata used by the skip predicate."""
         super().__init__(**kwargs)
         self.cfg = cfg
         self.cum_seqlen_q = cum_seqlen_q
+        self.cum_seqlen_k = cum_seqlen_k
+        self.seq_lens_kv = seq_lens_kv
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
@@ -89,10 +95,24 @@ class PackedContextWorkQueue(WorkQueue):
         if cutlass.const_expr(self.cfg.uses_causal_reversed_head_batch_seq_tile_order):
             seq_coord = Int32(self.cfg.num_seq_tiles) - seq_coord - Int32(1)
         batch_coord = Int32(work_tile.tile_idx[batch_idx])
-        q_begin = Int32(self.cum_seqlen_q[batch_coord])
-        q_end = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
-        seqlen_q = q_end - q_begin
-        return seq_coord * Int32(self.cfg.cta_tiler[0]) >= seqlen_q
+        skip = cutlass.Boolean(False)
+        if cutlass.const_expr(
+            self.cum_seqlen_q is not None and not self.cfg.has_uniform_varlen
+        ):
+            q_begin = Int32(self.cum_seqlen_q[batch_coord])
+            q_end = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
+            skip = seq_coord * Int32(self.cfg.cta_tiler[0]) >= q_end - q_begin
+        if cutlass.const_expr(self.seq_lens_kv is not None):
+            skip = skip or Int32(self.seq_lens_kv[batch_coord]) <= Int32(0)
+        elif cutlass.const_expr(
+            self.cum_seqlen_k is not None and not self.cfg.has_uniform_varlen
+        ):
+            skip = (
+                skip
+                or self.cum_seqlen_k[batch_coord + Int32(1)]
+                <= self.cum_seqlen_k[batch_coord]
+            )
+        return skip
 
 
 def _persistent_tail(work_queue: WorkQueue) -> None:
@@ -272,6 +292,7 @@ def create_load_task(
                         seqlen_k,
                         kv_tile_start,
                         kv_request_begin,
+                        kv_page_idx_lb,
                         kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     sq.acquire()
@@ -299,6 +320,7 @@ def create_load_task(
                                 seqlen_k=seqlen_k,
                                 kv_tile_start=kv_tile_start,
                                 kv_request_begin=kv_request_begin,
+                                kv_page_idx_lb=kv_page_idx_lb,
                                 kv_page_idx_ub=kv_page_idx_ub,
                             )
                             sk.commit()
@@ -333,6 +355,7 @@ def create_load_task(
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                     kv_request_begin=kv_request_begin,
+                                    kv_page_idx_lb=kv_page_idx_lb,
                                     kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             else:
@@ -345,6 +368,7 @@ def create_load_task(
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                     kv_request_begin=kv_request_begin,
+                                    kv_page_idx_lb=kv_page_idx_lb,
                                     kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             sv.commit()
@@ -477,6 +501,7 @@ def create_load_task(
                     seqlen_k,
                     kv_tile_start,
                     kv_request_begin,
+                    kv_page_idx_lb,
                     kv_page_idx_ub,
                 ) = coords
                 sq.acquire()
@@ -504,6 +529,7 @@ def create_load_task(
                         seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sk.commit()
@@ -525,6 +551,7 @@ def create_load_task(
                             seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sk.commit()
@@ -546,6 +573,7 @@ def create_load_task(
                             seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sv.commit()
@@ -567,6 +595,7 @@ def create_load_task(
                         seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sv.commit()
@@ -698,6 +727,7 @@ def create_load_task(
                         seqlen_k,
                         kv_tile_start,
                         kv_request_begin,
+                        kv_page_idx_lb,
                         kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     # Load Q0 for the first Q tile in this work tile.
@@ -737,6 +767,7 @@ def create_load_task(
                             kv_tile_start=kv_tile_start,
                             seqlen_k=seqlen_k,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sk.commit()
@@ -753,6 +784,7 @@ def create_load_task(
                         kv_tile_start=kv_tile_start,
                         seqlen_k=seqlen_k,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sk.commit()
@@ -780,6 +812,7 @@ def create_load_task(
                     seqlen_k=seqlen_k,
                     kv_tile_start=kv_tile_start,
                     kv_request_begin=kv_request_begin,
+                    kv_page_idx_lb=kv_page_idx_lb,
                     kv_page_idx_ub=kv_page_idx_ub,
                 )
                 sv.commit()
@@ -909,12 +942,10 @@ def create_mma_task(
         )
         num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
         num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
-        loop_carried_head_dim_stages = 2
-        if (
-            num_head_dim_stages_k != loop_carried_head_dim_stages
-            or num_head_dim_stages_v != loop_carried_head_dim_stages
-        ):
-            raise ValueError("loop-carried split S/P scheduling expects two K/V stages")
+        if num_head_dim_stages_k not in (1, 2) or num_head_dim_stages_v not in (1, 2):
+            raise ValueError(
+                "loop-carried split S/P scheduling expects one or two K/V stages"
+            )
 
         def mma_schedule_body(
             gqkv: GmemQKVResource,
@@ -956,6 +987,7 @@ def create_mma_task(
                         v_seqlen_k,
                         v_kv_tile_start,
                         _kv_request_begin,
+                        _kv_page_idx_lb,
                         _kv_page_idx_ub,
                     ) = gqkv.compute_coords()
 
@@ -995,15 +1027,16 @@ def create_mma_task(
                     )
                     sk.release()
 
-                    sk.wait()
-                    desc_k_base = sk.k_desc()
-                    sp0.qk_mma(
-                        desc_q_base=desc_q0_base,
-                        desc_k_base=desc_k_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=1,
-                    )
-                    sk.release()
+                    if num_head_dim_stages_k > 1:
+                        sk.wait()
+                        desc_k_base = sk.k_desc()
+                        sp0.qk_mma(
+                            desc_q_base=desc_q0_base,
+                            desc_k_base=desc_k_base,
+                            section=FmhaStage.Loop,
+                            head_dim_stage_idx=1,
+                        )
+                        sk.release()
                     sp0.commit()
                     if not smem_q.cfg.stats_via_smem:
                         vd0.commit()
@@ -1034,21 +1067,22 @@ def create_mma_task(
                     )
                     sv.release()
 
-                    sv.wait()
-                    if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
-                        desc_v_base = sv.v_desc_paged(
+                    if num_head_dim_stages_v > 1:
+                        sv.wait()
+                        if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
+                            desc_v_base = sv.v_desc_paged(
+                                section=FmhaStage.Loop,
+                                seqlen_k=v_seqlen_k,
+                                kv_tile_start=v_kv_tile_start,
+                            )
+                        else:
+                            desc_v_base = sv.v_desc()
+                        to.pv_mma(
+                            desc_v_base=desc_v_base,
                             section=FmhaStage.Loop,
-                            seqlen_k=v_seqlen_k,
-                            kv_tile_start=v_kv_tile_start,
+                            head_dim_stage_idx=1,
                         )
-                    else:
-                        desc_v_base = sv.v_desc()
-                    to.pv_mma(
-                        desc_v_base=desc_v_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=1,
-                    )
-                    sv.release()
+                        sv.release()
                     to.commit()
                     tp0.release()
 
@@ -1175,6 +1209,7 @@ def create_mma_task(
                         v_seqlen_k,
                         v_kv_tile_start,
                         _kv_request_begin,
+                        _kv_page_idx_lb,
                         _kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                 if wq is not None:
@@ -1387,6 +1422,7 @@ def create_mma_task(
                     v_seqlen_k,
                     v_kv_tile_start,
                     _kv_request_begin,
+                    _kv_page_idx_lb,
                     _kv_page_idx_ub,
                 ) = gqkv.compute_coords()
             # HEAD: consume Q0, K0, Q1, and V0. TmemStatsDone starts empty, so
