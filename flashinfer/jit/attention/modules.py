@@ -1337,6 +1337,8 @@ def get_batch_prefill_bidirectional_ranges_spec(
         # NVFP4 cache has them.
         if not packed_fp4_kv:
             raise ValueError("v_sf_swizzled requires a packed NVFP4 KV cache.")
+        if head_dim_vo % 64:
+            raise ValueError("v_sf_swizzled requires head_dim_vo divisible by 64.")
         uri += "_v_sf_swizzled"
 
     tensor_names: List[str] = ["bidirectional_ranges"]
