@@ -60,7 +60,7 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int thread_idx = (int)tid;
     int lane_idx = (int)lane;
     int warp_idx = (int)warp;
@@ -142,13 +142,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
         if (top_k > 0) {
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(hi0));
-            max_hi = _warp_redux_u32_0;
+            unsigned int _warp_redux_5;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(hi0));
+            max_hi = _warp_redux_5;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_1;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_1;
+            unsigned int _warp_redux_6;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_6) : "r"(lo_contrib));
+            max_lo = _warp_redux_6;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[0] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -162,13 +162,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
             keys[3] = ((update != 0) ? refill64 : keys[3]);
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_2;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_2) : "r"(hi0));
-            max_hi = _warp_redux_u32_2;
+            unsigned int _warp_redux_7;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_7) : "r"(hi0));
+            max_hi = _warp_redux_7;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_3;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_3) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_3;
+            unsigned int _warp_redux_8;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_8) : "r"(lo_contrib));
+            max_lo = _warp_redux_8;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[1] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -182,13 +182,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
             keys[3] = ((update != 0) ? refill64 : keys[3]);
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_4;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_4) : "r"(hi0));
-            max_hi = _warp_redux_u32_4;
+            unsigned int _warp_redux_9;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_9) : "r"(hi0));
+            max_hi = _warp_redux_9;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_5;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_5) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_5;
+            unsigned int _warp_redux_10;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_10) : "r"(lo_contrib));
+            max_lo = _warp_redux_10;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[2] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -202,13 +202,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
             keys[3] = ((update != 0) ? refill64 : keys[3]);
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_6;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_6) : "r"(hi0));
-            max_hi = _warp_redux_u32_6;
+            unsigned int _warp_redux_11;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_11) : "r"(hi0));
+            max_hi = _warp_redux_11;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_7;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_7) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_7;
+            unsigned int _warp_redux_12;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_12) : "r"(lo_contrib));
+            max_lo = _warp_redux_12;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[3] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -222,13 +222,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
             keys[3] = ((update != 0) ? refill64 : keys[3]);
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_8;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_8) : "r"(hi0));
-            max_hi = _warp_redux_u32_8;
+            unsigned int _warp_redux_13;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_13) : "r"(hi0));
+            max_hi = _warp_redux_13;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_9;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_9) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_9;
+            unsigned int _warp_redux_14;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_14) : "r"(lo_contrib));
+            max_lo = _warp_redux_14;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[4] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -242,13 +242,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
             keys[3] = ((update != 0) ? refill64 : keys[3]);
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_10;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_10) : "r"(hi0));
-            max_hi = _warp_redux_u32_10;
+            unsigned int _warp_redux_15;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_15) : "r"(hi0));
+            max_hi = _warp_redux_15;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_11;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_11) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_11;
+            unsigned int _warp_redux_16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_16) : "r"(lo_contrib));
+            max_lo = _warp_redux_16;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[5] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -262,13 +262,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
             keys[3] = ((update != 0) ? refill64 : keys[3]);
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_12;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_12) : "r"(hi0));
-            max_hi = _warp_redux_u32_12;
+            unsigned int _warp_redux_17;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_17) : "r"(hi0));
+            max_hi = _warp_redux_17;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_13;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_13) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_13;
+            unsigned int _warp_redux_18;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_18) : "r"(lo_contrib));
+            max_lo = _warp_redux_18;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[6] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -282,13 +282,13 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
             keys[3] = ((update != 0) ? refill64 : keys[3]);
             hi0 = (unsigned int)(keys[0] >> 32);
             lo0 = (unsigned int)keys[0];
-            unsigned int _warp_redux_u32_14;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_14) : "r"(hi0));
-            max_hi = _warp_redux_u32_14;
+            unsigned int _warp_redux_19;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_19) : "r"(hi0));
+            max_hi = _warp_redux_19;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
-            unsigned int _warp_redux_u32_15;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_15) : "r"(lo_contrib));
-            max_lo = _warp_redux_u32_15;
+            unsigned int _warp_redux_20;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_20) : "r"(lo_contrib));
+            max_lo = _warp_redux_20;
             packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
             out_idx[7] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
@@ -303,56 +303,55 @@ kernel_cake_stepfun_moe_fdd94436356faa9ae3e0(float* __restrict__ scores, __nv_bf
         float score_f = __uint_as_float(lane_bits);
         float max_score = -CUDART_INF_F;
         if (lane_0 < top_k) {
-            uint32_t _f32_setp_0_bits;
-            asm("{ .reg .pred p; setp.ge.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_f32_setp_0_bits) : "f"(score_f), "f"(max_score));
-            bool _f32_setp_0 = _f32_setp_0_bits != 0;
-            max_score = ((_f32_setp_0) ? score_f : max_score);
+            uint32_t _setp_21_bits;
+            asm("{ .reg .pred p; setp.ge.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_setp_21_bits) : "f"(score_f), "f"(max_score));
+            bool _setp_21 = _setp_21_bits != 0;
+            max_score = ((_setp_21) ? score_f : max_score);
         }
-        float _warp_reduce_0 = max_score;
+        float _warp_reduce_22 = max_score;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-        max_score = _warp_reduce_0;
+            _warp_reduce_22 = max_noftz(_warp_reduce_22, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_22, offset));
+        max_score = _warp_reduce_22;
         float sum_score = 0.0f;
         float new_score = 0.0f;
         if (lane_0 < top_k) {
-            float _sub_0;
-            asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(score_f), "f"(max_score));
-            new_score = _sub_0;
-            float _exp2_0 = approx_exp2(mul_f32_rn_ftz(new_score, 1.4426950216293335f));
-            new_score = _exp2_0;
-            float _add_0;
-            asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(sum_score), "f"(new_score));
-            sum_score = _add_0;
+            float _sub_23;
+            asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_23) : "f"(score_f), "f"(max_score));
+            new_score = _sub_23;
+            float _exp2_24 = approx_exp2(mul_f32_rn_ftz(new_score, 1.442695f));
+            new_score = _exp2_24;
+            float _add_25;
+            asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_25) : "f"(sum_score), "f"(new_score));
+            sum_score = _add_25;
         }
-        float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 16);
-        float _add_1;
-        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(sum_score), "f"(_shfl_xor_0));
-        sum_score = _add_1;
-        float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 8);
-        float _add_2;
-        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(sum_score), "f"(_shfl_xor_1));
-        sum_score = _add_2;
-        float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 4);
-        float _add_3;
-        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_3) : "f"(sum_score), "f"(_shfl_xor_2));
-        sum_score = _add_3;
-        float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 2);
-        float _add_4;
-        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_4) : "f"(sum_score), "f"(_shfl_xor_3));
-        sum_score = _add_4;
-        float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 1);
-        float _add_5;
-        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(sum_score), "f"(_shfl_xor_4));
-        sum_score = _add_5;
+        float _shfl_xor_sync_27 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 16);
+        float _add_26;
+        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_26) : "f"(sum_score), "f"(_shfl_xor_sync_27));
+        sum_score = _add_26;
+        float _shfl_xor_sync_29 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 8);
+        float _add_28;
+        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_28) : "f"(sum_score), "f"(_shfl_xor_sync_29));
+        sum_score = _add_28;
+        float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 4);
+        float _add_30;
+        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_30) : "f"(sum_score), "f"(_shfl_xor_sync_31));
+        sum_score = _add_30;
+        float _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 2);
+        float _add_32;
+        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_32) : "f"(sum_score), "f"(_shfl_xor_sync_33));
+        sum_score = _add_32;
+        float _shfl_xor_sync_35 = __shfl_xor_sync(0xFFFFFFFF, sum_score, 1);
+        float _add_34;
+        asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_34) : "f"(sum_score), "f"(_shfl_xor_sync_35));
+        sum_score = _add_34;
         unsigned int softmax_bits = 0;
         if (lane_0 < top_k) {
-            float _rcp_0 = approx_rcp(sum_score);
-            softmax_bits = __as_u32(mul_f32_rn_ftz(_rcp_0, new_score));
+            float _rcp_36 = approx_rcp(sum_score);
+            softmax_bits = __as_u32(mul_f32_rn_ftz(_rcp_36, new_score));
         }
         if (lane_idx < top_k) {
-            __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(__uint_as_float(softmax_bits), 0.0f));
-            packed_word = (unsigned int)lane_expert << 16 | __as_u32(_bf16x2_0) & 65535;
+            packed_word = (unsigned int)lane_expert << 16 | __as_u32(__float22bfloat162_rn(make_float2(__uint_as_float(softmax_bits), 0.0f))) & 65535;
             topk_packed[token * top_k + lane_idx] = (int)packed_word;
         }
     }
