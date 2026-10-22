@@ -633,7 +633,13 @@ def main():
     )
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--batches", type=int, nargs="+", default=[8, 32, 64, 128, 256])
-    ap.add_argument("--rates", type=int, nargs="+", default=[0, 20, 40, 80])
+    ap.add_argument(
+        "--rates",
+        type=float,
+        nargs="+",
+        default=[0, 20, 40, 80],
+        help="flush rows in %% of the batch (at least one row when > 0), e.g. 6.25 = 1 / 16",
+    )
     ap.add_argument(
         "--arm",
         choices=list(ARMS),
@@ -707,6 +713,7 @@ def main():
         help="sustained DRAM peak (TB/s) for DRAM %% (with --dram-bytes)",
     )
     args = ap.parse_args()
+    args.rates = [int(r) if float(r).is_integer() else r for r in args.rates]
     if (args.localized or args.persistent) and args.arm not in _UMMA_SR:
         ap.error("--localized / --persistent: umma or rubin arms only")
     if (args.persistent or args.no_persistent) and not args.arm.startswith("rubin"):
@@ -746,7 +753,7 @@ def main():
         flush=True,
     )
     recs = []
-    hdr = "   B | " + " | ".join(f"{r:3d}% (us)" for r in args.rates)
+    hdr = "   B | " + " | ".join(f"{r:>3g}% (us)" for r in args.rates)
     print(hdr)
     print("-" * len(hdr))
     for B in args.batches:
@@ -756,7 +763,7 @@ def main():
                 B,
                 r,
                 args.iters,
-                1000 + B + r,
+                1000 + B + int(r),
                 io_dtype,
                 state_dtype,
                 ring_dtype,
