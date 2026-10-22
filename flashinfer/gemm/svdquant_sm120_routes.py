@@ -26,7 +26,7 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
-SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 13
+SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 14
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -374,14 +374,15 @@ def sm120_producer_variants(
         return large + small
     if rank == 128:
         # Only the large-M producers stage wide fragments. The warp-specialized
-        # family follows the shared ladder so existing indices keep their meaning.
+        # and small-M families follow the shared ladder in that order so
+        # existing indices keep their meaning.
         ws = tuple(
             (SM120_FAMILY_WS_RANK128, tiling, grid_mode)
             for tiling in SM120_RANK128_WS_TILING_LADDER
             if sm120_ws_tiling_is_valid(m, k, *tiling)
             for grid_mode in SM120_WS_GRID_MODES
         )
-        return large + ws
+        return large + ws + small
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)

@@ -282,7 +282,9 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
     quant::Type* __restrict__ down, int M, int K) {
   constexpr int kRank = Rank;
-  static_assert(Rank == 32 || Rank == 64);
+  // Rank only sets how many DownTileCols-wide column tiles the down CTAs cover;
+  // a CTA's fragments, shared accumulator and K split do not depend on it.
+  static_assert(Rank == 32 || Rank == 64 || Rank == 128);
   static_assert(!PackedL2T || Rank == 32);
   static_assert(!SignalLaunch || PackedL2T, "launch signaling requires packed L2T");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
@@ -1481,15 +1483,15 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   if constexpr (Rank == 64) {
     if (family != 0 && family != 1) return cudaErrorInvalidValue;
   }
-  // Rank 128 has the large-M (eight wide down warps) and the warp-specialized
-  // large-M families only.
+  // Rank 128 has the large-M (eight wide down warps), the warp-specialized
+  // large-M and the row-major small-M families.
   if constexpr (Rank == 128) {
     if (family == 5) {
       return nvfp4_smooth_quantize_lora_down_ws_rank128_sm120<Rank>(
           x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, a, b, c,
           address_policy, stream);
     }
-    if (family != 0) return cudaErrorInvalidValue;
+    if (family != 0 && family != 1) return cudaErrorInvalidValue;
   }
   if (family == 2) {
     // One M, parameterised on K: the role split bakes M in, so this family
@@ -1523,18 +1525,17 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
 #undef FI_SVDQ_PACKED_SMALL_CASE
     return cudaErrorInvalidValue;
   }
-  // The small-M kernel stages one n8 fragment per warp (rank 32/64 only).
-  if constexpr (Rank <= 64) {
-    if (family == 1) {
+  // The small-M kernel tiles the rank into DownTileCols-wide column tiles, so
+  // every compiled rank reuses the same tilings.
+  if (family == 1) {
 #define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                            \
   if (a == (BT) && b == (DTC) && c == (RPQB)) {                                      \
     return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(    \
         x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
   }
-      FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
+    FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
 #undef FI_SVDQ_SMALL_CASE
-      return cudaErrorInvalidValue;
-    }
+    return cudaErrorInvalidValue;
   }
   return nvfp4_smooth_quantize_lora_down_dyn_sm120<Rank>(x, pre_quant_scale, global_scale, xq, sf,
                                                          l2t_smoothed, down, m, k, a, b, c, stream,

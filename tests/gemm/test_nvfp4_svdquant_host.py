@@ -1842,6 +1842,27 @@ def test_rank64_fusion_invalidates_unfused_route_cache() -> None:
     assert routes.sm120_linear_route_abi_version(64, 3072, 32) == 10
 
 
+@pytest.mark.parametrize("m,k", [(64, 3072), (537, 7168), (4096, 12288)])
+def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None:
+    variants = routes.sm120_producer_variants(m, k, 128)
+    families = [family for family, _, _ in variants]
+    small = families.index(routes.SM120_FAMILY_SMALL_M)
+    # Appended last, so the large-M and warp-specialized indices keep their meaning.
+    assert set(families[:small]) == {
+        routes.SM120_FAMILY_LARGE_M,
+        routes.SM120_FAMILY_WS_RANK128,
+    }
+    assert set(families[small:]) == {routes.SM120_FAMILY_SMALL_M}
+    for variant in range(small, len(variants)):
+        assert routes.sm120_decode_producer_variant(m, k, variant, 128) == variants[
+            variant
+        ]
+        # The small-M kernel reads L2T in its (k, r) row-major layout.
+        assert not routes.sm120_variant_reads_kmajor_l2t(m, k, variant, 128)
+        assert not routes.sm120_variant_packs_l2t(m, k, variant, 128)
+    assert routes.sm120_linear_route_abi_version(m, k, 128) == 14
+
+
 # Workspace provisioning and cached tactic feasibility.
 
 

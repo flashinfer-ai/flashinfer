@@ -4958,7 +4958,7 @@ def _check_linear_graph_replay(
     assert _sqnr_db(expected_fresh, captured.float()) > 40.0
 
 
-@pytest.mark.parametrize("rank", [32, 64])
+@pytest.mark.parametrize("rank", [32, 64, 128])
 @pytest.mark.parametrize(
     "shape", [(129, 256, 256), (537, 5376, 7168), (64, 3072, 3072)]
 )
@@ -4974,16 +4974,33 @@ def test_linear_rank_autotune_and_graph_replay(
     _check_linear_graph_replay(rank, shape, use_bias, enable_pdl, backend_name)
 
 
+def _small_m_variants(m: int, k: int, rank: int) -> list[int]:
+    return [
+        variant
+        for variant, (family, _, _) in enumerate(
+            routes.sm120_producer_variants(m, k, rank)
+        )
+        if family == routes.SM120_FAMILY_SMALL_M
+    ]
+
+
 @pytest.mark.parametrize(
-    "m,k,variant",
+    "rank,m,k,variant",
     [
-        (m, k, variant)
+        (64, m, k, variant)
         for m, k in [(64, 3072), (537, 7168), (2048, 3072), (4096, 12288)]
         for variant in range(routes.sm120_producer_variant_count(m, k, 64))
+    ]
+    # Rank 128's large-M and warp-specialized families are covered by the
+    # complete-linear tests; every small-M tiling is swept here.
+    + [
+        (128, m, k, variant)
+        for m, k in [(64, 3072), (537, 7168), (1024, 1536)]
+        for variant in _small_m_variants(m, k, 128)
     ],
 )
-def test_rank64_fused_prefix_observes_graph_weight_updates(
-    m: int, k: int, variant: int
+def test_fused_prefix_observes_graph_weight_updates(
+    rank: int, m: int, k: int, variant: int
 ) -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
@@ -4992,17 +5009,17 @@ def test_rank64_fused_prefix_observes_graph_weight_updates(
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     pqs = (1 + 0.2 * torch.randn(k, device="cuda", dtype=torch.bfloat16)).abs()
     global_scale = (2688 / (x.float() * pqs.float()).abs().amax()).reshape(1)
-    l2t = torch.randn((k, 64), device="cuda", dtype=torch.bfloat16)
+    l2t = torch.randn((k, rank), device="cuda", dtype=torch.bfloat16)
     xq = torch.empty((m, k // 2), device="cuda", dtype=torch.uint8)
     sf = torch.zeros(
         ((m + 127) // 128 * 128 * (k // 16),), device="cuda", dtype=torch.uint8
     )
-    down = torch.empty((m, 64), device="cuda", dtype=torch.bfloat16)
+    down = torch.empty((m, rank), device="cuda", dtype=torch.bfloat16)
     expected_xq = torch.empty_like(xq)
     expected_sf = torch.zeros_like(sf)
-    module = backend.get_nvfp4_svdquant_sm120_module(64)
+    module = backend.get_nvfp4_svdquant_sm120_module(rank)
     family, tiling, address_policy = routes.sm120_decode_producer_variant(
-        m, k, variant, 64
+        m, k, variant, rank
     )
 
     def prefix() -> None:
@@ -5017,7 +5034,7 @@ def test_rank64_fused_prefix_observes_graph_weight_updates(
         reference = x.float() @ l2t.float()
         assert torch.equal(xq, expected_xq)
         assert torch.equal(sf, expected_sf)
-        for rank_column in range(64):
+        for rank_column in range(rank):
             assert (
                 _sqnr_db(reference[:, rank_column], down[:, rank_column].float()) > 40
             )
