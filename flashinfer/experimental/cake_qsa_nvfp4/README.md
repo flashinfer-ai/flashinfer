@@ -82,10 +82,12 @@ capturable with a replay-stable layout. The counters are zeroed once, the
 first time a buffer's storage is seen for a `rows * num_kv_heads` (a new
 buffer at a freed buffer's address is a new storage and is zeroed again), and
 reset themselves after every launch; `reset_workspace(buffer)` forgets a
-buffer whose bytes another use overwrote. Without a workspace the partials and
-counters are allocated per call, as the default implementation does; that
-path is outside the zero-allocation guarantee (a CUDA graph still captures
-it through its private memory pool).
+buffer whose bytes another use overwrote. Without a workspace the partials are
+allocated per call, as the default implementation does, and the fused form's
+counters come from a module buffer per (device, stream): zeroed when it is
+allocated, left idle by every launch, grown on demand; a capturing stream
+allocates its counters per call instead (the graph's private pool). That path
+is outside the zero-allocation guarantee.
 
 Nothing on the host reads tensor contents; every dispatch is on host scalars
 and tensor metadata.

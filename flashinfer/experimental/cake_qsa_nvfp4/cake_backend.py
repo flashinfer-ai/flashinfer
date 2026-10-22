@@ -52,9 +52,14 @@ seen for a ``rows * num_kv_heads`` -- a new buffer the allocator places at a
 freed buffer's address is a new storage and is zeroed again -- and reset
 themselves after every launch), so a call with a workspace allocates nothing
 and is CUDA-graph capturable with a replay-stable layout.  A call with no rows
-returns before the workspace is read.  Without a workspace the partials and
-counters are allocated per call, as the reference implementation does; that
-path is outside the zero-allocation guarantee.
+returns before the workspace is read.  Without a workspace the partials are
+allocated per call, as the reference implementation does, and the fused form's
+counters come from a module buffer per (device, stream): zeroed when it is
+allocated, left at its idle value by every launch, grown when a call needs more
+counters than it holds; calls on one stream are ordered, so no two launches
+share live counters.  A capturing stream allocates its counters per call (the
+graph's private pool, replayed with the zero fill), so the cache never holds a
+graph pool's memory.  That path is outside the zero-allocation guarantee.
 
 Nothing here reads tensor contents: every dispatch is on host scalars and
 tensor metadata.  The kernels run on the current torch stream of the device.
@@ -264,6 +269,28 @@ def reset_workspace(workspace: torch.Tensor) -> None:
     _zeroed_counters.pop(workspace.untyped_storage(), None)
 
 
+# The fused form's group counters for calls without a workspace, one buffer per (device index, CUDA stream
+# handle) (module docstring, "Workspace rule"): zeroed when allocated, left at an idle value by every launch,
+# replaced by a larger zeroed buffer when a call needs more counters.  Launches on one stream are ordered, so a
+# buffer per stream is never live in two launches at once.
+_STREAM_COUNTERS_MIN = 1024
+_stream_counters: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _stream_counters_buffer(
+    device: torch.device, device_index: int, count: int
+) -> torch.Tensor:
+    """``count`` idle group counters (uint32, contiguous) of the current stream's buffer on ``device``."""
+    key = (device_index, torch.cuda.current_stream(device_index).cuda_stream)
+    buffer = _stream_counters.get(key)
+    if buffer is None or buffer.numel() < count:
+        buffer = torch.zeros(
+            max(count, _STREAM_COUNTERS_MIN), dtype=torch.uint32, device=device
+        )
+        _stream_counters[key] = buffer
+    return buffer[:count]
+
+
 def _device_index(device: torch.device | int | None) -> int:
     if device is None:
         return torch.cuda.current_device()
@@ -433,11 +460,16 @@ def qsa_sparse_paged_attention(
             (splits, num_rows, num_qo_heads, head_dim), dtype=torch.float32
         )
         partial_lse = q.new_empty((splits, num_rows, num_qo_heads), dtype=torch.float32)
-        merge_counters = (
-            torch.zeros(num_rows * num_kv_heads, dtype=torch.uint32, device=q.device)
-            if fused
-            else None
-        )
+        if not fused:
+            merge_counters = None
+        elif torch.cuda.is_current_stream_capturing():
+            merge_counters = torch.zeros(
+                num_rows * num_kv_heads, dtype=torch.uint32, device=q.device
+            )
+        else:
+            merge_counters = _stream_counters_buffer(
+                q.device, device_index, num_rows * num_kv_heads
+            )
     values = {
         "q": q,
         "k_data": k_cache,
