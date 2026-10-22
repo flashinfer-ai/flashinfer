@@ -1112,8 +1112,8 @@ __device__ auto quantizePackedFPXValue(
   // Do the conversion and set the output and scaling factor
   auto func = [&]() {
     if constexpr (is_fp8) {
-      return [](PackedVec<GemmOutputType>& vec, float /* ignored */, uint8_t* SFout,
-                float /* ignored */) -> uint64_t {
+      return [](PackedVec<GemmOutputType>& vec, float /* ignored */, float /* ignored */,
+                uint8_t* SFout, float /* ignored */) -> uint64_t {
         static_assert(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize == VecSize);
         return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout);
       };
@@ -1127,7 +1127,8 @@ __device__ auto quantizePackedFPXValue(
     }
   }();
 
-  return func(packed_vec, global_scale_val, sf_out, 0.0f);
+  return func(packed_vec, global_scale_val, reciprocal_approximate_ftz(global_scale_val), sf_out,
+              0.0f);
 }
 
 template <int VecSize, int ElementsPerThread>

@@ -375,7 +375,7 @@ quantize_with_block_size(
               reinterpret_cast<FP4OutT*>(out)[outOffset] =
                   cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
                                        DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
-                      in_vec, SFScaleVal, sf_out);
+                      in_vec, SFScaleVal, reciprocal_approximate_ftz(SFScaleVal), sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
                   cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -579,7 +579,7 @@ quantize_with_block_size_tma(
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
                                          DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
-                        in_vec, SFScaleVal, sf_out);
+                        in_vec, SFScaleVal, reciprocal_approximate_ftz(SFScaleVal), sf_out);
               } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -715,8 +715,8 @@ cvt_fp16_to_fp4_expert(
 
     reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
         cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF,
-                             DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(in_vec, SFScaleVal,
-                                                                               sf_out);
+                             DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
+            in_vec, SFScaleVal, reciprocal_approximate_ftz(SFScaleVal), sf_out);
   }
 #endif
 }
@@ -981,23 +981,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       loadPackedVec(vec_in, reinterpret_cast<InType const*>(input) + vecOffset);
     }
     uint8_t fp8Scale;
-    PackedFp4Type fp4Vals;
-    if constexpr (!DISABLE_FP4_QUANT_FAST_MATH &&
-                  !IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
-      auto localMax = cuda_abs(vec_in.elts[0]);
-#pragma unroll
-      for (int i = 1; i < SF_VEC_SIZE / 2; ++i) {
-        localMax = cuda_max(localMax, cuda_abs(vec_in.elts[i]));
-      }
-      float const vecMax = float(cuda_max(localMax.x, localMax.y));
-      // Preserve the decode scale instead of round-tripping approximate reciprocals.
-      fp4Vals = cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, SF_VEC_SIZE, false>(
-          vec_in, globalEncodeScale, perTokenScale, vecMax, &fp8Scale);
-    } else {
-      fp4Vals =
-          cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH,
-                               NVFP4_4OVER6_CONFIG>(vec_in, globalEncodeScale, &fp8Scale, rowAmax);
-    }
+    auto fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false,
+                                        DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
+        vec_in, globalEncodeScale, perTokenScale, &fp8Scale, rowAmax);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
     int64_t sfOffset;
