@@ -1522,6 +1522,33 @@ def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
         cake_kcp._options({"_kcp_test_knobs": {"schedul": "wait_first"}})
 
 
+def test_ring_exchange_contract() -> None:
+    """SPEC-2's ring exchange is explicit only (``auto`` is a2a), needs every document chain within
+    ``RING_MAX_HOPS`` hops, and has no form with ``save_transfer=True`` (the ring receives no c1 tensor): the
+    documented ``NotImplementedError`` the multi-GPU rows avoid by asking for the recompute form."""
+    from types import SimpleNamespace
+
+    near = SimpleNamespace(max_hops=cake_kcp.RING_MAX_HOPS)
+    far = SimpleNamespace(max_hops=cake_kcp.RING_MAX_HOPS + 1)
+    # the shipped default since the round-1 adoption
+    assert cake_kcp.KcpOptions().save_transfer is True
+    assert cake_kcp._exchange_scheme(near, cake_kcp.KcpOptions()) == "a2a"
+    assert (
+        cake_kcp._exchange_scheme(
+            near, cake_kcp.KcpOptions(exchange="ring", save_transfer=False)
+        )
+        == "ring"
+    )
+    with pytest.raises(NotImplementedError, match="no ring form"):
+        cake_kcp._exchange_scheme(
+            near, cake_kcp.KcpOptions(exchange="ring", save_transfer=True)
+        )
+    with pytest.raises(ValueError, match="n_d_max"):
+        cake_kcp._exchange_scheme(
+            far, cake_kcp.KcpOptions(exchange="ring", save_transfer=False)
+        )
+
+
 def test_cols_rule_thresholds() -> None:
     """D1 (P2-R4): up to 24 concurrent 128-column state chains keep the registry's c8 record, more take the c16
     record; 256-column map chains stay with the registry's c16; ``fixed`` never asks for a record."""

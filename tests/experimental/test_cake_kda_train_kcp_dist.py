@@ -225,9 +225,11 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
             torch.equal(res[n], res_recompute[n]) for n in TENSORS
         ),
         "ring_eq_a2a": ring_ok,
-        # a backend with local stages must have run the SPEC-3 assertion (unless disabled) and passed it
+        # a backend with local stages must have run the SPEC-3 assertion (unless disabled) and passed it; a rank
+        # without tokens launches no local stage, so it has nothing to check
         "spec3": (not backend.local_stages)
         or (spec3 is None and os.environ.get(cake_kcp.SPEC3_ENV, "1") == "0")
+        or (spec3 is None and q.shape[0] == 0)
         or bool(spec3 and spec3.get("equal")),
     }
     gathered = {}
@@ -239,10 +241,13 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
             objs = [res[n].cpu()]
         gathered[n] = objs
     flag_list = [None] * W
+    spec3_list = [None] * W
     if W > 1:
         dist.all_gather_object(flag_list, flags)
+        dist.all_gather_object(spec3_list, spec3)
     else:
         flag_list = [flags]
+        spec3_list = [spec3]
     report = {
         "rank": rank,
         "world": W,
@@ -251,7 +256,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "metrics": {},
         "backend": backend.name,
         "backend_path": getattr(backend, "path", None),
-        "spec3": spec3,
+        "spec3_by_rank": spec3_list,
     }
     for key in flags:
         report["flags"][key] = all(f[key] for f in flag_list)
