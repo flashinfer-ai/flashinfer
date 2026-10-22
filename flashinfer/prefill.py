@@ -3929,7 +3929,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            if self._cudnn_paged_bounds is not None and qo_indptr.device.type == "cpu":
+            if self._backend == "cudnn" and qo_indptr.device.type == "cpu":
                 # Own CPU-origin prefixes so a same-batch plan can retain its
                 # metadata bindings. Device-origin prefixes stay borrowed.
                 owned = self._cudnn_qo_indptr_buffer
@@ -3947,13 +3947,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._qo_indptr_buf = qo_indptr.to(
                     self.device, non_blocking=non_blocking
                 )
-            self._paged_kv_indptr_buf = paged_kv_indptr.to(
-                self.device, non_blocking=non_blocking
-            )
+            if self._backend == "cudnn":
+                # cuDNN consumes the table and actual lengths staged below.
+                # Graph mode above still refreshes every retained FA2 buffer.
+                self._paged_kv_indptr_buf = None
+                self._paged_kv_last_page_len_buf = None
+            else:
+                self._paged_kv_indptr_buf = paged_kv_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
+                self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(
+                    self.device, non_blocking=non_blocking
+                )
             self._paged_kv_indices_buf = paged_kv_indices.to(
-                self.device, non_blocking=non_blocking
-            )
-            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(
                 self.device, non_blocking=non_blocking
             )
             if packed_custom_mask is not None:
