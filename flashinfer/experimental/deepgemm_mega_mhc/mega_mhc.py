@@ -1108,9 +1108,15 @@ class MegaMHCPlan:
         """Re-split the projection into the plan's ``fnp`` buffer on the current
         stream: the plan's ``fn`` as it reads now, or ``fn`` (same shape and
         dtype), which the plan retains from then on. Torch operations only, so a
-        CUDA Graph may capture it. The FP8 programs read ``fn`` directly and
-        need no update."""
+        CUDA Graph may capture it. The FP8 programs read the ``fn`` bound at
+        plan time in place: there this call is a no-op, and a replacement
+        tensor is refused rather than ignored."""
         if self.fnp is None:
+            if fn is not None:
+                raise ValueError(
+                    "the FP8 programs read the fn bound at plan time; "
+                    "prepare a new plan to replace it"
+                )
             return
         if fn is not None:
             if (

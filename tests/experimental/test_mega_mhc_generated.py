@@ -335,6 +335,18 @@ def test_bf16_only_layout_is_not_exported():
         prepare_mega_mhc(**inputs(64, False), sf_layout="bf16")
 
 
+def test_fp8_plan_refuses_a_replacement_fn():
+    """The FP8 programs read the ``fn`` bound at plan time: ``update_fn()`` is a
+    no-op there, and a replacement tensor is refused rather than ignored."""
+    _skip_unless_exported()
+    values = inputs(64, False)
+    plan = prepare_mega_mhc(**values, sf_layout="col")
+    assert plan.fnp is None
+    assert plan.update_fn() is None
+    with pytest.raises(ValueError, match="bound at plan time"):
+        plan.update_fn(values["fn"].clone())
+
+
 # ---------------------------------------------------------------------------- the BF16-output route (hidden 4096)
 
 
