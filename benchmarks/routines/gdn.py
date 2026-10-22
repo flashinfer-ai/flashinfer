@@ -216,9 +216,14 @@ def parse_gdn_args(line, parser):
         required=False,
         nargs="+",
         default=["flashinfer"],
-        choices=["flashinfer", "triton", "fla"],
+        choices=["flashinfer", "triton", "fla", "rubin", "rubin_ugpu"],
         help="Kernel backends to benchmark. 'triton' is available for "
-        "decode/MTP; 'fla' (flash-linear-attention) for prefill.",
+        "decode/MTP; 'fla' (flash-linear-attention) for prefill; 'rubin' "
+        "(the Rubin-tuned T=1 kernel, SM107 only) for decode with bfloat16 "
+        "state; 'rubin_ugpu' is 'rubin' with uGPU localization (a "
+        "ugpu_state_pool: each die updates the half of every state in its own "
+        "memory). On decode, "
+        "'flashinfer' is the generic FlashInfer kernel.",
     )
 
     args = parser.parse_args(line)
@@ -291,8 +296,19 @@ def parse_gdn_args(line, parser):
             raise ValueError(
                 "The fla backend is only available for chunk_gated_delta_rule"
             )
+        if any(x in args.backends for x in ("rubin", "rubin_ugpu")) and (
+            is_mtp or args.state_dtype != "bfloat16"
+        ):
+            raise ValueError(
+                "The rubin / rubin_ugpu backends are only available for "
+                "gated_delta_rule_decode with --state_dtype bfloat16"
+            )
 
     if is_prefill:
+        if any(x in args.backends for x in ("rubin", "rubin_ugpu")):
+            raise ValueError(
+                "The rubin backend is only available for gated_delta_rule_decode"
+            )
         if "triton" in args.backends:
             raise ValueError(
                 "The triton backend is only available for decode/MTP routines; "
@@ -554,6 +570,19 @@ def _testGdnDecodeLike(args, seq_len):
     state_writeback = True if (not is_mtp or use_bf16_state) else args.update_state
     disable_state_update = not state_writeback
 
+    # uGPU localization: a copy of the pool in the [pool, HV, 2, V/2, K] layout whose
+    # halves live in the two dies' memory
+    ugpu_pool = None
+    if "rubin_ugpu" in backends:
+        from flashinfer.gdn_decode import ugpu_state_pool
+
+        ugpu_pool = ugpu_state_pool(pool_size, num_sab_heads, head_size, device)
+
+        def to_ugpu(src):
+            ugpu_pool.copy_(src.view(pool_size, num_sab_heads, 2, -1, head_size))
+
+        to_ugpu(state_pool)
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] Mode: {'MTP' if is_mtp else 'decode'} (T={T})")
         print(f"[VVERBOSE] {q.shape = }, {q.dtype = }")
@@ -606,6 +635,8 @@ def _testGdnDecodeLike(args, seq_len):
             # BF16 state always goes through the pool path with pre-allocated
             # indices: the non-pool API path synthesizes an arange index
             # tensor per call, whose tiny kernel would pollute CUPTI timing.
+            # backend="flashinfer": the generic kernel, also on SM107 where
+            # "auto" would pick the Rubin-tuned one (see the "rubin" backend).
             if pool_split or use_bf16_state:
                 return gated_delta_rule_decode_pretranspose(
                     q,
@@ -622,9 +653,61 @@ def _testGdnDecodeLike(args, seq_len):
                     initial_state=state,
                     initial_state_indices=initial_state_indices,
                     output_state_indices=output_state_indices,
+                    backend="flashinfer",
                 )[0]
             return gated_delta_rule_decode_pretranspose(
-                q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+                q,
+                k,
+                v,
+                state,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale,
+                output,
+                use_qk_l2norm,
+                backend="flashinfer",
+            )[0]
+        elif backend == "rubin_ugpu":
+            # Rubin kernel with uGPU localization; refcheck passes a fresh copy of
+            # the pool, timing passes state_pool itself (state then evolves in place)
+            if state is not state_pool:
+                to_ugpu(state)
+            return gated_delta_rule_decode_pretranspose(
+                q,
+                k,
+                v,
+                None,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale,
+                output,
+                use_qk_l2norm,
+                initial_state=ugpu_pool,
+                initial_state_indices=initial_state_indices,
+                output_state_indices=output_state_indices,
+            )[0]
+        elif backend == "rubin":
+            # Rubin-tuned T=1 bf16-state kernel (SM107), via the public API
+            return gated_delta_rule_decode_pretranspose(
+                q,
+                k,
+                v,
+                None,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale,
+                output,
+                use_qk_l2norm,
+                initial_state=state,
+                initial_state_indices=initial_state_indices,
+                output_state_indices=output_state_indices,
+                backend="rubin",
             )[0]
         elif backend == "triton":
             if is_mtp:
