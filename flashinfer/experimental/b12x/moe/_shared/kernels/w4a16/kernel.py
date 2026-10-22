@@ -13901,6 +13901,9 @@ def run_w4a16_moe(
         weight_layout=weight_layout,
         collect_activation_amax=collect_activation_amax,
         prefill_fused_sum=use_prefill_fused_sum,
+        # The small-M direct kernel returned above when it applies; the
+        # generic path stores unpadded rows in intermediate_cache2.
+        small_m_direct=False,
     )
     intermediate_size = int(prepared.intermediate_size)
     fc1_cols = buffer_plan.fc1_cols
