@@ -212,6 +212,9 @@ kernel_cake_vsa_sm90_621c69308425d51cff89(const __grid_constant__ CUtensorMap Q,
     const int k_smem_addr = smem + 17408;
     __nv_bfloat16* vt_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
     const int vt_smem_addr = smem + 82944;
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Vt))) : "memory"); }
 
     // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 9 barriers)
     // Mbarriers at smem_raw[0..72)
@@ -241,12 +244,7 @@ kernel_cake_vsa_sm90_621c69308425d51cff89(const __grid_constant__ CUtensorMap Q,
         }
     }
 
-    __syncthreads();
-
     // === Task calls (dependency order) ===
-    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
-    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
-    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Vt))) : "memory"); }
     int item = bid;
     int mb = seqlen_q / 64;
     int plan_base = item * 5;
@@ -297,6 +295,7 @@ kernel_cake_vsa_sm90_621c69308425d51cff89(const __grid_constant__ CUtensorMap Q,
             }
         }
     }
+    __syncthreads();
     int warp_raw = warp;
     int warp_u = __shfl_sync(0xFFFFFFFF, warp_raw, 0);
     int wg = warp_u / 4;

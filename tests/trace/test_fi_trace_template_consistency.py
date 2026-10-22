@@ -304,7 +304,7 @@ def assert_template_axes_covered(
     """
     Assert that every ``Const`` axis in *template* has at least one source:
 
-    1. The ``Const`` carries its own fixed ``value``, OR
+    1. The ``Const`` carries its own fixed ``value`` or an ``extract`` callable, OR
     2. A tensor input whose ``dim_names`` contain the axis name, OR
     3. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
     4. A parameter of *func* matching the axis name (scalar-kwarg fallback for
@@ -331,6 +331,7 @@ def assert_template_axes_covered(
         for name, marker in template.axes.items()
         if isinstance(marker, Const)
         and marker.value is None
+        and marker.extract is None
         and name not in getattr(template, "derived_axes", ())
         and name not in tensor_dim_names
         and name not in scalar_keys

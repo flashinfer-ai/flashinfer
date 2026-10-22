@@ -548,7 +548,7 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                 mw3 = _vec_load_10[0];
             }
             unsigned int pk[16];
-            float scale = attention_scale * 1.4426950408889634f * k_cache_scale;
+            float scale = attention_scale * 1.442695f * k_cache_scale;
             float m_used = -CUDART_INF_F;
             float row_sum = 0.0f;
             unsigned int sm_s_stage = 0;
@@ -1974,8 +1974,8 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                         _phase_q_ready_0 ^= 1;
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_0 = (_mma_base_lo_0) + (0) * 8192;
-                        int _smem_desc_lo_1 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_0 = (_mma_base_lo_0) + (0) * 8192;
+                        int _mma_b_lo_0 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2029,7 +2029,7 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_s0), "r"(0) : "memory");
+                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_s0), "r"(0) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
@@ -2037,8 +2037,8 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                         _phase_q_ready_1 ^= 1;
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_2 = (_mma_base_lo_2) + (0) * 8192;
-                        int _smem_desc_lo_3 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_1 = (_mma_base_lo_2) + (0) * 8192;
+                        int _mma_b_lo_1 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2092,7 +2092,7 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_s0), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"(tmem_s0), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
@@ -2100,8 +2100,8 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                         _phase_q_ready_2 ^= 1;
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_4 = (_mma_base_lo_3) + (0) * 8192;
-                        int _smem_desc_lo_5 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_2 = (_mma_base_lo_3) + (0) * 8192;
+                        int _mma_b_lo_2 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2155,7 +2155,7 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_s0), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_s0), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
@@ -2163,8 +2163,8 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                         _phase_q_ready_3 ^= 1;
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_6 = (_mma_base_lo_4) + (0) * 8192;
-                        int _smem_desc_lo_7 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_3 = (_mma_base_lo_4) + (0) * 8192;
+                        int _mma_b_lo_3 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2218,15 +2218,15 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"(tmem_s0), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_3), "r"(tmem_s0), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                     } else if (qk_stage == 0) {
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_8 = (_mma_base_lo_0) + (0) * 8192;
-                        int _smem_desc_lo_9 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_4 = (_mma_base_lo_0) + (0) * 8192;
+                        int _mma_b_lo_4 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2280,14 +2280,14 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"(tmem_s0), "r"(0) : "memory");
+                    :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_s0), "r"(0) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_10 = (_mma_base_lo_2) + (0) * 8192;
-                        int _smem_desc_lo_11 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_5 = (_mma_base_lo_2) + (0) * 8192;
+                        int _mma_b_lo_5 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2341,14 +2341,14 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_s0), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_5), "r"(_mma_b_lo_5), "r"(tmem_s0), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_12 = (_mma_base_lo_3) + (0) * 8192;
-                        int _smem_desc_lo_13 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_6 = (_mma_base_lo_3) + (0) * 8192;
+                        int _mma_b_lo_6 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2402,14 +2402,14 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_12), "r"(_smem_desc_lo_13), "r"(tmem_s0), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_6), "r"(tmem_s0), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_14 = (_mma_base_lo_4) + (0) * 8192;
-                        int _smem_desc_lo_15 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_7 = (_mma_base_lo_4) + (0) * 8192;
+                        int _mma_b_lo_7 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2463,15 +2463,15 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_14), "r"(_smem_desc_lo_15), "r"(tmem_s0), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_7), "r"(tmem_s0), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                     } else {
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_16 = (_mma_base_lo_0) + (0) * 8192;
-                        int _smem_desc_lo_17 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_8 = (_mma_base_lo_0) + (0) * 8192;
+                        int _mma_b_lo_8 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2525,14 +2525,14 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_16), "r"(_smem_desc_lo_17), "r"(tmem_s1), "r"(0) : "memory");
+                    :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_8), "r"(tmem_s1), "r"(0) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_18 = (_mma_base_lo_2) + (0) * 8192;
-                        int _smem_desc_lo_19 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_9 = (_mma_base_lo_2) + (0) * 8192;
+                        int _mma_b_lo_9 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2586,14 +2586,14 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_18), "r"(_smem_desc_lo_19), "r"(tmem_s1), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_9), "r"(tmem_s1), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_20 = (_mma_base_lo_3) + (0) * 8192;
-                        int _smem_desc_lo_21 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_10 = (_mma_base_lo_3) + (0) * 8192;
+                        int _mma_b_lo_10 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2647,14 +2647,14 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_20), "r"(_smem_desc_lo_21), "r"(tmem_s1), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_10), "r"(tmem_s1), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                         mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_22 = (_mma_base_lo_4) + (0) * 8192;
-                        int _smem_desc_lo_23 = (_mma_base_lo_1) + (mma_stage) * 512;
+                        int _mma_a_lo_11 = (_mma_base_lo_4) + (0) * 8192;
+                        int _mma_b_lo_11 = (_mma_base_lo_1) + (mma_stage) * 512;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2708,7 +2708,7 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_22), "r"(_smem_desc_lo_23), "r"(tmem_s1), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_11), "r"(_mma_b_lo_11), "r"(tmem_s1), "r"(1) : "memory");
                         elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                         mma_stage += 1;
                         if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
@@ -2718,57 +2718,57 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     if (qk_stage == 2) { qk_stage = 0; _phase_s_empty ^= 1; }
                     if (tile_2 > 0) {
                         mbarrier_wait_hint(p_full_addr + (pv_stage) * 8, _phase_p_full, 10000000);
-                        const bool _selected_wait_cond_24 = pv_stage == 0;
-                        mbarrier_wait((_selected_wait_cond_24 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_24 ? (_phase_ready) : (_phase_ready)));
-                        if (_selected_wait_cond_24) {
+                        const bool _selected_wait_cond_0 = pv_stage == 0;
+                        mbarrier_wait((_selected_wait_cond_0 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_0 ? (_phase_ready) : (_phase_ready)));
+                        if (_selected_wait_cond_0) {
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_25 = (_mma_base_lo_5) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p0, _smem_desc_lo_25, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
-                            int _smem_desc_lo_26 = (_mma_base_lo_6) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p0 + 8, _smem_desc_lo_26, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_27 = (_mma_base_lo_7) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p0 + 16, _smem_desc_lo_27, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_28 = (_mma_base_lo_8) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p0 + 24, _smem_desc_lo_28, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_12 = (_mma_base_lo_5) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p0, _mma_b_lo_12, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
+                            int _mma_b_lo_13 = (_mma_base_lo_6) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p0 + 8, _mma_b_lo_13, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_14 = (_mma_base_lo_7) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p0 + 16, _mma_b_lo_14, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_15 = (_mma_base_lo_8) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p0 + 24, _mma_b_lo_15, 0x40004040, 270598160, 1);
                             elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                             mma_stage += 1;
                             if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                             mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_29 = (_mma_base_lo_5) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p0, _smem_desc_lo_29, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
-                            int _smem_desc_lo_30 = (_mma_base_lo_6) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p0 + 8, _smem_desc_lo_30, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_31 = (_mma_base_lo_7) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p0 + 16, _smem_desc_lo_31, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_32 = (_mma_base_lo_8) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p0 + 24, _smem_desc_lo_32, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_16 = (_mma_base_lo_5) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p0, _mma_b_lo_16, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
+                            int _mma_b_lo_17 = (_mma_base_lo_6) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p0 + 8, _mma_b_lo_17, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_18 = (_mma_base_lo_7) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p0 + 16, _mma_b_lo_18, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_19 = (_mma_base_lo_8) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p0 + 24, _mma_b_lo_19, 0x40004040, 270598160, 1);
                             elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                             mma_stage += 1;
                             if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                         } else {
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_33 = (_mma_base_lo_5) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p1, _smem_desc_lo_33, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
-                            int _smem_desc_lo_34 = (_mma_base_lo_6) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p1 + 8, _smem_desc_lo_34, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_35 = (_mma_base_lo_7) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p1 + 16, _smem_desc_lo_35, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_36 = (_mma_base_lo_8) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o0, tmem_p1 + 24, _smem_desc_lo_36, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_20 = (_mma_base_lo_5) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p1, _mma_b_lo_20, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
+                            int _mma_b_lo_21 = (_mma_base_lo_6) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p1 + 8, _mma_b_lo_21, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_22 = (_mma_base_lo_7) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p1 + 16, _mma_b_lo_22, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_23 = (_mma_base_lo_8) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o0, tmem_p1 + 24, _mma_b_lo_23, 0x40004040, 270598160, 1);
                             elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                             mma_stage += 1;
                             if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                             mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_37 = (_mma_base_lo_5) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p1, _smem_desc_lo_37, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
-                            int _smem_desc_lo_38 = (_mma_base_lo_6) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p1 + 8, _smem_desc_lo_38, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_39 = (_mma_base_lo_7) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p1 + 16, _smem_desc_lo_39, 0x40004040, 270598160, 1);
-                            int _smem_desc_lo_40 = (_mma_base_lo_8) + (mma_stage) * 512;
-                            mma_ts_step_cg2(tmem_o1, tmem_p1 + 24, _smem_desc_lo_40, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_24 = (_mma_base_lo_5) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p1, _mma_b_lo_24, 0x40004040, 270598160, ((tile_2 - 1 == 0) ? 0 : 1));
+                            int _mma_b_lo_25 = (_mma_base_lo_6) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p1 + 8, _mma_b_lo_25, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_26 = (_mma_base_lo_7) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p1 + 16, _mma_b_lo_26, 0x40004040, 270598160, 1);
+                            int _mma_b_lo_27 = (_mma_base_lo_8) + (mma_stage) * 512;
+                            mma_ts_step_cg2(tmem_o1, tmem_p1 + 24, _mma_b_lo_27, 0x40004040, 270598160, 1);
                             elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                             mma_stage += 1;
                             if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
@@ -2779,57 +2779,57 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     }
                 }
                 mbarrier_wait_hint(p_full_addr + (pv_stage) * 8, _phase_p_full, 10000000);
-                const bool _selected_wait_cond_41 = pv_stage == 0;
-                mbarrier_wait((_selected_wait_cond_41 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_41 ? (_phase_ready) : (_phase_ready)));
-                if (_selected_wait_cond_41) {
+                const bool _selected_wait_cond_1 = pv_stage == 0;
+                mbarrier_wait((_selected_wait_cond_1 ? (ready_addr + (mma_stage) * 8) : (ready_addr + (mma_stage) * 8)), (_selected_wait_cond_1 ? (_phase_ready) : (_phase_ready)));
+                if (_selected_wait_cond_1) {
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _smem_desc_lo_42 = (_mma_base_lo_5) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p0, _smem_desc_lo_42, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
-                    int _smem_desc_lo_43 = (_mma_base_lo_6) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p0 + 8, _smem_desc_lo_43, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_44 = (_mma_base_lo_7) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p0 + 16, _smem_desc_lo_44, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_45 = (_mma_base_lo_8) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p0 + 24, _smem_desc_lo_45, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_28 = (_mma_base_lo_5) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p0, _mma_b_lo_28, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
+                    int _mma_b_lo_29 = (_mma_base_lo_6) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p0 + 8, _mma_b_lo_29, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_30 = (_mma_base_lo_7) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p0 + 16, _mma_b_lo_30, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_31 = (_mma_base_lo_8) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p0 + 24, _mma_b_lo_31, 0x40004040, 270598160, 1);
                     elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                     mma_stage += 1;
                     if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _smem_desc_lo_46 = (_mma_base_lo_5) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p0, _smem_desc_lo_46, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
-                    int _smem_desc_lo_47 = (_mma_base_lo_6) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p0 + 8, _smem_desc_lo_47, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_48 = (_mma_base_lo_7) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p0 + 16, _smem_desc_lo_48, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_49 = (_mma_base_lo_8) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p0 + 24, _smem_desc_lo_49, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_32 = (_mma_base_lo_5) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p0, _mma_b_lo_32, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
+                    int _mma_b_lo_33 = (_mma_base_lo_6) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p0 + 8, _mma_b_lo_33, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_34 = (_mma_base_lo_7) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p0 + 16, _mma_b_lo_34, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_35 = (_mma_base_lo_8) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p0 + 24, _mma_b_lo_35, 0x40004040, 270598160, 1);
                     elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                     mma_stage += 1;
                     if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                 } else {
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _smem_desc_lo_50 = (_mma_base_lo_5) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p1, _smem_desc_lo_50, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
-                    int _smem_desc_lo_51 = (_mma_base_lo_6) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p1 + 8, _smem_desc_lo_51, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_52 = (_mma_base_lo_7) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p1 + 16, _smem_desc_lo_52, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_53 = (_mma_base_lo_8) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o0, tmem_p1 + 24, _smem_desc_lo_53, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_36 = (_mma_base_lo_5) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p1, _mma_b_lo_36, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
+                    int _mma_b_lo_37 = (_mma_base_lo_6) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p1 + 8, _mma_b_lo_37, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_38 = (_mma_base_lo_7) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p1 + 16, _mma_b_lo_38, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_39 = (_mma_base_lo_8) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o0, tmem_p1 + 24, _mma_b_lo_39, 0x40004040, 270598160, 1);
                     elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                     mma_stage += 1;
                     if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
                     mbarrier_wait_hint(ready_addr + (mma_stage) * 8, _phase_ready, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _smem_desc_lo_54 = (_mma_base_lo_5) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p1, _smem_desc_lo_54, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
-                    int _smem_desc_lo_55 = (_mma_base_lo_6) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p1 + 8, _smem_desc_lo_55, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_56 = (_mma_base_lo_7) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p1 + 16, _smem_desc_lo_56, 0x40004040, 270598160, 1);
-                    int _smem_desc_lo_57 = (_mma_base_lo_8) + (mma_stage) * 512;
-                    mma_ts_step_cg2(tmem_o1, tmem_p1 + 24, _smem_desc_lo_57, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_40 = (_mma_base_lo_5) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p1, _mma_b_lo_40, 0x40004040, 270598160, ((num_tiles_2 - 1 == 0) ? 0 : 1));
+                    int _mma_b_lo_41 = (_mma_base_lo_6) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p1 + 8, _mma_b_lo_41, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_42 = (_mma_base_lo_7) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p1 + 16, _mma_b_lo_42, 0x40004040, 270598160, 1);
+                    int _mma_b_lo_43 = (_mma_base_lo_8) + (mma_stage) * 512;
+                    mma_ts_step_cg2(tmem_o1, tmem_p1 + 24, _mma_b_lo_43, 0x40004040, 270598160, 1);
                     elect_commit_cg2_multicast(free_addr + (mma_stage) * 8, (uint16_t)(15));
                     mma_stage += 1;
                     if (mma_stage == 12) { mma_stage = 0; _phase_ready ^= 1; }
@@ -2864,8 +2864,7 @@ kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec(const __grid_constant__ CUtensorMap Q
                     "}"
                     :: "r"(tmem_pair_addr), "r"(cta_rank ^ 1) : "memory");
             }
-            int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-            asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
+            asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.cluster.arrive.release;" ::: "memory");
             asm volatile("barrier.cluster.wait.acquire;" ::: "memory");

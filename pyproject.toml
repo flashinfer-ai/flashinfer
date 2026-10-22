@@ -158,6 +158,8 @@ exclude = [
 # The Qwen 3.5 gated attention block: the feature README and the vendored cuDNN Frontend tree's provenance files.
 "flashinfer.experimental.qwen_3_5_block" = ["README.md"]
 "flashinfer.experimental.qwen_3_5_block._cudnn_frost" = ["VENDOR.md", "VENDOR_MANIFEST.json"]
+# CUDA sources for the experimental SM80-SM90 QSA NVFP4 sparse paged attention.
+"flashinfer.experimental.qsa_nvfp4" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [

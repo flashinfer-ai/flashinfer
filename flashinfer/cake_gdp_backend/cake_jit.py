@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host plan and loader glue of the Cake Gated DeltaProduct (GDP) decode kernels
-for Nemotron 4 (``K = 128``, ``V = 64``, ``n <= 4`` Householder updates per
-token, FP32 state pool; SM100 / SM103).
+(``K = 128``, ``V = 64``, ``n <= 4`` Householder updates per
+token, FP32 state pool; SM90 / SM100 / SM103).
 
 Every module below is one mechanically exported production build: a CUDA
 device translation unit plus a tvm-ffi binding compiled together for exactly
@@ -37,18 +37,23 @@ static-token-count program of the call's ``T`` whose band admits the call's
 runtime-token-count program of the route (``T`` up to its ``max_t_steps``).
 Batch size and head count are runtime scalars, so a changed problem size never
 recompiles anything.  Two kernel bodies ship: the lane-owns-rows body
-(``variant`` ``l8r4`` / ``l8r2``, one CTA per batch row and head) and, for
-``T = 1`` with ``B x HV <= 160``, the row-partition body (``splitv8_tile8``,
-eight CTAs per state head); each record names its body (``body``: ``lanerow`` for
-the lane-owns-rows body, ``splitv`` for the row partition).
+(``variant`` ``l8r4`` / ``l8r2`` / ``l4r2``, one CTA per batch row and head)
+and, for ``T = 1`` with ``B x HV <= 160``, the row-partition body
+(``splitv8_tile8``, eight CTAs per state head); each record names its body
+(``body``: ``lanerow`` for the lane-owns-rows body, ``splitv`` for the row
+partition).  A band may differ per architecture (SM90 has no one-wave-of-5
+``l8r4w5`` program at ``T = 1`` and owns the one-CTA-per-SM rows of ``T = 4``
+with ``l4r2``): a selection cell then names the ``arches`` it applies to, and a
+cell without ``arches`` applies on every architecture its record is delivered
+for.
 
 The program name ``cake_gdp_<20 hex>`` is the first twenty hex digits of the
 SHA-256 of the compact JSON ``{"build": <build keywords, sorted>, "module":
 <dotted kernel module>}`` of the kernel the program was rendered from; the
 record's ``build`` spells those keywords: ``variant`` (the body's geometry:
-``l8r4`` = eight lanes per state row, four rows per lane; ``l8r2``; ``l4r4``
-for the runtime programs; ``splitv8_tile8`` = eight CTAs of eight rows per
-head), ``num_householder`` (``n``),
+``l8r4`` = eight lanes per state row, four rows per lane; ``l8r2``; ``l4r2``;
+``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of eight rows
+per head), ``num_householder`` (``n``),
 ``t_steps`` (a fixed token count compiled in; ``None`` for a runtime token
 count up to ``max_t_steps``) and ``use_qk_l2norm``.
 """
@@ -67,8 +72,154 @@ from . import cake_build
 # ``launch.use_pdl``, ``arg_plan`` and ``logical``) are rewritten by the
 # exporter from the rendered program; every other field is host plan.
 MODULES: dict[str, dict[str, Any]] = {
+    "cake_gdp_068a895d0c8fa77ed2f9": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "splitv",
+        "build": {
+            "arch": "sm_90a",
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "t_steps": 1,
+            "use_qk_l2norm": True,
+            "variant": "splitv8_tile8",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 8,
+            "kind": "state_heads",
+            "tile_v": 8,
+        },
+        "kernel": "cake_gdp_068a895d0c8fa77ed2f9",
+        "kernel_symbol": "kernel_cake_gdp_068a895d0c8fa77ed2f9",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 6400,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_068a895d0c8fa77ed2f9",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "q": "q",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": 160,
+            "kind": "state_heads_between",
+        },
+    },
     "cake_gdp_27eb88658ee4bdc4ae35": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -205,14 +356,30 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": [
+                    "sm_100a",
+                    "sm_103a",
+                ],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": [
+                    "sm_90a",
+                ],
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_3342c82179fa758b0570": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -353,6 +520,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_3425d6511e4eab4896cd": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -493,6 +661,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_3cbdef34ce5b580c2216": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -784,6 +953,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_585a5ea4cbdd07f1b2a8": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -924,6 +1094,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_5970bfa6676087a3ce92": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -1069,6 +1240,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_78fc9caafee16e2af047": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -1206,6 +1378,150 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "decode",
         "select_rule": None,
+    },
+    "cake_gdp_baca2c2d21cf59fc2d3c": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "t_steps": 4,
+            "use_qk_l2norm": True,
+            "variant": "l4r2",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_baca2c2d21cf59fc2d3c",
+        "kernel_symbol": "kernel_cake_gdp_baca2c2d21cf59fc2d3c",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 11392,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_baca2c2d21cf59fc2d3c",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "q": "q",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 1,
+            "kind": "state_heads_between",
+        },
     },
     "cake_gdp_f2f0c7abbf10082a6996": {
         "arches": [
@@ -1354,6 +1670,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_fefa1931e0ddadb74891": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
         ],
@@ -1493,20 +1810,56 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": [
             {
                 "above": 160,
+                "arches": [
+                    "sm_100a",
+                    "sm_103a",
+                ],
                 "at_most": None,
                 "ctas_per_sm_at_most": 4,
                 "kind": "state_heads_between",
             },
             {
                 "above": 160,
+                "arches": [
+                    "sm_100a",
+                    "sm_103a",
+                ],
                 "at_most": None,
                 "ctas_per_sm_above": 5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 160,
+                "arches": [
+                    "sm_90a",
+                ],
+                "at_most": None,
                 "kind": "state_heads_between",
             },
         ],
     },
 }
 ROUTES: dict[str, dict[str, list[str]]] = {
+    "sm_90a": {
+        "decode_nh1": [
+            "cake_gdp_78fc9caafee16e2af047",
+        ],
+        "decode_nh2": [
+            "cake_gdp_3342c82179fa758b0570",
+        ],
+        "decode_nh3": [
+            "cake_gdp_068a895d0c8fa77ed2f9",
+            "cake_gdp_fefa1931e0ddadb74891",
+            "cake_gdp_27eb88658ee4bdc4ae35",
+            "cake_gdp_baca2c2d21cf59fc2d3c",
+            "cake_gdp_3cbdef34ce5b580c2216",
+            "cake_gdp_5970bfa6676087a3ce92",
+            "cake_gdp_585a5ea4cbdd07f1b2a8",
+        ],
+        "decode_nh4": [
+            "cake_gdp_3425d6511e4eab4896cd",
+        ],
+    },
     "sm_100a": {
         "decode_nh1": [
             "cake_gdp_78fc9caafee16e2af047",
@@ -1549,11 +1902,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# One verified build per architecture: B200 / GB200 (``sm_100a``) and B300 / GB300
-# (``sm_103a``).  Every architecture is compiled with its exact ``-gencode`` flag
-# set (``build.json`` ``arch_flags``); there is no family fallback.
-ARCHES = ("sm_100a", "sm_103a")
+# One verified build per architecture: H100 / H200 (``sm_90a``), B200 / GB200
+# (``sm_100a``) and B300 / GB300 (``sm_103a``).  Every architecture is compiled
+# with its exact ``-gencode`` flag set (``build.json`` ``arch_flags``); there is
+# no family fallback.
+ARCHES = ("sm_90a", "sm_100a", "sm_103a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
+    (9, 0): "sm_90a",
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
 }
@@ -1662,20 +2017,24 @@ def route_modules(
     return tuple(names)
 
 
-def _selects(rule: Any, state_heads: int, sm_count: int) -> bool:
-    """Whether a static program's band admits ``state_heads = B x HV`` on a device of ``sm_count`` SMs:
+def _selects(rule: Any, state_heads: int, sm_count: int, arch: str) -> bool:
+    """Whether a static program's band admits ``state_heads = B x HV`` on a device of ``sm_count`` SMs of ``arch``:
     ``above < state_heads <= at_most`` (``at_most`` ``None`` = unbounded) within the wave bounds
     ``state_heads <= ctas_per_sm_at_most x sm_count`` / ``state_heads > ctas_per_sm_above x sm_count`` when the
-    rule carries them.  A list of such cells is a band of several intervals and admits when any cell does.
-    ``None`` (a runtime program) admits everything."""
+    rule carries them.  A cell naming ``arches`` applies on those architectures only (a band that differs per
+    architecture); a list of such cells is a band of several intervals and admits when any cell does.  ``None`` (a
+    runtime program) admits everything."""
 
     if rule is None:
         return True
     if isinstance(rule, list):
-        return any(_selects(cell, state_heads, sm_count) for cell in rule)
+        return any(_selects(cell, state_heads, sm_count, arch) for cell in rule)
     kind = rule["kind"]
     if kind != "state_heads_between":
         raise ValueError(f"unknown Cake GDP decode selection rule: {kind!r}")
+    arches = rule.get("arches")
+    if arches is not None and arch not in arches:
+        return False
     state_heads, sm_count = int(state_heads), int(sm_count)
     at_most = rule["at_most"]
     if state_heads <= int(rule["above"]) or (
@@ -1708,9 +2067,9 @@ def selected_module(
     This is the band rule of the kernel (its ``band_variant``), spelled once as the records' ``select_rule``
     leaves: a route carries static-token-count programs (``build["t_steps"]`` = the call's ``T``), each owning a
     band of state-head counts (``above < state_heads <= at_most`` within optional wave bounds, multiples of the SM
-    count; a band of several intervals is a list of such cells), and one runtime-token-count program (``build["t_steps"]`` ``None``, ``T`` up to
-    ``build["max_t_steps"]``) for every other call.  Exactly one static program may admit a call; the runtime
-    program is the fallback.
+    count; a band of several intervals is a list of such cells, and a cell may name the ``arches`` it applies to),
+    and one runtime-token-count program (``build["t_steps"]`` ``None``, ``T`` up to ``build["max_t_steps"]``) for
+    every other call.  Exactly one static program may admit a call; the runtime program is the fallback.
     """
 
     num_tokens, state_heads = int(num_tokens), int(state_heads)
@@ -1723,7 +2082,7 @@ def selected_module(
         name
         for name in names
         if MODULES[name]["build"]["t_steps"] == num_tokens
-        and _selects(MODULES[name]["select_rule"], state_heads, sm_count)
+        and _selects(MODULES[name]["select_rule"], state_heads, sm_count, arch)
     ]
     if len(static) > 1:
         raise ValueError(

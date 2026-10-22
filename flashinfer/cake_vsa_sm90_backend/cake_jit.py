@@ -123,6 +123,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "compact": False,
             "kind": "persistent",
             "queue": False,
+            "tagged": False,
         },
         "workspace_rule": {
             "dbg_words": 64,
@@ -184,6 +185,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "compact": False,
             "kind": "persistent",
             "queue": True,
+            "tagged": False,
         },
         "workspace_rule": {
             "dbg_words": 64,
@@ -245,6 +247,69 @@ MODULES: dict[str, dict[str, Any]] = {
             "compact": True,
             "kind": "persistent",
             "queue": False,
+            "tagged": False,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "attention_tagged": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "Vt"],
+            ["buffer", "O"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_dead614631d8a6b8d69e",
+        "kernel_symbol": "kernel_cake_vsa_sm90_dead614631d8a6b8d69e",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 232064,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_dead614631d8a6b8d69e",
+        "logical": {
+            "K": "k",
+            "O": "out",
+            "Q": "q",
+            "Vt": "v",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": False,
+            "kind": "persistent",
+            "queue": False,
+            "tagged": True,
         },
         "workspace_rule": {
             "dbg_words": 64,
@@ -1066,10 +1131,15 @@ ARCHES = ("sm_90a",)
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (9, 0): "sm_90a",
 }
-# The stages in registry order; the two persistent stages and the fifteen
+# The stages in registry order; the four persistent stages and the fifteen
 # shipped small-selection variants.
 STAGES: tuple[str, ...] = tuple(MODULES)
-PERSISTENT_STAGES = ("attention", "attention_queue", "attention_compact")
+PERSISTENT_STAGES = (
+    "attention",
+    "attention_queue",
+    "attention_compact",
+    "attention_tagged",
+)
 SMALL_STAGES: tuple[str, ...] = tuple(
     name for name in MODULES if MODULES[name]["route"]["kind"] == "small"
 )
@@ -1119,14 +1189,21 @@ def stage_record(name: str) -> dict[str, Any]:
     return record
 
 
-def persistent_stage(queue: bool, compact: bool = False) -> str:
+def persistent_stage(queue: bool, compact: bool = False, tagged: bool = False) -> str:
     """The persistent kernel's stage: the queue-scheduled twin when ``queue``, the compact
     static program when ``compact`` (uniform pair plans of short tiles with many tiles per
-    CTA; see ``cake_planner.COMPACT_MAX_TILE_POS``)."""
+    CTA; see ``cake_planner.COMPACT_MAX_TILE_POS``), the tagged static program when
+    ``tagged`` (single-reader K / V^T tags; see ``cake_planner.kv_tags_pay``)."""
 
     if queue:
         return "attention_queue"
-    return "attention_compact" if compact else "attention"
+    return (
+        "attention_compact"
+        if compact
+        else "attention_tagged"
+        if tagged
+        else "attention"
+    )
 
 
 def small_stage(kmax: int, split: bool = False, cluster: int = 0) -> str:

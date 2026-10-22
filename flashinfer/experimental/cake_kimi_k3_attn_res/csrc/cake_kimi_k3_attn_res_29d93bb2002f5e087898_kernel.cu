@@ -89,13 +89,6 @@ __device__ __forceinline__ float approx_rcp(float x) {
     return y;
 }
 
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(256) void
@@ -195,8 +188,7 @@ kernel_cake_kimi_k3_attn_res_29d93bb2002f5e087898(__nv_bfloat16* __restrict__ ou
         block_dot = _warp_reduce_3;
         if (warp == 0) {
             if (elect_sync()) {
-                float _rsqrt_0 = rsqrtf(block_sum_sq / 7168.0f + eps);
-                float inv_rms = _rsqrt_0;
+                float inv_rms = rsqrtf(block_sum_sq / 7168.0f + eps);
                 source_scores[source] = block_dot * inv_rms;
             }
         }
@@ -206,19 +198,16 @@ kernel_cake_kimi_k3_attn_res_29d93bb2002f5e087898(__nv_bfloat16* __restrict__ ou
         float row_max = source_scores[0];
         #pragma unroll
         for (int source_1 = 1; source_1 < 5; source_1++) {
-            float _max_0 = max_noftz(row_max, source_scores[source_1]);
-            row_max = _max_0;
+            row_max = fmaxf(row_max, source_scores[source_1]);
         }
         float denominator = 0.0f;
         #pragma unroll
         for (int source_2 = 0; source_2 < 5; source_2++) {
-            float _exp_0 = expf(source_scores[source_2] - row_max);
-            float probability = _exp_0;
+            float probability = expf(source_scores[source_2] - row_max);
             source_probabilities[source_2] = probability;
             denominator += probability;
         }
-        float _rcp_0 = approx_rcp(denominator);
-        float denominator_rcp = _rcp_0;
+        float denominator_rcp = approx_rcp(denominator);
         #pragma unroll
         for (int source_3 = 0; source_3 < 5; source_3++) {
             source_probabilities[source_3] = source_probabilities[source_3] * denominator_rcp;
@@ -264,8 +253,8 @@ kernel_cake_kimi_k3_attn_res_29d93bb2002f5e087898(__nv_bfloat16* __restrict__ ou
     output_sum_sq = _warp_reduce_5;
     if (warp == 0) {
         if (elect_sync()) {
-            float _rsqrt_1 = rsqrtf(output_sum_sq / 7168.0f + output_norm_eps);
-            output_norm_scalar[0] = _rsqrt_1;
+            float _rsqrt_6 = rsqrtf(output_sum_sq / 7168.0f + output_norm_eps);
+            output_norm_scalar[0] = _rsqrt_6;
         }
     }
     __syncthreads();
@@ -274,8 +263,7 @@ kernel_cake_kimi_k3_attn_res_29d93bb2002f5e087898(__nv_bfloat16* __restrict__ ou
     for (int item_6 = 0; item_6 < 28; item_6++) {
         unsigned long long elem_4 = (unsigned long long)tid + (unsigned long long)(item_6 * 256);
         float value_2 = mixed[item_6] * output_inv_rms * (float)output_norm_weight[elem_4];
-        __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)value_2;
-        out[out_base + elem_4] = _cvt_bf16_0;
+        out[out_base + elem_4] = (__nv_bfloat16)value_2;
     }
 }
 
