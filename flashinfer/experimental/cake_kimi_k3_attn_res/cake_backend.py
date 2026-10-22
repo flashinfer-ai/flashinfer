@@ -207,7 +207,9 @@ _FAST_MATH_BANDS = _by_arch(
     lambda t: {program: _bands(bands) for program, bands in t.items()},
 )
 # Round-2 cell tables (architecture -> SM count -> (M, K) cell), consulted before the legacy
-# derivation; a cell absent here keeps the legacy program.
+# derivation; a cell absent here keeps the legacy program.  The export spells the round-3 cells
+# into the same tables (the native K5 cells of both architectures and the sm_100a ``_crfnone``
+# persistent twins).
 _R2_PERSISTENT_KEY_CELLS = _by_arch_sm(
     ROUTES["R2_PERSISTENT_KEY_CELLS"],
     lambda t: {
@@ -452,8 +454,13 @@ _PERSISTENT_FLAG_PWA = 1
 _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
+# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_write]``: ``_fm`` is the fast-math
+# twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built with
+# ``consumed_release_fence_mode="none"`` (the kernel states its own tcgen05 fences), a registered
+# program of its own whose schedule label ends in ``_authored_fences`` -- and ``_write`` the
+# snapshot-write variant.  A fallback never crosses the ``_fm`` / ``_crfnone`` / ``_write`` lines.
 _PERSISTENT_KEY = re.compile(
-    r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)(_fm)?(_write)?$"
+    r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)(_fm)?(_crfnone)?(_write)?$"
 )
 _SMALL_M_KEY = re.compile(
     r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_fm)?(_write)?$"
@@ -461,7 +468,9 @@ _SMALL_M_KEY = re.compile(
 _PAIR_KEY = re.compile(r"^pair:k(\d+)_nc(\d+)(_pbf16a)?(_fm)?(_write)?$")
 
 
-def _persistent_schedule_id(nc: int, depth: int, bits: str) -> str:
+def _persistent_schedule_id(
+    nc: int, depth: int, bits: str, authored_fences: bool = False
+) -> str:
     schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
     if bits[_PERSISTENT_FLAG_ECR] == "1":
         schedule_id += "_early_consume"
@@ -473,6 +482,8 @@ def _persistent_schedule_id(nc: int, depth: int, bits: str) -> str:
         schedule_id += "_prefix_round_once"
     if bits[_PERSISTENT_FLAG_REGISTER_CARRY_ONLY] == "1":
         schedule_id += "_register_carry_only"
+    if authored_fences:
+        schedule_id += "_authored_fences"
     return schedule_id
 
 
@@ -541,18 +552,22 @@ def _persistent_fallback(
         if exact
         else (None, None, None)
     )
-    want_write = bool(exact and exact.group(6)) or plan.kernel_key.endswith("_write")
+    want_write = bool(exact and exact.group(7)) or plan.kernel_key.endswith("_write")
     want_fm = bool(exact and exact.group(5)) or "_fm" in plan.kernel_key
+    want_authored = bool(exact and exact.group(6)) or "_crfnone" in plan.kernel_key
     candidates = []
     for key in table:
         match = _PERSISTENT_KEY.match(key)
         if match is None or int(match.group(1)) != K:
             continue
-        if bool(match.group(6)) != want_write:
+        if bool(match.group(7)) != want_write:
             # the snapshot store exists only in the write variants: never cross that line
             continue
         if bool(match.group(5)) != want_fm:
             # fast-math programs round differently (one BF16 ulp class): never substitute across it
+            continue
+        if bool(match.group(6)) != want_authored:
+            # the fence-authored twin states its own tcgen05 fences: never substitute across it
             continue
         nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
         score = (
@@ -571,7 +586,7 @@ def _persistent_fallback(
         return None
     _score, key, nc, depth, bits = min(candidates)
     grid_x, grid_policy = _grid(M, num_sms, nc)
-    schedule_id = _persistent_schedule_id(nc, depth, bits)
+    schedule_id = _persistent_schedule_id(nc, depth, bits, want_authored)
     if want_fm:
         schedule_id += "_fastmath"
     if want_write:
@@ -841,16 +856,17 @@ def _pair_plan(
 def _persistent_plan_for_key(
     arch: str, num_sms: int, M: int, K: int, use_pdl: bool, key: str
 ) -> RoutePlan:
-    """The plan of a round-2 persistent cell: the key as the table names it, the grid of its ``nc``
-    and the labels of its fields (what ``_persistent_plan_exact`` derives for a legacy cell)."""
+    """The plan of a round-2 / round-3 persistent cell: the key as the table names it, the grid of
+    its ``nc`` and the labels of its fields (what ``_persistent_plan_exact`` derives for a legacy
+    cell; a ``_crfnone`` key labels its schedule ``_authored_fences``)."""
     match = _PERSISTENT_KEY.match(key)
-    if match is None or int(match.group(1)) != K or match.group(6):
+    if match is None or int(match.group(1)) != K or match.group(7):
         raise ValueError(
             f"round-2 cell ({M}, {K}) names {key!r}, not a dense persistent key of K={K}"
         )
     nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
     grid_x, grid_policy = _grid(M, num_sms, nc)
-    schedule_id = _persistent_schedule_id(nc, depth, bits) + (
+    schedule_id = _persistent_schedule_id(nc, depth, bits, bool(match.group(6))) + (
         "_fastmath" if match.group(5) else ""
     )
     wait_policy = "deferred_wait_st" if _wait_policy(arch) else "control_wait_st"
