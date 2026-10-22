@@ -343,6 +343,12 @@ def plan_w4a16_buffers(
     prefill_fused_sum: bool | None = None,
     small_m_direct: bool = True,
 ) -> W4A16BufferPlan:
+    """Return the scratch extents one W4A16 launch of ``m`` tokens needs.
+
+    ``small_m_direct`` reserves the 256-column ``intermediate_cache2`` width
+    the small-M direct kernel needs for ModelOpt weights at ``m <= 8``.
+    Callers that have already ruled that kernel out pass ``False``.
+    """
     routed_rows = int(m) * int(topk)
     route_num_experts = (
         int(prepared.num_experts)
@@ -387,9 +393,6 @@ def plan_w4a16_buffers(
         and not full_rotation
     ):
         # Native micro decode stores 128-word chunks of paired BF16 values.
-        # Callers that have already ruled the direct kernel out (for example
-        # E8M0 shards whose intermediate size spans a partial second chunk)
-        # pass small_m_direct=False and only need the routed-row width.
         cache2_width = ((intermediate_size + 255) // 256) * 256
     use_prefill_fused_sum = prefill_fused_sum_eligible(
         dtype=dtype if dtype is not None else "",
