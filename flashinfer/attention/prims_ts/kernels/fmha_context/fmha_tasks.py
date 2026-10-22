@@ -34,6 +34,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 from ..stage import FmhaStage
+from ...sage.modes import SageKTransport, SageScoreScaling
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
     schedule,
@@ -50,6 +51,7 @@ from .fmha_resources import (
     SmemKVResource,
     SmemOResource,
     SmemPageOffsetsKvResource,
+    SmemSageKScalesResource,
     SmemQResource,
     TmemOResource,
     TmemPResource,
@@ -188,13 +190,15 @@ def create_load_task(
     task_class: type[Task] = Task,
     smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None,
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None,
+    smem_sage_k: SmemSageKScalesResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp TMA load task.
 
     When ``smem_page_offsets_kv`` is provided, each K/V TMA load consumes page
     IDs prefetched by the auxiliary warp through the ordinary asynchronous
-    page-offset pipeline.
+    page-offset pipeline. When ``smem_sage_k`` is provided, the warp also
+    stages each K tile's Sage ``sfK`` words after the tile's K load.
     """
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
@@ -209,6 +213,8 @@ def create_load_task(
         src.append(smem_page_offsets_kv)
     if smem_page_offsets_v is not None:
         src.append(smem_page_offsets_v)
+    if smem_sage_k is not None:
+        dst.append(smem_sage_k)
     if smem_q.cfg.single_qkv_instance and smem_q.cfg.has_tmem_p_pipeline:
         num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
         num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
@@ -651,12 +657,29 @@ def create_load_task(
         sq: SmemQResource,
         sk: SmemKVResource,
         sv: SmemKVResource,
+        skr: SmemSageKScalesResource | None,
         wq: WorkQueue | None,
     ) -> None:
-        """Load paired Q instances and their directly addressed K/V tiles."""
+        """Load paired Q instances and their directly addressed K/V tiles.
+
+        With ``skr`` each K tile's Sage ``sfK`` words follow the tile's K
+        load into the scale ring.
+        """
         sq.init_load_state()
         sk.init_load_state()
         sv.init_load_state()
+
+        def stage_sage_k_scales() -> None:
+            if skr is None:
+                return
+            skr.acquire()
+            skr.copy_tile(
+                kv_head_coord=kv_head_coord,
+                batch_coord=batch_coord,
+                kv_tile_start=kv_tile_start,
+            )
+            skr.commit()
+
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):  # noqa: SIM117
             # The first K-loop iteration also loads Q0/Q1. Later iterations
             # only stream the next K/V tiles through their respective pipelines.
@@ -717,6 +740,7 @@ def create_load_task(
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sk.commit()
+                    stage_sage_k_scales()
                 else:
                     # Throttle TMA before reserving a KV stage.
                     sk.try_acquire()
@@ -732,6 +756,7 @@ def create_load_task(
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sk.commit()
+                    stage_sage_k_scales()
                     with d.first_iter():
                         # Load Q1 for the second Q tile in this work tile.
                         sq.acquire()
@@ -768,7 +793,18 @@ def create_load_task(
     ) -> None:
         """Contiguous-KV captured schedule over a shared K/V buffer."""
         # Mypy retains the earlier branch's five-argument closure signature.
-        load_schedule_body(gqkv, sq, skv, skv, wq)  # type: ignore[call-arg]
+        load_schedule_body(gqkv, sq, skv, skv, None, wq)  # type: ignore[call-arg]
+
+    @schedule
+    def load_sage_schedule(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        skr: SmemSageKScalesResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Contiguous-KV captured schedule that also stages Sage ``sfK`` tiles."""
+        load_schedule_body(gqkv, sq, skv, skv, skr, wq)  # type: ignore[call-arg]
 
     @schedule
     def load_split_schedule(
@@ -779,15 +815,27 @@ def create_load_task(
         wq: WorkQueue | None = None,
     ) -> None:
         """Contiguous-KV captured schedule over split K and V buffers."""
-        load_schedule_body(gqkv, sq, sk, sv, wq)  # type: ignore[call-arg]
+        load_schedule_body(gqkv, sq, sk, sv, None, wq)  # type: ignore[call-arg]
 
-    captured_schedule = _schedule_with_work_queue(
-        load_split_schedule if split_kv else load_schedule,
-        gmem_qkv,
-        smem_q,
-        *kv_resources,
-        work_queue=work_queue,
-    )
+    if smem_sage_k is not None:
+        if split_kv:
+            raise ValueError("the Sage scale ring requires a shared K/V buffer")
+        captured_schedule = _schedule_with_work_queue(
+            load_sage_schedule,
+            gmem_qkv,
+            smem_q,
+            *kv_resources,
+            smem_sage_k,
+            work_queue=work_queue,
+        )
+    else:
+        captured_schedule = _schedule_with_work_queue(
+            load_split_schedule if split_kv else load_schedule,
+            gmem_qkv,
+            smem_q,
+            *kv_resources,
+            work_queue=work_queue,
+        )
     return task_class(
         src_resources=src,
         dst_resources=dst,
@@ -1257,6 +1305,11 @@ def create_mma_task(
             return sk.k_desc()
         return sk.k_stage_desc()
 
+    def seed_scores(sp):
+        """Seed an acquired S stage with the INT32 score bias before its K wait."""
+        if smem_q.cfg.uses_int32_scores:
+            sp.seed_scores()
+
     def qk_mma_stages(sk, sp, desc_q_base, section, *, descriptors=None):
         """Issue all K slices, loading descriptors once and reusing them for Q1."""
         stages = []
@@ -1349,6 +1402,7 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd0.acquire()
                     sp0.acquire()
+                    seed_scores(sp0)
                 qk_mma_slice(
                     sp0, desc_q0_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1362,6 +1416,7 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd1.acquire()
                     sp1.acquire()
+                    seed_scores(sp1)
                 qk_mma_slice(
                     sp1, desc_q1_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1421,6 +1476,7 @@ def create_mma_task(
                 # waits on its group's P tile instead. The tail drains no SP slot.
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp0.acquire()
+                    seed_scores(sp0)
                     k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
                     sp0.commit()
                     to.acquire()
@@ -1434,6 +1490,7 @@ def create_mma_task(
                     )
                     to.commit()
                     sp1.acquire()
+                    seed_scores(sp1)
                     qk_mma_stages(
                         sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
                     )
@@ -1678,6 +1735,7 @@ def create_softmax_task(
     task_class: type[Task] = Task,
     tmem_p_prefix_ready: TmemPPrefixReadyResource | None = None,
     smem_p: SmemPResource | None = None,
+    smem_sage_k: SmemSageKScalesResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create a four-warp Softmax task.
@@ -2190,6 +2248,22 @@ def create_softmax_task(
         if smem_p is None:
             raise ValueError("p_in_smem requires the group's SMEM P resource")
         dst.append(smem_p)
+    # Sage attention takes each K tile's sfK words from the prepared buffer
+    # or from the load warp's ring (``SageKTransport``), and scales blocks of
+    # raw scores or dequantizes them (``SageScoreScaling``).
+    use_sage = tmem_sp.cfg.use_sage_attention
+    sage_transport = tmem_sp.cfg.sage_k_transport
+    sage_scaling = tmem_sp.cfg.sage_score_scaling
+    if use_sage and not p_in_smem:
+        raise ValueError("Sage attention requires P in SMEM")
+    if sage_transport is SageKTransport.RING and sage_scaling is SageScoreScaling.BLOCK:
+        # The P pass of block-scaled scores reuses the max pass's words, and
+        # a ring stage is released after the max pass.
+        raise ValueError("block-scaled Sage scores load their sfK words directly")
+    if sage_transport is SageKTransport.RING:
+        if smem_sage_k is None:
+            raise ValueError("this Sage K block size requires the sfK ring")
+        src.append(smem_sage_k)
 
     def softmax_schedule_body(
         sp: TmemSPResource,
@@ -2198,6 +2272,7 @@ def create_softmax_task(
         wq: WorkQueue | None = None,
         pr: TmemPPrefixReadyResource | None = None,
         pb: SmemPResource | None = None,
+        skr: SmemSageKScalesResource | None = None,
     ) -> None:
         """Captured schedule for one softmax warp group."""
         if tmem_sp.enable_early_tile_sum:
@@ -2208,10 +2283,40 @@ def create_softmax_task(
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
 
-        def exp2_p(sp: TmemSPResource, *, row_max: Any, scale_softmax_log2: Any) -> Any:
+        def exp2_p(
+            sp: TmemSPResource,
+            *,
+            row_max: Any,
+            scale_softmax_log2: Any,
+            sage_q_scale: Any = None,
+            sage_k_words: Any = None,
+        ) -> Any:
             """Softmax and P store. With P in SMEM the store goes to the SMEM P tile,
             with the half overlap the leading half is published behind ``pr``, else P goes
-            to the TMEM S/P stage."""
+            to the TMEM S/P stage. A Sage plan passes the work tile's ``sfQ`` and, when it
+            scales blocks, the tile's ``sfK`` words from its max pass."""
+            if sage_scaling is SageScoreScaling.BLOCK:
+                p_chunk = sp.sage_exp2_p_smem(
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_words=sage_k_words,
+                )
+                pb.acquire()
+                sp.store_p()
+                pb.commit()
+                return p_chunk
+            if use_sage:
+                # The scores carry sfK already; sfQ joins the exp2 scale.
+                p_chunk = sp.sage_dequantized_exp2_p_smem(
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                )
+                pb.acquire()
+                sp.store_p()
+                pb.commit()
+                return p_chunk
             if p_in_smem:
                 # The S stage is released already, so exp2 and the P store are
                 # auxiliary work on the loaded S and the SMEM P tile.
@@ -2244,12 +2349,60 @@ def create_softmax_task(
             window_end = Int32(0)
             if tmem_sp.uses_variable_window:
                 window_start, window_end = sp.cache_variable_window_bounds()
+            sage_q_scale = sage_k_words = None
+            if use_sage:
+                sage_q_scale, sage_k_first_atom = sp.cache_sage_scales()
+
+            def start_sage_k_words(section: FmhaStage) -> Any:
+                """Start obtaining the K tile's ``sfK`` words before the wait for its scores.
+
+                The global transport loads the words, so the wait hides their
+                latency; the ring transport waits for the load warp's stage and
+                returns its offset, read after the score wait."""
+                if sage_transport is SageKTransport.GLOBAL:
+                    return sp.load_sage_k_words(
+                        sage_k_first_atom=sage_k_first_atom, section=section
+                    )
+                skr.wait()
+                return skr.open_stage()
+
+            def sage_row_max(row_max: Any, k_words: Any, section: FmhaStage) -> Any:
+                """Row max of the dequantized scores.
+
+                A ring stage's words are read after the score wait and the
+                stage is released after the max pass (``SmemSageKScalesResource``)."""
+                if sage_transport is SageKTransport.RING:
+                    k_words = sp.read_staged_sage_k_words(sage_k_stage_words=k_words)
+                if sage_scaling is SageScoreScaling.BLOCK:
+                    maxima = sp.sage_row_max(
+                        row_max=row_max,
+                        sage_q_scale=sage_q_scale,
+                        sage_k_words=k_words,
+                        section=section,
+                    )
+                else:
+                    maxima = sp.sage_dequantized_row_max(
+                        row_max=row_max,
+                        sage_q_scale=sage_q_scale,
+                        sage_k_words=k_words,
+                        section=section,
+                    )
+                if sage_transport is SageKTransport.RING:
+                    skr.release()
+                return maxima
+
             # Reserve a stats slot before the first softmax result is published.
             vec.acquire()
             with domain_loop(loop_start, loop_end, loop_step):
+                if use_sage:
+                    sage_k_words = start_sage_k_words(FmhaStage.Loop)
                 sp.wait()
                 # Compute row max and publish vec.
-                if tmem_sp.uses_variable_window:
+                if use_sage:
+                    old_row_max, row_max = sage_row_max(
+                        row_max, sage_k_words, FmhaStage.Loop
+                    )
+                elif tmem_sp.uses_variable_window:
                     old_row_max, row_max = sp.variable_window_row_max(
                         row_max=row_max,
                         window_start=window_start,
@@ -2317,6 +2470,8 @@ def create_softmax_task(
                     sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_words=sage_k_words,
                 )
                 if s0s1_seq is None or early_token:
                     pass
@@ -2518,11 +2673,18 @@ def create_softmax_task(
                 vec.commit()
             elif tmem_sp.uses_fixed_dense_k_tail_mask:
                 # Dense tail: one more loop step with the zero-filled lanes masked out.
+                if use_sage:
+                    sage_k_words = start_sage_k_words(FmhaStage.Tail)
                 sp.wait()
-                old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                    row_max=row_max,
-                    section=FmhaStage.Tail,
-                )
+                if use_sage:
+                    old_row_max, row_max = sage_row_max(
+                        row_max, sage_k_words, FmhaStage.Tail
+                    )
+                else:
+                    old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
+                        row_max=row_max,
+                        section=FmhaStage.Tail,
+                    )
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -2541,6 +2703,8 @@ def create_softmax_task(
                     sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_words=sage_k_words,
                 )
                 if s0s1_seq is None:
                     pass
@@ -2613,7 +2777,28 @@ def create_softmax_task(
     ) -> None:
         softmax_schedule_body(sp, vec, seq, wq, None, pb)
 
-    if p_in_smem:
+    @schedule
+    def softmax_schedule_pb_skr(
+        sp: TmemSPResource,
+        vec: TmemStatsResource,
+        seq: S0S1SequenceResource,
+        pb: SmemPResource,
+        skr: SmemSageKScalesResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        softmax_schedule_body(sp, vec, seq, wq, None, pb, skr)
+
+    if p_in_smem and sage_transport is SageKTransport.RING:
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule_pb_skr,
+            tmem_sp,
+            tmem_vec,
+            s0s1_seq,
+            smem_p,
+            smem_sage_k,
+            work_queue=work_queue,
+        )
+    elif p_in_smem:
         captured_schedule = _schedule_with_work_queue(
             softmax_schedule_pb,
             tmem_sp,

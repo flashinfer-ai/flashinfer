@@ -2022,13 +2022,14 @@ def test_fp8_blackwell_tile_m_rule():
         and composition["form"] == constants["form"]
     )
     # the composition record is the gated record on the 512-row tile: only the tile height, the per-record identity
-    # (module / device / binding names) and the architecture list differ; the rule data and every launch fact are shared
+    # (module / device names and the compile definitions that select the program in the family's shared binding)
+    # and the architecture list differ; the rule data and every launch fact are shared
     assert {key for key in gated if gated[key] != composition[key]} == {
         "tile_m",
         "pair_m",
         "module",
         "device",
-        "binding",
+        "compile_flags",
         "arches",
     }
     assert gated["arches"] == ["sm_100a", "sm_103a"] and composition["arches"] == [

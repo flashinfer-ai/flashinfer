@@ -191,8 +191,11 @@ class QuantConfig:
         Only NVFP4 activations accept an explicit value (``__post_init__``
         raises otherwise). A runner that has not threaded the setting into
         its quantizer rejects an explicit value instead of dropping it; see
-        ``MoERunner.supports_nvfp4_4over6``. A pinned recipe also pins the
-        GEMM2-input scale of the weight pack: build it with
+        ``MoERunner.supports_nvfp4_4over6``. CuteDSL and TRT-LLM FP4 honor a
+        pinned recipe only with ``per_token_scale=True``, where they
+        requantize the GEMM2 input themselves; CUTLASS NVFP4 honors it on its
+        standard path. For CuteDSL a pinned recipe also pins the GEMM2-input
+        scale of the weight pack: build it with
         ``CuteDslConfig.prepare_weights(..., nvfp4_4over6=<the same value>)``
         or the call raises ``ValueError``. An unset field is not emitted by
         ``__repr__``, so the ``eval(repr(cfg))`` round-trip still holds.
@@ -2941,8 +2944,55 @@ class CudnnFrostMxfp8Mxfp4Config:
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
 
 
+@dataclass(frozen=True)
+class FrostLowLatencyConfig:
+    """Low-token routed MoE on SM100/SM103/SM107.
+
+    Explicit opt-in; omitted from the default backend list. Autotuning selects
+    Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
+    prepared weights and numerical contract. Both are multi-kernel pipelines,
+    with precomputed routing and no EP communication. The Tensor Core path
+    overlaps its fused GU/activation/quantizer and Down GEMM through PDL.
+    Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
+    Prepare other backend views as well to permit fallback for larger inputs.
+
+    MXFP4/MXFP8 weights with MXFP8 inputs support SwiGLU through TC or FMA.
+    BF16 weights/inputs use FMA with gated or non-gated activations and top-k
+    at most 32. BF16 rounds the activation to BF16 and combines BF16 expert
+    outputs with ordered, separate FP32 multiplication and addition. This is
+    distinct from the MX intermediate quantization/combine contract.
+    """
+
+    max_num_tokens: int = 2
+
+    def __post_init__(self):
+        if not 1 <= self.max_num_tokens <= 8:
+            raise ValueError("max_num_tokens must be between 1 and 8")
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(w1, w1_scale, w2, w2_scale):
+        """Pack canonical prequantized MX weights without requantizing them."""
+        from .backends.frost_low_latency.prepare import prepare_weights
+
+        return prepare_weights(w1, w1_scale, w2, w2_scale)
+
+    @staticmethod
+    def prepare_bf16_weights(w1, w2, *, activation=None):
+        """Prepare BF16 [up, gate] or non-gated weights, padding I to 128."""
+        from .backends.frost_low_latency.prepare import prepare_bf16_weights
+
+        return prepare_bf16_weights(
+            w1, w2, SwiGLU() if activation is None else activation
+        )
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
     CudnnFrostNvfp4Config,
@@ -2987,6 +3037,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
     CudnnFrostNvfp4Config,

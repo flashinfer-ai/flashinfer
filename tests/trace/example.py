@@ -125,6 +125,7 @@ rmsnorm_h7168.json
 rmsnorm_sigmoid_gate_nh32_h64.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
+silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -136,6 +137,7 @@ top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
 trtllm_bf16_routed_moe_topk2_e8_h1024.json
 trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3.json
+trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3_r4o61.json
 trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
 trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
@@ -505,6 +507,7 @@ from flashinfer.quantization.fp4_quantization import (
 from flashinfer.quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 
 quant_M, quant_K = 128, 4096
@@ -605,6 +608,12 @@ with contextlib.suppress(Exception):
     grouped_a = torch.randn(2, 256, quant_K, dtype=torch.bfloat16, device=device)
     grouped_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
     mxfp8_grouped_quantize(grouped_a, grouped_mask)
+
+# Fused SiLU + mul + masked MXFP8 (SM100+): [B, M, 2K] -> masked grouped GEMM layout.
+with contextlib.suppress(Exception):
+    experts_a = torch.randn(2, 256, 2 * quant_K, dtype=torch.bfloat16, device=device)
+    experts_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
+    silu_and_mul_mxfp8_experts_quantize(experts_a, experts_mask)
 
 # ── Single-request attention (non-batched) ───────────────────────────────────
 sa_Hq, sa_Hk, sa_D, sa_KV = 32, 8, 128, 256
@@ -2071,6 +2080,19 @@ flashinfer.prims_ts_fp4_block_scale_moe.fi_trace(
 )
 flashinfer.prims_ts_fp4_block_scale_routed_moe.fi_trace(
     topk_ids=_pts_moe_packed_topk,
+    **_pts_moe_fp4_common,
+)
+from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: E402
+    NVFP44Over6Config,
+)
+
+# An explicit 4over6 recipe adds the derived nvfp4_4over6 axis (r4o6 + wire
+# code, 1 for the default recipe); the definitions above leave it unset and so
+# carry no such axis.
+flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe.fi_trace(
+    topk_ids=_pts_moe_packed_topk,
+    per_token_scale=torch.ones(_pts_moe_T, dtype=torch.float32, device=device),
+    nvfp4_4over6=NVFP44Over6Config(),
     **_pts_moe_fp4_common,
 )
 

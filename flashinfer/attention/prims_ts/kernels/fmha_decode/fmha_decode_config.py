@@ -28,14 +28,22 @@ import math
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN, Int8
 
-from ...sage import SAGE_K_BLOCK_SIZES, is_power_of_two
+from ...sage.config import SAGE_K_BLOCK_SIZES, is_power_of_two
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
     _block_sparse_proxy_summary_geometry,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from ...sage import _SAGE_ATOM_MIN_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
+from ...sage.layout import (
+    _SAGE_ATOM_MIN_WORDS,
+    _SAGE_ATOM_TOKENS,
+    _SageKSection,
+    _SageQSection,
+    _SageScaleLayout,
+    _SageVSection,
+)
+from ...sage.modes import SageScoreScaling
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
@@ -2076,10 +2084,9 @@ class FmhaDecodeConfig:
                 f"got {self.sage_k_summary_block_size}"
             )
         q_block_size = self.sage_q_block_size
-        if not is_power_of_two(q_block_size) or q_block_size > self.tile_size_q:
+        if not is_power_of_two(q_block_size):
             raise ValueError(
-                "sage_q_block_size must be a power of two no larger than "
-                f"tile_size_q ({self.tile_size_q}), got {q_block_size}"
+                f"sage_q_block_size must be a power of two, got {q_block_size}"
             )
         if not self.streams_tmem_p_fragments:
             raise ValueError(
@@ -2663,24 +2670,31 @@ class FmhaDecodeConfig:
         assert self.use_sage_attention and self.groups_tokens_heads_q
         assert self.keeps_atom_tokens == _SAGE_ATOM_TOKENS
         assert self.keeps_fragments_per_atom == _SAGE_ATOM_MIN_WORDS
-        num_summaries = 0
+        summaries = None
         if self.use_block_sparse_proxy_routes:
             num_summaries, _ = _block_sparse_proxy_summary_geometry(
                 seq_len_kv, self.kv_block_size
             )
+            summaries = _SageKSection(
+                length=num_summaries,
+                block_size=self.sage_k_scale_block_size(proxy=True),
+                source_block_size=self.sage_k_summary_block_size,
+            )
         layout = _SageScaleLayout(
-            seq_len_kv=seq_len_kv,
-            k_block_size=self.sage_k_block_size,
-            num_summaries=num_summaries,
-            k_summary_block_size=self.sage_k_summary_block_size,
-            k_tokens_block_size=self.sage_k_scale_block_size(),
-            summaries_block_size=self.sage_k_scale_block_size(proxy=True),
-            seq_len_q=self.max_seq_len_q,
-            q_block_size=self.sage_q_block_size,
-            heads_q_per_kv=self.heads_q_per_kv,
-            tile_size_q=self.tile_size_q,
-            headdim=self.headdim,
-            v_mean=self.sage_v_mean,
+            k_tokens=_SageKSection(
+                length=seq_len_kv,
+                block_size=self.sage_k_scale_block_size(),
+                source_block_size=self.sage_k_block_size,
+            ),
+            q_rows=_SageQSection(
+                seq_len_q=self.max_seq_len_q,
+                q_block_size=self.sage_q_block_size,
+                heads_q_per_kv=self.heads_q_per_kv,
+                rows_per_tile=self.tile_size_q,
+                heads_interleaved=True,
+            ),
+            v_rows=_SageVSection(headdim=self.headdim, has_mean=self.sage_v_mean),
+            summaries=summaries,
         )
         q_rows = layout.q_rows
         assert q_rows.tokens_per_tile == self.q_tokens_per_cta
@@ -2695,18 +2709,21 @@ class FmhaDecodeConfig:
             1, self.softmax_score_fragment_regs // self.sage_k_scale_block_size(proxy)
         )
 
-    def sage_scores_dequantized(self, proxy: bool = False) -> bool:
-        """Whether the max pass writes a route kind's scores back dequantized.
+    def sage_score_scaling(self, proxy: bool = False) -> SageScoreScaling | None:
+        """Return how the softmax applies a route kind's ``sfK`` to its scores.
 
-        A kind with one scale per score (the one-token K block) does, so the P
-        pass reads neither its ``sfK`` nor the INT32 bias; other geometries
-        stay quantized to avoid a TMEM round trip per tile.
+        A kind with one scale per score (the one-token K block) is
+        dequantized: the max pass writes its scores back multiplied, so the P
+        pass reads neither its ``sfK`` nor the INT32 bias. Other geometries
+        scale blocks of ``sage_k_scale_block_size`` columns, avoiding a TMEM
+        round trip per tile. Every kind's words come through the
+        ``SageKScalesResource`` ring (``SageKTransport.RING``).
         """
-        return (
-            self.use_sage_attention
-            and self.sage_k_groups_per_fragment(proxy)
-            == self.softmax_score_fragment_regs
-        )
+        if not self.use_sage_attention:
+            return None
+        if self.sage_k_groups_per_fragment(proxy) == self.softmax_score_fragment_regs:
+            return SageScoreScaling.DEQUANTIZED
+        return SageScoreScaling.BLOCK
 
     @property
     def matches_kv256_task_topology(self) -> bool:

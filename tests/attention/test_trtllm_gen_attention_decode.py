@@ -1,5 +1,9 @@
 import inspect
 import math
+import os
+import re
+import subprocess
+import sys
 from typing import Union
 
 import pytest
@@ -1288,6 +1292,30 @@ def test_trtllm_batch_decode(
     )
 
 
+@pytest.mark.parametrize(
+    "max_in_kv_len", [64, 256], ids=["window-does-not-bind", "window-binds"]
+)
+def test_trtllm_batch_decode_sliding_window_accuracy(max_in_kv_len: int) -> None:
+    """Check accuracy on both sides of the causal-window kernel-selection boundary."""
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=2,
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=1,
+        window_left=127,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=False,
+        enable_sink=False,
+        max_in_kv_len=max_in_kv_len,
+        head_dim=128,
+    )
+
+
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("provide_lse", [False, True])
 def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
@@ -2084,3 +2112,359 @@ def test_trtllm_batch_decode_spec(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+# Multi-wave KV split (opt-in): with FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1, when one wave
+# of CTAs gives at most 2 KV splits, trtllm-gen uses up to 4 waves (fmhaKernels.cuh). Unset keeps
+# the stock one-wave split. The 32/2-head cases have base CTAs = 2 x batch (one Q CTA per
+# request), so one-wave splits are SMs // (2 x batch).
+MULTI_WAVE_KV_SPLIT_ENV = "FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT"
+_MULTI_WAVE_SENTINEL = 0x5A
+
+
+def _multi_wave_sm_count() -> int:
+    compute_capability = get_compute_capability(torch.device(GPU_DEVICE))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen backend requires SM100 or SM103 GPUs.")
+    return get_device_sm_count(torch.device(GPU_DEVICE))
+
+
+def _multi_wave_inputs(
+    batch_size: int,
+    q_len: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    head_dim: int,
+    q_dtype: str,
+    kv_dtype: str,
+    max_kv_len: int,
+    page_size: int = 16,
+):
+    """Deterministic paged-KV decode inputs with mixed KV lengths."""
+    torch.manual_seed(0)
+    num_qo_heads = num_kv_heads * head_grp_size
+    q_lens = torch.full((batch_size,), q_len, dtype=torch.int32)
+    seq_lens = torch.randint(
+        max(q_len, max_kv_len // 8), max_kv_len + 1, (batch_size,), dtype=torch.int32
+    )
+    seq_lens[-1] = max_kv_len
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    kv_cache, k_scale, v_scale, ref_kv_cache, _ = create_kv_cache(
+        batch_size, seq_lens, page_size, num_kv_heads, head_dim, kv_dtype, "bf16"
+    )
+    page_table, _, _ = create_page_table(batch_size, seq_lens, page_size)
+    return dict(
+        q=q,
+        ref_q=ref_q,
+        kv_cache=kv_cache,
+        ref_kv_cache=ref_kv_cache,
+        page_table=page_table,
+        q_lens=q_lens,
+        seq_lens=seq_lens,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_len=q_len,
+        bmm1_scale=float(q_scale * k_scale) * head_dim**-0.5,
+        bmm2_scale=float(v_scale),
+    )
+
+
+def _multi_wave_decode(
+    inp, workspace_buffer, window_left=-1, max_seq_len=None, return_lse=False
+):
+    return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query=inp["q"],
+        kv_cache=inp["kv_cache"],
+        workspace_buffer=workspace_buffer,
+        block_tables=inp["page_table"],
+        seq_lens=inp["seq_lens"].to(GPU_DEVICE),
+        max_seq_len=max_seq_len or int(inp["seq_lens"].max().item()),
+        bmm1_scale=inp["bmm1_scale"],
+        bmm2_scale=inp["bmm2_scale"],
+        window_left=window_left,
+        out_dtype=torch.bfloat16,
+        kv_layout="HND",
+        backend="trtllm-gen",
+        q_len_per_req=inp["q_len"],
+        return_lse=return_lse,
+    )
+
+
+def _assert_multi_wave_matches_fp32_reference(inp, output, q_dtype, window_left=-1):
+    # sdpa_paged_reference computes in fp32 from the dequantized Q/K/V.
+    output_ref = sdpa_paged_reference(
+        inp["ref_q"],
+        inp["ref_kv_cache"],
+        inp["q_lens"],
+        inp["seq_lens"],
+        inp["page_table"],
+        inp["page_size"],
+        inp["num_qo_heads"],
+        inp["num_kv_heads"],
+        inp["head_dim"],
+        "HND",
+        window_left,
+    )
+    rtol, atol = (4e-2, 7e-2) if q_dtype == "fp8" else (1e-2, 1e-2)
+    if inp["q_len"] > 1:
+        rtol, atol = rtol * 2, atol * 2
+    assert_close_with_mismatch_tolerance(
+        output.float(),
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=int(5e-5 * output.numel()),
+    )
+
+
+def _sentinel_workspace(num_bytes: int, offset: int = 0):
+    """A workspace view at `offset` into a sentinel-filled buffer that has a guard tail."""
+    storage = torch.full(
+        (offset + num_bytes + TRTLLM_GEN_WORKSPACE_CHECK_BYTES,),
+        _MULTI_WAVE_SENTINEL,
+        dtype=torch.int8,
+        device=GPU_DEVICE,
+    )
+    return storage, storage[offset : offset + num_bytes]
+
+
+def _untouched(region: torch.Tensor) -> bool:
+    return bool((region == _MULTI_WAVE_SENTINEL).all().item())
+
+
+def _multi_wave_scratch_bytes(sm_count, total_ctas, step_q, head_dim_per_cta_v):
+    """Scratch bytes the launcher checks for a multi-wave split (fitsMultiCtasKvScratch).
+
+    The callers pass the cubin's stepQ and headDimPerCtaV, which Python cannot read. The
+    exact-capacity cases fail by design if a cubin has other values.
+    """
+    stats_bytes = max(sm_count, total_ctas) * step_q * 8
+    partial_o_bytes = total_ctas * step_q * head_dim_per_cta_v * 2
+    return stats_bytes + partial_o_bytes
+
+
+def _multi_wave_cases(m: int) -> dict:
+    """Decode cases for SM count m. expect: what the opt-in run does versus the default run.
+
+    engaged: more CTAs than SMs. unchanged: the same launch as default (bitwise).
+    cga_gmem: engaged, and the CGA candidate falls back to Gmem on occupancy.
+    """
+    cases = {}
+
+    def add(name, expect, batch_size, q_len=1, **kw):
+        cfg = dict(batch_size=batch_size, q_len=q_len, head_grp_size=16, head_dim=128)
+        cfg.update(q_dtype="fp8", kv_dtype="fp8", max_kv_len=8192, window_left=-1)
+        cfg.update(
+            page_size=16, workspace_bytes=None, misalign=0, lse=False, expect=expect
+        )
+        cfg.update(kw)
+        cases[name] = cfg
+
+    # fp32-reference shapes. KV is fp8 and out is bf16. Head 512 with 16/2 heads and q_len 6:
+    # keepsMmaAb Q64, headDimPerCtaV 256, separate reducer, base CTAs = 4 x batch.
+    for k0 in (1, 2):
+        for q_len in (1, 6):
+            for q_dtype in ("fp8", "bf16"):
+                batch_size = m // 4 + (1 if k0 == 1 else 0)
+                name = f"one_wave_{k0}-q{q_len}-{q_dtype}q"
+                add(name, "engaged", batch_size, q_len, q_dtype=q_dtype)
+    add("tuned_max_3", "engaged", m // 4 + 1, max_kv_len=768)
+    add("window_1023", "engaged", m // 4 + 1, window_left=1023)
+    head512 = dict(
+        q_len=6, head_grp_size=8, head_dim=512, max_kv_len=4096, page_size=64
+    )
+    add("head512-one_wave_1", "engaged", m // 8 + 1, **head512)
+    add("head512-base_2x_sms", "engaged", m // 2, **head512)
+    add("base_2x_sms", "engaged", m, max_kv_len=2048)
+    add("base_over_2x_sms", "unchanged", m + 1, max_kv_len=2048)  # 4 waves give 1 split
+    # One wave gives 4 splits; and short KV that binds tunedMax with tile-search probes.
+    add("parity", "unchanged", m // 8)
+    add("parity_tile_search", "unchanged", 4, q_len=4, max_kv_len=1024)
+    # Capacity: q_len 6, bf16, keepsMmaAb Q128 (stepQ 128, headDimPerCtaV 128). One wave gives
+    # 1 split, so stock writes no scratch. With LSE, the workspace starts 8 bytes past a 16-byte
+    # boundary and the launcher pads 8 bytes before the softmax stats.
+    batch_size = m // 4 + 1
+    need = _multi_wave_scratch_bytes(
+        m, (4 * m // (2 * batch_size)) * 2 * batch_size, 128, 128
+    )
+    for lse in (False, True):
+        misalign = 8 if lse else 0
+        lse_bytes = (
+            _trtllm_gen_softmax_slab_bytes(32, batch_size, 6)
+            + TRTLLM_GEN_WORKSPACE_CHECK_BYTES
+            if lse
+            else 0
+        )
+        for short in (False, True):
+            add(
+                f"capacity-{'lse_misaligned' if lse else 'no_lse'}-"
+                f"{'one_byte_short' if short else 'exact'}",
+                "unchanged" if short else "engaged",
+                batch_size,
+                6,
+                q_dtype="bf16",
+                kv_dtype="bf16",
+                workspace_bytes=misalign + lse_bytes + need - int(short),
+                misalign=misalign,
+                lse=lse,
+                scratch_start=misalign + lse_bytes,
+            )
+    # swapsMmaAb Q16 (stepQ 16): one wave gives 2 splits (CGA). The multi-wave grid exceeds CGA
+    # occupancy, so the candidate reselects GmemReduction.
+    batch_size = m // 4
+    need = _multi_wave_scratch_bytes(
+        m, (4 * m // (2 * batch_size)) * 2 * batch_size, 16, 128
+    )
+    add("cga_reselection_fits", "cga_gmem", batch_size, workspace_bytes=need)
+    add(
+        "cga_reselection_one_byte_short",
+        "unchanged",
+        batch_size,
+        workspace_bytes=need - 1,
+    )
+    return cases
+
+
+def _multi_wave_case_inputs(cfg: dict):
+    return _multi_wave_inputs(
+        cfg["batch_size"],
+        cfg["q_len"],
+        2,
+        cfg["head_grp_size"],
+        cfg["head_dim"],
+        cfg["q_dtype"],
+        cfg["kv_dtype"],
+        cfg["max_kv_len"],
+        page_size=cfg["page_size"],
+    )
+
+
+_MULTI_WAVE_FINAL_LAUNCH = re.compile(
+    r"final launch: kernelName = (\S+), multiCtasKvMode = (\d+), "
+    r"numCtasX = (\d+), numCtasY = (\d+), numCtasZ = (\d+)"
+)
+_MULTI_CTAS_KV_DISABLED, _GMEM_REDUCTION, _CGA_SMEM_REDUCTION = (
+    0,
+    1,
+    3,
+)  # MultiCtasKvMode
+
+
+def _multi_wave_worker(cases: dict, out_path: str) -> None:
+    """Subprocess body: one decode call per case, in order, so the log has one launch per case."""
+    results = {}
+    for case, cfg in cases.items():
+        inp = _multi_wave_case_inputs(cfg)
+        num_bytes = cfg["workspace_bytes"] or workspace_size
+        storage, workspace_buffer = _sentinel_workspace(num_bytes, cfg["misalign"])
+        assert workspace_buffer.data_ptr() % 16 == cfg["misalign"]
+        result = _multi_wave_decode(
+            inp, workspace_buffer, window_left=cfg["window_left"], return_lse=cfg["lse"]
+        )
+        output = result[0] if cfg["lse"] else result
+        torch.cuda.synchronize()
+        checks = {"tail": _untouched(storage[cfg["misalign"] + num_bytes :])}
+        if "scratch_start" in cfg:
+            start = cfg["scratch_start"]
+            checks["scratch"] = _untouched(workspace_buffer[start:])
+            guard = workspace_buffer[
+                max(0, start - TRTLLM_GEN_WORKSPACE_CHECK_BYTES) : start
+            ]
+            checks["lse_guard"] = not cfg["lse"] or _untouched(guard)
+        results[case] = (output.cpu(), checks)
+        del inp, storage, workspace_buffer, result
+    torch.save(results, out_path)
+
+
+def _run_multi_wave_worker(cases: dict, out_path: str, opt_in: bool) -> dict:
+    env = dict(os.environ, FLASHINFER_LOG_LEVEL="DEBUG")
+    env.pop(MULTI_WAVE_KV_SPLIT_ENV, None)
+    if opt_in:
+        env[MULTI_WAVE_KV_SPLIT_ENV] = "1"
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    script = (
+        "from tests.attention.test_trtllm_gen_attention_decode import _multi_wave_worker\n"
+        f"_multi_wave_worker({cases!r}, {out_path!r})\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    # One final-launch line per decode call; a capacity retry logs only its launched attempt.
+    launches = _MULTI_WAVE_FINAL_LAUNCH.findall(result.stdout)
+    assert len(launches) == len(cases), result.stdout[-2000:]
+    saved = torch.load(out_path)
+    return {
+        case: (*saved[case], name, int(mode), int(x) * int(y) * int(z))
+        for case, (name, mode, x, y, z) in zip(cases, launches, strict=True)
+    }
+
+
+@pytest.fixture(scope="module")
+def multi_wave_runs(tmp_path_factory):
+    # The env is read once per process: one subprocess per setting runs every case.
+    sm_count = _multi_wave_sm_count()
+    cases = _multi_wave_cases(sm_count)
+    out_dir = tmp_path_factory.mktemp("multi_wave")
+    runs = {
+        opt_in: _run_multi_wave_worker(cases, str(out_dir / f"{opt_in}.pt"), opt_in)
+        for opt_in in (False, True)
+    }
+    return sm_count, cases, runs
+
+
+@pytest.mark.parametrize("case", list(_multi_wave_cases(148)))
+def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> None:
+    sm_count, cases, runs = multi_wave_runs
+    cfg = cases[case]
+    output, checks, name, mode, num_ctas = runs[True][case]
+    stock_output, stock_checks, stock_name, stock_mode, stock_num_ctas = runs[False][
+        case
+    ]
+    for run_checks in (checks, stock_checks):
+        assert run_checks["tail"], f"{case}: decode wrote past the workspace"
+        assert run_checks.get("lse_guard", True), (
+            f"{case}: decode wrote into the LSE guard"
+        )
+
+    # Unset: the stock one-wave split. Multi-CTA never launches more CTAs than SMs.
+    assert stock_mode == _MULTI_CTAS_KV_DISABLED or stock_num_ctas <= sm_count
+    if "scratch_start" in cfg:
+        assert stock_checks["scratch"], (
+            "default run wrote partials for a one-split shape"
+        )
+
+    # Opt-in.
+    if cfg["expect"] == "unchanged":
+        # The split is unchanged, or the multi-wave split did not fit: exactly the stock launch.
+        assert (name, mode, num_ctas) == (stock_name, stock_mode, stock_num_ctas)
+        assert torch.equal(output, stock_output)
+    else:
+        # More CTAs than SMs and than the stock launch, with multi-CTA KV on.
+        assert num_ctas > max(sm_count, stock_num_ctas), (num_ctas, stock_num_ctas)
+        assert mode != _MULTI_CTAS_KV_DISABLED
+        if "scratch_start" in cfg:
+            assert not checks["scratch"], (
+                "multi-wave split did not run at exact capacity"
+            )
+        if cfg["expect"] == "cga_gmem":
+            assert (stock_mode, mode) == (_CGA_SMEM_REDUCTION, _GMEM_REDUCTION), (
+                name,
+                mode,
+            )
+
+    # Both runs match an fp32 reference (sdpa_paged_reference on the dequantized Q/K/V).
+    inp = _multi_wave_case_inputs(cfg)
+    for out in (output, stock_output):
+        _assert_multi_wave_matches_fp32_reference(
+            inp, out.to(GPU_DEVICE), cfg["q_dtype"], cfg["window_left"]
+        )

@@ -46,7 +46,8 @@ tiles (``grid = min(tiles, SMs)``), either one 64-row query block whose KV list
 alternates between the two consumer warpgroups (``split``) or two query blocks
 of one head sharing the KV ring (``pair``), and plans with enough tiles per CTA
 keep one static tile per CTA and hand the rest out through a device queue in
-head-major order (``attention_queue``).  The plan layouts mirror the Cake kernel modules
+head-major order (``attention_queue``); uniform pair plans of short tiles with many tiles
+per CTA run the compact static program (``attention_compact``).  The plan layouts mirror the Cake kernel modules
 and are validated by the kernels' own tests; both planners are dependency-free
 ports of the Cake planners and must stay byte-identical to them.
 
@@ -349,11 +350,15 @@ class CakeVsaSm90Plan:
             self.num_tiles = plan["num_tiles"]
             self.tile_stride = plan["tile_stride"]
             self.queue = plan["queue"]
+            self.compact = plan["compact"]
+            self.tagged = plan["tagged"]
             self.num_rows = plan["num_rows"]
             self.num_heads = plan["H"]
             self.qo_len = plan["MB"] * BLOCK
             self.kv_len = plan["NB"] * BLOCK
-            self.stage = persistent_stage(bool(self.queue))
+            self.stage = persistent_stage(
+                bool(self.queue), bool(self.compact), bool(self.tagged)
+            )
             rule = _loader.workspace_rule(self.stage)
             assert rule is not None and rule["kind"] == "persistent"
             with torch.cuda.device(self.device):

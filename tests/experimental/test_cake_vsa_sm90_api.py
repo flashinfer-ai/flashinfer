@@ -424,7 +424,7 @@ def test_facade_re_exports_the_backend():
     assert facade.ARCHES == backend.ARCHES == ("sm_90a",)
     assert facade.SUPPORTED_COMPUTE_CAPABILITIES == ((9, 0),)
     assert set(facade.__all__) <= set(dir(backend))
-    assert len(facade.STAGES) == 17
+    assert len(facade.STAGES) == 19
     assert backend.__name__ == "flashinfer.cake_vsa_sm90_backend"
     assert (
         flashinfer.sparse.VariableBlockSparseAttentionWrapper
