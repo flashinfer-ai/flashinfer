@@ -22,7 +22,7 @@ existing implementation: a float64 model of the kernel's arithmetic with its ele
 tolerance, the ``2^-6`` accuracy limit against exact attention, count-0 / count-1 rows,
 unmapped pages, blocks past the cache, rows without a request, NHD and HND caches and the
 group sizes 12, 16 and 1.  The split count the reference models is the package's host
-split rule (``host_num_splits``, decided by the device's SM count).  This suite adds the
+split rule (``num_splits``, decided by the device's SM count).  This suite adds the
 host rule itself (formula, measured table, tile and merge caps), a 33-split case, bitwise
 repeatability, CUDA-graph replay with and without a caller-owned workspace, the
 zero-allocation workspace path, and the ``build.json`` contract of the package.
@@ -45,8 +45,7 @@ import torch
 import flashinfer
 from flashinfer.experimental.cake_qsa_nvfp4 import cake_backend, cake_jit
 from flashinfer.experimental.cake_qsa_nvfp4.cake_backend import (
-    OVERRIDES,
-    host_num_splits,
+    SPLIT_OVERRIDES,
     num_splits,
 )
 
@@ -62,6 +61,9 @@ _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 TILE = 64  # tokens per split tile
 # The decode's launch bound: the split formula's capacity is this many CTAs per SM.
 CTAS_PER_SM = 2
+# The decode's shared-memory pool, passed as dynamic shared memory by its binding; two
+# CTAs of it fit an SM (the launch bound).  The merge uses static shared memory alone.
+DECODE_SMEM_BYTES = 49792
 MAX_SPLITS = 128  # the merge kernel's split bound: the host rule never passes more
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128)  # the decode row counts of the owner's shape list
 
@@ -138,7 +140,7 @@ def _sm_count(device) -> int:
 
 def _splits(rows, num_kv_heads, device) -> int:
     """The split count the package passes for ``rows`` on ``device``: its host split rule."""
-    return host_num_splits(rows, num_kv_heads, WIDTH, _sm_count(device))
+    return num_splits(rows, num_kv_heads, WIDTH, _sm_count(device))
 
 
 def _dequant(data, sf, scale):
@@ -524,40 +526,55 @@ def test_rejects_invalid_inputs():
 # ---------------------------------------------------------------------------
 
 
+def _formula(rows, num_kv_heads, width, sm_count):
+    """The split formula alone: the most splits whose grid ``rows x kv_heads x splits``
+    stays within two CTAs per SM, at least 1 and at most the ``ceil(width / 64)`` tiles."""
+    tiles = math.ceil(width / TILE)
+    return max(1, min(tiles, CTAS_PER_SM * sm_count // (rows * num_kv_heads)))
+
+
 def test_split_formula_fills_the_device_capacity():
-    """``num_splits``: the most splits whose grid ``rows x kv_heads x splits`` stays within
-    ``capacity`` CTAs, at least 1 and at most the ``ceil(width / 64)`` tiles."""
-    # 132 SMs x 2 CTAs (264) and 108 SMs x 2 CTAs (216) over the shape list's rows.
-    assert [num_splits(r, 2, WIDTH, 264) for r in ROWS] == [33, 33, 33, 16, 8, 4, 2, 1]
-    assert [num_splits(r, 2, WIDTH, 216) for r in ROWS] == [33, 33, 27, 13, 6, 3, 1, 1]
-    # The floor (more CTAs than the capacity), one tile, and no merge cap in the formula.
-    assert num_splits(2048, 2, WIDTH, 264) == 1
-    assert num_splits(1, 1, TILE, 264) == 1
-    assert num_splits(1, 1, 200 * TILE, 10**6) == 200
+    """``num_splits`` on an SM count the measured table does not name is the formula:
+    80 SMs (160 CTAs) and 66 SMs (132 CTAs) over the shape list's rows, the floor (more
+    CTAs than the capacity), one tile, the merge kernel's bound, and the sizes it refuses."""
+    assert [num_splits(r, 2, WIDTH, 80) for r in ROWS] == [33, 33, 20, 10, 5, 2, 1, 1]
+    assert [num_splits(r, 2, WIDTH, 66) for r in ROWS] == [33, 33, 16, 8, 4, 2, 1, 1]
+    for sm_count in (80, 66):
+        assert [num_splits(r, 2, WIDTH, sm_count) for r in ROWS] == [
+            _formula(r, 2, WIDTH, sm_count) for r in ROWS
+        ]
+    assert num_splits(2048, 2, WIDTH, 132) == 1
+    assert num_splits(1, 1, TILE, 132) == 1
+    assert num_splits(1, 1, 200 * TILE, 10**6) == MAX_SPLITS
+    for rows, num_kv_heads, sm_count in ((0, 2, 132), (1, 0, 132), (1, 2, 0)):
+        with pytest.raises(ValueError):
+            num_splits(rows, num_kv_heads, WIDTH, sm_count)
 
 
 def test_host_rule_applies_the_measured_table_within_the_caps():
-    """``host_num_splits``: the formula at two CTAs per SM, replaced by the measured
+    """``num_splits``: the formula at two CTAs per SM, replaced by the measured
     ``(sm_count, rows)`` entry where the table has one, never above the tile count or the
     merge kernel's 128 splits."""
-    assert OVERRIDES == {(132, 4): 16, (132, 8): 8, (108, 64): 4, (108, 128): 2}
+    assert SPLIT_OVERRIDES == {(132, 4): 16, (132, 8): 8, (108, 64): 4, (108, 128): 2}
     assert all(
         isinstance(sm, int) and isinstance(rows, int) and 1 <= s <= MAX_SPLITS
-        for (sm, rows), s in OVERRIDES.items()
+        for (sm, rows), s in SPLIT_OVERRIDES.items()
     )
     table_132 = [33, 33, 16, 8, 8, 4, 2, 1]
     table_108 = [33, 33, 27, 13, 6, 3, 4, 2]
-    assert [host_num_splits(r, 2, WIDTH, 132) for r in ROWS] == table_132
-    assert [host_num_splits(r, 2, WIDTH, 108) for r in ROWS] == table_108
-    # An SM count without entries takes the formula at its capacity.
-    assert [host_num_splits(r, 2, WIDTH, 80) for r in ROWS] == [
-        num_splits(r, 2, WIDTH, CTAS_PER_SM * 80) for r in ROWS
-    ]
+    assert [num_splits(r, 2, WIDTH, 132) for r in ROWS] == table_132
+    assert [num_splits(r, 2, WIDTH, 108) for r in ROWS] == table_108
+    # Away from the table's rows the formula holds; at them the entry does.
+    for sm_count in (132, 108):
+        for rows in ROWS:
+            formula = _formula(rows, 2, WIDTH, sm_count)
+            want = SPLIT_OVERRIDES.get((sm_count, rows), formula)
+            assert num_splits(rows, 2, WIDTH, sm_count) == want, (sm_count, rows)
     # The table never exceeds the tile count ...
-    assert host_num_splits(4, 2, TILE, 132) == 1
-    assert host_num_splits(4, 2, 10 * TILE, 132) == 10
+    assert num_splits(4, 2, TILE, 132) == 1
+    assert num_splits(4, 2, 10 * TILE, 132) == 10
     # ... and the formula never exceeds the merge kernel's bound.
-    assert host_num_splits(1, 1, 200 * TILE, 1000) == MAX_SPLITS
+    assert num_splits(1, 1, 200 * TILE, 1000) == MAX_SPLITS
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +598,9 @@ def test_capabilities_route_to_the_two_libraries():
 
 def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     """Three programs: the plain decode, the cooperative decode that merges its splits in
-    the launch, and the separate merge; 128 threads each, no cluster, static shared memory
-    only; the argument plan names every kernel parameter in order and then the grid."""
+    the launch, and the separate merge; 128 threads each, no cluster; the decode's
+    shared-memory pool as dynamic shared memory, the merge's static; the argument plan
+    names every kernel parameter in order and then the grid."""
     assert set(cake_jit.MODULES) == {"decode", "decode_coop", "merge"}
     for name, record in cake_jit.MODULES.items():
         assert re.fullmatch(r"cake_qsa_nvfp4_[0-9a-f]{20}", record["library"]), name
@@ -595,7 +613,9 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         launch = record["launch"]
         assert tuple(launch["block"]) == (128, 1, 1), name
         assert tuple(launch["cluster"]) == (1, 1, 1), name
-        assert launch["dynamic_smem_bytes"] == 0, name
+        assert launch["dynamic_smem_bytes"] == (
+            0 if name == "merge" else DECODE_SMEM_BYTES
+        ), name
         assert launch["use_pdl"] is False, name
         assert launch["cooperative"] is (name == "decode_coop"), name
         parameters = MERGE_PARAMETERS if name == "merge" else DECODE_PARAMETERS
