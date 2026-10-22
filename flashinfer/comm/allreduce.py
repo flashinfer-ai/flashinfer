@@ -1138,6 +1138,10 @@ def allreduce_fusion(
                 weight_bias=weight_bias,
             )
 
+            # Return quant_out as documented (and as the MNNVL path does), even
+            # though this pattern also writes norm_out.
+            if pattern == AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant:
+                return quant_out
             if norm_out is not None:
                 return norm_out
             elif quant_out is not None:

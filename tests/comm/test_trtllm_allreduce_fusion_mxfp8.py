@@ -305,7 +305,7 @@ def _run_unified_api_worker(world_size, rank, dtype, port):
                 )
                 ret, _ = run(pattern, norm_out, quant_out, scale_out, layout)
                 torch.cuda.synchronize()
-                assert ret is (norm_out if with_norm_out else quant_out)
+                assert ret is quant_out
                 # The reference norm comes from a different launch configuration; allow
                 # the same isolated one-code differences as the legacy-API test.
                 diff = quant_out.view(torch.uint8).int() - ref_q.view(torch.uint8).int()
