@@ -466,36 +466,89 @@ def check_h4096(outputs, values, label=""):
         assert max_abs <= 2e-5 or max_abs <= 2 * max_abs_c, (name, max_abs, max_abs_c)
 
 
+# The token counts at which the hidden-4096 split count changes, per SM count the
+# program ships for (the two-wave rule of its source of record: a count of at
+# least ten where the tokens fit two tail rounds of the grid, the deepgemm count
+# of at least 16 elsewhere), and the count at each point on the 208-SM board.
+H4096_SWITCH_POINTS = {
+    148: (129, 257, 385, 577, 705, 833, 897, 1153, 1409),
+    152: (129, 257, 385, 577, 705, 833, 961, 1217, 1473),
+    208: (193, 385, 577, 833, 1025, 1153, 1281, 1665, 2049),
+    212: (193, 385, 577, 833, 1025, 1217, 1345, 1665, 2049),
+    216: (193, 385, 577, 833, 1025, 1217, 1345, 1729, 2113),
+}
+H4096_SPLITS_208 = {
+    1: 64,
+    193: 32,
+    385: 22,
+    577: 16,
+    833: 13,
+    1025: 11,
+    1153: 10,
+    1281: 16,
+    1665: 13,
+    2049: 16,
+}
+
+
+def _deepgemm_splits(tokens, num_sms):
+    """The one-wave count the rule starts from: the fewest splits reaching the
+    shortest longest task, never below 16."""
+    m_blocks = (tokens + 63) // 64
+    max_splits = min(64, max(16, num_sms // m_blocks))
+    longest = (64 + max_splits - 1) // max_splits
+    return (64 + longest - 1) // longest
+
+
 @pytest.mark.parametrize("num_sms", H4096_SM_COUNTS)
 def test_h4096_host_rules(num_sms):
     """The split and grid rules of the BF16-output program: the switch points of
-    its rule on every SM count it ships for, a resident grid, and the
-    deterministic mode's fixed split count."""
+    its rule on every SM count it ships for (each the first token count of its
+    count, one token less keeps the previous one), the count's bounds (at least
+    ten, never above the deepgemm count of at least 16; a smaller count only
+    where the tokens fit two tail rounds of the grid, its tasks in two waves),
+    a resident grid, the scratch size, and the deterministic mode's 16."""
     points = _runtime.mhc_infer_switch_points(num_sms)
-    assert points == ((129, 257, 385) if num_sms < 208 else (193, 385, 577))
-    expected = {
-        1: 64,
-        points[0] - 1: 64,
-        points[0]: 32,
-        points[1] - 1: 32,
-        points[1]: 22,
-        points[2] - 1: 22,
-        points[2]: 16,
-    }
-    for tokens, splits in expected.items():
-        assert _runtime.mhc_infer_num_splits(tokens, num_sms) == splits
-        assert _runtime.mhc_infer_num_splits(tokens, num_sms, deterministic=True) == 16
-        ctas = _runtime.mhc_infer_num_ctas(tokens, num_sms, splits)
-        m_blocks = (tokens + 63) // 64
-        assert m_blocks <= ctas <= num_sms
-        assert ctas == min(num_sms, max(m_blocks * splits, (tokens + 3) // 4))
-        assert (
-            _runtime.mhc_infer_scratch_floats(tokens, splits)
-            == m_blocks * splits * 1664
-        )
+    assert points == H4096_SWITCH_POINTS[num_sms]
+    assert points == _runtime.mhc_infer_switch_points(num_sms, max_tokens=1 << 14)
+    tokens = sorted(
+        {
+            1,
+            2,
+            63,
+            64,
+            65,
+            *(p + d for p in points for d in (-1, 0)),
+            4096,
+            8192,
+            1 << 20,
+        }
+    )
+    for t in tokens:
+        splits = _runtime.mhc_infer_num_splits(t, num_sms)
+        legacy = _deepgemm_splits(t, num_sms)
+        assert 10 <= splits <= legacy <= 64
+        assert _runtime.mhc_infer_num_splits(t, num_sms, deterministic=True) == 16
+        ctas = _runtime.mhc_infer_num_ctas(t, num_sms, splits)
+        m_blocks = (t + 63) // 64
+        assert min(num_sms, m_blocks) <= ctas <= num_sms
+        assert ctas == min(num_sms, max(m_blocks * splits, (t + 3) // 4))
+        if splits != legacy:
+            assert m_blocks * splits <= 2 * ctas and m_blocks * 64 <= 12 * ctas
+        assert _runtime.mhc_infer_scratch_floats(t, splits) == m_blocks * splits * 1664
+    for t in points:
+        assert t % 64 == 1
+        assert _runtime.mhc_infer_num_splits(
+            t, num_sms
+        ) != _runtime.mhc_infer_num_splits(t - 1, num_sms)
+    assert _runtime.mhc_infer_num_splits(points[-1], num_sms) == 16
     assert _runtime.mhc_infer_num_splits(1 << 20, num_sms) == 16
+    assert _runtime.mhc_infer_num_splits(1, num_sms) == 64
     assert _runtime.mhc_infer_num_ctas(1, num_sms, 64) == 64
     assert _runtime.mhc_infer_num_ctas(4096, num_sms, 16) == num_sms
+    if num_sms == 208:
+        table = {t: _runtime.mhc_infer_num_splits(t, num_sms) for t in H4096_SPLITS_208}
+        assert table == H4096_SPLITS_208
 
 
 def test_split_fn_is_the_exact_three_way_split():

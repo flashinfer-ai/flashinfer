@@ -442,13 +442,26 @@ def num_launch_sms(
 def mhc_infer_num_splits(
     num_tokens: int, num_sms: int, deterministic: bool = False
 ) -> int:
-    """Splits of the 64 K blocks (H4096, 4 routes): the deepgemm_mega_mhc rule at hidden 4096; 16 when deterministic."""
+    """Splits of the 64 K blocks (H4096, 4 routes), 16 when deterministic. The deepgemm_mega_mhc count fills one wave
+    of the SMs with the K blocks divided evenly, never below 16; when the tokens fit two rounds of the tail (twelve
+    tokens per CTA of the grid), a smaller count of at least ten whose tasks fit two waves of the grid and whose
+    waves x K blocks per task is smaller takes its place (the smallest such count), because the run then ends with
+    the coefficient chains of the last wave and not with the tail, which the idle CTAs of a partial last wave serve."""
     if deterministic:
         return 16
     m_blocks = (num_tokens + 63) // 64
     max_splits = min(64, max(16, num_sms // m_blocks))
     longest = (64 + max_splits - 1) // max_splits
-    return (64 + longest - 1) // longest
+    splits = (64 + longest - 1) // longest
+    grid = mhc_infer_num_ctas(num_tokens, num_sms, splits)
+    best = ((m_blocks * splits + grid - 1) // grid) * longest
+    if m_blocks * 64 <= 12 * grid:
+        for candidate in range(10, splits):
+            waves = (m_blocks * candidate + grid - 1) // grid
+            blocks = (64 + candidate - 1) // candidate
+            if waves <= 2 and waves * blocks < best:
+                splits, best = candidate, waves * blocks
+    return splits
 
 
 def mhc_infer_num_ctas(num_tokens: int, num_sms: int, num_splits: int) -> int:
@@ -464,10 +477,11 @@ def mhc_infer_scratch_floats(num_tokens: int, num_splits: int) -> int:
 
 
 def mhc_infer_switch_points(num_sms: int, max_tokens: int = 1 << 20) -> tuple[int, ...]:
-    """Every T at which num_splits changes (the correctness tests cover both sides of each); the rule changes only
-    at m-block boundaries and never below 16, so the scan stops there."""
+    """Every T at which num_splits changes (the correctness tests cover both sides of each): the rule changes only at
+    m-block boundaries, so the scan steps by 64, and it stops once the tokens exceed two tail rounds of the SMs and the
+    count has returned to the deepgemm count (never below 16 from there on)."""
     points, previous, t = [], mhc_infer_num_splits(1, num_sms), 65
-    while t <= max_tokens and previous != 16:
+    while t <= max_tokens and (previous != 16 or t <= 12 * num_sms):
         current = mhc_infer_num_splits(t, num_sms)
         if current != previous:
             points.append(t)
