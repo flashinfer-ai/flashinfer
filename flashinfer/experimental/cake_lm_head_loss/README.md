@@ -390,7 +390,8 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   path, the autograd `Function`s and the eager entry points.
 * `csrc/cake_lm_head_loss/` -- generated kernel translation units
   (`cake_lm_head_loss_<unit>_kernel.cu`, one architecture-neutral unit per
-  kernel shared by the records of both architectures, the per-architecture
+  kernel family shared by the records of both architectures, the sibling
+  forms of a family selected by compile definitions and the per-architecture
   lowering under `__CUDA_ARCH__` guards -- except the four logits GEMM forms,
   whose sm_103a lowering stages the C tile in shared memory for a TMA store
   behind a six-stage operand pipeline while sm_100a stores from registers

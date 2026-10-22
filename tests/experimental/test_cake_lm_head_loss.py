@@ -269,6 +269,42 @@ def _same(a, b) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_KERNEL_SOURCE_RE = re.compile(
+    r"^csrc/cake_lm_head_loss/cake_lm_head_loss_([0-9a-f]{20})_kernel\.cu$"
+)
+_PROGRAM_KERNEL_DEFINITION_RE = re.compile(
+    r"^-DCAKE_PROGRAM_KERNEL=(kernel_cake_lm_head_loss_[0-9a-f]{20})$"
+)
+_PROGRAM_KERNEL_DEFAULT_RE = re.compile(
+    r"^#ifndef CAKE_PROGRAM_KERNEL\n"
+    r"#define CAKE_PROGRAM_KERNEL (kernel_cake_lm_head_loss_[0-9a-f]{20})\n"
+    r"#endif$",
+    re.MULTILINE,
+)
+
+
+def _kernel_source_symbol(entry, package):
+    """The unit whose kernel translation unit a library compiles and the kernel symbol
+    that source defines for it: the library's own unit spelling its symbol literally, or a
+    shared unit whose source defaults ``CAKE_PROGRAM_KERNEL`` to its own symbol and takes
+    a sibling form's symbol from the library's compile definitions."""
+    kernel_unit = _KERNEL_SOURCE_RE.match(entry["sources"][0]).group(1)
+    text = (package / entry["sources"][0]).read_text()
+    own = f"kernel_cake_lm_head_loss_{kernel_unit}"
+    defaults = _PROGRAM_KERNEL_DEFAULT_RE.findall(text)
+    carried = [
+        m.group(1)
+        for m in map(_PROGRAM_KERNEL_DEFINITION_RE.match, entry["nvcc_flags"])
+        if m is not None
+    ]
+    assert len(defaults) <= 1 and len(carried) <= 1, entry["name"]
+    if not defaults:  # a unit of its own: the source spells its symbol
+        assert not carried and own in text, entry["name"]
+        return kernel_unit, own
+    assert defaults[0] == own and "CAKE_PROGRAM_KERNEL(" in text, entry["name"]
+    return kernel_unit, carried[0] if carried else own
+
+
 def test_registry_records_are_well_formed():
     assert cake_jit.STAGES == (
         "gather_rows_bf16",
@@ -366,13 +402,19 @@ def test_registry_records_are_well_formed():
             assert int(physical.get("tma_workspace_bytes", 0)) >= 0
             assert int(physical.get("workspace_bytes", 0)) >= 0
             kernel, launch = (s.removeprefix("csrc/") for s in entry["sources"])
-            # one architecture-neutral translation unit per kernel (no architecture directory)
-            assert kernel == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_kernel.cu"
+            # one architecture-neutral translation unit per kernel (no architecture directory);
+            # a sibling form's library compiles the shared unit's file and names its own
+            # kernel through CAKE_PROGRAM_KERNEL in its compile definitions
+            kernel_unit, defined = _kernel_source_symbol(entry, package)
+            assert (
+                kernel == f"cake_lm_head_loss/cake_lm_head_loss_{kernel_unit}_kernel.cu"
+            )
+            assert kernel_unit == unit or defined == f"kernel_cake_lm_head_loss_{unit}"
             assert launch == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_launch.cu"
             csrc = package / "csrc"
             assert (csrc / kernel).is_file() and (csrc / launch).is_file()
             symbol = f"kernel_{physical['module']}"
-            assert symbol in (csrc / kernel).read_text()
+            assert defined == symbol
             stub = (csrc / launch).read_text()
             assert f"#define CAKE_KERNEL_SYMBOL {symbol}\n" in stub
             shim = re.search(

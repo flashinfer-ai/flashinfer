@@ -51,10 +51,12 @@ from . import cake_build
 # ``cake_lm_head_loss_<unit>`` (one architecture-neutral translation unit per
 # kernel, shared by the records of every architecture; the per-architecture
 # lowering sits under ``__CUDA_ARCH__`` guards) whose ``build.json`` entry
-# ``cake_lm_head_loss_<unit>_<arch>`` lists ``csrc/cake_lm_head_loss/
-# cake_lm_head_loss_<unit>_kernel.cu`` and the launch stub ``..._launch.cu``
-# that binds the shared launcher under ``csrc/cake_lm_head_loss/shim/`` to the
-# kernel.  Do not edit by hand.
+# ``cake_lm_head_loss_<unit>_<arch>`` lists the kernel translation unit that
+# defines the stage's symbol -- the unit's own ``csrc/cake_lm_head_loss/
+# cake_lm_head_loss_<unit>_kernel.cu``, or a sibling form's file with this
+# unit's kernel symbol named through a compile definition -- and the launch
+# stub ``..._launch.cu`` that binds the shared launcher under
+# ``csrc/cake_lm_head_loss/shim/`` to the kernel.  Do not edit by hand.
 # --- generated registry (written by the Cake export; do not edit) ---
 _ARG_PLANS: dict[str, list[list[str]]] = {
     "gather_rows_bf16": [
