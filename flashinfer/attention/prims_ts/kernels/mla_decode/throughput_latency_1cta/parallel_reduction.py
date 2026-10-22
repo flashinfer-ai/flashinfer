@@ -32,6 +32,7 @@ from ..helpers.ops import (
     warp_reduce_sum_f32,
 )
 from ..helpers.query import flat_query_row_state, public_query_flat_row
+from ..helpers.tile import runtime_request_publishes
 from ..parallel_reduction_topology import ParallelReductionTopology
 from .config import MlaConfig
 
@@ -255,7 +256,9 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         )
         valid_stats = stats_head_idx < Int32(cfg.num_heads_q) and stats_query_row[4]
         if cutlass.const_expr(not finalize_attention):
-            valid_stats = valid_stats & (cache_seqs[batch_idx] > Int32(0))
+            valid_stats = valid_stats & runtime_request_publishes(
+                cfg, cache_seqs, batch_idx
+            )
         if valid_stats:
             row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
             lse_per_lane = ceil_div(
@@ -352,7 +355,9 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     # Sparse finalization must publish even if the primary source is empty:
     # the extra source may be live, and two empty sources produce zero output.
     if cutlass.const_expr(not finalize_attention):
-        valid_output = valid_output & (cache_seqs[batch_idx] > Int32(0))
+        valid_output = valid_output & runtime_request_publishes(
+            cfg, cache_seqs, batch_idx
+        )
     if valid_output:
         output_acc = cutlass.Array(
             Float32,
@@ -497,7 +502,9 @@ def _run_parallel_gmem_reduction_shared_stats(
             batch_idx=batch_idx,
         )
         valid_stats = stats_head_idx < Int32(cfg.num_heads_q) and valid_stats_row
-        valid_stats = valid_stats & (cache_seqs[batch_idx] > Int32(0))
+        valid_stats = valid_stats & runtime_request_publishes(
+            cfg, cache_seqs, batch_idx
+        )
         lse_per_lane = ceil_div(local_slots, GMEM_REDUCTION_WARP_LANES)
         lane_lse = cutlass.Array(
             Float32,
@@ -585,7 +592,7 @@ def _run_parallel_gmem_reduction_shared_stats(
         and dim_idx < Int32(cfg.head_dim_v)
         and valid_output_row
     )
-    valid_output = valid_output & (cache_seqs[batch_idx] > Int32(0))
+    valid_output = valid_output & runtime_request_publishes(cfg, cache_seqs, batch_idx)
     local_output = cutlass.Array(
         Float32,
         output_elements_per_thread,
@@ -695,7 +702,9 @@ def _run_parallel_gmem_reduction_shared_stats(
                 batch_idx=batch_idx,
             )
             valid_stats = stats_head_idx < Int32(cfg.num_heads_q) and valid_stats_row
-            valid_stats = valid_stats & (cache_seqs[batch_idx] > Int32(0))
+            valid_stats = valid_stats & runtime_request_publishes(
+                cfg, cache_seqs, batch_idx
+            )
             peer_lse = neg_inf
             for peer_rank_i in cutlass.range_constexpr(cluster_size):
                 if valid_stats and lane_idx == Int32(peer_rank_i):

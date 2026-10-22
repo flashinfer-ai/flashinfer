@@ -19,6 +19,7 @@ from .smem_p import SmemPResource
 from .smem_resources import (
     SmemKResource,
     SmemKvResource,
+    SmemRawKvResource,
     SmemPageOffsetsResource,
     SmemQResource,
     SmemVResource,
@@ -37,6 +38,7 @@ __all__ = [
     "ScheduleTokenThrottleResource",
     "SmemKResource",
     "SmemKvResource",
+    "SmemRawKvResource",
     "SmemPResource",
     "SmemPageOffsetsResource",
     "SmemQResource",
@@ -49,3 +51,11 @@ __all__ = [
     "TmemSoftmaxGlobalResource",
     "TmemSoftmaxLocalResource",
 ]
+
+from .qfp4 import (  # noqa: E402,F401
+    Bmm1DoneResource,
+    ScaleLandedResource,
+    SfbReadyResource,
+    SmemQFp4Resource,
+)
+from .o_done import ODoneResource  # noqa: E402,F401

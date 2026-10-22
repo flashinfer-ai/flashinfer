@@ -98,6 +98,10 @@ class MlaConfig:
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
+    # Threshold skip correction: freeze the running row max while a
+    # K tile raises it by at most the runtime threshold (log2 units) and skip
+    # that tile's O rescale.  E4M3 P then uses the 1.75 scale instead of 448.
+    enable_skip_correction: bool = False
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512
@@ -194,6 +198,40 @@ class MlaConfig:
     # JIT code.
     kernel_variant: str = "swaps_mma_ab"
     use_paged_kv: int = 1
+    # Token-sparse (DSA) decode: every page-table entry is one physical token
+    # row of a flat KV pool, gathered four rows per Gather4 TMA; the per-token
+    # K domain arrives through ``cache_seqs`` (one "batch" per query token).
+    is_dynamic_token_sparse: int = 0
+    # Token-sparse NVFP4 KV (the TRT-LLM NVFP4 MLA cache):
+    # three loader warps own their token indices, gather one 128-key K tile
+    # ([lat0 16 KB | lat1 16 KB | rope 8 KB] of raw E2M1 rows) per raw stage with
+    # Gather4 TMA and stage the token block scales; BMM1 runs
+    # tcgen05.mma.kind::mxf4nvf4 on Q quantized on chip to NVFP4 against the raw
+    # K ring (block scales in TMEM); eight dequant warps convert the resident
+    # latent slices to the E4M3 V ring (QMUL4) for the FP8 PV MMA; one 8-warp
+    # softmax task owns both 64-column halves of every S tile.
+    is_dynamic_token_sparse_nvfp4: int = 0
+    nvfp4_residual_dim: int = 64
+    nvfp4_scale_row_bytes: int = 40
+    # Raw K ring: stages, bytes per stage and the transaction bytes declared per
+    # stage (>= the gathered bytes so the count splits evenly across the loader
+    # warps; each warp completes its share of the surplus once its scale copies
+    # landed).
+    kv_raw_stages: int = 2
+    kv_raw_stage_bytes: int = 40960
+    nvfp4_raw_stage_tx_bytes: int = 0
+    # Token block-scale staging slots (one 128-token tile of 40-byte rows each).
+    nvfp4_scale_slots: int = 4
+    nvfp4_scale_slot_bytes: int = 128 * 40
+    # TMEM columns for the SFA / SFB blocks (4 columns per K64 chunk, 10 chunks)
+    # and for the packed E4M3 P tile.
+    tmem_sf_cols: int = 48
+    tmem_p_cols: int = 32
+    # setmaxnreg budget of the K/V loader task (defaults to mma_load_regs).
+    load_regs: int = 0
+    dequant_warp_idx: int = 12
+    dequant_num_warps: int = 8
+    dequant_regs: int = 56
     supports_var_seq_lens: int = 1
     use_persistent_scheduler: int = 1
     use_clc_dynamic_persistent_scheduler: int = 0
@@ -203,6 +241,16 @@ class MlaConfig:
     use_attention_sinks: int = 0
     use_sliding_window_causal: int = 0
     attention_window_size: int = 0
+
+    @property
+    def native_sparse_pages(self) -> bool:
+        """One token per page on the native sparse path (RoPE folded into D512).
+
+        Token-sparse DSA decode also addresses one token row per page-table
+        entry, but it stages its own routes and validity masks, so it is
+        excluded here.
+        """
+        return self.num_tokens_per_page == 1 and not self.is_dynamic_token_sparse
 
     @property
     def one_insts_kv_swap(self) -> bool:
@@ -734,7 +782,13 @@ def correction_register_budget(tile_size_q: int) -> int:
     return MlaConfig.correction_regs
 
 
-def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str, int]:
+def keeps_mma_ab_config_kwargs(
+    profile: MlaProfile,
+    qkv_dtype: str,
+    *,
+    is_dynamic_token_sparse: bool = False,
+    is_dynamic_token_sparse_nvfp4: bool = False,
+) -> dict[str, int]:
     """Return keeps-MMA-AB scheduler, pipeline, and register traits."""
 
     kv_stages = MlaConfig.kv_stages
@@ -749,7 +803,7 @@ def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str,
         use_persistent_scheduler = 0
         use_clc_dynamic_persistent_scheduler = 0
 
-    return {
+    kwargs = {
         # Keeps-MMA-AB has one QK/PV pipe.  Raising this value would change the
         # KV work partition without adding the second stream used by the swaps
         # schedule, and would therefore skip every other KV tile.
@@ -771,6 +825,60 @@ def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str,
         "use_persistent_scheduler": use_persistent_scheduler,
         "use_clc_dynamic_persistent_scheduler": use_clc_dynamic_persistent_scheduler,
     }
+    if is_dynamic_token_sparse_nvfp4:
+        # NVFP4 token-sparse layout: softmax W0-7 (one 8-warp column-split task), MMA
+        # W8, loader W9-11 (own their token indices, no page-offset warp), dequant
+        # W12-19; 20 warps = 640 threads.  Register budget at the 96-register launch
+        # bound: 8 x 144 + 4 x 80 (MMA + loader group) + 8 x 56 = 1920. Raw ring: two
+        # 128-key K tiles ([lat0 16 KB | lat1 16 KB | rope 8 KB] each) fed straight to
+        # the mxf4nvf4 BMM1; V ring: four E4M3 slices (one whole tile) so the dequant
+        # converts V(t) while PV(t - 1) runs.
+        raw_tile_bytes = 128 * 128 * 2 + 128 * 64
+        kwargs.update(
+            {
+                "load_warp_idx": 9,
+                "load_num_warps": 3,
+                "page_offsets_warp_idx": 11,
+                "dequant_warp_idx": 12,
+                "dequant_num_warps": 8,
+                "threads_per_cta": 640,
+                "softmax_regs": 144,
+                "correction_regs": 144,
+                "mma_load_regs": 80,
+                "load_regs": 80,
+                "dequant_regs": 56,
+                "q_stages": 1,
+                "kv_stages": 4,
+                "num_insts_kv": 1,
+                "tile_size_kv": 128,
+                "kv_raw_stages": 2,
+                "kv_raw_stage_bytes": raw_tile_bytes,
+                "nvfp4_raw_stage_tx_bytes": _nvfp4_declared_stage_bytes(
+                    raw_tile_bytes, 3
+                ),
+                "nvfp4_scale_slots": 4,
+                "tmem_sf_cols": 48,
+                "tmem_s_cols": 128,
+                "tmem_p_cols": 32,
+            }
+        )
+    elif is_dynamic_token_sparse:
+        # Token-sparse: one warp cannot issue 32 Gather4 per 16 KB stage fast
+        # enough (~0.6 us per stage measured), so the K/V loader spans warps
+        # 12-15 (8 gathers each) and warp 9 pads.  Register budget for 16
+        # warps: 4x168 + 4x160 + 8x80 = 62464 <= 65536.
+        kwargs.update(
+            {
+                "load_warp_idx": 12,
+                "load_num_warps": 4,
+                "threads_per_cta": 512,
+                "softmax_regs": 168,
+                "correction_regs": 160,
+                "mma_load_regs": 80,
+                "load_regs": 80,
+            }
+        )
+    return kwargs
 
 
 def resolve_split_kv_reduction_policy(
@@ -1497,6 +1605,19 @@ def resolve_throughput_latency_mla_profile(
     )
 
 
+def _nvfp4_declared_stage_bytes(stage_bytes: int, num_warps: int) -> int:
+    """``stage_bytes`` plus the smallest surplus of at least one byte per warp that splits evenly.
+
+    The surplus (< 512 B, the smallest Gather4 completion) is completed by the
+    loader warps themselves, so the barrier can only flip once every gathered
+    byte and every warp's share have landed.
+    """
+    extra = num_warps
+    while (stage_bytes + extra) % num_warps:
+        extra += 1
+    return stage_bytes + extra
+
+
 def make_throughput_latency_mla_config(
     *,
     batch_size: int,
@@ -1518,6 +1639,10 @@ def make_throughput_latency_mla_config(
     explicit_split_kv: int | None = None,
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    enable_skip_correction: bool = False,
+    is_dynamic_token_sparse: bool = False,
+    is_dynamic_token_sparse_nvfp4: bool = False,
+    nvfp4_residual_dim: int = 64,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile."""
 
@@ -1549,7 +1674,24 @@ def make_throughput_latency_mla_config(
         raise ValueError("latent_dim must be positive")
     if rope_dim < 0:
         raise ValueError("rope_dim must be non-negative")
-    if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
+    if is_dynamic_token_sparse_nvfp4:
+        is_dynamic_token_sparse = True
+        if nvfp4_residual_dim != 64:
+            raise ValueError(
+                "token-sparse NVFP4 MLA currently supports residual_dim=64 only"
+            )
+    if is_dynamic_token_sparse:
+        if num_tokens_per_page != 1:
+            raise ValueError(
+                "token-sparse 1CTA MLA addresses one physical token per page-table "
+                f"entry and requires num_tokens_per_page=1, got {num_tokens_per_page}"
+            )
+        if qkv_dtype != "e4m3" or rope_dim != 64 or latent_dim != 512:
+            raise ValueError(
+                "token-sparse 1CTA MLA currently supports E4M3 Q/K/V with the "
+                "576 = 512 + 64 DSA geometry"
+            )
+    elif num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
         num_tokens_per_page == 1 and rope_dim == 0
     ):
         raise ValueError(
@@ -1563,10 +1705,17 @@ def make_throughput_latency_mla_config(
             f"num_tokens_per_page={num_tokens_per_page}"
         )
     pages_per_kv_tile = MlaConfig.tile_size_kv // num_tokens_per_page
-    metadata_capacity = (
-        128 if num_tokens_per_page == 1 else MlaConfig.page_offsets_entries_per_stage
+    # Page size one stages one int32 row index per token: a 128-token K tile
+    # needs 128 entries.
+    page_offsets_entries_per_stage = (
+        MlaConfig.tile_size_kv
+        if num_tokens_per_page == 1
+        else MlaConfig.page_offsets_entries_per_stage
     )
-    if pages_per_kv_tile > metadata_capacity:
+    page_offsets_stages = MlaConfig.page_offsets_stages
+    if is_dynamic_token_sparse:
+        page_offsets_stages = 4
+    if pages_per_kv_tile > page_offsets_entries_per_stage:
         raise ValueError(
             "page-offset staging capacity is smaller than one KV tile: "
             f"pages_per_kv_tile={pages_per_kv_tile}, "
@@ -1592,7 +1741,9 @@ def make_throughput_latency_mla_config(
         seq_len_kv=seq_len_kv,
         latent_dim=latent_dim,
         rope_dim=rope_dim,
-        num_tokens_per_page=num_tokens_per_page,
+        # Profile enumeration only checks that the page size is a dense one;
+        # the token-sparse page size of one is validated above.
+        num_tokens_per_page=(16 if is_dynamic_token_sparse else num_tokens_per_page),
         max_active_clusters=max_active_clusters,
         qkv_dtype=qkv_dtype,
         tile_size_q=tile_size_q,
@@ -1674,6 +1825,7 @@ def make_throughput_latency_mla_config(
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         mask_type=mask_type,
+        enable_skip_correction=enable_skip_correction,
         head_dim_qk=head_dim_qk,
         head_dim_v=latent_dim,
         latent_dim=latent_dim,
@@ -1692,8 +1844,14 @@ def make_throughput_latency_mla_config(
         softmax_regs=softmax_register_budget(tile_size_q),
         correction_regs=correction_register_budget(tile_size_q),
         num_tokens_per_page=num_tokens_per_page,
-        page_offsets_entries_per_stage=metadata_capacity,
         max_num_pages_per_seq_kv=max(1, ceil(seq_len_kv / num_tokens_per_page)),
+        page_offsets_entries_per_stage=page_offsets_entries_per_stage,
+        page_offsets_stages=page_offsets_stages,
+        is_dynamic_token_sparse=int(is_dynamic_token_sparse),
+        is_dynamic_token_sparse_nvfp4=int(is_dynamic_token_sparse_nvfp4),
+        nvfp4_residual_dim=int(nvfp4_residual_dim),
+        nvfp4_scale_row_bytes=(576 + nvfp4_residual_dim) // 16,
+        nvfp4_scale_slot_bytes=128 * ((576 + nvfp4_residual_dim) // 16),
         tmem_s_cols=tile_size_q,
         tmem_stats_cols=MlaConfig.tmem_stats_cols,
         tmem_o_cols=tile_size_q,
@@ -1708,7 +1866,14 @@ def make_throughput_latency_mla_config(
     )
     config_kwargs.update(dtype_config_kwargs(qkv_dtype, o_dtype))
     if selected_profile.kernel_variant == "keeps_mma_ab":
-        config_kwargs.update(keeps_mma_ab_config_kwargs(selected_profile, qkv_dtype))
+        config_kwargs.update(
+            keeps_mma_ab_config_kwargs(
+                selected_profile,
+                qkv_dtype,
+                is_dynamic_token_sparse=is_dynamic_token_sparse,
+                is_dynamic_token_sparse_nvfp4=is_dynamic_token_sparse_nvfp4,
+            )
+        )
     cfg = MlaConfig(**config_kwargs)
     validate_explicit_cluster_reduction_config(cfg, reduction_mode=reduction_mode)
     cfg = resolve_auto_cluster_reduction_config(

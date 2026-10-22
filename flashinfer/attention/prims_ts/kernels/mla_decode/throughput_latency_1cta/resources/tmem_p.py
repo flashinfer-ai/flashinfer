@@ -23,6 +23,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.experimental.task_scheduling.enums import WorkAttr
+from cutlass.experimental.task_scheduling.memory import TmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
     TaskLocalVariable,
@@ -37,6 +38,7 @@ from ...helpers.constants import (
 
 from ...helpers.layout import (
     _TASK_CACHE_TMEM_BASE_OFFSET,
+    _TASK_CACHE_WARP_GRP_THREAD_IDX,
     decode_gen_task_cache,
     num_packed_p_regs,
     num_softmax_scale_groups,
@@ -50,11 +52,12 @@ from ...helpers.math import (
 )
 from ...helpers.ops import (
     float_to_u32_bits,
-    fp8_log2_quant_scale,
+    fp8_log2_p_scale,
     pack_float4_to_fp8_e4m3,
     softmax_sum_state_ptr,
     tcgen05_second_panel_addr,
     tcgen05_store_p_16x32bx2_x16,
+    tcgen05_store_p_fp8_16x32bx2_x8,
     tcgen05_store_p_fp8_16x32bx2_x16,
     u32_bits_to_float,
 )
@@ -96,6 +99,12 @@ class TmemPResource(MlaResource):
         self._init_tmem_state(stage_info)
         return Int32(0)
 
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_materialize_state(self, stage_info: StageInfo) -> None:
+        """Softmax-side view initialization (no state: P lives in TMEM)."""
+        del stage_info
+
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_stage_idx)
     @cute.jit
     def init_stage_work_tile_state(self, stage_info: StageInfo):
@@ -105,8 +114,34 @@ class TmemPResource(MlaResource):
         del stage_info
         return Int32(0)
 
+    def get_tmem_requirements(self):
+        """Native FP4 QK keeps P in its own TMEM columns (S is single-staged)."""
+        if not self.cfg.is_dynamic_token_sparse_nvfp4:
+            return []
+        if self._tmem_alloc is None:
+            num_stages = (
+                self.pipeline_config.num_stages
+                if self.pipeline_config is not None
+                else 1
+            )
+            self._tmem_alloc = TmemAllocation(
+                name=f"{self.name}",
+                num_columns=self.cfg.tmem_p_cols * num_stages,
+            )
+        return [self._tmem_alloc]
+
     @cute.jit
     def _p_base_addr(self, stage_info: StageInfo, task_cache):
+        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse_nvfp4):
+            # Column split: each 128-thread half of the softmax task writes
+            # its 16-column half of the P tile.
+            return (
+                task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+                + Int32(self._tmem_alloc.offset)
+                + stage_info.stage_idx * Int32(self.cfg.tmem_p_cols)
+                + (task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] >> Int32(7))
+                * Int32(self.cfg.tmem_p_cols // 2)
+            )
         p_base = (
             task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
             + Int32(self.tmem_alias_ref._tmem_alloc.offset)
@@ -116,9 +151,8 @@ class TmemPResource(MlaResource):
             p_base = p_base + Int32(WARP_LANES)
         return p_base
 
-    @producer_work
     @cute.jit
-    def materialize_p(
+    def _compute_p_impl(
         self,
         stage_info: StageInfo,
         *,
@@ -126,13 +160,12 @@ class TmemPResource(MlaResource):
         s_arr,
         local_sum_arr,
     ):
-        """Materialize grouped-head softmax probabilities into TMEM P."""
-        # Producer work for TmemPResource: softmax converts S to P and stores it
-        # directly into the TMEM score/P stage.  PV MMA consumes the returned
-        # p_stage_idx through the loop/tail TMEM-P producer labels.
-        cfg = self.cfg
-        task_cache = decode_gen_task_cache(stage_info)
+        """exp / pack half of ``materialize_p``: returns the packed P registers.
 
+        Also called from ``TmemSResource.compute_p_s`` before the P stage is
+        acquired (native FP4 QK).
+        """
+        cfg = self.cfg
         num_scale_groups = num_softmax_scale_groups(cfg)
         neg_scaled_max = cutlass.Array(
             Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
@@ -160,8 +193,8 @@ class TmemPResource(MlaResource):
         ):
             log2_scale_pair = (self.scale_softmax_log2, self.scale_softmax_log2)
             neg_scaled_pair = (
-                neg_scaled_max[0] + fp8_log2_quant_scale(),
-                neg_scaled_max[0] + fp8_log2_quant_scale(),
+                neg_scaled_max[0] + fp8_log2_p_scale(cfg),
+                neg_scaled_max[0] + fp8_log2_p_scale(cfg),
             )
             has_finite_max = new_max_arr[0] != neg_max_f32()
             for packed_idx in cutlass.range_constexpr(packed_p_reg_count):
@@ -171,7 +204,7 @@ class TmemPResource(MlaResource):
                 p2 = Float32(0.0)
                 p3 = Float32(0.0)
                 if has_finite_max:
-                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                    if cutlass.const_expr(cfg.native_sparse_pages):
                         scaled01 = ffma2(
                             (s_arr[s_base + 0], s_arr[s_base + 1]),
                             log2_scale_pair,
@@ -184,7 +217,7 @@ class TmemPResource(MlaResource):
                             ),
                             neg_scaled_pair,
                         )
-                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                    if cutlass.const_expr(cfg.native_sparse_pages):
                         scaled23 = ffma2(
                             (s_arr[s_base + 2], s_arr[s_base + 3]),
                             log2_scale_pair,
@@ -201,7 +234,7 @@ class TmemPResource(MlaResource):
                     p1 = cute.math.exp2(scaled01[1], fastmath=True)
                     p2 = cute.math.exp2(scaled23[0], fastmath=True)
                     p3 = cute.math.exp2(scaled23[1], fastmath=True)
-                if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                if cutlass.const_expr(cfg.native_sparse_pages):
                     sums[0], sums[1] = fadd2((sums[0], sums[1]), (p0, p1))
                     sums[2], sums[3] = fadd2((sums[2], sums[3]), (p2, p3))
                 else:
@@ -225,7 +258,7 @@ class TmemPResource(MlaResource):
                         p_val = cute.math.exp2(
                             s_arr[s_idx] * self.scale_softmax_log2
                             + neg_scaled_max[scale_idx]
-                            + fp8_log2_quant_scale(),
+                            + fp8_log2_p_scale(cfg),
                             fastmath=True,
                         )
                     p_vals[elem_idx] = p_val
@@ -242,7 +275,7 @@ class TmemPResource(MlaResource):
                 if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
                     new_max = new_max_arr[0]
                     if new_max != neg_max_f32():
-                        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                        if cutlass.const_expr(cfg.native_sparse_pages):
                             scaled = ffma2(
                                 (s_arr[s0], s_arr[s1]),
                                 (self.scale_softmax_log2, self.scale_softmax_log2),
@@ -259,7 +292,7 @@ class TmemPResource(MlaResource):
                                 s_arr[s1] * self.scale_softmax_log2 + neg_scaled_max[0],
                                 fastmath=True,
                             )
-                    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                    if cutlass.const_expr(cfg.native_sparse_pages):
                         offset = (pair_idx % 2) * 2
                         sums[offset], sums[offset + 1] = fadd2(
                             (sums[offset], sums[offset + 1]), (p0, p1)
@@ -289,7 +322,7 @@ class TmemPResource(MlaResource):
                 regs_p[pair_idx] = pack_float2_to_bf16(p0, p1)
 
         if cutlass.const_expr(
-            cfg.kernel_variant == "keeps_mma_ab" and cfg.num_tokens_per_page == 1
+            cfg.kernel_variant == "keeps_mma_ab" and cfg.native_sparse_pages
         ):
             local_sums[0] = (sums[0] + sums[1]) + (sums[2] + sums[3])
 
@@ -298,7 +331,7 @@ class TmemPResource(MlaResource):
             local_sum_arr[scale_idx] = local_sums[scale_idx]
 
         if cutlass.const_expr(
-            cfg.kernel_variant == "keeps_mma_ab" and cfg.num_tokens_per_page != 1
+            cfg.kernel_variant == "keeps_mma_ab" and not cfg.native_sparse_pages
         ):
             state_idx = cute.arch.thread_idx()[0]
             state_ptr = self.tmem_alias_ref._softmax_scratch.data_ptr(state_idx)
@@ -323,8 +356,23 @@ class TmemPResource(MlaResource):
                 alignment=4,
             )
 
+        return regs_p
+
+    @cute.jit
+    def _store_p_impl(self, stage_info: StageInfo, *, regs_p):
+        """Store half of ``materialize_p``: TMEM P store of ``regs_p``."""
+        cfg = self.cfg
+        task_cache = decode_gen_task_cache(stage_info)
+        packed_p_reg_count = num_packed_p_regs(cfg)
         p_base = self._p_base_addr(stage_info, task_cache)
-        if cutlass.const_expr(cfg.is_fp8_qkv()):
+        if cutlass.const_expr(cfg.is_fp8_qkv() and packed_p_reg_count == 8):
+            tcgen05_store_p_fp8_16x32bx2_x8(p_base, regs_p)
+            if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
+                # Second panel for the upper 256 dv columns of PV.
+                tcgen05_store_p_fp8_16x32bx2_x8(
+                    tcgen05_second_panel_addr(p_base), regs_p
+                )
+        elif cutlass.const_expr(cfg.is_fp8_qkv()):
             tcgen05_store_p_fp8_16x32bx2_x16(p_base, regs_p)
             if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
                 tcgen05_store_p_fp8_16x32bx2_x16(
@@ -358,6 +406,35 @@ class TmemPResource(MlaResource):
                         )
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
         cute.arch.fence_view_async_tmem_store()
+
+    @producer_work
+    @cute.jit
+    def materialize_p(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr,
+        s_arr,
+        local_sum_arr,
+    ):
+        """Materialize grouped-head softmax probabilities into TMEM P."""
+        # Producer work for TmemPResource: softmax converts S to P and stores it
+        # directly into the TMEM score/P stage.  PV MMA consumes the returned
+        # p_stage_idx through the loop/tail TMEM-P producer labels.
+        regs_p = self._compute_p_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            local_sum_arr=local_sum_arr,
+        )
+        self._store_p_impl(stage_info, regs_p=regs_p)
+
+    @producer_work
+    @cute.jit
+    def store_p(self, stage_info: StageInfo, *, regs_p):
+        """Store the P registers computed before the P acquire
+        (``TmemSResource.compute_p_s``)."""
+        self._store_p_impl(stage_info, regs_p=regs_p)
 
     @consumer_work(returns=p_stage_idx)
     @cute.jit

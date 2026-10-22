@@ -372,12 +372,20 @@ class TmemOResource(MlaResource):
         cfg = self.cfg
         v_stage_idx = v_subtile_idx % cfg.v_head_dim_stages
         task_cache = decode_gen_task_cache(stage_info)
-        p_addr = (
-            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-            + Int32(self.p_tmem_ref.tmem_alias_ref._tmem_alloc.offset)
-            + Int32(WARP_LANES)
-            + Int32(p_stage_idx) * Int32(cfg.tmem_s_cols)
-        )
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+            # Native FP4 QK: P has its own TMEM columns (S is single-staged).
+            p_addr = (
+                task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+                + Int32(self.p_tmem_ref._tmem_alloc.offset)
+                + Int32(p_stage_idx) * Int32(cfg.tmem_p_cols)
+            )
+        else:
+            p_addr = (
+                task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+                + Int32(self.p_tmem_ref.tmem_alias_ref._tmem_alloc.offset)
+                + Int32(WARP_LANES)
+                + Int32(p_stage_idx) * Int32(cfg.tmem_s_cols)
+            )
         if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
             p_addr = tcgen05_panel_addr(p_addr, v_stage_idx // 2)
         idesc = cprims.Tcgen05InstrDesc.build(
@@ -389,11 +397,10 @@ class TmemOResource(MlaResource):
             n_dim=cfg.head_dim_per_stage_v,
             m_dim=cfg.tile_size_q,
         )
+        k_blocks = cfg.tile_size_kv // mma_k_step_for_qkv(cfg)
         if prims.elect_sync():
             base_addr = self._pv_o_base_addr(stage_info, v_subtile_idx=v_subtile_idx)
-            for k_block in cutlass.range_constexpr(
-                cfg.tile_size_kv // mma_k_step_for_qkv(cfg)
-            ):
+            for k_block in cutlass.range_constexpr(k_blocks):
                 prims.tcgen05_mma(
                     mma_kind_for_qkv(cfg),
                     prims.CTAGroup.CTA_1,
@@ -404,11 +411,21 @@ class TmemOResource(MlaResource):
                     scale_d,
                 )
                 scale_d = Boolean(True)
-                if cutlass.const_expr(
-                    k_block + 1 < cfg.tile_size_kv // mma_k_step_for_qkv(cfg)
-                ):
+                if cutlass.const_expr(k_block + 1 < k_blocks):
                     p_addr = p_addr + Int32(8)
                     v_desc = v_desc + Int32(256 if cfg.is_fp8_qkv() else 128)
+
+    @producer_work
+    @cute.jit
+    def all_pv_issued(self, stage_info: StageInfo) -> None:
+        """Native FP4 QK schedule: every PV of the work tile was issued; ``commit`` tracks them."""
+        del stage_info
+
+    @consumer_work
+    @cute.jit
+    def all_pv_done(self, stage_info: StageInfo) -> None:
+        """Native FP4 QK schedule: observed after ``wait``; O is final."""
+        del stage_info
 
     @consumer_work(
         returns=(o_stage_idx, tail_o_stage_idx_0, tail_o_stage_idx_1),

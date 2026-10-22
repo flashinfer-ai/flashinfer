@@ -1205,6 +1205,20 @@ def _get_compiled_mla_decode(
 
     output_quant_args = _fake_output_quant_args(getattr(kernel, "output_quant", None))
 
+    # The 1CTA kernel also serves token-sparse DSA decode (``dsa.py``), which
+    # passes a skip-correction threshold, the raw Gather4 descriptors, the NVFP4
+    # block-scale pool and its dequantization scale after ``output_scale``.
+    # Dense and native-sparse MLA keep the exact online-softmax rescale and
+    # leave the token-sparse operands unset.
+    from .kernels.mla_decode.throughput_latency_1cta.kernel import (
+        ThroughputLatencyMlaDecodeTs,
+    )
+
+    one_cta = isinstance(kernel, ThroughputLatencyMlaDecodeTs)
+    token_sparse_args = (
+        (cutlass.Float32(0.0), None, None, cutlass.Float32(1.0)) if one_cta else ()
+    )
+
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
     def compile_kernel():
@@ -1224,6 +1238,7 @@ def _get_compiled_mla_decode(
             sparse_inputs_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
+            *token_sparse_args,
             stream_fake,
             output_quant_args=output_quant_args,
             options=_COMPILE_OPTIONS,
@@ -1238,6 +1253,17 @@ def _get_compiled_mla_decode(
             compile_kernel,
             extra=(),
         )
+    if one_cta:
+        launch = compiled
+
+        def compiled(*args):
+            # _launch_mla_decode passes output_quant_args as the last
+            # positional argument; the 1CTA ABI inserts the skip-correction
+            # threshold and the token-sparse descriptors / scale pool /
+            # dequant scale (inactive for dense callers) before it.
+            *dense_args, output_quant_args = args
+            return launch(*dense_args, 0.0, None, None, 1.0, output_quant_args)
+
     return compiled
 
 
