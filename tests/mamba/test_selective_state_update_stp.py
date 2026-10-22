@@ -20,8 +20,10 @@ def _get_algorithms():
 
 def _skip_unsupported_dim(algorithm, dim):
     """Skip head dims that the horizontal and vertical kernels do not support."""
-    if algorithm == "horizontal" and dim % 64 != 0:
-        pytest.skip(f"horizontal kernel requires dim divisible by 64, got {dim}")
+    if algorithm == "horizontal" and (dim % 64 != 0 or dim > 256):
+        pytest.skip(
+            f"horizontal kernel requires dim divisible by 64 and at most 256, got {dim}"
+        )
     if algorithm == "vertical" and (dim % 16 != 0 or dim < 48):
         pytest.skip(
             f"vertical kernel requires dim divisible by 16 and >= 48, got {dim}"
@@ -43,6 +45,7 @@ _BASE_PARAMS = [
     (  64,    64,     96,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=96
     (  64,    64,     32,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=32
     (  64,    64,    160,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=160
+    (  64,    64,    320,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=320
     (  64,    64,     64,   64,     torch.bfloat16,     torch.float32,     True ),  # dstate=64
     (  64,    64,     64,   96,     torch.bfloat16,     torch.float32,     True ),  # dstate=96
     (  64,    64,     64,  256,     torch.bfloat16,     torch.float32,     True ),  # dstate=256
