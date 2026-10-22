@@ -47,6 +47,7 @@ from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
 )
 from flashinfer.fused_moe import (
     BackendOptions,
+    CudnnFrostBf16Config,
     CutlassBf16Config,
     ExecutionConfig,
     ExpertConfig,
@@ -521,7 +522,13 @@ def test_bf16_original_layer_api_can_execute_winning_cudnn_frost_and_replay(
     act, weights = bf16_packs(
         tokens=4096, experts=experts, hidden=hidden, intermediate=intermediate
     )
-    layer = MoELayer(bf16_config(experts=experts, intermediate=intermediate))
+    # Frost is a candidate only when the config lists it.
+    layer = MoELayer(
+        replace(
+            bf16_config(experts=experts, intermediate=intermediate),
+            backend=BackendOptions((CutlassBf16Config(), CudnnFrostBf16Config())),
+        )
+    )
     visited = []
 
     def select(act, weights, runners):
