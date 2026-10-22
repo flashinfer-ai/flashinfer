@@ -534,12 +534,21 @@ def arch_for_capability(capability: tuple[int, int]) -> str | None:
     return ARCH_BY_CAPABILITY.get((values[0], values[1]))
 
 
-def device_arch(device_index: int) -> str:
-    """Exported architecture of one CUDA device (``RuntimeError`` when the device
-    is not an exported target)."""
+@functools.cache
+def device_capability(device_index: int) -> tuple[int, int]:
+    """Compute capability of one CUDA device (immutable per process; queried once
+    per device index, never per launch)."""
     import torch
 
-    capability = tuple(torch.cuda.get_device_capability(device_index))
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return (int(major), int(minor))
+
+
+@functools.cache
+def device_arch(device_index: int) -> str:
+    """Exported architecture of one CUDA device (``RuntimeError`` when the device
+    is not an exported target; the error is not cached, the architecture is)."""
+    capability = device_capability(device_index)
     arch = arch_for_capability(capability)
     if arch is None:
         raise RuntimeError(
@@ -665,6 +674,7 @@ __all__ = [
     "TILE_TOKENS",
     "arch_for_capability",
     "device_arch",
+    "device_capability",
     "launch_grid",
     "library_name",
     "load",

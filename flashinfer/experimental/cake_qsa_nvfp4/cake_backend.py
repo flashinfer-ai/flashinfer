@@ -44,13 +44,17 @@ the separate merge.
 Workspace rule: the partials (``partial_out`` FP32 ``[splits, rows,
 num_qo_heads, 256]``, ``partial_lse`` FP32 ``[splits, rows, num_qo_heads]``)
 and the fused form's counters (uint32 ``[rows * num_kv_heads]``) come from the
-caller's ``workspace_buffer`` when one is given (uint8 CUDA, at least
-:func:`qsa_workspace_bytes` bytes; carved, never copied; the counters are
-zeroed once, the first time a buffer is seen for a ``rows * num_kv_heads``,
-and reset themselves after every launch), so a call with a workspace allocates
-nothing and is CUDA-graph capturable with a replay-stable layout.  Without a
-workspace the partials and counters are allocated per call, as the reference
-implementation does; that path is outside the zero-allocation guarantee.
+caller's ``workspace_buffer`` when one is given (a contiguous uint8 tensor on
+the device of ``q``, 256-byte aligned, at least :func:`qsa_workspace_bytes`
+bytes; checked on every call that passes one, one split included; carved, never
+copied; the counters are zeroed once, the first time a buffer's *storage* is
+seen for a ``rows * num_kv_heads`` -- a new buffer the allocator places at a
+freed buffer's address is a new storage and is zeroed again -- and reset
+themselves after every launch), so a call with a workspace allocates nothing
+and is CUDA-graph capturable with a replay-stable layout.  A call with no rows
+returns before the workspace is read.  Without a workspace the partials and
+counters are allocated per call, as the reference implementation does; that
+path is outside the zero-allocation guarantee.
 
 Nothing here reads tensor contents: every dispatch is on host scalars and
 tensor metadata.  The kernels run on the current torch stream of the device.
@@ -60,6 +64,7 @@ from __future__ import annotations
 
 import functools
 import math
+import weakref
 from typing import Optional
 
 import torch
@@ -120,10 +125,7 @@ def is_supported(device: torch.device | int | None = None) -> bool:
     if not torch.cuda.is_available():
         return False
     index = _device_index(device)
-    return (
-        cake_jit.arch_for_capability(tuple(torch.cuda.get_device_capability(index)))
-        is not None
-    )
+    return cake_jit.arch_for_capability(cake_jit.device_capability(index)) is not None
 
 
 @functools.cache
@@ -178,26 +180,32 @@ def qsa_workspace_bytes(
     return _round_up(partial_lse[0] + partial_lse[1], ALIGN)
 
 
-# ``(data_ptr, rows * num_kv_heads)`` of every workspace whose counters were zeroed once (module docstring).
-_zeroed_counters: set[tuple[int, int]] = set()
+# The ``(storage_offset, rows * num_kv_heads)`` slots whose group counters were zeroed once, per workspace storage
+# (module docstring, "Workspace rule").  The storage is held weakly: a storage that dies takes its entry with it,
+# so a new buffer the allocator places at a recycled address is zeroed again.  Keyed by the storage, never by the
+# address: an address is reused by the next allocation of its size and may hold anything in between.
+_CounterSlots = set[tuple[int, int]]
+_zeroed_counters: weakref.WeakKeyDictionary[torch.UntypedStorage, _CounterSlots] = (
+    weakref.WeakKeyDictionary()
+)
 
 
-def _carve(
+def _check_workspace(
     workspace: torch.Tensor,
+    device: torch.device,
     num_rows: int,
     num_qo_heads: int,
     num_kv_heads: int,
     splits: int,
-    *,
-    counters: bool,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """The partial outputs, the partial LSEs and (when ``counters``) the zeroed group counters as views of the
-    caller's ``workspace`` (``qsa_workspace_bytes`` bytes at least); nothing is allocated or copied."""
+) -> torch.Tensor:
+    """The caller's ``workspace`` as a flat uint8 view after its checks (device of ``q``, uint8, contiguous, at
+    least ``qsa_workspace_bytes`` bytes for this call, 256-byte aligned); run on every call that passes a buffer,
+    whatever the split count, so that a buffer's verdict does not depend on the device's SM count."""
     _check(
-        workspace.device.type == "cuda"
+        workspace.device == device
         and workspace.dtype == torch.uint8
         and workspace.is_contiguous(),
-        "workspace_buffer must be a contiguous uint8 CUDA tensor",
+        "workspace_buffer must be a contiguous uint8 CUDA tensor on the device of q",
     )
     raw = workspace.reshape(-1)
     need = qsa_workspace_bytes(num_rows, num_qo_heads, num_kv_heads, splits)
@@ -208,6 +216,20 @@ def _carve(
     _check(
         raw.data_ptr() % ALIGN == 0, f"workspace_buffer must be {ALIGN}-byte aligned"
     )
+    return raw
+
+
+def _carve(
+    raw: torch.Tensor,
+    num_rows: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    splits: int,
+    *,
+    counters: bool,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """The partial outputs, the partial LSEs and (when ``counters``) the zeroed group counters as views of the
+    checked flat workspace ``raw`` (:func:`_check_workspace`); nothing is allocated or copied."""
     slot_counters, slot_out, slot_lse = _layout(
         num_rows, num_qo_heads, num_kv_heads, splits
     )
@@ -228,19 +250,18 @@ def _carve(
         .view(torch.uint32)
         .view(num_rows * num_kv_heads)
     )
-    key = (raw.data_ptr(), num_rows * num_kv_heads)
-    if key not in _zeroed_counters:
+    seen = _zeroed_counters.setdefault(raw.untyped_storage(), set())
+    key = (raw.storage_offset(), num_rows * num_kv_heads)
+    if key not in seen:
         group_counters.zero_()
-        _zeroed_counters.add(key)
+        seen.add(key)
     return partial_out, partial_lse, group_counters
 
 
 def reset_workspace(workspace: torch.Tensor) -> None:
-    """Forget that ``workspace`` was seen: the next call carving it zeroes its counters again (for a buffer whose
-    bytes another use overwrote)."""
-    ptr = workspace.reshape(-1).data_ptr()
-    for key in [key for key in _zeroed_counters if key[0] == ptr]:
-        _zeroed_counters.discard(key)
+    """Forget that ``workspace`` (its storage) was seen: the next call carving it zeroes its counters again (for a
+    buffer whose bytes another use overwrote)."""
+    _zeroed_counters.pop(workspace.untyped_storage(), None)
 
 
 def _device_index(device: torch.device | int | None) -> int:
@@ -293,7 +314,10 @@ def qsa_sparse_paged_attention(
     del (
         use_prefill_config
     )  # kept for the signature; the split rule does not depend on it
-    capability = tuple(torch.cuda.get_device_capability(q.device))
+    if q.device.type != "cuda":
+        raise ValueError("device must be a cuda device")
+    device_index = _device_index(q.device)
+    capability = cake_jit.device_capability(device_index)
     if cake_jit.arch_for_capability(capability) is None:
         raise RuntimeError(
             f"QSA NVFP4 attention supports SM80 through SM90, got SM{capability[0]}{capability[1]}"
@@ -380,18 +404,24 @@ def qsa_sparse_paged_attention(
     if num_rows == 0:
         return out
 
-    device_index = _device_index(q.device)
     selection_width = logical_indices.shape[1] - 1
     splits = num_splits(
         num_rows, num_kv_heads, selection_width, cake_jit.sm_count(device_index)
     )
     form = select_form(num_rows, num_kv_heads, splits, device_index)
     fused = form == "fused"
+    raw = (
+        _check_workspace(
+            workspace_buffer, q.device, num_rows, num_qo_heads, num_kv_heads, splits
+        )
+        if workspace_buffer is not None
+        else None
+    )
     if splits == 1:
         partial_out = partial_lse = merge_counters = None
-    elif workspace_buffer is not None:
+    elif raw is not None:
         partial_out, partial_lse, merge_counters = _carve(
-            workspace_buffer,
+            raw,
             num_rows,
             num_qo_heads,
             num_kv_heads,
