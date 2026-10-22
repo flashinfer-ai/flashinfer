@@ -8679,6 +8679,70 @@ def _fmha_v2_prefill_sm120_run(
     return out
 
 
+@flashinfer_api
+def fmha_v2_prefill_glm(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    *,
+    softmax_scale: float = 1.0 / 16.0,
+    causal: bool = True,
+    out: Optional[torch.Tensor] = None,
+    softmax_stats: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run packed, block-scaled GLM FP8 prefill on SM120 using TMA.
+
+    Q/K/V have logical shape ``[total_tokens, heads, 256]`` and head-major
+    storage (strides ``[256, total_tokens * 256, 1]``), with FP8 E4M3 dtype.
+    Q and KV may have different total lengths. Apply RoPE and concatenate
+    K's NoPE/RoPE components before quantization.
+
+    Each FP32 scale tensor has shape ``[batch, heads, ceil(max_length/64)]``.
+    Scales must be finite and positive, and reconstruct a block as
+    ``x_float = x_fp8 * scale``. Blocks start at each sequence boundary.
+    Q/K scales affect logits; V scales are applied during online accumulation.
+    Quantization itself runs upstream of this attention kernel.
+
+    Cumulative lengths are contiguous CUDA int32 tensors of shape
+    ``[batch + 1]`` starting at zero and ending at the corresponding token
+    count. Every sequence must satisfy ``0 < q_length <= kv_length`` and the
+    supplied maxima. Causal masking is bottom-right aligned for cached prefixes.
+    Device length/scale values are not copied to the host or synchronized;
+    callers must meet these contracts, including during graph replay.
+
+    Output is contiguous ``[total_q, heads, 256]`` BF16 (default) or FP16.
+    Optional ``softmax_stats`` is a contiguous FP32 tensor ``[total_q, heads, 2]``
+    containing row max and scaled exponential sum. Recover logsumexp with
+    ``stats[..., 0] + log(stats[..., 1] / 256)``.
+    """
+    if out is None:
+        out = torch.empty(query.shape, device=query.device, dtype=torch.bfloat16)
+    get_trtllm_fmha_v2_sm120_module().run_glm(
+        query,
+        key,
+        value,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        q_scale,
+        k_scale,
+        v_scale,
+        softmax_stats,
+        max_seqlen_q,
+        max_seqlen_kv,
+        softmax_scale,
+        causal,
+    )
+    return out
+
+
 @flashinfer_api(trace=fmha_v2_prefill_sm120_trace)
 def fmha_v2_prefill_sm120(
     query: torch.Tensor,
@@ -8819,6 +8883,15 @@ def fmha_v2_prefill_deepseek(
     scale_bmm2_d: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
+    Run causal prefill with separate Q/K/V for DeepSeek or GLM-4.7-Flash.
+
+    Supports DeepSeek Q/K=192, V=128 and expanded GLM Q/K=256, V=256.
+    The GLM path requires contiguous FP8 E4M3 Q/K/V and BF16 or FP16 output.
+    Apply RoPE before calling and concatenate NoPE and RoPE in Q/K; both
+    segments use the same dtype and per-tensor scale. For GLM, pass
+    ``scale_bmm1=q_scale * k_scale / 16`` and ``scale_bmm2=v_scale``.
+    This is fixed-length BSHD prefill, not absorbed 576/512 MLA.
+
     Parameters
     ----------
     query : torch.Tensor
@@ -8826,9 +8899,10 @@ def fmha_v2_prefill_deepseek(
     key : torch.Tensor
         key tensor with shape [batch_size, seq_len, num_heads, head_dim]
     value : torch.Tensor
-        value tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        value tensor with shape [batch_size, seq_len, num_heads, head_dim_v],
+        where head_dim_v is 128 for DeepSeek or 256 for GLM.
     out : torch.Tensor
-        output tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        output tensor with the same shape as value.
     return_lse : bool
         whether to return the log-sum-exp of attention output
     num_heads : int
@@ -8861,13 +8935,40 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm12x_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    if any(t.ndim != 4 for t in (query, key, value, out)):
+        raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
     if query.shape[1] != seq_len:
         raise ValueError("query sequence length must match seq_len.")
     if return_lse and lse is None:
         raise ValueError("lse must be provided when return_lse=True.")
-    assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
-        "currently only support deepseek r1 192 query and 128 value"
-    )
+    head_dims = (query.shape[3], key.shape[3], value.shape[3])
+    if head_dims not in ((192, 192, 128), (256, 256, 256)):
+        raise ValueError("requires DeepSeek Q/K=192, V=128 or GLM Q/K/V=256.")
+    if head_dims == (256, 256, 256):
+        if num_heads <= 0 or seq_len <= 0 or query.shape[0] <= 0:
+            raise ValueError("GLM batch, seq_len, and num_heads must be positive.")
+        if any(t.dtype != torch.float8_e4m3fn for t in (query, key, value)):
+            raise ValueError("GLM 256/256 prefill requires FP8 E4M3 Q/K/V.")
+        if out.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("GLM 256/256 prefill requires BF16 or FP16 output.")
+        expected_shape = (query.shape[0], seq_len, num_heads, head_dim)
+        if head_dim != 256 or any(
+            t.shape != expected_shape for t in (query, key, value, out)
+        ):
+            raise ValueError(
+                "GLM tensors must match batch, seq_len, heads, and dim=256."
+            )
+        if any(t.device != query.device for t in (key, value, out)):
+            raise ValueError("query, key, value, and out must be on the same device.")
+        if not all(t.is_contiguous() for t in (query, key, value, out)):
+            raise ValueError("query, key, value, and out must be contiguous.")
+        if lse is not None and (
+            lse.shape != (*expected_shape[:3], 2)
+            or lse.dtype != torch.float32
+            or lse.device != query.device
+            or not lse.is_contiguous()
+        ):
+            raise ValueError("lse must be a contiguous FP32 [B, S, H, 2] tensor.")
     return _fmha_v2_prefill_sm120_run(
         query,
         key,

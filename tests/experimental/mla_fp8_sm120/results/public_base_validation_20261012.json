@@ -1,0 +1,25 @@
+{
+  "date": "2026-10-12",
+  "base": "f9a2ce5acf8ea565311238c7a8c991072c9ff010",
+  "runtime_sources_unchanged": true,
+  "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell, SM120",
+  "torch": "2.11.0+cu129",
+  "flashinfer_runtime": "0.6.15.post1",
+  "cute_dsl": "4.6.0",
+  "sglang_base": "b8835cd4735d1e22512aed177d78690dae9171b9",
+  "passed_tests": [
+    "test_graph_replay_reads_current_tensors_and_scales",
+    "test_ragged_prefixes_and_empty_causal_rows",
+    "test_real_projection_shapes_match_existing_gemm"
+  ],
+  "service_benchmark_rerun": false,
+  "sanitizer_rerun": false,
+  "source_sha256": {
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_cute.py": "f5e034786fc6838172dd76e4bcae7f420d2eff47a416b3aaab3d9340df15542c",
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_interface.py": "27395b8ded3ce4509c0b4ae75cf35091312d9c9c548ddcb4646c151afad071bd",
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_quantize.py": "0121a925d95963994b2e6d63fe125c6e806e62129e31240c9fc4e6e6851e7eb2",
+    "flashinfer/experimental/mla_fp8_sm120/materialized_fp8_hook.py": "6ff3e5681d89b809f029eb2ba35efcf4139600859b201eb99fc16376ae345c0b",
+    "flashinfer/experimental/mla_fp8_sm120/projection_tuning.py": "ff5f161ce82efe7484c384809e47286e1f2e2494024c0a133c91ff9f71741946",
+    "flashinfer/experimental/mla_fp8_sm120/projection_policy.cuh": "b1372cad6bd59e399d93a211f5fe329f3986222e61849c0f57e19bbc36894ef0"
+  }
+}

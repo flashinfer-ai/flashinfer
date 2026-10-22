@@ -1,0 +1,841 @@
+{
+  "time_utc": "2026-10-09T08:47:18.532701+00:00",
+  "checkout_base": "bfe80f7594c98bd8a67167ee891a7b44dd6e31ba",
+  "checkout_version": "0.7.2",
+  "baseline_installed_version": "0.6.15.post1",
+  "note": "All builds use checkout FlashInfer headers and installed CUTLASS/CCCL dependency headers. The 16 base checks preceded clang-format; the final formatted base source was rebuilt for four memcheck cases. Other 12 checks used formatted sources. Historical benchmark latency numbers were not remeasured for 0.7.2.",
+  "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell (SM120)",
+  "idle_policy": "Wait for 5 consecutive seconds of GPU and memory utilization <=2%; preserve all external processes.",
+  "source_sha256": {
+    "flashinfer/experimental/mla_fp8_sm120/quantization.py": "b5d01987ad1815abf42ac9aa8792ecd10e530d8cf9bebd80cc3f992c9a0bcb63",
+    "flashinfer/experimental/mla_fp8_sm120/__init__.py": "f1cd9bcab75bb3feacc9d26fbd9a8469d582fd66f3975f1f40c24807ccfb3e85",
+    "flashinfer/experimental/mla_fp8_sm120/mla_fp8.cu": "0afc5d576120df60dcedb80edd1ac069a708154e3226b0580bb0798f79892ef1",
+    "flashinfer/experimental/mla_fp8_sm120/scheduler_fp8.cuh": "338b1d855538133d0e89e6e2b6b0d9588ab6b392485912905bd798305f24fe2b",
+    "flashinfer/experimental/mla_fp8_sm120/wrapper.py": "6861b9d9b265cb7976ee5ff83b42d7f23a366b1ff04b3b947498a5a6042df44a"
+  },
+  "header_sha256": {
+    "include/flashinfer/attention/mla.cuh": "57ea43d1c475f3cea19e24e3f1b2e0ea1c569e19cba422b16e242aecb298c6e0",
+    "include/flashinfer/attention/mla_params.cuh": "57be4a5ea15a670305fc45dc7d03b5f3b4f041321e6db05efed01096391946bf",
+    "include/flashinfer/attention/scheduler.cuh": "b1fb27078084262158ed070e220ad317467306d1f0b32e0d9624bf85e6ef97ce",
+    "include/flashinfer/mma.cuh": "f6df5d6475bf2fc33932399b7063894a2a4ed27cfabe45ae7cd239a1c61943e9"
+  },
+  "numerical_case_count": 28,
+  "memcheck_case_count": 4,
+  "memcheck_errors": 0,
+  "checks": {
+    "base": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.004476570885112471,
+        "max_abs": 0.046790374645724664,
+        "lse_max_abs": 1.0275660482506055e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.004476570885112471,
+        "max_abs": 0.046790374645724664,
+        "lse_max_abs": 1.0275660482506055e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.00784851079172371,
+        "max_abs": 0.06241526290710231,
+        "lse_max_abs": 1.1110742548225971e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.00784851079172371,
+        "max_abs": 0.06241526290710231,
+        "lse_max_abs": 1.1110742548225971e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+        "max_abs": 0.12303631330802678,
+        "lse_max_abs": 1.5935432617908418e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+        "max_abs": 0.12303631330802678,
+        "lse_max_abs": 1.5935432617908418e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.009586048589432577,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1834172930491604e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.009586048589432577,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1834172930491604e-06,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.006297120019803729,
+        "max_abs": 0.05111847656429391,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.006297120019803729,
+        "max_abs": 0.05111847656429391,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.2171567185248477e-06,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.2171567185248477e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.01209520790854036,
+        "max_abs": 0.11083715917685588,
+        "lse_max_abs": 8.554717503272968e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_91c55cbfa63aac58.so",
+        "relative_l2_vs_dequant_fp64": 0.01209520790854036,
+        "max_abs": 0.11083715917685588,
+        "lse_max_abs": 8.554717503272968e-07,
+        "finite": true
+      }
+    ],
+    "groups4": [
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 166,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_e0f85ab1ecea45bd.so",
+        "relative_l2_vs_dequant_fp64": 0.005553977001880111,
+        "max_abs": 0.06391753258064359,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 166,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_e0f85ab1ecea45bd.so",
+        "relative_l2_vs_dequant_fp64": 0.005553977001880111,
+        "max_abs": 0.06391753258064359,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 167,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_e0f85ab1ecea45bd.so",
+        "relative_l2_vs_dequant_fp64": 0.007186399440960009,
+        "max_abs": 0.06748524126699351,
+        "lse_max_abs": 1.328296889369085e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 166,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_e0f85ab1ecea45bd.so",
+        "relative_l2_vs_dequant_fp64": 0.007186399440960009,
+        "max_abs": 0.06748524126699351,
+        "lse_max_abs": 1.328296889369085e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 167,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_e0f85ab1ecea45bd.so",
+        "relative_l2_vs_dequant_fp64": 0.009221784489575084,
+        "max_abs": 0.12897630652607317,
+        "lse_max_abs": 1.2836762692813863e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 166,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_e0f85ab1ecea45bd.so",
+        "relative_l2_vs_dequant_fp64": 0.009221784489575084,
+        "max_abs": 0.12897630652607317,
+        "lse_max_abs": 1.2836762692813863e-06,
+        "finite": true
+      }
+    ],
+    "tile64": [
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 254,
+          "shared_bytes": 73984,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d2_a4e93f4a563903e2.so",
+        "relative_l2_vs_dequant_fp64": 0.0061650616768551495,
+        "max_abs": 0.0691489997399315,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 254,
+          "shared_bytes": 73984,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d2_a4e93f4a563903e2.so",
+        "relative_l2_vs_dequant_fp64": 0.0061650616768551495,
+        "max_abs": 0.0691489997399315,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 254,
+          "shared_bytes": 73984,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d2_a4e93f4a563903e2.so",
+        "relative_l2_vs_dequant_fp64": 0.007955710318817748,
+        "max_abs": 0.06642767868915733,
+        "lse_max_abs": 9.192824315107373e-07,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 254,
+          "shared_bytes": 73984,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d2_a4e93f4a563903e2.so",
+        "relative_l2_vs_dequant_fp64": 0.007955710318817748,
+        "max_abs": 0.06642767868915733,
+        "lse_max_abs": 9.192824315107373e-07,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 254,
+          "shared_bytes": 73984,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d2_a4e93f4a563903e2.so",
+        "relative_l2_vs_dequant_fp64": 0.009222869330604497,
+        "max_abs": 0.12897630652607317,
+        "lse_max_abs": 1.2836762692813863e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 254,
+          "shared_bytes": 73984,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d2_a4e93f4a563903e2.so",
+        "relative_l2_vs_dequant_fp64": 0.009222869330604497,
+        "max_abs": 0.12897630652607317,
+        "lse_max_abs": 1.2836762692813863e-06,
+        "finite": true
+      }
+    ],
+    "memcheck": [
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_5f9bd414dc0b1a1a.so",
+        "relative_l2_vs_dequant_fp64": 0.005553977435189814,
+        "max_abs": 0.06391753258064359,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_5f9bd414dc0b1a1a.so",
+        "relative_l2_vs_dequant_fp64": 0.005553977435189814,
+        "max_abs": 0.06391753258064359,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_5f9bd414dc0b1a1a.so",
+        "relative_l2_vs_dequant_fp64": 0.011198790674267283,
+        "max_abs": 0.11279788453603867,
+        "lse_max_abs": 1.543137496895497e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_5f9bd414dc0b1a1a.so",
+        "relative_l2_vs_dequant_fp64": 0.011198790674267283,
+        "max_abs": 0.11279788453603867,
+        "lse_max_abs": 1.543137496895497e-06,
+        "finite": true
+      }
+    ]
+  },
+  "final_binary_instruction_counts": {
+    "QMMA.16832.F32.E4M3.E4M3": 416
+  },
+  "example": "Passed: BF16 output [1,20,512], all finite, after final int64 host-bound validation change.",
+  "final_formatted_smoke": [
+    {
+      "name": "decode",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_5f9bd414dc0b1a1a.so",
+      "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+      "max_abs": 0.04860561618633086,
+      "lse_max_abs": 8.085393616852343e-07,
+      "finite": true
+    }
+  ],
+  "static_checks": {
+    "scoped_mypy": "Passed, 3 backend Python source files",
+    "ruff": "Passed after formatting and four safe lint fixes",
+    "pytest_collection": "Passed, 3 parametrized hardware tests collected; reference cases executed through their standalone CLI.",
+    "pre_commit_all": "Passed: pre-commit run -a (entire checkout), after formatting. The final docstring/evidence-only edits are checked again with all hooks on the staged files.",
+    "pre_commit_staged": "Passed: all hooks on the 64 files in this contribution.",
+    "installed_flashinfer_audit": "8 of 8 installed source files still match the initial study SHA-256 values."
+  }
+}

@@ -14,6 +14,7 @@
 
 #include <fmha/gemm.h>
 #include <fmha/kernel_traits.h>
+#include <fmha/sm120_tma.h>
 #include <fmha/utils.h>
 #include <fused_multihead_attention_kernel.h>
 
@@ -21,8 +22,16 @@ namespace fused_multihead_attention {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Kernel_traits, typename Params>
-inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
+template <typename Kernel_traits, bool BLOCK_SCALED = false, typename Params>
+inline __device__ void device_flash_attention_nl_tiled(Params const& kernel_params) {
+  auto const& params = [&]() -> decltype(auto) {
+    if constexpr (Kernel_traits::USE_TMA_GLM) {
+      return static_cast<bert::Fused_multihead_attention_params_v2 const&>(kernel_params);
+    } else {
+      return (kernel_params);
+    }
+  }();
+  static_assert(!BLOCK_SCALED || Kernel_traits::USE_TMA_GLM);
   // The instruction traits.
   using Traits_p = typename Kernel_traits::Traits_p;
   using Traits_o = typename Kernel_traits::Traits_o;
@@ -40,17 +49,23 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   // The global memory tile to load Q.
   using Gmem_tile_q = typename Kernel_traits::Gmem_tile_q;
   // The shared memory tile to swizzle Q.
-  using Smem_tile_q = typename Kernel_traits::Smem_tile_q;
+  using Smem_tile_q = std::conditional_t<Kernel_traits::USE_TMA_GLM,
+                                         fmha::Sm120_tma_qk<typename Kernel_traits::Smem_tile_q>,
+                                         typename Kernel_traits::Smem_tile_q>;
 
   // The global memory tile to load K.
   using Gmem_tile_k = typename Kernel_traits::Gmem_tile_k;
   // The shared memory tile to swizzle K.
-  using Smem_tile_k = typename Kernel_traits::Smem_tile_k;
+  using Smem_tile_k = std::conditional_t<Kernel_traits::USE_TMA_GLM,
+                                         fmha::Sm120_tma_qk<typename Kernel_traits::Smem_tile_k>,
+                                         typename Kernel_traits::Smem_tile_k>;
 
   // The global memory tile to load V.
   using Gmem_tile_v = typename Kernel_traits::Gmem_tile_v;
   // The shared memory tile to swizzle V.
-  using Smem_tile_v = typename Kernel_traits::Smem_tile_v;
+  using Smem_tile_v = std::conditional_t<Kernel_traits::USE_TMA_GLM,
+                                         fmha::Sm120_tma_v<typename Kernel_traits::Smem_tile_v>,
+                                         typename Kernel_traits::Smem_tile_v>;
 
   // The global memory tile to store O.
   using Gmem_tile_o = typename Kernel_traits::Gmem_tile_o;
@@ -65,10 +80,12 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   enum { USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V };
 
   // Do we use LDGSTS for any of the 3 input matrices.
-  enum { USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V };
+  enum {
+    USE_LDGSTS = !Kernel_traits::USE_TMA_GLM && (USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V)
+  };
 
   // TODO ANT: assertions
-  static_assert(USE_LDGSTS, "Supports only USE_LDGSTS = true");
+  static_assert(USE_LDGSTS || Kernel_traits::USE_TMA_GLM, "Requires async loads");
   static_assert(!Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
 
   // If either K or V uses LDGSTS, they cannot share a buffer.
@@ -93,17 +110,24 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   enum { CHECK_NEG_INF = Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK };
 
   // Shared memory.
-  extern __shared__ char smem_[];
+  extern __shared__ __align__(1024) char smem_[];
+  auto* tma_bars = reinterpret_cast<uint64_t*>(smem_ + Kernel_traits::BYTES_PER_SMEM_QKV);
 
   // The loop -- each CTA works on a different loop iteration.
   int const ctas_per_o_row = (Cta_tile_o::VALID_N + Cta_tile_o::N - 1) / Cta_tile_o::N;
-  int const q_loop = blockIdx.x / ctas_per_o_row;
+  // Causal tiles near the end of Q have the most KV work. Schedule those
+  // first across all heads to avoid a long tail of partially occupied SMs.
+  int const linear_tile = blockIdx.x + gridDim.x * blockIdx.y;
+  int const q_loop = Kernel_traits::USE_TMA_GLM && Kernel_traits::CAUSAL_MASK
+                         ? gridDim.x - 1 - linear_tile / params.h
+                         : blockIdx.x / ctas_per_o_row;
   // Each CTA works on a specific row partition of O.
   int const o_part = blockIdx.x % ctas_per_o_row;
   // The block index for the batch.
   int const bidb = blockIdx.z;
   // The block index for the head.
-  int const bidh = blockIdx.y;
+  int const bidh = Kernel_traits::USE_TMA_GLM && Kernel_traits::CAUSAL_MASK ? linear_tile % params.h
+                                                                            : blockIdx.y;
   // The thread index.
   int const tidx = threadIdx.x;
 
@@ -173,17 +197,24 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   gmem_k.move_by_offset(kv_loop_start);
   gmem_v.move_by_offset(kv_loop_start);
 
-  // Trigger the loads for Q.
-  gmem_q.load(smem_q);
-  // Trigger the loads for K.
-  gmem_k.load(smem_k);
+  if constexpr (Kernel_traits::USE_TMA_GLM) {
+    fmha::Sm120_tma_transport tma(smem_, tma_bars, bidh, BLOCK_SCALED ? 0 : bidb);
+    tma.expect(0, 32768);
+    tma.load(kernel_params.glm_q, 0, (BLOCK_SCALED ? binfo.sum_s : 0) + q_loop * 64, 0);
+    tma.load(kernel_params.glm_k, 1, (BLOCK_SCALED ? binfo.sum_s_kv : 0) + kv_loop_start, 0);
+  } else {
+    // Trigger the loads for Q.
+    gmem_q.load(smem_q);
+    // Trigger the loads for K.
+    gmem_k.load(smem_k);
 
-  // Push the LDGDEPBAR instruction after the loads for Q, K
-  fmha::ldgdepbar<USE_LDGSTS>();
+    // Push the LDGDEPBAR instruction after the loads for Q, K
+    fmha::ldgdepbar<USE_LDGSTS>();
 
-  // Commit the data for Q and K to shared memory.
-  gmem_q.commit(smem_q);
-  gmem_k.commit(smem_k);
+    // Commit the data for Q and K to shared memory.
+    gmem_q.commit(smem_q);
+    gmem_k.commit(smem_k);
+  }
 
   // Declare the fragments for Q/K/V.
   typename Smem_tile_q::Fragment frag_q[Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_M];
@@ -263,6 +294,18 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   constexpr int BMM2_TAIL_MMAS_K_BOUND = Mma_tile_o::MMAS_K;
   constexpr int BMM2_MAIN_MMAS_K_BOUND = Kernel_traits::TOTAL_BMM2_MMAS_K - BMM2_TAIL_MMAS_K_BOUND;
 
+  fmha::Sm120_tma_transport tma(smem_, tma_bars, bidh, BLOCK_SCALED ? 0 : bidb, false);
+  if constexpr (Kernel_traits::USE_TMA_GLM) {
+    tma.wait(0, 0);
+#pragma unroll
+    for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) smem_q.load(frag_q[ki], ki);
+  }
+  float query_scale = 1.f, value_scale = 1.f;
+  if constexpr (BLOCK_SCALED) {
+    query_scale =
+        params.sage.q.scales[(bidb * params.h + bidh) * params.sage.q.max_nblock + q_loop] *
+        __uint_as_float(params.scale_bmm1);
+  }
   for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N) {
     bool const first_step = (kv_loop == kv_loop_start);
     // It is possible that all tokens are masked out (sliding-window-attention).
@@ -312,7 +355,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
 #pragma unroll
       for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
         // Load the fragments for Q/K inner tile
-        smem_q.load(frag_q[ki], ki);
+        if constexpr (!Kernel_traits::USE_TMA_GLM) smem_q.load(frag_q[ki], ki);
         smem_k.load(frag_k[ki], ki);
 
         // Do the math for the values already in registers.
@@ -333,21 +376,25 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
         gmem_v.move();
         smem_v.move_to_next_write_buffer();
       }
-      gmem_v.load(smem_v);
-
-      fmha::ldgdepbar<USE_LDGSTS>();
-
-      gmem_v.commit(smem_v);
-
-      // Wait for Q/K to finish loading
-      fmha::depbar_<USE_LDGSTS, 1>();
-      __syncthreads();
+      if constexpr (Kernel_traits::USE_TMA_GLM) {
+        tma.expect(1, 16384);
+        tma.load(kernel_params.glm_v, 2, (BLOCK_SCALED ? binfo.sum_s_kv : 0) + kv_loop, 1);
+        tma.wait(0, ((kv_loop - kv_loop_start) / 64) & 1);
+      } else {
+        gmem_v.load(smem_v);
+        fmha::ldgdepbar<USE_LDGSTS>();
+        gmem_v.commit(smem_v);
+        fmha::depbar_<USE_LDGSTS, 1>();
+      }
+      if constexpr (!Kernel_traits::USE_TMA_GLM) {
+        __syncthreads();
+      }
 
 // Do this part of P^T = (Q * K^T)^T.
 #pragma unroll
       for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
         // Load the fragments for Q/K inner tile
-        smem_q.load(frag_q[ki], ki);
+        if constexpr (!Kernel_traits::USE_TMA_GLM) smem_q.load(frag_q[ki], ki);
         smem_k.load(frag_k[ki], ki);
 
         // Do the math for the values already in registers.
@@ -359,13 +406,35 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
       smem_k.move_to_next_read_buffer();
     }  // end BMM1 tail loop
 
+    // Full tiles have one K buffer. All warps must finish reading it before
+    // the BMM2 tail prefetch overwrites it for the next KV iteration.
+    if constexpr (!Kernel_traits::USE_GRANULAR_TILING) {
+      __syncthreads();
+    }
+
+    if constexpr (Kernel_traits::USE_TMA_GLM) {
+      if (kv_loop + 64 < kv_loop_end) {
+        tma.expect(0, 16384);
+        tma.load(kernel_params.glm_k, 1, (BLOCK_SCALED ? binfo.sum_s_kv : 0) + kv_loop + 64, 0);
+      }
+    }
+
     // Store the P matrix.
 #if defined(STORE_P)
     gmem_p.store(acc_p);
 #endif
 
     // Convert from the accumulator type to FP32 for Softmax.
-    softmax.unpack(acc_p);
+    float value_rescale = 1.f;
+    if constexpr (BLOCK_SCALED) {
+      int const index = (bidb * params.h + bidh) * params.sage.k.max_nblock + kv_loop / 64;
+      softmax.unpack(acc_p, query_scale * params.sage.k.scales[index]);
+      float const next_value_scale = params.sage.v.scales[index];
+      value_rescale = __fdividef(value_scale, next_value_scale);
+      value_scale = next_value_scale;
+    } else {
+      softmax.unpack(acc_p);
+    }
 
     // Apply the mask.
     if (apply_mask) {
@@ -414,7 +483,11 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
       }
 
       // Update last step's acc_o.
-      acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+      if constexpr (BLOCK_SCALED) {
+        acc_o_normalizer.update(acc_o, global_max, tmp, global_sum, value_rescale);
+      } else {
+        acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+      }
       // Apply expf of softmax.
       // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
       softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
@@ -471,8 +544,17 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
 #pragma unroll
       for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki) {
         int p_ki = bmm2_k + ki;
-        smem_v.load(frag_v[ki], ki);
-        fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+        if constexpr (Kernel_traits::USE_TMA_GLM) {
+#pragma unroll
+          for (int ni = 0; ni < Mma_tile_o::VALID_MMAS_N; ++ni) {
+            typename Smem_tile_v::Fragment v;
+            smem_v.load_one(v, ni, ki);
+            acc_o[0][ni].mma(frag_p[p_ki][0], v);
+          }
+        } else {
+          smem_v.load(frag_v[ki], ki);
+          fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+        }
       }
 
       // Make sure we are done reading the data (smem).
@@ -483,59 +565,82 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
 
     // BMM2 tail loop
     {
-      if (kv_loop + Cta_tile_p::N < kv_loop_end) {
-        // Trigger the load for the next Q/K values
-        // Advance K rows and rewind QK cols
-        int col_steps = fmha::div_up((int)Kernel_traits::VALID_D, (int)Kernel_traits::CTA_P_TILE_K);
-        // Enforce warp-uniform value. Removing this one line can contribute to 10% perf drop
-        // due to register spills
-        col_steps = __shfl_sync(0xffffffff, col_steps, 0);
-
-        if constexpr (Kernel_traits::RELOAD_Q) {
-          gmem_q.move_col();
-          gmem_q.rewind_col(col_steps);
-          smem_q.move_to_next_write_buffer();
-          gmem_q.load(smem_q);
-        }
-        gmem_k.move();
-        gmem_k.move_col();
-        gmem_k.rewind_col(col_steps);
-        smem_k.move_to_next_write_buffer();
-        gmem_k.load(smem_k);
-
-        // Push the LDGDEPBAR instruction after the loads for K.
-        fmha::ldgdepbar<USE_LDGSTS>();
-
-        if constexpr (Kernel_traits::RELOAD_Q) {
-          gmem_q.commit(smem_q);
-        }
-        gmem_k.commit(smem_k);
-
-        // Wait for V to finish loading
-        fmha::depbar_<USE_LDGSTS, 1>();
-        __syncthreads();
+      if constexpr (Kernel_traits::USE_TMA_GLM) {
+        tma.wait(1, ((kv_loop - kv_loop_start) / 64) & 1);
       } else {
-        fmha::depbar_<USE_LDGSTS, 0>();
-        __syncthreads();
+        if (kv_loop + Cta_tile_p::N < kv_loop_end) {
+          // Trigger the load for the next Q/K values
+          // Advance K rows and rewind QK cols
+          int col_steps =
+              fmha::div_up((int)Kernel_traits::VALID_D, (int)Kernel_traits::CTA_P_TILE_K);
+          // Enforce warp-uniform value. Removing this one line can contribute to 10% perf drop
+          // due to register spills
+          col_steps = __shfl_sync(0xffffffff, col_steps, 0);
+
+          if constexpr (Kernel_traits::RELOAD_Q) {
+            gmem_q.move_col();
+            gmem_q.rewind_col(col_steps);
+            smem_q.move_to_next_write_buffer();
+            gmem_q.load(smem_q);
+          }
+          gmem_k.move();
+          gmem_k.move_col();
+          gmem_k.rewind_col(col_steps);
+          smem_k.move_to_next_write_buffer();
+          gmem_k.load(smem_k);
+
+          // Push the LDGDEPBAR instruction after the loads for K.
+          fmha::ldgdepbar<USE_LDGSTS>();
+
+          if constexpr (Kernel_traits::RELOAD_Q) {
+            gmem_q.commit(smem_q);
+          }
+          gmem_k.commit(smem_k);
+
+          // Wait for V to finish loading
+          fmha::depbar_<USE_LDGSTS, 1>();
+          __syncthreads();
+        } else {
+          fmha::depbar_<USE_LDGSTS, 0>();
+          __syncthreads();
+        }
       }
 
 // Do this part of O = P^T * V^T.
 #pragma unroll
       for (int ki = 0; ki < BMM2_TAIL_MMAS_K_BOUND; ++ki) {
         int p_ki = BMM2_MAIN_MMAS_K_BOUND + ki;
-        smem_v.load(frag_v[ki], ki);
-        fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+        if constexpr (Kernel_traits::USE_TMA_GLM) {
+#pragma unroll
+          for (int ni = 0; ni < Mma_tile_o::VALID_MMAS_N; ++ni) {
+            typename Smem_tile_v::Fragment v;
+            smem_v.load_one(v, ni, ki);
+            acc_o[0][ni].mma(frag_p[p_ki][0], v);
+          }
+        } else {
+          smem_v.load(frag_v[ki], ki);
+          fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+        }
       }
 
       smem_v.move_to_next_read_buffer();
     }  // end BMM2 tail loop
+
+    // Likewise, release the single V buffer before the next BMM1 tail load.
+    if constexpr (!Kernel_traits::USE_GRANULAR_TILING) {
+      __syncthreads();
+    }
 
   }  // Inner loop over the key/value sequence length.
 
   // Update the sum if attention sinks are used.
   acc_o_normalizer.update_sum(global_max, global_sum);
   // Update acc_o of flash attention
-  acc_o_normalizer.final_update(acc_o, global_sum);
+  if constexpr (BLOCK_SCALED) {
+    acc_o_normalizer.final_update(acc_o, global_sum, value_scale);
+  } else {
+    acc_o_normalizer.final_update(acc_o, global_sum);
+  }
 
   // If kv_loop breaks prematurely in case of causal masking, make sure there is no data in-flight
   if (Kernel_traits::CAUSAL_MASK) {
@@ -544,26 +649,31 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   // Wait for last round of LDS K/V to finish
   __syncthreads();
 
+  if constexpr (Kernel_traits::DIRECT_16BIT_OUTPUT) {
+    gmem_o.template store_accumulators<Kernel_traits::USE_TMA_GLM>(acc_o, params, binfo, tidx,
+                                                                   q_loop * Gmem_tile_o::ROWS);
+  } else {
 // Loop over MMAS_M.
 #pragma unroll
-  for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii) {
-    // Swizzle the elements and do the final reduction.
-    smem_o.store(acc_o, ii);
+    for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii) {
+      // Swizzle the elements and do the final reduction.
+      smem_o.store(acc_o, ii);
 
-    // Make sure the data is in shared memory.
-    __syncthreads();
-
-    // Load from shared memory.
-    uint4 out[Gmem_tile_o::STGS_PER_LOOP];
-    smem_o.load(out);
-
-    // Make sure the data was read from shared memory.
-    if (ii < Gmem_tile_o::LOOPS - 1) {
+      // Make sure the data is in shared memory.
       __syncthreads();
-    }
 
-    // Output the values.
-    gmem_o.store(out, ii);
+      // Load from shared memory.
+      uint4 out[Gmem_tile_o::STGS_PER_LOOP];
+      smem_o.load(out);
+
+      // Make sure the data was read from shared memory.
+      if (ii < Gmem_tile_o::LOOPS - 1) {
+        __syncthreads();
+      }
+
+      // Output the values.
+      gmem_o.store(out, ii);
+    }
   }
   if (params.softmax_stats_ptr != nullptr) {
     using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;

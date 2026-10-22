@@ -1,0 +1,221 @@
+{
+  "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell (SM120)",
+  "baseline_commit": "481a4e4a11e25e742f25162b2fa85d85729dafdc",
+  "input": "captured GLM layer 23, B=1 H=20 Dqk=Dv=256, causal, FP8 E4M3 to BF16",
+  "timer": "CUDA graph/events, four alternating rounds, 60 ms timing window per entry",
+  "results": [
+    {
+      "tokens": 1024,
+      "baseline_ms": 0.06589308541918558,
+      "optimized_ms": 0.049800103213616866,
+      "fused_reference_ms": 0.053351460366054204,
+      "latency_reduction_pct": 24.42286941519215,
+      "speedup_pct": 32.3151583371988,
+      "vs_fused_latency_pct": -6.656532226242396,
+      "output_bitwise_equal": true
+    },
+    {
+      "tokens": 2048,
+      "baseline_ms": 0.21259384497092187,
+      "optimized_ms": 0.15743719037079934,
+      "fused_reference_ms": 0.15007989419041484,
+      "latency_reduction_pct": 25.944615004101713,
+      "speedup_pct": 35.03406944078233,
+      "vs_fused_latency_pct": 4.902253043335625,
+      "output_bitwise_equal": true
+    },
+    {
+      "tokens": 5093,
+      "baseline_ms": 1.217821810196857,
+      "optimized_ms": 0.8871802685865715,
+      "fused_reference_ms": 0.7990898943376972,
+      "latency_reduction_pct": 27.15023978399913,
+      "speedup_pct": 37.26881146004899,
+      "vs_fused_latency_pct": 11.023837852671825,
+      "output_bitwise_equal": true
+    }
+  ],
+  "profiling": {
+    "prior_full_tile": {
+      "registers_per_thread": 248,
+      "dynamic_smem_kib": 64,
+      "resident_block_limit": 1,
+      "occupancy_pct": 8.33,
+      "compute_throughput_pct": 52.0,
+      "local_load_instructions": 0,
+      "local_store_instructions": 0
+    },
+    "optimized": {
+      "registers_per_thread": 248,
+      "dynamic_smem_kib": 48,
+      "resident_block_limit": 2,
+      "occupancy_pct": 16.07,
+      "compute_throughput_pct": 62.46,
+      "local_load_instructions": 0,
+      "local_store_instructions": 0
+    },
+    "fused_reference": {
+      "registers_per_thread": 255,
+      "dynamic_smem_kib": 49,
+      "resident_block_limit": 2,
+      "occupancy_pct": 16.44,
+      "compute_throughput_pct": 72.87,
+      "local_load_instructions": 0,
+      "local_store_instructions": 0
+    }
+  },
+  "synthetic_reproduction": [
+    {
+      "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+      "timer": "CUDA graph/events",
+      "flashinfer_version": "0.7.2",
+      "flashinfer_path": "/sgl-workspace/flashinfer/flashinfer/__init__.py"
+    },
+    {
+      "shape": [
+        1,
+        1024,
+        20,
+        256
+      ],
+      "median_ms": {
+        "current": 0.05010640025138855,
+        "baseline": 0.0660087987780571
+      },
+      "samples_ms": {
+        "current": [
+          0.05002959966659546,
+          0.0501583993434906,
+          0.050260800123214724,
+          0.0500544011592865
+        ],
+        "baseline": [
+          0.06605439782142639,
+          0.0659879982471466,
+          0.0660295993089676,
+          0.06597920060157776
+        ]
+      }
+    },
+    {
+      "shape": [
+        1,
+        2048,
+        20,
+        256
+      ],
+      "median_ms": {
+        "current": 0.1574852019548416,
+        "baseline": 0.21205239892005923
+      },
+      "samples_ms": {
+        "current": [
+          0.1574720025062561,
+          0.15739600062370301,
+          0.15752320289611815,
+          0.15749840140342714
+        ],
+        "baseline": [
+          0.2120527982711792,
+          0.21205199956893922,
+          0.21205199956893922,
+          0.2120527982711792
+        ]
+      }
+    },
+    {
+      "shape": [
+        1,
+        5093,
+        20,
+        256
+      ],
+      "median_ms": {
+        "current": 0.8858440160751343,
+        "baseline": 1.2043083906173706
+      },
+      "samples_ms": {
+        "current": [
+          0.8763984203338623,
+          0.8851784229278565,
+          0.8865096092224121,
+          0.8891200065612793
+        ],
+        "baseline": [
+          1.2022351741790773,
+          1.2034895896911622,
+          1.2051271915435793,
+          1.2060080051422117
+        ]
+      }
+    }
+  ],
+  "validation": {
+    "native_tests_passed": 100,
+    "native_tests_deselected": 421,
+    "paired_real_output_lse_bitwise_comparisons": 28,
+    "updated_cuda_graph_cases": 7,
+    "racecheck_errors": 0,
+    "memcheck_errors": 0,
+    "final_vs_profiled_sass_equal_kernels": 8
+  },
+  "serving": {
+    "initial": {
+      "qps": 4.707083269270846,
+      "mean_e2e_ms": 2309.6973525785143,
+      "p95_e2e_ms": 3563.7168254354033,
+      "output_tokens_per_sec": 438.5001096570989,
+      "mean_output_tokens": 93.1575,
+      "successes": 400,
+      "requests": 400,
+      "round_qps": [
+        4.7232411730167705,
+        4.691035538924222
+      ]
+    },
+    "optimized": {
+      "qps": 4.841203650910476,
+      "mean_e2e_ms": 2241.699498143862,
+      "p95_e2e_ms": 3277.889274666086,
+      "output_tokens_per_sec": 465.57855510806047,
+      "mean_output_tokens": 96.17,
+      "successes": 400,
+      "requests": 400,
+      "round_qps": [
+        4.856491123645214,
+        4.826012121297123
+      ]
+    },
+    "fused": {
+      "qps": 5.303673035908935,
+      "mean_e2e_ms": 2042.1995773969684,
+      "p95_e2e_ms": 3031.2744310474955,
+      "output_tokens_per_sec": 505.1748566703261,
+      "mean_output_tokens": 95.25,
+      "successes": 400,
+      "requests": 400,
+      "round_qps": [
+        5.266543201402206,
+        5.341330128260387
+      ]
+    },
+    "delta_optimized_vs_initial_pct": {
+      "qps": 2.8493309756214558,
+      "mean_e2e_ms": -2.944015775865194,
+      "p95_e2e_ms": -8.020489976343615,
+      "output_tokens_per_sec": 6.175242572262185,
+      "mean_output_tokens": 3.2337707645653913
+    },
+    "config": {
+      "concurrency": 11,
+      "count": 200,
+      "repeats": 2,
+      "flush_kv_before_each_repeat": true,
+      "warmup_requests": 9,
+      "max_tokens": 128,
+      "temperature": 0.6,
+      "stream": false,
+      "dataset_sha256": "aeb4bbe4af87784d8b12f7a39b07d242019ba61b135943d4198a977559eb2dd0"
+    }
+  }
+}
