@@ -70,6 +70,7 @@ from moe_hopper_fp8.kernel_fp8_glu_fc12_swapab import (
 )
 from moe_nvfp4_swapab.moe_utils import spin_wait
 from moe_nvfp4_swapab.topk_reduce import TopkReduce
+from moe_hopper_fp8.internode_topk_reduce import InternodeTopkReduce
 from src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
@@ -146,6 +147,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         generate_c: bool = False,
         # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
         tail_split_pairs: bool = False,
+        # Internode (NCCL GIN rail proxy pull, see TokenInPullTokenBackPush):
+        # ranks per NVLink domain; None = one domain spanning the world.
+        ranks_per_node: Optional[int] = None,
+        enable_nccl_gin: bool = False,
     ) -> None:
         # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
         # only possible with a single active dispatch warp.  Without the
@@ -172,6 +177,18 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # NVFP4 naming: any non-epi mode stages fc2 rows locally and pushes
         # them back from the dispatch warp area.
         token_back_by_dispatch = token_back_mode != "epi_warps"
+        if enable_nccl_gin:
+            if fc2_in_kernel_topk_reduce:
+                raise NotImplementedError(
+                    "enable_nccl_gin needs the separate internode TopkReduce "
+                    "(fc2_in_kernel_topk_reduce=False): the node partials are "
+                    "added after the kernel."
+                )
+            if not apply_topk_in_fc1:
+                raise NotImplementedError(
+                    "enable_nccl_gin requires apply_topk_in_fc1=True (the rail "
+                    "peer reduce sums already-weighted FC2 rows)."
+                )
         if fc2_in_kernel_topk_reduce and not apply_topk_in_fc1:
             raise ValueError(
                 "fc2_in_kernel_topk_reduce requires apply_topk_in_fc1=True; "
@@ -236,6 +253,13 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         self.hidden = hidden
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.combine_format = CombineFormat.parse("bf16")
+        self.enable_nccl_gin = bool(enable_nccl_gin)
+        self.ranks_per_node = (
+            world_size if ranks_per_node is None else int(ranks_per_node)
+        )
+        self.num_nodes = world_size // self.ranks_per_node
+        # Remote node slots: landing / receive planes are indexed by them.
+        self.num_remote_slots = self.num_nodes - 1 if self.enable_nccl_gin else 0
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
@@ -361,6 +385,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             # Only the active dispatch warps get a pull-buffer slot; the idle
             # slots would otherwise cost 3 * hidden_bytes of AB-stage SMEM.
             compact_pull_buffer=compact_pull_buffer,
+            ranks_per_node=self.ranks_per_node,
+            enable_nccl_gin=self.enable_nccl_gin,
+            global_rank=self.local_rank,
+            max_tokens_per_rank=self.max_tokens_per_rank,
         )
 
         # Region layout (same call drives both get_workspace_sizes() and the
@@ -497,7 +525,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             _RegionSpec(
                 "expert_send_count",
                 cutlass.Int64,
-                (num_total_experts,),
+                # One reservation set per source this rank prepares: its own
+                # tokens, plus (internode) every remote origin it proxies.
+                (num_total_experts * (1 + self.num_remote_slots),),
                 16,
             ),
             _RegionSpec(
@@ -534,6 +564,18 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 )
             )
 
+        if self.enable_nccl_gin:
+            # [0] = this rank's valid-token count, [1 + s] = the count of the
+            # remote origin proxied under slot s (atomicMax of token + 1).
+            specs.append(
+                _RegionSpec(
+                    "gin_token_count",
+                    cutlass.Int32,
+                    (1 + self.num_remote_slots,),
+                    16,
+                )
+            )
+
         # Data buffers start at l1_token_buffer. The persistent NVLink phase
         # counter is intentionally after the reset prefix.
         specs += [
@@ -545,6 +587,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ),
             _RegionSpec(
                 "nvlink_barrier_counter",
+                cutlass.Int32,
+                (1,),
+                16,
+            ),
+            # Persistent launch counter (internode payload flags compare
+            # against it); outside the reset prefix like the NVLink phase.
+            _RegionSpec(
+                "gin_epoch",
                 cutlass.Int32,
                 (1,),
                 16,
@@ -634,17 +684,59 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ),
         ]
 
+        if self.enable_nccl_gin:
+            slots = self.num_remote_slots
+            hidden = self.hidden
+            specs += [
+                # Monotonic per-launch flags: payload of slot s landed here
+                # (read by this node's owners).  Never reset.
+                _RegionSpec("gin_payload_flag", cutlass.Int32, (slots,), 16),
+                # Stage 1 landing planes (RDMA destination, then LSA source).
+                _RegionSpec(
+                    "gin_recv_topk_idx", cutlass.Int64,
+                    (slots, max_tokens_per_rank, num_topk), 128,
+                ),
+                _RegionSpec(
+                    "gin_recv_topk_weights", cutlass.Float32,
+                    (slots, max_tokens_per_rank, num_topk), 128,
+                ),
+                _RegionSpec(
+                    "gin_recv_token", cutlass.Uint8,
+                    (slots, max_tokens_per_rank, self.hidden_bytes), 128,
+                ),
+                _RegionSpec(
+                    "gin_recv_sf", cutlass.Int32,
+                    (slots, max_tokens_per_rank, self.sf_uint32_per_token), 128,
+                ),
+                # Node partials: return put source here, destination at origin.
+                _RegionSpec(
+                    "gin_reduce_buf", cutlass.BFloat16,
+                    (slots, max_tokens_per_rank, hidden), 128,
+                ),
+                _RegionSpec(
+                    "gin_remote_partial", cutlass.BFloat16,
+                    (slots, max_tokens_per_rank, hidden), 128,
+                ),
+            ]
+
         # The per-topk FC2 plane is an implementation workspace, not public IO.
         # It is the cross-rank STG/TMA target and therefore belongs in the shared
         # symmetric workspace. In-kernel reduce accumulates directly into
         # output_activation (REDG from epi_warps, or bulk reduce push from the
         # dispatch token-back modes) and needs no staging.
         if not self.fc2_in_kernel_topk_reduce:
+            # Rows [0, T): this rank's own (token, topk) cells.  Internode:
+            # rows T + s*T + t are the landing rows of the remote origin
+            # proxied under slot s (node owners write them like local cells).
             specs.append(
                 _RegionSpec(
                     "unreduced_expert_output",
                     self.combine_format.act_dtype,
-                    (max_tokens_per_rank, num_topk, self.hidden),
+                    (
+                        max_tokens_per_rank * (1 + self.num_remote_slots),
+                        num_topk,
+                        self.hidden,
+                    ),
                     128,
                 )
             )
@@ -793,6 +885,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # Codegen / runtime.
         max_active_clusters: cutlass.Constexpr,
         stream,
+        # Internode only: nccl4py ``DevComm`` / ``Window`` of the registered
+        # arena (every peer-visible buffer above lives inside that window).
+        gin_dev_comm=None,
+        gin_window=None,
     ) -> None:
         """Launch the FP8 MegaMoE-complete fused kernel.
 
@@ -960,6 +1056,30 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             16,
         )
 
+        gin_views = {}
+        if cutlass.const_expr(self.enable_nccl_gin):
+            gin_views = dict(
+                gin_dev_comm=gin_dev_comm,
+                gin_window=gin_window,
+                gin_recv_topk_idx=self._view_shared(
+                    shared_workspace, "gin_recv_topk_idx",
+                ),
+                gin_recv_topk_weights=self._view_shared(
+                    shared_workspace, "gin_recv_topk_weights",
+                ),
+                gin_recv_token=self._view_shared(shared_workspace, "gin_recv_token"),
+                gin_recv_sf=self._view_shared(shared_workspace, "gin_recv_sf"),
+                gin_reduce_buf=self._view_shared(shared_workspace, "gin_reduce_buf"),
+                gin_remote_partial=self._view_shared(
+                    shared_workspace, "gin_remote_partial",
+                ),
+                gin_payload_flag=self._view_shared(
+                    shared_workspace, "gin_payload_flag",
+                ),
+                gin_token_count=self._view_local(local_workspace, "gin_token_count"),
+                gin_epoch=self._view_local(local_workspace, "gin_epoch"),
+            )
+
         token_comm_args = ExtractedTokenCommArgs(
             input_token_buffer=activation,
             input_sf_buffer=activation_sf,
@@ -993,6 +1113,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
             sm_count=sm_count,
+            **gin_views,
         )
 
         _fc12_kwargs = dict(
@@ -1028,7 +1149,25 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # into the SwiGLU output before FC1-output quantization, while the
         # transformers graph leaves each term unweighted and applies scores in
         # this standalone reducer.
-        if cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
+        if cutlass.const_expr(self.enable_nccl_gin):
+            # Node-ordered reduce (I11): local cells of this node's experts in
+            # top-k order, then one returned partial per remote node.
+            InternodeTopkReduce(
+                self.hidden,
+                self.num_topk,
+                num_experts_per_rank=self.num_experts_per_rank,
+                ranks_per_node=self.ranks_per_node,
+                num_nodes=self.num_nodes,
+                my_node=self.local_rank // self.ranks_per_node,
+                max_tokens_per_rank=self.max_tokens_per_rank,
+            )(
+                combine_target,
+                topk_idx,
+                self._view_shared(shared_workspace, "gin_remote_partial"),
+                output_activation,
+                stream,
+            )
+        elif cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1)
                 else None
@@ -1052,6 +1191,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
 
     def token_comm_extra_smem_storage_class(self) -> type:
         return self.token_comm.extra_smem_storage_class()
+
+    def token_comm_hook_prepare_device_resources(self, token_comm_args):
+        self.token_comm.prepare_device_resources(token_comm_args)
 
     def token_comm_hook_fc1_ready_counter_ptr(self, token_comm_args):
         return self.token_comm.fc1_ready_counter_ptr(token_comm_args)

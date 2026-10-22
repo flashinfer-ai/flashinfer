@@ -197,6 +197,10 @@ class MegaMoEHopperFp8Config:
     apply_topk_in_fc1: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    # Internode (NCCL GIN rail proxy pull): ranks per NVLink domain (None =
+    # one domain spanning the world) and the GIN transport switch.
+    ranks_per_node: Optional[int] = None
+    enable_nccl_gin: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in _KIND_TO_TORCH_DTYPE:
@@ -434,6 +438,10 @@ class MegaMoEHopperFp8Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+        # Internode: the session's NCCL GIN arena and the shared-workspace
+        # slice carved from it (set by get_symm_buffer_for_hopper_fp8_mega_moe).
+        self._gin_arena: Optional[Any] = None
+        self._gin_shared_workspace: Optional[torch.Tensor] = None
 
     @property
     def config(self) -> MegaMoEHopperFp8Config:
@@ -627,6 +635,8 @@ class MegaMoEHopperFp8Frontend:
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
             c.enable_iket,
+            c.ranks_per_node,
+            c.enable_nccl_gin,
         )
 
     @staticmethod
@@ -660,15 +670,12 @@ class MegaMoEHopperFp8Frontend:
                     "shapes."
                 )
 
-    def _ensure_mega_compiled(self, inputs: MegaMoEHopperFp8Inputs) -> _CompiledMega:
-        key = self._mega_compile_key()
-        if self._mega is not None and self._mega_key == key:
-            return self._mega
+    def _build_kernel(self):
+        """Instantiate the mega kernel object for the current config.
 
-        ensure_not_capturing("cute.compile + symmetric-heap allocation")
-        self._release_workspace()
-
-        import cutlass.cute as cute
+        Returns ``(kernel, max_active_clusters)``; no compile, no allocation
+        (the internode arena sizes the shared workspace from it).
+        """
         import cutlass.utils as cutlass_utils
 
         from common.megamoe_constants import Fp8E8M0SfVecSize, SfPaddingBlock
@@ -740,7 +747,24 @@ class MegaMoEHopperFp8Frontend:
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
             tail_split_pairs=c.tail_split_pairs,
+            ranks_per_node=c.ranks_per_node,
+            enable_nccl_gin=c.enable_nccl_gin,
         )
+
+        return kernel, max_active_clusters
+
+    def _ensure_mega_compiled(self, inputs: MegaMoEHopperFp8Inputs) -> _CompiledMega:
+        key = self._mega_compile_key()
+        if self._mega is not None and self._mega_key == key:
+            return self._mega
+
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+        self._release_workspace()
+
+        import cutlass.cute as cute
+
+        kernel, max_active_clusters = self._build_kernel()
+        c = self.config
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -748,11 +772,30 @@ class MegaMoEHopperFp8Frontend:
             dtype=torch.uint8,
             device="cuda",
         )
-        shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-        )
+        if c.enable_nccl_gin:
+            # Internode: the shared workspace is a slice of the session's
+            # registered NCCL arena (pre-sized at symm-buffer creation; the
+            # shared regions do not depend on the launch geometry).
+            arena = self._gin_arena
+            shared_workspace = self._gin_shared_workspace
+            if arena is None or shared_workspace is None:
+                raise RuntimeError(
+                    "enable_nccl_gin sessions must be created with "
+                    "get_symm_buffer_for_hopper_fp8_mega_moe(enable_nccl_gin=True)."
+                )
+            if shared_workspace.numel() < shared_ws_bytes:
+                raise RuntimeError(
+                    f"GIN arena shared workspace too small: {shared_workspace.numel()} "
+                    f"< {shared_ws_bytes} bytes."
+                )
+            symmetric_base = arena.base
+            peer_offsets_list = arena.peer_offsets
+        else:
+            shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
+            symmetric_base, peer_offsets_list = _compute_peer_offsets(
+                shared_workspace,
+                c.world_size,
+            )
 
         mega = _CompiledMega(
             compiled=None,
@@ -801,7 +844,9 @@ class MegaMoEHopperFp8Frontend:
     def _release_workspace(self) -> None:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
-            free_sym_tensor(self._mega.shared_workspace)
+            # Internode: the shared workspace belongs to the GIN arena.
+            if not self._config.enable_nccl_gin:
+                free_sym_tensor(self._mega.shared_workspace)
         # The cache entry dies with the workspace: if a recompile fails after
         # the free, a stale (_mega, _mega_key) hit would launch against freed
         # symmetric memory.
@@ -1125,12 +1170,19 @@ class MegaMoEHopperFp8Frontend:
             )
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        # The offset table covers this NVLink domain only (= the world on a
+        # single node); internode traffic goes through the GIN arena.
+        node_ranks = c.ranks_per_node if c.enable_nccl_gin else c.world_size
         peer_rank_ptr_mapper_host = SymBufferHost(
             base_addr=mega.symmetric_base,
             offsets=tuple(mega.peer_offsets_list),
-            rank_idx=c.rank,
-            num_max_ranks=c.world_size,
+            rank_idx=c.rank % node_ranks,
+            num_max_ranks=node_ranks,
         )
+        gin_kwargs = {}
+        if c.enable_nccl_gin:
+            gin_dev_comm, gin_window = self._gin_arena.kernel_handles()
+            gin_kwargs = dict(gin_dev_comm=gin_dev_comm, gin_window=gin_window)
 
         return dict(
             activation=self._to_cute(inputs.activation),
@@ -1161,6 +1213,7 @@ class MegaMoEHopperFp8Frontend:
             shared_workspace=self._to_cute_ptr(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             stream=stream,
+            **gin_kwargs,
         )
 
 
@@ -1248,6 +1301,8 @@ class MegaMoEHopperFp8SymmBuffer:
     # launch cache keys (data_ptrs) stay stable across launches.
     _unit_scales: Dict[Tuple[str, int], torch.Tensor] = field(default_factory=dict)
     _destroyed: bool = False
+    # Internode: the registered NCCL GIN arena every buffer above lives in.
+    _gin_arena: Optional[Any] = None
 
     @property
     def fc1_c(self) -> Optional[torch.Tensor]:
@@ -1263,6 +1318,9 @@ class MegaMoEHopperFp8SymmBuffer:
             free_sym_tensor(root)
         self._sym_roots.clear()
         self._unit_scales.clear()
+        if self._gin_arena is not None:
+            self._gin_arena.close()
+            self._gin_arena = None
         self._destroyed = True
 
     @property
@@ -1323,6 +1381,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     num_sched_stages: Optional[int] = None,
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
+    ranks_per_node: Optional[int] = None,
+    enable_nccl_gin: bool = False,
 ) -> MegaMoEHopperFp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one SM90 FP8 session.
 
@@ -1483,6 +1543,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         num_sched_stages=num_sched_stages,
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
+        ranks_per_node=ranks_per_node,
+        enable_nccl_gin=enable_nccl_gin,
     )
     if knob_overrides:
         # Non-geometry knobs from the cache/dict (token_back_mode,
@@ -1493,6 +1555,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     frontend = MegaMoEHopperFp8Frontend(cfg)
 
     data_dtype = cfg.torch_ab_dtype
+    if cfg.enable_nccl_gin:
+        return _get_internode_symm_buffer(cfg, frontend)
 
     sym_roots: list[torch.Tensor] = []
     x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
@@ -1547,6 +1611,87 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         output_activation=output_activation,
         _frontend=frontend,
         _sym_roots=sym_roots,
+    )
+
+
+def _get_internode_symm_buffer(
+    cfg: MegaMoEHopperFp8Config,
+    frontend: MegaMoEHopperFp8Frontend,
+) -> MegaMoEHopperFp8SymmBuffer:
+    """Internode session: carve every peer-visible buffer out of one GIN arena.
+
+    The arena is registered once (window registration is collective), so it is
+    sized here for the inputs, the output and the kernel's shared workspace
+    (whose regions depend only on the problem shape, not on the launch
+    geometry a later knob change may pick).  NVSHMEM is never initialised.
+    """
+    from src.token_comm import TokenInPullTokenBackPush
+
+    from .gin_arena import GinArena
+
+    if cfg.ranks_per_node is None:
+        raise ValueError("enable_nccl_gin requires ranks_per_node.")
+    if cfg.in_kernel_fc2_reduce:
+        raise NotImplementedError(
+            "enable_nccl_gin requires the separate (internode) TopkReduce."
+        )
+    num_nodes = cfg.world_size // cfg.ranks_per_node
+    t_max = cfg.num_tokens_per_rank
+    hidden = cfg.hidden
+    kernel, _ = frontend._build_kernel()
+    _, shared_ws_bytes = kernel.get_workspace_sizes()
+    if cfg.blockwise:
+        sf_shape = (t_max, _round_up(hidden // _FP8_BLOCK_SCALE_K, 4))
+        sf_dtype = torch.float32
+    else:
+        sf_shape = (t_max, _round_up(_ceil_div(hidden, _FP8_E8M0_SF_VEC_SIZE), 4))
+        sf_dtype = torch.uint8
+    plan = [
+        ((t_max, hidden), torch.uint8),
+        (sf_shape, sf_dtype),
+        ((t_max, cfg.num_topk), torch.int64),
+        ((t_max, cfg.num_topk), torch.float32),
+        ((t_max, hidden), torch.bfloat16),
+        ((shared_ws_bytes,), torch.uint8),
+    ]
+    capacity = sum(GinArena.padded_bytes(sh, dt) for sh, dt in plan) + 4096
+    arena = GinArena(
+        rank=cfg.rank,
+        world_size=cfg.world_size,
+        ranks_per_node=cfg.ranks_per_node,
+        capacity_bytes=capacity,
+        signal_count=TokenInPullTokenBackPush.internode_signal_count(num_nodes),
+    )
+    x = arena.alloc((t_max, hidden), torch.uint8).view(cfg.torch_ab_dtype)
+    if cfg.blockwise:
+        x_sf = arena.alloc(sf_shape, torch.float32)
+    else:
+        x_sf = arena.alloc(sf_shape, torch.uint8).view(_E8M0_SCALE_DTYPE)
+    topk_idx = arena.alloc((t_max, cfg.num_topk), torch.int64)
+    topk_idx.fill_(-1)
+    topk_weights = arena.alloc((t_max, cfg.num_topk), torch.float32)
+    output_activation = arena.alloc((t_max, hidden), torch.bfloat16)
+    frontend._gin_arena = arena
+    frontend._gin_shared_workspace = arena.alloc((shared_ws_bytes,), torch.uint8)
+    torch.cuda.synchronize()
+    return MegaMoEHopperFp8SymmBuffer(
+        num_total_experts=cfg.num_total_experts,
+        num_max_tokens=t_max,
+        num_topk=cfg.num_topk,
+        hidden=hidden,
+        intermediate=cfg.intermediate,
+        rank=cfg.rank,
+        world_size=cfg.world_size,
+        kind=cfg.kind,
+        fp8_scale_mode=cfg.fp8_scale_mode,
+        x=x,
+        x_sf=x_sf,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        output_activation=output_activation,
+        _frontend=frontend,
+        _sym_roots=[],
+        _gin_arena=arena,
     )
 
 

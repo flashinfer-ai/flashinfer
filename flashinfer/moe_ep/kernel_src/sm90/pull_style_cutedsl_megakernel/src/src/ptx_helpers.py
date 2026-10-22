@@ -517,3 +517,94 @@ def _fence_rel_gpu(
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
     """
     llvm.fence(llvm.AtomicOrdering.release, syncscope="device", loc=loc, ip=ip)
+
+# ---------------------------------------------------------------------------
+# Internode (NCCL GIN) combine helpers: 16-byte raw global load/store and the
+# BF16x2 <-> FP32 conversions the rail-peer node reduce needs.  The load and
+# the unpack return LLVM literal structs (not vectors) so no vector aggregate
+# crosses the inline-asm boundary.
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def ldg_b128_raw(addr: Int64, *, loc=None, ip=None):
+    """``ld.global.v4.u32`` from a raw 16-byte-aligned byte address.
+
+    Returns the four 32-bit words (lowest address first) as ``Int32`` values.
+    """
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [addr.ir_value()],
+        "ld.global.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+@dsl_user_op
+def stg_b128_raw(addr: Int64, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None, ip=None) -> None:
+    """``st.global.v4.u32`` of four 32-bit words to a raw 16-byte-aligned address."""
+    llvm.inline_asm(
+        None,
+        [
+            addr.ir_value(),
+            Int32(w0).ir_value(),
+            Int32(w1).ir_value(),
+            Int32(w2).ir_value(),
+            Int32(w3).ir_value(),
+        ],
+        "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def bf16x2_to_f32x2(word: Int32, *, loc=None, ip=None):
+    """Widen a packed BF16 pair (low half = lower address) to two FP32 values (exact)."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [Int32(word).ir_value()],
+        "{\n"
+        "  .reg .b32 lo, hi;\n"
+        "  shl.b32 lo, $2, 16;\n"
+        "  and.b32 hi, $2, 0xffff0000;\n"
+        "  mov.b32 $0, lo;\n"
+        "  mov.b32 $1, hi;\n"
+        "}",
+        "=f,=f,r",
+        has_side_effects=False,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Int32:
+    """Round two FP32 values to BF16 (RN) and pack them, ``lo`` in the low half."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(hi).ir_value(), Float32(lo).ir_value()],
+            "cvt.rn.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )

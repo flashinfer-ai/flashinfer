@@ -1575,6 +1575,10 @@ class Sm90SwigluFp8Fc12Kernel:
         """
         return 1
 
+    def token_comm_hook_prepare_device_resources(self, token_comm_args):
+        """Kernel entry: materialize comm handles (NCCL GIN).  No-op base."""
+        pass
+
     @cute.jit
     def token_comm_hook_sched_warp_pre_init_wait(self, token_comm_args):
         """Sched warp: wait for dispatch barrier before reading sizes.  No-op base."""
@@ -2734,6 +2738,10 @@ class Sm90SwigluFp8Fc12Kernel:
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
+        # Internode: materialize the NCCL GIN handles while the by-value
+        # DevComm argument dominates the whole kernel (no-op otherwise).
+        if cutlass.const_expr(token_comm_args is not None):
+            self.token_comm_hook_prepare_device_resources(token_comm_args)
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 

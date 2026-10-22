@@ -1256,6 +1256,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
+        # Internode: materialize the NCCL GIN handles while the by-value
+        # DevComm argument dominates the whole kernel (no-op otherwise).
+        if cutlass.const_expr(token_comm_args is not None):
+            self.token_comm_hook_prepare_device_resources(token_comm_args)
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 
