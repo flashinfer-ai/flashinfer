@@ -1131,7 +1131,7 @@ ARCHES = ("sm_90a",)
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (9, 0): "sm_90a",
 }
-# The stages in registry order; the two persistent stages and the fifteen
+# The stages in registry order; the four persistent stages and the fifteen
 # shipped small-selection variants.
 STAGES: tuple[str, ...] = tuple(MODULES)
 PERSISTENT_STAGES = (
