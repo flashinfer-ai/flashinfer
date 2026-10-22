@@ -300,22 +300,25 @@ def _get_mm_fp4_cute_dsl_tactics(
 
 
 def _blockscaled_gemm_cache_key_files() -> tuple:
-    """Source files whose content invalidates the on-disk mm_fp4 kernels."""
+    """Source files whose content invalidates block-scaled GEMM objects."""
     from .kernels import (
         dense_blockscaled_gemm_sm100,
         dense_blockscaled_gemm_sm100_common,
         dense_blockscaled_gemm_sm103,
         dense_blockscaled_gemm_sm100_splitk,
         epilogue_utils,
+        utils,
     )
 
     return (
         __file__,
+        os.path.join(os.path.dirname(__file__), "gemm_mm_mxfp8_cute_dsl.py"),
         dense_blockscaled_gemm_sm100.__file__,
         dense_blockscaled_gemm_sm100_common.__file__,
         dense_blockscaled_gemm_sm103.__file__,
         dense_blockscaled_gemm_sm100_splitk.__file__,
         epilogue_utils.__file__,
+        utils.__file__,
         # Hash Rubin sources without importing its optional DSL dependencies.
         os.path.join(
             os.path.dirname(__file__), "kernels", "dense_blockscaled_gemm_sm107.py"
@@ -384,7 +387,7 @@ def _compile_block_scaled_gemm(
         batch_size=batch_size,
         max_active_clusters=max_active_clusters,
         per_token_alpha=per_token_alpha,
-        dynamic_max_active_clusters=cache_module_name == "mm_fp4",
+        dynamic_max_active_clusters=cache_module_name in ("mm_fp4", "mm_mxfp8"),
     )
 
     if cache_module_name is None:
@@ -397,7 +400,9 @@ def _compile_block_scaled_gemm(
             _blockscaled_kernel_disk_name(
                 cache_key,
                 batch_size,
-                None if cache_module_name == "mm_fp4" else max_active_clusters,
+                None
+                if cache_module_name in ("mm_fp4", "mm_mxfp8")
+                else max_active_clusters,
             ),
             compile_kernel,
             extra_key_files=_blockscaled_gemm_cache_key_files(),
@@ -409,7 +414,7 @@ def _compile_block_scaled_gemm(
 
 
 def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
-    """On-disk kernel name encoding every mm_fp4 codegen parameter.
+    """On-disk kernel name encoding every block-scaled codegen parameter.
 
     Must be symbol-safe as produced (see tests/jit/test_cute_dsl_cache.py):
     JitSpecCuteDsl sanitizes names, and two names differing only in
@@ -475,10 +480,10 @@ def _make_blockscaled_gemm_compile_fn(
     from cutlass.cute.runtime import make_ptr
 
     # Keep the shared GEMM wrapper's existing constexpr ABI for other callers
-    # (MXFP8 etc.). FP4 uses a runtime occupancy argument so one exported object
-    # works across GPU SKUs and can be compiled on a CPU release builder.
+    # (e.g. b12x). Packaged GEMMs pass occupancy at runtime so one exported
+    # object works across GPU SKUs and can be compiled on a CPU release builder.
     @cute.jit
-    def fp4_wrapper(
+    def dynamic_occupancy_wrapper(
         mA: cute.Tensor,
         mB: cute.Tensor,
         mC: cute.Tensor,
@@ -553,7 +558,7 @@ def _make_blockscaled_gemm_compile_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
         return cute.compile(
-            fp4_wrapper if dynamic_max_active_clusters else gemm.wrapper,
+            dynamic_occupancy_wrapper if dynamic_max_active_clusters else gemm.wrapper,
             a_fake,
             b_fake,
             c_fake,

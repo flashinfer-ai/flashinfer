@@ -507,7 +507,7 @@ FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some k
 **How it works:**
 - Auto-detects GPUs in system or reads `FLASHINFER_CUDA_ARCH_LIST` environment variable
 - CuTe-DSL AOT worker parallelism is controlled with `FLASHINFER_CUTE_DSL_AOT_WORKERS`; runtime FP4 autotuner precompilation uses `FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS`
-- To package another CuTe-DSL operation, register a `CuteDslAOTOperation` in `flashinfer/jit/cute_dsl_aot.py`. Its adapter owns supported architectures, named configurations, and a `JitSpecCuteDsl` factory; the shared builder handles spawned compilation, strict exports, and packaging. See `flashinfer/jit/gemm/cute_dsl_fp4.py` for the FP4 adapter. Keep tactic enumeration and kernel construction in the operation implementation, outside `gemm_base.py`.
+- To package another CuTe-DSL operation, register a `CuteDslAOTOperation` in `flashinfer/jit/cute_dsl_aot.py`. Its adapter owns supported architectures, named configurations, and a `JitSpecCuteDsl` factory; the shared builder handles spawned compilation, strict exports, and packaging. See `flashinfer/jit/gemm/cute_dsl_fp4.py` and `cute_dsl_mxfp8.py` for FP4 and MXFP8 adapters. MXFP8 packages the SM100 persistent/cluster split-K and native SM107 families for SM100a/103a/107a; its experimental warp split-K path remains JIT-only because it specializes on N/K. Keep tactic enumeration and kernel construction in the operation implementation, outside `gemm_base.py`.
 - JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
 - If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 

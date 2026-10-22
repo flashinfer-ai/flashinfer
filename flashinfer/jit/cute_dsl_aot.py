@@ -51,7 +51,9 @@ def get_aot_operations() -> tuple[CuteDslAOTOperation, ...]:
     """Register operation adapters here; imports must not initialize a GPU."""
     from .gemm.cute_dsl_fp4 import MM_FP4_OPERATION
 
-    return (MM_FP4_OPERATION,)
+    from .gemm.cute_dsl_mxfp8 import MM_MXFP8_OPERATION
+
+    return (MM_FP4_OPERATION, MM_MXFP8_OPERATION)
 
 
 def _compile_aot_kernel(operation, name, config, arch, jit_dir) -> Path:

@@ -79,11 +79,11 @@ from .gemm_mm_fp4_cute_dsl import (
 from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
+    _mm_mxfp8_cache_key,
+    _make_mm_mxfp8_kernel,
 )
 from ..experimental.cake_nvfp4_per_token.support import cake_mm_fp4_requirement
 from .kernels.utils import (
-    _SM107_MXFP8_MMA_INST_SHAPE_K,
-    _SM107_MXFP8_MMA_TILER_K,
     _get_sm107_mxfp8_tactics,
     _rank_mm_fp4_autotune_tactics,
     _select_sm100_mm_fp4_cute_dsl_tactic,
@@ -7066,9 +7066,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             ) = tactic
             if split_k_slices < 1:
                 raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
-            is_split_k = split_k_slices > 1
-
-            if is_split_k:
+            if split_k_slices > 1:
                 structurally_invalid = (
                     cluster_shape_mn != (1, 1) or not swap_ab or use_prefetch
                 )
@@ -7099,7 +7097,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                         use_prefetch,
                         split_k_slices,
                     ) = tactic
-                    is_split_k = False
 
             # Re-check whatever is about to launch against the narrow-tile
             # envelope (Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok):
@@ -7118,7 +7115,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                     use_prefetch,
                     split_k_slices,
                 ) = tactic
-                is_split_k = False
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -7136,39 +7132,12 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = (
-                sf_vec_size,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                swap_ab,
-                use_prefetch,
-                enable_pdl,
-                out_dtype,
-                split_k_slices,
-            )
+            cache_key = _mm_mxfp8_cache_key(tactic, enable_pdl, out_dtype)
 
-            make_kernel: Callable[[], object]
-            kernel_cache = _CUTE_DSL_MM_MXFP8_KERNEL_CACHE
-            if is_split_k:
-                make_kernel = lambda: split_k_kernel_cls(
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    split_k_slices,
-                    enable_pdl,
-                )
-            else:
-                make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    use_prefetch,
-                    enable_pdl,
-                )
-
-            compiled_gemm, _ = _compile_block_scaled_gemm(
-                kernel_cache,
+            compiled_gemm, max_active_clusters = _compile_block_scaled_gemm(
+                _CUTE_DSL_MM_MXFP8_KERNEL_CACHE,
                 cache_key,
-                make_kernel,
+                lambda: _make_mm_mxfp8_kernel(cache_key),
                 ab_cutlass_dtype=cutlass.Float8E4M3FN,
                 sf_dtype=sf_dtype,
                 c_cutlass_dtype=c_cutlass_dtype,
@@ -7180,6 +7149,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 sf_k=sf_k,
                 batch_size=batch_size,
                 cluster_shape_k=split_k_slices,
+                cache_module_name="mm_mxfp8",
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
@@ -7198,6 +7168,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 kernel_a_sf.data_ptr(),
                 kernel_b_sf.data_ptr(),
                 alpha_for_launch,
+                max_active_clusters,
             )
             return out
 
@@ -7255,7 +7226,6 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
             "Supported: torch.bfloat16, torch.float16."
         )
     c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
-    Sm107Kernel = _sm107_mxfp8_cute_dsl_kernel()
 
     class CuteDSLMxfp8Sm107GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -7309,15 +7279,11 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            compiled_gemm, _ = _compile_block_scaled_gemm(
+            cache_key = _mm_mxfp8_cache_key(tactic, False, out_dtype, native_sm107=True)
+            compiled_gemm, max_active_clusters = _compile_block_scaled_gemm(
                 _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE,
-                (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype),
-                lambda: Sm107Kernel(
-                    sf_vec_size,
-                    (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXFP8_MMA_INST_SHAPE_K),
-                    (mma_tiler_mn[0], mma_tiler_mn[1], _SM107_MXFP8_MMA_TILER_K),
-                    cluster_shape_mn,
-                ),
+                cache_key,
+                lambda: _make_mm_mxfp8_kernel(cache_key),
                 ab_cutlass_dtype=cutlass.Float8E4M3FN,
                 sf_dtype=cutlass.Float8E8M0FNU,
                 c_cutlass_dtype=c_cutlass_dtype,
@@ -7328,6 +7294,7 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=1,
+                cache_module_name="mm_mxfp8",
             )
 
             launch_out = (
@@ -7343,6 +7310,7 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
                 kernel_a_sf.data_ptr(),
                 kernel_b_sf.data_ptr(),
                 _prepare_alpha_for_launch(None, a.device),
+                max_active_clusters,
             )
             return out
 
