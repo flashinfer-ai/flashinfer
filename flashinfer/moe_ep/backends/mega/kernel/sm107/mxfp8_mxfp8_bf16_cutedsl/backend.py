@@ -254,7 +254,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 t.scales.view(torch.uint8)
             )
             workspace.topk_idx[:num_tokens].copy_(t.topk_ids.to(torch.int32))
-            workspace.topk_weights[:num_tokens].copy_(t.topk_weights.to(torch.float32))
+            workspace.topk_weights[:num_tokens].copy_(
+                t.topk_weights.to(torch.float32).masked_fill(t.topk_ids == -1, 0)
+            )
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)

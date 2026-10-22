@@ -313,12 +313,16 @@ def test_invalid_routes_rejected_before_int32_conversion(ids):
         validate_routing_values(torch.tensor(ids), torch.ones(1, 2), 8)
 
 
-def test_masked_routes_and_finite_score_contract():
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
+def test_masked_routes_and_finite_score_contract(score):
     validate_routing_values(torch.tensor([[-1, -1], [0, 7]]), torch.ones(2, 2), 8)
+    validate_routing_values(
+        torch.tensor([[-1, -1], [0, -1]]),
+        torch.tensor([[score, score], [1.0, score]]),
+        8,
+    )
     with pytest.raises(RuntimeError, match="finite scores"):
-        validate_routing_values(
-            torch.tensor([[0, 1]]), torch.tensor([[1.0, float("nan")]]), 8
-        )
+        validate_routing_values(torch.tensor([[0, 1]]), torch.tensor([[1.0, score]]), 8)
 
 
 @pytest.mark.parametrize("name", ["fc1_alpha", "fc2_alpha", "fc1_norm_const"])

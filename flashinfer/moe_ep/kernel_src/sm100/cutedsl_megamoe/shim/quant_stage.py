@@ -54,7 +54,7 @@ _GRAPH_CAPTURED_BUFFERS: set[int] = set()
 
 @cache
 def _int32_routing_stager_class():
-    """Adapt routing stores for GenPhase without changing the vendored kernel."""
+    """Use int32 routing with zero scores for masked slots."""
     import cutlass
     import cutlass.cute as cute
     from src.inputs_process import DataPreprocess
@@ -82,7 +82,7 @@ def _int32_routing_stager_class():
                 )
                 weight = (
                     cutlass.Float32(0.0)
-                    if is_padding
+                    if idx == -1
                     else cutlass.Float32(topk_weights[token_idx, tid])
                 )
                 topk_idx_output[token_idx, tid] = idx

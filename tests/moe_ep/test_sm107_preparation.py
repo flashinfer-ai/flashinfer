@@ -118,20 +118,24 @@ def test_staging_graph_restores_shared_workspace_tail(monkeypatch, layout):
         (16385, 6),
     ],
 )
-def test_routing_check_rebinds_inputs_and_replays(monkeypatch, ffi, dtype, shape):
+@pytest.mark.parametrize("fused", ["0", "1"])
+def test_routing_check_rebinds_inputs_and_replays(
+    monkeypatch, ffi, dtype, shape, fused
+):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
         validate_routing_values,
     )
 
     monkeypatch.setenv("FLASHINFER_SM107_PREP_TVM_FFI", ffi)
-    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", fused)
     tokens, topk = shape
     ids = torch.arange(topk, device="cuda", dtype=dtype).repeat(tokens, 1)
     scores = torch.ones(tokens, topk, device="cuda")
     ws = SimpleNamespace()
     validate_routing_values(ids, scores, 128, workspace=ws)
     torch.cuda.synchronize()
-    assert ws._routing_checks
+    if fused == "1":
+        assert ws._routing_checks
 
     # Observe invalid replay inputs without poisoning the worker's CUDA context.
     verdict = torch.empty((), dtype=torch.bool, device="cuda")
@@ -175,7 +179,12 @@ def test_routing_check_rebinds_inputs_and_replays(monkeypatch, ffi, dtype, shape
                 scores[row, -1] = score
                 graph.replay()
                 torch.cuda.synchronize()
+                assert verdict.item()
+                ids[row, -1] = 0
+                graph.replay()
+                torch.cuda.synchronize()
                 assert not verdict.item()
+                ids[row, -1] = -1
             scores[row, -1] = 1
             graph.replay()
             torch.cuda.synchronize()
@@ -221,3 +230,68 @@ def test_routing_check_reuses_kernel_across_row_counts(
     finally:
         for graph in graphs:
             graph.reset()
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("prequantized", [False, True])
+@pytest.mark.parametrize("fused", ["0", "1"])
+@pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_staging_zeroes_masked_scores(
+    monkeypatch, kind, prequantized, fused, score_dtype
+):
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from tests.moe_ep.test_moe_ep_sm107_block_scaled_mega_multirank import (
+        _megakernel_config,
+    )
+    from tests.moe_ep.sm107_test_utils import quantize
+
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", fused)
+    live, capacity, hidden, topk = 8, 16, 512, 4
+    x = torch.randn(live, hidden, device="cuda", dtype=torch.bfloat16)
+    xq, sf = quantize(x, kind)
+    ids = torch.arange(topk, device="cuda", dtype=torch.int64).repeat(live, 1)
+    scores = torch.rand(live, topk, device="cuda", dtype=score_dtype)
+    ws = SimpleNamespace(
+        config=SimpleNamespace(num_total_experts=8),
+        x=torch.empty((capacity, xq.shape[1]), device="cuda", dtype=xq.dtype),
+        x_sf=torch.empty((capacity, sf.shape[1]), device="cuda", dtype=sf.dtype),
+        topk_idx=torch.empty(capacity, topk, device="cuda", dtype=torch.int32),
+        topk_weights=torch.empty(capacity, topk, device="cuda"),
+        fc1_alpha=torch.ones(8, device="cuda"),
+        fc2_alpha=torch.ones(8, device="cuda"),
+        fc1_norm_const=torch.ones(8, device="cuda"),
+        note_staged_tokens=lambda n: None,
+    )
+    kernel = create_mega_kernel(_megakernel_config(kind))
+    tensors = MoEEpTensors(
+        xq if prequantized else x, ids, scores, scales=sf if prequantized else None
+    )
+
+    def stage():
+        kernel.stage_inputs(tensors, ws, quantize_input=not prequantized)
+
+    stage()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        stage()
+    for column, value in enumerate((float("nan"), float("inf"), -float("inf"))):
+        ids.copy_(torch.arange(topk, device="cuda").repeat(live, 1))
+        scores.fill_(0.25)
+        ids[:, column] = -1
+        ids[0] = -1
+        scores[:, column] = value
+        scores[0] = value
+        expected = scores.float().masked_fill(ids == -1, 0)
+        for launch in (stage, graph.replay):
+            ws.topk_weights.fill_(123)
+            launch()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(ws.topk_weights[:live], expected, rtol=0, atol=0)
+            assert torch.equal(ws.topk_idx[:live], ids.to(torch.int32))
+            assert (ws.topk_idx[live:] == -1).all()
+            assert (
+                scores[ids == -1].isnan() if column == 0 else scores[ids == -1] == value
+            ).all()
+    graph.reset()

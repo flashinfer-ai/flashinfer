@@ -65,10 +65,13 @@ topology. See the [NVSHMEM environment variable reference](https://docs.nvidia.c
 | Prequantized inputs | Matching data format; scales are `[T, H/16]` E4M3 for NVFP4 or `[T, H/32]` E8M0 for MXFP8; uint8 scale storage is interpreted as raw bytes. Pass the logical scale columns, excluding internal workspace communication padding. |
 | Activation | SwiGLU by default; SiTU requires both positive, finite beta parameters and excludes gate/up clamps |
 | Normalization | NVFP4 accepts positive, finite local-expert FP32 vectors for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`. Per-call values override config defaults; if both omit a value, staging uses one. MXFP8 and MXFP4/MXFP8 do not accept these scalars. |
-| Routing values | Unique valid expert IDs per token or `-1` masked slots; finite scores; repeated masked slots are allowed |
+| Routing values | Unique valid expert IDs per token or `-1` masked slots; finite scores for valid routes; repeated masked slots are allowed |
 | Output | BF16; owned tensor by default; workspace views expire on the next workspace use or destruction |
 | Graphs and pooling | Warm up eagerly on every rank before capture; sequential, stream-ordered use of a shared workspace |
 | Determinism | In-kernel FC2 reduction is opt-in and requires early routing weights; repeatability must be characterized separately |
+
+Scores for masked (`-1`) routes may be NaN or infinite. Staging writes zero
+for those scores without modifying the caller's routing tensors.
 
 Routing value checks use device assertions so they remain active on graph
 replay without a host synchronization. Invalid routing can invalidate the
