@@ -110,21 +110,22 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful plain CTA wait: no .sem/.scope qualifier, which PTX reads as
-// .acquire.cta, for a typed protocol whose source spells none (FA4's interior
-// P-ready edge).
-__device__ __forceinline__ void mbarrier_wait_plain(int mbar_addr, int phase) {
+// Exact plain CTA wait (no .sem/.scope, PTX's default .acquire.cta) used by
+// source schedules whose PTX spells no qualifier while retaining a typed
+// suspendTimeHint operand.
+__device__ __forceinline__ void mbarrier_wait_plain_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
-        "LAB_WAIT_PLAIN:\n\t"
+        "LAB_WAIT_PLAIN_HINT:\n\t"
         "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_PLAIN;\n\t"
-        "bra.uni LAB_WAIT_PLAIN;\n\t"
-        "DONE_PLAIN:\n\t"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra DONE_PLAIN_HINT;\n\t"
+        "bra LAB_WAIT_PLAIN_HINT;\n\t"
+        "DONE_PLAIN_HINT:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
 }
 
 
@@ -321,7 +322,7 @@ kernel_cake_kimi_k3_attn_res_9b3a0b6c855562030d7e(__nv_bfloat16* __restrict__ ou
                     const int source_base = chunk * 4;
                     const int remaining_sources = 6 - source_base;
                     const int active_rows = ((remaining_sources > 4) ? 4 : remaining_sources);
-                    mbarrier_wait_plain(consumed_addr + (producer_stage) * 8, producer_phase_flipped);
+                    mbarrier_wait_plain_hint(consumed_addr + (producer_stage) * 8, producer_phase_flipped, 10000000);
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         const int extra_delta_row = ((chunk == 1) ? 1 : 0);
