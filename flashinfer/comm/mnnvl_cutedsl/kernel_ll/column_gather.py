@@ -192,6 +192,7 @@ class LLColumnGather:
             to_cute_dynamic(shard.flatten(), 16, divisibility=self.hidden_local),
             self._stage_state,
             self._mailbox_multicast,
+            None,
             m,
             stream,
         )

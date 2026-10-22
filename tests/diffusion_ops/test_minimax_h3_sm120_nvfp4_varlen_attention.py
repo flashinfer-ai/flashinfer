@@ -19,8 +19,12 @@ per-128-row Q block mean removal with in-kernel compensation, block amax / 6 sca
 quantization) and an FP32 softmax.  The E2M1 scores and probabilities carry the FP4 block-scaled
 error budget: the package tolerance is ``atol = 1.0, rtol = 0.1`` on every element (the same contract
 as the SM100 NVFP4 attention routes) plus a relative-L2 bound about four times the FP8 operator's,
-checked on packed boundaries, tails, empty segments and multi-segment streams.  Every test needs
-an SM120 GPU (the JIT module only builds for compute capability 12.x).
+checked on packed boundaries, tails, empty segments and multi-segment streams.  The opt-in
+``pv_mode="fp8"`` route (NVFP4 scores, E4M3 probabilities and V; three generated programs) shares
+the API and the FP4 tolerance and is held to a smaller relative-L2 error than the default route on
+the same inputs, to bitwise idempotence, to stream-private workspaces and to its program routing.
+Every test needs an SM120 GPU (the JIT modules only build for compute capability 12.x) except the
+workspace estimators and the ``pv_mode`` validation.
 """
 
 import math
@@ -32,13 +36,23 @@ from flashinfer.diffusion_ops import (
     minimax_h3_sm120_varlen_attention_fp8,
     minimax_h3_sm120_varlen_attention_nvfp4,
 )
+import flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention as nvfp4_ops
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
+    minimax_h3_sm120_nvfp4_fp8pv_programs,
     workspace_bytes_nvfp4,
+    workspace_bytes_nvfp4_fp8pv,
 )
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention import (
     MINIMAX_H3_HEAD_DIM,
     MINIMAX_H3_NUM_HEADS,
+    _plan,
     workspace_bytes,
+)
+from flashinfer.jit.cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention import (
+    ATTENTION_BASE,
+    ATTENTION_SHORT,
+    QUANTIZE,
+    QUANTIZE_MB3,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -56,8 +70,10 @@ CU_SEQLENS = [
     (0, 0, 129, 129, 500),
     (0, 133, 300, 900),
     (0, 257, 4567, 4824),
+    (0, 4096),
     (0, 4097),
 ]
+PV_MODES = ("fp4", "fp8")
 
 
 def _supported() -> bool:
@@ -130,10 +146,11 @@ def _check(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 @requires_sm120
+@pytest.mark.parametrize("pv_mode", PV_MODES)
 @pytest.mark.parametrize("cu_seqlens", CU_SEQLENS)
 @pytest.mark.parametrize("heads", [MINIMAX_H3_NUM_HEADS, 3])
 def test_minimax_h3_sm120_varlen_attention_nvfp4_matches_fp32_oracle(
-    cu_seqlens: tuple, heads: int
+    cu_seqlens: tuple, heads: int, pv_mode: str
 ) -> None:
     if heads != MINIMAX_H3_NUM_HEADS and cu_seqlens[-1] > 1000:
         pytest.skip("small-head sweep covers the boundary shapes only")
@@ -142,17 +159,24 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_matches_fp32_oracle(
     q, k, v = synthetic_inputs(tokens, heads, seed=tokens + heads, device=device)
     cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
     out = minimax_h3_sm120_varlen_attention_nvfp4(
-        q, k, v, cu, cu_seqlens_host=cu_seqlens
+        q, k, v, cu, cu_seqlens_host=cu_seqlens, pv_mode=pv_mode
     )
     torch.cuda.synchronize()
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     _check(out, fp32_oracle(q, k, v, cu_seqlens))
     # Idempotence: the quantized operands and block scales are rebuilt every call, bit-exactly.
     again = minimax_h3_sm120_varlen_attention_nvfp4(
-        q, k, v, cu, cu_seqlens_host=cu_seqlens
+        q, k, v, cu, cu_seqlens_host=cu_seqlens, pv_mode=pv_mode
     )
     torch.cuda.synchronize()
     assert torch.equal(out, again)
+    if pv_mode == "fp4":
+        # The default is the fp4 route, bit for bit.
+        default = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out, default)
 
 
 @requires_sm120
@@ -262,3 +286,121 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_error_vs_fp8_operator() -> None
     rel4 = ((out4.float() - expected).norm() / expected.norm()).item()
     rel8 = ((out8.float() - expected).norm() / expected.norm()).item()
     assert rel8 < rel4 < 6.0 * rel8, (rel4, rel8)
+
+
+def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_unknown_pv_mode() -> None:
+    # Validated before any device work: CPU tensors reach the pv_mode check first.
+    q = torch.empty(4, 2, MINIMAX_H3_HEAD_DIM, dtype=torch.bfloat16)
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    with pytest.raises(ValueError, match="pv_mode must be one of"):
+        minimax_h3_sm120_varlen_attention_nvfp4(q, q, q, cu, pv_mode="fp16")
+
+
+def test_minimax_h3_sm120_nvfp4_fp8pv_workspace_is_smaller_than_fp8() -> None:
+    # Packed E2M1 Q / K (half the E4M3 rows) plus their block scales and the K scale tiles against the FP8
+    # operator's E4M3 Q / K; V^T is E4M3 in both.
+    assert workspace_bytes_nvfp4_fp8pv(1, 1, 1) > 0
+    for tokens, heads, segments in ((128, 1, 1), (4824, 56, 3), (109952, 56, 1)):
+        assert (
+            0
+            < workspace_bytes_nvfp4_fp8pv(tokens, heads, segments)
+            < workspace_bytes(tokens, heads, segments)
+        )
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    ("cu_seqlens", "quantize", "attention"),
+    [
+        ((0, 4096), QUANTIZE, ATTENTION_SHORT),
+        ((0, 4097), QUANTIZE, ATTENTION_BASE),
+        ((0, 1024), QUANTIZE_MB3, ATTENTION_SHORT),
+        ((0, 1025), QUANTIZE, ATTENTION_SHORT),
+        ((0, 0, 129, 129, 500), QUANTIZE_MB3, ATTENTION_SHORT),
+        ((0, 257, 4567, 4824), QUANTIZE, ATTENTION_BASE),
+    ],
+)
+def test_minimax_h3_sm120_nvfp4_fp8pv_routes_its_programs(
+    cu_seqlens: tuple, quantize, attention, monkeypatch
+) -> None:
+    device = torch.device("cuda:0")
+    plan = _plan(cu_seqlens, MINIMAX_H3_NUM_HEADS, device)
+    assert minimax_h3_sm120_nvfp4_fp8pv_programs(plan) == (quantize, attention)
+    # The launches the operator issues follow the same selection.
+    seen = []
+    original = nvfp4_ops._minimax_h3_sm120_varlen_attention_nvfp4_fp8pv_impl
+
+    def recording(*args):
+        seen.append((args[-7], args[-6]))  # quantize_small, attention_short
+        return original(*args)
+
+    monkeypatch.setattr(
+        nvfp4_ops, "_minimax_h3_sm120_varlen_attention_nvfp4_fp8pv_impl", recording
+    )
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=13, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    out = minimax_h3_sm120_varlen_attention_nvfp4(
+        q, k, v, cu, cu_seqlens_host=cu_seqlens, pv_mode="fp8"
+    )
+    torch.cuda.synchronize()
+    assert seen == [(quantize is QUANTIZE_MB3, attention is ATTENTION_SHORT)]
+    _check(out, fp32_oracle(q, k, v, cu_seqlens))
+
+
+@requires_sm120
+def test_minimax_h3_sm120_nvfp4_fp8pv_is_more_accurate_than_the_default_route() -> None:
+    """``pv_mode="fp8"`` keeps the probabilities and V in E4M3: its relative-L2 error against the FP32
+    oracle is below the default (Sage3-recipe) route's on the same inputs, and it meets the FP4
+    tolerance on every element."""
+    device = torch.device("cuda:0")
+    for cu_seqlens, seed in (((0, 257, 4567, 4824), 5), ((0, 8192), 17)):
+        q, k, v = synthetic_inputs(
+            cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=seed, device=device
+        )
+        cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+        expected = fp32_oracle(q, k, v, cu_seqlens)
+        out8 = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens, pv_mode="fp8"
+        )
+        out4 = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens, pv_mode="fp4"
+        )
+        torch.cuda.synchronize()
+        _check(out8, expected)
+        rel8 = ((out8.float() - expected).norm() / expected.norm()).item()
+        rel4 = ((out4.float() - expected).norm() / expected.norm()).item()
+        assert rel8 < rel4, (cu_seqlens, rel8, rel4)
+
+
+@requires_sm120
+def test_minimax_h3_sm120_nvfp4_fp8pv_two_streams_keep_private_counters() -> None:
+    """The statistics launch's arrival counters are per (device, stream): two streams running the
+    route concurrently on different inputs each reproduce their single-stream result bit for bit."""
+    device = torch.device("cuda:0")
+    cu_seqlens = (0, 700, 1400, 2100)  # folded statistics (segments above 512 tokens)
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    inputs = [
+        synthetic_inputs(cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=seed, device=device)
+        for seed in (21, 22)
+    ]
+    expected = []
+    for q, k, v in inputs:
+        expected.append(
+            minimax_h3_sm120_varlen_attention_nvfp4(
+                q, k, v, cu, cu_seqlens_host=cu_seqlens, pv_mode="fp8"
+            )
+        )
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(device=device) for _ in inputs]
+    outs = [torch.empty_like(q) for q, _k, _v in inputs]
+    for _round in range(4):
+        for stream, (q, k, v), out in zip(streams, inputs, outs, strict=True):
+            with torch.cuda.stream(stream):
+                minimax_h3_sm120_varlen_attention_nvfp4(
+                    q, k, v, cu, out, cu_seqlens_host=cu_seqlens, pv_mode="fp8"
+                )
+    torch.cuda.synchronize()
+    for out, want in zip(outs, expected, strict=True):
+        assert torch.equal(out, want)

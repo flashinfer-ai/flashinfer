@@ -67,9 +67,11 @@ and the MoEEpCommunication path); a backend must be registered as exactly one
 kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 - **`MoEEpCommunication`** (`core/comm/communication.py`) is a self-contained
-  dispatch/combine object: one long-lived instance per EP group owns its
-  workspace, and per-step routing state lives in that workspace. The NVLink
-  backends implement it. `dispatch(hidden_states, topk_ids,
+  dispatch/combine object: long-lived instances of one EP group (e.g. one per
+  MoE layer) share a workspace per layout, and per-step routing state lives in
+  that workspace, so rounds on it must not interleave. The NVLink
+  backends implement it, with the workspace in
+  [symmetric memory](./symmetric_memory.md). `dispatch(hidden_states, topk_ids,
   topk_weights, ...)` returns `ep_size * tokens_per_rank` receive rows with
   their GLOBAL top-k routing (rows without a token carry
   `MoEEpCommParams.invalid_expert_id`); the expert computation weights and
@@ -91,8 +93,8 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
 | `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
-| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | The one-sided protocol of the `flashinfer.comm` `moe_a2a_*` ops running the generated Cake kernels (`backend="cake"`); SM100/SM103 only |
-| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`moe_prepare` / `moe_comm` of `flashinfer.comm.trtllm_alltoall`); `num_experts % 4 == 0` |
+| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | One-sided put/get like `nvlink_one_sided`, running generated Cake kernels (`cake/kernels.py`, `csrc/cake_moe_alltoall*`); SM100/SM103 only |
+| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/nvlink_two_sided_*`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
 
@@ -288,7 +290,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 |------|------|
 | `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store`, optional `process_group` (EP comm; defaults to WORLD), `auto_bootstrap=True` |
 | `FleetParams` | EP sizing only (no weights); split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
-| `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `recv_count`, `num_tokens_per_expert` |
+| `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `fc1_activation_per_token_scale`, `recv_count`, `num_tokens_per_expert` |
 | `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
 | `MoEEpMegaWorkspace` | Public, layer-bound capacity-profile handle returned by `MoEEpMegaLayer.create_workspace()`; do not construct directly |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |

@@ -418,8 +418,10 @@ def test_unit_blocks_carry_the_stage_facts():
         assert record["kernel"] == loader._KERNEL_OVERRIDES.get(
             program, "kernel_" + program
         )
-        assert set(record["launch"]) == {"block", "cluster"}
+        assert set(record["launch"]) == {"block", "cluster", "dynamic_smem_bytes"}
         assert all(len(record["launch"][k]) == 3 for k in ("block", "cluster"))
+        smem = record["launch"]["dynamic_smem_bytes"]
+        assert isinstance(smem, int) and not isinstance(smem, bool) and smem >= 0
         kinds = [kind for kind, _ in record["arg_plan"]]
         assert set(kinds) <= {"tma_buffer", "buffer", "parameter", "launch", "grid"}
         assert record["arg_plan"][-3:] == [

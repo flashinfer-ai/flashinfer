@@ -251,8 +251,6 @@ class TmemSResource(MlaResource):
                 Uint32,
                 softmax_scratch_words(self.cfg),
             )
-        self.q_desc_current = Int64(0)
-        self.q_desc_rope_current = Int64(0)
         if cutlass.const_expr(
             self.cfg.kernel_variant == "keeps_mma_ab"
             and self.cfg.num_tokens_per_page != 1
@@ -291,6 +289,16 @@ class TmemSResource(MlaResource):
         # resource later produces QK scores into TMEM.
         del stage_info
         self._make_initial_softmax_vars()
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_descriptor_state(self, stage_info: StageInfo):
+        """Initialize cached Q descriptors in the producer task's scope."""
+        # Persistent HEAD and LOOP have separate runtime skip guards. Seed the
+        # descriptors before those guards so their values dominate every use.
+        del stage_info
+        self.q_desc_current = Int64(0)
+        self.q_desc_rope_current = Int64(0)
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit

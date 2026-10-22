@@ -54,8 +54,10 @@ from ..autotuner import (
 )
 from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
+    NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP44Over6Config,
     nvfp4_4over6_cache_key,
+    nvfp4_4over6_code,
     resolve_nvfp4_4over6,
 )
 from ..tllm_enums import DEFAULT_SWIGLU_LIMIT
@@ -65,6 +67,7 @@ from .api import (
     _CUDNN_GROUPED_GEMM_FP4_ARCHS,
     _CUDNN_GROUPED_GEMM_FP8_ARCHS,
     _CUDNN_GROUPED_GEMM_MXFP8_ARCHS,
+    _CUTILE_SUPPORTED_ACTIVATIONS,
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_FP8_ARCHS,
     _CUTLASS_FP8_BLOCK_ARCHS,
@@ -87,6 +90,7 @@ from .api import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -118,10 +122,22 @@ _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
     GeGLUTanh,
     ReLU2,
     SiTU,
+    PowLU,
     Identity,
     GELU,
     ReLU,
     SiLU,
+)
+
+# The CuTile backends borrowed the CUTLASS list while both supported the same
+# activations; PowLU (CUTLASS-adaptor-only) is where they diverge. Derive the
+# class tuple from the enum allowlist that cutile/activation.py and prepare.py
+# actually enforce, so a future CUTLASS-only activation cannot leak into the
+# CuTile runners' claimed support.
+_CUTILE_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = tuple(
+    activation
+    for activation in _CUTLASS_SEMANTIC_ACTIVATIONS
+    if activation.type in _CUTILE_SUPPORTED_ACTIVATIONS
 )
 
 _CUTILE_INT32_INDEX_LIMIT = 1 << 31
@@ -567,6 +583,19 @@ def _cutlass_activation_params(
         params["swiglu_limit"] = torch.full(
             (num_experts,), activation.limit, dtype=torch.float32, device=device
         )
+    elif isinstance(activation, PowLU):
+        # PowLUAdaptor reads ``m`` from the generic swiglu_alpha slot and the
+        # clamp from swiglu_limit (see cutlass_fused_moe_kernels.cuh). Its
+        # compile-time default matches PowLU()'s, so a default ``m`` needs no
+        # tensor; an absent limit leaves the branches unclamped.
+        if activation.m != PowLU().m:
+            params["swiglu_alpha"] = torch.full(
+                (num_experts,), activation.m, dtype=torch.float32, device=device
+            )
+        if activation.limit is not None:
+            params["swiglu_limit"] = torch.full(
+                (num_experts,), activation.limit, dtype=torch.float32, device=device
+            )
     return params
 
 
@@ -1875,7 +1904,15 @@ class _CutlassRunnerBase(MoERunner):
                     f"{type(self).__name__}: SwiGLUStep does not consume "
                     f"per-expert overrides {ignored}; only gemm1_clamp_limit is valid."
                 )
-        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU)):
+        # PowLU reads m from gemm1_alpha and its clamp from gemm1_clamp_limit;
+        # gemm1_beta has no PowLU meaning.
+        if isinstance(activation, PowLU) and "gemm1_beta" in view:
+            raise ValueError(
+                f"{type(self).__name__}: PowLU does not consume the per-expert "
+                "override gemm1_beta; only gemm1_alpha (the exponent m) and "
+                "gemm1_clamp_limit are valid."
+            )
+        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU, PowLU)):
             raise ValueError(
                 f"{type(self).__name__}: per-expert activation overrides {present} "
                 f"are invalid for {type(activation).__name__}."
@@ -2326,6 +2363,9 @@ class _CutlassRunnerBase(MoERunner):
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
             **self._activation_params,
+            # Unset everywhere except on CutlassNvfp4Runner (QuantConfig
+            # rejects an explicit value for other activations).
+            nvfp4_4over6=self.config.quant.nvfp4_4over6,
         )
         return inputs[0]
 
@@ -2447,6 +2487,9 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
     """
 
     backend_key = "cutlass_nvfp4"
+    # Threaded as QuantParams::FP4 nvfp4_4over6_code; both of CUTLASS's NVFP4
+    # activation quantizations have 4over6 variants, so no per-token rule.
+    supports_nvfp4_4over6 = True
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_NVFP4_ARCHS
@@ -3270,7 +3313,7 @@ class CuTileBf16Runner(MoERunner):
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
-    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    supported_activation_classes = _CUTILE_SEMANTIC_ACTIVATIONS
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
     _num_top_tactics_per_stage: ClassVar[int] = 2
@@ -5539,6 +5582,9 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
     backend_key = "trtllm_fp4_routed"
     supports_per_token_scale = True
+    # Threaded as MoERunnerArgs.nvfp4_4over6_code; _check_support() narrows
+    # it to the per-token path, the only one that requantizes the GEMM2 input.
+    supports_nvfp4_4over6 = True
     supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
@@ -5583,6 +5629,17 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 raise NotImplementedError(
                     f"{type(self).__name__} does not support per-token scale for "
                     f"{pair[0].name}×{pair[1].name}."
+                )
+            if (
+                isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
+                and not self.config.quant.per_token_scale
+            ):
+                # Only a pinned recipe is rejected: ``None`` is what GEMM1's
+                # NVFP4 epilogue (no 4over6 variant) already does.
+                raise NotImplementedError(
+                    f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
+                    "only with per_token_scale=True, the one path that requantizes "
+                    "the GEMM2 input."
                 )
 
             from ..utils import get_compute_capability
@@ -5683,6 +5740,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             use_per_token_scaling=self._per_token,
             num_experts=self.config.routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
+            # Unset reads the environment per call, like the flat API.
+            nvfp4_4over6_code=NVFP4_4OVER6_CODE_FROM_ENV
+            if self.config.quant.nvfp4_4over6 is _UNSET
+            else nvfp4_4over6_code(
+                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
+            ),
         )
 
     def get_valid_tactics(  # type: ignore[override]

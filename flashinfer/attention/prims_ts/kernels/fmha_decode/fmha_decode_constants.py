@@ -207,19 +207,3 @@ PARALLEL_REDUCTION_SLOT_LANES = 4
 OUTPUT_VALUES_PER_THREAD = 8
 FP8_PACKED_OUTPUT_REGS_PER_THREAD = 2
 PACKED_OUTPUT_REGS_PER_THREAD = 4
-
-# INT8 Q/K scores accumulate onto the bit pattern of ``1.5 * 2**23``. Integers
-# in ``[2**23, 2**24)`` are FP32 numbers with unit spacing and every D = 128
-# INT8 dot product has ``|score| <= 2**21``, so the INT32 accumulator is the
-# exact FP32 number ``12582912.0 + score`` and the softmax reads it without a
-# conversion, removing the bias once per scale group.
-INT32_SCORE_BIAS = 12582912.0
-# One ``kind::f16`` MMA step writes the bias before the INT8 K steps: both
-# operands read one BF16 tile whose K = 16 rows repeat
-# ``[1024, 1024, 1024, 0]``, so the twelve products ``2**20`` sum exactly to
-# ``1.5 * 2**23``. The tile is unswizzled K-major 32-byte rows with 128-byte
-# LBO and 256-byte SBO core-matrix strides.
-INT32_SCORE_SEED_MMA_K = 16
-INT32_SCORE_SEED_TILE_WORDS = (0x44804480, 0x00004480)
-INT32_SCORE_SEED_TILE_LBO = 128
-INT32_SCORE_SEED_TILE_SBO = 256
