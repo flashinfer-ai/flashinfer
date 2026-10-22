@@ -26,7 +26,8 @@
 // w8a16_fp8_gemm(out, act, weight, scale, bias, workspace, algo):
 //   act [M, K] fp16 or bf16 (the dtype the module was built for), weight [N, K] fp8 e4m3,
 //   scale one fp32 value, bias [N] in act's dtype (optional), out [M, N] in act's dtype;
-//   all contiguous and on one device; M, N, K positive 32-bit values with K % 16 == 0 and
+//   all contiguous and on one device; M, N, K positive, each at most W8A16MaxDim, with
+//   ceil(M / 64) x ceil(N / 64) at most W8A16MaxTiles64 (see W8A16CheckDims), K % 16 == 0 and
 //   N % 8 == 0.  act, weight, out, bias and the workspace start at 16-byte aligned
 //   addresses (scale is one element and only needs to be contiguous).  The workspace is an
 //   optional contiguous buffer of any dtype, counted in bytes, that must hold at least what
@@ -88,10 +89,21 @@ inline int W8A16NumSms(int device_id) {
 
 // Shape rules the workspace query shares with the call.  M = 0 is handled by the Python
 // caller (empty output, no launch); here the tile schedulers divide by the tile counts, so
-// every dimension must be positive, and the kernels index with 32-bit ints.
+// every dimension must be positive.  The kernels and CUTLASS's tile schedulers index with
+// 32-bit ints: a dimension needs headroom for the largest tile (256) in the tile-count
+// ceiling division `(dim + tile - 1) / tile`, and the output tile count must fit an int
+// (the schedulers multiply the two tile counts, and the split count, in 32 bits).  Both
+// bounds sit far beyond any allocatable problem.
+inline constexpr int64_t W8A16MaxDim = INT32_MAX - 255;    // 2^31 - 256
+inline constexpr int64_t W8A16MaxTiles64 = INT32_MAX / 8;  // 64x64 output tiles, x 8 splits
 inline void W8A16CheckDims(int64_t M, int64_t N, int64_t K) {
-  TVM_FFI_ICHECK(M > 0 && N > 0 && K > 0 && M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX)
-      << "M, N, K must be positive 32-bit values, got " << M << " " << N << " " << K;
+  TVM_FFI_ICHECK(M > 0 && N > 0 && K > 0 && M <= W8A16MaxDim && N <= W8A16MaxDim &&
+                 K <= W8A16MaxDim)
+      << "M, N, K must be positive and at most " << W8A16MaxDim << ", got " << M << " " << N << " "
+      << K;
+  TVM_FFI_ICHECK((M + 63) / 64 * ((N + 63) / 64) <= W8A16MaxTiles64)
+      << "M x N is too large: ceil(M / 64) x ceil(N / 64) must be at most " << W8A16MaxTiles64
+      << ", got M=" << M << " N=" << N;
   TVM_FFI_ICHECK(K % 16 == 0) << "K must be a multiple of 16 (16-byte TMA rows of fp8), got " << K;
   TVM_FFI_ICHECK(N % 8 == 0) << "N must be a multiple of 8 (16-byte output rows), got " << N;
 }

@@ -121,7 +121,7 @@ inline double W8A16Sm90TileUs(const W8A16Sm90TileCost& t, double k_len) {
   return t.ns_per_k * 1e-3 * k_len + epi;
 }
 
-// Output tiles of a tile shape, in double: the admitted M and N reach INT32_MAX each.
+// Output tiles of a tile shape, in double: the admitted M and N reach 2^31 - 256 each.
 inline double W8A16Sm90TilesOf(const W8A16Sm90TileCost& t, int M, int N) {
   return static_cast<double>(W8A16Tiles(N, t.tile_w)) *
          static_cast<double>(W8A16Tiles(M, t.tile_a));

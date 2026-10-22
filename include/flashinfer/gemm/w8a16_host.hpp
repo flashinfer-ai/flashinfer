@@ -117,7 +117,7 @@ struct W8A16WorkspaceLayout {
 };
 
 // cudaErrorInvalidValue when the total leaves the signed 64-bit range the workspace query
-// reports in (checked arithmetic: the admitted dimensions reach INT32_MAX each); `*layout`
+// reports in (checked arithmetic: the admitted dimensions reach 2^31 - 256 each); `*layout`
 // is left untouched then.
 template <typename V>
 cudaError_t W8A16WorkspaceOf(int M, int N, int K, int device_id, int num_sms, int splits,

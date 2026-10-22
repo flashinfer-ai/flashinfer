@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.gemm import w8a16_fp8_gemm, w8a16_fp8_gemm_workspace_bytes
+from flashinfer.gemm.w8a16_fp8 import get_w8a16_fp8_gemm_module
 from flashinfer.utils import get_compute_capability
 
 
@@ -27,6 +28,38 @@ def _needs_hopper_or_blackwell():
     """The op has Hopper (sm_90a) and Blackwell (sm_100a) builds only."""
     if get_compute_capability(torch.device("cuda"))[0] not in (9, 10):
         pytest.skip("w8a16_fp8_gemm needs Hopper or Blackwell")
+
+
+def _major() -> int:
+    return get_compute_capability(torch.device("cuda"))[0]
+
+
+def _skip_unless_arch(algo: str) -> None:
+    """Skip a case whose forced variant belongs to the other architecture."""
+    table = _ALGOS_SM100 if _major() == 10 else _ALGOS_SM90
+    if algo not in table:
+        pytest.skip(f"{algo} is not a variant of this architecture")
+
+
+def _check_against_reference(out, act, w_fp8, scale, bias, tag):
+    """The kernel must be finite and no worse than the cast-copy path (16-bit
+    pre-scaled weight) against the fp32 reference, with a small floor."""
+    ref32 = act.float() @ (w_fp8.float() * scale).T
+    if bias is not None:
+        ref32 = ref32 + bias.float()
+    cast_err = (
+        (_cast_copy_reference(act, w_fp8, scale, bias).float() - ref32)
+        .abs()
+        .max()
+        .item()
+    )
+    err = (out.float() - ref32).abs().max().item()
+    assert torch.isfinite(out.float()).all(), tag
+    assert err <= max(2.0 * cast_err, 2e-3 * ref32.abs().max().item()), (
+        tag,
+        err,
+        cast_err,
+    )
 
 
 def _quantize(w32: torch.Tensor):
@@ -74,12 +107,33 @@ def test_w8a16_fp8_gemm(m, n, k, dtype, bias):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_w8a16_fp8_gemm_every_fp8_value(dtype):
-    """Every finite e4m3 byte (denormals included) must dequantize exactly.
+@pytest.mark.parametrize(
+    "algo",
+    [
+        None,
+        # Blackwell: the smem-A / chunk-partitioned transform, two TMEM-A tiles, the
+        # 1SM tile, stream-K and the split-K reduce (K = 256 is two 128-deep tiles).
+        "2sm256x256",
+        "2sm256x128",
+        "1sm128x128",
+        "2sm256x128_streamk",
+        "2sm256x128_splitk",
+        # Hopper: a cooperative tile, a ping-pong tile and stream-K (K = 256 is too
+        # short for a Hopper split).
+        "128x256",
+        "64x256",
+        "128x256_streamk",
+    ],
+)
+def test_w8a16_fp8_gemm_every_fp8_value(dtype, algo):
+    """Every finite e4m3 byte (denormals included) must dequantize exactly, on every
+    structurally different conversion path.
 
     act = identity over K, so out[m, n] = scale * weight[n, m] with no accumulation
     error beyond the final 16-bit rounding; the weight table enumerates all 254
     finite encodings (the two NaN bytes are excluded)."""
+    if algo is not None:
+        _skip_unless_arch(algo)
     dev = torch.device("cuda")
     K = 256
     codes = torch.arange(256, dtype=torch.int32, device=dev)
@@ -93,9 +147,9 @@ def test_w8a16_fp8_gemm_every_fp8_value(dtype):
     w_fp8 = table.view(torch.float8_e4m3fn)
     scale = torch.tensor([3.0], dtype=torch.float32, device=dev)
     act = torch.eye(K, device=dev, dtype=torch.float32).to(dtype)
-    out = w8a16_fp8_gemm(act, w_fp8, scale)
+    out = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
     ref = (w_fp8.float() * scale).T.to(dtype)
-    assert torch.equal(out, ref), (out.float() - ref.float()).abs().max()
+    assert torch.equal(out, ref), (algo, (out.float() - ref.float()).abs().max())
 
 
 def test_w8a16_fp8_gemm_3d_and_out():
@@ -174,51 +228,75 @@ def test_w8a16_fp8_gemm_caller_workspace():
     )
 
 
+_MAX_DIM = 2**31 - 256  # the admitted bound on each of M, N, K (a multiple of 8 and 16)
+_MAX_TILES64 = 2**28 - 1  # the admitted bound on ceil(M / 64) x ceil(N / 64)
+
+
 def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
-    """The workspace query runs the dispatch cost models without allocating anything,
-    so it reaches dimensions the launcher admits (<= INT32_MAX) that no tensor would:
-    the tile-count ceil divisions must not overflow there."""
+    """The workspace query runs the dispatch cost models and, for stream-K, CUTLASS's
+    own scheduler sizing without allocating anything, so it reaches the largest
+    dimensions the launcher admits, which no tensor would.  Every variant's query must
+    answer there (the tile-count arithmetic must not overflow), and one past the bound
+    is rejected: a dimension over 2**31 - 256 would overflow CUTLASS's 32-bit
+    tile-count ceiling division, an output beyond 2**28 - 1 tiles of 64x64 its 32-bit
+    tile product."""
     dev = torch.device("cuda")
-    big = 2**31 - 1
+    big = _MAX_DIM
+    algos = [None] + (_ALGOS_SM100 if _major() == 10 else _ALGOS_SM90)
+    # ceil(big / 64) is 2^25 - 4, so 8 tile columns (N = 512) give 2^28 - 32 output
+    # tiles of 64x64, still under the cap; K at the bound exercises the k-tile count of
+    # the stream-K sizing and the split rules.
     for m, n, k in [
-        (big, 8, 16),
-        (big, 2**31 - 8, 16),
-        (8, 2**31 - 8, 25600),
+        (big, 448, 1024),
+        (big, 512, 1024),
+        (448, big, 1024),
+        (8, 8, big),
         (big, 8, 25600),
     ]:
-        assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev) >= 0
-    with pytest.raises(ValueError, match="<= 2147483647"):
-        w8a16_fp8_gemm_workspace_bytes(big + 1, 8, 16, dev)
+        for algo in algos:
+            assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo) >= 0, (
+                m,
+                n,
+                k,
+                algo,
+            )
+    for m, n, k in [(big + 8, 8, 16), (8, big + 8, 16), (8, 8, big + 16)]:
+        with pytest.raises(ValueError, match=f"<= {_MAX_DIM}"):
+            w8a16_fp8_gemm_workspace_bytes(m, n, k, dev)
+    # 9 tile columns (N = 576) give 9 x (2^25 - 4) tiles, over the cap.
+    with pytest.raises(ValueError, match="too large"):
+        w8a16_fp8_gemm_workspace_bytes(big, 576, 1024, dev)
+    with pytest.raises(ValueError, match="too large"):
+        w8a16_fp8_gemm_workspace_bytes(2**20, 2**20, 1024, dev)
 
 
 def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
-    """A forced split-K at extreme dimensions asks for `splits x M x N` fp32 partials,
-    which leaves the signed 64-bit range the query returns in (M = N ~ 2^31 gives
-    ~2^64 bytes per slice); the query must say so instead of wrapping around and
-    reporting a small number.  Smaller dimensions still report the exact size, and the
-    split policies themselves must not overflow on the way there (the Blackwell long-K
-    rule compares wave counts scaled by the split count, which stays bounded at large
-    M, N and K together)."""
+    """A forced split-K at large dimensions asks for `splits x M x N` fp32 partials.
+    Within the admitted tile count that stays far inside the signed 64-bit range the
+    query returns in, and it is reported exactly (plus the CUTLASS scheduler
+    workspace, if any) even though no one would allocate it; the split policies
+    themselves must not overflow on the way there (the Blackwell long-K rule compares
+    wave counts scaled by the split count).  Dimensions whose partials would leave the
+    range are rejected by the tile-count bound before the query is asked."""
     dev = torch.device("cuda")
-    major = get_compute_capability(dev)[0]
-    algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
-    big = 2**31 - 1
-    for m, n, k in [
-        (big, 2**31 - 8, 1024),
-        (2**30, 2**30, 1024),
-        (2**30, 2**30, 2**30),  # long K: the Blackwell wave-fill split rule runs too
-        (big, 2**31 - 8, 2**31 - 2**16),
-    ]:
-        with pytest.raises(Exception, match="exceeds the 64-bit byte range"):
-            w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
-    # 2 slices x 2^20 x 2^20 floats = 2^43 bytes (8 TiB): fits the range, so it is
-    # reported exactly (plus the CUTLASS scheduler workspace, if any), even though no
-    # one would allocate it.  The forced split on this short K is the smallest, 2.
-    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**20, 1024, dev, algo) >= 2**43
+    algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[_major()]
+    big = _MAX_DIM
+    # 2 slices x 2^20 x 2^19 floats = 2^42 bytes (4 TiB).  The forced split on this
+    # short K is the smallest, 2.
+    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**19, 1024, dev, algo) >= 2**42
+    # 2 slices x (2^31 - 256) x 448 floats, about 7.7 TB.
+    assert (
+        w8a16_fp8_gemm_workspace_bytes(big, 448, 1024, dev, algo) >= 2 * big * 448 * 4
+    )
+    # Long K with a large grid: the wave-fill split rules run at their extremes.
+    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**19, 2**30, dev, algo) >= 2**42
     # The launcher's own choice at the extreme dimensions never picks a split it cannot
     # size (the Hopper cost model's partials cap is evaluated without overflowing).
-    for m, n, k in [(big, 2**31 - 8, 1024), (2**30, 2**30, 2**30)]:
+    for m, n, k in [(big, 448, 1024), (2**20, 2**19, 2**30), (8, 8, big)]:
         assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev) >= 0
+    for m, n, k in [(big, big, 1024), (2**30, 2**30, 2**30)]:
+        with pytest.raises(ValueError, match="too large"):
+            w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
 
 
 def test_w8a16_fp8_gemm_rejects_aliasing():
@@ -353,9 +431,9 @@ def test_w8a16_fp8_gemm_forced_splitk_unsplittable_k():
     )  # K % 16 == 0, but neither 64 x (2 x 8) nor 128 x 2 divides it
     act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
     w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
-    with pytest.raises(Exception, match="cannot slice K=960"):
+    with pytest.raises(RuntimeError, match="cannot slice K=960"):
         w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
-    with pytest.raises(Exception, match="cannot slice K=960"):
+    with pytest.raises(RuntimeError, match="cannot slice K=960"):
         w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
     # The launcher's own choice never asks for an impossible split.
     assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev) >= 0
@@ -589,3 +667,250 @@ def test_w8a16_fp8_gemm_algo(algo, m, n, k, bias, dtype):
     )
     with pytest.raises(ValueError):
         w8a16_fp8_gemm(act, w_fp8, scale, algo="nope")
+
+
+# ---------------------------------------------------------------------------
+# Grouped / swizzled tile traversal
+# ---------------------------------------------------------------------------
+
+_GROUPED_CASES = [
+    # Hopper: weight >= 40 MB and M >= 16384 turn the custom grouped scheduler on; 65
+    # activation tiles of 256 leave a last group of 1 (group 2) or 1 (group 4).
+    ("128x256", 16385, 4096, 10240),  # 32 weight tiles: group 2
+    ("128x256", 16385, 8192, 5120),  # 64 weight tiles: group 4
+    ("128x256_splitk", 16385, 4096, 10240),  # group 2 under the split-K batch index
+    (
+        "64x256",
+        16385,
+        4096,
+        10240,
+    ),  # ping-pong tile, 64 weight tiles (group 4 if grouped)
+    # Blackwell: weight >= 64 MiB and M >= 4096 turn the swizzle on; 4097 activation
+    # rows leave a residual tile, 16392 weight rows a residual 2SM tile.
+    ("2sm256x128", 4097, 16392, 4096),
+    ("2sm256x256", 4097, 16392, 4096),  # the smem-A tile under the swizzle
+    ("2sm256x128_splitk", 4097, 16392, 4096),
+]
+
+
+@pytest.mark.parametrize("algo,m,n,k", _GROUPED_CASES)
+def test_w8a16_fp8_gemm_grouped_traversal(algo, m, n, k):
+    """Shapes that actually enable the L2 tile grouping (Hopper grouped scheduler,
+    Blackwell swizzle), with a final incomplete group and, for split-K, the batch
+    index on top.  The output is pre-filled with NaN so a tile the traversal skips
+    fails the finiteness check, and a tile visited twice still has to agree with the
+    reference."""
+    _skip_unless_arch(algo)
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    out = torch.full((m, n), float("nan"), device=dev, dtype=torch.bfloat16)
+    ret = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, out=out)
+    assert ret is out
+    _check_against_reference(out, act, w_fp8, scale, None, (algo, m, n, k))
+    del act, w_fp8, out
+
+
+# ---------------------------------------------------------------------------
+# K tails, short prologues, N tails on every single-pass variant
+# ---------------------------------------------------------------------------
+
+_SINGLE_PASS_ALGOS = [a for a in _ALGOS_SM100 + _ALGOS_SM90 if "splitk" not in a]
+
+
+@pytest.mark.parametrize("algo", _SINGLE_PASS_ALGOS)
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 136, 16),  # one k-tile, partial; N tail of 8 on a 128-wide tile
+        (3, 264, 80),  # K not a multiple of either tile depth; N tail of 8 on 256
+        (
+            77,
+            136,
+            144,
+        ),  # two Hopper k-tiles plus a tail; one Blackwell tile plus a tail
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_w8a16_fp8_gemm_small_tails(algo, m, n, k, dtype):
+    """Every single-pass variant on problems shorter than its pipeline: TMA zero-fill
+    of the K tail, a prologue of one or two k-tiles, N tails under the epilogue
+    predication, odd M, both activation dtypes, with bias."""
+    _skip_unless_arch(algo)
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    act = torch.randn(m, k, device=dev, dtype=dtype)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    bias = torch.randn(n, device=dev, dtype=dtype)
+    out = w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, algo=algo)
+    _check_against_reference(out, act, w_fp8, scale, bias, (algo, m, n, k, dtype))
+
+
+@pytest.mark.parametrize(
+    "algo", [a for a in _ALGOS_SM100 + _ALGOS_SM90 if "splitk" in a]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_w8a16_fp8_gemm_minimal_splitk(algo, dtype):
+    """Each split-K variant at the shortest K it can slice (Hopper: 1024 = 2 x 8
+    k-tiles of 64; Blackwell: 256 = 2 k-tiles of 128), on an N tail and odd M; the
+    next shorter legal K is rejected by both the query and the call."""
+    _skip_unless_arch(algo)
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    k, k_short = (1024, 512) if _major() == 9 else (256, 128)
+    m, n = 77, 136
+    act = torch.randn(m, k, device=dev, dtype=dtype)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    bias = torch.randn(n, device=dev, dtype=dtype)
+    assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo) >= 2 * m * n * 4
+    out = w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, algo=algo)
+    _check_against_reference(out, act, w_fp8, scale, bias, (algo, dtype))
+    with pytest.raises(RuntimeError, match=f"cannot slice K={k_short}"):
+        w8a16_fp8_gemm_workspace_bytes(m, n, k_short, dev, algo)
+    with pytest.raises(RuntimeError, match=f"cannot slice K={k_short}"):
+        w8a16_fp8_gemm(
+            act[:, :k_short].contiguous(),
+            w_fp8[:, :k_short].contiguous(),
+            scale,
+            algo=algo,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Caller workspace: stream-K and split-K, reuse on one non-default stream
+# ---------------------------------------------------------------------------
+
+
+def _shape_needing_workspace(algo, dev):
+    """A problem on which the forced variant reports a nonzero workspace (a stream-K
+    variant may decompose a problem data-parallel and need none)."""
+    for m, n, k in [
+        (1024, 512, 5120),
+        (300, 1024, 25600),
+        (2048, 1024, 5120),
+        (1024, 1024, 8192),
+        (256, 1024, 5120),
+    ]:
+        if w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo) > 0:
+            return m, n, k
+    raise AssertionError(f"no candidate shape needs a workspace under {algo}")
+
+
+@pytest.mark.parametrize(
+    "algo",
+    ["2sm256x128_splitk", "2sm256x128_streamk", "128x128_splitk", "128x256_streamk"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_w8a16_fp8_gemm_caller_workspace_reuse(algo, dtype):
+    """One poisoned caller buffer reused by several calls queued on a non-default
+    stream, with changed activations, scales and biases, distinct outputs and one
+    smaller problem; checked after a single synchronization.  Canary bytes around the
+    supplied workspace and output views must survive (scratch and vector-store
+    bounds).  Nothing in the buffer may be assumed between calls: per-launch barrier
+    initialization and partial overwrite are what this checks."""
+    _skip_unless_arch(algo)
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    m, n, k = _shape_needing_workspace(algo, dev)
+    problems = [(m, 1.0, True), (m, 0.5, False), (m // 2, 2.0, True), (m, 1.0, False)]
+    # One buffer sized for the largest need among the problems it serves (a smaller
+    # problem may resolve to a different split count).
+    need = max(
+        w8a16_fp8_gemm_workspace_bytes(mi, n, k, dev, algo, act_dtype=dtype)
+        for mi, _, _ in problems
+    )
+    assert need > 0
+    pad = 256  # bytes; keeps the views 16-byte aligned
+    buf = torch.full((pad + need + pad,), 0x7F, dtype=torch.uint8, device=dev)
+    ws = buf[pad : pad + need]
+    pad_el = 64  # elements of 2 bytes
+    outs = []
+    cases = []
+    base_act = torch.randn(m, k, device=dev, dtype=dtype)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for i, (mi, s_mult, with_bias) in enumerate(problems):
+            act = (base_act[:mi] * (i + 1)).contiguous()
+            sc = scale * s_mult
+            bias = torch.randn(n, device=dev, dtype=dtype) if with_bias else None
+            obuf = torch.full(
+                (pad_el + mi * n + pad_el,), float("nan"), device=dev, dtype=dtype
+            )
+            out = obuf[pad_el : pad_el + mi * n].view(mi, n)
+            ret = w8a16_fp8_gemm(
+                act, w_fp8, sc, bias=bias, algo=algo, out=out, workspace=ws
+            )
+            assert ret is out
+            outs.append(obuf)
+            cases.append((mi, act, sc, bias))
+    torch.cuda.synchronize()
+    for obuf, (mi, act, sc, bias) in zip(outs, cases, strict=True):
+        out = obuf[pad_el : pad_el + mi * n].view(mi, n)
+        assert torch.isnan(obuf[:pad_el]).all() and torch.isnan(obuf[-pad_el:]).all()
+        _check_against_reference(out, act, w_fp8, sc, bias, (algo, dtype, mi))
+    assert (buf[:pad] == 0x7F).all() and (buf[-pad:] == 0x7F).all()
+
+
+# ---------------------------------------------------------------------------
+# The native boundary, called directly
+# ---------------------------------------------------------------------------
+
+
+def test_w8a16_fp8_gemm_native_checks():
+    """The module's own FFI entry points reject what the contract says they reject,
+    independently of the Python guards: the other activation dtype, misaligned out
+    and workspace, out / workspace overlapping an input, dimensions past the bounds,
+    and algo codes outside the table, including values whose low 32 bits are a valid
+    code (an int64 narrowed to int would accept them).  The context is alive
+    afterwards: a valid direct call still computes."""
+    dev = torch.device("cuda")
+    major = _major()
+    mod = get_w8a16_fp8_gemm_module(dev, torch.bfloat16)
+    m, n, k = 16, 128, 1024
+    act = torch.ones(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8 = torch.ones(n, k, device=dev).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.5], device=dev)
+    out = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
+    launch = mod.w8a16_fp8_gemm
+    query = mod.w8a16_fp8_gemm_workspace_bytes
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+
+    # The bf16 module refuses fp16 activations (one module per dtype).
+    with pytest.raises(RuntimeError):
+        launch(out.half(), act.half(), w_fp8, scale, None, None, 0)
+    # Misaligned out / workspace (contiguous views at a one-element offset).
+    out_off = torch.empty(m * n + 1, device=dev, dtype=torch.bfloat16)[1:].view(m, n)
+    with pytest.raises(RuntimeError, match="aligned"):
+        launch(out_off, act, w_fp8, scale, None, None, 0)
+    ws_off = torch.empty(1 << 20, device=dev, dtype=torch.uint8)[1:]
+    with pytest.raises(RuntimeError, match="aligned"):
+        launch(out, act, w_fp8, scale, None, ws_off, 0)
+    # Overlap: out on act's storage (a square problem), workspace on the weight.
+    sq = torch.ones(k, k, device=dev, dtype=torch.bfloat16)
+    w_sq = torch.ones(k, k, device=dev).to(torch.float8_e4m3fn)
+    with pytest.raises(RuntimeError, match="out must not overlap act"):
+        launch(sq, sq, w_sq, scale, None, None, 0)
+    ws_on_w = w_fp8.view(torch.uint8).view(-1)
+    with pytest.raises(RuntimeError, match="workspace must not overlap weight"):
+        launch(out, act, w_fp8, scale, None, ws_on_w, 0)
+    # Dimension bounds at the native boundary.
+    with pytest.raises(RuntimeError, match="at most"):
+        query(_MAX_DIM + 8, 8, 16, idx, 0)
+    with pytest.raises(RuntimeError, match="too large"):
+        query(_MAX_DIM, _MAX_DIM, 1024, idx, 0)
+    # Algo codes: reserved, past the table, negative, and 2**32 + valid (low 32 bits
+    # are 0 = auto or a real variant).
+    first_valid = 2 if major == 9 else 1
+    reserved = 1 if major == 9 else 8
+    for code in (reserved, 99, -1, 2**32, 2**32 + first_valid, 2**40 + first_valid):
+        with pytest.raises(RuntimeError, match="algo"):
+            query(m, n, k, idx, code)
+        with pytest.raises(RuntimeError, match="algo"):
+            launch(out, act, w_fp8, scale, None, None, code)
+    # Still alive: a direct valid call computes 0.5 * K.
+    launch(out, act, w_fp8, scale, None, None, 0)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.full((m, n), 512.0, device=dev, dtype=torch.bfloat16))

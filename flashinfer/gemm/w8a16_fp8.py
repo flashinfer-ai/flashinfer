@@ -160,8 +160,9 @@ def w8a16_fp8_gemm_workspace_bytes(
         The problem: ``m`` is the flattened row count of ``act`` (the product
         of its leading dimensions), ``n`` the weight's row count, ``k`` the
         reduction depth.  Same bounds as the call: ``m >= 0``, ``n`` and ``k``
-        positive, ``k`` a multiple of 16, ``n`` a multiple of 8, all at most
-        ``2**31 - 1``.
+        positive, ``k`` a multiple of 16, ``n`` a multiple of 8, each at most
+        ``2**31 - 256``, and ``ceil(m / 64) * ceil(n / 64)`` at most
+        ``2**28 - 1``.
     device: Optional[torch.device]
         The CUDA device the call will run on (current device when omitted or
         given without an index).  The answer depends on it.
@@ -200,7 +201,12 @@ def w8a16_fp8_gemm_workspace_bytes(
     return _workspace_bytes(m, n, k, device.index, algo_code, act_dtype)
 
 
-_INT32_MAX = 2**31 - 1
+# The kernels and CUTLASS's tile schedulers index with 32-bit ints: a dimension needs
+# headroom for the largest tile (256) in the tile-count ceiling division, and the output
+# tile count (times the split count, at most 8) must fit an int.  The launchers check the
+# same bounds.
+_MAX_DIM = 2**31 - 256
+_MAX_TILES64 = (2**31 - 1) // 8  # 64x64 output tiles
 
 
 def _check_dims(m: int, n: int, k: int) -> None:
@@ -209,9 +215,13 @@ def _check_dims(m: int, n: int, k: int) -> None:
     divide by the tile counts)."""
     if m < 0 or n <= 0 or k <= 0:
         raise ValueError(f"need M >= 0, N > 0, K > 0, got M={m} N={n} K={k}")
-    if max(m, n, k) > _INT32_MAX:
-        # The kernels index with 32-bit ints; the launchers check the same bound.
-        raise ValueError(f"M, N, K must be <= {_INT32_MAX}, got M={m} N={n} K={k}")
+    if max(m, n, k) > _MAX_DIM:
+        raise ValueError(f"M, N, K must be <= {_MAX_DIM}, got M={m} N={n} K={k}")
+    if -(-m // 64) * -(-n // 64) > _MAX_TILES64:
+        raise ValueError(
+            f"M x N is too large: ceil(M / 64) x ceil(N / 64) must be <= {_MAX_TILES64}, "
+            f"got M={m} N={n}"
+        )
     if k % 16 != 0:
         raise ValueError(
             f"K must be a multiple of 16 (16-byte TMA rows of fp8), got K={k}"
@@ -350,7 +360,9 @@ def w8a16_fp8_gemm(
 
     Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
     8, both non-zero, and ``M`` (the product of ``act``'s leading dimensions,
-    not each of them), ``N`` and ``K`` each at most ``2**31 - 1``.  Every tensor
+    not each of them), ``N`` and ``K`` each at most ``2**31 - 256``, with
+    ``ceil(M / 64) * ceil(N / 64)`` at most ``2**28 - 1`` (an output of about
+    a terabyte; the kernels count tiles in 32-bit ints).  Every tensor
     among ``act`` / ``weight`` / ``bias`` / ``out`` / ``workspace`` must start
     at a 16-byte aligned address (a view into a larger buffer at an odd
     storage offset does not; contiguity alone is not enough).  Nothing is
