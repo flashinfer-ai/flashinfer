@@ -360,9 +360,12 @@ struct FP4Converter<
         QuantizationSFLayout::SWIZZLED);
     *SFOffset = fp8SFVal;
 
+    // Guard the post-rounding SFValue, not vecMax: the fp8 SF conversion can underflow small
+    // vecMax values to zero, and reciprocal(0) = inf turns zero elements into NaN (see #2441).
     float outputScale =
-        vecMax != 0.f ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                      : 0.0f;
+        SFValue != 0.f
+            ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+            : 0.0f;
     float2 fp2Vals[ELTS_PER_THREAD_T / 2];
 #pragma unroll
     for (int i = 0; i < static_cast<int>(ELTS_PER_THREAD_T); i += 2) {
@@ -441,7 +444,9 @@ struct FP8Converter<
     tmpSFVal.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
     SFValue = static_cast<float>(tmpSFVal);
     fp8SFVal = tmpSFVal.__x;
-    float outputScale = vecMax != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
+    // Guard the post-rounding SFValue, not vecMax: the fp8 SF conversion can underflow small
+    // vecMax values to zero, and reciprocal(0) = inf turns zero elements into NaN (see #2441).
+    float outputScale = SFValue != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
 
     auto SFOffset = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(
         batchIdx, rowIdx, colIdx, numRows, numCols / SF_VEC_SIZE, SFout,
