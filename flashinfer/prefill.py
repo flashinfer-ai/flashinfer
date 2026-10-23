@@ -3001,12 +3001,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=self._int_workspace_buffer.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        # Double-buffer pinned host memory to avoid CPU-GPU write-after-read races (issue #6533)
+        self._pin_memory_int_workspace_buffers = [
+            torch.empty(
+                self._int_workspace_buffer.shape,
+                dtype=self._int_workspace_buffer.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(2)
+        ]
+        with torch.cuda.device(self.device):
+            self._pin_memory_copy_events = [
+                torch.cuda.Event(enable_timing=False) for _ in range(2)
+            ]
+        self._pin_buffer_idx = 0
+        self._pin_memory_int_workspace_buffer = self._pin_memory_int_workspace_buffers[
+            0
+        ]
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
@@ -3081,6 +3093,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
     def is_cuda_graph_enabled(self) -> bool:
         return self._use_cuda_graph
 
+    def __del__(self) -> None:
+        try:
+            if hasattr(self, "_pin_memory_copy_events") and torch.cuda.is_initialized():
+                for ev in self._pin_memory_copy_events:
+                    if not ev.query():
+                        ev.synchronize()
+        except Exception:
+            pass
+
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
     ) -> None:
@@ -3103,12 +3124,26 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self._cudnn_prepared = None
         self._int_workspace_buffer = int_workspace_buffer
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=self._int_workspace_buffer.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        for ev in self._pin_memory_copy_events:
+            if not ev.query():
+                ev.synchronize()
+        self._pin_memory_int_workspace_buffers = [
+            torch.empty(
+                self._int_workspace_buffer.shape,
+                dtype=self._int_workspace_buffer.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(2)
+        ]
+        with torch.cuda.device(self.device):
+            self._pin_memory_copy_events = [
+                torch.cuda.Event(enable_timing=False) for _ in range(2)
+            ]
+        self._pin_buffer_idx = 0
+        self._pin_memory_int_workspace_buffer = self._pin_memory_int_workspace_buffers[
+            0
+        ]
 
     @flashinfer_api
     def workspace_size(
@@ -3970,10 +4005,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
         if self._cached_module is not None:
+            buf_idx = self._pin_buffer_idx % 2
+            ev = self._pin_memory_copy_events[buf_idx]
+            if not ev.query():
+                ev.synchronize()
+            pin_buf = self._pin_memory_int_workspace_buffers[buf_idx]
+            self._pin_memory_int_workspace_buffer = pin_buf
+
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
+                pin_buf,
                 qo_indptr_host,
                 paged_kv_indptr_host,
                 kv_lens_arr_host,
@@ -4010,6 +4052,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 *args,
             )
+            self._pin_memory_copy_events[buf_idx].record(
+                torch.cuda.current_stream(self.device)
+            )
+            self._pin_buffer_idx += 1
             if self._backend == "fa2":
                 # specialized SM90 fp8-KV verify kernel: eligibility, JIT
                 # build and workspace are settled here, outside the hot path
@@ -5276,12 +5322,24 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=torch.uint8,
-            pin_memory=True,
-            device="cpu",
-        )
+        # Double-buffer pinned host memory to avoid CPU-GPU write-after-read races (issue #6533)
+        self._pin_memory_int_workspace_buffers = [
+            torch.empty(
+                self._int_workspace_buffer.shape,
+                dtype=torch.uint8,
+                pin_memory=True,
+                device="cpu",
+            )
+            for _ in range(2)
+        ]
+        with torch.cuda.device(self.device):
+            self._pin_memory_copy_events = [
+                torch.cuda.Event(enable_timing=False) for _ in range(2)
+            ]
+        self._pin_buffer_idx = 0
+        self._pin_memory_int_workspace_buffer = self._pin_memory_int_workspace_buffers[
+            0
+        ]
         self._use_cuda_graph = use_cuda_graph
         # Set once an explicit-CUTLASS plan exists: `fmha_varlen_plan` allocates
         # fresh work-index buffers per call, so in CUDA-graph mode the first
@@ -5344,6 +5402,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     def is_cuda_graph_enabled(self) -> bool:
         return self._use_cuda_graph
 
+    def __del__(self) -> None:
+        try:
+            if hasattr(self, "_pin_memory_copy_events") and torch.cuda.is_initialized():
+                for ev in self._pin_memory_copy_events:
+                    if not ev.query():
+                        ev.synchronize()
+        except Exception:
+            pass
+
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
     ) -> None:
@@ -5362,12 +5429,26 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self._cudnn_prepared = None
         self._int_workspace_buffer = int_workspace_buffer
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=self._int_workspace_buffer.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        for ev in self._pin_memory_copy_events:
+            if not ev.query():
+                ev.synchronize()
+        self._pin_memory_int_workspace_buffers = [
+            torch.empty(
+                self._int_workspace_buffer.shape,
+                dtype=self._int_workspace_buffer.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(2)
+        ]
+        with torch.cuda.device(self.device):
+            self._pin_memory_copy_events = [
+                torch.cuda.Event(enable_timing=False) for _ in range(2)
+            ]
+        self._pin_buffer_idx = 0
+        self._pin_memory_int_workspace_buffer = self._pin_memory_int_workspace_buffers[
+            0
+        ]
 
     @flashinfer_api
     def plan(
@@ -6195,10 +6276,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             "cutile",
         ):
             assert self._cached_module is not None, "cached module is not initialized"
+            buf_idx = self._pin_buffer_idx % 2
+            ev = self._pin_memory_copy_events[buf_idx]
+            if not ev.query():
+                ev.synchronize()
+            pin_buf = self._pin_memory_int_workspace_buffers[buf_idx]
+            self._pin_memory_int_workspace_buffer = pin_buf
+
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
+                pin_buf,
                 qo_indptr_host,
                 kv_indptr_host,
                 kv_len_arr,
@@ -6236,6 +6324,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 *args,
             )
+            self._pin_memory_copy_events[buf_idx].record(
+                torch.cuda.current_stream(self.device)
+            )
+            self._pin_buffer_idx += 1
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
