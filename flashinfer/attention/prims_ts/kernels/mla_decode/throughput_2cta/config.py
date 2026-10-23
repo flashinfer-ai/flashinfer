@@ -574,15 +574,11 @@ def make_mla_decode_config(
             "one full-tile page: "
             f"tokens_per_k_cta={cfg.tokens_per_k_cta}, page_size={cfg.page_size}"
         )
-    if (
-        cfg.use_fp8_split_mma_schedule
-        and cfg.page_size > 1
-        and WARP_LANES % cfg.pages_per_k_tile != 0
-    ):
-        # Dense FP8 K/V loaders read page IDs from a one-entry-per-lane window
-        # that must hold whole K tiles.
+    if cfg.page_size > 1 and WARP_LANES % cfg.pages_per_k_tile != 0:
+        # The BF16 TMA warp and the FP8 K/V loaders read dense page IDs from a
+        # one-entry-per-lane window that must hold whole K tiles.
         raise ValueError(
-            f"FP8 dense MLA needs pages_per_k_tile to divide {WARP_LANES}: "
+            f"dense MLA needs pages_per_k_tile to divide {WARP_LANES}: "
             f"pages_per_k_tile={cfg.pages_per_k_tile}"
         )
     _require_divisible(

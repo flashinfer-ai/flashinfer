@@ -176,7 +176,8 @@ def build_mla_decode_task_manager(
     """Build the MLA decode TaskManager with all resources, tasks, and dependency graph.
 
     The throughput 2CTA graph uses Q/K/V TMA loads, register-held page-ID
-    windows (BF16 and dense FP8 loaders), QK/PV MMA, softmax, and
+    windows (BF16: refreshed at each window boundary; dense FP8 K/V loaders:
+    the next window is also prefetched), QK/PV MMA, softmax, and
     correction/store tasks. Validation-only
     calls pass a concrete integer ``domain`` and no runtime tensors; JIT calls
     pass symbolic runtime state and skip schedule validation. The dependency

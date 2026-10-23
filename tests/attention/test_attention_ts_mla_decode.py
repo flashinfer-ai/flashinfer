@@ -1465,12 +1465,13 @@ def test_attention_ts_mla_fp8_dense_loaders_read_page_window(page_size: int):
         ]
 
 
-def test_attention_ts_mla_fp8_dense_page_window_rejects_wide_k_tiles():
+@pytest.mark.parametrize("qkv_dtype", ("bf16", "e4m3"))
+def test_attention_ts_mla_dense_page_window_rejects_wide_k_tiles(qkv_dtype):
     """A K tile spanning more than 32 pages cannot use the page-ID window."""
 
     with pytest.raises(ValueError, match="pages_per_k_tile to divide 32"):
         make_mla_decode_config(
-            qkv_dtype="e4m3",
+            qkv_dtype=qkv_dtype,
             o_dtype="bf16",
             page_size=16,
             mma_qk_tiler_mn=(128, 1024),

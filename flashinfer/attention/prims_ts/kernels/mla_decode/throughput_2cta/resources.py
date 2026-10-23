@@ -710,7 +710,9 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             "cached_next_window_page",
             Int32,
             Int32(0),
-            "Per-lane page id of the prefetched next 32-entry window.",
+            "This lane's page id in the next 32-entry window (dense FP8 "
+            "loaders), loaded one window ahead so that a window boundary "
+            "does not wait on the page table.",
         ),
     )
 

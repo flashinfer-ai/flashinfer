@@ -192,7 +192,9 @@ synchronization contract for CLC replay and runtime pruning.
 For BF16 2-CTA paged K/V, the TMA warp holds one 32-page-ID register window.
 It refreshes the window after `32 / pages_per_k_tile` logical K tiles, when the
 next 32 page-table entries are needed. This period follows directly from page
-and tile geometry and is internal to the task schedule.
+and tile geometry and is internal to the task schedule. The window must hold
+whole K tiles, so the config builder requires `pages_per_k_tile` to divide 32;
+every supported page size meets this with the 128-token K tile.
 
 The FP8 2-CTA dense K and V loader warps each hold their own window of the same
 shape. They read it before waiting for a free K/V slot and issue the next
