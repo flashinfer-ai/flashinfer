@@ -191,10 +191,17 @@ that writes the registry verifies the record against them before it is frozen.
 ## Layout of this package
 
 The kernel and launcher sources under `csrc/`, the registry `cake_jit.py` and
-`build.json` are exporter output, hand-folded here pending exporter support:
-programs that differ only in their constants or lever text share one
-translation unit, and each `build.json` entry selects its program through its
-own `-D` definitions.
+`build.json` were produced by the Cake exporter and are maintained by hand
+pending exporter support: programs that differ only in their constants or lever
+text share one translation unit, and each `build.json` entry selects its
+program through its own `-D` definitions.  A changed kernel program is
+re-rendered from the Cake kernel source, re-folded into its shared unit, and
+every entry of that unit, expanded under its `-D` definitions, is checked token
+for token against the program's own render before it ships; `build.json`
+records every source's digest and a closure digest per entry (the identity rule
+over program, architecture, kernel symbol, compile flags, source and shared
+header digests for re-rendered entries; the original exporter's digests for the
+others).  `csrc/.clang-format` disables formatting so the digests stay valid.
 
 * `cake_jit.py` -- registry: one record per program (`PROGRAMS`: role, the
   architecture-free `library` stem, architectures), the program of every
@@ -240,8 +247,7 @@ own `-D` definitions.
   preamble `cake_dsa_indexer_topk_device_common.cuh` and the shared launch helpers
   `cake_dsa_indexer_topk_host_common.cuh` delivered once; the preamble's helper
   functions are content-addressed files under `csrc/cake_device_helpers/`
-  (`csrc/.clang-format` disables formatting: the sources are identity-checked by
-  the export).
+  (`csrc/.clang-format` disables formatting so the digests stay valid).
 
 ## Tests and benchmark
 
