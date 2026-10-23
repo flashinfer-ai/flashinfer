@@ -154,6 +154,10 @@ The five kernel translation units share one device header,
 tensor-map ABI, math constants and the tcgen05 helpers behind need-guards): a
 hand fold of the exported preambles that no `build.json` entry lists, so the
 build's dependency tracking, not a manifest digest, covers it.
+The four main-kernel bindings share their dynamic shared-memory opt-in and
+TMA descriptor encoders the same way, through the fragment headers
+`cake_moe_grouped_gemm_binding_*.h` included inside each host-shim namespace
+(hand folds of exported text that no `build.json` entry lists).
 
 Measured on B200 (`sm_100a`), GB300 (`sm_103a`) and R200 (`sm_107a`); the
 performance summary is in the delivery pull requests.
