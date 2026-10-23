@@ -161,7 +161,7 @@ def w8a16_fp8_gemm_workspace_bytes(
         of its leading dimensions), ``n`` the weight's row count, ``k`` the
         reduction depth.  Same bounds as the call: ``m >= 0``, ``n`` and ``k``
         positive, ``k`` a multiple of 16, ``n`` a multiple of 8, each at most
-        ``2**31 - 256``, and ``ceil(m / 64) * ceil(n / 64)`` at most
+        ``2**31 - 512``, and ``ceil(m / 64) * ceil(n / 64)`` at most
         ``2**28 - 1``.
     device: Optional[torch.device]
         The CUDA device the call will run on (current device when omitted or
@@ -202,10 +202,11 @@ def w8a16_fp8_gemm_workspace_bytes(
 
 
 # The kernels and CUTLASS's tile schedulers index with 32-bit ints: a dimension needs
-# headroom for the largest tile (256) in the tile-count ceiling division, and the output
-# tile count (times the split count, at most 8) must fit an int.  The launchers check the
-# same bounds.
-_MAX_DIM = 2**31 - 256
+# headroom for the largest tile (256) in the tile-count ceiling division, which CuTe
+# evaluates as `(dim + tile) - 1`, so `dim + 256` itself must fit; and the output tile
+# count (times the split count, at most 8) must fit an int.  The launchers check the same
+# bounds.
+_MAX_DIM = 2**31 - 512
 _MAX_TILES64 = (2**31 - 1) // 8  # 64x64 output tiles
 
 
@@ -360,7 +361,7 @@ def w8a16_fp8_gemm(
 
     Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
     8, both non-zero, and ``M`` (the product of ``act``'s leading dimensions,
-    not each of them), ``N`` and ``K`` each at most ``2**31 - 256``, with
+    not each of them), ``N`` and ``K`` each at most ``2**31 - 512``, with
     ``ceil(M / 64) * ceil(N / 64)`` at most ``2**28 - 1`` (an output of about
     a terabyte; the kernels count tiles in 32-bit ints).  Every tensor
     among ``act`` / ``weight`` / ``bias`` / ``out`` / ``workspace`` must start

@@ -228,22 +228,23 @@ def test_w8a16_fp8_gemm_caller_workspace():
     )
 
 
-_MAX_DIM = 2**31 - 256  # the admitted bound on each of M, N, K (a multiple of 8 and 16)
+_MAX_DIM = 2**31 - 512  # the admitted bound on each of M, N, K (a multiple of 8 and 16)
 _MAX_TILES64 = 2**28 - 1  # the admitted bound on ceil(M / 64) x ceil(N / 64)
 
 
 def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
     """The workspace query runs the dispatch cost models and, for stream-K, CUTLASS's
     own scheduler sizing without allocating anything, so it reaches the largest
-    dimensions the launcher admits, which no tensor would.  Every variant's query must
-    answer there (the tile-count arithmetic must not overflow), and one past the bound
-    is rejected: a dimension over 2**31 - 256 would overflow CUTLASS's 32-bit
-    tile-count ceiling division, an output beyond 2**28 - 1 tiles of 64x64 its 32-bit
-    tile product."""
+    dimensions the launcher admits (a single dimension at the bound is a 32 GiB weight
+    or output, so it is reachable; the tile-count bound is not).  Every variant's query
+    must answer there (the tile-count arithmetic must not overflow), and one past the
+    bound is rejected: a dimension over 2**31 - 512 would overflow CUTLASS's 32-bit
+    tile-count ceiling division, which adds the tile (up to 256) before subtracting one,
+    an output beyond 2**28 - 1 tiles of 64x64 its 32-bit tile product."""
     dev = torch.device("cuda")
     big = _MAX_DIM
     algos = [None] + (_ALGOS_SM100 if _major() == 10 else _ALGOS_SM90)
-    # ceil(big / 64) is 2^25 - 4, so 8 tile columns (N = 512) give 2^28 - 32 output
+    # ceil(big / 64) is 2^25 - 8, so 8 tile columns (N = 512) give 2^28 - 64 output
     # tiles of 64x64, still under the cap; K at the bound exercises the k-tile count of
     # the stream-K sizing and the split rules.
     for m, n, k in [
@@ -263,7 +264,7 @@ def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
     for m, n, k in [(big + 8, 8, 16), (8, big + 8, 16), (8, 8, big + 16)]:
         with pytest.raises(ValueError, match=f"<= {_MAX_DIM}"):
             w8a16_fp8_gemm_workspace_bytes(m, n, k, dev)
-    # 9 tile columns (N = 576) give 9 x (2^25 - 4) tiles, over the cap.
+    # 9 tile columns (N = 576) give 9 x (2^25 - 8) tiles, over the cap.
     with pytest.raises(ValueError, match="too large"):
         w8a16_fp8_gemm_workspace_bytes(big, 576, 1024, dev)
     with pytest.raises(ValueError, match="too large"):

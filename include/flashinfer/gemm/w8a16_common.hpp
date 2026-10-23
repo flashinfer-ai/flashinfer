@@ -52,7 +52,7 @@ struct W8A16CutlassType<half> {
   using type = cutlass::half_t;
 };
 
-// Tile count along one dimension.  The launchers admit dimensions up to 2^31 - 256, so
+// Tile count along one dimension.  The launchers admit dimensions up to 2^31 - 512, so
 // `(dim + tile - 1)` is formed in 64 bits here (as int it would overflow for a tile above
 // 256; CUTLASS's own 32-bit ceiling division is what the 256 of headroom protects).
 inline long long W8A16Tiles(long long dim, long long tile) { return (dim + tile - 1) / tile; }
@@ -61,7 +61,7 @@ inline long long W8A16Tiles(long long dim, long long tile) { return (dim + tile 
 inline size_t W8A16Align256(size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 // Workspace sizes are reported through a signed 64-bit FFI return, and the launchers admit
-// every dimension up to 2^31 - 256, so `splits * M * N * sizeof(float)` would leave even 64
+// every dimension up to 2^31 - 512, so `splits * M * N * sizeof(float)` would leave even 64
 // bits in a workspace query that allocates nothing were the output tile count not capped
 // (W8A16CheckDims); the arithmetic stays checked regardless.  These multiply / add within [0,
 // INT64_MAX] and report false (leaving `*out` untouched) when the result would not fit.

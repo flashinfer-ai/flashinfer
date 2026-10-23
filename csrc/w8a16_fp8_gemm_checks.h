@@ -91,11 +91,17 @@ inline int W8A16NumSms(int device_id) {
 // caller (empty output, no launch); here the tile schedulers divide by the tile counts, so
 // every dimension must be positive.  The kernels and CUTLASS's tile schedulers index with
 // 32-bit ints: a dimension needs headroom for the largest tile (256) in the tile-count
-// ceiling division `(dim + tile - 1) / tile`, and the output tile count must fit an int
-// (the schedulers multiply the two tile counts, and the split count, in 32 bits).  Both
-// bounds sit far beyond any allocatable problem.
-inline constexpr int64_t W8A16MaxDim = INT32_MAX - 255;    // 2^31 - 256
-inline constexpr int64_t W8A16MaxTiles64 = INT32_MAX / 8;  // 64x64 output tiles, x 8 splits
+// ceiling division, which CuTe evaluates left to right as `(dim + tile) - 1`, so `dim + 256`
+// itself must fit; and the output tile count must fit an int (the schedulers multiply the
+// two tile counts, and the split count, in 32 bits).  The tile-count bound is far beyond any
+// allocatable output; a single dimension near the bound is not (a weight of 2^31 rows by
+// K = 16 is 32 GiB), so the dimension bound is a real limit.
+inline constexpr int64_t W8A16MaxDim = (INT64_C(1) << 31) - 512;  // 2^31 - 512
+inline constexpr int64_t W8A16MaxTiles64 = INT32_MAX / 8;         // 64x64 output tiles, x 8 splits
+static_assert(W8A16MaxDim + 256 <= INT32_MAX,
+              "dim + tile must not overflow int in the ceiling division");
+static_assert(W8A16MaxDim % 256 == 0,
+              "the bound is a legal M, N (multiple of 8) and K (multiple of 16)");
 inline void W8A16CheckDims(int64_t M, int64_t N, int64_t K) {
   TVM_FFI_ICHECK(M > 0 && N > 0 && K > 0 && M <= W8A16MaxDim && N <= W8A16MaxDim &&
                  K <= W8A16MaxDim)
