@@ -247,6 +247,10 @@ void Run(TensorView a_q_latent, TensorView a_kv_latent, TensorView a_out, Tensor
       << KERNEL_NAME << ": requires (num_kv >= 1)";
   TVM_FFI_CHECK((a_idx_stride >= a_topk), ValueError)
       << KERNEL_NAME << ": requires (idx_stride >= topk)";
+  TVM_FFI_CHECK((a_convert >= 0), ValueError)
+      << KERNEL_NAME << ": requires (convert >= 0)";
+  TVM_FFI_CHECK((a_convert <= 2), ValueError)
+      << KERNEL_NAME << ": requires (convert <= 2)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
