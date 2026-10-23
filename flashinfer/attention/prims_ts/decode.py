@@ -1449,7 +1449,12 @@ def _resolve_decode_launch_spec(
         seq_len_q=seq_len_q,
         max_active_clusters=int(max_active_clusters),
     )
-    return replace(resolved, requested_splits=requested_splits)
+    # Report the runtime fanout separately from the SM-bound workspace capacity.
+    policy = dict(resolved.policy)
+    policy["splits_kv"] = requested_splits
+    return replace(
+        resolved, policy=tuple(policy.items()), requested_splits=requested_splits
+    )
 
 
 def _make_decode_compile_spec(

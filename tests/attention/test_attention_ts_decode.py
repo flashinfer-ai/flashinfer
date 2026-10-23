@@ -7140,14 +7140,14 @@ def _check_window_grouped_graph_live_metadata(
                 physical = host.paged_kv_indices[page_begin + token // page_size]
                 host.v_cache[physical, :, token % page_size, channel] = value
     if qkv_dtype == torch.float8_e4m3fn:
-        # The CPU reference consumes the exact dequantized FP8 values.
+        # Model FP8 probability quantization as well as Q/K/V quantization.
         host = replace(
             host,
-            q=host.q.to(qkv_dtype).to(torch.bfloat16),
-            k_cache=host.k_cache.to(qkv_dtype).to(torch.bfloat16),
-            v_cache=host.v_cache.to(qkv_dtype).to(torch.bfloat16),
+            q=host.q.to(qkv_dtype),
+            k_cache=host.k_cache.to(qkv_dtype),
+            v_cache=host.v_cache.to(qkv_dtype),
+            out_dtype=out_dtype,
         )
-    host = _with_reference(host)
     atol, rtol = (0.015, 0.05) if qkv_dtype == torch.float8_e4m3fn else (0.004, 0.02)
     q = host.q.to(qkv_dtype).cuda()
     cache = torch.empty(
@@ -7190,6 +7190,16 @@ def _check_window_grouped_graph_live_metadata(
         window_left=window_left,
         split_kv=False,
     )
+    policy = dict(wrapper._policy)
+    reference_kwargs = dict(
+        num_insts_kv=int(policy["num_insts_kv"]),
+        q_tokens_per_cta=(
+            int(policy["tile_size_q"]) // (num_qo_heads // num_kv_heads)
+            if policy["groups_tokens_heads_q"]
+            else 1
+        ),
+    )
+    host = _with_reference(host, **reference_kwargs)
     output = torch.empty_like(q, dtype=out_dtype)
 
     def run():
@@ -7223,20 +7233,17 @@ def _check_window_grouped_graph_live_metadata(
     table.copy_(new_table)
     poison_skipped_pages(new_table, new_lengths)
     seq_lens_kv.copy_(torch.tensor(new_lengths, dtype=torch.int32))
-    expected = _decode_reference(
-        host.q,
-        host.k_cache,
-        host.v_cache,
-        torch.tensor(offsets, dtype=torch.int32),
-        torch.tensor(indices, dtype=torch.int32),
-        torch.tensor([(n - 1) % page_size + 1 for n in new_lengths], dtype=torch.int32),
-        sm_scale=head_dim**-0.5,
-        q_scale=1.0,
-        k_scale=1.0,
-        v_scale=1.0,
-        mask_type="causal",
-        window_left=window_left,
-    )
+    expected = _with_reference(
+        replace(
+            host,
+            paged_kv_indptr=torch.tensor(offsets, dtype=torch.int32),
+            paged_kv_indices=torch.tensor(indices, dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor(
+                [(n - 1) % page_size + 1 for n in new_lengths], dtype=torch.int32
+            ),
+        ),
+        **reference_kwargs,
+    ).reference_real
     seq_lens_kv[0] = 0
     table[0].fill_(-1)
     expected[0].fill_(8)
@@ -7791,6 +7798,7 @@ def test_attention_ts_decode_compact_variable_k_acceptance(
 
     wrapper = _plan_case(case, max_kv_len=max(case_kwargs["kv_lens"]))
     policy = dict(wrapper._policy)
+    assert policy["splits_kv"] == wrapper._plan_state.requested_splits
     _assert_auto_policy(policy, expected_policy, device=case.q.device)
 
     _exercise_public_paths(
