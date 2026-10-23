@@ -8,6 +8,11 @@ consumer converts fragments for FP8 WGMMA. This uses **single-promotion**:
 each NVFP4 fragment is decoded into one E4M3 fragment, rather than a
 dual-fragment representation.
 
+The NV frontend, configuration, backend, and kernel specialize their MXFP4
+counterparts. They share dispatch, scheduling, and the kernel entry, with
+format-specific scale layouts, promotion, stage budgets, and FC1 overlap.
+NV tuning and workspace/cache identities remain separate from MX.
+
 ## Weight and numerical contract
 
 Canonical FC1 weights have shape `[local_experts, 2 * intermediate, hidden]`

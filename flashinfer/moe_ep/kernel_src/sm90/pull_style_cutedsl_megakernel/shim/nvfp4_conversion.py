@@ -20,6 +20,8 @@ from cutlass._mlir.dialects import llvm
 # Packed payload layout is identical to MXFP4. Use the current vendor's
 # views so new LDSM/layout fixes also apply to NVFP4.
 from moe_hopper_fp8.mxfp4_cutedsl import (
+    make_offset_smem_layout as _make_offset_smem_layout,
+    make_offset_smem_layout_k256 as _make_offset_smem_layout_k256,
     make_packed_a_ldsm_views,
     make_packed_a_ldsm_views_k256,
     make_packed_a_ldsm_views_k256_half,
@@ -138,36 +140,9 @@ DONE:
 }"""
 
 
-def make_offset_smem_layout(
-    tile_m: int,
-    num_stages: int,
-) -> cute.Layout:
-    """Return the raw folded-offset layout copied by the TMA-A warp.
-
-    One M64/K128 fold block is 32x16 bytes.  K-tile is fixed at 128, so each
-    stage contains ``tile_m / 64`` independent 512-byte blocks.
-    """
-
-    if tile_m % MXFP4_FOLD_M != 0:
-        raise ValueError(f"tile_m ({tile_m}) must be divisible by {MXFP4_FOLD_M}")
-    m_blocks = tile_m // MXFP4_FOLD_M
-    stage_bytes = m_blocks * MXFP4_FOLD_BLOCK_BYTES
-    return cute.make_layout(
-        (
-            MXFP4_PHYSICAL_COLS,
-            MXFP4_FOLDED_M,
-            m_blocks,
-            1,
-            num_stages,
-        ),
-        stride=(
-            1,
-            MXFP4_PHYSICAL_COLS,
-            MXFP4_FOLD_BLOCK_BYTES,
-            stage_bytes,
-            stage_bytes,
-        ),
-    )
+def make_offset_smem_layout(tile_m: int, num_stages: int) -> cute.Layout:
+    """Use the shared folded layout with K16 scale rows."""
+    return _make_offset_smem_layout(tile_m, num_stages, folded_rows=MXFP4_FOLDED_M)
 
 
 @cute.jit
@@ -185,34 +160,9 @@ def make_expanded_offset_view(
     return cute.make_tensor(raw_offsets.iterator, expanded)
 
 
-def make_offset_smem_layout_k256(
-    tile_m: int,
-    num_stages: int,
-) -> cute.Layout:
-    """Return a K256-only folded-offset layout without changing K128 ABI."""
-
-    if tile_m % MXFP4_FOLD_M != 0:
-        raise ValueError(f"tile_m ({tile_m}) must be divisible by {MXFP4_FOLD_M}")
-    m_blocks = tile_m // MXFP4_FOLD_M
-    k128_blocks_per_tile = 2
-    bytes_per_m_block = k128_blocks_per_tile * MXFP4_FOLD_BLOCK_BYTES
-    stage_bytes = m_blocks * bytes_per_m_block
-    return cute.make_layout(
-        (
-            MXFP4_PHYSICAL_COLS,
-            MXFP4_FOLDED_M,
-            m_blocks,
-            k128_blocks_per_tile,
-            num_stages,
-        ),
-        stride=(
-            1,
-            MXFP4_PHYSICAL_COLS,
-            bytes_per_m_block,
-            MXFP4_FOLD_BLOCK_BYTES,
-            stage_bytes,
-        ),
-    )
+def make_offset_smem_layout_k256(tile_m: int, num_stages: int) -> cute.Layout:
+    """Use the shared folded layout with K16 scale rows."""
+    return _make_offset_smem_layout_k256(tile_m, num_stages, folded_rows=MXFP4_FOLDED_M)
 
 
 @cute.jit
