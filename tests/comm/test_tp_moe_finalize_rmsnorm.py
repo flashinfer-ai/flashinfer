@@ -201,7 +201,7 @@ def _worker(local_rank: int, master_port: int | None, world_size: int) -> None:
     assert not collective_support(local_rank != 0, dist.group.WORLD, device), (
         "one rank's failed initialization verdict must disable every rank"
     )
-    assert init_tp_moe_finalize_rmsnorm()
+    assert init_tp_moe_finalize_rmsnorm(backend="cute")
     assert torch.cuda.get_device_properties(device).multi_processor_count <= (
         finalize_module.NSLOT
     )
@@ -653,7 +653,7 @@ def _allocation_failure_worker(
 
         target.empty = fail
     try:
-        assert not init_tp_moe_finalize_rmsnorm()
+        assert not init_tp_moe_finalize_rmsnorm(backend="cute")
     finally:
         target.empty = original_empty
         dist.destroy_process_group()
@@ -677,7 +677,9 @@ def _path_worker(
             module._token_crossover = lambda nsm: 1
         elif path != "auto":
             module._select_path = lambda *_: path
-        assert init_tp_moe_finalize_rmsnorm()
+        # The CuTe paths are under test here (the selector and crossover are patched above); the Cake
+        # backend has its own tests below.
+        assert init_tp_moe_finalize_rmsnorm(backend="cute")
         crossover = module._token_crossover(module._WS.nsm)
         tokens = dict.fromkeys(
             n
@@ -892,3 +894,263 @@ def test_tp_moe_finalize_rmsnorm_allocation_failure_is_rank_consistent(
         args=(_free_port(), world_size, site),
         nprocs=world_size,
     )
+
+
+# --------------------------------------------------------------------------- the Cake backend
+
+
+def _cake_routed(device: torch.device, world_size: int) -> bool:
+    """Whether the Cake package routes this device's architecture at ``world_size``."""
+    cake_jit = importlib.import_module(
+        "flashinfer.cake_tp_moe_finalize_rmsnorm_backend.cake_jit"
+    )
+    arch = cake_jit.arch_for_capability(torch.cuda.get_device_capability(device))
+    return arch is not None and cake_jit.route_available(
+        arch, cake_jit.route_key(world_size)
+    )
+
+
+def _warm_cake_libraries() -> None:
+    """Build the Cake libraries of this device's architecture once, outside the
+    collective workers (whose first call would otherwise compile them under the
+    worker timeout)."""
+    cake_jit = importlib.import_module(
+        "flashinfer.cake_tp_moe_finalize_rmsnorm_backend.cake_jit"
+    )
+    arch = cake_jit.arch_for_capability(torch.cuda.get_device_capability())
+    if arch is None:
+        return
+    for spec in cake_jit.specs_for_arch(arch):
+        spec.build_and_load()
+
+
+def _cake_worker(
+    local_rank: int,
+    master_port: int | None,
+    world_size: int,
+    backend: str,
+    routing_fp32: bool,
+    weight_before_norm: bool,
+) -> None:
+    _init_group(local_rank, master_port, world_size)
+    module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
+    cake_jit = importlib.import_module(
+        "flashinfer.cake_tp_moe_finalize_rmsnorm_backend.cake_jit"
+    )
+    try:
+        device = torch.device("cuda", local_rank)
+        routed = _cake_routed(device, world_size)
+        available = init_tp_moe_finalize_rmsnorm(backend=backend)
+        cake = module._WS.cake
+        assert (cake is not None) == routed, (world_size, backend, routed)
+        if backend == "cake":
+            assert available == routed
+            assert not module._WS.available, "backend='cake' prepares no CuTe workspace"
+        else:
+            assert available
+        with pytest.raises(RuntimeError, match="already initialized with backend"):
+            init_tp_moe_finalize_rmsnorm(backend="cute")
+        rank = dist.get_rank()
+        nsm = torch.cuda.get_device_properties(device).multi_processor_count
+        tokens = [1, 2, 8, 17, 24, 31, 32, 33, 36, 37, 64, 65, 76, 128]
+        tokens += [144, 145, 148, 149, 152, 153, 256, 1025, 8193, 33, 2, nsm]
+        arch = cake_jit.arch_for_capability(torch.cuda.get_device_capability(device))
+        for num_tokens in tokens:
+            shared = torch.Generator(device=device).manual_seed(21000 + num_tokens)
+            local = torch.Generator(device=device).manual_seed(22000 + rank)
+            partial = torch.randn(
+                num_tokens,
+                TOPK,
+                HIDDEN_SIZE,
+                dtype=torch.bfloat16,
+                device=device,
+                generator=local,
+            )
+            partial[0] *= 1e-4
+            rows, indices = _make_permuted(partial, seed=23000 + rank)
+            indices[0, 0] = -1
+            indices[-1, -1] = rows.shape[0]
+            weights = torch.rand(
+                num_tokens,
+                TOPK,
+                device=device,
+                generator=shared,
+                dtype=torch.float32 if routing_fp32 else torch.bfloat16,
+            )
+            weights /= weights.sum(-1, keepdim=True)
+            norm = torch.randn(
+                HIDDEN_SIZE, device=device, dtype=torch.bfloat16, generator=shared
+            )
+            norm *= 0.1
+            out = torch.empty(
+                num_tokens, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
+            )
+            gain = float(num_tokens % 2)
+
+            def call():
+                tp_moe_finalize_rmsnorm(
+                    rows,
+                    weights,
+                    indices,
+                    norm,
+                    out,
+                    eps=1e-8,
+                    gain_center=gain,
+                    weight_before_norm=weight_before_norm,
+                    backend=backend,
+                )
+
+            def check():
+                expected = _reference(
+                    rows, indices, weights, norm, 1e-8, gain, weight_before_norm
+                )
+                _assert_model_close(
+                    out, expected, context=f"{backend=} {num_tokens=} {rank=}"
+                )
+                rank0 = out.clone()
+                dist.broadcast(rank0, src=0)
+                assert torch.equal(out, rank0), (
+                    f"rank disagreement: {backend=} {num_tokens=}"
+                )
+
+            if backend == "cake" and not routed:
+                with pytest.raises(RuntimeError, match="Cake TP MoE finalize"):
+                    call()
+                break
+            call()
+            check()
+            if cake is not None:
+                # the routed Cake program ran: the record whose window admits the
+                # count, at the grid the agreed capacity allows
+                selected = cake.select(num_tokens)
+                assert selected is not None, (num_tokens, arch, world_size)
+                assert cake.last == selected, (cake.last, selected)
+                record = cake_jit.MODULES[selected[0]]
+                assert cake_jit.admits(record["select_rule"], num_tokens, arch)
+                cake.last = None
+            else:
+                # backend="auto" on an (architecture, world size) without Cake
+                # programs: the CuTe path ran and compiled its specialization
+                key = module._program_key(
+                    num_tokens, rows, weights, weight_before_norm, 1e-8, gain
+                )
+                assert key in module._PROGRAMS, num_tokens
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                call()
+            for replay in range(3):
+                partial.normal_(generator=local)
+                partial[0] *= 1e-4
+                new_rows, new_indices = _make_permuted(
+                    partial, seed=24000 + rank + replay
+                )
+                new_indices[0, 0] = -1
+                new_indices[-1, -1] = rows.shape[0]
+                rows.copy_(new_rows)
+                indices.copy_(new_indices)
+                weights.uniform_(generator=shared)
+                weights /= weights.sum(-1, keepdim=True)
+                norm.normal_(generator=shared)
+                norm *= 0.1
+                graph.replay()
+                check()
+            if num_tokens == 33:
+                norm.zero_()
+                weights.fill_(1.0 / TOPK)
+                partial.fill_(1 if rank == 0 else 0)
+                new_rows, new_indices = _make_permuted(partial, seed=26000 + rank)
+                rows.copy_(new_rows)
+                indices.copy_(new_indices)
+                weights.zero_()
+                weights[:, 0] = 2**24
+                weights[:, 1] = 1
+                weights[:, 2] = -(2**24)
+                graph.replay()
+                check()
+            del graph
+        if cake is not None and backend == "cake":
+            assert not module._PROGRAMS, "backend='cake' compiled a CuTe specialization"
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("backend", ["cake", "auto"])
+@pytest.mark.parametrize("routing_fp32", [False, True])
+@pytest.mark.parametrize("weight_before_norm", [False, True])
+def test_tp_moe_finalize_rmsnorm_cake_backend(
+    world_size: int, backend: str, routing_fp32: bool, weight_before_norm: bool
+) -> None:
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("TP MoE finalize requires SM100, SM103, or SM107")
+    if "LOCAL_RANK" in os.environ:
+        if int(os.environ["WORLD_SIZE"]) != world_size:
+            pytest.skip("different torchrun world size")
+        _warm_cake_libraries()
+        _run_env_worker(
+            _cake_worker,
+            (
+                int(os.environ["LOCAL_RANK"]),
+                None,
+                world_size,
+                backend,
+                routing_fp32,
+                weight_before_norm,
+            ),
+        )
+    else:
+        if torch.cuda.device_count() < world_size:
+            pytest.skip(f"{world_size} GPUs are required")
+        _warm_cake_libraries()
+        mp.spawn(
+            _cake_worker,
+            args=(_free_port(), world_size, backend, routing_fp32, weight_before_norm),
+            nprocs=world_size,
+        )
+
+
+def test_tp_moe_finalize_rmsnorm_backend_keyword() -> None:
+    module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
+    rows = torch.zeros(1, HIDDEN_SIZE, dtype=torch.bfloat16)
+    weights = torch.zeros(1, TOPK, dtype=torch.bfloat16)
+    indices = torch.zeros(1, TOPK, dtype=torch.int32)
+    norm = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16)
+    out = torch.zeros(1, HIDDEN_SIZE, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="backend must be one of"):
+        init_tp_moe_finalize_rmsnorm(backend="fast")
+    with pytest.raises(ValueError, match="backend must be one of"):
+        supports_tp_moe_finalize_rmsnorm(
+            rows, weights, indices, norm, out, backend="fast"
+        )
+    with pytest.raises(ValueError, match="backend must be one of"):
+        tp_moe_finalize_rmsnorm(
+            rows,
+            weights,
+            indices,
+            norm,
+            out,
+            eps=1e-8,
+            gain_center=0.0,
+            weight_before_norm=False,
+            backend="fast",
+        )
+    if module._WS.initialized:
+        pytest.skip("the workspace is initialized in this process")
+    for backend in ("auto", "cake", "cute"):
+        assert not supports_tp_moe_finalize_rmsnorm(
+            rows, weights, indices, norm, out, backend=backend
+        )
+    with pytest.raises(RuntimeError, match="not prepared for this group"):
+        tp_moe_finalize_rmsnorm(
+            rows,
+            weights,
+            indices,
+            norm,
+            out,
+            eps=1e-8,
+            gain_center=0.0,
+            weight_before_norm=False,
+            backend="cake",
+        )
