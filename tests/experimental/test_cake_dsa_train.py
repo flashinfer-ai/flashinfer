@@ -4155,9 +4155,12 @@ def test_nope_flat_entry_compacts_through_the_stage_flat_mode(monkeypatch):
     assert fwd["indices"].data_ptr() == prep["out"].data_ptr()
     assert fwd["topk_length"] is prep["topk_length"]
     assert (fwd["has_topk_length"], fwd["derive_length"], fwd["convert"]) == (1, 0, 0)
-    saved = out.grad_fn.nope_prep
-    assert saved.indices.data_ptr() == prep["out"].data_ptr()
-    assert saved.operands["topk_length"] is prep["topk_length"]
+    saved = (
+        out.grad_fn.saved_tensors
+    )  # (q, kv, out, lse, o_lo, rows, lengths): the stage's pair, not ``idx``
+    assert saved[5].data_ptr() == prep["out"].data_ptr()
+    assert saved[6].data_ptr() == prep["topk_length"].data_ptr()
+    assert out.grad_fn.nope_prep.has_topk_length
     # a column slice of a wider buffer and a view inside a storage are read in place by the flat stage
     wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
     wide[:, 3 : 3 + K] = idx
@@ -4174,7 +4177,11 @@ def test_nope_flat_entry_compacts_through_the_stage_flat_mode(monkeypatch):
     fwd = calls[0][1]
     assert fwd["indices"].data_ptr() == idx.data_ptr() and fwd["topk_length"] is mine
     assert (fwd["has_topk_length"], fwd["derive_length"], fwd["convert"]) == (1, 0, 0)
-    assert out_m.grad_fn.nope_prep.indices is idx
+    saved_m = out_m.grad_fn.saved_tensors
+    assert (
+        saved_m[5].data_ptr() == idx.data_ptr()
+        and saved_m[6].data_ptr() == mine.data_ptr()
+    )
     # the eager forward: raw rows, lengths derived in-kernel
     del calls[:]
     forward_nope(q.detach(), kv, idx)
@@ -6417,11 +6424,15 @@ def test_nope_hole_rows_are_deterministic_run_to_run():
 
 
 def _graph_capture(fn):
-    """Warm ``fn`` on a side stream, capture one call into a CUDA graph, replay it twice; returns the captured
-    outputs (the buffers the replays refresh)."""
+    """Run ``fn`` eagerly on a side stream (detached copies of its outputs are the reference), warm it twice
+    there, capture one call into a CUDA graph on that stream and replay it twice; returns ``(eager, captured)``
+    (the captured outputs are the buffers the replays refresh).  Everything runs on the capture stream: a leaf's
+    ``AccumulateGrad`` node records the stream of its first use, and one created on the default stream is a stale
+    reference that invalidates the capture."""
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        eager = tuple(t.detach().clone() for t in fn())
         for _ in range(2):
             fn()
     torch.cuda.current_stream().wait_stream(stream)
@@ -6432,7 +6443,7 @@ def _graph_capture(fn):
     for _ in range(2):
         graph.replay()
     torch.cuda.synchronize()
-    return captured
+    return eager, captured
 
 
 def test_nope_public_entries_capture_into_a_cuda_graph_on_hole_rows():
@@ -6465,9 +6476,7 @@ def test_nope_public_entries_capture_into_a_cuda_graph_on_hole_rows():
         )
 
     for fn in (varlen, flat, kernel_level):
-        eager = fn()
-        torch.cuda.synchronize()
-        captured = _graph_capture(fn)
+        eager, captured = _graph_capture(fn)
         for a, b in zip(eager, captured, strict=True):
             assert torch.equal(a, b)
 
@@ -6478,13 +6487,14 @@ def test_nope_flat_entry_hole_rows_meet_the_floor_on_the_compacted_order(constru
     compacted order (``reference_fp64_nope(..., compact=True)``: the lazy-rescale floor walks 64-slot tiles in slot
     order, so the floor depends on the slot order the kernel sees; the exact values do not): ``out`` / ``dq``
     within 1.02x their floors plus the element-wise and row bands, ``dkv`` within 1.05x.  Constructions: the pooled
-    draw with the open pool's tail at a fixed column (the R2 structure in miniature) and iid rows with every third
-    slot ``-1`` and a fully masked row."""
+    draw with the open pool's tail at a fixed column over a document that starts inside the query range (the R2
+    structure in miniature: a row has holes only while it holds fewer than ``pools`` complete pools, so the first
+    251 positions carry them) and iid rows with every third slot ``-1`` and a fully masked row."""
     _require_nope_compacting_stage()
     _require_nope_program(backward=True)
     if construction == "pooled_fixed_tail":
         inp = _nope_inputs(
-            512, 2048, seed=NOPE_SEED + 850, topk=256, index="pooled_fixed_tail"
+            512, 512, seed=NOPE_SEED + 850, topk=256, index="pooled_fixed_tail"
         )
         idx = inp.idx_global
     else:

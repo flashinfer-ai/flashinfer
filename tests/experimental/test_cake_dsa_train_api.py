@@ -1594,7 +1594,7 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
     with _quiet_experimental():
         out_f, lse_f = dsa_sparse_attention_nope(inp.q, inp.kv, masked, return_lse=True)
         out_s, lse_s = dsa_sparse_attention_nope(
-            inp.q, inp.kv, rows, topk_length=counts, return_lse=True, num_segments=2
+            inp.q, inp.kv, rows, topk_length=counts, return_lse=True
         )
     torch.cuda.synchronize()
     assert torch.equal(out_c, out_f) and torch.equal(lse_c, lse_f)
@@ -1832,11 +1832,12 @@ def test_rope_varlen_entry_captures_into_a_cuda_graph():
         dq_latent, dq_rope = torch.autograd.grad(out, leaves[:2], inp.dout)
         return out, dq_latent, dq_rope
 
-    eager = step()
-    torch.cuda.synchronize()
+    # eager reference, warm-ups and capture on one side stream: the leaves' ``AccumulateGrad`` nodes record the
+    # stream of their first use, and a node created on the default stream is a stale reference under capture
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        eager = tuple(t.detach().clone() for t in step())
         for _ in range(2):
             step()
     torch.cuda.current_stream().wait_stream(stream)
