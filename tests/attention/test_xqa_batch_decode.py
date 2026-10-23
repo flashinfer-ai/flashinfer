@@ -672,6 +672,7 @@ def test_batch_decode_tensor_cores_mtp_uses_xqa_decode_path():
     sm_scale = float(1.0 / (head_dim**0.5))
 
     workspace_direct, workspace_wrapper = create_workspace_buffers(GPU_DEVICE)
+    workspace_wrapper.zero_()
     out_direct = torch.empty_like(q)
     output_direct = flashinfer.decode.xqa_batch_decode_with_kv_cache(
         q,
@@ -716,7 +717,7 @@ def test_batch_decode_tensor_cores_mtp_uses_xqa_decode_path():
         atol=1e-2,
     )
 
-    workspace_implicit = torch.empty(
+    workspace_implicit = torch.zeros(
         workspace_size, dtype=torch.int8, device=GPU_DEVICE
     )
     wrapper_implicit = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
