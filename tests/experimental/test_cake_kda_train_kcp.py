@@ -453,11 +453,18 @@ def test_head_ownership_rows(H, W) -> None:
         assert (cb["padding"]["B1"]["send"] + cb["padding"]["B1"]["recv"] > 0) == (
             pad_tiles > 0
         )
-        assert (
-            kp.kcp_saved_bytes(ctx, H=H, with_conv=False, save_transfer=False)
-            == kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
-            + ctx.n_in * n_owners * Hg * kp.STATE_TILE_BYTES
+        # saved set: tables + padded S_in + the carry plane of a P > 1 rank (kept
+        # by default; saved_carry=False counts the plane-less re-walk form)
+        tb_bytes = kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+        no_plane = tb_bytes + ctx.n_in * n_owners * Hg * kp.STATE_TILE_BYTES
+        plane_slots = ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)
+        plane = plane_slots * H * kp.STATE_TILE_BYTES if hp.P > 1 else 0
+        got = kp.kcp_saved_bytes(ctx, H=H, with_conv=False, save_transfer=False)
+        got_no_plane = kp.kcp_saved_bytes(
+            ctx, H=H, with_conv=False, save_transfer=False, saved_carry=False
         )
+        assert got == no_plane + plane
+        assert got_no_plane == no_plane
         if (
             hp.Hg_r == 0
         ):  # a rank owning no heads: empty owner-side splits and chains, still a party to every collective
