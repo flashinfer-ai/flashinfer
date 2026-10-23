@@ -389,7 +389,7 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     ids = torch.tensor([[0, 3], [1, 2]])
     weights = torch.ones(2, 2)
     result = comm.dispatch(
-        hidden, ids, weights, hidden_states_scale=scale, max_tokens_per_rank=2
+        hidden, ids, weights, hidden_states_scale=scale, runtime_max_tokens_per_rank=2
     )
 
     payloads, rt, _, kwargs = fake_cake.calls["dispatch"]
@@ -427,10 +427,10 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
     assert fake_cake.calls["combine"][2][-1] is False
 
-    with pytest.raises(ValueError, match="max_tokens_per_rank"):
-        comm.dispatch(hidden, ids, weights, max_tokens_per_rank=4)
+    with pytest.raises(ValueError, match="runtime_max_tokens_per_rank"):
+        comm.dispatch(hidden, ids, weights, runtime_max_tokens_per_rank=4)
     with pytest.raises(ValueError, match="enable_rank_mask"):
-        comm.dispatch(hidden, ids, weights, active_rank_mask=torch.ones(4))
+        comm.dispatch(hidden, ids, weights, active_ranks=[0, 1])
     with pytest.raises(RuntimeError, match="before dispatch"):
         comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
 
@@ -438,6 +438,33 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     comm.destroy()
     with pytest.raises(RuntimeError, match="destroyed"):
         comm.dispatch(hidden, ids, weights)
+
+
+def test_cake_rank_mask(fake_cake) -> None:
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        CakeAlltoAllConfig,
+        create_communication,
+    )
+
+    comm = create_communication(
+        BootstrapConfig(world_size=2, rank=0),
+        _params(),
+        CakeAlltoAllConfig(enable_rank_mask=True),
+    )
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 3], [1, 2]])
+    comm.dispatch(hidden, ids, active_ranks=[0])
+    mask = fake_cake.calls["dispatch"][3]["active_rank_mask"]
+    assert mask.dtype == torch.uint64 and mask.tolist()[0] == 1
+    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
+    # The combine reuses the dispatch's mask.
+    assert fake_cake.calls["combine"][3]["active_rank_mask"] is mask
+
+    comm.dispatch(hidden, ids)
+    assert fake_cake.calls["dispatch"][3]["active_rank_mask"].tolist()[0] == 3
+    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
+    comm.destroy()
 
 
 def test_cake_rejects_dispatch_into_the_combine_region(fake_cake) -> None:
@@ -454,7 +481,7 @@ def test_cake_rejects_dispatch_into_the_combine_region(fake_cake) -> None:
     hidden = torch.ones(2, 8, dtype=torch.bfloat16)
     ids = torch.tensor([[0, 3], [1, 2]])
     with pytest.raises(ValueError, match="overlap the combine region"):
-        comm.dispatch(hidden, ids, torch.ones(2, 2), max_tokens_per_rank=2)
+        comm.dispatch(hidden, ids, torch.ones(2, 2), runtime_max_tokens_per_rank=2)
     assert "dispatch" not in fake_cake.calls
     comm.destroy()
 
@@ -657,20 +684,20 @@ def test_nvlink_one_sided_sizes_workspace_by_format(fake_one_sided) -> None:
 
 def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     comm = _one_sided(cft=False)
-    assert not comm.cft_enabled
+    assert not comm._cft_enabled
     assert fake_one_sided.probe["probed"] == 0
     assert fake_one_sided.module.calls["layout"][5] == 0
 
     fake_one_sided.probe["reason"] = "the device does not support it"
-    assert not _one_sided().cft_enabled
+    assert not _one_sided()._cft_enabled
 
     fake_one_sided.probe["reason"] = None
     fake_one_sided.probe["fabric_handles"] = False
-    assert not _one_sided().cft_enabled
+    assert not _one_sided()._cft_enabled
 
     fake_one_sided.probe["fabric_handles"] = True
     comm = _one_sided(use_low_precision_combine=True, cft_max_tokens_for_dispatch=2)
-    assert comm.cft_enabled
+    assert comm._cft_enabled
     # FP8 wire format sizes the CFT receive inbox.
     assert fake_one_sided.module.calls["layout"][5] == 6 * 8
     assert comm._use_cft(2, 2) and not comm._use_cft(3, 2)
@@ -746,7 +773,7 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
     ids = torch.tensor([[0, 3, 5, 7], [1, 2, 4, 6]])
     weights = torch.ones(2, 4)
     result = comm.dispatch(
-        hidden, ids, weights, hidden_states_scale=scale, max_tokens_per_rank=2
+        hidden, ids, weights, hidden_states_scale=scale, runtime_max_tokens_per_rank=2
     )
 
     sent_ids, payloads, rt, args = calls["dispatch"]
@@ -791,27 +818,51 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
 
     # Eight-byte expert-id rows cannot use CFT counted writes.
     narrow = _one_sided(_params(num_experts=8, top_k=2))
-    narrow.dispatch(hidden, ids[:, :2], max_tokens_per_rank=2)
+    narrow.dispatch(hidden, ids[:, :2], runtime_max_tokens_per_rank=2)
     assert calls["dispatch"][3][5] is False
 
-    with pytest.raises(ValueError, match="max_tokens_per_rank"):
+    with pytest.raises(ValueError, match="runtime_max_tokens_per_rank"):
+        comm.dispatch(hidden, ids, weights, runtime_max_tokens_per_rank=4)
+    with (
+        pytest.warns(DeprecationWarning, match="runtime_max_tokens_per_rank"),
+        pytest.raises(ValueError, match="runtime_max_tokens_per_rank=4"),
+    ):
         comm.dispatch(hidden, ids, weights, max_tokens_per_rank=4)
+    with pytest.raises(TypeError, match="deprecated alias"):
+        comm.dispatch(
+            hidden,
+            ids,
+            weights,
+            runtime_max_tokens_per_rank=2,
+            max_tokens_per_rank=2,
+        )
     with pytest.raises(RuntimeError, match="before dispatch"):
         comm.combine(buffer)
 
 
 def test_nvlink_one_sided_rank_mask(fake_one_sided) -> None:
+    calls = fake_one_sided.module.calls
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 3], [1, 2]])
     comm = _one_sided(enable_rank_mask=True)
-    mask = comm.active_rank_mask([0, 1, 255 % comm.ep_size])
-    assert mask.dtype == torch.uint64 and mask.tolist() == [3, 0, 0, 0]
+
+    comm.dispatch(hidden, ids, active_ranks=[0])
+    mask = calls["dispatch"][3][9]
+    assert mask.dtype == torch.uint64 and mask.tolist() == [1, 0, 0, 0]
+    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
+    # The combine reuses the dispatch's mask.
+    assert calls["combine"][13] is mask
+
+    comm.dispatch(hidden, ids)
+    assert calls["dispatch"][3][9].tolist() == [3, 0, 0, 0]
+    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
+
     with pytest.raises(ValueError, match="out of range"):
-        comm.active_rank_mask([2])
+        comm.dispatch(hidden, ids, active_ranks=[0, 2])
     with pytest.raises(ValueError, match="enable_rank_mask"):
-        _one_sided().dispatch(
-            torch.ones(2, 8, dtype=torch.bfloat16),
-            torch.tensor([[0, 3], [1, 2]]),
-            active_rank_mask=mask,
-        )
+        _one_sided().dispatch(hidden, ids, active_ranks=[0, 1])
+    _one_sided().dispatch(hidden, ids)
+    assert calls["dispatch"][3][9] is None
 
 
 def test_nvlink_one_sided_validates_config(fake_one_sided) -> None:

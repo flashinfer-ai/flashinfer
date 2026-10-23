@@ -114,6 +114,7 @@ class MoEEpSplitGraphState:
         "_topk_ids",
         "_topk_weights",
         "_out",
+        "_runtime_max_tokens_per_rank",
         "_buffer_signatures",
         "_destroyed",
     )
@@ -140,6 +141,7 @@ class MoEEpSplitGraphState:
         self._topk_ids = t.topk_ids
         self._topk_weights = t.topk_weights
         self._out = out
+        self._runtime_max_tokens_per_rank = t.runtime_max_tokens_per_rank
         # Tensor metadata is mutable: retaining the tensor alone does not
         # preserve the binding if the caller uses set_(), resize_(), or .data.
         self._buffer_signatures = {
@@ -230,6 +232,13 @@ class MoEEpSplitGraphState:
                     f"got {actual}. Copy new values into the registered tensor "
                     "in place instead of rebinding it or changing its metadata."
                 )
+        if t.runtime_max_tokens_per_rank != self._runtime_max_tokens_per_rank:
+            # The dispatch records this value as a kernel argument.
+            raise ValueError(
+                "MoEEpSplitGraphState: runtime_max_tokens_per_rank must stay "
+                f"{self._runtime_max_tokens_per_rank}, the value the state was "
+                f"created with; got {t.runtime_max_tokens_per_rank}."
+            )
 
     def destroy(self) -> None:
         """Release the persistent handle, if any. Idempotent.
@@ -535,6 +544,15 @@ class MoEEpSplitLayer(nn.Module):
             t.topk_weights,
             self._fleet_params,
         )
+        runtime_max = t.runtime_max_tokens_per_rank
+        if runtime_max is not None and not (
+            t.num_tokens <= runtime_max <= self._fleet_params.max_tokens_per_rank
+        ):
+            raise MoEEpConfigError(
+                f"runtime_max_tokens_per_rank={runtime_max} must lie in "
+                f"[num_tokens={t.num_tokens}, "
+                f"max_tokens_per_rank={self._fleet_params.max_tokens_per_rank}]"
+            )
 
         capturing = _is_capturing()
         if graph_state is not None:
@@ -874,11 +892,18 @@ class MoEEpSplitLayer(nn.Module):
         """Dispatch, run the inner kernel and combine over the communication."""
         comm = self._ensure_communication(t.topk_ids.shape[1])
         timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        # Registered backends need not take the keyword unless it is used.
+        extra = (
+            {}
+            if t.runtime_max_tokens_per_rank is None
+            else {"runtime_max_tokens_per_rank": t.runtime_max_tokens_per_rank}
+        )
         with self._stage(timings, "dispatch"):
             received = comm.dispatch(
                 self._kernel.pack_dispatch_payload(t.hidden_states),
                 t.topk_ids,
                 t.topk_weights,
+                **extra,
             )
         with self._stage(timings, "compute"):
             ctx = self._communication_kernel_context(comm, received)

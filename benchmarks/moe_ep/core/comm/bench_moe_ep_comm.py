@@ -517,7 +517,7 @@ def _time_dispatch_and_combine(
             topk_ids,
             topk_weights,
             hidden_states_scale=hidden_states_scale,
-            max_tokens_per_rank=step_max_tokens,
+            runtime_max_tokens_per_rank=step_max_tokens,
         )
         return received.hidden_states
 

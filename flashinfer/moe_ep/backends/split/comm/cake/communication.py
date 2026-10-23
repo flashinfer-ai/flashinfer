@@ -10,7 +10,7 @@ symmetric workspace grows with ``ep_size * max_tokens_per_rank``.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence
 
 from .....core.comm.communication import (
     MoEEpCommParams,
@@ -207,9 +207,19 @@ class CakeAlltoAll(MoEEpCommunication):
             raise RuntimeError("CakeAlltoAll has been destroyed")
         return self._state
 
-    def _check_rank_mask(self, active_rank_mask: "torch.Tensor | None") -> None:
-        if active_rank_mask is not None and not self.config.enable_rank_mask:
-            raise ValueError("active_rank_mask requires enable_rank_mask=True")
+    def _active_rank_mask(
+        self, active_ranks: "Sequence[int] | None"
+    ) -> "torch.Tensor | None":
+        """The kernels' CPU ``uint64`` bitmask of ``active_ranks``."""
+        from . import kernels
+
+        if not self.config.enable_rank_mask:
+            if active_ranks is not None:
+                raise ValueError("active_ranks requires enable_rank_mask=True")
+            return None
+        if active_ranks is None:
+            active_ranks = range(self.ep_size)
+        return kernels.active_rank_mask(active_ranks, self.ep_size)
 
     def dispatch(
         self,
@@ -218,15 +228,17 @@ class CakeAlltoAll(MoEEpCommunication):
         topk_weights: "torch.Tensor | None" = None,
         *,
         hidden_states_scale: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
+        runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
-        active_rank_mask: "torch.Tensor | None" = None,
+        active_ranks: "Sequence[int] | None" = None,
+        max_tokens_per_rank: Optional[int] = None,
     ) -> MoEEpDispatchResult:
         """See :meth:`MoEEpCommunication.dispatch`.
 
-        ``active_rank_mask`` is a CPU ``uint64`` mask from
-        :func:`flashinfer.moe_ep.backends.split.comm.cake.kernels.active_rank_mask`;
-        tokens routed to a masked-off rank are dropped. Requires
+        ``active_ranks`` lists the EP ranks that take part in this round, e.g.
+        all ranks but a failed one; tokens routed to any other rank are
+        dropped, and the matching :meth:`combine` uses the same ranks.
+        ``None`` means every rank. This rank must be active. Requires
         ``enable_rank_mask=True``.
         """
         import torch
@@ -235,16 +247,9 @@ class CakeAlltoAll(MoEEpCommunication):
 
         state = self._live_state()
         check_round_owner(self, state)
-        tokens_per_rank = (
-            self.params.max_tokens_per_rank
-            if max_tokens_per_rank is None
-            else max_tokens_per_rank
+        tokens_per_rank = self._resolve_runtime_max_tokens_per_rank(
+            runtime_max_tokens_per_rank, max_tokens_per_rank
         )
-        if not 0 < tokens_per_rank <= self.params.max_tokens_per_rank:
-            raise ValueError(
-                f"max_tokens_per_rank={tokens_per_rank} must be in "
-                f"(0, {self.params.max_tokens_per_rank}]"
-            )
         if eplb_local_stats is not None and eplb_local_stats.shape != (
             self.config.eplb_stats_num_experts,
         ):
@@ -253,7 +258,7 @@ class CakeAlltoAll(MoEEpCommunication):
                 f"({self.config.eplb_stats_num_experts},), got "
                 f"{tuple(eplb_local_stats.shape)}"
             )
-        self._check_rank_mask(active_rank_mask)
+        active_rank_mask = self._active_rank_mask(active_ranks)
         if topk_ids.dtype != torch.int32:
             topk_ids = topk_ids.to(torch.int32)
 
@@ -303,6 +308,7 @@ class CakeAlltoAll(MoEEpCommunication):
             "tokens_per_rank": tokens_per_rank,
             "combine_offset": state["combine_offset"],
             "combine_buffer": None,
+            "active_rank_mask": active_rank_mask,
         }
         state["round_owner"] = self
         recv = [t.flatten(0, 1) for t in recv]
@@ -345,11 +351,10 @@ class CakeAlltoAll(MoEEpCommunication):
         expert_output: "torch.Tensor",
         *,
         output: "torch.Tensor | None" = None,
-        active_rank_mask: "torch.Tensor | None" = None,
     ) -> "torch.Tensor":
         """See :meth:`MoEEpCommunication.combine`.
 
-        ``active_rank_mask`` must match the mask passed to :meth:`dispatch`.
+        Combines over the ``active_ranks`` of the matching :meth:`dispatch`.
         """
         from . import kernels
 
@@ -357,7 +362,6 @@ class CakeAlltoAll(MoEEpCommunication):
         round_state = self._round
         if round_state is None:
             raise RuntimeError("combine called before dispatch")
-        self._check_rank_mask(active_rank_mask)
         tokens_per_rank = round_state["tokens_per_rank"]
         if expert_output.dim() == 2:
             payload = expert_output.view(self.ep_size, tokens_per_rank, -1)
@@ -384,7 +388,7 @@ class CakeAlltoAll(MoEEpCommunication):
             in_workspace,
             use_low_precision=self.config.use_low_precision_combine,
             enable_rank_mask=self.config.enable_rank_mask,
-            active_rank_mask=active_rank_mask,
+            active_rank_mask=round_state["active_rank_mask"],
             enable_pdl=self.config.enable_pdl,
             output=output,
         )
@@ -393,13 +397,25 @@ class CakeAlltoAll(MoEEpCommunication):
         return combined
 
     def checkpoint_prepare(self) -> None:
-        """Release the workspace's physical memory, e.g. so that the process
-        can be checkpointed.
+        """Release the workspace's physical memory before a process checkpoint.
 
-        The virtual addresses stay reserved: CUDA graphs captured on the
-        workspace replay correctly after :meth:`checkpoint_restore`. Collective
-        over the EP group and only valid between rounds. Instances sharing the
-        workspace may call it again, which does nothing.
+        A CUDA process checkpoint cannot save the workspace's MNNVL physical
+        memory, which peer processes import. This method releases it but keeps
+        the workspace's virtual addresses reserved, so CUDA graphs captured on
+        the workspace replay correctly once :meth:`checkpoint_restore` has
+        backed it with new memory:
+
+        .. code-block:: python
+
+            communication.checkpoint_prepare()
+            # checkpoint and restore the process
+            communication.checkpoint_restore(comm_backend)
+
+        Collective over the EP group: every rank calls it in the same order,
+        after all work on the workspace has completed and only between
+        rounds. Instances sharing the workspace may call it again, which does
+        nothing. If it raises once unmapping has begun, the workspace cannot be
+        reused: restart the rank rather than retry.
         """
         state = self._live_state()
         if state["round_owner"] is not None:
@@ -410,8 +426,11 @@ class CakeAlltoAll(MoEEpCommunication):
         """Back the workspace with new memory after :meth:`checkpoint_prepare`
         and re-initialize it.
 
-        Collective over ``comm_backend``, which must span the EP group with
-        the original ranks. Does nothing when the workspace is mapped.
+        Collective over ``comm_backend``, a fresh backend that must span the
+        EP group with the original ranks and world size. Every rank calls it
+        in the same order. Does nothing when the workspace is mapped. If it
+        raises once remapping has begun, the workspace cannot be reused:
+        restart the rank rather than retry.
         """
         import torch
 

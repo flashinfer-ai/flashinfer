@@ -375,14 +375,28 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         return nvlink_platform_supported()
 
     @property
-    def cft_enabled(self) -> bool:
+    def _cft_enabled(self) -> bool:
         """Whether CFT counted writes are available to this instance's steps."""
         return self._state is not None and self._state["cft_ready"]
 
-    def active_rank_mask(self, active_ranks: Sequence[int]) -> "torch.Tensor":
-        """CPU ``uint64`` bitmask of ``active_ranks`` for ``active_rank_mask``."""
+    def _active_rank_mask(
+        self, active_ranks: "Sequence[int] | None"
+    ) -> "torch.Tensor | None":
+        """The kernels' CPU ``uint64`` bitmask of ``active_ranks``."""
         import torch
 
+        if not self.config.enable_rank_mask:
+            if active_ranks is not None:
+                raise ValueError("active_ranks requires enable_rank_mask=True")
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NVLinkOneSidedAlltoAll with enable_rank_mask=True cannot be "
+                "captured into a CUDA graph: the active-rank mask is fixed at "
+                "capture time."
+            )
+        if active_ranks is None:
+            active_ranks = range(self.ep_size)
         mask = 0
         for rank in active_ranks:
             rank = int(rank)
@@ -412,23 +426,9 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         return view
 
     def _use_cft(self, tokens_per_rank: int, max_tokens: int) -> bool:
-        if not self.cft_enabled:
+        if not self._cft_enabled:
             return False
         return self.config.cft is True or tokens_per_rank <= max_tokens
-
-    def _check_rank_mask(self, active_rank_mask: "torch.Tensor | None") -> None:
-        import torch
-
-        if not self.config.enable_rank_mask:
-            if active_rank_mask is not None:
-                raise ValueError("active_rank_mask requires enable_rank_mask=True")
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "NVLinkOneSidedAlltoAll with enable_rank_mask=True cannot be "
-                "captured into a CUDA graph: the active-rank mask is fixed at "
-                "capture time."
-            )
 
     def dispatch(
         self,
@@ -437,33 +437,29 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         topk_weights: "torch.Tensor | None" = None,
         *,
         hidden_states_scale: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
+        runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
-        active_rank_mask: "torch.Tensor | None" = None,
+        active_ranks: "Sequence[int] | None" = None,
+        max_tokens_per_rank: Optional[int] = None,
     ) -> MoEEpDispatchResult:
         """See :meth:`MoEEpCommunication.dispatch`.
 
-        ``active_rank_mask`` is a CPU ``uint64`` mask from
-        :meth:`active_rank_mask`; tokens routed to a masked-off rank are
-        dropped. Requires ``enable_rank_mask=True``.
+        ``active_ranks`` lists the EP ranks that take part in this round, e.g.
+        all ranks but a failed one; tokens routed to any other rank are
+        dropped, and the matching :meth:`combine` uses the same ranks.
+        ``None`` means every rank. This rank must be active. Requires
+        ``enable_rank_mask=True``.
         """
         import torch
 
         if self._state is None:
             raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
         check_round_owner(self, self._state)
-        self._check_rank_mask(active_rank_mask)
+        active_rank_mask = self._active_rank_mask(active_ranks)
         params = self.params
-        tokens_per_rank = (
-            params.max_tokens_per_rank
-            if max_tokens_per_rank is None
-            else max_tokens_per_rank
+        tokens_per_rank = self._resolve_runtime_max_tokens_per_rank(
+            runtime_max_tokens_per_rank, max_tokens_per_rank
         )
-        if not 0 < tokens_per_rank <= params.max_tokens_per_rank:
-            raise ValueError(
-                f"max_tokens_per_rank={tokens_per_rank} must be in "
-                f"(0, {params.max_tokens_per_rank}]"
-            )
         if topk_ids.dtype != torch.int32:
             topk_ids = topk_ids.to(torch.int32)
 
@@ -529,6 +525,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             "tokens_per_rank": tokens_per_rank,
             "local_num_tokens": topk_ids.shape[0],
             "combine_offset": int(combine_offset),
+            "active_rank_mask": active_rank_mask,
         }
         self._state["round_owner"] = self
         recv = [t.flatten(0, 1) for t in recv]
@@ -565,18 +562,16 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         expert_output: "torch.Tensor",
         *,
         output: "torch.Tensor | None" = None,
-        active_rank_mask: "torch.Tensor | None" = None,
     ) -> "torch.Tensor":
         """See :meth:`MoEEpCommunication.combine`.
 
-        ``active_rank_mask`` must match the mask passed to :meth:`dispatch`.
+        Combines over the ``active_ranks`` of the matching :meth:`dispatch`.
         """
         import torch
 
         state = self._round
         if state is None:
             raise RuntimeError("combine called before dispatch")
-        self._check_rank_mask(active_rank_mask)
         tokens_per_rank = state["tokens_per_rank"]
         if expert_output.dim() == 2:
             payload = expert_output.view(self.ep_size, tokens_per_rank, -1)
@@ -615,7 +610,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             self.config.use_low_precision_combine,
             use_cft,
             self.config.enable_rank_mask,
-            active_rank_mask,
+            state["active_rank_mask"],
             output,
             self.config.timeout_sec,
             self._enable_pdl,
@@ -625,13 +620,26 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         return output
 
     def checkpoint_prepare(self) -> None:
-        """Release the workspace's physical memory and CFT endpoints, e.g. so
-        that the process can be checkpointed.
+        """Release the workspace's physical memory and CFT endpoints before a
+        process checkpoint.
 
-        The virtual addresses stay reserved: CUDA graphs captured on the
-        workspace replay correctly after :meth:`checkpoint_restore`. Collective
-        over the EP group and only valid between rounds. Instances sharing the
-        workspace may call it again, which does nothing.
+        A CUDA process checkpoint cannot save the workspace's MNNVL physical
+        memory, which peer processes import, nor its CFT logical endpoints.
+        This method releases both but keeps the workspace's virtual addresses
+        reserved, so CUDA graphs captured on the workspace replay correctly
+        once :meth:`checkpoint_restore` has backed it with new memory:
+
+        .. code-block:: python
+
+            communication.checkpoint_prepare()
+            # checkpoint and restore the process
+            communication.checkpoint_restore(comm_backend)
+
+        Collective over the EP group: every rank calls it in the same order,
+        after all work on the workspace has completed and only between
+        rounds. Instances sharing the workspace may call it again, which does
+        nothing. If it raises once unmapping has begun, the workspace cannot be
+        reused: restart the rank rather than retry.
         """
         state = self._state
         if state is None:
@@ -651,10 +659,13 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         """Back the workspace with new memory after :meth:`checkpoint_prepare`
         and recreate its CFT endpoints.
 
-        Collective over ``comm_backend``, which must span the EP group with
-        the original ranks. Does nothing when the workspace is mapped. The CFT
+        Collective over ``comm_backend``, a fresh backend that must span the
+        EP group with the original ranks and world size. Every rank calls it
+        in the same order. Does nothing when the workspace is mapped. The CFT
         endpoints are recreated under the IDs they had, which CUDA graphs
         captured before the checkpoint use; raises if that is not possible.
+        If it raises once remapping has begun, the workspace cannot be reused:
+        restart the rank rather than retry.
         """
         from ......comm.mnnvl import all_ranks_agree
 
