@@ -539,7 +539,8 @@ def fused_kda_decode(
             ``[num_slots, 3 * H * 128, 3]`` and dtype bfloat16. Each slot uses
             either the sequence-dimension (SD) cache layout with strides
             ``[slot_stride, 1, 3 * H * 128]`` or the dimension-first (DS)
-            layout with strides ``[slot_stride, 3, 1]``. The Cake backend
+            layout with strides ``[slot_stride, 3, 1]``. Slots must start
+            8-byte aligned (``slot_stride`` a multiple of 4). The Cake backend
             supports SD only.
         raw_gate:
             Raw per-channel recurrence gate with shape
@@ -681,8 +682,9 @@ def packed_fused_kda_decode(
     accepts float32 or bfloat16 recurrent state and requires a finite negative
     ``lower_bound``. Both paths require head dimension 128 and convolution
     width four; T=1 accepts 8, 12, 16, 24, 32, 48, 64, or 96 heads and T>1
-    accepts 12, 16, 24, 32, 48, 64, or 96 heads. Other tensors follow :func:`fused_kda_decode`,
-    with the packed row count supplied by ``x``.
+    accepts 12, 16, 24, 32, 48, 64, or 96 heads. T>1 requires the SD
+    convolution-cache layout; the DS layout is T=1 only. Other tensors follow
+    :func:`fused_kda_decode`, with the packed row count supplied by ``x``.
 
     ``query_start_loc`` must be contiguous int32 of shape ``[N+1]``, start at
     zero, and contain nondecreasing offsets within ``x`` with active lengths no
