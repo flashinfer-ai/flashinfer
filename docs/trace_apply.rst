@@ -104,3 +104,98 @@ Error policy
 Trace Apply is strict. A matched solution that fails to build or run raises, so a
 broken solution is reported immediately rather than masked. A call with no
 matching registered name falls back to the original FlashInfer API.
+
+.. _trace_apply_sealed_packages:
+
+Sealed kernel packages
+----------------------
+
+The curated ``FLASHINFER_TRACE_APPLY_PATH`` folder is a *development* path: its
+solutions are loaded as plain JSON with **no verification**. The production path
+is a **sealed kernel package** — a directory whose name is the sha256 of its own
+``manifest.json``, so the digest that names a package pins every byte of it
+before anything is imported::
+
+    <root>/<sha256(manifest.json)>/
+        manifest.json        the directory name is the sha256 of these bytes
+        <sidecar files>      verified bytes, opaque to FlashInfer (e.g. a
+                             qualification receipt)
+        bundle/
+            solution.json    a FlashInfer Solution
+            ...              exactly the regular files the manifest lists
+
+The digest chain, all of which must hold before any code runs:
+
+* the package directory name equals the sha256 of ``manifest.json``;
+* ``files`` maps each bundle-relative file name to its sha256, with canonical
+  path rules only (no absolute paths, no ``..``, no NUL bytes);
+* ``bundle_sha256`` equals the sha256 of the sorted ``"name\0digest\n"`` listing,
+  so the listing itself cannot be edited to match a tampered file;
+* the bundle holds exactly the files the manifest lists — a missing file, an
+  extra file, a symbolic link, or a special file anywhere in the package refuses
+  verification;
+* sidecar files outside the bundle are authenticated by ``sealed_files``
+  (a mapping of package-relative names to sha256 digests). An earlier
+  package format's ``qualification_sha256`` key is accepted as an alias for
+  ``sealed_files = {"qualification.json": ...}``, so existing packages verify
+  unchanged. FlashInfer never interprets sidecar content: a consumer with
+  domain metadata (a qualification receipt, provenance, licenses) reads the
+  verified path through ``SealedPackage.sealed_files``;
+* the ``solution.json`` must be a FlashInfer Solution in a Python-family
+  language (``python``, ``triton``, ``cutedsl``, ``cutile``, ``tilelang``) — a
+  compiled family would need nvcc at serving start, and a
+  SOLBench/Kernel-Factory ``spec.languages`` document is refused rather than
+  silently translated.
+
+Loading
+~~~~~~~
+
+Three environment variables drive loading at ``import flashinfer`` time:
+
+============================================= =========================================================
+Variable                                      Meaning
+============================================= =========================================================
+``FLASHINFER_KERNEL_PACKAGES``                Comma-separated sha256 digests of sealed packages to
+                                              load and enable when FlashInfer is imported.
+``FLASHINFER_KERNEL_PACKAGE_ROOT``            Root directory holding the digest-named package
+                                              directories (default
+                                              ``/opt/flashinfer/kernel_packages``).
+``FLASHINFER_KERNEL_PLUGINS_DISABLE``         Kill switch: refuse sealed loading with a warning.
+============================================= =========================================================
+
+Loading is best-effort and never breaks ``import flashinfer``: a refused
+package warns (``SealedPackageError`` is a ``RuntimeError``, never an
+``ImportError``, so no engine can mistake the refusal for a missing optional
+dependency) and the surviving packages install. Packages may coexist with the
+curated path, with a warning that the curated solutions are unverified.
+
+Programmatic use
+~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from flashinfer.trace_apply import load_packages, verify_package, import_entry
+
+   result = load_packages("/opt/flashinfer/kernel_packages", ["<digest>", ...])
+   result.packages        # SealedPackage objects (sealed_files, solution, ...)
+   result.callables       # {(definition, solution name): imported entry point}
+   result.errors          # {digest: reason} for refusals when strict=False
+   result.applied         # enable_apply() return value
+
+A verified package's entry point can also be imported on its own:
+``import_entry(verify_package(root, digest))`` returns the sealed callable.
+Imported callables are registered as *preloaded* (``register_preloaded``), so
+the trace loaders never materialize sealed sources into the on-disk solution
+cache and every deferred import re-hashes the bytes it compiles. Importing a
+verified bundle executes its code: verification is content authentication, not
+a sandbox.
+
+Signatures
+~~~~~~~~~~
+
+Kernels are **not signed** anywhere in FlashInfer today, and this feature does
+not add signing: the digest chain authenticates *content* (what a digest names
+is what runs), and the trust anchor is the party that names the digest. The
+manifest reserves ``signature`` and ``schema_version`` fields so a future
+signature mechanism (e.g. keyless sigstore over the manifest) can be added
+without a format break; an unknown ``schema_version`` refuses.

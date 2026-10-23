@@ -175,11 +175,47 @@ def _reset_stats() -> None:
 _loaded_lock = Lock()
 _loaded: dict[tuple[str, str], Callable] = {}
 _loading_locks: dict[tuple[str, str], Lock] = {}
+#: Already-built callables registered by sealed-package loaders (trace_apply/packages).
+#: Consulted before the build path so sealed sources are never materialized
+#: into the on-disk solution cache.
+_preloaded: dict[tuple[str, str], Callable] = {}
+
+
+def register_preloaded(definition: str, name: str, fn: Callable) -> None:
+    """Register an already-built callable for a (definition, solution-name) pair.
+
+    Sealed-package loaders use this to hand ``enable_apply`` their imported
+    entry point: the registered callable is returned by the loaded-solution
+    boundary instead of building through the loaders, so sealed sources never
+    reach the world-writable solution cache. ``reset_loaded`` does not clear
+    preloaded entries; they are the caller's to manage via ``clear_preloaded``.
+    """
+    with _loaded_lock:
+        _preloaded[(str(definition), str(name))] = fn
+
+
+def clear_preloaded() -> None:
+    """Drop every preloaded entry (the sealed-package kill path)."""
+    with _loaded_lock:
+        _preloaded.clear()
+
+
+def preloaded_entry(definition: str, name: str) -> Callable | None:
+    """The callable preloaded for a (definition, solution-name) pair, if any.
+
+    Read access for installers that verify their registration is still the
+    live one (a foreign ``register_preloaded`` for the same key replaces it).
+    """
+    with _loaded_lock:
+        return _preloaded.get((str(definition), str(name)))
 
 
 def _get_loaded_solution(solution: Solution) -> Callable:
     key = (solution.definition, solution.name)
     with _loaded_lock:
+        preloaded = _preloaded.get(key)
+        if preloaded is not None:
+            return preloaded
         cached = _loaded.get(key)
         if cached is not None:
             return cached

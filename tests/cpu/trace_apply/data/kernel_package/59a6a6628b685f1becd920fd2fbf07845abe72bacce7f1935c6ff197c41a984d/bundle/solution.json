@@ -1,0 +1,24 @@
+{
+  "author": "ARIA",
+  "definition": "cutlass_fused_moe_e128_h2688_i1856_topk6",
+  "description": "The served kernel: FlashInfer's CUTLASS fused MoE module entry with the served scalars fixed (bf16, Relu2, tp=ep=1). The baseline a Kernel Factory campaign on this problem is measured against.",
+  "name": "stock_cutlass_fused_moe_e128_h2688_i1856_topk6",
+  "sources": [
+    {
+      "content": "\"\"\"The served kernel as the baseline: FlashInfer's CUTLASS fused MoE module entry.\n\ncudagym calls run(*inputs, output); FlashInfer's trace_apply calls it by keyword\nwith the Definition's input names and output=. It writes `output` in place and\nreturns None. Every scalar is the served value, fixed: the served-scalar contract\nregistered beside this Solution says which calls may reach it. The module entry\nis called rather than the public `cutlass_fused_moe`, so the call is neither\ntraced nor routed back to a Solution; the arguments mirror what the public API\npasses, `enable_pdl` resolved the way it resolves it. The GEMM tactics are the\nautotuner's, profiled once per token count the way serving profiles them.\n\"\"\"\n\nimport torch\nfrom flashinfer.autotuner import autotune\nfrom flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module\nfrom flashinfer.utils import device_support_pdl, get_compute_capability\n\nNUM_LOCAL_EXPERTS = 128\nHIDDEN_SIZE = 2688\nINTERMEDIATE_SIZE = 1856\nGEMM1_OUT_SIZE = 1856\n#: Token counts whose two GEMM tactics this process has profiled, per device.\n_TUNED = set()\n\n\ndef run(\n    input,\n    token_selected_experts,\n    token_final_scales,\n    fc1_expert_weights,\n    fc2_expert_weights,\n    output,\n):\n    fc1_shape = (NUM_LOCAL_EXPERTS, GEMM1_OUT_SIZE, HIDDEN_SIZE)\n    fc2_shape = (NUM_LOCAL_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE)\n    if tuple(fc1_expert_weights.shape) != fc1_shape:\n        raise ValueError(\n            f\"fc1_expert_weights {tuple(fc1_expert_weights.shape)} != {fc1_shape}\"\n        )\n    if tuple(fc2_expert_weights.shape) != fc2_shape:\n        raise ValueError(\n            f\"fc2_expert_weights {tuple(fc2_expert_weights.shape)} != {fc2_shape}\"\n        )\n    major, minor = get_compute_capability(input.device)\n    module = get_cutlass_fused_moe_module(f\"{major * 10 + minor}\")\n\n    def _call():\n        module.cutlass_fused_moe(\n            output,\n            input,\n            token_selected_experts,\n            token_final_scales,\n            fc1_expert_weights,\n            None,\n            fc2_expert_weights,\n            None,\n            torch.bfloat16,\n            [],\n            input_sf=None,\n            swiglu_alpha=None,\n            swiglu_beta=None,\n            swiglu_limit=None,\n            tp_size=1,\n            tp_rank=0,\n            ep_size=1,\n            ep_rank=0,\n            cluster_size=1,\n            cluster_rank=0,\n            use_packed_weights=False,\n            enable_alltoall=False,\n            use_deepseek_fp8_block_scale=False,\n            use_w4_group_scaling=False,\n            use_mxfp8_act_scaling=False,\n            min_latency_mode=False,\n            tune_max_num_tokens=8192,\n            enable_pdl=device_support_pdl(input.device),\n            activation_type=ActivationType.Relu2,\n            swizzled_input_sf=True,\n        )\n\n    # Serving profiles the two GEMM tactics at warm-up (vLLM runs FlashInfer's\n    # autotune before CUDA-graph capture); a cold process would time the\n    # fallback tactic instead. Profile once per token count, never inside a\n    # capture, then run the call as the served path runs it.\n    key = (input.shape[0], input.device.index)\n    with torch.cuda.device(input.device):\n        if key not in _TUNED and not torch.cuda.is_current_stream_capturing():\n            with autotune(True):\n                _call()\n            _TUNED.add(key)\n        _call()\n",
+      "path": "stock.py"
+    }
+  ],
+  "spec": {
+    "dependencies": [
+      "torch",
+      "flashinfer-python"
+    ],
+    "destination_passing_style": true,
+    "entry_point": "stock.py::run",
+    "language": "python",
+    "target_hardware": [
+      "sm100"
+    ]
+  }
+}
