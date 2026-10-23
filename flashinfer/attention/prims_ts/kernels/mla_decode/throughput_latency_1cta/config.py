@@ -892,6 +892,7 @@ def keeps_mma_ab_config_kwargs(
                 "q_stages": 1,
                 "kv_stages": 10,
                 "sparse_reuse_kv": True,
+                "cache_uniform_sparse_quads": True,
                 "load_warp_idx": 12,
                 "load_num_warps": 4,
                 "threads_per_cta": 512,

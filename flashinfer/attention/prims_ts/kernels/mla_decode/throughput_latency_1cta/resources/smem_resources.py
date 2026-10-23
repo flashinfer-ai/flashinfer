@@ -533,7 +533,12 @@ class SmemPageOffsetsResource(MlaResource):
         if self.cfg.is_dynamic_token_sparse:
             # The Gather4 loader reads its four row indices per lane straight
             # from the SMEM stage; a 128-entry register cache would not fit.
-            cache_entries = 1
+            # With uniform quads each loader warp caches only its own 32 rows.
+            cache_entries = (
+                self.cfg.sparse_cache_words
+                if self.cfg.cache_uniform_sparse_quads
+                else 1
+            )
         return cutlass.Array(
             Int32,
             cache_entries,
@@ -760,6 +765,26 @@ class SmemPageOffsetsResource(MlaResource):
         # into registers, and keeps swaps K0/K1 live until their delayed V use.
         del stage_info
         if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+            if cutlass.const_expr(self.cfg.cache_uniform_sparse_quads):
+                # Snapshot this warp's eight quads once per K / V tile as
+                # warp-uniform coordinates; every head-dimension stage of the
+                # tile then issues them from one elected lane without the
+                # per-lane R2UR waterfall.
+                quads = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
+                warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+                    self.cfg.load_warp_idx
+                )
+                row_base = self.consumer_work_stage * Int32(
+                    self.cfg.page_offsets_entries_per_stage
+                ) + warp * Int32(4 * quads)
+                for quad in cutlass.range_constexpr(quads):
+                    rows = self._smem_page_offsets.data_ptr(
+                        row_base + Int32(4 * quad)
+                    ).load(count=4, alignment=16)
+                    for j in cutlass.range_constexpr(4):
+                        cached_page_ids[6 + quad * 4 + j] = cute.arch.make_warp_uniform(
+                            Int32(rows[j])
+                        )
             return cached_page_ids
         if cutlass.const_expr(self.cfg.native_sparse_pages):
             lane = lane_idx_from_thread(cute.arch.thread_idx()[0])
@@ -1013,6 +1038,7 @@ class SmemKvResource(MlaResource):
         uses_compact_fp8_rope_stage: cutlass.Constexpr[bool],
         publish_mask: cutlass.Constexpr[bool] = False,
         tile_idx=None,
+        cached_page_ids=None,
     ):
         """Token-sparse K/V stage: 32 lanes x one Gather4 of four token rows each.
 
@@ -1056,25 +1082,42 @@ class SmemKvResource(MlaResource):
                     if lane_idx == Int32(0):
                         ring._smem_page_offsets[mask_base + word_idx] = bits
         quads_per_warp = 32 // num_load_warps
-        # Lane l < quads_per_warp issues quad (warp_in_task * quads_per_warp + l);
-        # the other lanes read (and drop) the last quad's indices, staying in
-        # the index stage.
-        quad = warp_in_task * Int32(quads_per_warp) + cute.math.min(
-            lane_idx, Int32(quads_per_warp - 1)
-        )
-        q_base = quad * Int32(4)
-        row0 = ring.token_row(q_base)
-        row1 = ring.token_row(q_base + Int32(1))
-        row2 = ring.token_row(q_base + Int32(2))
-        row3 = ring.token_row(q_base + Int32(3))
-        if lane_idx < Int32(quads_per_warp):
-            issue_gather4_tma_cta(
+        if cutlass.const_expr(cfg.cache_uniform_sparse_quads):
+            gather4_cached_warp(
+                stage_base.data_ptr(
+                    warp_in_task * Int32(quads_per_warp * 4 * row_bytes)
+                ),
                 descriptor,
-                stage_base.data_ptr(quad * Int32(4 * row_bytes)),
+                dim_offset,
+                cached_page_ids,
                 stage_info.barrier,
-                Int32(dim_offset),
-                (row0, row1, row2, row3),
+                cache_start=6,
+                num_quads=quads_per_warp,
+                num_slices=1,
+                quad_stride=4 * row_bytes,
+                slice_stride=0,
+                col_stride=0,
             )
+        else:
+            # Lane l < quads_per_warp issues quad (warp_in_task * quads_per_warp + l);
+            # the other lanes read (and drop) the last quad's indices, staying in
+            # the index stage.
+            quad = warp_in_task * Int32(quads_per_warp) + cute.math.min(
+                lane_idx, Int32(quads_per_warp - 1)
+            )
+            q_base = quad * Int32(4)
+            row0 = ring.token_row(q_base)
+            row1 = ring.token_row(q_base + Int32(1))
+            row2 = ring.token_row(q_base + Int32(2))
+            row3 = ring.token_row(q_base + Int32(3))
+            if lane_idx < Int32(quads_per_warp):
+                issue_gather4_tma_cta(
+                    descriptor,
+                    stage_base.data_ptr(quad * Int32(4 * row_bytes)),
+                    stage_info.barrier,
+                    Int32(dim_offset),
+                    (row0, row1, row2, row3),
+                )
         if cutlass.const_expr(uses_compact_fp8_rope_stage):
             if warp_in_task == Int32(0):
                 if prims.elect_sync():
@@ -1546,6 +1589,7 @@ class SmemKvResource(MlaResource):
                 uses_compact_fp8_rope_stage=uses_compact_fp8_rope_stage,
                 publish_mask=(not is_v) and qk_stage_idx == 0,
                 tile_idx=tile_idx,
+                cached_page_ids=cached_page_ids,
             )
             return
         if cutlass.const_expr(cfg.use_paged_kv == 1):
