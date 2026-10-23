@@ -239,7 +239,7 @@ def _soft_half(i, acc_s, l_i, m_i, acc_o, slog2):
 class MsaSparseAttnFp8:
     """NT tokens per CTA; the CTA walks the union of their selected KV blocks."""
 
-    def __init__(self, hq, hkv, nt, reverse=False):
+    def __init__(self, hq, hkv, nt, reverse=False, softmax_scale=None):
         """Record the head counts, tokens per CTA and walk order for this body."""
         self.hq = hq
         self.hkv = hkv
@@ -251,7 +251,11 @@ class MsaSparseAttnFp8:
         self.f16 = cutlass.Float16
         self.f32 = cutlass.Float32
         self.obf = cutlass.BFloat16
-        self.scale_log2 = (1.0 / math.sqrt(D)) / QSC * LOG2E
+        # softmax_scale is a compile-time constant: vLLM uses one scale per
+        # model (an fp8 cache folds k_scale into it), so this costs one extra
+        # compile rather than a per-call q prescale and its allocation.
+        scale = 1.0 / math.sqrt(D) if softmax_scale is None else float(softmax_scale)
+        self.scale_log2 = scale / QSC * LOG2E
 
     @cute.jit
     def __call__(
@@ -852,13 +856,31 @@ def _stream():
     return s
 
 
-def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, out):
+def run(
+    q,
+    kv,
+    q2k_indices,
+    cu_seqlens_q,
+    page_table,
+    seqused_k,
+    prefix_lens,
+    out,
+    softmax_scale=None,
+):
     # Everything that depends only on the shape signature (tile choice, launch
     # geometry, the boxed scalars the compiled entry expects) is resolved once
     # per shape; the per-call path is seven pointer boxes and one DSL call.
     """Run MSA sparse prefill over the union schedule. Writes ``p``."""
     ptshape = page_table.shape
-    sig = (q.shape[1], kv.shape[1], kv.shape[0], q.shape[0], ptshape[0], ptshape[1])
+    sig = (
+        q.shape[1],
+        kv.shape[1],
+        kv.shape[0],
+        q.shape[0],
+        ptshape[0],
+        ptshape[1],
+        softmax_scale,
+    )
     plan = _PLAN.get(sig)
     stream = _stream()
     pq = _I64(q.data_ptr())
@@ -870,7 +892,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
     pcu = _I64(cu_seqlens_q.data_ptr())
     po = _I64(out.data_ptr())
     if plan is None:
-        hq, hkv, npg, tq, nb, mpg = (int(v) for v in sig)
+        hq, hkv, npg, tq, nb, mpg = (int(v) for v in sig[:6])
         # nt is a compile-time tile height, so one launch gets one value; the
         # mean length is the only length-like quantity available without pulling
         # cu_seqlens_q to the host, and a sync per call would cost more than the
@@ -886,11 +908,11 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
         Nb, Ngrp = _I32(nb), _I32(ngrp)
         vt = torch.empty((npg, hkv, D, PG), dtype=kv.dtype, device=kv.device)
         pvt = _I64(vt.data_ptr())
-        key = (hq, hkv, nt)
+        key = (hq, hkv, nt, softmax_scale)
         fn = _CACHE.get(key)
         if fn is None:
             fn = cute.compile(
-                MsaSparseAttnFp8(hq, hkv, nt),
+                MsaSparseAttnFp8(hq, hkv, nt, softmax_scale=softmax_scale),
                 pq,
                 pkv,
                 pvt,
