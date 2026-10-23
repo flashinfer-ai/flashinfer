@@ -144,8 +144,8 @@ page sizes); the first probe on a served device and the first plan re-read them 
 
 ## Requirements and limits
 
-- SM107 (Rubin, cc 10.7) only; `nvidia-cutlass-dsl >= 4.8.0` (the first wheel with the `sm_107a` target; the repository-wide
-  floor is unchanged -- the kernels gate at runtime and decline by version); torch with CUDA 13; `cuda-python`.
+- SM107 (Rubin, cc 10.7) only; `nvidia-cutlass-dsl >= 4.8.0` (the first wheel with the `sm_107a` target; also the package minimum;
+  the kernels still gate at runtime and decline by version); torch with CUDA 13; `cuda-python`.
 - bf16 activations, weights and pools; `head_dim = 256`; `d_model % 256 == 0`; `rope_dim` 64 (the Qwen3.5 value) or 128
   (`qwen_3_5_block_support(...).rope_dims`: the fused norm + RoPE projection rotates whole 64-column epilogue-subtile pairs below
   the head dim, and the norm + RoPE kernels of the lowered decode chain shuffle 16 x a power-of-two elements -- 32 / 256 fail the
@@ -232,8 +232,8 @@ at eviction, a captured one retained and revived, a cold bucket under capture re
 `cudnn` package blocked).
 Validated on an SM107 (cc 10.7) GPU with `nvidia-cutlass-dsl` 4.8.0 and torch 2.14 in a Python environment without the
 cudnn-frontend package; the public and internal CI matrices have no SM107 runner, so the GPU tests skip there and the CPU tests
-(support, weights, RoPE, plan cache, isolation) run everywhere, including under the CI images' `nvidia-cutlass-dsl` 4.7.0, where the
-envelope declines by target.
+(support, weights, RoPE, plan cache, isolation) run everywhere. The CI image policy now pins `nvidia-cutlass-dsl` 4.8.0;
+the runtime gate still declines unsupported targets.
 
 No performance number is claimed in this draft. The Rubin decode levers (the 64-column decode tile, the decode-grid split combine
 and its lean group walk, the lowered small-M decode chain) landed on the cuDNN Frontend side on 2026-10-16 and are vendored here,

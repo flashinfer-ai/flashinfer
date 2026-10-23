@@ -310,13 +310,10 @@ install_and_verify() {
         # version skew between libs-base and libs-cu13.  requirements.txt
         # cannot add the extra conditionally, hence the separate install.
         #
-        # Keep this a floor, not an exact pin: an exact ==4.7.0 downgrades a
-        # newer CuTe DSL that the test image may ship (the Rubin image ships
-        # 4.8.0a0), which removes cutlass.utils.rubin_helpers and the sm_107a
-        # Arch member and so disables every SM107 path for the whole run.
-        # The a0 suffix is required for pip to consider pre-releases at all.
+        # Keep the floor in sync with the package and ci/cuda-versions.json
+        # without downgrading a newer DSL already installed in the test image.
         if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            _dependency_args+=("nvidia-cutlass-dsl[cu13]>=4.7.0a0")
+            _dependency_args+=("nvidia-cutlass-dsl[cu13]>=4.8.0")
         fi
         pip install --no-deps "${_dependency_args[@]}"
         unset _dependency_args
