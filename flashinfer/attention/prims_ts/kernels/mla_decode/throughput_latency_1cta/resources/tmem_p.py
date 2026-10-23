@@ -334,7 +334,7 @@ class TmemPResource(MlaResource):
             local_sum_arr[scale_idx] = local_sums[scale_idx]
 
         if cutlass.const_expr(
-            cfg.kernel_variant == "keeps_mma_ab" and not cfg.native_sparse_pages
+            cfg.kernel_variant == "keeps_mma_ab" and not cfg.keeps_ilp_softmax
         ):
             state_idx = cute.arch.thread_idx()[0]
             state_ptr = self.tmem_alias_ref._softmax_scratch.data_ptr(state_idx)

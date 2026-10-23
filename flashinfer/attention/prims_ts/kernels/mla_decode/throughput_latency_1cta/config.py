@@ -258,9 +258,10 @@ class MlaConfig:
 
     @property
     def keeps_ilp_softmax(self) -> bool:
-        """Keeps-MMA-AB softmax with a 4-way row max, FFMA2 exp arguments and four
-        packed sum accumulators (short dependency chains): the native sparse path
-        and the E4M3 token-sparse path."""
+        """Keeps-MMA-AB softmax with a 4-way row max, FFMA2 exp arguments, four
+        packed sum accumulators and the running max / sum in registers (short
+        dependency chains, no per-tile SMEM round trip or named barrier): the
+        native sparse path and the E4M3 token-sparse path."""
         return self.native_sparse_pages or (
             self.is_dynamic_token_sparse and not self.is_dynamic_token_sparse_nvfp4
         )

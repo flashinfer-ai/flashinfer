@@ -287,8 +287,7 @@ class TmemSResource(MlaResource):
                 self.page_offsets_kv.total_words,
             )
         if cutlass.const_expr(
-            self.cfg.kernel_variant == "keeps_mma_ab"
-            and not self.cfg.native_sparse_pages
+            self.cfg.kernel_variant == "keeps_mma_ab" and not self.cfg.keeps_ilp_softmax
         ):
             thread_idx = cute.arch.thread_idx()[0]
             state_ptr = self._softmax_scratch.data_ptr(thread_idx)
@@ -614,7 +613,7 @@ class TmemSResource(MlaResource):
 
         for idx in cutlass.range_constexpr(num_scale_groups):
             if cutlass.const_expr(
-                cfg.kernel_variant == "keeps_mma_ab" and not cfg.native_sparse_pages
+                cfg.kernel_variant == "keeps_mma_ab" and not cfg.keeps_ilp_softmax
             ):
                 state_ptr = self._softmax_scratch.data_ptr(warp_grp_thread_idx)
                 old_max_vals[idx] = u32_bits_to_float(
@@ -1252,7 +1251,7 @@ class TmemSResource(MlaResource):
         # published local_sum_arr.  It updates the running denominator for the
         # next score tile without consuming a new score payload.
         if cutlass.const_expr(
-            self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.native_sparse_pages
+            self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.keeps_ilp_softmax
         ):
             old_max = old_max_arr[0]
             new_max = new_max_arr[0]
