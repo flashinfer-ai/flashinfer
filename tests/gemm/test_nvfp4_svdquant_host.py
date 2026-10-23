@@ -301,7 +301,7 @@ def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
 
 
 @pytest.mark.parametrize(
-    "auto_backend_case", [(64, 128, 3072, 96), (64, 128, 3072, 128)], indirect=True
+    "auto_backend_case", [(64, 128, 3072, 96), (64, 128, 3072, 160)], indirect=True
 )
 @pytest.mark.parametrize("operation", ["gemm", "linear"])
 def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operation):
@@ -313,7 +313,7 @@ def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operati
     assert not builds, "no native tactic stages this rank; do not load the module"
 
 
-@pytest.mark.parametrize("rank", [96, 128])
+@pytest.mark.parametrize("rank", [96, 160])
 def test_explicit_cutlass_rejects_unsupported_rank_before_build(
     auto_backend_case, rank
 ):
@@ -542,11 +542,11 @@ def test_ranks_off_the_granularity_are_refused(monkeypatch, rank):
         gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank))
 
 
-def test_fused_linear_admission_supports_ranks_32_and_64():
-    """The fused prefix has separate rank-32 and rank-64 specializations."""
-    for rank in (96, 128):
+def test_fused_linear_admission_supports_ranks_32_64_and_128():
+    """The fused prefix has separate rank-32, rank-64 and rank-128 specializations."""
+    for rank in (96, 160):
         assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
-    for rank in (32, 64):
+    for rank in (32, 64, 128):
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
 
 
@@ -560,7 +560,7 @@ def test_sm120_accepts_rank_32(monkeypatch):
 def test_fused_prefix_rank_limit_does_not_restrict_shared_gemm_validation():
     """The shared GEMM check also admits ranks with no SM120 fused prefix."""
     m, k = 64, 3072
-    for rank in (96, 128):
+    for rank in (96, 160):
         assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
         assert (
             gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank)) is True
@@ -1463,7 +1463,7 @@ def test_linear_runners_load_the_requested_rank(
     assert type(runners[0]).__name__ == expected_fallback
 
 
-@pytest.mark.parametrize("rank", [0, 48, 96, 128])
+@pytest.mark.parametrize("rank", [0, 48, 96, 160])
 def test_linear_rejects_unsupported_ranks_before_loading_kernels(rank: int) -> None:
     with pytest.raises(ValueError, match="rank"):
         svdquant_linear(
@@ -3192,7 +3192,7 @@ def _run_ubsan(tmp_path: Path, source: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("rank", (32, 64))
+@pytest.mark.parametrize("rank", (32, 64, 128))
 def test_dynamic_prefix_offsets_cross_int32_boundary(tmp_path: Path, rank: int) -> None:
     # Compile the production expressions so UBSan checks C++ promotion rules,
     # without allocating multi-gigabyte CUDA tensors to reach the boundary.
@@ -3257,6 +3257,7 @@ def test_dynamic_prefix_offsets_cross_int32_boundary(tmp_path: Path, rank: int) 
             f"int row = {2147483648 // rank}, b_row = row;\n"
             "int row0 = row, row1 = row, row2 = row, row3 = row, row4 = row;\n"
             "int row5 = row, row6 = row, row7 = row, row8 = row, row9 = row;\n"
+            "int row_lo = row, row_hi = row;\n"
             f"{setup}\n"
             f"std::int64_t actual = {offset};\n"
             f"if (actual != {expected}LL) return __LINE__;\n"
@@ -3344,7 +3345,7 @@ int main() { check<false>(); check<true>(); }
     _run_ubsan(tmp_path, prelude + guard + checks)
 
 
-@pytest.fixture(scope="module", params=(32, 64))
+@pytest.fixture(scope="module", params=(32, 64, 128))
 def alignment_binary(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> Path:
@@ -3375,14 +3376,28 @@ def alignment_binary(
         root / "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
     ).read_text()
     large_m = _function(header, "inline cudaError_t launch_large_m_dyn_kernel(")
-    launch = large_m.index("nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<")
-    end = large_m.index("return cudaGetLastError();", launch)
-    # Execute all real geometry checks, replacing only the CUDA launch syntax.
-    large_m = large_m[:launch] + "++backend_calls;\n" + large_m[end:]
+    # Execute all real geometry checks, replacing only the two CUDA launches
+    # (the wide-rank staged-B kernel and the default kernel).
+    launch = large_m.index("if constexpr (kStagedB) {")
+    staged = _function(large_m[launch:], "if constexpr (kStagedB) {")
+    rest = large_m[launch + len(staged) :]
+    end = launch + len(staged) + rest.index("else {") + len(_function(rest, "else {"))
+    large_m = (
+        large_m[:launch]
+        + "++backend_calls;\n    return cudaGetLastError();"
+        + large_m[end:]
+    )
+    # The launcher sizes its down warps and staged-B shared memory with these.
+    wide_rank = header.index("constexpr bool large_m_stages_b(")
+    staged_bytes = header.index("constexpr int staged_b_shared_bytes(")
+    staged_bytes += len(_function(header, "constexpr int staged_b_shared_bytes("))
     functions += (
         "\nnamespace quant { using Type = std::uint16_t; constexpr int SF_VEC_SIZE = 16; }\n"
         "enum class DynAddress { Recompute };\n"
-        "template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy, int Rank>\n"
+        + _function(header, "constexpr int large_m_down_warps(")
+        + "\n"
+        + header[wide_rank:staged_bytes]
+        + "\ntemplate <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy, int Rank>\n"
         + large_m
     )
     program = r"""
