@@ -449,27 +449,26 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         // bounds max_smem_per_threadblock with. It is an approximation: FP4
         // scale-factor bytes and FP8 repack staging are not counted (both are
         // zero or small at CTA_TILE_Q=16).
-        // This fallback is reachable today: neither plan() nor the JIT path
-        // validates head dims, so within this branch (vo <= 256 -- vo in
-        // (256, 512) fails the NUM_MMA_D_VO tiling static_assert and vo >= 512
-        // / qk >= 512 return above) head_dim_qk may be any multiple of 16 up
-        // to 496 under pos_encoding_mode NONE. E.g. (qk, vo) = (448, 256) at
-        // 2-byte KV needs 16*448*2 + (448+256)*16*4*2 = 104448 bytes, which
-        // exceeds the 101376-byte opt-in limit of 99KB parts (SM86/89/120/121)
-        // -- the probe fires and the cta_tile_q=64 fallback (4x1 layout, 4x
-        // smaller KV step, like the Turing branch below) keeps the
-        // configuration dispatchable instead of failing outright. The
-        // kv_dtype_bytes accuracy likewise changes tile selection for such
-        // configurations: at (448, 256) the true 1-byte cost is
-        // 16*448*2 + (448+256)*16*4*1 = 59392 bytes, so callers that supply
-        // kv_dtype_bytes=1 get cta_tile_q=16 where the 2-byte assumption
-        // returned 64. Both behaviors are pinned by
+        // This fallback is reachable: at 2-byte KV the Python plan() check
+        // (_check_head_dim) only requires head dims that are multiples of 64,
+        // so within this branch (vo <= 256 -- vo in (256, 512) fails the
+        // NUM_MMA_D_VO tiling static_assert and vo >= 512 / qk >= 512 return
+        // above) head_dim_qk may be up to 448 under pos_encoding_mode NONE.
+        // E.g. (qk, vo) = (448, 256) at 2-byte KV needs
+        // 16*448*2 + (448+256)*16*4*2 = 104448 bytes, which exceeds the
+        // 101376-byte opt-in limit of 99KB parts (SM86/89/120/121) -- the
+        // probe fires and the cta_tile_q=64 fallback (4x1 layout, 4x smaller
+        // KV step, like the Turing branch below) keeps the configuration
+        // dispatchable instead of failing outright, as
         // test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256 in
-        // tests/attention/test_batch_prefill_kernels.py. Callers that cannot
-        // supply kv_dtype_bytes keep the conservative 2-byte default, which
-        // overestimates 1-byte (FP8/FP4) KV by 2x and can demote a working
-        // configuration to cta_tile_q=64 (a performance change, not a
-        // correctness one).
+        // tests/attention/test_batch_prefill_kernels.py pins. At 1-byte KV
+        // that check requires multiples of 128, and the largest such
+        // configuration here, (384, 256), fits even at the 2-byte estimate
+        // (94208 bytes), so kv_dtype_bytes changes no tile that plan()
+        // accepts. Callers that cannot supply kv_dtype_bytes keep the
+        // conservative 2-byte default, which overestimates 1-byte (FP8/FP4)
+        // KV by 2x and can demote a working configuration to cta_tile_q=64
+        // (a performance change, not a correctness one).
         int dev_id = 0, max_smem_per_block_optin = 0;
         cudaGetDevice(&dev_id);
         cudaDeviceGetAttribute(&max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
