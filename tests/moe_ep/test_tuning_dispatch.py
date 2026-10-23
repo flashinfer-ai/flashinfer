@@ -93,6 +93,14 @@ def test_unsupported_tuner_options_fail_before_import(options, dispatched, capsy
     assert capsys.readouterr().err
 
 
+def test_v1_cache_option_is_rejected(dispatched, capsys):
+    with pytest.raises(SystemExit) as exc:
+        tune.main([*_GEOMETRY, "--autotune-cache", "cache.json"])
+    assert exc.value.code == 2
+    assert not dispatched
+    assert "unrecognized arguments: --autotune-cache" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "options,do_finalize",
     [([], True), (["--do-finalize"], True), (["--no-do-finalize"], False)],

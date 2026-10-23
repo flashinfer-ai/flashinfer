@@ -219,6 +219,11 @@ def tune_one(
             l2,
             candidates,
             autotune_sm107_block_scaled_mega_moe,
+            tune_kwargs={
+                "force_tune": True,
+                "install_winner": False,
+                "allow_nondeterministic": args.allow_nondeterministic,
+            },
         )
     except BaseException:
         # A rank-local GPU failure must escape to the job supervisor without
@@ -233,6 +238,8 @@ def tune_one(
 def run_tuning(args, quant_kind: str) -> int:
     """Initialize the runtime and tune each token-capacity bucket."""
     import torch
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer import autotune_v2
 
     if args.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
         raise SystemExit("SM107 supports bf16, nvfp4, or mxfp8 combine")
@@ -269,8 +276,9 @@ def run_tuning(args, quant_kind: str) -> int:
             bootstrap, sm107_block_scaled_runtime_requirements(bootstrap)
         )
     try:
-        for max_tokens in args.max_tokens:
-            tune_one(args, rank, world_size, max_tokens, quant_kind)
+        with autotune_v2():
+            for max_tokens in args.max_tokens:
+                tune_one(args, rank, world_size, max_tokens, quant_kind)
         torch.cuda.synchronize()
     except BaseException:
         runtime = None
@@ -284,6 +292,8 @@ def run_tuning(args, quant_kind: str) -> int:
         from .....kernel_src.sm107.next_cutedsl_megamoe import knob_cache_path
 
         print(
-            f"[moe_ep-tune] done; cache: {knob_cache_path() or 'DISABLED'}", flush=True
+            f"[moe_ep-tune] done; MegaMoE cache: {knob_cache_path() or 'DISABLED'}; "
+            f"FlashInfer cache: {AutoTuner.get()._active_managed_store.env_dir}",
+            flush=True,
         )
     return 0

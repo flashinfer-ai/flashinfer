@@ -83,6 +83,7 @@ class MegaKernelBackend(ABC):
     supports_output_view: bool = False
     supports_unfinalized_output: bool = False
     supports_live_token_tuning: bool = False
+    supports_auto_workspaces: bool = False
     _knob_cache_module: str
 
     def __init__(self, config: object) -> None:
@@ -95,7 +96,7 @@ class MegaKernelBackend(ABC):
         self._profile_knobs: dict[tuple[int, int | None], dict] = {}
         self._autotune_winner: dict[str, Any] | None = None
 
-    def get_tuned_knobs(self) -> dict[str, Any]:
+    def get_tuned_knobs(self, workspace: Any = None) -> dict[str, Any]:
         """Return a copy of the last completed automatic tuning result."""
         if self._autotune_winner is None:
             raise RuntimeError(
@@ -206,6 +207,14 @@ class MegaKernelBackend(ABC):
 
     def _tuning_key(self, fleet_params: "FleetParams") -> dict[str, Any]:
         raise NotImplementedError
+
+    def coordinate_workspace_replacement(self, workspace: Any) -> bool:
+        """Agree whether later selection needs new storage for captured graphs.
+
+        Called on every EP rank before input staging. Backends may perform a
+        collective here; no rank may allocate replacement storage until it returns.
+        """
+        return False
 
     def _tuning_cache(self) -> Any:
         return importlib.import_module(self._knob_cache_module)
