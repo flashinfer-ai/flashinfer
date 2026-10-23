@@ -876,22 +876,6 @@ users should normally leave the batch-size policy at its defaults.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `FLASHINFER_KDA_T1_FAST_PATH` | `1` | `0` disables routing eligible recurrent KDA T=1 calls to the packed CuTe-DSL decode kernel. |
-| `FLASHINFER_PACKED_KDA_TILE_V` | batch policy | Override the V-dimension tile width with a supported packed-KDA tile size. |
-| `FLASHINFER_PACKED_KDA_ILP` | batch policy | Override the number of rows processed per instruction-level-parallel group. |
-| `FLASHINFER_PACKED_KDA_THREADS` | batch policy | Override CTA threads; the value divided by 16 must select a valid group count. |
-| `FLASHINFER_PACKED_KDA_EVICT_FIRST` | batch policy | Set to `1` or `0` to override the policy's first-use cache-eviction hint. |
-| `FLASHINFER_PACKED_KDA_CHUNKR` | policy-derived | Override rows per staged state-pool chunk. |
-| `FLASHINFER_PACKED_KDA_STAGES` | batch policy | Override cp.async pipeline depth; use `0` for register prefetch or at least `2` for pipelining. |
-| `FLASHINFER_PACKED_KDA_NO_CPASYNC` | `0` | `1` forces the register-prefetch kernel instead of cp.async staging. |
-| `FLASHINFER_PACKED_KDA_PERSIST` | `0` | `1` enables the persistent-CTA schedule when alignment and pipeline constraints permit it. |
-| `FLASHINFER_PACKED_KDA_TMA` | `0` | `1` uses TMA state-pool reads when the staged kernel is active; mutually exclusive with bulk stores. |
-| `FLASHINFER_PACKED_KDA_BULK` | `0` | `1` uses bulk stores for an eligible staged kernel; mutually exclusive with TMA reads. |
-| `FLASHINFER_PACKED_KDA_PRIVRING` | `1` | `1` selects private-ring synchronization when neither TMA nor bulk-store mode is active. |
-| `FLASHINFER_PACKED_KDA_MAXRREG` | `0` | Override the generated kernel's maximum-register tuning hint (`0` leaves it unspecified). |
-| `FLASHINFER_PACKED_KDA_L2HINT` | `256` | Override the generated kernel's L2-prefetch-size hint. |
-| `FLASHINFER_PACKED_KDA_HPC` | `1` | Override heads combined per CTA for eligible staged whole-head tiles. |
-| `FLASHINFER_PACKED_KDA_L2POL` | `0` | Override the experimental L2 cache-policy selector. |
-| `FLASHINFER_PACKED_KDA_MINBLOCKS` | `0` | Override the generated kernel's minimum-blocks-per-SM launch-bound hint. |
 
 ## Development Workflow
 

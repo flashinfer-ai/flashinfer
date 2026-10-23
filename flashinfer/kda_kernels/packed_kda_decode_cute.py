@@ -51,7 +51,6 @@ recurrent KDA kernel in ``flashinfer.kda_kernels.recurrent_kda``):
 """
 
 import functools
-import os
 from typing import Optional
 
 import cutlass
@@ -151,103 +150,6 @@ def _cp_async_bf16x8_cg(base_addr_i64, bf16_elem_offset, smem_addr_i32, l2_hint=
     return cutlass.Int32(r)
 
 
-def _l2_policy_evict_last():
-    """64-bit L2 cache policy: evict_last (created once per thread)."""
-    r = mlir_llvm.inline_asm(
-        cutlass.Int64.mlir_type,
-        [],
-        "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
-        "=l",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int64(r)
-
-
-def _l2_policy_evict_first():
-    r = mlir_llvm.inline_asm(
-        cutlass.Int64.mlir_type,
-        [],
-        "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
-        "=l",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int64(r)
-
-
-def _stg_hint_v4_b32(gmem_addr_i64, u0, u1, u2, u3, policy_i64):
-    """st.global.L2::cache_hint.v4.b32 — state write with an L2 policy.
-
-    evict_last keeps the freshly written state resident in L2 so its
-    write-back drains after kernel-end (overlapping the next kernel in a
-    serving pipeline) instead of competing with the in-kernel read stream.
-    """
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [
-            gmem_addr_i64.ir_value(),
-            u0.ir_value(),
-            u1.ir_value(),
-            u2.ir_value(),
-            u3.ir_value(),
-            policy_i64.ir_value(),
-        ],
-        "{ st.global.L2::cache_hint.v4.b32 [$1], {$2, $3, $4, $5}, $6;"
-        " mov.u32 $0, 0; }",
-        "=r,l,r,r,r,r,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _cp_async_bf16x8_cg_hint(
-    base_addr_i64, bf16_elem_offset, smem_addr_i32, policy_i64
-):
-    """cp.async.cg with an L2 cache policy (evict_first for the read stream)."""
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [
-            smem_addr_i32.ir_value(),
-            base_addr_i64.ir_value(),
-            bf16_elem_offset.ir_value(),
-            policy_i64.ir_value(),
-        ],
-        "{ .reg .u64 _a; mad.wide.u32 _a, $3, 2, $2;"
-        " cp.async.cg.shared.global.L2::cache_hint [$1], [_a], 16, $4;"
-        " mov.u32 $0, 0; }",
-        "=r,r,l,r,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _stg_v4_b32(gmem_addr_i64, u0, u1, u2, u3):
-    """st.global.v4.b32 at a raw byte address (default cache policy)."""
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [
-            gmem_addr_i64.ir_value(),
-            u0.ir_value(),
-            u1.ir_value(),
-            u2.ir_value(),
-            u3.ir_value(),
-        ],
-        "{ st.global.v4.b32 [$1], {$2, $3, $4, $5}; mov.u32 $0, 0; }",
-        "=r,l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
 def _cp_async_commit_group():
     r = mlir_llvm.inline_asm(
         cutlass.Int32.mlir_type,
@@ -273,114 +175,6 @@ def _cp_async_wait_group_n(n_const):
         [],
         f"{{ cp.async.wait_group {int(n_const)}; mov.u32 $0, 0; }}",
         "=r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _cp_async_bulk_store(gmem_addr_i64, smem_addr_i32, size_bytes):
-    """One shared->global bulk store (async proxy, bulk_group completion).
-
-    The issuing warp's lane 0 pushes its warp's contiguous smem region out
-    through the TMA path — state writes leave the SM without occupying
-    LSU/L1TEX wavefronts.
-    """
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [gmem_addr_i64.ir_value(), smem_addr_i32.ir_value()],
-        "{ cp.async.bulk.global.shared::cta.bulk_group [$1], [$2], "
-        f"{int(size_bytes)};"
-        " mov.u32 $0, 0; }",
-        "=r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _cp_async_bulk_read(smem_addr_i32, gmem_addr_i64, mbar_addr_i32, size_bytes):
-    """One global->shared bulk read completing on an mbarrier (TMA-1D)."""
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [
-            smem_addr_i32.ir_value(),
-            gmem_addr_i64.ir_value(),
-            mbar_addr_i32.ir_value(),
-        ],
-        "{ cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
-        f" [$1], [$2], {int(size_bytes)}, [$3];"
-        " mov.u32 $0, 0; }",
-        "=r,r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _cp_async_bulk_commit():
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [],
-        "{ cp.async.bulk.commit_group; mov.u32 $0, 0; }",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _cp_async_bulk_wait_read(n_const):
-    """Wait until at most n bulk groups have unread smem sources."""
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [],
-        f"{{ cp.async.bulk.wait_group.read {int(n_const)}; mov.u32 $0, 0; }}",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _cp_async_bulk_wait(n_const):
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [],
-        f"{{ cp.async.bulk.wait_group {int(n_const)}; mov.u32 $0, 0; }}",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _fence_proxy_async():
-    """Order generic-proxy smem writes before async-proxy bulk reads."""
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [],
-        "{ fence.proxy.async.shared::cta; mov.u32 $0, 0; }",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
-def _sync_warp():
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [],
-        "{ bar.warp.sync 0xffffffff; mov.u32 $0, 0; }",
-        "=r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
@@ -749,10 +543,6 @@ def _kda_packed_t1_smem_kernel(
     chunk_rows: cutlass.Constexpr[int],
     cp_l2_hint: cutlass.Constexpr[int],
     heads_per_cta: cutlass.Constexpr[int],
-    bulk_store: cutlass.Constexpr[bool],
-    tma_read: cutlass.Constexpr[bool],
-    l2_policy_mode: cutlass.Constexpr[int],
-    private_ring: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
 ):
     """cp.async-pipelined variant for the DRAM-bound large-batch regime.
@@ -808,22 +598,12 @@ def _kda_packed_t1_smem_kernel(
     ccol = (tidx % THREADS_PER_ROW) * COL_SPAN
     CPJ = tuple(range(COL_SPAN // vec))
 
-    # Bulk-store geometry: with SUB == 1 each warp's rows are contiguous
-    # (2 groups x ilp_rows rows = one span), so its write-back is a single
-    # shared->global bulk copy issued by lane 0.
-    warp_idx = tidx // 32
-    WARP_ROWS: cutlass.Constexpr[int] = 2 * ilp_rows
-
     smem = cutlass.utils.SmemAllocator()
     sH = smem.allocate_tensor(
         cutlass.BFloat16,
         cute.make_layout((n_stages, CHUNK_ROWS, K), stride=(CHUNK_ROWS * K, K, 1)),
         16,
     )
-    sMbar = smem.allocate_tensor(
-        cutlass.Int64, cute.make_layout((2 * n_stages,), stride=(1,)), 8
-    )
-    CHUNK_BYTES: cutlass.Constexpr[int] = CHUNK_ROWS * K * 2
 
     raw_slot = state_indices[i_n]
 
@@ -902,52 +682,18 @@ def _kda_packed_t1_smem_kernel(
         h_base = h_slots[0].iterator.toint()
         sh_base = cutlass.Int32(sH.iterator.toint())
 
-        # L2 eviction steering: state writes pin as evict_last so their
-        # write-back drains after kernel-end (in serving it overlaps the next
-        # kernel); the read stream optionally marks evict_first.
-        pol_w = cutlass.Int64(0)
-        pol_r = cutlass.Int64(0)
-        if cutlass.const_expr(l2_policy_mode >= 1):
-            pol_w = _l2_policy_evict_last()
-        if cutlass.const_expr(l2_policy_mode >= 2):
-            pol_r = _l2_policy_evict_first()
-
         # Prologue: put the first D chunks in flight before the q/k/gate
-        # staging math, which then hides their latency. In bulk-store mode one
-        # ring slot stays spare so refills never wait on the newest bulk read.
-        D: cutlass.Constexpr[int] = n_stages - (2 if bulk_store else 1)
-        if cutlass.const_expr(tma_read):
-            # TMA-1D ring: one bulk read per chunk, full/empty mbarriers
-            # instead of LDGSTS groups + CTA barriers. All slots prefill.
-            if tidx == 0:
-                for s in range(n_stages):
-                    cute.arch.mbarrier_init(sMbar.iterator + s, 1)
-                    cute.arch.mbarrier_init(sMbar.iterator + n_stages + s, _NUM_THREADS)
-            cute.arch.mbarrier_init_fence()
-            cute.arch.barrier()
-            if tidx == 0:
-                for c in range(min(n_stages, ITERS)):
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        sMbar.iterator + c, CHUNK_BYTES
-                    )
-                    _cp_async_bulk_read(
-                        sh_base + c * CHUNK_BYTES,
-                        h_base + cutlass.Int64((i_v * tile_v + c * CHUNK_ROWS) * K * 2),
-                        cutlass.Int32(sMbar.iterator.toint()) + c * 8,
-                        CHUNK_BYTES,
-                    )
-        else:
-            for c in range(min(D, ITERS)):
-                grow_base = i_v * tile_v + c * CHUNK_ROWS + crow
-                for j in CPJ:
-                    elem_off = grow_base * K + ccol + j * vec
-                    smem_byte = (
-                        (c % n_stages) * CHUNK_ROWS * K + crow * K + ccol + j * vec
-                    ) * 2
-                    _cp_async_bf16x8_cg(
-                        h_base, elem_off, sh_base + smem_byte, cp_l2_hint
-                    )
-                _cp_async_commit_group()
+        # staging math, which then hides their latency.
+        D: cutlass.Constexpr[int] = n_stages - 1
+        for c in range(min(D, ITERS)):
+            grow_base = i_v * tile_v + c * CHUNK_ROWS + crow
+            for j in CPJ:
+                elem_off = grow_base * K + ccol + j * vec
+                smem_byte = (
+                    (c % n_stages) * CHUNK_ROWS * K + crow * K + ccol + j * vec
+                ) * 2
+                _cp_async_bf16x8_cg(h_base, elem_off, sh_base + smem_byte, cp_l2_hint)
+            _cp_async_commit_group()
 
         # ------------------------------------------------------------------
         # Pipelined main loop: wait chunk -> barrier -> refill ring -> compute.
@@ -1056,70 +802,32 @@ def _kda_packed_t1_smem_kernel(
                         )
                         cute.autovec_copy(vt, r_v_all[itl * SUB + sub])
 
-            if cutlass.const_expr(private_ring):
-                # Per-thread deep wait: own bytes of chunk it+1 resident, so
-                # the prefetched LDS below needs no CTA barrier — except
-                # while PROLOGUE chunks are being consumed: the prologue uses
-                # the shared crow/ccol issue geometry (better warp
-                # coalescing), so chunks 0..D-1 arrive via other threads'
-                # copies and each needs a publish after the matching wait.
-                _cp_async_wait_group_n(
-                    max(0, min(D - 2, ITERS - 2 - it)) if it + 1 < ITERS else 0
-                )
-                if cutlass.const_expr(it <= D - 2):
-                    cute.arch.barrier()
-                if cutlass.const_expr(it + D < ITERS):
-                    c = it + D
-                    for sub2 in SUBI:
-                        for r in ROWS:
-                            lrow = (sub2 * _NUM_GROUPS + group_idx) * ilp_rows + r
-                            elem_off = (
-                                i_v * tile_v + c * CHUNK_ROWS + lrow
-                            ) * K + k_lane * vec
-                            smem_byte = (
-                                ((c % n_stages) * CHUNK_ROWS + lrow) * K + k_lane * vec
-                            ) * 2
-                            _cp_async_bf16x8_cg(
-                                h_base, elem_off, sh_base + smem_byte, cp_l2_hint
-                            )
-                    _cp_async_commit_group()
-            elif cutlass.const_expr(tma_read):
-                cute.arch.mbarrier_wait(
-                    sMbar.iterator + (it % n_stages), (it // n_stages) & 1
-                )
-            else:
-                # Deep wait: chunk it+1 must also be resident so its LDS can
-                # issue this iteration and cover a full compute phase.
-                _cp_async_wait_group_n(
-                    max(0, min(D - 2, ITERS - 2 - it)) if it + 1 < ITERS else 0
-                )
-                if cutlass.const_expr(bulk_store):
-                    if cutlass.const_expr(it >= 2):
-                        # The slot refilled below was bulk-stored two
-                        # iterations ago; allow the newest bulk group to stay
-                        # in flight.
-                        _cp_async_bulk_wait_read(1)
-                    elif cutlass.const_expr(it == 1):
-                        _cp_async_bulk_wait_read(0)
+            # Per-thread deep wait: own bytes of chunk it+1 resident, so
+            # the prefetched LDS below needs no CTA barrier — except
+            # while PROLOGUE chunks are being consumed: the prologue uses
+            # the shared crow/ccol issue geometry (better warp
+            # coalescing), so chunks 0..D-1 arrive via other threads'
+            # copies and each needs a publish after the matching wait.
+            _cp_async_wait_group_n(
+                max(0, min(D - 2, ITERS - 2 - it)) if it + 1 < ITERS else 0
+            )
+            if cutlass.const_expr(it <= D - 2):
                 cute.arch.barrier()
-
-                if cutlass.const_expr(it + D < ITERS):
-                    c = it + D
-                    grow_base = i_v * tile_v + c * CHUNK_ROWS + crow
-                    for j in CPJ:
-                        elem_off = grow_base * K + ccol + j * vec
+            if cutlass.const_expr(it + D < ITERS):
+                c = it + D
+                for sub2 in SUBI:
+                    for r in ROWS:
+                        lrow = (sub2 * _NUM_GROUPS + group_idx) * ilp_rows + r
+                        elem_off = (
+                            i_v * tile_v + c * CHUNK_ROWS + lrow
+                        ) * K + k_lane * vec
                         smem_byte = (
-                            (c % n_stages) * CHUNK_ROWS * K + crow * K + ccol + j * vec
+                            ((c % n_stages) * CHUNK_ROWS + lrow) * K + k_lane * vec
                         ) * 2
-                        if cutlass.const_expr(l2_policy_mode >= 2):
-                            _cp_async_bf16x8_cg_hint(
-                                h_base, elem_off, sh_base + smem_byte, pol_r
-                            )
-                        else:
-                            _cp_async_bf16x8_cg(
-                                h_base, elem_off, sh_base + smem_byte, cp_l2_hint
-                            )
-                    _cp_async_commit_group()
+                        _cp_async_bf16x8_cg(
+                            h_base, elem_off, sh_base + smem_byte, cp_l2_hint
+                        )
+                _cp_async_commit_group()
 
             h_slot = h_slots[it // ITERS_H]
             cur = it % 2
@@ -1167,34 +875,6 @@ def _kda_packed_t1_smem_kernel(
                     + (it % ITERS_H) * CHUNK_ROWS
                     + (sub * _NUM_GROUPS + group_idx) * ilp_rows
                 )
-                if cutlass.const_expr(tma_read and sub == SUB - 1):
-                    # Slot consumed into registers: free it and let thread 0
-                    # refill immediately — the bulk read streams during the
-                    # remaining compute of this iteration.
-                    cute.arch.mbarrier_arrive(
-                        sMbar.iterator + n_stages + (it % n_stages)
-                    )
-                    if cutlass.const_expr(it + n_stages < ITERS):
-                        if tidx == 0:
-                            cute.arch.mbarrier_wait(
-                                sMbar.iterator + n_stages + (it % n_stages),
-                                (it // n_stages) & 1,
-                            )
-                            cute.arch.mbarrier_arrive_and_expect_tx(
-                                sMbar.iterator + (it % n_stages), CHUNK_BYTES
-                            )
-                            _cp_async_bulk_read(
-                                sh_base + (it % n_stages) * CHUNK_BYTES,
-                                h_base
-                                + cutlass.Int64(
-                                    (i_v * tile_v + (it + n_stages) * CHUNK_ROWS)
-                                    * K
-                                    * 2
-                                ),
-                                cutlass.Int32(sMbar.iterator.toint())
-                                + (it % n_stages) * 8,
-                                CHUNK_BYTES,
-                            )
                 # Pass 1 (fused): s = (h*d).k and od = (h*d).q in one sweep;
                 # their butterflies interleave (independent trees), and pass 2
                 # no longer carries an output reduction.
@@ -1276,524 +956,9 @@ def _kda_packed_t1_smem_kernel(
                             h1 = r_k[i + 1] * vn[r] + h1
                         r_hb32[cur][sub][r][i // 2] = _f32x2_to_bf16x2(h0, h1)
 
-                if cutlass.const_expr(bulk_store):
-                    # h_new goes back into this chunk's smem slot (warp-local
-                    # rows), then one bulk store per warp pushes it out via the
-                    # async proxy.
-                    stage_v = sH[(it % n_stages, None, None)]
-                    for r in ROWS:
-                        hs_w = cute.local_tile(
-                            stage_v,
-                            (1, vec),
-                            ((sub * _NUM_GROUPS + group_idx) * ilp_rows + r, k_lane),
-                        )
-                        cute.autovec_copy(r_hb[cur][sub][r], hs_w)
-                    _sync_warp()
-                    if lane == 0:
-                        _fence_proxy_async()
-                        row0 = it * CHUNK_ROWS + warp_idx * WARP_ROWS
-                        g_addr = h_base + cutlass.Int64((i_v * tile_v + row0) * K * 2)
-                        s_addr = sh_base + (
-                            ((it % n_stages) * CHUNK_ROWS + warp_idx * WARP_ROWS)
-                            * K
-                            * 2
-                        )
-                        _cp_async_bulk_store(g_addr, s_addr, WARP_ROWS * K * 2)
-                        _cp_async_bulk_commit()
-                else:
-                    if cutlass.const_expr(l2_policy_mode >= 1):
-                        for r in ROWS:
-                            st_addr = h_base + cutlass.Int64(
-                                ((it // ITERS_H) * V * K + (vb + r) * K + k_lane * vec)
-                                * 2
-                            )
-                            _stg_hint_v4_b32(
-                                st_addr,
-                                r_hb32[cur][sub][r][0],
-                                r_hb32[cur][sub][r][1],
-                                r_hb32[cur][sub][r][2],
-                                r_hb32[cur][sub][r][3],
-                                pol_w,
-                            )
-                    else:
-                        for r in ROWS:
-                            ht = cute.local_tile(h_slot, (1, vec), (vb + r, k_lane))
-                            cute.autovec_copy(r_hb[cur][sub][r], ht)
-
-        if cutlass.const_expr(bulk_store):
-            # Writes must be complete (not just smem-read) before exit.
-            _cp_async_bulk_wait(0)
-
-
-@cute.kernel
-def _kda_packed_t1_persist_kernel(
-    state: cute.Tensor,  # [pool, H, V, K] bf16, padded slot stride allowed
-    q: cute.Tensor,  # [B, H, K] bf16 strided view of mixed_qkv
-    k: cute.Tensor,  # [B, H, K] bf16 strided view of mixed_qkv
-    v: cute.Tensor,  # [B, H, V] bf16 strided view of mixed_qkv
-    g: cute.Tensor,  # [B, H, K] bf16 strided view of raw_gate
-    beta: cute.Tensor,  # [B, H] bf16 (row stride dynamic)
-    A_log: cute.Tensor,  # [H] f32
-    dt_bias: cute.Tensor,  # [H, K] f32
-    o: cute.Tensor,  # [B, H, V] bf16 contiguous
-    state_indices: cute.Tensor,  # [B] i32
-    scale: cutlass.Constexpr[float],
-    eps: cutlass.Constexpr[float],
-    lb_log2e: cutlass.Constexpr[float],
-    precomputed: cutlass.Constexpr[bool],
-    H: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-    V: cutlass.Constexpr[int],
-    n_stages: cutlass.Constexpr[int],
-    cp_l2_hint: cutlass.Constexpr[int],
-    use_packed_fma: cutlass.Constexpr[bool],
-):
-    """Persistent v2: the champion pipeline with items streamed per CTA.
-
-    Composition of every proven win — fused output form, LDS double-buffer,
-    barrier-free private cp.async ring — with a grid-stride item loop whose
-    ring NEVER drains: chunk look-ahead and staging loads cross item
-    boundaries, so the per-item fill bubble (the dominant remaining stall)
-    is paid once per CTA instead of once per item. Requires
-    ITERS_H % n_stages == 0 (slot/parity arithmetic stays compile-time) and
-    a 16-byte-aligned pool. One item = one whole (batch, head) head block.
-    """
-    ilp_rows: cutlass.Constexpr[int] = 2
-    CHUNK_ROWS: cutlass.Constexpr[int] = 16
-    ITERS: cutlass.Constexpr[int] = V // CHUNK_ROWS  # 8 chunks per item
-    P: cutlass.Constexpr[int] = n_stages - 1  # in-flight depth (2-cold refill)
-
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    gdim, _, _ = cute.arch.grid_dim()
-
-    B = cutlass.Int32(q.shape[0])
-    num_items = B * H
-
-    lane = tidx % 32
-    k_lane = tidx % _LANES_PER_ROW
-    group_idx = tidx // _LANES_PER_ROW
-
-    vec: cutlass.Constexpr[int] = _ELEMS_PER_LANE
-    vals: cutlass.Constexpr[int] = _VALS_PER_LANE
-    ROWS = tuple(range(ilp_rows))
-    VECI = tuple(range(vec))
-    VECP = tuple(range(0, vec, 2))
-    VALSI = tuple(range(vals))
-    ITERI = tuple(range(ITERS))
-
-    smem = cutlass.utils.SmemAllocator()
-    sH = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((n_stages, CHUNK_ROWS, K), stride=(CHUNK_ROWS * K, K, 1)),
-        16,
-    )
-    sh_base = cutlass.Int32(sH.iterator.toint())
-
-    q_src = cute.make_rmem_tensor(
-        cute.make_layout((vals,), stride=(1,)), cutlass.Float32
-    )
-    k_src = cute.make_rmem_tensor(
-        cute.make_layout((vals,), stride=(1,)), cutlass.Float32
-    )
-    d_src = cute.make_rmem_tensor(
-        cute.make_layout((vals,), stride=(1,)), cutlass.Float32
-    )
-    q_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vals,), stride=(1,)), cutlass.BFloat16
-    )
-    k_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vals,), stride=(1,)), cutlass.BFloat16
-    )
-    g_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vals,), stride=(1,)), cutlass.BFloat16
-    )
-    dtb_f32 = cute.make_rmem_tensor(
-        cute.make_layout((vals,), stride=(1,)), cutlass.Float32
-    )
-    r_q = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
-    r_k = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
-    r_d = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
-    r_hb = [
-        [
-            cute.make_rmem_tensor(
-                cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
-            )
-            for _ in ROWS
-        ]
-        for _ in range(2)
-    ]
-    r_hb32 = [[cute.recast_tensor(t, cutlass.Int32) for t in bufs] for bufs in r_hb]
-    r_v_all = [
-        cute.make_rmem_tensor(
-            cute.make_layout((ilp_rows,), stride=(1,)), cutlass.BFloat16
-        )
-        for _ in ITERI
-    ]
-    r_o_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((ilp_rows,), stride=(1,)), cutlass.BFloat16
-    )
-
-    # Item metadata: current + look-ahead (byte base of the 32 KiB head
-    # block; ok flags gate compute and refills of inactive/out-of-range).
-    item_cur = cutlass.Int32(bidx)
-    i_n_cur = item_cur // H
-    i_h_cur = item_cur % H
-    slot_cur = state_indices[i_n_cur]
-    base_cur = cutlass.Int64(0)
-    ok_cur = (slot_cur >= 0) & (cutlass.Int64(slot_cur) < state.shape[0])
-    if ok_cur:
-        base_cur = state[
-            (cutlass.Int64(slot_cur), i_h_cur, None, None)
-        ].iterator.toint()
-
-    item_nxt = item_cur + gdim
-    i_n_nxt = item_nxt // H
-    i_h_nxt = item_nxt % H
-    ok_nxt = item_nxt < num_items
-    base_nxt = cutlass.Int64(0)
-    if ok_nxt:
-        slot_nxt = state_indices[i_n_nxt]
-        if (slot_nxt >= 0) & (cutlass.Int64(slot_nxt) < state.shape[0]):
-            base_nxt = state[
-                (cutlass.Int64(slot_nxt), i_h_nxt, None, None)
-            ].iterator.toint()
-        else:
-            ok_nxt = False
-
-    # Prologue: first P chunks of item 0 (empty commits when inactive) —
-    # self-service geometry, each thread fetches only the bytes it consumes.
-    for c in range(P):
-        if ok_cur:
-            for r in ROWS:
-                lrow = group_idx * ilp_rows + r
-                elem_off = (c * CHUNK_ROWS + lrow) * K + k_lane * vec
-                smem_byte = (
-                    ((c % n_stages) * CHUNK_ROWS + lrow) * K + k_lane * vec
-                ) * 2
-                _cp_async_bf16x8_cg(base_cur, elem_off, sh_base + smem_byte, cp_l2_hint)
-        _cp_async_commit_group()
-
-    n_my_items = (num_items - item_cur + gdim - 1) // gdim
-    for _j in cutlass.range(n_my_items, unroll=1):
-        # ------------------------------------------------------------------
-        # Per-item staging (q/k/g/dt loads land here for the FIRST item;
-        # later items' loads were prefetched during the previous item and
-        # only the math runs). The ring keeps streaming underneath.
-        # ------------------------------------------------------------------
-        if _j == 0:
-            q_tile = cute.local_tile(q, (1, 1, vals), (i_n_cur, i_h_cur, lane))
-            k_tile = cute.local_tile(k, (1, 1, vals), (i_n_cur, i_h_cur, lane))
-            g_tile = cute.local_tile(g, (1, 1, vals), (i_n_cur, i_h_cur, lane))
-            dtb_tile = cute.local_tile(dt_bias, (1, vals), (i_h_cur, lane))
-            cute.autovec_copy(q_tile, q_bf16)
-            cute.autovec_copy(k_tile, k_bf16)
-            cute.autovec_copy(g_tile, g_bf16)
-            cute.autovec_copy(dtb_tile, dtb_f32)
-
-        if cutlass.const_expr(precomputed):
-            # Pre-computed convention: beta arrives already sigmoided.
-            a_exp = cutlass.Float32(0.0)
-            r_beta = cutlass.Float32(beta[(i_n_cur, i_h_cur)])
-        else:
-            a_exp = cute.exp(cutlass.Float32(A_log[i_h_cur]), fastmath=True)
-            b_logit = cutlass.Float32(beta[(i_n_cur, i_h_cur)])
-            r_beta = cute.rcp(
-                cute.exp(-b_logit, fastmath=True) + 1.0, approx=True, ftz=True
-            )
-
-        sum_q = cutlass.Float32(0.0)
-        sum_k = cutlass.Float32(0.0)
-        for i in VALSI:
-            q_val = cutlass.Float32(q_bf16[i])
-            k_val = cutlass.Float32(k_bf16[i])
-            q_src[i] = q_val
-            k_src[i] = k_val
-            sum_q += q_val * q_val
-            sum_k += k_val * k_val
-            if cutlass.const_expr(precomputed):
-                # g is the log-space decay: d = exp(g).
-                d_src[i] = cute.exp2(
-                    cutlass.Float32(g_bf16[i]) * _LOG2_E, fastmath=True
-                )
-            else:
-                gate_x = cutlass.Float32(g_bf16[i]) + dtb_f32[i]
-                sig = cute.rcp(
-                    cute.exp(-(a_exp * gate_x), fastmath=True) + 1.0,
-                    approx=True,
-                    ftz=True,
-                )
-                d_src[i] = cute.exp2(lb_log2e * sig, fastmath=True)
-
-        kq_p = cutlass.Float32(0.0)
-        for i in VALSI:
-            kq_p += q_src[i] * k_src[i]
-        for offset in [16, 8, 4, 2, 1]:
-            sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=0xFFFFFFFF)
-            sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=0xFFFFFFFF)
-            kq_p += cute.arch.shuffle_sync_bfly(kq_p, offset=offset, mask=0xFFFFFFFF)
-        inv_q = cute.rsqrt(sum_q + eps, fastmath=True) * scale
-        inv_k = cute.rsqrt(sum_k + eps, fastmath=True)
-        r_kq = kq_p * (inv_q * inv_k)
-
-        for i in VECI:
-            source_lane = 2 * k_lane + i // vals
-            source_value = i % vals
-            r_q[i] = (
-                cute.arch.shuffle_sync(
-                    q_src[source_value], offset=source_lane, mask=0xFFFFFFFF
-                )
-                * inv_q
-            )
-            r_k[i] = (
-                cute.arch.shuffle_sync(
-                    k_src[source_value], offset=source_lane, mask=0xFFFFFFFF
-                )
-                * inv_k
-            )
-            r_d[i] = cute.arch.shuffle_sync(
-                d_src[source_value], offset=source_lane, mask=0xFFFFFFFF
-            )
-
-        for it in ITERI:
-            vt = cute.local_tile(
-                v,
-                (1, 1, ilp_rows),
-                (
-                    i_n_cur,
-                    i_h_cur,
-                    (it * CHUNK_ROWS + group_idx * ilp_rows) // ilp_rows,
-                ),
-            )
-            cute.autovec_copy(vt, r_v_all[it])
-
-        # ------------------------------------------------------------------
-        # 8 chunks; refills and the LDS prefetch cross into the next item.
-        # ------------------------------------------------------------------
-        for it in ITERI:
-            cur = it % 2
-            # Per-thread wait: own bytes of chunks p and p+1 resident
-            # (steady-state constant count; tail passes trivially).
-            _cp_async_wait_group_n(P - 2 if P >= 2 else 0)
-
-            # Refill chunk p+P (slot (p-1) % n: two iterations cold).
-            if cutlass.const_expr(it + P < ITERS):
-                c = it + P
-                if ok_cur:
-                    for r in ROWS:
-                        lrow = group_idx * ilp_rows + r
-                        elem_off = (c * CHUNK_ROWS + lrow) * K + k_lane * vec
-                        smem_byte = (
-                            (((it + P) % n_stages) * CHUNK_ROWS + lrow) * K
-                            + k_lane * vec
-                        ) * 2
-                        _cp_async_bf16x8_cg(
-                            base_cur, elem_off, sh_base + smem_byte, cp_l2_hint
-                        )
-                _cp_async_commit_group()
-            else:
-                c = it + P - ITERS
-                if ok_nxt:
-                    for r in ROWS:
-                        lrow = group_idx * ilp_rows + r
-                        elem_off = (c * CHUNK_ROWS + lrow) * K + k_lane * vec
-                        smem_byte = (
-                            (((it + P) % n_stages) * CHUNK_ROWS + lrow) * K
-                            + k_lane * vec
-                        ) * 2
-                        _cp_async_bf16x8_cg(
-                            base_nxt, elem_off, sh_base + smem_byte, cp_l2_hint
-                        )
-                _cp_async_commit_group()
-
-            # First chunk of the very first item lands in buffer 0 here.
-            if cutlass.const_expr(it == 0):
-                if _j == 0:
-                    stage0 = sH[(0, None, None)]
-                    for r in ROWS:
-                        hs = cute.local_tile(
-                            stage0, (1, vec), (group_idx * ilp_rows + r, k_lane)
-                        )
-                        cute.autovec_copy(hs, r_hb[0][r])
-            # LDS prefetch of chunk p+1 (crosses into the next item at it=7;
-            # parity (it+1)%2 stays compile-time since ITERS is even).
-            stage_n = sH[((it + 1) % n_stages, None, None)]
-            for r in ROWS:
-                hs = cute.local_tile(
-                    stage_n, (1, vec), (group_idx * ilp_rows + r, k_lane)
-                )
-                cute.autovec_copy(hs, r_hb[1 - cur][r])
-
-            # Staging prefetch for the next item, mid-item (dead buffers).
-            if cutlass.const_expr(it == ITERS - 2):
-                if ok_nxt:
-                    q_tile = cute.local_tile(q, (1, 1, vals), (i_n_nxt, i_h_nxt, lane))
-                    k_tile = cute.local_tile(k, (1, 1, vals), (i_n_nxt, i_h_nxt, lane))
-                    g_tile = cute.local_tile(g, (1, 1, vals), (i_n_nxt, i_h_nxt, lane))
-                    dtb_tile = cute.local_tile(dt_bias, (1, vals), (i_h_nxt, lane))
-                    cute.autovec_copy(q_tile, q_bf16)
-                    cute.autovec_copy(k_tile, k_bf16)
-                    cute.autovec_copy(g_tile, g_bf16)
-                    cute.autovec_copy(dtb_tile, dtb_f32)
-
-            vb = it * CHUNK_ROWS + group_idx * ilp_rows
-            hb32_cur = r_hb32[cur]
-            r_v_it = r_v_all[it]
-            if ok_cur:
-                # Pass 1 (fused): s = (h*d).k and od = (h*d).q in one sweep.
-                s_e = [cutlass.Float32(0.0) for _ in ROWS]
-                s_o = [cutlass.Float32(0.0) for _ in ROWS]
-                o_e = [cutlass.Float32(0.0) for _ in ROWS]
-                o_o = [cutlass.Float32(0.0) for _ in ROWS]
-                for i in VECP:
-                    for r in ROWS:
-                        h0, h1 = _bf16x2_to_f32x2(hb32_cur[r][i // 2])
-                        h0, h1 = cute.arch.fma_packed_f32x2(
-                            src_a=(h0, h1),
-                            src_b=(r_d[i], r_d[i + 1]),
-                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                        )
-                        s_e[r], s_o[r] = cute.arch.fma_packed_f32x2(
-                            src_a=(h0, h1),
-                            src_b=(r_k[i], r_k[i + 1]),
-                            src_c=(s_e[r], s_o[r]),
-                        )
-                        o_e[r], o_o[r] = cute.arch.fma_packed_f32x2(
-                            src_a=(h0, h1),
-                            src_b=(r_q[i], r_q[i + 1]),
-                            src_c=(o_e[r], o_o[r]),
-                        )
-                s = [s_e[r] + s_o[r] for r in ROWS]
-                od = [o_e[r] + o_o[r] for r in ROWS]
-                for offset in [8, 4, 2, 1]:
-                    for r in ROWS:
-                        s[r] += cute.arch.shuffle_sync_bfly(
-                            s[r], offset=offset, mask=0xFFFFFFFF
-                        )
-                        od[r] += cute.arch.shuffle_sync_bfly(
-                            od[r], offset=offset, mask=0xFFFFFFFF
-                        )
-
-                vn = [(cutlass.Float32(r_v_it[r]) - s[r]) * r_beta for r in ROWS]
-
-                if k_lane == 0:
-                    for r in ROWS:
-                        r_o_bf16[r] = cutlass.BFloat16(od[r] + vn[r] * r_kq)
-                    ot = cute.local_tile(
-                        o, (1, 1, ilp_rows), (i_n_cur, i_h_cur, vb // ilp_rows)
-                    )
-                    cute.autovec_copy(r_o_bf16, ot)
-
-                # Pass 2 (store only): h_new = h*d + k*vn, repack, STG.128.
-                for i in VECP:
-                    for r in ROWS:
-                        h0, h1 = _bf16x2_to_f32x2(hb32_cur[r][i // 2])
-                        h0, h1 = cute.arch.fma_packed_f32x2(
-                            src_a=(h0, h1),
-                            src_b=(r_d[i], r_d[i + 1]),
-                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                        )
-                        h0, h1 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_k[i], r_k[i + 1]),
-                            src_b=(vn[r], vn[r]),
-                            src_c=(h0, h1),
-                        )
-                        hb32_cur[r][i // 2] = _f32x2_to_bf16x2(h0, h1)
-
                 for r in ROWS:
-                    st_addr = base_cur + cutlass.Int64(
-                        ((vb + r) * K + k_lane * vec) * 2
-                    )
-                    _stg_v4_b32(
-                        st_addr,
-                        hb32_cur[r][0],
-                        hb32_cur[r][1],
-                        hb32_cur[r][2],
-                        hb32_cur[r][3],
-                    )
-            else:
-                for r in ROWS:
-                    r_o_bf16[r] = cutlass.BFloat16(0.0)
-                if k_lane == 0:
-                    ot = cute.local_tile(
-                        o, (1, 1, ilp_rows), (i_n_cur, i_h_cur, vb // ilp_rows)
-                    )
-                    cute.autovec_copy(r_o_bf16, ot)
-
-        # Rotate item metadata.
-        item_cur = item_nxt
-        i_n_cur = i_n_nxt
-        i_h_cur = i_h_nxt
-        base_cur = base_nxt
-        ok_cur = ok_nxt
-        item_nxt = item_cur + gdim
-        i_n_nxt = item_nxt // H
-        i_h_nxt = item_nxt % H
-        ok_nxt = item_nxt < num_items
-        base_nxt = cutlass.Int64(0)
-        if ok_nxt:
-            slot_n2 = state_indices[i_n_nxt]
-            if (slot_n2 >= 0) & (cutlass.Int64(slot_n2) < state.shape[0]):
-                base_nxt = state[
-                    (cutlass.Int64(slot_n2), i_h_nxt, None, None)
-                ].iterator.toint()
-            else:
-                ok_nxt = False
-
-
-@cute.jit
-def _kda_packed_t1_persist_launch(
-    state: cute.Tensor,
-    q: cute.Tensor,
-    k: cute.Tensor,
-    v: cute.Tensor,
-    g: cute.Tensor,
-    beta: cute.Tensor,
-    A_log: cute.Tensor,
-    dt_bias: cute.Tensor,
-    o: cute.Tensor,
-    state_indices: cute.Tensor,
-    grid_ctas: cutlass.Int32,
-    stream: cuda.CUstream,
-    scale: cutlass.Constexpr[float],
-    eps: cutlass.Constexpr[float],
-    lb_log2e: cutlass.Constexpr[float],
-    precomputed: cutlass.Constexpr[bool],
-    H: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-    V: cutlass.Constexpr[int],
-    n_stages: cutlass.Constexpr[int],
-    cp_l2_hint: cutlass.Constexpr[int],
-    use_packed_fma: cutlass.Constexpr[bool],
-):
-    smem_bytes = n_stages * 16 * K * 2 + 128
-    _kda_packed_t1_persist_kernel(
-        state,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        A_log,
-        dt_bias,
-        o,
-        state_indices,
-        scale,
-        eps,
-        lb_log2e,
-        precomputed,
-        H,
-        K,
-        V,
-        n_stages,
-        cp_l2_hint,
-        use_packed_fma,
-    ).launch(
-        grid=[grid_ctas, 1, 1],
-        block=[_NUM_THREADS, 1, 1],
-        smem=smem_bytes,
-        stream=stream,
-    )
+                    ht = cute.local_tile(h_slot, (1, vec), (vb + r, k_lane))
+                    cute.autovec_copy(r_hb[cur][sub][r], ht)
 
 
 @cute.jit
@@ -1822,10 +987,6 @@ def _kda_packed_t1_smem_launch(
     chunk_rows: cutlass.Constexpr[int],
     cp_l2_hint: cutlass.Constexpr[int],
     heads_per_cta: cutlass.Constexpr[int],
-    bulk_store: cutlass.Constexpr[bool],
-    tma_read: cutlass.Constexpr[bool],
-    l2_policy_mode: cutlass.Constexpr[int],
-    private_ring: cutlass.Constexpr[bool],
     min_blocks: cutlass.Constexpr[int],
     use_packed_fma: cutlass.Constexpr[bool],
 ):
@@ -1858,10 +1019,6 @@ def _kda_packed_t1_smem_launch(
         chunk_rows,
         cp_l2_hint,
         heads_per_cta,
-        bulk_store,
-        tma_read,
-        l2_policy_mode,
-        private_ring,
         use_packed_fma,
     ).launch(
         grid=[grid_size, 1, 1],
@@ -2030,41 +1187,15 @@ def _get_compiled(
     aux_aligned: bool,
     use_packed_fma: bool,
     evict_first_state: bool,
-    maxrreg: int = 0,
     n_stages: int = 0,
     num_groups: int = _NUM_GROUPS,
     cp_l2_hint: int = 0,
     chunk_rows: int = 0,
-    bulk_store: bool = False,
     heads_per_cta: int = 1,
-    tma_read: bool = False,
-    persistent: bool = False,
-    l2_policy_mode: int = 0,
-    private_ring: bool = False,
     min_blocks: int = 0,
     precomputed: bool = False,
 ):
     options = "--enable-tvm-ffi --generate-line-info --opt-level 3"
-    if maxrreg:
-        options += f" --ptxas-options='-maxrregcount={maxrreg}'"
-    if persistent:
-        return cute.compile(
-            _kda_packed_t1_persist_launch,
-            *_make_compile_inputs(qkv_div, gate_div, pool_div, aux_aligned)[:-1],
-            cutlass.Int32(0),
-            make_fake_stream(use_tvm_ffi_env_stream=True),
-            _SCALE,
-            _EPS,
-            _LOWER_BOUND * _LOG2_E,
-            precomputed,
-            _HEADS,
-            _HEAD_DIM,
-            _HEAD_DIM,
-            n_stages,
-            cp_l2_hint,
-            use_packed_fma,
-            options=options,
-        )
     if n_stages:
         # cp.async pipelined variant (16-byte-aligned pools, tile_v >= 64).
         return cute.compile(
@@ -2083,10 +1214,6 @@ def _get_compiled(
             chunk_rows or _NUM_GROUPS * ilp_rows,
             cp_l2_hint,
             heads_per_cta,
-            bulk_store,
-            tma_read,
-            l2_policy_mode,
-            private_ring,
             min_blocks,
             use_packed_fma,
             options=options,
@@ -2161,21 +1288,6 @@ def _select_config(
         cfg = (128, 2, 8, 5, False)
 
     tile_v, ilp_rows, num_groups, stages, evict = cfg
-    # Looked up per call, like every other tuning override below.
-    tile_v_env = os.environ.get("FLASHINFER_PACKED_KDA_TILE_V")
-    if tile_v_env:
-        tile_v = int(tile_v_env)
-        ilp_rows = max(1, min(4, tile_v // _NUM_GROUPS))
-        num_groups = _NUM_GROUPS
-    ilp_env = os.environ.get("FLASHINFER_PACKED_KDA_ILP")
-    if ilp_env:
-        ilp_rows = int(ilp_env)
-    threads_env = os.environ.get("FLASHINFER_PACKED_KDA_THREADS")
-    if threads_env:
-        num_groups = int(threads_env) // _LANES_PER_ROW
-    if os.environ.get("FLASHINFER_PACKED_KDA_EVICT_FIRST"):
-        evict = os.environ["FLASHINFER_PACKED_KDA_EVICT_FIRST"] == "1"
-
     # Reject schedules the kernels cannot trace correctly: the grid covers V
     # with tile_v-wide tiles, every group must own a whole number of ilp-row
     # blocks, and the DSL needs vector lengths of at least two.
@@ -2333,67 +1445,15 @@ def _launch_from_views(
     # The cp.async pipeline requires a 16 B-aligned pool and at least two
     # chunks per CTA; otherwise fall back to the register-prefetch kernel
     # (which handles any alignment via scalar copies).
-    chunk_rows = (
-        int(os.environ.get("FLASHINFER_PACKED_KDA_CHUNKR", "0"))
-        or _NUM_GROUPS * ilp_rows
-    )
-    # A chunk must cover at least one compute sub-iteration.
-    chunk_rows = max(chunk_rows, _NUM_GROUPS * ilp_rows)
+    chunk_rows = _NUM_GROUPS * ilp_rows
     iters = tile_v // chunk_rows
     if pool_div != 8 or iters < 2:
         n_stages = 0
-    if n_stages and (
-        tile_v % chunk_rows != 0 or chunk_rows % (_NUM_GROUPS * ilp_rows) != 0
-    ):
-        raise ValueError(
-            f"FLASHINFER_PACKED_KDA_CHUNKR={chunk_rows} must divide "
-            f"tile_v={tile_v} and be a multiple of "
-            f"{_NUM_GROUPS * ilp_rows} rows"
-        )
     if n_stages:
         # iters + 1 stages lets the prologue put ALL chunks of a short
         # pipeline in flight before the q/k/gate staging math.
-        stages_env = int(os.environ.get("FLASHINFER_PACKED_KDA_STAGES", str(n_stages)))
-        if stages_env == 1:
-            raise ValueError(
-                "FLASHINFER_PACKED_KDA_STAGES=1 is invalid: cp.async refill "
-                "requires a slot to stay cold for two iterations (use 0 for "
-                "the register-prefetch kernel, or >=2)"
-            )
-        n_stages = 0 if stages_env <= 0 else min(stages_env, iters + 1)
+        n_stages = min(n_stages, iters + 1)
         num_groups = _NUM_GROUPS  # smem kernel is fixed at 128 threads
-    if os.environ.get("FLASHINFER_PACKED_KDA_NO_CPASYNC", "0") == "1":
-        n_stages = 0
-
-    persistent = (
-        os.environ.get("FLASHINFER_PACKED_KDA_PERSIST", "0") == "1"
-        and pool_div == 8
-        and n_stages >= 2
-    )
-    if persistent:
-        # Slot/parity arithmetic requires n_stages to divide the 8 chunks
-        # per item.
-        n_stages = 8 if n_stages >= 8 else 4
-    # The pipelined kernel has three mutually exclusive staging/wait modes
-    # (private ring / TMA reads / barriered ring with optional bulk stores);
-    # normalize the experimental env toggles here so the kernel never sees an
-    # inconsistent combination (e.g. TMA prologue + private-ring waits).
-    tma_read = os.environ.get("FLASHINFER_PACKED_KDA_TMA", "0") == "1" and n_stages > 0
-    bulk_store = (
-        os.environ.get("FLASHINFER_PACKED_KDA_BULK", "0") == "1"
-        and n_stages > 0
-        and chunk_rows == _NUM_GROUPS * ilp_rows
-    )
-    if tma_read and bulk_store:
-        raise ValueError(
-            "FLASHINFER_PACKED_KDA_TMA and FLASHINFER_PACKED_KDA_BULK are "
-            "mutually exclusive"
-        )
-    private_ring = (
-        os.environ.get("FLASHINFER_PACKED_KDA_PRIVRING", "1") == "1"
-        and not tma_read
-        and not bulk_store
-    )
     aux_aligned = dtb.data_ptr() % 16 == 0 and output_view.data_ptr() % 16 == 0
     compiled = _get_compiled(
         tile_v,
@@ -2404,52 +1464,14 @@ def _launch_from_views(
         aux_aligned,
         _use_packed_fma(),
         evict,
-        int(os.environ.get("FLASHINFER_PACKED_KDA_MAXRREG", "0")),
         n_stages,
         num_groups,
-        int(os.environ.get("FLASHINFER_PACKED_KDA_L2HINT", "256")),
+        256,
         chunk_rows,
-        bulk_store,
-        (
-            int(os.environ.get("FLASHINFER_PACKED_KDA_HPC", "1"))
-            if n_stages > 0
-            and tile_v == _HEAD_DIM
-            and _HEADS % max(1, int(os.environ.get("FLASHINFER_PACKED_KDA_HPC", "1")))
-            == 0
-            else 1
-        ),
-        tma_read,
-        persistent,
-        int(os.environ.get("FLASHINFER_PACKED_KDA_L2POL", "0")),
-        private_ring,
-        int(os.environ.get("FLASHINFER_PACKED_KDA_MINBLOCKS", "0")),
+        1,
+        0,
         precomputed_gate,
     )
-    if persistent:
-        sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        # Balanced grid: the largest divisor of the item count that fits the
-        # resident capacity gives every CTA the same item count (no tail).
-        items = batch * _HEADS
-        cap = sms * 6  # 6 blocks/SM at the champion's register footprint
-        grid_ctas = min(items, cap)
-        for div in range(cap, cap // 2, -1):
-            if items % div == 0:
-                grid_ctas = div
-                break
-        compiled(
-            state,
-            q,
-            k,
-            v,
-            g,
-            raw_beta,
-            A_log,
-            dtb,
-            output_view,
-            state_indices,
-            grid_ctas,
-        )
-        return
     compiled(
         state,
         q,
