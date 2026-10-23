@@ -351,13 +351,20 @@ the A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
 B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (LRU). Call
 `graph_cache_clear()` (both modules) before
 `torch.distributed.destroy_process_group()` and whenever a layer's operands
-are gone for good. A captured call runs its one-CTA-per-SM tape programs
-without the device cache-config bracket of the shipped walk geometry (the
-bracket cannot be issued inside a capture): on the CP8 / CP16 rows replay is
-still 1.9-9.1 % faster than the eager default, on the CP4 row 1.3-2.3 % slower
-(the eager default keeps the full geometry gain; `graph="off"` is the shipped
-default). The A/B record was taken with pointer-stable harness inputs; its
-gain is an upper bound of what a framework sees.
+are gone for good. A replayed call keeps the tape programs at one CTA per SM:
+the device cache-config bracket of the eager path cannot be issued inside a
+capture, so right after each tape launch is captured the host sets the
+preferred shared-memory carveout as a launch attribute of the kernel node it
+just added (`cudaStreamGetCaptureInfo` + `cudaGraphKernelNodeSetAttribute`,
+host-only `ctypes` calls into the runtime that is already loaded) and the
+replayed graph carries the cap itself. Without those entry points, or when the
+runtime cannot name the captured node, the capture continues without the cap
+after one warning (`LAST_CALL[kind]["cache_config"] == "unavailable"`); the
+results are bitwise identical either way. The previous replay form stays
+reachable for A/B records through the private test knob `graph_cap`
+(`CAKE_KCP_TEST_KNOBS=1`); `graph="off"` is the shipped default. The A/B
+record was taken with pointer-stable harness inputs; its gain is an upper
+bound of what a framework sees.
 
 Limits of a partition: at most 65536 fragments per rank (the layout table's
 document search), at most 64 segments per fragment and no walk chain longer
@@ -378,6 +385,19 @@ itself (occupancy only -- results never depend on the geometry). The earlier
 geometry stays reachable for A/B records through the private test knob
 `walk_geometry` (`CAKE_KCP_TEST_KNOBS=1`).
 
+Host path: the eager KCP calls reuse the call-independent host work -- the
+validated options, the workspace's last tables and pool views, the local
+stages' launch templates and the table set's own device tables -- keyed on
+object identity plus host integers and bounded (`ID_CACHE_MAX = 256` entries
+per table-set cache; the conv halo module keeps at most `HOST_CACHE_MAX = 64`
+contexts). The launch templates live on the workspace's local arena and
+reference the table set only weakly, so a training loop that builds a new
+context and workspace per step releases everything with them. The kernels,
+their arguments and their order are unchanged, so the results are bitwise
+those of the previous host path, which stays reachable for A/B records
+through the private test knob `host_trim` (`CAKE_KCP_TEST_KNOBS=1`; the conv
+module's `_set_test_knobs({"host_trim": 0})`).
+
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
 exchange -- the default with the all-to-all exchange (an earlier revision).
@@ -389,8 +409,16 @@ automatically; an explicit `save_transfer=True` together with the ring is a
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule, below it on one-fragment ranks the
 largest `P` that runs one CTA per SM (`floor(SM / H)`), on every other rank
-one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`);
-`ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1"`).
+one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`) -- except that a rank
+with two or three fragments below the cap whose `P = 1` walks run one wave
+(`n_frag H <= SM`) takes `P = 1` when the longest-processing-time makespan of
+its actual fragment chunk counts at `P = 1` is not above the makespan at the
+occupancy `P` (such a rank runs no segment composition and no backward
+re-walk; equal two-fragment ranks tie, unequal ones keep `P > 1`);
+`ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1_p1tie"`). The
+previous rules stay selectable through the private test knob `p_rule`, as
+does the fused form of the carry merges (`merge_fuse="carry"`: the two carry
+families of a phase in one launch; off by default).
 
 The KCP kernels live beside the single-rank programs:
 
