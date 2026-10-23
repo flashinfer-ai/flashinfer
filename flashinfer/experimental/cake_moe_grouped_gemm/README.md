@@ -149,6 +149,11 @@ and the closure digest; FlashInfer's build-target rules --
 only). The bindings include the package's `csrc/cake_ffi_checks.h`, no
 FlashInfer header. The 512-wide weight-gradient tile is registered for
 `sm_100a` and `sm_103a`.
+The five kernel translation units share one device header,
+`cake_moe_grouped_gemm_device.cuh`, carrying their common preamble (typedefs,
+tensor-map ABI, math constants and the tcgen05 helpers behind need-guards): a
+hand fold of the exported preambles that no `build.json` entry lists, so the
+build's dependency tracking, not a manifest digest, covers it.
 
 Measured on B200 (`sm_100a`), GB300 (`sm_103a`) and R200 (`sm_107a`); the
 performance summary is in the delivery pull requests.
