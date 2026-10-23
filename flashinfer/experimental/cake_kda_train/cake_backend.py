@@ -141,6 +141,10 @@ ALIGN = 256  # every arena sub-buffer and table starts on a 256 B boundary (TMA 
 # The arena layouts: the forward's, the backward's of the saved-set paths (``bwd``) and of the checkpoint replay
 # (``replay``, which keeps the internal ``akk_int`` rows), each in its light and tape form.
 MODES = ("fwd", "fwd_tape", "bwd", "bwd_tape", "replay", "replay_tape")
+# The lower-memory arena option (:class:`KdaArena`, ``lean``): the saved-set paths' backward layouts without the
+# replay-only buffers, with the tail stages split into ``tail_passes`` chunk ranges (per-pass buffers sized for one
+# range).  Not in :data:`MODES`: a lean workspace serves no replay.
+LEAN_MODES = ("bwd_lean", "bwd_tape_lean")
 # The device tables, in the order of the table buffer (the fifth on the segmented route only).
 TABLE_NAMES = (
     "chunk_bos",
@@ -170,6 +174,53 @@ del _path
 # program (``cake_jit.run_module``).  The workspace holds one so a diagnostic harness can run the same composition
 # against another build of the same kernels; the package itself always launches through ``cake_jit``.
 Launcher = Callable[..., None]
+
+
+@dataclasses.dataclass(frozen=True)
+class KdaArena:
+    """The lower-memory arena option of a :class:`KdaWorkspace`; off by default (``KdaArena()`` is today's arena and
+    launch list).
+
+    ``lean`` sizes a backward workspace for the saved-set paths only (layouts ``bwd_lean`` / ``bwd_tape_lean``: no
+    replay layout, no internal ``dout`` copy), so the workspace serves no checkpoint replay (``chunk_kda_bwd`` with
+    ``saved=None``; ``torch.utils.checkpoint`` never replays: the node's backward reads the recomputed saved set)
+    and no row that dispatches the separate ``dav`` program (H 9-15, outside the contract's head counts).
+    ``tail_passes = B`` (which implies ``lean``) runs the three chunk-parallel tail stages of the backward (the
+    fused gradient, GLM intra, the gate epilogue) once per range of ``ceil(NC_pad / B)`` chunks on offset views of
+    the whole-sequence buffers, with the per-pass buffers (``dq_f, dk_f, dg_f, db_f, dAkk, dAqk, dg_int, db_int``)
+    sized for one range: the same kernels on the same bytes (bitwise the same gradients), ``B - 1`` more launches
+    per tail stage.  The arena bytes: :func:`workspace_bytes` / :func:`memory_report` with ``arena=``; the floor
+    from four passes on is 2820 B per internal token-head (plus three state blocks on the segmented route), against
+    4488 at head (passes above four buy nothing).
+    """
+
+    lean: bool = False
+    tail_passes: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.tail_passes, bool)
+            or not isinstance(self.tail_passes, int)
+            or self.tail_passes < 1
+        ):
+            raise ValueError(
+                f"KdaArena: tail_passes must be an int >= 1, got {self.tail_passes!r}"
+            )
+        if self.tail_passes > 1 and not self.lean:
+            object.__setattr__(
+                self, "lean", True
+            )  # the tail split lives in the lean layouts
+
+    def mode(self, base: str) -> str:
+        """The layout mode of ``base`` (``"bwd"`` / ``"bwd_tape"`` / the replay forms) under this option."""
+        if not self.lean or base in LEAN_MODES or base.startswith("fwd"):
+            return base
+        if base.startswith("replay"):
+            raise ValueError(
+                "a lean workspace (KdaArena(lean=True)) serves no checkpoint replay (chunk_kda_bwd with "
+                "saved=None): pass the saved set, or allocate the workspace with lean=False"
+            )
+        return base + "_lean"
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -344,18 +395,42 @@ class Plan:
                 count += self.launches(stage, path)
         return count
 
-    def layout(self, mode: str) -> tuple[Region, ...]:
+    def layout(self, mode: str, tail_passes: int = 1) -> tuple[Region, ...]:
         """The arena regions of ``mode`` (:data:`MODES`): ``"fwd"`` / ``"bwd"`` (``save_mode="light"``; the saved-set
         paths) / ``"replay"`` (the checkpoint replay, which keeps the internal ``akk_int`` rows), and their
-        ``*_tape`` forms (``save_mode="tape"``: ``h`` and ``v_new`` live in the saved set)."""
-        return _layout(self.R, self.H, self.NC_pad, self.NSEG, mode)
+        ``*_tape`` forms (``save_mode="tape"``: ``h`` and ``v_new`` live in the saved set); the lean layouts
+        (:data:`LEAN_MODES`, :class:`KdaArena`) take their ``tail_passes``."""
+        return _layout(self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes)
 
-    def workspace_bytes(self, mode: str = "bwd") -> int:
-        return _mode_bytes(self.R, self.H, self.NC_pad, self.NSEG, mode)
+    def workspace_bytes(self, mode: str = "bwd", tail_passes: int = 1) -> int:
+        return _mode_bytes(self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes)
 
-    def arena_bytes(self, *, backward: bool = True, save_mode: str = "light") -> int:
+    def check_arena(self, arena: KdaArena) -> None:
+        """``ValueError`` when ``arena`` cannot serve this plan: a lean arena on a row whose backward dispatches the
+        separate ``dav`` program (H 9-15; the lean layouts keep no ``dv1`` and no whole-sequence ``dAqk``)."""
+        if arena.lean and any(
+            self.dispatched("dav", path)
+            for path in self.records
+            if path not in ("fwd", "fwd_nosave")
+        ):
+            raise ValueError(
+                f"KdaArena(lean=True) does not serve H={self.H}: the backward of this row launches the separate "
+                "dA / dv program (dav); the lean layouts serve the contract's head counts 1, 2, 4, 8, 16, 32, 64"
+            )
+
+    def arena_bytes(
+        self,
+        *,
+        backward: bool = True,
+        save_mode: str = "light",
+        arena: KdaArena | None = None,
+    ) -> int:
         """The arena a :class:`KdaWorkspace` of this plan allocates: the larger of the saved-set and the replay
-        layouts for a backward workspace (both paths run in it), the forward layout otherwise."""
+        layouts for a backward workspace (both paths run in it), the forward layout otherwise; under a lean
+        ``arena`` the lean layout of its ``tail_passes`` (the saved-set paths only)."""
+        arena = KdaArena() if arena is None else arena
+        if backward:
+            self.check_arena(arena)
         return _arena_bytes(
             self.R,
             self.H,
@@ -363,6 +438,7 @@ class Plan:
             self.NSEG,
             backward=backward,
             save_mode=save_mode,
+            arena=arena,
         )
 
     def table_layout(self) -> tuple[tuple[str, int, int], ...]:
@@ -616,6 +692,119 @@ SLOTS: dict[str, tuple[tuple[Occupant, ...], ...]] = {
     "replay": BWD_SLOTS,
     "replay_tape": BWD_TAPE_SLOTS,
 }
+# The lean layouts' per-pass buffer kinds: the token kinds sized for one tail range of ``R_b = 64 * ceil(NC_pad /
+# tail_passes)`` internal rows instead of ``R``; their sub-offsets count in ``R_b * H`` bytes.
+PASS_KINDS: dict[str, str] = {"F32p": "F32", "A32p": "A32", "V32p": "V32"}
+# the per-pass set of one tail range, in packing order: the fused gradient's outputs (step 6), GLM intra's (7)
+_PASS_OCCUPANTS: tuple[Occupant, ...] = (
+    ("dq_f", "F32p", 0, (6, 7)),
+    ("dk_f", "F32p", 0, (6, 7)),
+    ("dg_f", "F32p", 0, (6, 7)),
+    ("dAkk", "A32p", 0, (6, 7)),
+    ("dAqk", "A32p", 0, (6, 7)),
+    ("db_f", "V32p", 0, (6, 7)),
+    ("dg_int", "F32p", 0, (7, 8)),
+    ("db_int", "V32p", 0, (7, 8)),
+)
+# the segmented route's backward state blocks (as in BWD_SLOTS: offsets / transfers / carried states, then the
+# reverse offsets and carried adjoint states on the first and third block)
+_SEG_BLOCKS_BWD: tuple[Occupant, ...] = (
+    ("seg_b", "SEG", 0, (3, 3)),
+    ("seg_m", "SEG", 1, (3, 5)),
+    ("hseg", "SEG", 2, (3, 3)),
+    ("dseg", "SEG", 0, (5, 5)),
+    ("dhseg", "SEG", 2, (5, 5)),
+)
+
+
+def _lean_slots_single(tape: bool) -> tuple[tuple[Occupant, ...], ...]:
+    """The lean layout of one tail pass: the saved-set layout (``SLOTS["bwd"]`` / ``["bwd_tape"]``) without the
+    replay-only ``do_int`` copy (the saved-set paths pass the user's ``dout``; ``db_int`` takes a slot of its own)
+    and with ``kb`` under the ``dh`` tape (sub-offset 256, lifetime ``[1, 3]``: the saved-state pass 2 of the rows
+    with at most 32 chains, ``fwdh_p3_wy``, reads it at 3) instead of the state blocks' slot, where its declared
+    ``[1, 2]`` lifetime relies on the ``light_states`` path leaving those blocks unused.  4108 B per internal
+    token-head (tape: 3340) plus the state blocks."""
+    out: list[tuple[Occupant, ...]] = []
+    for slot in SLOTS["bwd_tape" if tape else "bwd"]:
+        names = [o[0] for o in slot]
+        if "do_int" in names:
+            out.append((("db_int", "V32", 0, (7, 8)),))
+        elif "kb" in names:
+            out.append(tuple(o for o in slot if o[0] != "kb"))
+        elif "dh" in names:
+            out.append(tuple(slot) + (("kb", "B16", 256, (1, 3)),))
+        else:
+            out.append(slot)
+    return tuple(out)
+
+
+def _lean_slots(
+    tape: bool, passes: int, R: int, H: int, NC: int, NSEG: int
+) -> tuple[tuple[Occupant, ...], ...]:
+    """The lean layout of ``passes >= 2`` tail passes.  Whole-sequence buffers: gk, v_new and h (light only), dv2,
+    dh with u and kb under it (tape: and the prep's unread pad-row target), qg / kg, w, beta_int: 2820 B per
+    internal token-head (tape 2052).  The per-pass set (:data:`_PASS_OCCUPANTS`, one tail range each) is packed
+    first-fit, in order, into the bytes of the two whole-sequence slots that are dead before the tail (qg / kg: 512
+    B per token-head, w: 256); what does not fit goes to an overflow slot shared with the segmented route's state
+    blocks (lifetimes [3, 5] against the per-pass [6, 8]).  From four passes on everything fits: 2820 * R * H +
+    3 * block, plus the ceil slack of the last range."""
+    R_b = BT * -(-NC // passes)
+    unit_w, unit_p = R * H, R_b * H
+    whole: list[list[Occupant]] = [
+        [("gk", "F32", 0, (1, 7))],
+        [("dv2", "B16", 0, (1, 6))],
+        [
+            ("dh", "TAPE", 0, (5, 6)),
+            ("u", "B16", 0, (2, 2) if tape else (2, 3)),
+            ("kb", "B16", 256, (1, 3)),
+        ],
+        [("qg", "B16", 0, (1, 5)), ("kg", "B16", 256, (1, 5))],
+        [("w", "B16", 0, (2, 5))],
+        [("beta_int", "V32", 0, (1, 7))],
+    ]
+    if tape:
+        whole[2].append(("v_new_scratch", "B16", 0, (1, 1)))
+    else:
+        whole.insert(1, [("v_new", "B16", 0, (1, 6))])
+        whole.insert(3, [("h", "TAPE", 0, (3, 6))])
+    capacity = {"qg": 512 * unit_w, "w": 256 * unit_w}
+    used = {"qg": 0, "w": 0}
+    extra: dict[str, list[Occupant]] = {"qg": [], "w": []}
+    overflow: list[Occupant] = []
+    over_used = 0
+    for name, kind, _sub, life in _PASS_OCCUPANTS:
+        nbytes = _kind_bytes(kind, R, H, NC, NSEG, R_b)[0]
+        for host in ("qg", "w"):
+            if used[host] + nbytes <= capacity[host]:
+                extra[host].append((name, kind, used[host] // unit_p, life))
+                used[host] += nbytes
+                break
+        else:
+            overflow.append((name, kind, over_used // unit_p, life))
+            over_used += nbytes
+    slots = [tuple(group + extra.get(group[0][0], [])) for group in whole]
+    if overflow or NSEG:
+        slots.append(tuple(overflow) + (_SEG_BLOCKS_BWD if NSEG else ()))
+    return tuple(slots)
+
+
+def _slots_of(
+    mode: str, tail_passes: int, R: int, H: int, NC: int, NSEG: int
+) -> tuple[tuple[Occupant, ...], ...]:
+    if mode in LEAN_MODES:
+        tape = mode == "bwd_tape_lean"
+        if tail_passes == 1:
+            return _lean_slots_single(tape)
+        return _lean_slots(tape, tail_passes, R, H, NC, NSEG)
+    if mode not in SLOTS:
+        raise ValueError(
+            f"layout mode must be one of {MODES + LEAN_MODES}, got {mode!r}"
+        )
+    if tail_passes != 1:
+        raise ValueError(
+            f"layout {mode!r}: tail_passes={tail_passes} applies to the lean layouts {LEAN_MODES} only"
+        )
+    return SLOTS[mode]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -637,11 +826,13 @@ def _element_size(dtype: torch.dtype) -> int:
 
 
 def _kind_bytes(
-    kind: str, R: int, H: int, NC: int, NSEG: int
+    kind: str, R: int, H: int, NC: int, NSEG: int, R_b: int | None = None
 ) -> tuple[int, tuple[int, ...]]:
-    tail, dtype = KIND_SHAPE[kind]
-    if kind == "TAPE":
-        shape: tuple[int, ...] = (NC, H, *tail)
+    tail, dtype = KIND_SHAPE[PASS_KINDS.get(kind, kind)]
+    if kind in PASS_KINDS:
+        shape: tuple[int, ...] = (R if R_b is None else R_b, H, *tail)
+    elif kind == "TAPE":
+        shape = (NC, H, *tail)
     elif kind == "SEG":
         shape = (NSEG, H, *tail)
     else:
@@ -653,28 +844,45 @@ def _kind_bytes(
 
 
 @functools.cache
-def _layout(R: int, H: int, NC: int, NSEG: int, mode: str) -> tuple[Region, ...]:
-    if mode not in SLOTS:
-        raise ValueError(f"layout mode must be one of {MODES}, got {mode!r}")
+def _layout(
+    R: int, H: int, NC: int, NSEG: int, mode: str, tail_passes: int = 1
+) -> tuple[Region, ...]:
+    slots = _slots_of(mode, tail_passes, R, H, NC, NSEG)
     block = (
         NSEG * H * D * D * 4
     )  # one fp32 [NSEG, H, 128, 128] state block of the segmented route
+    R_b = BT * -(
+        -NC // tail_passes
+    )  # the internal rows of one tail range (the per-pass buffers' extent)
     regions: list[Region] = []
     offset = 0
-    for slot, occupants in enumerate(SLOTS[mode]):
+    for slot, occupants in enumerate(slots):
         base = end = offset
         spans: list[tuple[str, int, int, tuple[int, int]]] = []
         for name, kind, sub, life in occupants:
             if kind in SEG_KINDS and NSEG == 0:
                 continue  # the serial route has no segment state
-            nbytes, shape = _kind_bytes(kind, R, H, NC, NSEG)
-            start = base + sub * (block if kind in SEG_KINDS else R * H)
+            nbytes, shape = _kind_bytes(kind, R, H, NC, NSEG, R_b)
+            unit = (
+                block
+                if kind in SEG_KINDS
+                else (R_b * H if kind in PASS_KINDS else R * H)
+            )
+            start = base + sub * unit
             if start % ALIGN:
                 raise ValueError(
                     f"layout {mode}: {name} at sub-offset {sub} is not {ALIGN} B aligned"
                 )
             regions.append(
-                Region(name, slot, start, nbytes, shape, KIND_SHAPE[kind][1], life)
+                Region(
+                    name,
+                    slot,
+                    start,
+                    nbytes,
+                    shape,
+                    KIND_SHAPE[PASS_KINDS.get(kind, kind)][1],
+                    life,
+                )
             )
             end = max(end, start + nbytes)
             spans.append((name, start, start + nbytes, life))
@@ -743,22 +951,42 @@ def _num_segments(num_docs: int, H: int, sm_count: int, arch: str | None) -> int
     return cake_jit.segment_plan(num_docs, H, sm_count, arch)[2]
 
 
-def _mode_bytes(R: int, H: int, NC_pad: int, NSEG: int, mode: str) -> int:
-    """The bytes of one arena layout (:data:`MODES`)."""
+def _mode_bytes(
+    R: int, H: int, NC_pad: int, NSEG: int, mode: str, tail_passes: int = 1
+) -> int:
+    """The bytes of one arena layout (:data:`MODES` or :data:`LEAN_MODES`)."""
     return max(
-        (r.offset + r.nbytes for r in _layout(R, H, NC_pad, NSEG, mode)), default=0
+        (r.offset + r.nbytes for r in _layout(R, H, NC_pad, NSEG, mode, tail_passes)),
+        default=0,
     )
 
 
 def _arena_bytes(
-    R: int, H: int, NC_pad: int, NSEG: int, *, backward: bool, save_mode: str
+    R: int,
+    H: int,
+    NC_pad: int,
+    NSEG: int,
+    *,
+    backward: bool,
+    save_mode: str,
+    arena: KdaArena | None = None,
 ) -> int:
     """The arena a :class:`KdaWorkspace` of the problem allocates: the larger of the saved-set and the replay
     layouts for a backward workspace (both paths run in it), the forward layout otherwise; the ``*_tape`` layouts
-    under ``save_mode="tape"``."""
+    under ``save_mode="tape"``; under a lean ``arena`` (:class:`KdaArena`) the lean layout of its ``tail_passes``
+    alone (a lean workspace serves no replay)."""
     tape = save_mode == "tape"
     if not backward:
         return _mode_bytes(R, H, NC_pad, NSEG, "fwd_tape" if tape else "fwd")
+    if arena is not None and arena.lean:
+        return _mode_bytes(
+            R,
+            H,
+            NC_pad,
+            NSEG,
+            "bwd_tape_lean" if tape else "bwd_lean",
+            arena.tail_passes,
+        )
     modes = ("bwd_tape", "replay_tape") if tape else ("bwd", "replay")
     return max(_mode_bytes(R, H, NC_pad, NSEG, mode) for mode in modes)
 
@@ -772,10 +1000,11 @@ def workspace_bytes(
     save_mode: str = "light",
     sm_count: int | None = None,
     arch: str | None = None,
+    arena: KdaArena | None = None,
 ) -> int:
     """Arena bytes a :class:`KdaWorkspace` of the problem allocates (``backward=False``: the forward's layout only;
     a backward workspace takes the larger of the saved-set paths' layout and the replay's; ``save_mode`` selects
-    the tape layouts).  A function of the host scalars and, through the segmented route's segment count, of
+    the tape layouts; ``arena`` the lower-memory option, :class:`KdaArena`).  A function of the host scalars and, through the segmented route's segment count, of
     ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's SM count when ``sm_count`` is ``None``, the
     current device's architecture when ``arch`` is ``None``).  The outputs and the saved set are allocated per
     call: :func:`saved_bytes`, :func:`output_bytes`."""
@@ -785,9 +1014,13 @@ def workspace_bytes(
         )
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
+    if arena is not None and arena.lean and backward:
+        plan(S, num_docs, H, sms, arch).check_arena(arena)
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     nseg = _num_segments(num_docs, H, sms, arch)
-    return _arena_bytes(rows, H, nc_pad, nseg, backward=backward, save_mode=save_mode)
+    return _arena_bytes(
+        rows, H, nc_pad, nseg, backward=backward, save_mode=save_mode, arena=arena
+    )
 
 
 def tables_bytes(
@@ -859,17 +1092,28 @@ def output_bytes(S: int, H: int, *, backward: bool) -> int:
     return 3 * S * H * D * 2 + S * H * 2 + S * H * D * 4
 
 
-def lifetime_table(mode: str = "bwd") -> list[dict[str, Any]]:
+def lifetime_table(
+    mode: str = "bwd", tail_passes: int = 1, *, plan: Plan | None = None
+) -> list[dict[str, Any]]:
     """The layout as rows ``{slot, buffer, kind, unit, ..., first_write, last_read}``: token kinds in bytes per
     internal token-head (a tape entry of 32768 B per chunk-head spreads over the chunk's 64 rows), the segmented
     route's state blocks (``unit="seg_block"``) in bytes per (segment, head), present only when the plan
-    dispatches that route."""
-    if mode not in SLOTS:
-        raise ValueError(f"layout mode must be one of {MODES}, got {mode!r}")
+    dispatches that route.  The lean layouts (:data:`LEAN_MODES`) take ``tail_passes``; from two passes on their
+    per-pass buffers (``unit="R_b*H"``: bytes per internal token-head of one tail range) are packed by the
+    problem's geometry, so a ``plan`` is required there."""
+    if mode in LEAN_MODES and tail_passes > 1:
+        if plan is None:
+            raise ValueError(
+                "lifetime_table: the multi-pass lean layouts pack the per-pass buffers by the problem's geometry; "
+                "pass plan="
+            )
+        slots = _slots_of(mode, tail_passes, plan.R, plan.H, plan.NC_pad, plan.NSEG)
+    else:
+        slots = _slots_of(mode, tail_passes, 0, 1, 0, 0)
     rows: list[dict[str, Any]] = []
-    for slot, occupants in enumerate(SLOTS[mode]):
+    for slot, occupants in enumerate(slots):
         for name, kind, sub, life in occupants:
-            tail, dtype = KIND_SHAPE[kind]
+            tail, dtype = KIND_SHAPE[PASS_KINDS.get(kind, kind)]
             n = 1
             for extent in tail:
                 n *= extent
@@ -881,6 +1125,8 @@ def lifetime_table(mode: str = "bwd") -> list[dict[str, Any]]:
                     "bytes_per_th": 0,
                     "bytes_per_seg_head": elem,
                 }
+            elif kind in PASS_KINDS:
+                size = {"unit": "R_b*H", "sub_offset_per_th": sub, "bytes_per_th": elem}
             else:
                 size = {
                     "unit": "R*H",
@@ -908,11 +1154,15 @@ def memory_report(
     *,
     sm_count: int | None = None,
     arch: str | None = None,
+    arena: KdaArena | None = None,
 ) -> dict[str, Any]:
     """Bytes one problem needs beyond its inputs: the arena (forward-only and full, with the saved-set paths' and
     the replay's backward layouts apart), the saved set, the outputs and the totals of the three boundaries (arena
     + the per-call tensors live at the peak).  ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's
-    when ``None``) select the segmented route's segment count."""
+    when ``None``) select the segmented route's segment count.  ``arena`` (:class:`KdaArena`) adds the configured
+    arenas (``arena_bwd_configured``; the default's stays ``arena_bwd``), the floor of the lean layouts
+    (``arena_floor``: 2820 B per internal token-head plus three state blocks) and recomputes the totals with the
+    configured backward arena (the replay total keeps the default's: a lean workspace serves no replay)."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"memory_report: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
@@ -920,6 +1170,9 @@ def memory_report(
     tape = save_mode == "tape"
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
+    arena = KdaArena() if arena is None else arena
+    if arena.lean:
+        plan(S, num_docs, H, sms, arch).check_arena(arena)
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sms, arch)
     arena_fwd = _arena_bytes(
@@ -932,6 +1185,11 @@ def memory_report(
         rows, H, nc_pad, num_segments, "replay_tape" if tape else "replay"
     )
     arena_bwd = max(arena_saved, arena_replay)
+    arena_bwd_conf = _arena_bytes(
+        rows, H, nc_pad, num_segments, backward=True, save_mode=save_mode, arena=arena
+    )
+    block = num_segments * H * D * D * 4
+    arena_floor = (2052 if tape else 2820) * rows * H + 3 * block
     saved = saved_bytes(S, H, num_docs, save_mode=save_mode, sm_count=sms, arch=arch)
     out_f, out_b = output_bytes(S, H, backward=False), output_bytes(S, H, backward=True)
     # The per-call segment states in the saved set: tape two blocks (seg_state, its transfer half is the saved
@@ -964,15 +1222,25 @@ def memory_report(
         "arena_bwd": arena_bwd,
         "arena_bwd_layout_saved_path": arena_saved,
         "arena_bwd_layout_replay_path": arena_replay,
+        # the lower-memory arena option (KdaArena): off -> the configured arenas equal the defaults
+        "lean": arena.lean,
+        "tail_passes": arena.tail_passes,
+        "arena_bwd_default": arena_bwd,
+        "arena_bwd_configured": arena_bwd_conf,
+        "arena_fwd_configured": arena_fwd,
+        "arena_floor": arena_floor,
         "saved": saved,
         "out_fwd": out_f,
         "out_bwd": out_b,
         "fwd_total_fwd_arena": arena_fwd + out_f + saved,  # a forward-only workspace
-        "fwd_total_bwd_arena": arena_bwd
+        "fwd_total_bwd_arena": arena_bwd_conf
         + out_f
         + saved,  # the same workspace serving every boundary
-        "bwd_total": arena_bwd + out_b,  # the saved set exists before the call
-        "replay_total": arena_bwd + out_f + saved + out_b,
+        "bwd_total": arena_bwd_conf + out_b,  # the saved set exists before the call
+        "replay_total": arena_bwd
+        + out_f
+        + saved
+        + out_b,  # the default arena: lean serves no replay
     }
 
 
@@ -1045,7 +1313,9 @@ class KdaWorkspace:
     not initialized: every element a launch reads is written earlier in the same call (the layout note), so its
     content at allocation never reaches a result; ``zero_init=True`` fills it with zeros for diagnostics (an
     arena of 2.5 GiB takes about 0.35 ms per fill).  ``launcher`` replaces ``cake_jit.run_module`` for
-    diagnostics only.
+    diagnostics only.  ``arena`` (:class:`KdaArena`, off by default; kept as :attr:`arena_option`, the attribute
+    ``arena`` being the uint8 arena tensor) selects the lower-memory arena option: the lean backward layouts (no
+    replay on this workspace) and the tail split into ``tail_passes`` passes.
     """
 
     def __init__(
@@ -1057,11 +1327,15 @@ class KdaWorkspace:
         zero_init: bool = False,
         save_mode: str = "light",
         launcher: Launcher | None = None,
+        arena: KdaArena | None = None,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
                 f"KdaWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
             )
+        self.arena_option = KdaArena() if arena is None else arena
+        if backward:
+            plan.check_arena(self.arena_option)
         self.plan = plan
         self.device_index = _device_index(torch.device(device))
         self.device = torch.device("cuda", self.device_index)
@@ -1073,7 +1347,9 @@ class KdaWorkspace:
         self.backward = backward
         self.save_mode = save_mode
         self.launcher: Launcher = cake_jit.run_module if launcher is None else launcher
-        self.bytes = plan.arena_bytes(backward=backward, save_mode=save_mode)
+        self.bytes = plan.arena_bytes(
+            backward=backward, save_mode=save_mode, arena=self.arena_option
+        )
         self.zero_init = zero_init
         # The pad-chunk rows of every buffer a consumer reads are written in the same call (see the layout note),
         # so the content at allocation is irrelevant to the results: no fill by default (``zero_init=True`` zeros
@@ -1084,19 +1360,27 @@ class KdaWorkspace:
         self._views_cache: dict[str, types.SimpleNamespace] = {}
         self._eye: torch.Tensor | None = None
         self._epoch = 0  # the carry launches of this arena under the overlap pair (see next_epoch)
+        # the tail split's per-call constants (tail_constants), allocated once per workspace
+        self._tail_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
 
     def views(self, mode: str) -> types.SimpleNamespace:
-        """The buffer views of layout ``mode`` on this arena (``ValueError`` when the arena is too small for it)."""
+        """The buffer views of layout ``mode`` on this arena (``ValueError`` when the arena is too small for it);
+        under a lean arena the backward modes map to their lean forms and the replay modes are refused."""
+        mode = self.arena_option.mode(mode)
         ns = self._views_cache.get(mode)
         if ns is None:
-            need = self.plan.workspace_bytes(mode)
+            # the tail split shapes the lean backward layouts only; every other layout has one form
+            tail = self.arena_option.tail_passes if mode in LEAN_MODES else 1
+            need = self.plan.workspace_bytes(mode, tail)
             if need > self.bytes:
                 raise ValueError(
                     f"KdaWorkspace: layout {mode!r} needs {need} B, the arena has {self.bytes} B (allocated for "
-                    f"backward={self.backward}, save_mode={self.save_mode!r})"
+                    f"backward={self.backward}, save_mode={self.save_mode!r}, arena={self.arena_option})"
                 )
             ns = types.SimpleNamespace()
-            regions = {r.name: r for r in self.plan.layout(mode)}
+            regions = {r.name: r for r in self.plan.layout(mode, tail)}
             for r in regions.values():
                 setattr(
                     ns,
@@ -1143,6 +1427,25 @@ class KdaWorkspace:
         self._epoch += 1
         return self._epoch
 
+    def tail_constants(
+        self, passes: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The tail split's int32 device constants for ``passes`` passes over this plan's chunk bound: the first
+        chunk and the length of every range (:func:`_tail_ranges`) and the buffer the real-chunk counts of the
+        ranges are computed into per call (three tiny in-place ops; nothing is allocated per call)."""
+        key = (self.plan.NC_pad, passes)
+        consts = self._tail_cache.get(key)
+        if consts is None:
+            ranges = _tail_ranges(self.plan.NC_pad, passes)
+            c0 = torch.tensor(
+                [r[0] for r in ranges], dtype=torch.int32, device=self.device
+            )
+            ln = torch.tensor(
+                [r[1] for r in ranges], dtype=torch.int32, device=self.device
+            )
+            consts = self._tail_cache[key] = (c0, ln, torch.empty_like(c0))
+        return consts
+
     @property
     def fwd(self) -> types.SimpleNamespace:
         return self.views("fwd")
@@ -1162,6 +1465,7 @@ class KdaWorkspace:
         backward: bool = True,
         save_mode: str = "light",
         launcher: Launcher | None = None,
+        arena: KdaArena | None = None,
     ) -> KdaWorkspace:
         """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device``."""
         index = _device_index(torch.device(device))
@@ -1171,6 +1475,7 @@ class KdaWorkspace:
             backward=backward,
             save_mode=save_mode,
             launcher=launcher,
+            arena=arena,
         )
 
     def with_plan(self, plan: Plan) -> KdaWorkspace:
@@ -1184,15 +1489,20 @@ class KdaWorkspace:
         other.__dict__.update(self.__dict__)
         other.plan = plan
         other._views_cache = {}
+        other._tail_cache = {}
         return other
 
     def paths(self) -> tuple[str, ...]:
         """The paths this workspace serves: the two forward paths (with and without a saved set) and, with
-        ``backward``, the backward paths this plan can take (``light_states`` on the segmented route only)."""
+        ``backward``, the backward paths this plan can take (``light_states`` on the segmented route only; no
+        ``replay`` under a lean arena)."""
         if not self.backward:
             return ("fwd", "fwd_nosave")
         return tuple(
-            path for path in PATHS if path != "light_states" or self.plan.recur == "seg"
+            path
+            for path in PATHS
+            if (path != "light_states" or self.plan.recur == "seg")
+            and not (path == "replay" and self.arena_option.lean)
         )
 
     def records(self) -> dict[str, dict[str, str]]:
@@ -1213,15 +1523,21 @@ class KdaWorkspace:
             cake_jit.load(name, self.arch)
 
     def run(
-        self, stage: str, values: dict[str, Any], *, path: str, launch: int = 0
+        self,
+        stage: str,
+        values: dict[str, Any],
+        *,
+        path: str,
+        launch: int = 0,
+        grid: tuple[int, int, int] | None = None,
     ) -> None:
         """Launch the record of ``stage`` on ``path`` (its ``launch``-th launch) with the logical argument
-        ``values``."""
+        ``values``; ``grid`` replaces the plan's grid (the tail split's per-range grids)."""
         name = self.plan.record(stage, path)
         self.launcher(
             name,
             values,
-            grid=self.plan.grid(stage, path, launch),
+            grid=self.plan.grid(stage, path, launch) if grid is None else grid,
             device_index=self.device_index,
         )
 
@@ -1235,6 +1551,7 @@ def _workspace(
     *,
     backward: bool,
     save_mode: str | None = None,
+    arena: KdaArena | None = None,
 ) -> KdaWorkspace:
     if workspace is None:
         return KdaWorkspace.for_problem(
@@ -1244,6 +1561,12 @@ def _workspace(
             device,
             backward=backward,
             save_mode="light" if save_mode is None else save_mode,
+            arena=arena,
+        )
+    if arena is not None and arena != workspace.arena_option:
+        raise ValueError(
+            f"workspace: allocated with arena={workspace.arena_option}, the call asks for arena={arena}; pass "
+            "arena=None to run with the workspace's option, or allocate a workspace with this one"
         )
     p = workspace.plan
     if (p.S, p.N, p.H) != (S, N, H):
@@ -1538,6 +1861,68 @@ def _adjoint_recurrence(
     )
 
 
+def _tail_ranges(NC_pad: int, passes: int) -> tuple[tuple[int, int], ...]:
+    """The ``(first chunk, length)`` ranges of ``passes`` tail passes over ``NC_pad`` chunks: ``ceil(NC_pad /
+    passes)`` chunks each, the last one clipped (fewer ranges than ``passes`` when the clipped tail is empty)."""
+    length = -(-int(NC_pad) // int(passes))
+    return tuple(
+        (c0, min(length, int(NC_pad) - c0)) for c0 in range(0, int(NC_pad), length)
+    )
+
+
+def _tail_passes(
+    ws: KdaWorkspace,
+    views: types.SimpleNamespace,
+    values: dict[str, Any],
+    tables: tuple[torch.Tensor, ...],
+    *,
+    path: str,
+    h: torch.Tensor,
+) -> None:
+    """Steps 6-8 of the backward (the fused gradient, GLM intra, the gate epilogue) once per tail range
+    (:func:`_tail_ranges`) of a lean workspace with ``tail_passes > 1``.  Per range: the whole-sequence arena
+    buffers (``gk``, ``v_new``, ``dv2``, ``beta_int``, the ``h`` / ``dh`` tapes) as leading-axis views offset by the
+    range's first chunk, the chunk tables as the range's slices, ``seq_chunk_start`` as the one-entry count of the
+    range's real chunks (``num_seqs = 0`` makes the fused gradient read that entry as its item bound), the lean
+    layout's per-pass buffers as they are (sized for one range) and the token tensors whole (every kernel reaches
+    them through the absolute ``chunk_bos``); the grids are the plan's rules at the range's chunk count.  The same
+    kernels address the same bytes as in one pass, so the gradients are bitwise the same."""
+    p = ws.plan
+    passes = ws.arena_option.tail_passes
+    c0_vec, len_vec, nc_vec = ws.tail_constants(passes)
+    # the real chunks of every range: clamp(NC_real - c0, 0, length), NC_real = seq_chunk_start[N]
+    torch.sub(tables[2][p.N : p.N + 1], c0_vec, out=nc_vec)
+    nc_vec.clamp_(min=0)
+    torch.minimum(nc_vec, len_vec, out=nc_vec)
+    chunk_bos, chunk_len = tables[0], tables[1]
+    for i, (c0, length) in enumerate(_tail_ranges(p.NC_pad, passes)):
+        rows = BT * c0
+        pass_values = {
+            **values,
+            "gk": values["gk"][rows:],
+            "v_new": values["v_new"][rows:],
+            "dv2": values["dv2"][rows:],
+            "beta_int": values["beta_int"][rows:],
+            "h2d": h[c0:].view(-1, D),
+            "dh2d": views.dh[c0:].view(-1, D),
+            "chunk_bos": chunk_bos[c0 : c0 + length],
+            "chunk_len": chunk_len[c0 : c0 + length],
+            "seq_chunk_start": nc_vec[i : i + 1],
+            "num_seqs": 0,
+            "num_chunks_pad": length,
+        }
+        for stage in ("dqkg", "glm_intra", "gate_epilogue"):
+            grid = cake_jit.launch_grid(
+                p.record(stage, path),
+                num_chunks_pad=length,
+                num_seqs=p.N,
+                num_heads=p.H,
+                sm_count=p.sm_count,
+                num_segments=p.NSEG,
+            )
+            ws.run(stage, pass_values, path=path, grid=grid)
+
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1550,6 +1935,7 @@ def chunk_kda_fwd(
     save_for_backward: bool = True,
     workspace: KdaWorkspace | None = None,
     save_mode: str | None = None,
+    arena: KdaArena | None = None,
 ) -> tuple[torch.Tensor, KdaChunkSaved | None]:
     """The forward: ``out`` BF16 like ``v`` (a fresh tensor) and the saved set (``None`` without
     ``save_for_backward``; fresh ``Aqk`` / ``Akk`` and tables and, with ``save_mode="light"`` on the segmented route
@@ -1571,10 +1957,13 @@ def chunk_kda_fwd(
     programs and the copies.  The ``h`` / ``v_new`` tapes are written only in tape mode.  ``workspace``
     (:class:`KdaWorkspace`, the forward layout at least)
     is reused; without one a workspace is allocated for this call.  ``save_mode=None`` takes the workspace's
-    default.
+    default.  ``arena`` (:class:`KdaArena`) is the lower-memory arena option: the forward's layout is the same
+    under every option (``None`` takes the workspace's; a differing option on a given workspace is refused).
     """
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
-    ws = _workspace(workspace, S, N, H, v.device, backward=False, save_mode=save_mode)
+    ws = _workspace(
+        workspace, S, N, H, v.device, backward=False, save_mode=save_mode, arena=arena
+    )
     p = ws.plan
     save_mode = ws.save_mode if save_mode is None else save_mode
     if save_mode not in SAVE_MODES:
@@ -1696,6 +2085,7 @@ def chunk_kda_bwd(
     saved: KdaChunkSaved | None = None,
     scale: float = SCALE,
     workspace: KdaWorkspace | None = None,
+    arena: KdaArena | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs.
 
@@ -1711,12 +2101,36 @@ def chunk_kda_bwd(
     adjoint recurrence, the fused dq / dk / dg, GLM intra and the gate epilogue, where the bracketed ones depend
     on the path and the row (``Plan.launch_count(path)``; the tables are rebuilt when the saved set carries
     none).  The backward writes nothing into the saved set.  ``workspace`` (:class:`KdaWorkspace` with the
-    backward layout) is reused; without one a workspace is allocated for this call.
+    backward layout) is reused; without one a workspace is allocated for this call.  ``arena``
+    (:class:`KdaArena`): the lower-memory option of that per-call workspace (``None`` takes a given workspace's
+    option; a differing one is refused); a lean per-call arena is sized for the saved set's version (the tape
+    layouts for a version-2 set).  A lean workspace serves no replay (``saved=None``): the lean layouts and the
+    tail split (``tail_passes``: steps 6-8 once per chunk range, :func:`_tail_passes`) are the saved-set paths'.
     """
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
     dout = _squeeze_batch(dout, "dout", 3)
     _check(dout, "dout", (S, H, D), torch.bfloat16, v.device)
-    ws = _workspace(workspace, S, N, H, v.device, backward=True)
+    lean = (
+        arena.lean
+        if arena is not None
+        else (workspace is not None and workspace.arena_option.lean)
+    )
+    if saved is None and lean:
+        raise ValueError(
+            "chunk_kda_bwd: a lean arena (KdaArena(lean=True)) serves no checkpoint replay (saved=None): pass "
+            "the saved set, or run the replay on a workspace with lean=False"
+        )
+    lean_tape = lean and saved is not None and saved.version == SAVED_VERSION_TAPE
+    ws = _workspace(
+        workspace,
+        S,
+        N,
+        H,
+        v.device,
+        backward=True,
+        save_mode="tape" if lean_tape else None,
+        arena=arena,
+    )
     p = ws.plan
     seg = p.recur == "seg"
     replay = saved is None
@@ -1878,9 +2292,12 @@ def chunk_kda_bwd(
     # seg_state[1] (version 3 with the states) or the recompute's (the arena's seg_state[1])
     seg_m = (saved.seg_m if tape else seg_state[1]).view(-1, D, D) if seg else None
     _adjoint_recurrence(ws, b, values, path=path, seg_m=seg_m)
-    ws.run("dqkg", values, path=path)
-    ws.run("glm_intra", values, path=path)
-    ws.run("gate_epilogue", values, path=path)
+    if ws.arena_option.tail_passes == 1:
+        ws.run("dqkg", values, path=path)
+        ws.run("glm_intra", values, path=path)
+        ws.run("gate_epilogue", values, path=path)
+    else:
+        _tail_passes(ws, b, values, tables, path=path, h=h)
     return tuple(_ranked(x, batched) for x in (dq, dk, dv, dbeta, dg))
 
 
@@ -1910,7 +2327,7 @@ class ChunkKDAFunction(torch.autograd.Function):
     and the backward then allocates its own (:func:`chunk_kda_bwd` without ``workspace``)."""
 
     @staticmethod
-    def forward(ctx, q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode):
+    def forward(ctx, q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode, arena):
         out, saved = chunk_kda_fwd(
             q,
             k,
@@ -1922,6 +2339,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             save_for_backward=True,
             workspace=workspace,
             save_mode=save_mode,
+            arena=arena,
         )
         ctx.save_for_backward(
             q,
@@ -1939,6 +2357,12 @@ class ChunkKDAFunction(torch.autograd.Function):
         # a weak reference: the node must not keep a per-call arena alive until the backward (under activation
         # checkpointing that would be one arena per layer)
         ctx.workspace_ref = None if workspace is None else weakref.ref(workspace)
+        # the arena option of the backward's own workspace when the caller's is gone (KdaArena holds ints only)
+        ctx.arena = (
+            arena
+            if arena is not None
+            else (None if workspace is None else workspace.arena_option)
+        )
         ctx.version, ctx.n_tables = saved.version, len(saved.tables)
         ctx.problem = (saved.S, saved.H, saved.num_docs)
         return out
@@ -1972,8 +2396,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             saved=saved,
             scale=ctx.scale,
             workspace=workspace,
+            arena=None if workspace is not None else ctx.arena,
         )
-        return dq, dk, dv, dg, dbeta, None, None, None, None
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None
 
 
 def chunk_kda(
@@ -1987,6 +2412,7 @@ def chunk_kda(
     scale: float = SCALE,
     workspace: KdaWorkspace | None = None,
     save_mode: str | None = None,
+    arena: KdaArena | None = None,
 ) -> torch.Tensor:
     """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta``.
 
@@ -1996,10 +2422,12 @@ def chunk_kda(
     backward allocates its own.  Without one each call allocates its own, for the forward and again for the
     backward; the arenas are not zero-filled.  After a forward under ``torch.utils.checkpoint``
     (``use_reentrant=False``) the node keeps no arena and no saved tensor alive.  ``save_mode`` (``None``: the
-    workspace's default, ``"light"`` without one) selects the saved set's version.
+    workspace's default, ``"light"`` without one) selects the saved set's version.  ``arena`` (:class:`KdaArena`,
+    ``None``: the workspace's option, off without one) is the lower-memory arena option; the node records it, so
+    the backward's own workspace (a per-call or checkpointed forward) takes the same option.
     """
     return ChunkKDAFunction.apply(
-        q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode
+        q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode, arena
     )
 
 
@@ -2028,8 +2456,10 @@ __all__ = [
     "FWD_SLOTS",
     "FWD_TAPE_SLOTS",
     "KIND_SHAPE",
+    "LEAN_MODES",
     "MAX_DOCS",
     "MODES",
+    "PASS_KINDS",
     "SAVED_VERSION",
     "SAVED_VERSION_TAPE",
     "SAVE_MODES",
@@ -2038,6 +2468,7 @@ __all__ = [
     "SLOTS",
     "TABLE_NAMES",
     "ChunkKDAFunction",
+    "KdaArena",
     "KdaChunkSaved",
     "KdaWorkspace",
     "Launcher",

@@ -43,6 +43,9 @@ Usage::
     out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)
     ws = kda_train_workspace(S, num_docs, H, device, save_mode="tape")   # saved set v2: the backward
     out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)  # skips its recurrence recompute
+    arena = kda_train_arena(lean=True, tail_passes=4)                    # the lower-memory arena option
+    ws = kda_train_workspace(S, num_docs, H, device, arena=arena)        # (off by default): a smaller backward
+    out = chunk_kda(q, k, v, g, beta, cu_seqlens, workspace=ws)          # arena, the same gradients bitwise
 
 Context-parallel training (KCP): the packed batch is split over the ranks
 of a process group (``kcp_partition``), every rank holds its fragments of the
@@ -85,6 +88,7 @@ def chunk_kda_fwd(
     save_for_backward: bool = True,
     workspace: Optional[Any] = None,
     save_mode: Optional[str] = None,
+    arena: Optional[Any] = None,
 ) -> tuple[torch.Tensor, Optional[Any]]:
     r"""Packed KDA chunked training forward.
 
@@ -110,6 +114,10 @@ def chunk_kda_fwd(
         forward half of its recurrence recompute) or ``"tape"`` (version 2: also the forward's state tape and
         ``v_new``, 768 B more per token-head, so the backward skips the whole recompute); ``None`` takes the
         workspace's default (``"light"`` without one).
+    arena : KdaArena, optional
+        The lower-memory arena option (:func:`kda_train_arena`; off by default): the forward's layout is the
+        same under every option; ``None`` takes the workspace's option, a differing option on a given workspace
+        is refused.
 
     Returns
     -------
@@ -128,6 +136,7 @@ def chunk_kda_fwd(
         save_for_backward=save_for_backward,
         workspace=workspace,
         save_mode=save_mode,
+        arena=arena,
     )
 
 
@@ -144,6 +153,7 @@ def chunk_kda_bwd(
     saved: Optional[Any] = None,
     scale: Optional[float] = None,
     workspace: Optional[Any] = None,
+    arena: Optional[Any] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Packed KDA chunked training backward.
 
@@ -159,6 +169,11 @@ def chunk_kda_bwd(
         The forward's scale; ``128 ** -0.5`` when ``None``.
     workspace : KdaWorkspace, optional
         A reused workspace with backward buffers; without one this call allocates its own.
+    arena : KdaArena, optional
+        The lower-memory arena option (:func:`kda_train_arena`; off by default) of that per-call workspace:
+        the lean backward layouts and the tail split (``tail_passes``), the same gradients bitwise; ``None``
+        takes a given workspace's option, a differing one is refused.  A lean arena serves no checkpoint replay
+        (``saved=None``).
 
     Returns
     -------
@@ -178,6 +193,7 @@ def chunk_kda_bwd(
         saved=saved,
         scale=DEFAULT_SCALE if scale is None else scale,
         workspace=workspace,
+        arena=arena,
     )
 
 
@@ -193,11 +209,13 @@ def chunk_kda(
     scale: Optional[float] = None,
     workspace: Optional[Any] = None,
     save_mode: Optional[str] = None,
+    arena: Optional[Any] = None,
 ) -> torch.Tensor:
     r"""Packed KDA chunked training as an autograd node (``torch.utils.checkpoint`` compatible).
 
     Returns ``out`` BF16 like ``v`` with gradients to ``q, k, v, g, beta``; see :func:`chunk_kda_fwd` for the
-    operands and ``save_mode`` and :func:`chunk_kda_bwd` for the gradients.
+    operands, ``save_mode`` and ``arena`` (the node records the option, so a backward that allocates its own
+    workspace takes it too) and :func:`chunk_kda_bwd` for the gradients.
     """
     from .experimental.cake_kda_train import cake_backend
 
@@ -211,7 +229,20 @@ def chunk_kda(
         scale=DEFAULT_SCALE if scale is None else scale,
         workspace=workspace,
         save_mode=save_mode,
+        arena=arena,
     )
+
+
+def kda_train_arena(*, lean: bool = False, tail_passes: int = 1) -> Any:
+    """The lower-memory arena option (a ``KdaArena``; the default, ``lean=False, tail_passes=1``, is the full
+    layout).  ``lean=True`` selects the lean backward layouts (4108 B per internal token-head with one tail pass
+    instead of the full layout's 5376 / 5120; no checkpoint replay on such a workspace); ``tail_passes >= 2``
+    (implies ``lean``) runs the backward's tail, the fused gradient / GLM intra / gate epilogue, once per range of
+    ``ceil(NC_pad / tail_passes)`` chunks over per-range buffers: 2820 B per internal token-head plus three state
+    blocks on the floor, the same gradients bitwise, some speed cost (see the package README)."""
+    from .experimental.cake_kda_train import cake_backend
+
+    return cake_backend.KdaArena(lean=lean, tail_passes=tail_passes)
 
 
 def kda_train_workspace(
@@ -222,14 +253,16 @@ def kda_train_workspace(
     *,
     backward: bool = True,
     save_mode: str = "light",
+    arena: Optional[Any] = None,
 ) -> Any:
     """A caller-owned ``KdaWorkspace`` (one arena of internal intermediates) for ``S`` tokens in ``num_docs``
     documents with ``H`` heads on ``device``, reused by every call that receives it: the forward layout only with
-    ``backward=False``; ``save_mode`` is the default of the calls on it and sizes the arena for that mode."""
+    ``backward=False``; ``save_mode`` is the default of the calls on it and sizes the arena for that mode;
+    ``arena`` (:func:`kda_train_arena`) is the lower-memory arena option, off when ``None``."""
     from .experimental.cake_kda_train import cake_backend
 
     return cake_backend.KdaWorkspace.for_problem(
-        S, num_docs, H, device, backward=backward, save_mode=save_mode
+        S, num_docs, H, device, backward=backward, save_mode=save_mode, arena=arena
     )
 
 
@@ -241,13 +274,21 @@ def kda_train_workspace_bytes(
     backward: bool = True,
     save_mode: str = "light",
     sm_count: Optional[int] = None,
+    arena: Optional[Any] = None,
 ) -> int:
     """Bytes :func:`kda_train_workspace` allocates for the problem (``sm_count``: the device's SM count, the
-    current CUDA device's when ``None``; it sets the segment count of the segmented recurrences)."""
+    current CUDA device's when ``None``; it sets the segment count of the segmented recurrences; ``arena``: the
+    lower-memory arena option, off when ``None``)."""
     from .experimental.cake_kda_train import cake_backend
 
     return cake_backend.workspace_bytes(
-        S, num_docs, H, backward=backward, save_mode=save_mode, sm_count=sm_count
+        S,
+        num_docs,
+        H,
+        backward=backward,
+        save_mode=save_mode,
+        sm_count=sm_count,
+        arena=arena,
     )
 
 
@@ -588,6 +629,7 @@ __all__ = [
     "kcp_partition",
     "kcp_saved_bytes",
     "kcp_workspace_bytes",
+    "kda_train_arena",
     "kda_train_saved_bytes",
     "kda_train_workspace",
     "kda_train_workspace_bytes",

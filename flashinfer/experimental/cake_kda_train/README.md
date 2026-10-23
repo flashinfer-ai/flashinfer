@@ -17,15 +17,16 @@ from `build.json` otherwise (see "Layout of this package").
 ## Public entry points (`flashinfer/kda_train.py`)
 
 ```python
-from flashinfer.kda_train import chunk_kda, chunk_kda_fwd, chunk_kda_bwd, kda_train_workspace
+from flashinfer.kda_train import chunk_kda, chunk_kda_fwd, chunk_kda_bwd, kda_train_workspace, kda_train_arena
 
-out = chunk_kda(q, k, v, g, beta, cu_seqlens, scale=None, workspace=None, save_mode=None)  # autograd
+out = chunk_kda(q, k, v, g, beta, cu_seqlens, scale=None, workspace=None, save_mode=None, arena=None)  # autograd
 out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, scale=None,
-                           save_for_backward=True, workspace=None, save_mode=None)
+                           save_for_backward=True, workspace=None, save_mode=None, arena=None)
 dq, dk, dv, dbeta, dg = chunk_kda_bwd(q, k, v, g, beta, cu_seqlens, dout,
-                                      saved=saved, scale=None, workspace=None)
+                                      saved=saved, scale=None, workspace=None, arena=None)
 dq, dk, dv, dbeta, dg = chunk_kda_bwd(q, k, v, g, beta, cu_seqlens, dout)         # checkpoint replay
 ws = kda_train_workspace(S, num_docs, H, device, backward=True, save_mode="light")  # caller-owned
+ws = kda_train_workspace(S, num_docs, H, device, arena=kda_train_arena(tail_passes=4))  # lower-memory arena
 ```
 
 ### Contract
@@ -149,6 +150,97 @@ same call by their producer).  `backward=False` sizes the arena for the
 forward layout only; `save_mode="tape"` sizes it for the tape layouts (smaller
 arenas: `h` and `v_new` live in the saved set) and makes `"tape"` the default
 of the calls on it.
+
+### Lower-memory arena (`KdaArena`)
+
+The lower-memory arena option, off by default, shrinks the arena of a
+backward workspace; the gradients stay bitwise the same.
+`kda_train_arena(lean=False, tail_passes=1)` in `flashinfer/kda_train.py`
+returns a `KdaArena`, a frozen dataclass with those two fields
+(`tail_passes >= 1`; `tail_passes > 1` implies `lean=True`), which
+`kda_train_workspace(...)`, `kda_train_workspace_bytes(...)`,
+`chunk_kda_fwd`, `chunk_kda_bwd` and `chunk_kda` take as the keyword-only
+`arena=`.  `None` takes the workspace's option (off without one); an option
+different from a given workspace's is refused with `ValueError`.  A workspace
+keeps its option as `arena_option` (its `arena` stays the `uint8` tensor).
+The autograd node of `chunk_kda` records the option, so a backward that
+allocates its own workspace (after a per-call forward, or a forward under
+non-reentrant `torch.utils.checkpoint`) uses the same one.  The forward's
+layout is the same under every option and smaller than the lean backward
+layouts (2560 B per internal token-head against at least 2820 in the light
+form), so the option changes nothing about the forward or the saved set.
+
+```python
+arena = kda_train_arena(lean=True, tail_passes=4)                # lean layouts, four tail passes
+nbytes = kda_train_workspace_bytes(S, num_docs, H, arena=arena)  # the arena it allocates
+ws = kda_train_workspace(S, num_docs, H, device, arena=arena)    # caller-owned, reused
+out = chunk_kda(q, k, v, g, beta, cu_seqlens, workspace=ws)      # the default arena's gradients, bitwise
+```
+
+`lean=True` sizes a backward workspace for the saved-set paths alone: the
+layouts `bwd_lean` / `bwd_tape_lean` (`cake_backend.LEAN_MODES`) take the
+place of the larger of the saved-set and replay layouts and drop the replay
+prep's internal `dout` copy (`do_int`).  Such a workspace serves no checkpoint
+replay: `chunk_kda_bwd` with `saved=None` raises `ValueError` on it.
+`torch.utils.checkpoint` is unaffected, since the node's backward always reads
+the recomputed saved set, never the replay path.  A lean arena also refuses
+the rows whose backward dispatches the separate dA / dv program `dav` (9 to 15
+heads) with `ValueError` when a backward workspace is built and in the byte
+queries; it serves the contract's head counts 1, 2, 4, 8, 16, 32 and 64.
+
+`tail_passes = B` runs the three chunk-parallel tail stages of the backward
+(the fused gradient `dqkg`, GLM intra `glm_intra` and the gate epilogue
+`gate_epilogue`: launch steps 6 to 8 of the backward's lifetime tables) once
+per range of `ceil(NC_pad / B)` chunks.  Each pass takes views of the
+whole-sequence buffers (`gk`, `v_new`, `dv2`, `beta_int`, the `h` / `dh`
+tapes) offset to the range's first chunk, the range's slices of the chunk
+tables and the per-pass buffers (`dq_f`, `dk_f`, `dg_f`, `db_f`, `dAkk`,
+`dAqk`, `dg_int`, `db_int`), which are sized for one range; the token tensors
+(`q`, `k`, `v`, `dout`, the saved `Aqk` / `Akk`, the gradients) are passed
+whole, every kernel reaching them through the absolute `chunk_bos` offsets.
+The same kernels address the same bytes as in one pass, so the gradients are
+bitwise those of the default arena; the cost is `B - 1` more launches per tail
+stage and the speed lost to their smaller grids.
+
+Sizes are in bytes per internal token-head (one of the `R = 64 * NC_pad`
+padded rows times one head), plus, on the segmented route, FP32 state blocks
+of `block = NSEG * H * 64 KiB` each.  A default backward workspace takes the
+larger of the saved-set layout (4360; tape 3592) and the replay layout (4488;
+tape 3720); one lean pass gives
+`4108 * R * H + max(0, 3 * block - 256 * R * H)` bytes (tape 3340), the three
+state blocks sharing a slot of 256 B per internal token-head as in the
+default layouts.  From two passes on the whole-sequence set is 2820 (tape
+2052) and the per-pass set, 2568 B per internal token-head of one range, is
+packed first-fit into the two whole-sequence slots that are dead before the
+tail (`qg` / `kg`, 512, and `w`, 256); the rest goes to an overflow slot
+shared with the state blocks.  Two passes give
+`2820 * R * H + max(3 * block, 516 * R * H)` (3336; tape 2568), four or more
+`2820 * R * H + 3 * block + slack` (tape: 2052 in place of 2820), where
+`slack` is the ceil slack of the last range (the per-pass buffers are sized
+for `R_b = 64 * ceil(NC_pad / tail_passes)` rows; it is zero when
+`tail_passes` divides `NC_pad`); passes above four buy nothing more.  Against
+the default's 4488 the light constants are about 8 % (one pass), 26 % (two
+passes) and 37 % (four or more) smaller.  The table gives the constants; the
+state blocks and the slack come on top where the formulas say so:
+
+| arena | light: B per internal token-head | tape: B per internal token-head | checkpoint replay (`saved=None`) |
+|---|---|---|---|
+| default (`KdaArena()`) | 4488 | 3720 | yes |
+| `lean=True`, one pass | 4108 | 3340 | no |
+| `tail_passes=2` | 3336 | 2568 | no |
+| `tail_passes >= 4` | 2820 | 2052 | no |
+
+The byte queries take the option too: `kda_train_workspace_bytes(..., arena=)`
+and `cake_backend.workspace_bytes(..., arena=)` give the configured arena for
+any `tail_passes`, and `cake_backend.memory_report(..., arena=)` adds the
+fields `lean`, `tail_passes`, `arena_bwd_default`, `arena_bwd_configured`,
+`arena_fwd_configured` and `arena_floor` (`2820 * R * H + 3 * block`; 2052 in
+place of 2820 for the tape forms) and recomputes its totals with the
+configured backward arena (the replay total keeps the default's).
+`cake_backend.lifetime_table(mode, tail_passes, plan=)` renders the lean
+layouts: their per-pass rows carry `unit="R_b*H"`, and from two passes on a
+`plan` is required, since the packing depends on the problem's geometry.  The
+context-parallel (KCP) entry points do not take the option in this version.
 
 ## Kernel structure of one training step
 
