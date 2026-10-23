@@ -19,7 +19,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Protocol, Sequence, Tuple, Union
 
 import torch
 
@@ -298,11 +298,22 @@ def _check_weights(
 # --------------------------------------------------------------------------- the paged KV cache: FlashInfer layouts -> the block's views
 
 
+class KvGeometry(Protocol):
+    """What :func:`kv_views` reads of a block geometry: the KV head count and the head dim.  A structural type, so the sibling
+    packages' geometries (the Qwen 3.8 block's among them) are accepted without inheriting from :class:`Qwen35BlockGeometry`."""
+
+    @property
+    def num_kv_heads(self) -> int: ...
+
+    @property
+    def head_dim(self) -> int: ...
+
+
 def kv_views(
     kv_cache: KvCache,
     kv_layout: str,
     *,
-    geometry: Qwen35BlockGeometry,
+    geometry: KvGeometry,
     page_size: int,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
