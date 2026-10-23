@@ -1019,6 +1019,41 @@ def test_checkpoint_replay_is_bitwise(T: int) -> None:
         )
 
 
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
+    """A non-reentrant ``torch.utils.checkpoint`` around prepare / finish keeps no tensor of the layer alive after
+    the forward (``stats`` and the inputs travel through the saved tensors; the handle holds no branch output), and
+    the checkpointed backward is bitwise the plain one."""
+    from torch.utils.checkpoint import checkpoint
+
+    i = _make_inputs(T, seed=SEED + 41)
+
+    def connection(X, fn, scale, base):
+        U, handle = pkg.cake_mhc_train_prepare(
+            X, fn, scale, base, save_stats=save_stats
+        )
+        B = (U.float() + i["B"].float()).to(BF16)
+        return pkg.cake_mhc_train_finish(X, B, handle)
+
+    def leaves() -> list:
+        return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
+
+    plain = leaves()
+    (connection(*plain).float() * i["dY"].float()).sum().backward()
+
+    checkpointed = leaves()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    Y = checkpoint(connection, *checkpointed, use_reentrant=False)
+    torch.cuda.synchronize()
+    kept = torch.cuda.memory_allocated() - before - Y.untyped_storage().nbytes()
+    assert kept == 0, f"{kept} bytes kept alive after a checkpointed forward"
+    (Y.float() * i["dY"].float()).sum().backward()
+    for p, c in zip(plain, checkpointed, strict=True):
+        assert torch.equal(p.grad, c.grad), "checkpointing changed a gradient bit"
+
+
 @pytest.mark.parametrize("T", (1000,))
 def test_accumulate_four_times(T: int) -> None:
     """Four consecutive ``accumulate=True`` passes on four input sets against the FP64 sum of the four gradients plus
