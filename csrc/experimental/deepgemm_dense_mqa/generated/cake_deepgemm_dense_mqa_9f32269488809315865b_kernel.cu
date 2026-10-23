@@ -79,7 +79,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_97fcf15832343046dcbe(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
+kernel_cake_deepgemm_dense_mqa_9f32269488809315865b(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -141,6 +141,15 @@ kernel_cake_deepgemm_dense_mqa_97fcf15832343046dcbe(const __grid_constant__ CUte
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Weights))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV_scales))) : "memory"); }
+    if (warp == 8) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        #pragma unroll 1
+        for (unsigned int pf_line = lane; pf_line < (seq_len + 31) / 32; pf_line += 32) {
+            unsigned int pf_row = pf_line * 32;
+            if (pf_row < seq_len) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(cu_seq_len_k_start + pf_row))); }
+            if (pf_row < seq_len) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(cu_seq_len_k_end + pf_row))); }
+        }
+    }
 
     // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 22 barriers)
     // Mbarriers at smem_raw[0..176)
@@ -981,7 +990,6 @@ kernel_cake_deepgemm_dense_mqa_97fcf15832343046dcbe(const __grid_constant__ CUte
                         float scale_kv = smem_kv_scales[kv_scale_stage_base + math_thread_idx];
                         mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(kv_empty_addr + (math_kv_stage) * 8);
                         math_kv_stage += 1;
                         if (math_kv_stage == 5) { math_kv_stage = 0; _phase_kv_full_1 ^= 1; }
@@ -1172,7 +1180,6 @@ kernel_cake_deepgemm_dense_mqa_97fcf15832343046dcbe(const __grid_constant__ CUte
                             math_tmem_phase ^= 1;
                         }
                     }
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(q_empty_addr + (math_q_stage) * 8);
                     math_q_stage += 1;
                     if (math_q_stage == 3) { math_q_stage = 0; _phase_q_full_1 ^= 1; }

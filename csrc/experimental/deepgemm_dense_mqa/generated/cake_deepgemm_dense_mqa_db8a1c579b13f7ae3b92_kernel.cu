@@ -26,28 +26,22 @@
 #define NUM_Q_PIPE_STAGES 3
 #define NUM_KV_PIPE_STAGES 5
 #define NUM_TMEM_PIPE_STAGES 3
-#define SMEM_NEGINF_SCRATCH_OFF 226832
+#define SMEM_NEGINF_SCRATCH_OFF 221200
 #define SMEM_NEGINF_SCRATCH_STAGE_BYTES 4096
 #define SMEM_NEGINF_SCRATCH_STRIDE 4096
-#define SMEM_LOCAL_WORK_OFF 51712
-#define SMEM_LOCAL_WORK_STAGE_BYTES 3072
-#define SMEM_LOCAL_WORK_STRIDE 3072
-#define SMEM_LOCAL_COST_OFF 54784
-#define SMEM_LOCAL_COST_STAGE_BYTES 3072
-#define SMEM_LOCAL_COST_STRIDE 3072
-#define SMEM_SCAN_WARP_SUMS_OFF 57856
-#define SMEM_SCAN_WARP_SUMS_STAGE_BYTES 96
-#define SMEM_SCAN_WARP_SUMS_STRIDE 96
-#define SMEM_SCAN_CARRY_OFF 57952
-#define SMEM_SCAN_CARRY_STAGE_BYTES 8
-#define SMEM_SCAN_CARRY_STRIDE 8
-#define SMEM_LOCAL_BASE_OFF 220672
-#define SMEM_LOCAL_BASE_STAGE_BYTES 3072
-#define SMEM_LOCAL_BASE_STRIDE 3072
-#define SMEM_LOCAL_SPLITS_OFF 223744
-#define SMEM_LOCAL_SPLITS_STAGE_BYTES 3072
-#define SMEM_LOCAL_SPLITS_STRIDE 3072
-#define SMEM_LOCAL_HEADER_OFF 226816
+#define SMEM_LOCAL_WORK_OFF 220672
+#define SMEM_LOCAL_WORK_STAGE_BYTES 128
+#define SMEM_LOCAL_WORK_STRIDE 128
+#define SMEM_LOCAL_COST_OFF 220800
+#define SMEM_LOCAL_COST_STAGE_BYTES 128
+#define SMEM_LOCAL_COST_STRIDE 128
+#define SMEM_LOCAL_BASE_OFF 220928
+#define SMEM_LOCAL_BASE_STAGE_BYTES 128
+#define SMEM_LOCAL_BASE_STRIDE 128
+#define SMEM_LOCAL_SPLITS_OFF 221056
+#define SMEM_LOCAL_SPLITS_STAGE_BYTES 128
+#define SMEM_LOCAL_SPLITS_STRIDE 128
+#define SMEM_LOCAL_HEADER_OFF 221184
 #define SMEM_LOCAL_HEADER_STAGE_BYTES 12
 #define SMEM_LOCAL_HEADER_STRIDE 12
 #define SMEM_SMEM_Q_OFF 1024
@@ -68,7 +62,7 @@
 #define SMEM_CANDIDATE_QUEUE_INDICES_OFF 161280
 #define SMEM_CANDIDATE_QUEUE_INDICES_STAGE_BYTES 8192
 #define SMEM_CANDIDATE_QUEUE_INDICES_STRIDE 8192
-#define SMEM_TOTAL 231040
+#define SMEM_TOTAL 225408
 #define CANDIDATE_MODE 0
 #define FULL_Q_BLOCKS 0
 #ifndef SM_COUNT
@@ -79,7 +73,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
+kernel_cake_deepgemm_dense_mqa_db8a1c579b13f7ae3b92(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_scales_alias, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, unsigned int* __restrict__ ScheduleMeta, float* __restrict__ CandidateValues, int* __restrict__ CandidateIndices, int* __restrict__ CandidateCounts, float* __restrict__ ScoreThresholds, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, unsigned int seq_len, unsigned int seq_len_kv, unsigned int stride_logits, unsigned int num_q_blocks, unsigned int num_kv_splits, unsigned int candidate_capacity)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -114,10 +108,6 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
     const int local_work_addr = smem + SMEM_LOCAL_WORK_OFF;
     unsigned int* local_cost = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_COST_OFF);
     const int local_cost_addr = smem + SMEM_LOCAL_COST_OFF;
-    unsigned long long* scan_warp_sums = reinterpret_cast<unsigned long long*>(smem_raw + SMEM_SCAN_WARP_SUMS_OFF);
-    const int scan_warp_sums_addr = smem + SMEM_SCAN_WARP_SUMS_OFF;
-    unsigned long long* scan_carry = reinterpret_cast<unsigned long long*>(smem_raw + SMEM_SCAN_CARRY_OFF);
-    const int scan_carry_addr = smem + SMEM_SCAN_CARRY_OFF;
     unsigned int* local_base = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_BASE_OFF);
     const int local_base_addr = smem + SMEM_LOCAL_BASE_OFF;
     unsigned int* local_splits = reinterpret_cast<unsigned int*>(smem_raw + SMEM_LOCAL_SPLITS_OFF);
@@ -201,19 +191,16 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
     // Kernel post-init ops
     const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    if (tid == 0) {
-        scan_carry[0] = 0;
-    }
-    #pragma unroll 1
-    for (unsigned int block_base = 0; block_base < num_q_blocks; block_base += 384) {
-        unsigned int qidx_1 = block_base + (unsigned int)tid;
-        unsigned long long value_1 = 0;
-        if (qidx_1 < num_q_blocks) {
+    if (tid < 32) {
+        unsigned int qidx = tid;
+        unsigned int splits = 0;
+        unsigned int cost = 0;
+        if (qidx < num_q_blocks) {
             unsigned int start = 4294967295;
             unsigned int end = 0;
             #pragma unroll
             for (int qi = 0; qi < 4; qi++) {
-                unsigned int _min_0 = ((qidx_1 * 4 + (unsigned int)qi) < (seq_len - 1) ? (qidx_1 * 4 + (unsigned int)qi) : (seq_len - 1));
+                unsigned int _min_0 = ((qidx * 4 + (unsigned int)qi) < (seq_len - 1) ? (qidx * 4 + (unsigned int)qi) : (seq_len - 1));
                 unsigned int row = _min_0;
                 unsigned int _min_1 = (((unsigned int)cu_seq_len_k_start[row]) < (seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[row]) : (seq_len_kv));
                 unsigned int _min_2 = ((start) < (_min_1) ? (start) : (_min_1));
@@ -223,93 +210,50 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
                 end = _max_0;
             }
             unsigned int base = start / 4 * 4;
-            unsigned int splits = (end - base + 255) / 256;
-            unsigned int cost = splits;
-            if (splits != 0) {
-                cost += 1;
+            unsigned int splits_0 = (end - base + 255) / 256;
+            unsigned int cost_1 = splits_0;
+            if (splits_0 != 0) {
+                cost_1 += 1;
             }
-            local_base[qidx_1] = base;
-            local_splits[qidx_1] = splits;
+            splits = splits_0;
+            cost = cost_1;
+            local_base[qidx] = base;
+            local_splits[qidx] = splits_0;
             if (bid == 0) {
-                ScheduleMeta[(unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + 2 * qidx_1] = base;
-                ScheduleMeta[(unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + 2 * qidx_1 + 1] = splits;
+                ScheduleMeta[(unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + 2 * qidx] = base;
+                ScheduleMeta[(unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + 2 * qidx + 1] = splits_0;
             }
-            value_1 = ((unsigned long long)splits << 32) + (unsigned long long)cost;
         }
-        __syncthreads();
-        unsigned long long previous_carry = scan_carry[0];
-        unsigned long long lane_sum = value_1;
-        unsigned long long _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 1, 32);
-        unsigned long long synced = _shfl_up_0;
+        unsigned long long scanned = ((unsigned long long)splits << 32) + (unsigned long long)cost;
+        unsigned long long _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scanned, 1, 32);
+        unsigned long long preceding = _shfl_up_0;
         if (lane >= 1) {
-            lane_sum += synced;
+            scanned += preceding;
         }
-        unsigned long long _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 2, 32);
-        unsigned long long synced_0 = _shfl_up_1;
+        unsigned long long _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scanned, 2, 32);
+        unsigned long long preceding_0 = _shfl_up_1;
         if (lane >= 2) {
-            lane_sum += synced_0;
+            scanned += preceding_0;
         }
-        unsigned long long _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 4, 32);
-        unsigned long long synced_1 = _shfl_up_2;
+        unsigned long long _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scanned, 4, 32);
+        unsigned long long preceding_1 = _shfl_up_2;
         if (lane >= 4) {
-            lane_sum += synced_1;
+            scanned += preceding_1;
         }
-        unsigned long long _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 8, 32);
-        unsigned long long synced_2 = _shfl_up_3;
+        unsigned long long _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scanned, 8, 32);
+        unsigned long long preceding_2 = _shfl_up_3;
         if (lane >= 8) {
-            lane_sum += synced_2;
+            scanned += preceding_2;
         }
-        unsigned long long _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 16, 32);
-        unsigned long long synced_3 = _shfl_up_4;
+        unsigned long long _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scanned, 16, 32);
+        unsigned long long preceding_3 = _shfl_up_4;
         if (lane >= 16) {
-            lane_sum += synced_3;
+            scanned += preceding_3;
         }
-        if (lane == 31) {
-            scan_warp_sums[warp] = lane_sum;
-        }
-        __syncthreads();
-        unsigned long long warp_total = 0;
-        if (lane < 12) {
-            warp_total = scan_warp_sums[lane];
-        }
-        unsigned long long warp_sum = warp_total;
-        unsigned long long _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 1, 32);
-        unsigned long long synced_w = _shfl_up_5;
-        if (lane >= 1) {
-            warp_sum += synced_w;
-        }
-        unsigned long long _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 2, 32);
-        unsigned long long synced_w_4 = _shfl_up_6;
-        if (lane >= 2) {
-            warp_sum += synced_w_4;
-        }
-        unsigned long long _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 4, 32);
-        unsigned long long synced_w_5 = _shfl_up_7;
-        if (lane >= 4) {
-            warp_sum += synced_w_5;
-        }
-        unsigned long long _shfl_up_8 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 8, 32);
-        unsigned long long synced_w_6 = _shfl_up_8;
-        if (lane >= 8) {
-            warp_sum += synced_w_6;
-        }
-        unsigned long long _shfl_up_9 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 16, 32);
-        unsigned long long synced_w_7 = _shfl_up_9;
-        if (lane >= 16) {
-            warp_sum += synced_w_7;
-        }
-        unsigned long long _shfl_0 = __shfl_sync(0xFFFFFFFF, warp_sum - warp_total, warp);
-        unsigned long long preceding = _shfl_0;
-        unsigned long long scanned_1 = lane_sum - value_1 + preceding + value_1 + previous_carry;
-        if (qidx_1 < num_q_blocks) {
-            local_work[qidx_1] = (unsigned int)(scanned_1 >> 32);
-            local_cost[qidx_1] = (unsigned int)scanned_1;
-        }
-        if (tid == 383) {
-            scan_carry[0] = scanned_1;
-        }
-        __syncthreads();
+        local_work[qidx] = (unsigned int)(scanned >> 32);
+        local_cost[qidx] = (unsigned int)scanned;
     }
+    __syncthreads();
     if (tid == 0) {
         unsigned int total_work = local_work[num_q_blocks - 1];
         unsigned int total_cost = local_cost[num_q_blocks - 1];
@@ -322,64 +266,40 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
         unsigned int coordinate = total_work;
         if (target != total_cost) {
             block = 0;
-            unsigned int probe = block + 512;
+            unsigned int probe = block + 32;
             if (probe <= num_q_blocks) {
                 if (target >= local_cost[probe - 1]) {
                     block = probe;
                 }
             }
-            unsigned int probe_0 = block + 256;
+            unsigned int probe_0 = block + 16;
             if (probe_0 <= num_q_blocks) {
                 if (target >= local_cost[probe_0 - 1]) {
                     block = probe_0;
                 }
             }
-            unsigned int probe_1 = block + 128;
+            unsigned int probe_1 = block + 8;
             if (probe_1 <= num_q_blocks) {
                 if (target >= local_cost[probe_1 - 1]) {
                     block = probe_1;
                 }
             }
-            unsigned int probe_2 = block + 64;
+            unsigned int probe_2 = block + 4;
             if (probe_2 <= num_q_blocks) {
                 if (target >= local_cost[probe_2 - 1]) {
                     block = probe_2;
                 }
             }
-            unsigned int probe_3 = block + 32;
+            unsigned int probe_3 = block + 2;
             if (probe_3 <= num_q_blocks) {
                 if (target >= local_cost[probe_3 - 1]) {
                     block = probe_3;
                 }
             }
-            unsigned int probe_4 = block + 16;
+            unsigned int probe_4 = block + 1;
             if (probe_4 <= num_q_blocks) {
                 if (target >= local_cost[probe_4 - 1]) {
                     block = probe_4;
-                }
-            }
-            unsigned int probe_5 = block + 8;
-            if (probe_5 <= num_q_blocks) {
-                if (target >= local_cost[probe_5 - 1]) {
-                    block = probe_5;
-                }
-            }
-            unsigned int probe_6 = block + 4;
-            if (probe_6 <= num_q_blocks) {
-                if (target >= local_cost[probe_6 - 1]) {
-                    block = probe_6;
-                }
-            }
-            unsigned int probe_7 = block + 2;
-            if (probe_7 <= num_q_blocks) {
-                if (target >= local_cost[probe_7 - 1]) {
-                    block = probe_7;
-                }
-            }
-            unsigned int probe_8 = block + 1;
-            if (probe_8 <= num_q_blocks) {
-                if (target >= local_cost[probe_8 - 1]) {
-                    block = probe_8;
                 }
             }
             unsigned int cost_before = 0;
@@ -400,64 +320,40 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
         unsigned int coordinate_3 = total_work;
         if (target_0 != total_cost) {
             block_1 = 0;
-            unsigned int probe_9 = block_1 + 512;
-            if (probe_9 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_9 - 1]) {
-                    block_1 = probe_9;
+            unsigned int probe_5 = block_1 + 32;
+            if (probe_5 <= num_q_blocks) {
+                if (target_0 >= local_cost[probe_5 - 1]) {
+                    block_1 = probe_5;
                 }
             }
-            unsigned int probe_0_1 = block_1 + 256;
+            unsigned int probe_0_1 = block_1 + 16;
             if (probe_0_1 <= num_q_blocks) {
                 if (target_0 >= local_cost[probe_0_1 - 1]) {
                     block_1 = probe_0_1;
                 }
             }
-            unsigned int probe_1_1 = block_1 + 128;
+            unsigned int probe_1_1 = block_1 + 8;
             if (probe_1_1 <= num_q_blocks) {
                 if (target_0 >= local_cost[probe_1_1 - 1]) {
                     block_1 = probe_1_1;
                 }
             }
-            unsigned int probe_2_1 = block_1 + 64;
+            unsigned int probe_2_1 = block_1 + 4;
             if (probe_2_1 <= num_q_blocks) {
                 if (target_0 >= local_cost[probe_2_1 - 1]) {
                     block_1 = probe_2_1;
                 }
             }
-            unsigned int probe_3_1 = block_1 + 32;
+            unsigned int probe_3_1 = block_1 + 2;
             if (probe_3_1 <= num_q_blocks) {
                 if (target_0 >= local_cost[probe_3_1 - 1]) {
                     block_1 = probe_3_1;
                 }
             }
-            unsigned int probe_4_1 = block_1 + 16;
+            unsigned int probe_4_1 = block_1 + 1;
             if (probe_4_1 <= num_q_blocks) {
                 if (target_0 >= local_cost[probe_4_1 - 1]) {
                     block_1 = probe_4_1;
-                }
-            }
-            unsigned int probe_5_1 = block_1 + 8;
-            if (probe_5_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_5_1 - 1]) {
-                    block_1 = probe_5_1;
-                }
-            }
-            unsigned int probe_6_1 = block_1 + 4;
-            if (probe_6_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_6_1 - 1]) {
-                    block_1 = probe_6_1;
-                }
-            }
-            unsigned int probe_7_1 = block_1 + 2;
-            if (probe_7_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_7_1 - 1]) {
-                    block_1 = probe_7_1;
-                }
-            }
-            unsigned int probe_8_1 = block_1 + 1;
-            if (probe_8_1 <= num_q_blocks) {
-                if (target_0 >= local_cost[probe_8_1 - 1]) {
-                    block_1 = probe_8_1;
                 }
             }
             unsigned int cost_before_1 = 0;
@@ -478,7 +374,6 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
         ScheduleMeta[2 * bid + 1] = split;
         ScheduleMeta[2 * SM_COUNT + bid] = coordinate_3 - coordinate;
     }
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     __syncthreads();
 
     // ---- Role: load_q ----
@@ -982,7 +877,6 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
                         float scale_kv = smem_kv_scales[kv_scale_stage_base + math_thread_idx];
                         mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(kv_empty_addr + (math_kv_stage) * 8);
                         math_kv_stage += 1;
                         if (math_kv_stage == 5) { math_kv_stage = 0; _phase_kv_full_1 ^= 1; }
@@ -1173,7 +1067,6 @@ kernel_cake_deepgemm_dense_mqa_2e080c04d067985f0445(const __grid_constant__ CUte
                             math_tmem_phase ^= 1;
                         }
                     }
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(q_empty_addr + (math_q_stage) * 8);
                     math_q_stage += 1;
                     if (math_q_stage == 3) { math_q_stage = 0; _phase_q_full_1 ^= 1; }
