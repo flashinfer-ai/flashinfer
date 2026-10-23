@@ -19,6 +19,9 @@ Differences from the base kernel:
 * a persistent kernel (``kernel_persist``, sm_107a; chosen automatically at T = 2-8 when
   ``num_sms`` names a die-restricted stream, or forced with ``persistent``), with
   ``num_sms`` / ``grid_override`` / ``persistent_counter`` / ``flush_hint``;
+* on sm_107a the automatic heads per CTA also depend on T, ``flush_hint`` and the rounding
+  mode (``auto_heads_per_cta``: all value heads of a key head per CTA from 1.5-2.7 waves of
+  CTA slots, not 8);
 * the fp32 copies of bf16 ``A_log`` / ``dt_bias`` are safe across streams and re-made after an
   in-place update.
 
@@ -4367,28 +4370,74 @@ _CVT_RS_CC = (
     (10, 7),
 )  # archs whose ptxas accepts cvt.rs (see mamba/conversion.cuh)
 _CTA_SLOTS_PER_SM = _MIN_BLOCKS_PER_SM
-_HPC2_MAX_WAVES = 8  # hpc = 2 up to this many waves (see auto_heads_per_cta)
+# Heads per CTA (auto_heads_per_cta): 1 while the hpc = 1 grid fits cap1 waves of CTA slots, 2
+# while the hpc = 2 grid fits cap2 waves, else all of a key head's value heads. On the archs of
+# _HPC_TUNED_CC the caps depend on T, flush_hint and the rounding mode (measured on Rubin, see
+# auto_heads_per_cta); elsewhere cap1 = 1 and cap2 = _HPC2_MAX_WAVES (tuned on B200).
+_HPC_TUNED_CC = ((10, 7),)
+_HPC1_MAX_WAVES = 1.0
+_HPC2_MAX_WAVES = 8  # without T
+_HPC2_MAX_WAVES_MTP = 1.5  # T >= 2, round to nearest
+_HPC2_MAX_WAVES_MTP_SR = 1.75  # T >= 2, stochastic rounding
+_HPC2_MAX_WAVES_T1_FF = 2.4  # T = 1, flush_hint "flush_first"
+_HPC2_MAX_WAVES_T1 = 2.7  # T = 1, flush_hint None / "some"
+_HPC_NO_FLUSH_WAVES = (0.65, 0.8)  # flush_hint "none", any T: (cap1, cap2)
 
 
 def auto_heads_per_cta(
-    batch: int, n_key_heads: int, num_sms: int, heads_per_key: int = HPK
+    batch: int,
+    n_key_heads: int,
+    num_sms: int,
+    heads_per_key: int = HPK,
+    T: Optional[int] = None,
+    flush_hint: Optional[str] = None,
+    sr: str = "",
 ) -> int:
-    """Heads per CTA for a batch: 1 while the hpc = 1 grid fits in one wave of CTA slots,
-    2 (when it divides ``heads_per_key``) while the hpc = 2 grid fits in 8 waves, else all
-    ``heads_per_key`` value heads of a key head in one CTA.
+    """Heads per CTA for ``batch`` rows over ``n_key_heads`` key heads on ``num_sms`` SMs: 1
+    while the hpc = 1 grid (rows x key heads x ``heads_per_key`` CTAs) fits cap1 waves of CTA
+    slots (4 x ``num_sms``), 2 (when it divides ``heads_per_key``) while the hpc = 2 grid fits
+    cap2 waves, else all ``heads_per_key`` value heads of a key head in one CTA.
 
-    One CTA runs its value heads one after another, so splitting a key head over 2 or 4
-    CTAs (each repeating the small per-key-head prologue) shortens the per-CTA chain and
-    gives the scheduler finer-grained work. hpc = 1 only pays off while everything runs in
-    one wave; hpc = 2 keeps winning over hpc = 4 well past one wave (5-25% at B = 16..128,
-    cold clean L2), and the repeated prologue only catches up around B = 160-192, where
-    the two are within 1.5%. B200 (148 SMs), 4 value heads per key head: 1 for B <= 9, 2
-    for B <= 148, else 4 (3 per key head: 1 for B <= 12, else 3)."""
+    One CTA runs its value heads one after another, so splitting a key head over 2 or 4 CTAs
+    (each repeating the per-key-head prologue) shortens the per-CTA chain and gives the
+    scheduler finer-grained work, until the repeated prologue costs more than that saves (Rubin,
+    T = 1, B = 128 per die: 67 instructions per DRAM KB at hpc = 2, 47 at hpc = 4).
+
+    Without ``T`` (``_launch`` passes it on _HPC_TUNED_CC only, so on sm_100a): cap1 = 1, cap2 =
+    8, tuned on B200 with cold clean L2, where hpc = 2 kept winning over hpc = 4 well past one
+    wave (5-25 % at B = 16..128, within 1.5 % at B = 160-192). B200 (148 SMs), 4 value heads per
+    key head: 1 for B <= 9, 2 for B <= 148, else 4 (3 per key head: 1 for B <= 12, else 3).
+
+    With ``T`` (sm_107a): cap1 = 1; cap2 = 1.5 at T >= 2 (1.75 with stochastic rounding ``sr``),
+    2.4 at T = 1 with ``flush_hint`` "flush_first", 2.7 at T = 1 otherwise; ``flush_hint`` "none"
+    (no flush rows), any T: cap1 = 0.65, cap2 = 0.8. Per Rubin die (8 key heads on 106 SMs; a
+    whole-GPU launch of 16 key heads on 212 SMs alike): 1 for B <= 13, 2 up to B = 39 at T >= 2
+    (46 with stochastic rounding), 63 at T = 1 flush-first and 71 otherwise, else 4 (the 8-wave
+    cap: 2 up to B = 212); no flush rows: 1 for B <= 8, 2 for B <= 21, else 4. Measured on Rubin
+    VR200 with hpc = 1 / 2 / 4 forced and interleaved (CUPTI step time, 2-3 replicas per cell,
+    T = 1-8; uGPU and whole-GPU launches, warm and cold L2, flush rows first and in random order,
+    round to nearest, LCG and Philox-5): hpc = 4 overtakes hpc = 2 at B = 28-44 per die at T >= 2
+    and B = 38-72 at T = 1, latest with cold L2, stochastic rounding, random row order or a
+    whole-GPU launch. The caps follow the latest crossover: over the cells they change 1.11x
+    (geomean), worst 0.99x (ties at the caps). uGPU, flush rows first, warm L2, round to nearest,
+    B = 128: T = 1 28.32 -> 25.50 us, T = 4 36.19 -> 31.91 us, T = 8 46.02 -> 41.25 us."""
     slots = _CTA_SLOTS_PER_SM * num_sms
     hpk = heads_per_key
-    if batch * n_key_heads * hpk <= slots:
+    if T is None:
+        cap1, cap2 = _HPC1_MAX_WAVES, _HPC2_MAX_WAVES
+    elif flush_hint == "none":
+        cap1, cap2 = _HPC_NO_FLUSH_WAVES
+    elif T >= 2:
+        cap1, cap2 = _HPC1_MAX_WAVES, _HPC2_MAX_WAVES_MTP
+        if sr:  # stochastic rounding
+            cap2 = _HPC2_MAX_WAVES_MTP_SR
+    else:  # T = 1
+        cap1, cap2 = _HPC1_MAX_WAVES, _HPC2_MAX_WAVES_T1
+        if flush_hint == "flush_first":
+            cap2 = _HPC2_MAX_WAVES_T1_FF
+    if batch * n_key_heads * hpk <= cap1 * slots:
         return 1
-    if hpk % 2 == 0 and batch * n_key_heads * (hpk // 2) <= _HPC2_MAX_WAVES * slots:
+    if hpk % 2 == 0 and batch * n_key_heads * (hpk // 2) <= cap2 * slots:
         return 2
     return hpk
 
@@ -4558,8 +4607,9 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     without that many locality domains run the per-die launches back to back on the current
     stream.
 
-    ``heads_per_cta`` (a divisor of HV / H; None = by batch size, see ``auto_heads_per_cta``)
-    sets how many of a key head's 4 value heads one CTA runs.
+    ``heads_per_cta`` (a divisor of HV / H; None = by batch size, on sm_107a also by T,
+    ``flush_hint`` and the rounding mode, see ``auto_heads_per_cta``) sets how many of a key
+    head's 4 value heads one CTA runs.
 
     ``stochastic_rounding`` rounds the fp16 state written by flush rows stochastically
     (``cvt.rs.f16x2``, sm_100a / sm_103a / sm_107a); outputs, rings and verify rows are unchanged:
@@ -4597,7 +4647,8 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     ``flush_hint`` (performance only, never changes results: both kernels are bit-identical on
     every row mix) tells the host which flush rows the launch has, since it cannot read
     ``hist_len`` (a device tensor) without a sync. "none" lowers the automatic choice's
-    minimum from 8 items per CTA slot to half an item. With Philox rounding at T = 6-8 and
+    minimum from 8 items per CTA slot to half an item, and on sm_107a it also sets the heads per
+    CTA of non-persistent launches (``auto_heads_per_cta``). With Philox rounding at T = 6-8 and
     few items per CTA slot a persistent launch (chosen or forced, without ``grid_override``) runs the non-persistent
     kernel instead (measured faster there); how few depends on the hint:
 
@@ -4875,11 +4926,13 @@ def _launch(
         persistent = _pz_auto(
             T, hpk, heads_per_cta, H * B, num_sms, grid_override, target, flush_hint
         )
-    hpc = (
-        (hpk if persistent else auto_heads_per_cta(B, H, nsm, hpk))
-        if heads_per_cta is None
-        else int(heads_per_cta)
-    )
+    if heads_per_cta is not None:
+        hpc = int(heads_per_cta)
+    elif persistent:
+        hpc = hpk
+    else:  # by batch size, and on _HPC_TUNED_CC by T, flush hint and rounding mode
+        tuned = (target.major, target.minor) in _HPC_TUNED_CC
+        hpc = auto_heads_per_cta(B, H, nsm, hpk, T if tuned else None, flush_hint, sr)
     if persistent:
         if (target.major, target.minor) not in _PZ_CC:
             raise ValueError(

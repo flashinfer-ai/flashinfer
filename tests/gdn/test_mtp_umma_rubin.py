@@ -94,6 +94,85 @@ def test_bit_identical_to_base_kernel(T, hpc):
         assert torch.equal(x, y), name
 
 
+def test_auto_heads_per_cta_rubin_caps():
+    """auto_heads_per_cta with T (the sm_107a caps): hpc = 1 while the hpc = 1 grid fits one wave
+    of CTA slots, hpc = 2 while the hpc = 2 grid fits 1.5 waves at T >= 2 (1.75 with stochastic
+    rounding), 2.4 (flush rows first) / 2.7 waves at T = 1; no flush rows: 0.65 / 0.8 waves at
+    any T. Without T: the 8-wave cap whatever the hint and rounding (also the base file's policy
+    test, run here against this build)."""
+    f = _rubin_mod().auto_heads_per_cta
+    die = (8, 106)  # one die of a Rubin uGPU launch: key heads and SMs (424 CTA slots)
+    assert [f(b, *die) for b in (13, 14, 212, 213)] == [1, 2, 2, 4]
+    got = [f(b, *die, 4, None, "none", "philox") for b in (13, 14, 212, 213)]
+    assert got == [1, 2, 2, 4]
+    for T in (2, 4, 8):
+        for hint in (None, "some", "flush_first"):
+            got = [f(b, *die, 4, T, hint) for b in (13, 14, 39, 40, 212)]
+            assert got == [1, 2, 2, 4, 4], (T, hint)
+            for sr in ("philox", "lcg", "lcg_clock"):
+                got = [f(b, *die, 4, T, hint, sr) for b in (13, 14, 46, 47, 212)]
+                assert got == [1, 2, 2, 4, 4], (T, hint, sr)
+    for sr in ("", "philox"):  # T = 1: the hint moves the cap, the rounding does not
+        got = [f(b, *die, 4, 1, "flush_first", sr) for b in (13, 14, 63, 64)]
+        assert got == [1, 2, 2, 4], sr
+        for hint in (None, "some"):
+            got = [f(b, *die, 4, 1, hint, sr) for b in (13, 14, 71, 72)]
+            assert got == [1, 2, 2, 4], (hint, sr)
+    for T in (1, 4, 8):
+        assert [f(b, *die, 4, T, "none") for b in (8, 9, 21, 22)] == [1, 2, 2, 4]
+    # one whole-GPU launch (16 key heads, 212 SMs): the same batch boundaries
+    assert [f(b, 16, 212, 4, 4) for b in (13, 14, 39, 40)] == [1, 2, 2, 4]
+    assert [f(b, 16, 212, 4, 1, "flush_first") for b in (63, 64)] == [2, 4]
+    # 2 value heads per key head: both past one hpc = 1 wave; 3: no hpc = 2
+    assert [f(b, *die, 2, 4) for b in (26, 27, 500)] == [1, 2, 2]
+    assert [f(b, *die, 3, 4) for b in (17, 18)] == [1, 3]
+
+
+def test_auto_heads_per_cta_dispatch(monkeypatch):
+    """_launch passes T, flush_hint and the rounding mode to auto_heads_per_cta on sm_107a only
+    (sm_100a keeps the 8-wave cap: 2 heads per CTA in every case below), and the automatic choice
+    gives the same bits as 4 heads per CTA. One whole-device launch over 16 key heads."""
+    from flashinfer.utils import get_compute_capability
+
+    _skip_if_no_rubin_build()
+    M = _rubin_mod()
+    on_rubin = get_compute_capability(torch.device("cuda")) == (10, 7)
+    nsm = torch.cuda.get_device_properties(DEV).multi_processor_count
+    seen = []
+    real = M._get_kernel
+
+    def spy(*args, **kw):
+        seen.append(args[6])  # heads per CTA
+        return real(*args, **kw)
+
+    monkeypatch.setattr(M, "_get_kernel", spy)
+    # T, rows, flush_hint, rounding, heads per CTA on Rubin (212 SMs)
+    for T, B, hint, mode, rubin_hpc in (
+        (4, 48, None, "none", 4),
+        (4, 44, None, "lcg", 2),  # stochastic rounding: hpc = 2 up to 46 rows
+        (1, 66, "flush_first", "none", 4),
+        (1, 66, None, "none", 2),  # T = 1, flush rows anywhere: hpc = 2 up to 71 rows
+        (4, 24, "none", "none", 4),  # no flush rows: hpc = 2 up to 21 rows
+    ):
+        case, fm = _pz_case(T, 770 + B, _ugpu_pattern(B, 770 + B))
+        H = case[0].shape[2]
+        if not on_rubin:
+            want = M.auto_heads_per_cta(B, H, nsm, 4)
+        elif nsm == 212:
+            want = rubin_hpc
+        else:
+            want = M.auto_heads_per_cta(B, H, nsm, 4, T, hint, mode.replace("none", ""))
+        sr = _sr_kw(mode)
+        ref = _pz_call(case, fm, heads_per_cta=4, **sr)
+        seen.clear()
+        got = _pz_call(
+            case, fm, heads_per_cta=None, persistent=False, flush_hint=hint, **sr
+        )
+        assert seen == [want], (T, B, hint, mode, seen)
+        for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+            assert torch.equal(x, y), (T, B, hint, mode, name)
+
+
 def test_persistent_rejected_off_sm107():
     """persistent=True is sm_107a only: elsewhere a clear ValueError, not a silent fallback."""
     from flashinfer.utils import get_compute_capability
