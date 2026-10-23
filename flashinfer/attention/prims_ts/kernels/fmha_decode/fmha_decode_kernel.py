@@ -30,6 +30,7 @@ Entry points:
 """
 
 import math
+from dataclasses import replace
 
 import cutlass
 import cutlass.experimental.cuda as cuda
@@ -94,6 +95,7 @@ from .fmha_decode_resources import (
     TmemTransformedKvResource,
 )
 from .fmha_decode_resources.helpers_common import (
+    split_kv_grid_coord,
     _q_group_token_base,
     _q_seq_bounds,
 )
@@ -367,6 +369,8 @@ def _build_decode_gen_schedule(
     sparse_row_route_begin: Int32 | None = None,
     sparse_route_count: Int32 | None = None,
     sage_scales_ptr: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -637,6 +641,7 @@ def _build_decode_gen_schedule(
         uses_page_offsets_task
         and use_per_inst_kv_resources
         and not use_one_inst_qkv
+        and not cfg.runtime_page_window
         and not (
             use_native_paged_kv
             and cfg.uses_q_token_kv_block_sparse_page_route
@@ -1422,6 +1427,7 @@ def _build_decode_gen_schedule(
         partial_stats_ptr=partial_stats_ptr,
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
+        lse_ptr=lse_ptr,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
         num_heads_kv=num_heads_kv,
@@ -1451,6 +1457,7 @@ def _build_decode_gen_schedule(
             partial_stats_ptr=partial_stats_ptr,
             split_kv_counter_ptr=split_kv_counter_ptr,
             attention_sinks_ptr=attention_sinks_ptr,
+            lse_ptr=lse_ptr,
             seqlens_kv=kv_seqlens,
             max_seq_len_kv=corr_max_seq_len_kv,
             num_heads_kv=num_heads_kv,
@@ -2359,6 +2366,8 @@ def _build_decode_gen_schedule(
         # The score-seed operand tile is written once by its owning instance.
         eager_init_resources.append(tmem_s0)
 
+    for task in task_list:
+        task.requested_splits = requested_splits
     return (
         task_list,
         resource_dependency_graph,
@@ -2434,6 +2443,7 @@ def build_decode_task_manager(
         total_kv_tiles,
         tile_sched_params=None,
         num_heads_kv=Int32(num_heads_kv),
+        lse_ptr=None,
     )
 
     tm = TaskManager(
@@ -2550,8 +2560,8 @@ def _run_decode_gen_active(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    scale_softmax_log2: Float32,
+    output_scale: Float32,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -2588,6 +2598,8 @@ def _run_decode_gen_active(
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     g_sage_scales: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2701,9 +2713,9 @@ def _run_decode_gen_active(
     ) = _build_decode_gen_schedule(
         cfg,
         total_kv_tiles,
-        scale_softmax_log2=g_scale_s_log2_e,
+        scale_softmax_log2=scale_softmax_log2,
         o_ptr=o_iter,
-        output_scale=g_output_scale,
+        output_scale=output_scale,
         partial_o_ptr=g_partial_o,
         partial_stats_ptr=g_partial_stats,
         split_kv_counter_ptr=g_split_kv_counter,
@@ -2747,6 +2759,8 @@ def _run_decode_gen_active(
         sparse_route_metadata=g_sparse_route_metadata,
         sparse_row_route_begin=sparse_row_route_begin,
         sparse_route_count=sparse_route_count,
+        lse_ptr=lse_ptr,
+        requested_splits=requested_splits,
     )
 
     smem_allocator.allocate()
@@ -2821,8 +2835,11 @@ def _run_decode_gen_active(
             runtime_seq_len_kv,
             seq_len_q,
             _q_group_token_base(cfg, q_group_idx),
+            requested_splits=requested_splits,
         )
-        split_idx = cute.arch.block_idx()[0] % Int32(cfg.splits_kv)
+        split_idx = Int32(cute.arch.block_idx()[0])
+        if cutlass.const_expr(not cfg.uses_compact_split_grid):
+            split_idx = split_idx % Int32(cfg.splits_kv)
         run_task_graph = cute.arch.make_warp_uniform(
             split_idx < deferred_active_splits_kv
         )
@@ -2892,8 +2909,8 @@ def _run_decode_gen_runtime_prefix(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    scale_softmax_log2: Float32,
+    output_scale: Float32,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -2929,6 +2946,8 @@ def _run_decode_gen_runtime_prefix(
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     g_sage_scales: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -2946,6 +2965,7 @@ def _run_decode_gen_runtime_prefix(
             runtime_seq_len_kv,
             seq_len_q,
             q_token_base,
+            requested_splits=requested_splits,
         )
         if cutlass.const_expr(not cfg.use_separate_reduction_kernel):
             # Preserve one neutral producer for fused empty-K semantics.
@@ -2960,7 +2980,9 @@ def _run_decode_gen_runtime_prefix(
                 # This also avoids changing the grid or adding a reducer launch.
                 if active_splits_kv == Int32(cfg.splits_kv - 1):
                     active_splits_kv = Int32(cfg.splits_kv)
-        split_idx = q_group_cta_idx % Int32(cfg.splits_kv)
+        split_idx = Int32(cute.arch.block_idx()[0])
+        if cutlass.const_expr(not cfg.uses_compact_split_grid):
+            split_idx = q_group_cta_idx % Int32(cfg.splits_kv)
         split_is_active = split_idx < active_splits_kv
 
     if cutlass.const_expr(cfg.supports_cluster_smem_reduction):
@@ -2976,8 +2998,8 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
@@ -3014,6 +3036,8 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -3030,8 +3054,8 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
@@ -3068,6 +3092,8 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -3085,8 +3111,8 @@ def decode_gen_kernel(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    scale_softmax_log2: Float32,
+    output_scale: Float32,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -3116,9 +3142,11 @@ def decode_gen_kernel(
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     g_sage_scales: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
-    q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
+    q_group_cta_idx, h_k_idx, b_idx = split_kv_grid_coord(cfg, cute.arch.block_idx())
     if cutlass.const_expr(
         cfg.use_q_token_kv_block_sparse_route
         and not cfg.shares_sparse_pattern
@@ -3139,8 +3167,9 @@ def decode_gen_kernel(
                 g_q_token_kv_block_sparse_page_membership_stride * g_h_k
             )
     q_group_idx = q_group_cta_idx
-    if cutlass.const_expr(cfg.use_split_kv):
-        # Grid coordinates and scratch linearization retain configured fanout.
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        q_group_idx = Int32(cute.arch.block_idx()[2]) % Int32(cfg.num_q_ctas)
+    elif cutlass.const_expr(cfg.use_split_kv):
         q_group_idx = q_group_cta_idx // Int32(cfg.splits_kv)
 
     q_token_offset = Int32(0)
@@ -3178,8 +3207,8 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
@@ -3199,8 +3228,10 @@ def decode_gen_kernel(
                 b_idx,
                 q_token_offset,
                 seq_len_q,
-                Int32(cfg.splits_kv),
-                True,
+                Int32(cfg.splits_kv)
+                if requested_splits is None
+                else requested_splits[0],
+                requested_splits is None,
                 False,
                 tile_sched_params,
                 cfg,
@@ -3211,6 +3242,8 @@ def decode_gen_kernel(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
             )
         elif cutlass.const_expr(cfg.use_split_kv and cfg.use_pdl):
             # The immediately preceding grid may produce seq_lens. Send every
@@ -3227,8 +3260,8 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
@@ -3265,6 +3298,8 @@ def decode_gen_kernel(
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -3278,8 +3313,8 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
@@ -3315,6 +3350,8 @@ def decode_gen_kernel(
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
             )
     else:
         # Inactive requests publish no output or partials; dependent reducers
@@ -3340,7 +3377,7 @@ def fmha_decode_launch(
     partial_stats_iter: cute.Pointer,
     split_kv_counter_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    scale_s: Float32,
+    softmax_scale: Float32,
     output_scale: Float32,
     kv_b_stride: Int32,
     max_active_clusters: Int32,
@@ -3362,6 +3399,8 @@ def fmha_decode_launch(
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
     sage_scales_iter: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Standalone JIT launcher for FMHA decode TS.
 
@@ -3369,6 +3408,12 @@ def fmha_decode_launch(
     its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
     """
     log2_e = math.log2(math.e)
+    if cutlass.const_expr(requested_splits is not None):
+        # Prepare the reciprocal once on the host; counts stay runtime operands.
+        requested_splits = (
+            requested_splits,
+            cute.fast_divmod_create_divisor(requested_splits * Int32(cfg.num_insts_kv)),
+        )
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
     bias_static_sliding_kv_tma = (
@@ -3683,8 +3728,18 @@ def fmha_decode_launch(
         )
 
     grid_x = q_groups
+    grid_batch = b
     if cutlass.const_expr(cfg.use_split_kv):
         grid_x = q_groups * Int32(cfg.splits_kv)
+        if cutlass.const_expr(cfg.uses_compact_split_grid):
+            # X contains only live policy splits. Q/batch share Z with a
+            # compile-time Q stride, avoiding runtime-count coordinate division.
+            grid_x = (
+                Int32(cfg.splits_kv)
+                if requested_splits is None
+                else requested_splits[0]
+            )
+            grid_batch = b * q_groups
 
     if cutlass.const_expr(cfg.use_persistent_scheduler):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
@@ -3694,7 +3749,7 @@ def fmha_decode_launch(
         grid = tile_sched_params.get_grid_shape()
     else:
         tile_sched_params = None
-        grid = (grid_x, h_k, b)
+        grid = (grid_x, h_k, grid_batch)
     # cluster distributed-SMEM reduction groups the splits_kv split CTAs
     # of each sequence (contiguous in grid-X) into one cluster so they can write
     # partials into each other's shared memory via prims.mapa.
@@ -3706,55 +3761,81 @@ def fmha_decode_launch(
         0,
         mem_space=cutlass.AddressSpace.gmem,
     )
-    decode_gen_kernel(
-        tma_desc_q,
-        tma_desc_k,
-        tma_desc_v,
-        tma_desc_k_sf,
-        tma_desc_v_sf,
-        tma_desc_k,
-        tma_desc_v,
-        o_iter,
-        s_k,
-        h_k,
-        Float32(scale_s * log2_e),
-        output_scale,
-        seqlens_kv_iter,
-        cu_seqlens_q_iter,
-        page_idx_kv_iter,
-        k_sf_iter,
-        v_sf_iter,
-        page_table_stride,
-        page_table_capacity,
-        q_token_kv_block_sparse_page_memberships_iter,
-        q_token_kv_block_sparse_page_membership_stride,
-        partial_o_iter,
-        partial_stats_iter,
-        split_kv_counter_iter,
-        attention_sinks_iter,
-        h_r,
-        tile_sched_params,
-        cfg,
-        seq_len_kv,
-        use_variable_seqlens_kv,
-        use_native_paged_kv,
-        use_static_native_seqlens_kv,
-        null_sparse_route_ptr,
-        null_sparse_route_ptr,
-        null_sparse_route_ptr,
-        static_full_split_prefix,
-        g_sage_scales=sage_scales_iter,
-    ).launch(
-        grid=grid,
-        block=[cfg.threads_per_cta, 1, 1],
-        cluster=cluster_shape,
-        stream=stream,
-        min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, effective_seq_len_kv),
-        # PDL-capable attention initializes all local task resources before
-        # acquiring its immediately preceding producer. Split attention also
-        # defers runtime prefix pruning until after that acquire.
-        use_pdl=cfg.use_pdl,
+    # Both schedules are compiled together and selected by runtime bounds.
+    # A CTA-relative 32-ID stage covers any instruction-aligned short span;
+    # longer spans retain the ordinary staged pipeline. Counts never enter
+    # the compile identity or require another JIT when this choice changes.
+    can_hold_runtime_window = (
+        cfg.runtime_split_kv
+        and requested_splits is not None
+        and use_native_paged_kv
+        and cfg.use_split_kv
+        and not cfg.use_sliding_window_causal
+        and not cfg.uses_scattered_page_route
+        and not cfg.use_block_sparse
+        and cfg.num_insts_kv * (cfg.tile_size_kv // cfg.num_tokens_per_page) <= 32
     )
+    use_runtime_window = cutlass.Boolean(False)
+    if cutlass.const_expr(can_hold_runtime_window):
+        pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
+        window_tiles = (32 // pages_per_tile // cfg.num_insts_kv) * cfg.num_insts_kv
+        use_runtime_window = s_k <= requested_splits[0] * Int32(
+            window_tiles * cfg.tile_size_kv
+        )
+    for profile in cutlass.range_constexpr(2 if can_hold_runtime_window else 1):
+        launch_cfg = replace(cfg, runtime_page_window=(profile == 1))
+        if use_runtime_window == cutlass.Boolean(profile == 1):
+            decode_gen_kernel(
+                tma_desc_q,
+                tma_desc_k,
+                tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
+                tma_desc_k,
+                tma_desc_v,
+                o_iter,
+                s_k,
+                h_k,
+                Float32(softmax_scale * log2_e),
+                output_scale,
+                seqlens_kv_iter,
+                cu_seqlens_q_iter,
+                page_idx_kv_iter,
+                k_sf_iter,
+                v_sf_iter,
+                page_table_stride,
+                page_table_capacity,
+                q_token_kv_block_sparse_page_memberships_iter,
+                q_token_kv_block_sparse_page_membership_stride,
+                partial_o_iter,
+                partial_stats_iter,
+                split_kv_counter_iter,
+                attention_sinks_iter,
+                h_r,
+                tile_sched_params,
+                launch_cfg,
+                seq_len_kv,
+                use_variable_seqlens_kv,
+                use_native_paged_kv,
+                use_static_native_seqlens_kv,
+                null_sparse_route_ptr,
+                null_sparse_route_ptr,
+                null_sparse_route_ptr,
+                static_full_split_prefix,
+                g_sage_scales=sage_scales_iter,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+            ).launch(
+                grid=grid,
+                block=[cfg.threads_per_cta, 1, 1],
+                cluster=cluster_shape,
+                stream=stream,
+                min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, effective_seq_len_kv),
+                # PDL-capable attention initializes all local task resources before
+                # acquiring its immediately preceding producer. Split attention also
+                # defers runtime prefix pruning until after that acquire.
+                use_pdl=cfg.use_pdl,
+            )
 
 
 @cute.jit
@@ -3769,7 +3850,7 @@ def fmha_block_sparse_launch(
     row_route_offsets_iter: cute.Pointer,
     row_route_counts_iter: cute.Pointer,
     route_metadata_iter: cute.Pointer,
-    scale_s: Float32,
+    softmax_scale: Float32,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     seq_len_kv: cutlass.Constexpr[int],
@@ -4023,7 +4104,7 @@ def fmha_block_sparse_launch(
         o_iter,
         s_k,
         h_k,
-        Float32(scale_s * log2_e),
+        Float32(softmax_scale * log2_e),
         Float32(1.0),
         seqlens_kv_iter,
         null_i32_ptr,
@@ -4054,6 +4135,7 @@ def fmha_block_sparse_launch(
         tma_desc_k_summary_atom=k_desc_summary_atom,
         tma_desc_v_summary_atom=v_desc_summary_atom,
         g_sage_scales=sage_scales_iter,
+        lse_ptr=None,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],

@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32",
-  "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size. The plan also owns the K/V length vector, so run() must omit seq_lens. Every run supplies a fixed row-strided page table; packed-Q runs also supply Q offsets.",
+  "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size. The plan also owns the K/V length vector, so run() must omit seq_lens_kv. Every run supplies a fixed row-strided page table; packed-Q runs also supply Q offsets.",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.BatchDecodePagedTSWrapper.run",
@@ -88,16 +88,27 @@
     "len_qo_indptr": {
       "type": "var",
       "description": "Length of cumulative Q offsets."
+    },
+    "kv_storage_head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Stored K/V width; D/2 for packed NVFP4."
+    },
+    "kv_scale_groups": {
+      "type": "var",
+      "description": "NVFP4 scale groups; one per 16 logical values."
     }
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
     "page_size in (4, 8, 16, 32, 64, 128)",
+    "kv_storage_head_dim in (head_dim, head_dim // 2)",
+    "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 128",
-    "max_pages_per_seq * page_size >= max(seq_lens)",
-    "min(seq_lens) >= 1",
-    "max(seq_lens) <= max_kv_len",
+    "max_pages_per_seq * page_size >= max(seq_lens_kv)",
+    "min(seq_lens_kv) >= 1",
+    "max(seq_lens_kv) <= max_kv_len",
     "seq_len_q >= 2"
   ],
   "inputs": {
@@ -115,7 +126,7 @@
         "num_pages",
         "num_kv_heads",
         "page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -124,7 +135,7 @@
         "num_pages",
         "num_kv_heads",
         "page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -136,13 +147,13 @@
       "dtype": "int32",
       "description": "Required fixed row-strided physical page table supplied to run()."
     },
-    "seq_lens": {
+    "seq_lens_kv": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Plan-owned per-request K/V lengths; this is optional trace context and run() must receive seq_lens=None."
+      "description": "Plan-owned per-request K/V lengths; this is optional trace context and run() must receive seq_lens_kv=None."
     },
     "qo_indptr": {
       "shape": [
@@ -152,12 +163,32 @@
       "optional": true,
       "description": "Cumulative Q offsets required by a packed-Q run."
     },
-    "bmm1_scale": {
+    "k_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "v_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "softmax_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
     },
-    "bmm2_scale": {
+    "output_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true

@@ -1747,6 +1747,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             offset = self.consumer_work_stage * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
+        elif cutlass.const_expr(cfg.runtime_page_window):
+            offset = self.consumer_work_stage * Int32(32) + local_tile_idx * Int32(
+                pages_per_tile
+            )
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
@@ -1787,6 +1791,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             offset = self.consumer_work_stage * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
+        elif cutlass.const_expr(cfg.runtime_page_window):
+            offset = self.consumer_work_stage * Int32(32) + local_tile_idx * Int32(
+                pages_per_tile
+            )
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
@@ -2196,6 +2204,9 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                     Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV]),
                     self.seq_len_q,
                     _q_group_token_base(cfg, runtime_q_group),
+                    requested_splits=_decode_gen_task_cache(stage_info)[10]
+                    if cfg.runtime_split_kv
+                    else None,
                 )
                 local_page_end = (
                     Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tiles
@@ -2425,6 +2436,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             grouped_base_page_idx = ((tile_idx * pages_per_tile) >> Int32(5)) << Int32(
                 5
             )
+            if cutlass.const_expr(cfg.runtime_page_window):
+                grouped_base_page_idx = (
+                    Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) * pages_per_tile
+                )
             if page_warp_rank == Int32(0):
                 grouped_logical_page_idx = cute.math.min(
                     grouped_base_page_idx + lane_idx, page_idx_ub

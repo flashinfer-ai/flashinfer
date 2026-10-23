@@ -152,7 +152,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
-from cutlass import Int32
+from cutlass import Float32, Int32
 from ..tensor_map import create_tensor_map_ragged_from_tensor
 
 from cutlass.experimental.task_scheduling.memory import (
@@ -706,8 +706,10 @@ def build_context_task_manager(
     variable_window_token_ends: cute.Tensor | None = None,
     variable_window_cta_starts: cute.Tensor | None = None,
     variable_window_q_stride: int | Int32 = 0,
-    scale_softmax_log2: cute.Tensor | None = None,
-    output_scale: cute.Tensor | None = None,
+    scale_softmax_log2: Float32 | None = None,
+    output_scale: Float32 | cute.Tensor | None = None,
+    lse_output: cute.Tensor | None = None,
+    attention_sinks: cute.Tensor | None = None,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
@@ -741,9 +743,8 @@ def build_context_task_manager(
     ``num_kv_heads``; the softmax groups and the correction warps read it in
     place.
 
-    ``scale_softmax_log2`` and ``output_scale`` are optional one-element
-    float32 device tensors. Resource setup loads element 0 once before the K/V
-    loop and reuses the value through task-local dataflow. ``scale_softmax_log2``
+    ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalars.
+    Resources carry these operands through task-local dataflow. ``scale_softmax_log2``
     is the base-2 softmax multiplier, normally
     ``softmax_scale * log2(e)``; FP8 callers can fold Q/K dequant scales into
     it. ``output_scale`` multiplies the final O store; FP8 output can fold the
@@ -1296,6 +1297,11 @@ def build_context_task_manager(
         tmem_vec_offset=cfg.tmem_vec0_offset,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        lse_output=lse_output,
+        attention_sinks=attention_sinks,
+        cum_seqlen_q=cum_seqlen_q,
+        query_seq_len=variable_window_q_stride,
+        peer_idx=0,
         name="tmem_vec0",
     )
     smem_o_0 = SmemOResource(
@@ -1389,6 +1395,11 @@ def build_context_task_manager(
             tmem_vec_offset=cfg.tmem_vec1_offset,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            lse_output=lse_output,
+            attention_sinks=attention_sinks,
+            cum_seqlen_q=cum_seqlen_q,
+            query_seq_len=variable_window_q_stride,
+            peer_idx=1,
             name="tmem_vec1",
         )
         smem_o_1 = SmemOResource(
@@ -2778,8 +2789,10 @@ def build_fmha_task_manager(
     variable_window_token_ends: cute.Tensor | None = None,
     variable_window_cta_starts: cute.Tensor | None = None,
     variable_window_q_stride: int | Int32 = 0,
-    scale_softmax_log2: cute.Tensor | None = None,
-    output_scale: cute.Tensor | None = None,
+    scale_softmax_log2: Float32 | None = None,
+    output_scale: Float32 | cute.Tensor | None = None,
+    lse_output: cute.Tensor | None = None,
+    attention_sinks: cute.Tensor | None = None,
     q_offset: int | Int32 = 0,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
@@ -2807,8 +2820,8 @@ def build_fmha_task_manager(
     """Build the FMHA TaskManager using the shared context TS graph.
 
     Runtime scale arguments follow the same contract as
-    :func:`build_context_task_manager`: one-element float32 device tensors,
-    indexed at element 0 and cached by resource auxiliary work.
+    :func:`build_context_task_manager`: runtime float32 scalar operands
+    carried through task-local auxiliary dataflow.
     """
     if (
         cfg.causal_single_kv_tile
@@ -2885,6 +2898,8 @@ def build_fmha_task_manager(
         output_scale=output_scale,
         sage_scales=sage_scales,
         num_kv_heads=num_kv_heads,
+        lse_output=lse_output,
+        attention_sinks=attention_sinks,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -3297,8 +3312,8 @@ class FmhaTs:
         k_cute: cute.Tensor,
         v_cute: cute.Tensor,
         o_cute: cute.Tensor,
-        scale_softmax_log2: cute.Tensor,
-        output_scale: cute.Tensor,
+        scale_softmax_log2: Float32,
+        output_scale: Float32 | cute.Tensor,
         max_active_clusters: int,
         stream: cuda_drv.CUstream,
         cum_seqlen_q: cute.Tensor | None = None,
@@ -3315,6 +3330,8 @@ class FmhaTs:
         vc_k_scale: cute.Tensor | None = None,
         vc_repair_tiles: int = 0,
         sage_scales: cute.Tensor | None = None,
+        lse_output: cute.Tensor | None = None,
+        attention_sinks: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3324,12 +3341,12 @@ class FmhaTs:
         an outlier plan. VC-Attention-QK8 also takes the Q and K dequant scales
         as ``[H, B, blocks]`` tables with one scale per 128-token block.
 
-        ``scale_softmax_log2`` and ``output_scale`` must be one-element float32
-        device tensors. Example host values are
-        ``[math.log2(math.e) / math.sqrt(d)]`` for the softmax scale and
-        ``[1.0]`` for FP16 output. FP8 callers may fold Q/K/V and output
-        quantization scales into these runtime tensors. ``sage_scales`` is a
-        Sage plan's prepared FP32 scale buffer (``cfg.sage_scale_layout``).
+        ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalar
+        operands, normally ``log2(e) / sqrt(d)`` and ``1.0``. FP8 callers fold
+        scalar Q/K/V dequantization and output quantization scales into them.
+
+        VC-Attention additionally binds tile means and a static repair-tile count.
+        Its output_scale is a per-channel V scale table.
         """
         if cutlass.const_expr(self.cfg.use_sage_attention != (sage_scales is not None)):
             raise ValueError("sage_scales is required by, and only by, a Sage kernel")
@@ -3690,6 +3707,8 @@ class FmhaTs:
             vc_repair_tiles,
             self.is_persistent,
             self.is_clc_dynamic,
+            lse_output,
+            attention_sinks,
         ).launch(
             grid=grid,
             block=[block_size, 1, 1],
@@ -3716,8 +3735,8 @@ class FmhaTs:
             | utils.ClcDynamicPersistentTileSchedulerParams
             | None
         ),
-        scale_softmax_log2: cute.Tensor,
-        output_scale: cute.Tensor,
+        scale_softmax_log2: Float32,
+        output_scale: Float32 | cute.Tensor,
         num_kv_tiles: Int32,
         num_seq_tiles: Int32,
         q_offset: Int32,
@@ -3736,15 +3755,14 @@ class FmhaTs:
         vc_repair_tiles: cutlass.Constexpr[int] = 0,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
+        lse_output: cute.Tensor | None = None,
+        attention_sinks: cute.Tensor | None = None,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
-        ``scale_softmax_log2`` and ``output_scale`` are one-element float32
-        device tensors passed through to the TS resources. The resources load
-        element 0 in auxiliary setup before the K/V loop, so the hot loop uses
-        the cached task-local values rather than reloading global memory.
-        ``sage_scales`` is a Sage plan's prepared scale buffer, whose
-        sequences are strided by ``num_kv_heads``.
+        ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalar
+        operands passed through task-local resource dataflow.
+        ``sage_scales`` is the prepared per-block/channel scale buffer.
 
         Structure:
         1. Prefetch TMA descriptors
@@ -3804,6 +3822,8 @@ class FmhaTs:
             output_scale=output_scale,
             sage_scales=sage_scales,
             num_kv_heads=num_kv_heads,
+            lse_output=lse_output,
+            attention_sinks=attention_sinks,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
             vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,

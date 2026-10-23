@@ -849,8 +849,8 @@ class FmhaDecodeConfig:
 
     @property
     def uses_scattered_page_route(self) -> bool:
-        """Whether native paged loads consume one locator per page fragment."""
-        return self.has_storage_subpages or self.use_q_token_kv_block_sparse_route
+        """Whether a prepared sparse route supplies page-fragment locators."""
+        return self.use_q_token_kv_block_sparse_route
 
     @property
     def uses_page_offsets_task(self) -> bool:
@@ -920,7 +920,8 @@ class FmhaDecodeConfig:
         """Whether encoded paging keeps the complete CTA route in SMEM."""
 
         return (
-            self.use_paged_kv
+            not self.runtime_split_kv
+            and self.use_paged_kv
             and self.uses_scattered_page_route
             and self.tile_size_kv == 128
             and not self.use_sliding_window_causal
@@ -1009,6 +1010,17 @@ class FmhaDecodeConfig:
             return None
         if self.use_transform_kv:
             return 88
+        # Runtime partition metadata extends the full score tile's live ranges.
+        # Grant one eight-register quantum per Softmax thread from Correction;
+        # the two-instance Q128 graph returns 16 registers per correction lane.
+        if self.runtime_split_kv and self.use_keeps_mma_ab and self.tile_size_q == 128:
+            softmax_warps = self.softmax0_num_warps + (
+                self.softmax1_num_warps if self.num_insts_kv != 1 else 0
+            )
+            quanta = (
+                softmax_warps + self.correction_num_warps - 1
+            ) // self.correction_num_warps
+            return 88 - quanta * 8
         return KV_TILE_256_CORRECTION_TASK_REGISTERS if self.tile_size_kv == 256 else 88
 
     @property
@@ -1095,6 +1107,16 @@ class FmhaDecodeConfig:
             groups_tokens_heads_q=self.groups_tokens_heads_q,
         )
         return max(q_geometry.num_q_ctas(self.max_seq_len_q), 1)
+
+    @property
+    def uses_compact_split_grid(self) -> bool:
+        """Launch actual split work in X and fuse Q/batch in Z."""
+        return (
+            self.runtime_split_kv
+            and self.use_split_kv
+            and not self.use_cluster_smem_reduction
+            and not self.use_persistent_scheduler
+        )
 
     @property
     def has_single_q_cta(self) -> bool:
@@ -1475,6 +1497,9 @@ class FmhaDecodeConfig:
     # Split-KV fanout: number of CTAs that cooperate on one (batch, head_kv)
     # when use_split_kv is enabled. The launcher picks this based on SM count.
     splits_kv: int = 1
+    runtime_split_kv: bool = False
+    # Internal launch profile for a bounded CTA-relative page-ID span.
+    runtime_page_window: bool = False
     # Upper bound of splits_kv across all (batch, head_kv) groups,
     # used to size the per-launch partial-O / partial-stats / counter
     # scratch GMEM buffers.
@@ -1524,6 +1549,7 @@ class FmhaDecodeConfig:
     # denominator (extra logit that absorbs probability mass). Requires the
     # `attention_sinks` tensor argument at launch.
     use_attention_sinks: bool = False
+    lse_mode: str = "none"
     # Optional profile and reduction knobs selected by launcher policy or tests.
     use_keeps_mma_ab: bool = False
     # Sage attention: a nonzero ``sage_k_block_size`` enables per-block Q/K
@@ -1599,6 +1625,7 @@ class FmhaDecodeConfig:
         if (
             not self.use_separate_reduction_kernel
             or self.use_compact_parallel_reduction
+            or self.runtime_split_kv
         ):
             return 1
         return {
@@ -3197,7 +3224,7 @@ class FmhaDecodeConfig:
             return (
                 (self.max_seq_len_q > 1 or self.grouped_q_fits_tile)
                 and not self.use_variable_seqlens_q
-                and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
+                and self.mask_type in (DENSE, CAUSAL)
                 and (direct or self.has_valid_split_kv_fanout)
             )
 
@@ -3975,12 +4002,15 @@ def enumerate_auto_splits_kv(
     num_q_tiles: int,
     service_capacity: int,
     split_kv: bool = True,
+    requested_splits_kv: int = -1,
+    max_splits_kv: int | None = None,
 ) -> tuple[int, ...]:
     """Enumerate direct and useful split fanouts for an under-filled Q grid.
 
     All one-wave fanouts and the first capacity-crossing fanout participate in
     the empirical score. The latter is important when a partially filled wave
     cannot be completed by any uniform integer fanout.
+    A positive requested fanout is pinned, subject to the same KV-work cap.
     """
     if not split_kv:
         return (1,)
@@ -3992,7 +4022,10 @@ def enumerate_auto_splits_kv(
         seq_len_kv=seq_len_kv,
         tile_size_kv=tile_size_kv,
         num_insts_kv=num_insts_kv,
+        max_splits_kv=max_splits_kv,
     )
+    if requested_splits_kv > 0:
+        return (max(1, min(requested_splits_kv, max_by_work)),)
     base_grid = max(1, batch_size * num_heads_kv * num_q_tiles)
     if base_grid >= service_capacity or max_by_work <= 1:
         return (1,)
@@ -4274,8 +4307,6 @@ _MMA_SELECTION_FIELDS = {
 
 _LAUNCH_SELECTION_FIELDS = {
     "use_split_kv",
-    "splits_kv",
-    "max_splits_kv",
     "use_separate_reduction_kernel",
     "use_cluster_smem_reduction",
     "use_persistent_scheduler",
@@ -4433,6 +4464,8 @@ def _resolve_grouped_q_launch_candidates(
     num_heads_q: int,
     num_heads_kv: int,
     service_capacity: int,
+    splits_kv: int,
+    max_splits_kv: int | None,
     split_kv: bool = True,
 ) -> tuple[GroupedQLaunchCandidate, ...]:
     """Resolve one TileQ with Q-grid-aware direct and split recipes.
@@ -4460,6 +4493,19 @@ def _resolve_grouped_q_launch_candidates(
         # its Q geometry and modeled cost are identical to the qualified FP16
         # logical candidate. The KV selector materializes and validates the
         # actual BF16 profile only after the Q winner is known.
+        if cfg.tile_size_kv != 256 and not _try_apply_auto_kv256_profile(
+            probe,
+            q_candidate=candidate,
+            explicit_fields=explicit_fields,
+            auto_tuner=True,
+            split_kv_mode="disabled",
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+        ):
+            return ()
+        probe.tile_size_kv = 128
         probe.q_dtype = Float16
         probe.k_dtype = Float16
         probe.v_dtype = Float16
@@ -4469,6 +4515,13 @@ def _resolve_grouped_q_launch_candidates(
             probe,
             explicit_fields | {"tile_size_q"},
         )
+        # Explicit MMA fields constrain candidates instead of disabling the
+        # search over the remaining geometry and launch choices.
+        if any(
+            getattr(probe, field) != getattr(cfg, field)
+            for field in _MMA_SELECTION_FIELDS & explicit_fields
+        ):
+            return ()
         if probe.use_keeps_mma_ab and not probe.supports_auto_grouped_keeps:
             return ()
         cost_num_insts_kv = probe.num_insts_kv
@@ -4483,15 +4536,21 @@ def _resolve_grouped_q_launch_candidates(
         return ()
     cost_kv_width = _grouped_q_cost_kv_width(probe)
 
-    split_candidates = enumerate_auto_splits_kv(
-        seq_len_kv=seq_len_kv,
-        batch_size=batch_size,
-        num_heads_kv=num_heads_kv,
-        tile_size_kv=cost_tile_size_kv,
-        num_insts_kv=cost_num_insts_kv,
-        num_q_tiles=candidate.q_tiles,
-        service_capacity=service_capacity,
-        split_kv=split_kv,
+    split_candidates = (
+        (cfg.splits_kv if cfg.use_split_kv else 1,)
+        if _LAUNCH_SELECTION_FIELDS & explicit_fields
+        else enumerate_auto_splits_kv(
+            seq_len_kv=seq_len_kv,
+            batch_size=batch_size,
+            num_heads_kv=num_heads_kv,
+            tile_size_kv=cost_tile_size_kv,
+            num_insts_kv=cost_num_insts_kv,
+            num_q_tiles=candidate.q_tiles,
+            service_capacity=service_capacity,
+            split_kv=split_kv,
+            requested_splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+        )
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
@@ -4541,21 +4600,26 @@ def _apply_auto_grouped_q_mma_config(
     max_splits_kv: int | None,
     split_kv: bool = True,
 ) -> GroupedQLaunchCandidate | None:
-    """Select a legal fixed multi-Q MMA and KV-split recipe when unpinned.
+    """Select a legal multi-Q MMA and KV-split recipe within caller constraints.
 
-    SQ1, packed/variable Q, explicit launch modes, ungrouped layouts, and
-    caller-provided MMA fields retain the existing path. Explicit fanout
-    controls bypass this selector together with explicit launch and MMA fields.
+    SQ1, packed sliding windows, explicit launch modes, and ungrouped layouts
+    retain the existing path. Explicit MMA fields filter candidates; explicit launch
+    fields and fanout controls constrain their launch recipes.
     Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
+
+    Fanout arguments here are caller overrides, before automatic selection.
+    Each Q candidate gets its own automatic split search; final KV/reduction
+    choices are applied after the joint recipe has been selected.
     """
+    # TODO: Refine short-KV setup/epilogue costs. Wider dense Q tiles can
+    # regress even when their current mainloop/reduction proxy scores lower.
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
-        or not cfg._in_grouped_q_selection_scope
-        or bool(_MMA_SELECTION_FIELDS & explicit_fields)
-        or bool(_LAUNCH_SELECTION_FIELDS & explicit_fields)
-        or splits_kv != -1
-        or max_splits_kv is not None
+        or seq_len_q <= 1
+        or not cfg.groups_tokens_heads_q
+        or not cfg.use_paged_kv
+        or (cfg.use_variable_seqlens_q and cfg.use_sliding_window_causal)
     ):
         return None
 
@@ -4589,6 +4653,8 @@ def _apply_auto_grouped_q_mma_config(
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
             service_capacity=service_capacity,
+            splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
             split_kv=split_kv,
         )
     )
@@ -4607,11 +4673,17 @@ def _apply_auto_grouped_q_mma_config(
         # mainloop-aware score instead of rewarding narrow tiles that reread
         # the complete KV sequence for each additional Q tile.
         direct = tuple(recipe for recipe in supported if recipe.splits_kv == 1)
-        if not direct:
-            return None
-        selected = select_grouped_q_direct_wave_candidate(direct)
+        selected = (
+            select_grouped_q_direct_wave_candidate(direct)
+            if direct
+            else select_grouped_q_launch_candidate(supported)
+        )
     _apply_grouped_q_mma_candidate(cfg, selected.mma)
-    if selected.splits_kv == 1 and selected.base_ctas > service_capacity:
+    if (
+        selected.splits_kv == 1
+        and selected.base_ctas > service_capacity
+        and not (_LAUNCH_SELECTION_FIELDS & explicit_fields)
+    ):
         # CLC persistence pays for work discovery by reusing one resident CTA
         # wave. Select it only when the direct launch has more than one wave;
         # a single-wave grid has no launch work for persistence to eliminate.
@@ -4814,8 +4886,8 @@ def _apply_auto_launch_mode(
     if mode not in ("gmem_reduction", "persistent"):
         return split_kv_mode
 
-    # An explicitly selected MMA profile can bypass the joint selector while
-    # still leaving launch mode automatic. Probe the complete derived launch
+    # Profiles outside the joint selector can still leave launch mode
+    # automatic. Probe the complete derived launch
     # before committing it, so an unsupported Keeps split/persistent recipe
     # falls back to the caller's valid direct profile.
     probe = deepcopy(cfg)
@@ -5056,7 +5128,7 @@ def _validate_profile_support(
             groups_tokens_heads_q=True,
         )
     # Fixed FP8 Q8 producers and reducers support both 16-bit output types.
-    # D64/D256 retain their grouped paged geometry; head ratios and
+    # D64/D256 retain their grouped paged-KV geometry; head ratios and
     # variable-Q layouts remain constrained by the same resource profile.
     qualified_fp8_q8_separate_reduction_supported = (
         not use_keeps_mma_ab
@@ -5071,7 +5143,6 @@ def _validate_profile_support(
             or (
                 use_groups_tokens_heads_q
                 and cfg.use_paged_kv
-                and cfg.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
                 and (
                     headdim == 64
                     or (headdim == 256 and cfg.out_dtype in (Float16, BFloat16))
@@ -5182,11 +5253,15 @@ def _validate_profile_support(
                 "packed ungrouped SwapsMmaAb does not support cluster SMEM reduction; "
                 "use grouped Q or a GMEM reduction mode"
             )
-    if cfg.use_transform_kv and cfg.use_paged_kv and cfg.num_tokens_per_page == 16:
-        raise ValueError(
-            "mixed Q/KV dtypes do not support paged-KV page size 16; "
-            "use 32, 64, or 128 tokens per page"
-        )
+    # Page16 currently misaligns D64 NVFP4 staging; other transformed profiles
+    # use the ordinary page-size and staging checks.
+    if (
+        cfg.use_nvfp4_kv
+        and cfg.headdim == 64
+        and cfg.use_paged_kv
+        and cfg.num_tokens_per_page == 16
+    ):
+        raise ValueError("NVFP4 KV with head_dim=64 does not support page_size=16")
     if cfg.use_transform_kv and not cfg.store_transformed_kv_in_tmem:
         # The SMEM transform assigns eight elements per thread per iteration.
         total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
@@ -5309,7 +5384,6 @@ def _validate_profile_support(
             and cfg.max_seq_len_q == 1
             and not cfg.use_variable_seqlens_q
             and cfg.use_paged_kv
-            and cfg.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
             and cfg.q_dtype == Float8E4M3FN
             and cfg.k_dtype == Float8E4M3FN
             and cfg.v_dtype == Float8E4M3FN
@@ -5512,10 +5586,10 @@ def make_decode_config(
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. For an unpinned fixed multi-Q paged launch with a
-       dense or causal mask, the Q selector first enumerates Swaps8/16/32 and
-       Keeps64/128 tiles and every useful direct/split recipe through the
-       first capacity-crossing fanout.
+       KV stage count. For a multi-Q paged launch, the Q selector first
+       enumerates Swaps8/16/32 and Keeps64/128
+       tiles and every useful direct/split recipe through the first
+       capacity-crossing fanout.
        Production-valid recipes minimize the empirical TileQ
        mainloop-plus-reduction proxy using their actual Q-grid CTA waves.
        Only a selected Q64 Keeps recipe may then promote a qualified FP16/BF16
@@ -5542,8 +5616,8 @@ def make_decode_config(
        downward for a one-wave cluster split.
     6. Validate the final profile combination before returning the config.
 
-    Attention-sink paths skip automatic launch-mode selection. Explicit launch
-    modes are still validated.
+    Outside joint grouped-Q selection, attention-sink paths retain their
+    existing launch mode. Explicit launch modes are still validated.
 
     ``split_kv`` is a common planning control for every FMHA kernel family.
     True permits supported automatic split recipes; False restricts selection
@@ -5656,8 +5730,8 @@ def make_decode_config(
             "fixed-Q max_seq_len_q must equal seq_len_q; use "
             "use_variable_seqlens_q for a runtime-varying Q length"
         )
-    # Resolve Q first. The KV selector consumes the multi-Q cost-model result
-    # instead of forcing a Q64 profile ahead of the established Q policy.
+    # Score Q geometry with candidate KV fanouts on the common KV128 basis.
+    # Finalize the KV tile and reduction mode after selecting that joint recipe.
     auto_selection_explicit_fields = set(explicit_fields)
     selected_grouped_q_recipe = _apply_auto_grouped_q_mma_config(
         cfg,
@@ -5730,7 +5804,9 @@ def make_decode_config(
     # Auto launch-mode selection. Only kicks in if the caller has not already
     # opted into a specific mode. The caller's split permission is independent
     # of Q storage; unsupported automatic recipes retain their direct fallback.
-    if selected_grouped_q_recipe is not None:
+    if selected_grouped_q_recipe is not None and not (
+        _LAUNCH_SELECTION_FIELDS & explicit_fields
+    ):
         if selected_grouped_q_recipe.splits_kv > 1:
             split_kv_mode = selected_grouped_q_recipe.split_kv_mode
             splits_kv = selected_grouped_q_recipe.splits_kv
