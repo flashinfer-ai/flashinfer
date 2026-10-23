@@ -99,21 +99,36 @@ def _mixed_lens(batch, ncols, top_k, next_n, seed):
 
 
 def _run_pair(lg, lens, top_k, pt, page_size, next_n=1, cr=1):
-    loc, _ = flashinfer.top_k_varlen(
-        lg, lens, top_k, next_n=next_n, compress_ratio=cr, backend="gvr_2"
-    )
-    pg, _ = flashinfer.top_k_varlen(
-        lg,
-        lens,
-        top_k,
-        next_n=next_n,
-        compress_ratio=cr,
-        backend="gvr_2",
-        page_table=pt,
-        page_size=page_size,
+    """Window-local and paged output of the same launch shape, each written into
+    a buffer poisoned with -7 first: no slot of either may stay unwritten (the
+    API's own torch.empty buffer could already hold a valid answer)."""
+    kw = dict(next_n=next_n, compress_ratio=cr, backend="gvr_2")
+    loc = torch.full((lg.shape[0], top_k), -7, dtype=torch.int32, device=_DEV)
+    pg = torch.full_like(loc, -7)
+    flashinfer.top_k_varlen(lg, lens, top_k, out_indices=loc, **kw)
+    flashinfer.top_k_varlen(
+        lg, lens, top_k, out_indices=pg, page_table=pt, page_size=page_size, **kw
     )
     torch.cuda.synchronize()
+    assert int((loc == -7).sum()) == 0, "unwritten slots in the local output"
+    assert int((pg == -7).sum()) == 0, "unwritten slots in the paged output"
     return loc, pg
+
+
+def _launcher_key(rows, ncols, top_k, page_shift):
+    """Cache key of a hint-free decode launch at the full-width envelope."""
+    return (
+        rows,
+        ncols,
+        top_k,
+        ncols,
+        1,
+        1,
+        True,
+        page_shift,
+        _host._arch_token(),
+        _host._sm_count(),
+    )
 
 
 # rows x columns shapes spanning the four engine families of the varlen router
@@ -196,12 +211,12 @@ def test_paged_main_register_rows(rows, ncols, top_k, page_size):
     lens[6], lens[7], lens[8] = top_k + 1, 2048, 2049
     lens = lens.to(torch.int32)
     pt = _page_table(rows, ncols, page_size, seed=41)
+    # drop the paged launcher first, so the family read below is the launch's
+    key = _launcher_key(rows, ncols, top_k, page_size.bit_length() - 1)
+    _host._VARLEN_CACHE.pop(key, None)
     loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
-    page_shift = page_size.bit_length() - 1
-    assert (
-        _host._varlen_launcher(rows, ncols, top_k, ncols, 1, 1, True, page_shift)[0]
-        == "main"
-    )
+    lc = _host._VARLEN_CACHE.get(key)
+    assert lc is not None and lc[0] == "main", f"{key}: {lc and lc[0]}"
     for r in range(rows):  # the local output itself is the exact top-k
         n = int(lens[r])
         if n > top_k:
