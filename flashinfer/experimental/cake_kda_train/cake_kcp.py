@@ -525,8 +525,11 @@ class KcpPreconditionError(RuntimeError):
     """The SPEC-3 probe found the backward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows different from the forward's
     on a real token row and ``CAKE_KCP_SPEC3=assert`` asked for an error (the design note §6.4).  The requirement of
     record is that the two backward modes (saved set, checkpoint replay) produce identical gradients: both run the
-    same prep, intra and WY programs on the same operands, which the GPU tests check bitwise.  The forward's prep
-    rows come from the intra program's fused prep and may differ from the prep program's."""
+    same prep, intra and WY programs on the same operands, which the GPU tests check bitwise.  The forward's and the
+    backward's ``gk`` buffers differ by construction on the current program set: the forward's intra program
+    (``write_prep = 1``) writes the chunk-final gate row alone (row 63 of every chunk: the chunk's total gate in log2
+    units; 0 on pad chunks) and the backward's prep program writes every token row's prefix, whose row 63 is the same
+    total; the K1 / K2 / K3 walks read row 63 only.  ``kg`` / ``qg`` / ``w`` / ``u`` agree bitwise."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -573,9 +576,12 @@ class KernelBackend(Backend):
     forward's intra program and WY program run on the ``fwd`` layout and their five rows (``gk`` / ``kg`` / ``qg`` /
     ``w`` / ``u``) are kept; after the backward's WY program the ``replay`` layout's rows are compared with them on
     every real token row (pad rows are reported separately).  The requirement of record is that the two backward
-    modes produce identical gradients (the GPU tests check saved mode against the replay bitwise); the forward's
-    prep rows come from the intra program's fused prep and may differ from the prep program's, so the probe records
-    by default.  ``CAKE_KCP_SPEC3=0`` skips it, ``=warn`` warns on a difference, ``=assert`` raises
+    modes produce identical gradients (the GPU tests check saved mode against the replay bitwise).  The probe's
+    ``equal`` is ``False`` by construction: the forward's intra program writes ``gk`` at row 63 of every chunk alone
+    (the chunk-final gate row, the only ``gk`` row the K1 / K2 / K3 walks read), the backward's prep program writes
+    every row's prefix with the same row 63, so ``rows["gk"]["real_rows_differ"]`` is the real rows minus the full
+    chunks while ``kg`` / ``qg`` / ``w`` / ``u`` report 0; hence the probe records by default.  ``CAKE_KCP_SPEC3=0``
+    skips it, ``=warn`` warns on a difference, ``=assert`` raises
     :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and :attr:`spec3`.
     """
 
