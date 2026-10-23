@@ -56,7 +56,6 @@ from .config import (
     MlaConfig,
     make_throughput_latency_mla_config,
     configure_sparse_mla,
-    validate_split_softmax_scale_config,
 )
 from .resources import (
     SmemKvResource,
@@ -522,22 +521,6 @@ def build_throughput_latency_mla_task_manager(
         use_clc_dynamic_scheduler,
         use_static_persistent_scheduler,
     )
-    validate_split_softmax_scale_config(cfg)
-    if cfg.sparse_split_softmax_scale and (
-        kv_producer is None
-        or output_quant is not None
-        or output_quant_args is not None
-        or cu_seqlens_q is not None
-        or acc_o_tensor is not None
-        or acc_lse_tensor is not None
-        or not use_page_offsets
-        or use_clc_dynamic_scheduler
-        or use_static_persistent_scheduler
-    ):
-        raise ValueError(
-            "split softmax scales require a joint custom KV producer, fixed Q, "
-            "direct page offsets and final unquantized output"
-        )
     if kv_producer is not None and (
         not cfg.single_kv_pipe or cfg.kernel_variant != "keeps_mma_ab"
     ):
@@ -1254,23 +1237,12 @@ def _make_single_kv_pipe_task_graph(
 
     Keep stores P in TMEM; single-stream swap stores P in SMEM. Both use
     one softmax group, two score stages, and one output accumulator.
-
-    The private scale slot normally holds BMM1 * LOG2_E. Only the validated
-    DS4.1 split-scale mode carries raw runtime BMM1 in that slot; resources then
-    retain raw maxima and apply BMM1 before the constant log2 conversion.
     """
 
     scale_softmax_log2, output_scale = _default_scales(
         scale_softmax_log2,
         output_scale,
     )
-    raw_softmax_scale = None
-    if cfg.sparse_split_softmax_scale:
-        raw_softmax_scale = scale_softmax_log2
-        # Materialize before task loops: a literal-backed Float32 retains a
-        # Python double, which FrontendNext's carry audit otherwise compares
-        # against the rounded FP32 reference initializer after lazy promotion.
-        scale_softmax_log2 = Float32(Float32(LOG2_E).ir_value())
     _check_persistent_scheduler_modes(
         use_clc_dynamic_scheduler,
         use_static_persistent_scheduler,
@@ -1471,7 +1443,6 @@ def _make_single_kv_pipe_task_graph(
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
-        raw_softmax_scale=raw_softmax_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1499,7 +1470,6 @@ def _make_single_kv_pipe_task_graph(
             pipeline_config=p_pipeline_cfg,
             inst_id=0,
             scale_softmax_log2=scale_softmax_log2,
-            raw_softmax_scale=raw_softmax_scale,
             tmem_alias_ref=tmem_s,
             name="ll_mla_q64_tmem_p",
         )
@@ -1537,7 +1507,6 @@ def _make_single_kv_pipe_task_graph(
         page_offsets=page_offsets,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
-        raw_softmax_scale=raw_softmax_scale,
         output_scale=output_scale,
         attention_sinks=sparse_epilogue_params,
         output_quant=output_quant,
@@ -1877,7 +1846,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         )
         self.fixed_seqlen = fixed_seqlen
         self.kv_producer = kv_producer
-        self.direct_split_softmax_scale = False
         self.output_quant = None
         # Sparse attention binds separate source lists; dense attention uses
         # the ordinary page table. Both reuse the staged KV loaders.
@@ -2038,15 +2006,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.qkv_dtype,
             self.page_size,
         )
-        if self.direct_split_softmax_scale and (
-            self.sparse_profile is None
-            or self.kv_producer is None
-            or self.output_quant is not None
-        ):
-            raise ValueError(
-                "split softmax scales require joint direct final output with "
-                "host scalars, a custom producer and no output quantizer"
-            )
         cfg = make_throughput_latency_mla_config(
             batch_size=self.batch_size,
             num_heads_q=self.num_heads,
@@ -2082,7 +2041,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 finalize_output=self.finalize_output,
                 direct_inputs=self.direct_sparse,
                 assume_valid_prefix=self.assume_valid_prefix,
-                split_softmax_scale=self.direct_split_softmax_scale,
                 source_capacities=self.direct_sparse_capacities,
             )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
@@ -2205,18 +2163,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self.runtime_config(max_q_len)
-        if cutlass.const_expr(cfg.sparse_split_softmax_scale):
-            if cutlass.const_expr(
-                cu_seqlens_q is not None
-                or output_quant_args is not None
-                or q_latent.element_type != cutlass.Float8E4M3FN
-                or o.element_type != cutlass.BFloat16
-                or lse.element_type != cutlass.Float32
-            ):
-                raise ValueError(
-                    "split softmax scales require fixed E4M3 Q, final BF16 O/FP32 LSE "
-                    "and no output-quantizer arguments"
-                )
 
         # Public fixed tensors use [H,D,SQ,B]/[H,SQ,B]; compact ragged tensors
         # use [H,D,totalQ]/[H,totalQ]. Both flatten H x Q for TMA because the
@@ -2507,12 +2453,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     extra_format=cfg.extra_kv_cache_format,
                 )
 
-        # Finite BMM1 may overflow BMM1 * LOG2_E even for tied scores. The
-        # validated joint mode carries raw BMM1 to the ordered resources.
-        if cutlass.const_expr(cfg.sparse_split_softmax_scale):
-            scale_softmax_log2 = softmax_scale
-        else:
-            scale_softmax_log2 = softmax_scale * LOG2_E
+        scale_softmax_log2 = softmax_scale * LOG2_E
         use_gmem_reduction = cutlass.const_expr(
             cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1
         )

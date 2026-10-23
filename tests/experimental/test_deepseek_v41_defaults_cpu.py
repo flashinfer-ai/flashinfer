@@ -1011,31 +1011,17 @@ def test_example_uses_common_descale_hnd_and_output_only_caller_buffers():
     assert checks == ["mixed_decode() is out"] * 2 + ["result is window_out"]
 
 
-@pytest.mark.parametrize("split_scale", [False, True])
 @pytest.mark.parametrize("use_defaults", [False, True])
-def test_split_softmax_scale_materializes_fp32_before_task_construction(
-    split_scale, use_defaults
-):
+def test_single_kv_pipe_task_scales(use_defaults):
     """Check setup plumbing with host mocks, not actual CuTe loop lowering."""
-    kernel_dir = _ROOT / "flashinfer/attention/prims_ts/kernels/mla_decode"
-    kernel = kernel_dir / "throughput_latency_1cta/kernel.py"
-    constants = ast.parse((kernel_dir / "helpers/constants.py").read_text())
-    log2_e = next(
-        ast.literal_eval(node.value)
-        for node in constants.body
-        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "LOG2_E"
+    kernel = (
+        _ROOT
+        / "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py"
     )
-    materialized = []
 
     class HostFloat32:
-        # Like CuTe, retain a Python literal until explicitly materialized.
         def __init__(self, value):
             self.value = value
-
-        def ir_value(self):
-            assert isinstance(self.value, float)
-            materialized.append(self.value)
-            return SimpleNamespace(value=float32(self.value))
 
     function = definition(kernel, "_make_single_kv_pipe_task_graph")
     setup_end = next(
@@ -1047,12 +1033,9 @@ def test_split_softmax_scale_materializes_fp32_before_task_construction(
     )
     supplied_scale, supplied_output = object(), object()
     namespace = {
-        "cfg": SimpleNamespace(sparse_split_softmax_scale=split_scale),
         "scale_softmax_log2": None if use_defaults else supplied_scale,
         "output_scale": None if use_defaults else supplied_output,
         "_default_scales": extract(kernel, "_default_scales", Float32=HostFloat32),
-        "Float32": HostFloat32,
-        "LOG2_E": log2_e,
     }
     exec(
         compile(
@@ -1063,26 +1046,12 @@ def test_split_softmax_scale_materializes_fp32_before_task_construction(
         namespace,
     )
     scale = namespace["scale_softmax_log2"]
-    raw_scale = namespace["raw_softmax_scale"]
     output = namespace["output_scale"]
-    if split_scale:
-        assert materialized == [log2_e]
-        assert isinstance(scale, HostFloat32)
-        assert isinstance(scale.value, SimpleNamespace)
-        assert scale.value.value == float32(log2_e) != log2_e
-        if use_defaults:
-            assert isinstance(raw_scale, HostFloat32) and raw_scale.value == 1.0
-        else:
-            assert raw_scale is supplied_scale
-    else:
-        assert not materialized and raw_scale is None
-        if use_defaults:
-            assert isinstance(scale, HostFloat32) and scale.value == 1.0
-        else:
-            assert scale is supplied_scale
     if use_defaults:
+        assert isinstance(scale, HostFloat32) and scale.value == 1.0
         assert isinstance(output, HostFloat32) and output.value == 1.0
     else:
+        assert scale is supplied_scale
         assert output is supplied_output
 
 
