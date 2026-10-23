@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 """CPU tests of the Cake single-GPU norm package (``flashinfer.cake_muse_spark_norm_backend``): the registry
-records and routes as the exporter wrote them, the selection and launch rules over the literals, the variant / route
-helpers of the host module, and ``build.json`` under FlashInfer's manifest checker."""
+records and routes of its two operators as the exporter wrote them, the selection and launch rules over the literals,
+the variant / route helpers of the host module, and ``build.json`` under FlashInfer's manifest checker."""
 
 import hashlib
 import importlib.util
@@ -20,31 +20,54 @@ from flashinfer.cake_muse_spark_norm_backend import cake_jit as loader
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = Path(pkg.__file__).parent
 OP = pkg.GATED_RESIDUAL_NEXT_RMSNORM
+OP_A = "gated_residual_rmsnorm"
 BLACKWELL = ("sm_100a", "sm_103a")
-PARAMETERS = (
-    "branch",
-    "residual",
-    "alpha",
-    "beta",
-    "next_weight",
-    "post_weight",
-    "residual_out",
-    "ffn_input",
-    "M",
-    "post_eps",
-    "next_eps",
-    "post_gain_center",
-    "next_gain_center",
-    "alpha_value",
-)
+# The kernel parameters of each operator's programs, in binding order (the grid triple follows).
+PARAMETERS = {
+    OP: (
+        "branch",
+        "residual",
+        "alpha",
+        "beta",
+        "next_weight",
+        "post_weight",
+        "residual_out",
+        "ffn_input",
+        "M",
+        "post_eps",
+        "next_eps",
+        "post_gain_center",
+        "next_gain_center",
+        "alpha_value",
+    ),
+    OP_A: (
+        "branch",
+        "residual",
+        "weight",
+        "alpha",
+        "beta",
+        "out",
+        "M",
+        "eps",
+        "gain_center",
+    ),
+}
+# The variants with exported programs: three of op B's four forms (the fourth runs through the post_weight
+# programs), both modes of op A in the plain and the PDL build.
+SHIPPED_VARIANTS = {
+    OP: ("alpha_tensor_pw", "alpha_scalar_nopw", "alpha_scalar_pw"),
+    OP_A: ("mode0", "mode0_pdl", "mode1", "mode1_pdl"),
+}
 FAMILY_FLAGS = ("--prec-div=true", "--prec-sqrt=true", "--ftz=false")
 NAME = re.compile(r"cake_muse_spark_norm_[0-9a-f]{20}")
 
 
-def _variant(build: dict) -> str:
-    return pkg.gated_residual_next_rmsnorm_variant(
-        build["tensor_alpha"], build["post_weight"]
-    )
+def _variant(op: str, build: dict) -> str:
+    if op == OP:
+        return pkg.gated_residual_next_rmsnorm_variant(
+            build["tensor_alpha"], build["post_weight"]
+        )
+    return f"mode{build['mode']}" + ("_pdl" if build["pdl"] else "")
 
 
 def test_variant_and_route_helpers():
@@ -71,6 +94,12 @@ def test_variant_and_route_helpers():
     assert loader.arch_for_capability((10,)) is None
     assert tuple(loader.ARCHES) == ("sm_100a", "sm_103a", "sm_107a")
     assert set(loader.ARCH_BY_CAPABILITY.values()) == set(loader.ARCHES)
+    assert tuple(loader.OPS) == (OP, OP_A)
+    assert loader.route_key(OP_A, "mode1_pdl") == f"{OP_A}_mode1_pdl"
+    with pytest.raises(ValueError, match="unknown variant"):
+        loader.route_key(OP_A, "mode2")
+    for op in loader.OPS:
+        assert set(SHIPPED_VARIANTS[op]) <= set(loader.VARIANTS[op])
 
 
 def test_support_follows_the_device_architecture(monkeypatch):
@@ -107,13 +136,15 @@ def test_registry_records_reference_the_build_manifest():
     libraries = cake_build.libraries_by_name()
     assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
     referenced = set()
+    logical_values = set()
     for name, record in loader.MODULES.items():
         assert NAME.fullmatch(name), name
         assert record["library"] == name
         assert record["kernel_symbol"] == f"kernel_{name}"
         assert record["ffi_entry"] == "run"
         assert record["occupancy_entry"] == "max_active_clusters"
-        assert record["op"] == OP
+        op = record["op"]
+        assert op in loader.OPS, name
         assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
             record
         ), name
@@ -121,16 +152,18 @@ def test_registry_records_reference_the_build_manifest():
         assert arches and set(arches) <= set(BLACKWELL), name
         build = record["build"]
         assert build["H"] == pkg.HIDDEN_SIZE
-        variant = _variant(build)
-        assert variant in ("alpha_tensor_pw", "alpha_scalar_nopw", "alpha_scalar_pw"), (
-            name
-        )
-        assert record["route"] == loader.route_key(OP, variant)
+        variant = _variant(op, build)
+        assert variant in SHIPPED_VARIANTS[op], name
+        assert record["route"] == loader.route_key(op, variant)
         launch = record["launch"]
         assert tuple(launch["block"]) == (build["threads"], 1, 1)
         assert tuple(launch["cluster"]) == (build["cluster"], 1, 1)
         assert launch["cooperative"] is False
-        assert launch["use_pdl"] is build["pdl"] is False
+        assert launch["use_pdl"] is build["pdl"]
+        if op == OP:
+            assert build["pdl"] is False
+        else:
+            assert build["pdl"] is variant.endswith("_pdl")
         assert (
             isinstance(launch["dynamic_smem_bytes"], int)
             and launch["dynamic_smem_bytes"] >= 0
@@ -143,18 +176,16 @@ def test_registry_records_reference_the_build_manifest():
         assert select["kind"] == loader.SELECT_KIND
         assert set(select["windows"]) == set(arches)
         parameters = [key for kind, key in record["arg_plan"] if kind != "grid"]
-        assert tuple(parameters) == PARAMETERS
+        assert tuple(parameters) == PARAMETERS[op]
         assert [key for kind, key in record["arg_plan"] if kind == "grid"] == [
             "grid_x",
             "grid_y",
             "grid_z",
         ]
         assert record["logical"] == {
-            key: ("rows" if key == "M" else key) for key in PARAMETERS
+            key: ("rows" if key == "M" else key) for key in PARAMETERS[op]
         }
-        assert set(record["logical"].values()) == set(loader.LOGICAL_TENSORS) | set(
-            loader.LOGICAL_SCALARS
-        )
+        logical_values |= set(record["logical"].values())
         for arch in arches:
             library = loader.library_name(name, arch)
             referenced.add(library)
@@ -179,14 +210,17 @@ def test_registry_records_reference_the_build_manifest():
             assert entry["entry"] == "run" and entry["arch"] == arch
             assert entry["min_cuda"]
     assert referenced == set(libraries)
+    assert logical_values == set(loader.LOGICAL_TENSORS) | set(loader.LOGICAL_SCALARS)
+    assert {record["op"] for record in loader.MODULES.values()} == set(loader.OPS)
 
 
 def test_routes_partition_the_row_counts():
     for arch, routes in loader.ROUTES.items():
         assert arch in BLACKWELL
         assert set(routes) == {
-            loader.route_key(OP, v)
-            for v in ("alpha_tensor_pw", "alpha_scalar_nopw", "alpha_scalar_pw")
+            loader.route_key(op, variant)
+            for op in loader.OPS
+            for variant in SHIPPED_VARIANTS[op]
         }
         for route, names in routes.items():
             assert len(names) == len(set(names))
@@ -238,6 +272,47 @@ def test_routes_partition_the_row_counts():
         loader.admits({"kind": "always"}, 1, "sm_100a")
 
 
+def test_gated_residual_rmsnorm_routes_window_the_row_count():
+    """Op A's eight routes (two architectures x four variants) hold four programs each over the windows 1-16 /
+    17-64 / 65-128 / 129-: the 65-128 window is the whole-row (one CTA per row, 512 threads) program and the
+    programs of a variant differ only by their window."""
+    for arch in BLACKWELL:
+        for variant in SHIPPED_VARIANTS[OP_A]:
+            route = loader.route_key(OP_A, variant)
+            names = loader.route_modules(arch, route)
+            assert len(names) == 4, (arch, route)
+            edges = [
+                loader.MODULES[name]["select_rule"]["windows"][arch] for name in names
+            ]
+            assert [tuple(window) for (window,) in edges] == [
+                (0, 16),
+                (16, 64),
+                (64, 128),
+                (128, None),
+            ], (arch, route)
+            for rows, position in (
+                (1, 0),
+                (16, 0),
+                (17, 1),
+                (64, 1),
+                (65, 2),
+                (96, 2),
+                (128, 2),
+                (129, 3),
+                (4096, 3),
+            ):
+                assert loader.selected_module(arch, route, rows) == names[position]
+            window = loader.MODULES[names[2]]
+            assert window["grid_rule"] == {"cluster": 1, "kind": "rows", "row_ctas": 1}
+            assert window["build"]["threads"] == 512 and window["build"]["split"] == 1
+            assert tuple(window["launch"]["block"]) == (512, 1, 1)
+            for name in names:
+                build = loader.MODULES[name]["build"]
+                assert build["mode"] == int(variant[4]) and build[
+                    "pdl"
+                ] is variant.endswith("_pdl")
+
+
 def test_launch_grid_and_args_follow_the_record(monkeypatch):
     record = next(
         r
@@ -273,7 +348,9 @@ def test_launch_grid_and_args_follow_the_record(monkeypatch):
         for logical in (*loader.LOGICAL_TENSORS, *loader.LOGICAL_SCALARS)
     }
     args = loader.launch_args(record, values, (7, 1, 1))
-    assert args[:-3] == tuple(values[record["logical"][key]] for key in PARAMETERS)
+    assert args[:-3] == tuple(
+        values[record["logical"][key]] for key in PARAMETERS[record["op"]]
+    )
     assert args[-3:] == (7, 1, 1)
     with pytest.raises(ValueError, match="needs logical argument 'rows'"):
         loader.launch_args(
