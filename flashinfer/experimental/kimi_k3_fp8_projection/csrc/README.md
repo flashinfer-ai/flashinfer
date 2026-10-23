@@ -25,8 +25,9 @@ the sibling's translation unit with its own `-D` flags (`cake_jit.py`: the
   `CAKE_CHECK_EXPANDED` macros) and, selected by `CAKE_HOST_COMMON_PART`, the
   receipt / chain text every launcher includes verbatim inside its namespace.
 
-`cake_device_helpers/` holds the compiler helper headers
-(`cake_<helper>_<16-hex>.cuh`) that the device preamble includes.
+The device preamble's compiler helper headers (`cake_<helper>_<16-hex>.cuh`)
+come from the repository's top-level `csrc/cake_device_helpers/` directory,
+which the loader puts on the include path after the package's own `csrc/`.
 
 The shared kernel and launcher sources, their `#ifndef` defaults and `#if`
 arms and the hoisted parts of the host header are a hand fold of the exported

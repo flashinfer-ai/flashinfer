@@ -617,8 +617,314 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
     torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
 
 
+def _initialize_glm47_gqa(
+    batch_size, seq_len, num_heads, num_kv_heads, device_scales, head_dim=128, seed=42
+):
+    torch.manual_seed(seed)
+    q_shape = (batch_size, seq_len, num_heads, head_dim)
+    kv_shape = (batch_size, seq_len, num_kv_heads, head_dim)
+    q, q_scale = to_float8(
+        torch.randn(q_shape, dtype=torch.bfloat16, device="cuda") * 0.7
+    )
+    k, k_scale = to_float8(
+        torch.randn(kv_shape, dtype=torch.bfloat16, device="cuda") * 1.1
+    )
+    v, v_scale = to_float8(torch.randn(kv_shape, dtype=torch.bfloat16, device="cuda"))
+    scales = (q_scale.item(), k_scale.item(), v_scale.item())
+    scale_bmm1 = scales[0] * scales[1] / math.sqrt(head_dim)
+    scale_bmm2 = scales[2]
+    use_bmm1_d = device_scales in ("bmm1", "both")
+    use_bmm2_d = device_scales in ("bmm2", "both")
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0,
+        # Deliberately wrong host scales verify each device scale overrides it.
+        "scale_bmm1": scale_bmm1 * (0.5 if use_bmm1_d else 1.0),
+        "scale_bmm2": scale_bmm2 * (0.5 if use_bmm2_d else 1.0),
+        "scale_bmm1_d": (
+            torch.tensor([scale_bmm1], dtype=torch.float32, device="cuda")
+            if use_bmm1_d
+            else None
+        ),
+        "scale_bmm2_d": (
+            torch.tensor([scale_bmm2], dtype=torch.float32, device="cuda")
+            if use_bmm2_d
+            else None
+        ),
+    }
+    out = torch.empty(q_shape, dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty((*q_shape[:3], 2), dtype=torch.float32, device="cuda")
+    return q, k, v, out, lse, scales, kwargs
+
+
+def _glm47_gqa_fp8_p_reference(q, k, v, scales):
+    """Emulate E4M3 P packing in the SM12x separate-Q/K/V kernels."""
+    _, seq_len, num_heads, head_dim = q.shape
+    heads_per_kv = num_heads // k.shape[2]
+    q_float, k_float, v_float = (
+        tensor.float().permute(0, 2, 1, 3) for tensor in (q, k, v)
+    )
+    out_ref = torch.empty_like(q, dtype=torch.float32)
+    positions = torch.arange(seq_len, device=q.device)
+    causal_mask = positions[:, None] < positions[None, :]
+    qk_scale = scales[0] * scales[1] / math.sqrt(head_dim)
+    # These kernels visit 64-key tiles in ascending order. Their softmax is
+    # FP32, but the unnormalized exp weights (maximum scaled to 256) are
+    # rounded to E4M3 before PV. Casting the final softmax probabilities to
+    # FP8 would model a different algorithm.
+    tile_size = 64
+    for kv_h in range(k.shape[2]):
+        h_lo, h_hi = kv_h * heads_per_kv, (kv_h + 1) * heads_per_kv
+        scores = torch.matmul(
+            q_float[:, h_lo:h_hi], k_float[:, kv_h : kv_h + 1].transpose(-1, -2)
+        )
+        scores.mul_(qk_scale).masked_fill_(causal_mask, float("-inf"))
+        # Every causal self-attention row has a valid key in the first tile.
+        row_max = scores[..., :tile_size].amax(dim=-1, keepdim=True)
+        row_sum = torch.zeros_like(row_max)
+        numerator = torch.zeros_like(q_float[:, h_lo:h_hi])
+        for start in range(0, seq_len, tile_size):
+            tile = scores[..., start : start + tile_size]
+            next_max = torch.maximum(row_max, tile.amax(dim=-1, keepdim=True))
+            correction = torch.exp(row_max - next_max)
+            weights = torch.exp(tile - (next_max - math.log(256.0)))
+            # Keep the denominator in FP32 BEFORE rounding P. When a later
+            # tile raises the running max, rescale both previous accumulators.
+            row_sum = row_sum * correction + weights.sum(dim=-1, keepdim=True)
+            packed_p = weights.to(torch.float8_e4m3fn).float()
+            numerator = numerator * correction + torch.matmul(
+                packed_p, v_float[:, kv_h : kv_h + 1, start : start + tile_size]
+            )
+            row_max = next_max
+        out_ref[:, :, h_lo:h_hi] = ((numerator / row_sum) * scales[2]).transpose(1, 2)
+    return out_ref
+
+
+def _assert_glm47_gqa_reference(q, k, v, out, lse, scales):
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    num_kv_heads = k.shape[2]
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=q.device)
+    cu_seq_lens = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=q.device) * seq_len
+    )
+    # The reference processes one KV-head group at a time, avoiding a
+    # [batch, 96, seq_len, seq_len] materialized score tensor.
+    out_ref, lse_ref = attention_ref_torch(
+        (
+            q.reshape(-1, num_heads, head_dim),
+            k.reshape(-1, num_kv_heads, head_dim),
+            v.reshape(-1, num_kv_heads, head_dim),
+        ),
+        seq_lens,
+        cu_seq_lens,
+        sm_scale=1.0 / math.sqrt(head_dim),
+        q_scale=scales[0],
+        k_scale=scales[1],
+        v_scale=scales[2],
+        causal=True,
+        return_lse=True,
+    )
+    # E4M3 softmax stores a max and an exponential sum scaled by 256.
+    actual_lse = lse[..., 0] + torch.log(lse[..., 1] / 256.0)
+    torch.testing.assert_close(
+        actual_lse, lse_ref.reshape_as(actual_lse), rtol=1e-2, atol=1e-3
+    )
+    # The existing FP8 tests calibrate this absolute tolerance for unit-variance V.
+    try:
+        torch.testing.assert_close(
+            out, out_ref.reshape_as(out).to(out.dtype), rtol=4e-2, atol=6e-2
+        )
+    except AssertionError:
+        # FP32 attention omits the kernel's intermediate E4M3 P rounding.
+        # Rare inputs can therefore exceed the original output tolerance
+        # (e.g. GLM-4.7-Flash B1/S129/H20, seeds 3/12 on SM120 and seed 42
+        # on Spark). Accept those outputs only if the quantized-P reference
+        # also agrees, using the same tolerances. LSE must still pass the
+        # unconditional FP32 check above; unrelated output errors still fail.
+        out_ref_fp8 = _glm47_gqa_fp8_p_reference(q, k, v, scales)
+        torch.testing.assert_close(out, out_ref_fp8.to(out.dtype), rtol=4e-2, atol=6e-2)
+
+
+@pytest.mark.parametrize("device_scales", ["host", "bmm1", "bmm2", "both"])
+@pytest.mark.parametrize(
+    "batch_size,seq_len,num_heads,num_kv_heads",
+    [
+        (1, 129, 96, 8),
+        (2, 512, 96, 8),
+        (1, 1024, 96, 8),
+        (2, 129, 12, 1),
+        (1, 512, 12, 1),
+        (2, 1024, 12, 1),
+    ],
+)
+def test_fmha_v2_prefill_deepseek_glm47_gqa(
+    batch_size, seq_len, num_heads, num_kv_heads, device_scales
+):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    q, k, v, out, lse, scales, kwargs = _initialize_glm47_gqa(
+        batch_size, seq_len, num_heads, num_kv_heads, device_scales
+    )
+    fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    _assert_glm47_gqa_reference(q, k, v, out, lse, scales)
+
+
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(96, 8), (12, 1)])
+def test_fmha_v2_prefill_deepseek_glm47_gqa_cuda_graph(num_heads, num_kv_heads):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    q, k, v, out, lse, scales, kwargs = _initialize_glm47_gqa(
+        2, 129, num_heads, num_kv_heads, "both"
+    )
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    expected_out, expected_lse = out.clone(), lse.clone()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+    _assert_glm47_gqa_reference(q, k, v, out, lse, scales)
+
+
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(96, 8), (12, 1)])
+def test_fmha_v2_prefill_deepseek_glm47_gqa_matches_expanded_mha(
+    num_heads, num_kv_heads
+):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    q, k, v, out, lse, _, kwargs = _initialize_glm47_gqa(
+        2, 129, num_heads, num_kv_heads, "both"
+    )
+    fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    heads_per_kv = num_heads // num_kv_heads
+    # Repeat the quantized bytes to keep expanded MHA inputs exactly identical.
+    k_expanded = (
+        k.view(torch.uint8).repeat_interleave(heads_per_kv, dim=2).view(k.dtype)
+    )
+    v_expanded = (
+        v.view(torch.uint8).repeat_interleave(heads_per_kv, dim=2).view(v.dtype)
+    )
+    out_mha, lse_mha = torch.empty_like(out), torch.empty_like(lse)
+    fmha_v2_prefill_sm120(
+        q, k_expanded, v_expanded, out_mha, return_lse=True, lse=lse_mha, **kwargs
+    )
+    torch.testing.assert_close(out, out_mha, rtol=0, atol=0)
+    torch.testing.assert_close(lse, lse_mha, rtol=0, atol=0)
+
+
+def test_fmha_v2_prefill_deepseek_glm47_gqa_validation():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    q, k, v, out, _, _, kwargs = _initialize_glm47_gqa(1, 129, 96, 8, "host")
+    with pytest.raises(ValueError, match="divisible by a positive KV head count"):
+        fmha_v2_prefill_deepseek(
+            q, k[:, :, :7].contiguous(), v[:, :, :7].contiguous(), out, **kwargs
+        )
+    with pytest.raises(ValueError, match="matching batch, seq_len, and KV head count"):
+        fmha_v2_prefill_deepseek(q, k, v[:, :, :7].contiguous(), out, **kwargs)
+    with pytest.raises(ValueError, match="query and out shapes must match"):
+        fmha_v2_prefill_deepseek(q, k, v, out[:, :, :95].contiguous(), **kwargs)
+
+
+def test_fmha_v2_prefill_sm120_gqa_head_dim_64():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+    q, k, v, out, lse, scales, kwargs = _initialize_glm47_gqa(
+        1, 129, 12, 1, "both", head_dim=64
+    )
+    fmha_v2_prefill_sm120(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    _assert_glm47_gqa_reference(q, k, v, out, lse, scales)
+
+
+@pytest.mark.parametrize(
+    "batch_size,seq_len,num_heads,device_scales",
+    [
+        (1, 129, 20, "host"),
+        (1, 129, 20, "both"),
+        (2, 512, 20, "bmm1"),
+        (1, 1024, 20, "bmm2"),
+        (2, 129, 5, "both"),
+        (1, 512, 5, "host"),
+        (1, 1024, 5, "both"),
+    ],
+)
+@pytest.mark.parametrize("seed", [42, 3, 12])
+def test_fmha_v2_prefill_deepseek_glm47_flash_mla(
+    batch_size, seq_len, num_heads, device_scales, seed
+):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    # GLM-4.7-Flash expands MLA context to Q/K/V=256 with 20 heads (5 per TP4 rank).
+    q, k, v, out, lse, scales, kwargs = _initialize_glm47_gqa(
+        batch_size,
+        seq_len,
+        num_heads,
+        num_heads,
+        device_scales,
+        head_dim=256,
+        seed=seed,
+    )
+    fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    _assert_glm47_gqa_reference(q, k, v, out, lse, scales)
+
+
+@pytest.mark.parametrize("num_heads", [20, 5])
+def test_fmha_v2_prefill_deepseek_glm47_flash_mla_cuda_graph(num_heads):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    q, k, v, out, lse, scales, kwargs = _initialize_glm47_gqa(
+        2, 129, num_heads, num_heads, "both", head_dim=256
+    )
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    expected_out, expected_lse = out.clone(), lse.clone()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fmha_v2_prefill_deepseek(q, k, v, out, return_lse=True, lse=lse, **kwargs)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+    _assert_glm47_gqa_reference(q, k, v, out, lse, scales)
+
+
+def test_fmha_v2_prefill_deepseek_glm47_flash_mla_validation():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    q, k, v, out, _, _, kwargs = _initialize_glm47_gqa(
+        1, 129, 20, 20, "host", head_dim=256
+    )
+    with pytest.raises(ValueError, match="requires FP8 E4M3 input"):
+        fmha_v2_prefill_deepseek(q.bfloat16(), k, v, out, **kwargs)
+    with pytest.raises(ValueError, match="requires BF16 output"):
+        fmha_v2_prefill_deepseek(q, k, v, out.half(), **kwargs)
+    with pytest.raises(ValueError, match="V/O head_dim to match Q/K"):
+        fmha_v2_prefill_deepseek(q, k, v[..., :128].contiguous(), out, **kwargs)
+    with pytest.raises(ValueError, match="requires Q/K head_dim"):
+        fmha_v2_prefill_deepseek(q, k, v, out, **dict(kwargs, head_dim=128))
+
+
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_heads", [(1, 128, 4), (1, 1024, 32), (2, 129, 4)]
 )
@@ -771,7 +1077,7 @@ def test_fmha_v2_prefill_sm120_validation():
         fmha_v2_prefill_sm120(q_bf16, k_bf16, v_bf16, out, **kwargs)
     with pytest.raises(ValueError, match="requires BF16 output"):
         fmha_v2_prefill_sm120(q, k, v, out.half(), **kwargs)
-    with pytest.raises(ValueError, match="requires Q/K head_dim=64 or 128"):
+    with pytest.raises(ValueError, match="requires Q/K head_dim"):
         fmha_v2_prefill_sm120(q, k, v, out, **{**kwargs, "head_dim": 96})
     q_noncontiguous = q.transpose(-1, -2).contiguous().transpose(-1, -2)
     with pytest.raises(ValueError, match="must be contiguous"):

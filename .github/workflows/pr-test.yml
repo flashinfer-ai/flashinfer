@@ -213,15 +213,20 @@ jobs:
           # A targeted run on a lane never tests more than that lane's bare run: H100
           # gets the request as-is (its bare run covers tests/); A10G and T4 get it
           # intersected with their shard lists, and a lane left with nothing is skipped.
-          A10G_SCOPE=""; T4_SCOPE=""
+          # A10G is intersected per shard: each shard whose files overlap the request
+          # runs as its own job, so a targeted run keeps the bare run's balancing and
+          # -k splits, and shards left with nothing are not scheduled.
+          A10G_SCOPES=(); T4_SCOPE=""
           if [ "$SKIP_GPU" != "true" ] && [ -n "${REQUESTED_TEST_PATH}" ]; then
-            A10G_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
-              --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh \
-              --targets "${REQUESTED_TEST_PATH}")
+            for shard in 1 2 3 4 5; do
+              A10G_SCOPES[$shard]=$(python3 scripts/pr_checks/targeted_lane_scope.py \
+                --scripts "scripts/task_jit_run_tests_part${shard}.sh" \
+                --targets "${REQUESTED_TEST_PATH}")
+              echo "A10G shard ${shard} targeted scope: ${A10G_SCOPES[$shard]:-<none: shard not scheduled>}"
+            done
             T4_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
               --scripts scripts/task_jit_run_tests_t4.sh \
               --targets "${REQUESTED_TEST_PATH}")
-            echo "A10G targeted scope: ${A10G_SCOPE:-<none: lane not scheduled>}"
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
           fi
           {
@@ -284,28 +289,30 @@ jobs:
               # paths. There is deliberately no arch selection: tests carry their own
               # arch guards (is_sm90a_supported() and friends) and skip themselves where
               # unsupported - nobody has to keep a path-to-arch mapping in sync with the
-              # tests. Per-lane scopes (A10G_SCOPE / T4_SCOPE) are computed above the
+              # tests. Per-lane scopes (A10G_SCOPES / T4_SCOPE) are computed above the
               # brace group, which is piped into jq and so runs in a subshell.
               #
-              # The default shards (task_jit_run_tests_part*.sh) are fixed pytest lists
-              # and take no arguments, so a targeted run uses task_run_unit_tests.sh --
-              # the script that forwards "$@" into TEST_PATH -- on every GPU runner.
+              # A10G runs its bare-run shard scripts, restricted to the scope through
+              # JIT_TEST_SCOPE (see scripts/jit_test_logging.sh). T4 and H100 use
+              # task_run_unit_tests.sh, the script that forwards "$@" into TEST_PATH.
               #
               # This step does NOT parse the PR body. Turning a declared scope into paths
               # happens once, in whoever issues the trigger (a reviewer, or the screening
               # watcher posting under its own identity). CI runs what it is told.
-              if [ -n "${A10G_SCOPE}" ]; then
-                jq -nc --arg test_path "${A10G_SCOPE}" '{
-                  name: "Targeted Unittest (A10G)",
-                  kind: "gpu",
-                  gpu_name: "A10G",
-                  runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
-                  cuda: "cu129",
-                  script: "task_run_unit_tests.sh",
-                  test_path: $test_path,
-                  timeout: 360
-                }'
-              fi
+              for shard in 1 2 3 4 5; do
+                if [ -n "${A10G_SCOPES[$shard]:-}" ]; then
+                  jq -nc --arg shard "$shard" --arg test_path "${A10G_SCOPES[$shard]}" '{
+                    name: "Targeted Unittest \($shard) (A10G)",
+                    kind: "gpu",
+                    gpu_name: "A10G",
+                    runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
+                    cuda: "cu129",
+                    script: "task_jit_run_tests_part\($shard).sh",
+                    test_path: $test_path,
+                    timeout: 360
+                  }'
+                fi
+              done
               if [ -n "${T4_SCOPE}" ]; then
                 jq -nc --arg test_path "${T4_SCOPE}" '{
                   name: "Targeted Unittest (T4)",
@@ -468,6 +475,12 @@ jobs:
 
       - name: Run Test
         if: matrix.kind != 'aot'
+        env:
+          # Kernel compile cache kept across this runner's jobs (see ci/bash.sh).
+          # runner.workspace is the parent of the checkout, so the Cleanup step's
+          # wipe of the checkout leaves it, and on the H100 hosts it sits on the
+          # large NVMe work volume rather than the small root filesystem.
+          CI_COMPILE_CACHE_DIR: ${{ runner.workspace }}/flashinfer-compile-cache
         run: |
           case "${TEST_SCRIPT}" in
             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
@@ -480,6 +493,19 @@ jobs:
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
           fi
+          # Per-build compile times, summarized by the next step.
+          mkdir -p junit
+          DOCKER_ARGS=(-e FLASHINFER_JIT_BUILD_LOG /workspace/junit/jit-builds.jsonl)
+          if [ "${MATRIX_KIND}" = "gpu" ] && [ "${TEST_SCRIPT}" = "task_run_unit_tests.sh" ]; then
+            # Targeted T4 runs compile with the same Ninja parallelism as the
+            # bare-run T4 script (MAX_JOBS=nproc) instead of test_utils.sh's
+            # 12 GB-per-nvcc budget, which was sized for H100 and resolves to
+            # MAX_JOBS=1 on these 8-vCPU / 30 GiB runners. The shard scripts have
+            # run these files at nproc without an OOM, and a 9-job targeted run of
+            # test_batch_prefill_kernels.py peaked at 12.3 GiB process-tree RSS.
+            DOCKER_ARGS+=(-e MAX_JOBS "$(nproc)")
+          fi
+          TEST_TARGETS=()
           if [ -n "${TEST_PATH_ARG:-}" ]; then
             # Read into an array and expand quoted, rather than relying on word
             # splitting: this keeps the shell safe on its own terms instead of
@@ -488,32 +514,53 @@ jobs:
             set -f
             read -r -a TEST_TARGETS <<< "${TEST_PATH_ARG}"
             set +f
+          fi
+          if [ "${#TEST_TARGETS[@]}" -gt 0 ] && [ "${TEST_SCRIPT}" != "task_run_unit_tests.sh" ]; then
+            # A10G shard scripts take no arguments; their pytest wrapper skips files
+            # outside JIT_TEST_SCOPE. Comma-joined because ci/bash.sh word-splits
+            # -e values.
+            DOCKER_ARGS+=(-e JIT_TEST_SCOPE "$(IFS=,; echo "${TEST_TARGETS[*]}")")
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}"
+          elif [ "${#TEST_TARGETS[@]}" -gt 0 ]; then
             # --test-path, not bare positionals: task_run_unit_tests.sh forwards "$@"
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+          fi
+
+      - name: Summarize JIT build times
+        if: always() && matrix.kind != 'aot'
+        run: |
+          if command -v python3 >/dev/null; then
+            python3 scripts/summarize_jit_builds.py junit/jit-builds.jsonl || true
+            python3 scripts/summarize_jit_builds.py --markdown \
+              junit/jit-builds.jsonl >> "${GITHUB_STEP_SUMMARY}" || true
+          else
+            echo "::warning::python3 unavailable on runner; JIT build summary skipped"
           fi
 
       - name: Make JUnit XML readable
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         run: |
           if [ -d junit ]; then
             sudo chmod -R a+rX junit
           fi
 
       - name: Upload JUnit XML and telemetry
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ matrix.kind == 'h100' && 'h100' || matrix.script }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Non-H100 names add the runner SM: A10G and T4 rows can run the same script.
+          name: junit-${{ matrix.kind == 'h100' && 'h100' || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/jit-builds.jsonl
             junit/run-summary.json
           if-no-files-found: warn
           retention-days: 30

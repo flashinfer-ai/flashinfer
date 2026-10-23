@@ -287,6 +287,9 @@ def runtime_work_tile_activity(
         cta_idx_q,
         cta_idx_kv,
     )
+    query_is_active = query_is_active & (
+        runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx) > Int32(0)
+    )
     return query_is_active, split_is_active
 
 

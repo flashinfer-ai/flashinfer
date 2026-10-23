@@ -21,10 +21,17 @@ planner :mod:`.cake_planner`, the plan object :class:`CakeVsaSm90Plan`, the
 reaches :func:`create_plan` through the :mod:`flashinfer.cake_vsa_sm90` facade;
 import that module for the user-facing documentation.
 
-Supported scope: BF16 HND ``q/k/v`` with shape ``(H, S, 128)``, equal query/KV
-head counts, noncausal 64-token query and KV blocks, 1..64 selected KV blocks
-per query block (ragged counts allowed), custom finite softmax scales
-(including 0 and negative), no LSE / PDL / positional encoding / logits soft cap.
+Supported scope: BF16 HND ``q/k/v`` with shape ``(H, S, 128)``, or Sage FP8
+``q/k/v`` (``torch.float8_e4m3fn``, same shapes) with their FP32 scales
+``q_scale (1, H, Sq)`` per token, ``k_scale (1, H, ceil(Sk / 16))`` per 16-token
+group and ``v_scale (H, 128)`` per channel bound at ``plan()`` (the output stays
+BF16); equal query/KV head counts, noncausal 64-token query and KV blocks, 1..64
+selected KV blocks per query block (ragged counts allowed), custom finite softmax
+scales (including 0 and negative), no LSE / PDL / positional encoding / logits
+soft cap.  The data type is a route decision of the plan (``q_data_type``), never
+a kernel flag: the FP8 stages are twins of the BF16 stages that consume the same
+planner bytes.  :func:`sage_fp8_quantize_sm90` produces the FP8 inputs and scales
+from BF16 HND tensors with the package's two quantizer kernels.
 
 Two kernels serve the contract.  Small problems (at most 6 selected KV blocks
 per query block, a grid that fits one wave, a plan that fits the kernel
@@ -46,7 +53,8 @@ tiles (``grid = min(tiles, SMs)``), either one 64-row query block whose KV list
 alternates between the two consumer warpgroups (``split``) or two query blocks
 of one head sharing the KV ring (``pair``), and plans with enough tiles per CTA
 keep one static tile per CTA and hand the rest out through a device queue in
-head-major order (``attention_queue``).  The plan layouts mirror the Cake kernel modules
+head-major order (``attention_queue``); uniform pair plans of short tiles with many tiles
+per CTA run the compact static program (``attention_compact``).  The plan layouts mirror the Cake kernel modules
 and are validated by the kernels' own tests; both planners are dependency-free
 ports of the Cake planners and must stay byte-identical to them.
 
@@ -66,16 +74,20 @@ from . import cake_jit as _loader
 from .cake_jit import (  # noqa: F401
     ARCH_BY_CAPABILITY,
     ARCHES,
+    FP8_PERSISTENT_STAGES,
+    FP8_SMALL_STAGES,
     LOGICAL_PARAM_ARRAYS,
     LOGICAL_SCALARS,
     LOGICAL_TENSORS,
     MODULES,
     PERSISTENT_STAGES,
+    QUANTIZE_STAGES,
     SMALL_STAGES,
     STAGES,
     arch_for_capability,
     persistent_stage,
     small_stage,
+    stage_dtype,
     stage_record,
 )
 from .cake_planner import (  # noqa: F401
@@ -114,6 +126,13 @@ from .cake_planner import (  # noqa: F401
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
 )
+# Sage FP8 route: E4M3 q/k/v, FP32 scales per query token / per 16-token KV group /
+# per V channel (the SM100 Sage package's layout); the quantizer kernels handle
+# 64 tokens per CTA and index with 32-bit offsets.
+FP8_DTYPE = torch.float8_e4m3fn
+K_SCALE_GROUP = 16
+QUANTIZE_TOKENS_PER_CTA = 64
+_INT32_ELEMENTS = 2**31 - 1
 
 
 def is_cake_vsa_sm90_supported(device: torch.device) -> bool:
@@ -164,9 +183,12 @@ class CakeVsaSm90Plan:
     capturable; ``plan()`` may not replace a plan that a graph has captured.
 
     The stage the plan launches (``self.stage``, a record of
-    :data:`cake_jit.MODULES`) is fixed when the plan is built, its library is
-    loaded then (outside graph capture), and its ffi arguments are bound once:
-    ``run`` only substitutes ``q``, ``k``, ``v`` and ``out``.
+    :data:`cake_jit.MODULES`) is fixed when the plan is built -- the route and
+    the data type (``self.fp8``) -- its library is loaded then (outside graph
+    capture), and its ffi arguments are bound once: ``run`` only substitutes
+    ``q``, ``k``, ``v`` and ``out``.  An FP8 plan binds ``q_scale`` / ``k_scale``
+    / ``v_scale`` here; a caller that re-quantizes per forward writes the same
+    tensors in place (graph-safe) and ``run`` takes no scales.
     """
 
     def __init__(
@@ -186,12 +208,18 @@ class CakeVsaSm90Plan:
         sm_scale: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: Optional[torch.dtype] = None,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
         non_blocking: bool = True,
         route: Optional[str] = None,
     ):
         """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"smallcluster"`` /
         ``"smallsplitcluster"`` / ``"persistent"`` force one kernel (the forced split-cluster route takes the
-        smallest variant that holds the selection and fits the plan parameter)."""
+        smallest variant that holds the selection and fits the plan parameter).  ``q_data_type``
+        ``torch.float8_e4m3fn`` (with ``kv_data_type`` equal or ``None``) selects the Sage FP8 twin of the
+        route and requires the three FP32 scales ``q_scale (1, H, Sq)``, ``k_scale (1, H, ceil(Sk / 16))``,
+        ``v_scale (H, 128)``, contiguous on the plan device; BF16 plans take none."""
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("cake (SM90) requires a CUDA device")
@@ -207,10 +235,31 @@ class CakeVsaSm90Plan:
             raise ValueError("cake (SM90) VSA accumulates QK in FP32 only")
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise ValueError("cake (SM90) VSA does not support logits_soft_cap")
-        if q_data_type != torch.bfloat16 or (
-            kv_data_type is not None and kv_data_type != torch.bfloat16
-        ):
-            raise ValueError("cake (SM90) VSA supports BF16 q/k/v only")
+        if q_data_type not in (torch.bfloat16, FP8_DTYPE):
+            raise ValueError(
+                "cake (SM90) VSA supports BF16 or Sage FP8 (float8_e4m3fn) q/k/v only"
+            )
+        if kv_data_type is not None and kv_data_type != q_data_type:
+            raise ValueError(
+                "cake (SM90) VSA requires kv_data_type equal to q_data_type (BF16 or "
+                f"float8_e4m3fn q/k/v only), got q_data_type={q_data_type}, "
+                f"kv_data_type={kv_data_type}"
+            )
+        self.fp8 = q_data_type == FP8_DTYPE
+        self.q_dtype = q_data_type
+        scales = {"q_scale": q_scale, "k_scale": k_scale, "v_scale": v_scale}
+        given = [name for name, tensor in scales.items() if tensor is not None]
+        if self.fp8 and len(given) != 3:
+            missing = [name for name in scales if name not in given]
+            raise ValueError(
+                "cake (SM90) Sage FP8 requires q_scale, k_scale and v_scale together "
+                f"(missing: {', '.join(missing)})"
+            )
+        if not self.fp8 and given:
+            raise ValueError(
+                "cake (SM90) VSA accepts q_scale/k_scale/v_scale only with "
+                f"q_data_type=float8_e4m3fn (Sage FP8); got q_data_type={q_data_type}"
+            )
         if num_qo_heads != num_kv_heads or num_qo_heads < 1:
             raise ValueError(
                 "cake (SM90) VSA requires equal, positive query/KV head counts"
@@ -218,6 +267,16 @@ class CakeVsaSm90Plan:
         if head_dim != HEAD_DIM:
             raise ValueError(f"cake (SM90) VSA requires head_dim {HEAD_DIM}")
         _check_descriptors(block_mask_map, block_row_sz, block_col_sz, num_qo_heads)
+        if self.fp8:
+            heads, mb, nb = (int(x) for x in block_mask_map.shape)
+            self.k_scale_groups = -(-(nb * BLOCK) // K_SCALE_GROUP)
+            for name, tensor, shape in (
+                ("q_scale", q_scale, (1, heads, mb * BLOCK)),
+                ("k_scale", k_scale, (1, heads, self.k_scale_groups)),
+                ("v_scale", v_scale, (heads, HEAD_DIM)),
+            ):
+                self._check_scale(name, tensor, shape)
+            self.q_scale, self.k_scale, self.v_scale = q_scale, k_scale, v_scale
         scale = 1.0 / math.sqrt(HEAD_DIM) if sm_scale is None else float(sm_scale)
         # The kernel consumes scale * log2(e) as FP32.
         if not math.isfinite(scale * LOG2E) or abs(scale * LOG2E) > _FP32_MAX:
@@ -281,6 +340,13 @@ class CakeVsaSm90Plan:
         bound: dict[str, Any] = {
             "scale_log2": float(self.scale_log2),
         }
+        if self.fp8:
+            # Scales are plan data (R3): bound once, read by every launch; the
+            # per-head stride of ``k_scale`` travels as a kernel scalar.
+            bound["q_scale"] = self.q_scale
+            bound["k_scale"] = self.k_scale
+            bound["v_scale"] = self.v_scale
+            bound["k_scale_groups"] = int(self.k_scale_groups)
         if small is not None:
             plan = plan_small(
                 block_mask_map, kmax=small[0], split=small[1], cluster=small[2]
@@ -301,7 +367,7 @@ class CakeVsaSm90Plan:
             self.qo_len = plan["MB"] * BLOCK
             self.kv_len = plan["NB"] * BLOCK
             self.stage = small_stage(
-                self.small_kmax, self.small_split, self.small_cluster
+                self.small_kmax, self.small_split, self.small_cluster, fp8=self.fp8
             )
             # The plan is a launch parameter (CPU int16): nothing is uploaded,
             # so an unsplit or cluster plan has no stream dependency and a
@@ -349,11 +415,15 @@ class CakeVsaSm90Plan:
             self.num_tiles = plan["num_tiles"]
             self.tile_stride = plan["tile_stride"]
             self.queue = plan["queue"]
+            self.compact = plan["compact"]
+            self.tagged = plan["tagged"]
             self.num_rows = plan["num_rows"]
             self.num_heads = plan["H"]
             self.qo_len = plan["MB"] * BLOCK
             self.kv_len = plan["NB"] * BLOCK
-            self.stage = persistent_stage(bool(self.queue))
+            self.stage = persistent_stage(
+                bool(self.queue), bool(self.compact), bool(self.tagged), fp8=self.fp8
+            )
             rule = _loader.workspace_rule(self.stage)
             assert rule is not None and rule["kind"] == "persistent"
             with torch.cuda.device(self.device):
@@ -406,10 +476,24 @@ class CakeVsaSm90Plan:
                 "keep the original wrapper alive while its graph may replay"
             )
 
-    def _check_tensor(self, name, tensor, shape) -> None:
-        if tuple(tensor.shape) != tuple(shape) or tensor.dtype != torch.bfloat16:
+    def _check_tensor(self, name, tensor, shape, dtype=torch.bfloat16) -> None:
+        if tuple(tensor.shape) != tuple(shape) or tensor.dtype != dtype:
             raise ValueError(
-                f"{name} must have shape {tuple(shape)} and dtype bfloat16"
+                f"{name} must have shape {tuple(shape)} and dtype {str(dtype).removeprefix('torch.')}"
+            )
+        if tensor.device != self.device or not tensor.is_contiguous():
+            raise ValueError(
+                f"{name} must be contiguous on the planned device {self.device}"
+            )
+
+    def _check_scale(self, name, tensor, shape) -> None:
+        """An FP32 Sage scale of the planned problem: exact shape, contiguous on the plan device."""
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"{name} must be a float32 tensor of shape {tuple(shape)}")
+        if tuple(tensor.shape) != tuple(shape) or tensor.dtype != torch.float32:
+            raise ValueError(
+                f"{name} must have shape {tuple(shape)} and dtype float32, got "
+                f"{tuple(tensor.shape)} {str(tensor.dtype).removeprefix('torch.')}"
             )
         if tensor.device != self.device or not tensor.is_contiguous():
             raise ValueError(
@@ -443,25 +527,32 @@ class CakeVsaSm90Plan:
             ("k", k, self.kv_len),
             ("v", v, self.kv_len),
         ):
-            self._check_tensor(name, tensor, (self.num_heads, length, HEAD_DIM))
+            self._check_tensor(
+                name, tensor, (self.num_heads, length, HEAD_DIM), self.q_dtype
+            )
         # Preserve VariableBlockSparseAttentionWrapper's existing DPS ABI: the
-        # provided output is [H*M, 1, D], while the return value is HND.
+        # provided output is [H*M, 1, D], while the return value is HND.  The
+        # output is BF16 for both data types.
         if out is None:
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError(
                     "CUDA graph capture requires a preallocated out buffer"
                 )
-            result = torch.empty_like(q)
+            result = torch.empty_like(q, dtype=torch.bfloat16)
         else:
             self._check_tensor("out", out, (self.num_heads * self.qo_len, 1, HEAD_DIM))
             result = out.view(self.num_heads, self.qo_len, HEAD_DIM)
             begin = out.data_ptr()
             end = begin + out.numel() * out.element_size()
-            for tensor in (q, k, v):
+            inputs: tuple[torch.Tensor, ...] = (q, k, v)
+            if self.fp8:
+                scales = (self.q_scale, self.k_scale, self.v_scale)
+                inputs += tuple(scale for scale in scales if scale is not None)
+            for tensor in inputs:
                 tensor_begin = tensor.data_ptr()
                 tensor_end = tensor_begin + tensor.numel() * tensor.element_size()
                 if begin < tensor_end and tensor_begin < end:
-                    raise ValueError("out must not overlap Q/K/V storage")
+                    raise ValueError("out must not overlap Q/K/V or scale storage")
 
         with torch.cuda.device(self.device):
             stream = torch.cuda.current_stream(self.device)
@@ -502,10 +593,124 @@ def create_plan(device, *args, **kwargs) -> CakeVsaSm90Plan:
         return CakeVsaSm90Plan(device, *args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Sage FP8 quantizer (the SM100 Sage package's kernels on HND tensors)
+# ---------------------------------------------------------------------------
+
+
+def _check_hnd(name, tensor, device, shape) -> None:
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 3:
+        raise ValueError(f"{name} must be a rank-3 HND tensor (H, S, {HEAD_DIM})")
+    if tuple(tensor.shape) != tuple(shape) or tensor.dtype != torch.bfloat16:
+        raise ValueError(
+            f"{name} must have shape {tuple(shape)} and dtype bfloat16, got "
+            f"{tuple(tensor.shape)} {str(tensor.dtype).removeprefix('torch.')}"
+        )
+    if tensor.device != device or not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous on {device}")
+    if tensor.numel() > _INT32_ELEMENTS:
+        raise ValueError(f"{name} exceeds 2**31 - 1 elements (32-bit kernel offsets)")
+
+
+def sage_fp8_quantize_sm90(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Fused Sage FP8 quantization of BF16 HND ``q/k/v`` for the FP8 route of :class:`CakeVsaSm90Plan`.
+
+    Returns ``(q8, k8, v8, q_scale, k_scale, v_scale)``: E4M3 tensors of the input shapes
+    and FP32 scales ``q_scale (1, H, Sq)`` per query token, ``k_scale (1, H, ceil(Sk / 16))``
+    per 16-token KV group (shared by its 16 tokens and all 128 channels) and ``v_scale (H, 128)``
+    per V channel over the whole sequence -- the shapes ``plan()`` takes.  A scale is
+    ``max(amax, 1e-6) / 448`` (the kernels floor the absolute maximum at ``1e-6`` and multiply by
+    the reciprocal), so the torch recipe ``amax.clamp_min(1e-12) / 448`` agrees to about 1e-5
+    relative on the scales and to one E4M3 step on the values.  Two kernel launches of the
+    package's ``quantize_qk_vamax`` / ``quantize_v`` stages behind one ``torch.zeros`` of the V
+    amax scratch.  HND ``(H, S, 128)`` is the kernels' BSHD layout with ``batch := H`` and one
+    head, so the inputs are passed as they are and the scale outputs come out in the plan's
+    shapes.  Each input holds at most ``2**31 - 1`` elements (32-bit kernel offsets).
+    """
+    if not isinstance(q, torch.Tensor) or q.ndim != 3:
+        raise ValueError(f"q must be a rank-3 HND tensor (H, S, {HEAD_DIM})")
+    device = q.device
+    if device.type != "cuda":
+        raise ValueError("q must be a CUDA tensor")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    heads, seqlen_q, dim = (int(x) for x in q.shape)
+    if dim != HEAD_DIM:
+        raise ValueError(f"head_dim must be {HEAD_DIM}, got {dim}")
+    if not isinstance(k, torch.Tensor) or k.ndim != 3:
+        raise ValueError(f"k must be a rank-3 HND tensor (H, S, {HEAD_DIM})")
+    seqlen_k = int(k.shape[1])
+    if heads < 1 or seqlen_q < 1 or seqlen_k < 1:
+        raise ValueError("q/k/v must have positive head and sequence counts")
+    _check_hnd("q", q, device, (heads, seqlen_q, HEAD_DIM))
+    _check_hnd("k", k, device, (heads, seqlen_k, HEAD_DIM))
+    _check_hnd("v", v, device, (heads, seqlen_k, HEAD_DIM))
+    groups = -(-seqlen_k // K_SCALE_GROUP)
+    q_chunks = -(-seqlen_q // QUANTIZE_TOKENS_PER_CTA)
+    k_chunks = -(-seqlen_k // QUANTIZE_TOKENS_PER_CTA)
+    chunks = max(q_chunks, k_chunks)
+    with torch.cuda.device(device):
+        q8 = torch.empty_like(q, dtype=FP8_DTYPE)
+        k8 = torch.empty_like(k, dtype=FP8_DTYPE)
+        v8 = torch.empty_like(v, dtype=FP8_DTYPE)
+        q_scale = torch.empty((1, heads, seqlen_q), dtype=torch.float32, device=device)
+        k_scale = torch.empty((1, heads, groups), dtype=torch.float32, device=device)
+        v_scale = torch.empty((heads, HEAD_DIM), dtype=torch.float32, device=device)
+        v_amax = torch.zeros((heads, HEAD_DIM), dtype=torch.float32, device=device)
+        _loader.run_module(
+            "quantize_qk_vamax",
+            {
+                "q_in": q,
+                "k_in": k,
+                "v_in": v,
+                "q_out": q8,
+                "k_out": k8,
+                "q_scale": q_scale,
+                "k_scale": k_scale,
+                "v_amax": v_amax,
+                "seqlen_q": seqlen_q,
+                "seqlen_k": seqlen_k,
+                "num_heads": 1,
+                "num_kv_heads": 1,
+                "grid_heads": 1,
+                "k_scale_groups": groups,
+                "chunks_per_bh": chunks,
+                "q_chunks": q_chunks,
+                "k_chunks": k_chunks,
+            },
+            grid=(heads * chunks, 1, 1),
+            device_index=device.index,
+        )
+        _loader.run_module(
+            "quantize_v",
+            {
+                "v_in": v,
+                "v_out": v8,
+                "v_amax": v_amax,
+                "v_scale": v_scale,
+                "seqlen_k": seqlen_k,
+                "num_heads": 1,
+                "chunks_per_bh": k_chunks,
+            },
+            grid=(heads * k_chunks, 1, 1),
+            device_index=device.index,
+        )
+    return q8, k8, v8, q_scale, k_scale, v_scale
+
+
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
+    "FP8_DTYPE",
+    "FP8_PERSISTENT_STAGES",
+    "FP8_SMALL_STAGES",
+    "K_SCALE_GROUP",
     "MODULES",
+    "QUANTIZE_STAGES",
     "STAGES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeVsaSm90Plan",
@@ -517,8 +722,10 @@ __all__ = [
     "persistent_stage",
     "plan_small",
     "plan_vsa_sm90",
+    "sage_fp8_quantize_sm90",
     "small_route",
     "small_stage",
     "split_cluster_variant_for",
     "split_kmax",
+    "stage_dtype",
 ]

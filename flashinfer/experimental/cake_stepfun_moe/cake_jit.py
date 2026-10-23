@@ -230,7 +230,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 6: fc2 mxfp8 tiles 8, 16, 32, 64, 256 (5 programs)
+    # 6: fc2 mxfp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -542,6 +542,29 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    # 20: fc1 mxfp8 tile 128 (1 program)
+    [
+        ["tma_buffer", "A"],
+        ["buffer", "B"],
+        ["tma_buffer", "SFA"],
+        ["buffer", "SFB"],
+        ["tma_buffer", "C"],
+        ["buffer", "SFC"],
+        ["buffer", "route_map"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_non_exiting_ctas"],
+        ["buffer", "clamp_limit"],
+        ["parameter", "M_out"],
+        ["parameter", "K"],
+        ["parameter", "grid_m"],
+        ["parameter", "grid_n"],
+        ["parameter", "K_tiles"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
 )
 # Storage dtype the binding checks per tensor argument.
 _ARG_DTYPES: tuple[dict[str, str], ...] = (
@@ -635,7 +658,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "scale_c": "float32",
         "token_sf": "float32",
     },
-    # 7: fc2 mxfp8 tiles 8, 16, 32, 64, 256 (5 programs)
+    # 7: fc2 mxfp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -743,7 +766,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 16: fc1 mxfp8 tiles 8, 16, 64, 256 (4 programs)
+    # 16: fc1 mxfp8 tiles 8, 16, 64, 128, 256 (5 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -901,9 +924,11 @@ _PROGRAMS: dict[str, tuple[str, int, int, int, list[int], list[int], int]] = {
     "a4a11b14b7fc96229730": ("fc2", 15, 3, 8, [256, 1, 1], [2, 1, 1], 214144),
     "a5b8153548cab6dd4a26": ("fc1", 10, 11, 2, [512, 1, 1], [2, 1, 1], 226432),
     "ae217b5e6c838affbdf0": ("routing", 0, 1, 0, [128, 1, 1], [1, 1, 1], 1152),
+    "ae6ca81a0800a8c71538": ("fc2", 6, 7, 9, [384, 1, 1], [2, 1, 1], 197248),
     "ae7dcfbf2d3e0cc4a20b": ("fc2", 6, 7, 9, [384, 1, 1], [2, 1, 1], 189056),
     "ae9bbf9c9644097f8828": ("routing", 1, 2, 0, [448, 1, 1], [1, 1, 1], 5632),
     "af32c4e6a3c0d0e036bf": ("fc2", 5, 6, 4, [512, 1, 1], [1, 1, 1], 183424),
+    "b398b040e1b8ef869e3c": ("fc1", 20, 16, 5, [384, 1, 1], [2, 1, 1], 209024),
     "b8722b9a6936e6a4c924": ("fc1", 16, 17, 10, [896, 1, 1], [2, 1, 1], 193152),
     "bf81684716f8abab06d1": ("routing", 1, 2, 0, [512, 1, 1], [1, 1, 1], 6400),
     "c1118bec4cfea74fa04e": ("fc2", 15, 3, 8, [256, 1, 1], [2, 1, 1], 222336),
@@ -1067,6 +1092,7 @@ _FC1: dict[str, tuple[str, int, int]] = {
     "8e32f55e2c8cc674a74a": ("nvfp4", 16, 512),
     "98389094462077483771": ("mxfp8", 64, 256),
     "a5b8153548cab6dd4a26": ("fp8", 128, 128),
+    "b398b040e1b8ef869e3c": ("mxfp8", 128, 256),
     "b8722b9a6936e6a4c924": ("nvfp4_bf16tok", 64, 512),
     "c16c727913eac39c7f25": ("mxfp8", 256, 256),
     "c3d9de1e9d6270fc651c": ("bf16", 256, 64),
@@ -1099,6 +1125,7 @@ _FC2: dict[str, tuple[str, int, int, str]] = {
     "893d9279ac4a4a3d1904": ("nvfp4_bf16tok", 32, 512, "r8c4"),
     "94969f032e90041ddaab": ("mxfp8", 32, 256, "r8c4"),
     "a4a11b14b7fc96229730": ("bf16", 128, 64, "none"),
+    "ae6ca81a0800a8c71538": ("mxfp8", 128, 128, "r128c4"),
     "ae7dcfbf2d3e0cc4a20b": ("mxfp8", 256, 128, "r128c4"),
     "af32c4e6a3c0d0e036bf": ("nvfp4_bf16tok", 64, 512, "r8c4"),
     "c1118bec4cfea74fa04e": ("bf16", 64, 128, "none"),
@@ -1319,6 +1346,7 @@ STAGE_TABLES: dict[str, list[str]] = {
         "cake_stepfun_moe_c96f943c65b2c8eaa9ab",
         "cake_stepfun_moe_e2293bcb1ccd0fb0fa95",
         "cake_stepfun_moe_98389094462077483771",
+        "cake_stepfun_moe_b398b040e1b8ef869e3c",
         "cake_stepfun_moe_c16c727913eac39c7f25",
     ],
     "requant": [
@@ -1342,6 +1370,7 @@ STAGE_TABLES: dict[str, list[str]] = {
         "cake_stepfun_moe_26edf45a86b9afe56815",
         "cake_stepfun_moe_94969f032e90041ddaab",
         "cake_stepfun_moe_f44269ae056bce32e72d",
+        "cake_stepfun_moe_ae6ca81a0800a8c71538",
         "cake_stepfun_moe_ae7dcfbf2d3e0cc4a20b",
         "cake_stepfun_moe_c3df92890bea6316d938",
         "cake_stepfun_moe_75f123649cc57072713c",

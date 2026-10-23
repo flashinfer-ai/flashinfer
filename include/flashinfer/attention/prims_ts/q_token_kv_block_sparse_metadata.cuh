@@ -95,9 +95,33 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   uint_fastdiv pattern_heads;
   int32_t locator_page_stride;
   bool release_pdl;
+  // True: a complete current block competes inside top-k; append only a partial tail.
+  // False: exclude the current block from top-k and always append its visible tokens.
+  bool count_current_block_in_topk;
+  // Nonzero for request-aligned fixed Q; query_positions then stores KV lengths.
+  int32_t fixed_query_len;
 };
 
 namespace detail {
+
+template <typename PositionType>
+__device__ __forceinline__ int64_t
+QueryPosition(const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params, int32_t row) {
+  if (params.fixed_query_len > 0) {
+    const int64_t length = params.query_positions[row / params.fixed_query_len];
+    return length > 0 ? length - params.fixed_query_len + row % params.fixed_query_len : -1;
+  }
+  return static_cast<int64_t>(params.query_positions[row]);
+}
+
+// Excluding the current block leaves it outside the selection budget even
+// when its last token completes the block.
+template <typename PositionType>
+__device__ __forceinline__ int64_t SelectedBlockBound(
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params, int64_t visible) {
+  return (visible - (!params.count_current_block_in_topk && visible > 0)) >>
+         params.sparse_block_shift;
+}
 
 struct QTokenKvBlockSparseMembershipSegment {
   uint32_t logical_block;
@@ -184,8 +208,9 @@ __device__ __forceinline__ void InitRoute(
   int32_t lane_request = -1;
   int64_t lane_position = -1;
   if (lane < query_count) {
-    lane_request = params.token_to_request[first_row + lane];
-    lane_position = static_cast<int64_t>(params.query_positions[first_row + lane]);
+    lane_request = params.fixed_query_len > 0 ? (first_row + lane) / params.fixed_query_len
+                                              : params.token_to_request[first_row + lane];
+    lane_position = QueryPosition(params, first_row + lane);
   }
   const int32_t request = __shfl_sync(0xffffffffu, lane_request, 0);
   const int64_t first_position = __shfl_sync(0xffffffffu, static_cast<long long>(lane_position), 0);
@@ -287,9 +312,9 @@ __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1
   int32_t* row_indices = params.q_token_kv_block_sparse_page_indices +
                          static_cast<int64_t>(blockIdx.x) * params.page_capacity;
   const int32_t visible = route.valid ? static_cast<int32_t>(route.first_position + 1) : 0;
-  const int32_t causal_blocks = visible >> params.sparse_block_shift;
+  const int32_t causal_blocks = SelectedBlockBound(params, visible);
   const int32_t complete_blocks = min(causal_blocks, params.block_topk);
-  const int32_t tail = visible & (params.sparse_block_size - 1);
+  const int32_t tail = visible - causal_blocks * params.sparse_block_size;
   const int32_t compact_length = complete_blocks * params.sparse_block_size + tail;
   const int32_t live_fragments = (compact_length + params.fragment_size - 1) / params.fragment_size;
   const uint32_t head = blockIdx.x % params.pattern_heads;
@@ -380,7 +405,7 @@ __device__ __forceinline__ int BuildTouchedUnion(
     if (shared.route.valid && query < static_cast<uint32_t>(shared.route.query_count) &&
         candidate_rank < static_cast<uint32_t>(GroupSize * (params.block_topk + 1))) {
       const int64_t visible_tokens = shared.route.first_position + query + 1;
-      const int64_t complete_block_count = visible_tokens >> params.sparse_block_shift;
+      const int64_t complete_block_count = SelectedBlockBound(params, visible_tokens);
       const int32_t selected_count = static_cast<int32_t>(
           complete_block_count < params.block_topk ? complete_block_count : params.block_topk);
       if (query_item < static_cast<uint32_t>(selected_count)) {
@@ -406,7 +431,7 @@ __device__ __forceinline__ int BuildTouchedUnion(
     if (shared.route.valid && query < static_cast<uint32_t>(shared.route.query_count) &&
         candidate_rank < static_cast<uint32_t>(GroupSize * (params.block_topk + 1))) {
       const int64_t visible_tokens = shared.route.first_position + query + 1;
-      const int64_t complete_block_count = (visible_tokens >> params.sparse_block_shift);
+      const int64_t complete_block_count = SelectedBlockBound(params, visible_tokens);
       const int32_t selected_count = static_cast<int32_t>(
           complete_block_count < params.block_topk ? complete_block_count : params.block_topk);
       if (query_item < static_cast<uint32_t>(selected_count)) {
@@ -419,8 +444,9 @@ __device__ __forceinline__ int BuildTouchedUnion(
           logical_block = selected_block;
         }
       } else if (query_item == static_cast<uint32_t>(params.block_topk) &&
-                 (visible_tokens & (params.sparse_block_size - 1)) != 0) {
-        logical_block = (visible_tokens >> params.sparse_block_shift);
+                 (!params.count_current_block_in_topk ||
+                  (visible_tokens & (params.sparse_block_size - 1)) != 0)) {
+        logical_block = SelectedBlockBound(params, visible_tokens);
       }
     }
 
@@ -726,9 +752,9 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
       const int64_t row = static_cast<int64_t>(group) * GroupSize + query;
       if (query < static_cast<uint32_t>(GroupSize) &&
           query_item < static_cast<uint32_t>(params.block_topk) && row < params.rows) {
-        const int64_t position = static_cast<int64_t>(params.query_positions[row]);
+        const int64_t position = QueryPosition(params, static_cast<int32_t>(row));
         if (position >= 0 && position < params.max_seq_len_kv &&
-            query_item < static_cast<uint64_t>((position + 1) >> params.sparse_block_shift)) {
+            query_item < static_cast<uint64_t>(SelectedBlockBound(params, position + 1))) {
           prefetched_blocks[item] =
               params.block_indices[row * params.block_indices_row_stride +
                                    static_cast<int64_t>(head) * params.block_indices_head_stride +
@@ -812,7 +838,7 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
     if (shared.route.valid && query < static_cast<uint32_t>(shared.route.query_count) &&
         candidate_rank < static_cast<uint32_t>(GroupSize * (params.block_topk + 1))) {
       const int64_t visible_tokens = shared.route.first_position + query + 1;
-      const int64_t complete_block_count = visible_tokens >> params.sparse_block_shift;
+      const int64_t complete_block_count = SelectedBlockBound(params, visible_tokens);
       const int32_t selected_count = static_cast<int32_t>(
           complete_block_count < params.block_topk ? complete_block_count : params.block_topk);
       if (query_item < static_cast<uint32_t>(selected_count)) {
@@ -830,8 +856,9 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
           logical_block = selected_block;
         }
       } else if (query_item == static_cast<uint32_t>(params.block_topk) &&
-                 (visible_tokens & (params.sparse_block_size - 1)) != 0) {
-        logical_block = visible_tokens >> params.sparse_block_shift;
+                 (!params.count_current_block_in_topk ||
+                  (visible_tokens & (params.sparse_block_size - 1)) != 0)) {
+        logical_block = SelectedBlockBound(params, visible_tokens);
       }
     }
     candidate_blocks[item] = -1;

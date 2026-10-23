@@ -196,6 +196,17 @@ POLICY_ROWS = [
 # withdrawn, so every POLICY_ROWS cell takes the same program at 148 and 152 SMs.
 _ROUND_2_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {}
 
+# Round 5: the POLICY_ROWS cells whose program depends on the SM count after the round-5 route tables.
+# sm_103a (4096, 5) takes the held nc3 depth-3 K = 5 program at 152 SMs (``R2_PERSISTENT_KEY_CELLS``)
+# and keeps the early-consume nc4 program at 148 SMs.
+_ROUND_5_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
+    ("sm_103a", 4096, 5, 152): (
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2",
+        152,
+    ),
+}
+
 
 def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
     """The (grid, schedule id) a POLICY_ROWS cell takes on ``sm_count`` SMs: the native ports and the
@@ -212,7 +223,7 @@ def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
 @pytest.mark.parametrize("arch,M,K,pdl,kind,schedule_id,grid_x", POLICY_ROWS)
 def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
     grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
-    kind, schedule_id, grid_x = _ROUND_2_ROWS.get(
+    kind, schedule_id, grid_x = (_ROUND_2_ROWS | _ROUND_5_ROWS).get(
         (arch, M, K, sm_count), (kind, schedule_id, grid_x)
     )
     plan = plan_route(arch, sm_count, M, K, pdl)
@@ -312,7 +323,7 @@ def test_round_2_cells_take_their_table_program():
             assert plan.threads == cb.PERSISTENT_THREADS and 1 <= plan.grid_x <= max(
                 M, sm_count
             )
-            flags = key.removesuffix("_fm").rsplit("_f", 1)[1]
+            flags = cb._PERSISTENT_KEY.match(key).group(4)
             if flags[cb._PERSISTENT_FLAG_REGISTER_CARRY_ONLY] == "1":
                 assert flags[cb._PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1"
                 assert plan.schedule_id.split("_fastmath")[0].endswith(
@@ -329,6 +340,33 @@ def test_round_2_cells_take_their_table_program():
             )
             assert plan.fallback_from is None and plan.threads == cb.PERSISTENT_THREADS
             seen += 1
+    # Round 5: a write cell names the dense key of the program whose snapshot-write variant the cell
+    # runs (block K written); the dense cell itself keeps its own program.
+    for arch, sm_count, M, K, key in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
+        for pdl in (False, True):
+            plan = cb._plan_route_exact(arch, sm_count, M, K, pdl, block_write_idx=K)
+            assert plan.kind == "persistent" and plan.fallback_from is None, (plan, key)
+            assert plan.kernel_key == f"{key}_write", (
+                arch,
+                sm_count,
+                M,
+                K,
+                pdl,
+                plan.kernel_key,
+            )
+            assert (
+                plan.schedule_id.endswith("_write")
+                and plan.threads == cb.PERSISTENT_THREADS
+            )
+            assert 1 <= plan.grid_x <= max(M, sm_count)
+            dense = plan_route(arch, sm_count, M, K, pdl)
+            assert dense.kind == "persistent" and dense.kernel_key != key, (dense, key)
+            seen += 1
+    assert list(_r2_cells("WRITE_PERSISTENT_KEY_CELLS")) == [
+        ("sm_100a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+        ("sm_103a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+        ("sm_103a", 152, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+    ]
     for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS"):
         for pdl in (False, True):
             plan = plan_route(arch, sm_count, M, K, pdl)
@@ -383,14 +421,11 @@ def test_round_2_cells_take_their_table_program():
             "persistent:k1_nc4_d2_f110000000000000",
         )
     # Cells round 2 left alone keep the legacy program: the GB300 K6 M3 small-M cell, the B300 K6 M192
-    # (pair) and K5 M768 cells, the record-only K2 M8192 (152) / M4096 (148) cells.
+    # (pair) cell, the record-only K2 M8192 (152) / M4096 (148) cells.
     assert (
         plan_route("sm_103a", 152, 3, 6, False).kernel_key == "small_m_cluster2:k6_fm"
     )
     assert plan_route("sm_103a", 148, 192, 6, False).kind == "persistent"
-    assert plan_route("sm_103a", 148, 768, 5, False).kernel_key.startswith(
-        "persistent:k5_nc3_d3_f010"
-    )
     assert (
         plan_route("sm_103a", 152, 8192, 2, False).kernel_key
         == "persistent:k2_nc4_d2_f011000000000000"
@@ -399,12 +434,112 @@ def test_round_2_cells_take_their_table_program():
         plan_route("sm_103a", 148, 4096, 2, False).kernel_key
         == "persistent:k2_nc4_d2_f110000000000000"
     )
-    for arch in ARCHES:
-        for sm_count in SM_COUNTS:
-            assert "native_k5" not in {
-                plan_route(arch, sm_count, M, 5, False).kernel_key
-                for M in (192, 256, 384, 768)
-            }
+    # Round 3: the sm_103a K5 cells M = 192 / 256 / 768 and the sm_100a K5 cells M = 192 / 256 / 384 /
+    # 768 / 1024 / 1536 / 2048 run the native K5 port (one CTA per SM, one two-architecture program)
+    # at the qualified SM counts and both PDL modes; M = 384 on sm_103a keeps its round-2 persistent
+    # key and M = 512 on sm_100a its legacy one.
+    for sm_count in SM_COUNTS:
+        for M in (192, 256, 768):
+            for pdl in (False, True):
+                plan = plan_route("sm_103a", sm_count, M, 5, pdl)
+                assert (
+                    plan.kind,
+                    plan.kernel_key,
+                    plan.grid_x,
+                    plan.fallback_from,
+                ) == (
+                    "native",
+                    "native_k5",
+                    sm_count,
+                    None,
+                ), (sm_count, M, pdl, plan)
+                assert plan.schedule_id == f"native_k5_nc3_d2_ws288_grid{sm_count}"
+        assert (
+            plan_route("sm_103a", sm_count, 384, 5, False).kernel_key
+            == "persistent:k5_nc4_d2_f111000000000000"
+        )
+    for M in (192, 256, 384, 768, 1024, 1536, 2048):
+        for pdl in (False, True):
+            plan = plan_route("sm_100a", 148, M, 5, pdl)
+            assert (plan.kind, plan.kernel_key, plan.grid_x, plan.fallback_from) == (
+                "native",
+                "native_k5",
+                148,
+                None,
+            ), (M, pdl, plan)
+            assert plan.schedule_id == "native_k5_nc3_d2_ws288_grid148"
+    assert (
+        plan_route("sm_100a", 148, 512, 5, False).kernel_key
+        == "persistent:k5_nc4_d2_f110000000000000"
+    )
+    # Round 3: twelve sm_100a K2 / K3 cells run the fence-authored twins of their early-release
+    # persistent programs: the key of the fenced program plus ``_crfnone`` (a registered program of
+    # its own, never a fallback across that suffix), the schedule label plus ``_authored_fences``,
+    # the same grid; K3 M = 1024 / 1536 and the band interiors keep the fenced programs, and no
+    # ``_crfnone`` key exists on sm_103a.
+    for M, K in (
+        (2048, 3),
+        (3072, 3),
+        (6144, 3),
+        (8192, 3),
+        (12288, 3),
+        (16384, 3),
+        (3072, 2),
+        (4096, 2),
+        (6144, 2),
+        (8192, 2),
+        (12288, 2),
+        (16384, 2),
+    ):
+        fenced = f"persistent:k{K}_nc4_d2_f110000000000000"
+        fenced_label = cb._persistent_schedule_id(4, 2, "110000000000000")
+        for pdl in (False, True):
+            plan = plan_route("sm_100a", 148, M, K, pdl)
+            assert (plan.kind, plan.kernel_key, plan.fallback_from) == (
+                "persistent",
+                fenced + "_crfnone",
+                None,
+            ), (M, K, pdl, plan)
+            assert plan.schedule_id == fenced_label + "_authored_fences"
+            assert (plan.grid_x, plan.threads) == (
+                cb._grid(M, 148, 4)[0],
+                cb.PERSISTENT_THREADS,
+            )
+    for M, K in ((1024, 3), (1536, 3), (2560, 3), (5000, 2)):
+        for pdl in (False, True):
+            plan = plan_route("sm_100a", 148, M, K, pdl)
+            assert plan.kind == "persistent" and plan.fallback_from is None, (
+                M,
+                K,
+                pdl,
+                plan,
+            )
+            assert not plan.kernel_key.endswith("_crfnone"), (M, K, pdl, plan)
+            assert not plan.schedule_id.endswith("_authored_fences")
+    for pdl in (False, True):
+        assert (
+            plan_route("sm_100a", 148, 1024, 3, pdl).kernel_key
+            == "persistent:k3_nc4_d2_f110000000000000"
+        )
+    for sm_count in SM_COUNTS:
+        for M in (2048, 3072, 4096, 6144, 8192, 12288, 16384):
+            for K in (2, 3):
+                assert not plan_route(
+                    "sm_103a", sm_count, M, K, False
+                ).kernel_key.endswith("_crfnone")
+    if MODULES:
+        assert KERNELS["sm_100a"]["native_k5"] == KERNELS["sm_103a"]["native_k5"]
+        assert MODULES[KERNELS["sm_103a"]["native_k5"]]["arches"] == [
+            "sm_100a",
+            "sm_103a",
+        ]
+        for K in (2, 3):
+            key = f"persistent:k{K}_nc4_d2_f110000000000000_crfnone"
+            assert key in KERNELS["sm_100a"] and key not in KERNELS["sm_103a"]
+            assert MODULES[KERNELS["sm_100a"][key]]["arches"] == ["sm_100a"]
+            assert MODULES[KERNELS["sm_100a"][key]]["schedule_id"].endswith(
+                "_authored_fences"
+            )
 
 
 @pytest.mark.parametrize("pdl", (False, True))
@@ -412,8 +547,11 @@ def test_round_2_cells_take_their_table_program():
     "arch,M,nc,depth",
     (
         # sm_100a: nc4 depth 3 from the band edge (round r4 closing screening); the r1 M4096 cell keeps nc3 depth 3.
+        # The M1536 cell itself runs the native K5 port since round 3 phase C (asserted exactly in
+        # test_round_2_cells_take_their_table_program); M1537 is the first persistent row of the depth-3 band.
         ("sm_100a", 1535, 4, 2),
-        ("sm_100a", 1536, 4, 3),
+        ("sm_100a", 1537, 4, 3),
+        ("sm_100a", 2049, 4, 3),
         ("sm_100a", 3072, 4, 3),
         ("sm_100a", 4096, 3, 3),
         ("sm_100a", 8192, 4, 3),
@@ -428,7 +566,9 @@ def test_round_2_cells_take_their_table_program():
 def test_plan_route_k5_depth3_bands(arch, M, nc, depth, pdl):
     """Round r4: the persistent K5 program runs four sources per chunk with a depth-3 pipeline from the
     per-architecture band edge (same-GPU ABBA, bit-identical, 1.3-3.8 % faster than depth 2); the band
-    edges are the dispatcher / evaluator / FI mirror constants."""
+    edges are the dispatcher / evaluator / FI mirror constants. Since round 3 phase C the sm_100a exact
+    cells M 192 / 256 / 384 / 768 / 1024 / 1536 / 2048 (K = 5) run the native K5 port instead (asserted
+    in test_round_2_cells_take_their_table_program), so the sm_100a rows here sit beside those cells."""
     plan = plan_route(arch, SM_COUNT, M, 5, pdl)
     assert plan.kind == "persistent", plan
     assert f"_nc{nc}_d{depth}_" in plan.schedule_id, (plan.schedule_id, nc, depth)
@@ -477,6 +617,44 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
     for bad_idx in (K - 1, K + 1, MAX_BLOCKS):
         with pytest.raises(ValueError):
             cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=bad_idx)
+
+
+def test_write_cell_programs_serve_their_cells_only():
+    """A ``WRITE_PERSISTENT_KEY_CELLS`` program is the exact program of its cells and never the
+    registered-variant fallback of another snapshot-write plan (round 5 pins the (4096, 4) write
+    cell to a depth-2 program that would otherwise be the closest registered variant of every
+    unregistered depth-2 K = 4 write key), so pinning a write cell changes no other route."""
+    cells = {}
+    for arch, sm_count, M, K, key in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
+        cells[(arch, sm_count, M, K)] = f"{key}_write"
+    pinned = {
+        arch: {k for (a, _s, _m, _k), k in cells.items() if a == arch}
+        for arch in ARCHES
+    }
+    assert all(pinned[arch] for arch in ARCHES)
+    assert pinned == {arch: cb._cell_pinned_write_keys(arch) for arch in ARCHES}
+    seen = 0
+    for arch in ARCHES:
+        for sm_count in SM_COUNTS:
+            for K in range(1, MAX_BLOCKS):
+                for pdl in (False, True):
+                    for M in _table_edge_token_counts():
+                        plan = plan_route(arch, sm_count, M, K, pdl, block_write_idx=K)
+                        if (arch, sm_count, M, K) in cells:
+                            assert plan.kernel_key == cells[arch, sm_count, M, K]
+                            assert plan.fallback_from is None
+                            continue
+                        assert plan.kernel_key not in pinned[arch], (
+                            arch,
+                            sm_count,
+                            M,
+                            K,
+                            pdl,
+                            plan.kernel_key,
+                            plan.fallback_from,
+                        )
+                        seen += plan.fallback_from is not None
+    assert seen
 
 
 def test_snapshot_write_fallback_stays_in_the_write_family(monkeypatch):
@@ -815,7 +993,7 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the round-2 cells, the release bands, the nc / depth edges, the native and pair cells) and, for
+# the round-2 / round-3 cells, the release bands, the nc / depth edges, the native and pair cells) and, for
 # K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
 # ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
 # fmt: off
@@ -827,11 +1005,11 @@ _ROUTE_BAND_START_ROWS = {
     ),
     2: (
         1, 192, 193, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072,
-        3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289,
+        3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289, 16384,
     ),
     3: (
         1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 256, 257, 385, 769,
-        4096, 4097,
+        2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289, 16384,
     ),
     4: (
         1, 5, 17, 129, 192, 193, 256, 257, 384, 385, 512, 513, 1024, 1025, 1537, 2048, 2049, 4096,
@@ -839,7 +1017,7 @@ _ROUTE_BAND_START_ROWS = {
     ),
     5: (
         1, 5, 9, 12, 13, 16, 17, 33, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024,
-        1025, 1536, 4096, 4097,
+        1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193,
     ),
     6: (1, 2, 5, 17, 33, 129, 192, 193, 384, 513),
     7: (1, 5, 17, 33, 65, 129, 192, 193, 256, 257, 385, 513, 768, 769),
@@ -857,7 +1035,9 @@ GPU_ROWS = sorted(
         (256, 1),
         (512, 1),
         # round-2 cells: the pair kernel, the native K7 / K8 / M128 ports, the register-carry and
-        # early + packed-add persistent programs, the per-PDL K1 M6144 cell
+        # early + packed-add persistent programs, the per-PDL K1 M6144 cell; round 3: the sm_103a
+        # K5 M192 / M256 / M768 and sm_100a K5 M192 ... M2048 cells of the native K5 port and the
+        # twelve sm_100a K2 / K3 fence-authored cells (every one of them a band start above)
         (192, 4),
         (192, 6),
         (192, 7),

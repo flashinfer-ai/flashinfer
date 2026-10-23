@@ -65,7 +65,7 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
     int* warp_totals = reinterpret_cast<int*>(smem_raw + 1024);
     const int warp_totals_addr = smem + 1024;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int thread_idx = (int)tid;
     int bid_0 = (int)bid;
     int nbids = (int)num_bids;
@@ -93,8 +93,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local = ((local_idx >= 0 && local_idx < extent && (local_idx & stride_mask) == 0) ? 1 : 0);
             exp_off[0] = 0;
             if (is_local != 0) {
-                unsigned int _atomic_old_0 = atomicAdd(&smem_expert_count[idx_ii], 1);
-                exp_off[0] = (int)_atomic_old_0;
+                unsigned int _atomic_fetch_add_0 = atomicAdd(&smem_expert_count[idx_ii], 1);
+                exp_off[0] = (int)_atomic_fetch_add_0;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0 << 16);
             expanded = grid_tid + grid_threads;
@@ -108,8 +108,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6 = ((local_idx_3 >= 0 && local_idx_3 < extent_4 && (local_idx_3 & stride_mask_5) == 0) ? 1 : 0);
             exp_off[1] = 0;
             if (is_local_6 != 0) {
-                unsigned int _atomic_old_1 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
-                exp_off[1] = (int)_atomic_old_1;
+                unsigned int _atomic_fetch_add_1 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
+                exp_off[1] = (int)_atomic_fetch_add_1;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2 << 16);
             expanded = grid_tid + 2 * grid_threads;
@@ -123,8 +123,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13 = ((local_idx_10 >= 0 && local_idx_10 < extent_11 && (local_idx_10 & stride_mask_12) == 0) ? 1 : 0);
             exp_off[2] = 0;
             if (is_local_13 != 0) {
-                unsigned int _atomic_old_2 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
-                exp_off[2] = (int)_atomic_old_2;
+                unsigned int _atomic_fetch_add_2 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
+                exp_off[2] = (int)_atomic_fetch_add_2;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9 << 16);
             expanded = grid_tid + 3 * grid_threads;
@@ -138,8 +138,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20 = ((local_idx_17 >= 0 && local_idx_17 < extent_18 && (local_idx_17 & stride_mask_19) == 0) ? 1 : 0);
             exp_off[3] = 0;
             if (is_local_20 != 0) {
-                unsigned int _atomic_old_3 = atomicAdd(&smem_expert_count[idx_ii_15], 1);
-                exp_off[3] = (int)_atomic_old_3;
+                unsigned int _atomic_fetch_add_3 = atomicAdd(&smem_expert_count[idx_ii_15], 1);
+                exp_off[3] = (int)_atomic_fetch_add_3;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16 << 16);
         } else {
@@ -158,8 +158,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_1 = ((local_idx_1 >= 0 && local_idx_1 < extent_1 && (local_idx_1 & stride_mask_1) == 0) ? 1 : 0);
                     exp_off[0] = 0;
                     if (is_local_1 != 0) {
-                        unsigned int _atomic_old_4 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
-                        exp_off[0] = (int)_atomic_old_4;
+                        unsigned int _atomic_fetch_add_4 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
+                        exp_off[0] = (int)_atomic_fetch_add_4;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_1 << 16);
                 }
@@ -179,8 +179,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_2 = ((local_idx_2 >= 0 && local_idx_2 < extent_2 && (local_idx_2 & stride_mask_2) == 0) ? 1 : 0);
                     exp_off[1] = 0;
                     if (is_local_2 != 0) {
-                        unsigned int _atomic_old_5 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
-                        exp_off[1] = (int)_atomic_old_5;
+                        unsigned int _atomic_fetch_add_5 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
+                        exp_off[1] = (int)_atomic_fetch_add_5;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_3 << 16);
                 }
@@ -200,8 +200,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_3 = ((local_idx_4 >= 0 && local_idx_4 < extent_3 && (local_idx_4 & stride_mask_3) == 0) ? 1 : 0);
                     exp_off[2] = 0;
                     if (is_local_3 != 0) {
-                        unsigned int _atomic_old_6 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
-                        exp_off[2] = (int)_atomic_old_6;
+                        unsigned int _atomic_fetch_add_6 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
+                        exp_off[2] = (int)_atomic_fetch_add_6;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_4 << 16);
                 }
@@ -221,8 +221,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_4 = ((local_idx_5 >= 0 && local_idx_5 < extent_5 && (local_idx_5 & stride_mask_4) == 0) ? 1 : 0);
                     exp_off[3] = 0;
                     if (is_local_4 != 0) {
-                        unsigned int _atomic_old_7 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
-                        exp_off[3] = (int)_atomic_old_7;
+                        unsigned int _atomic_fetch_add_7 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
+                        exp_off[3] = (int)_atomic_fetch_add_7;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_5 << 16);
                 }
@@ -242,8 +242,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_5 = ((local_idx_6 >= 0 && local_idx_6 < extent_6 && (local_idx_6 & stride_mask_6) == 0) ? 1 : 0);
             exp_off[4] = 0;
             if (is_local_5 != 0) {
-                unsigned int _atomic_old_8 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
-                exp_off[4] = (int)_atomic_old_8;
+                unsigned int _atomic_fetch_add_8 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
+                exp_off[4] = (int)_atomic_fetch_add_8;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_6 << 16);
             expanded = grid_tid + 5 * grid_threads;
@@ -257,8 +257,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_1 = ((local_idx_3_1 >= 0 && local_idx_3_1 < extent_4_1 && (local_idx_3_1 & stride_mask_5_1) == 0) ? 1 : 0);
             exp_off[5] = 0;
             if (is_local_6_1 != 0) {
-                unsigned int _atomic_old_9 = atomicAdd(&smem_expert_count[idx_ii_1_1], 1);
-                exp_off[5] = (int)_atomic_old_9;
+                unsigned int _atomic_fetch_add_9 = atomicAdd(&smem_expert_count[idx_ii_1_1], 1);
+                exp_off[5] = (int)_atomic_fetch_add_9;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_1 << 16);
             expanded = grid_tid + 6 * grid_threads;
@@ -272,8 +272,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_1 = ((local_idx_10_1 >= 0 && local_idx_10_1 < extent_11_1 && (local_idx_10_1 & stride_mask_12_1) == 0) ? 1 : 0);
             exp_off[6] = 0;
             if (is_local_13_1 != 0) {
-                unsigned int _atomic_old_10 = atomicAdd(&smem_expert_count[idx_ii_8_1], 1);
-                exp_off[6] = (int)_atomic_old_10;
+                unsigned int _atomic_fetch_add_10 = atomicAdd(&smem_expert_count[idx_ii_8_1], 1);
+                exp_off[6] = (int)_atomic_fetch_add_10;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_1 << 16);
             expanded = grid_tid + 7 * grid_threads;
@@ -287,8 +287,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_1 = ((local_idx_17_1 >= 0 && local_idx_17_1 < extent_18_1 && (local_idx_17_1 & stride_mask_19_1) == 0) ? 1 : 0);
             exp_off[7] = 0;
             if (is_local_20_1 != 0) {
-                unsigned int _atomic_old_11 = atomicAdd(&smem_expert_count[idx_ii_15_1], 1);
-                exp_off[7] = (int)_atomic_old_11;
+                unsigned int _atomic_fetch_add_11 = atomicAdd(&smem_expert_count[idx_ii_15_1], 1);
+                exp_off[7] = (int)_atomic_fetch_add_11;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_1 << 16);
         } else {
@@ -307,8 +307,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_7 = ((local_idx_7 >= 0 && local_idx_7 < extent_7 && (local_idx_7 & stride_mask_7) == 0) ? 1 : 0);
                     exp_off[4] = 0;
                     if (is_local_7 != 0) {
-                        unsigned int _atomic_old_12 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
-                        exp_off[4] = (int)_atomic_old_12;
+                        unsigned int _atomic_fetch_add_12 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
+                        exp_off[4] = (int)_atomic_fetch_add_12;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_7 << 16);
                 }
@@ -328,8 +328,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_8 = ((local_idx_8 >= 0 && local_idx_8 < extent_8 && (local_idx_8 & stride_mask_8) == 0) ? 1 : 0);
                     exp_off[5] = 0;
                     if (is_local_8 != 0) {
-                        unsigned int _atomic_old_13 = atomicAdd(&smem_expert_count[idx_ii_9], 1);
-                        exp_off[5] = (int)_atomic_old_13;
+                        unsigned int _atomic_fetch_add_13 = atomicAdd(&smem_expert_count[idx_ii_9], 1);
+                        exp_off[5] = (int)_atomic_fetch_add_13;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_8 << 16);
                 }
@@ -349,8 +349,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_9 = ((local_idx_9 >= 0 && local_idx_9 < extent_9 && (local_idx_9 & stride_mask_9) == 0) ? 1 : 0);
                     exp_off[6] = 0;
                     if (is_local_9 != 0) {
-                        unsigned int _atomic_old_14 = atomicAdd(&smem_expert_count[idx_ii_10], 1);
-                        exp_off[6] = (int)_atomic_old_14;
+                        unsigned int _atomic_fetch_add_14 = atomicAdd(&smem_expert_count[idx_ii_10], 1);
+                        exp_off[6] = (int)_atomic_fetch_add_14;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_10 << 16);
                 }
@@ -370,8 +370,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_10 = ((local_idx_11 >= 0 && local_idx_11 < extent_10 && (local_idx_11 & stride_mask_10) == 0) ? 1 : 0);
                     exp_off[7] = 0;
                     if (is_local_10 != 0) {
-                        unsigned int _atomic_old_15 = atomicAdd(&smem_expert_count[idx_ii_11], 1);
-                        exp_off[7] = (int)_atomic_old_15;
+                        unsigned int _atomic_fetch_add_15 = atomicAdd(&smem_expert_count[idx_ii_11], 1);
+                        exp_off[7] = (int)_atomic_fetch_add_15;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_11 << 16);
                 }
@@ -391,8 +391,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_11 = ((local_idx_12 >= 0 && local_idx_12 < extent_12 && (local_idx_12 & stride_mask_11) == 0) ? 1 : 0);
             exp_off[8] = 0;
             if (is_local_11 != 0) {
-                unsigned int _atomic_old_16 = atomicAdd(&smem_expert_count[idx_ii_12], 1);
-                exp_off[8] = (int)_atomic_old_16;
+                unsigned int _atomic_fetch_add_16 = atomicAdd(&smem_expert_count[idx_ii_12], 1);
+                exp_off[8] = (int)_atomic_fetch_add_16;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_12 << 16);
             expanded = grid_tid + 9 * grid_threads;
@@ -406,8 +406,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_2 = ((local_idx_3_2 >= 0 && local_idx_3_2 < extent_4_2 && (local_idx_3_2 & stride_mask_5_2) == 0) ? 1 : 0);
             exp_off[9] = 0;
             if (is_local_6_2 != 0) {
-                unsigned int _atomic_old_17 = atomicAdd(&smem_expert_count[idx_ii_1_2], 1);
-                exp_off[9] = (int)_atomic_old_17;
+                unsigned int _atomic_fetch_add_17 = atomicAdd(&smem_expert_count[idx_ii_1_2], 1);
+                exp_off[9] = (int)_atomic_fetch_add_17;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_2 << 16);
             expanded = grid_tid + 10 * grid_threads;
@@ -421,8 +421,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_2 = ((local_idx_10_2 >= 0 && local_idx_10_2 < extent_11_2 && (local_idx_10_2 & stride_mask_12_2) == 0) ? 1 : 0);
             exp_off[10] = 0;
             if (is_local_13_2 != 0) {
-                unsigned int _atomic_old_18 = atomicAdd(&smem_expert_count[idx_ii_8_2], 1);
-                exp_off[10] = (int)_atomic_old_18;
+                unsigned int _atomic_fetch_add_18 = atomicAdd(&smem_expert_count[idx_ii_8_2], 1);
+                exp_off[10] = (int)_atomic_fetch_add_18;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_2 << 16);
             expanded = grid_tid + 11 * grid_threads;
@@ -436,8 +436,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_2 = ((local_idx_17_2 >= 0 && local_idx_17_2 < extent_18_2 && (local_idx_17_2 & stride_mask_19_2) == 0) ? 1 : 0);
             exp_off[11] = 0;
             if (is_local_20_2 != 0) {
-                unsigned int _atomic_old_19 = atomicAdd(&smem_expert_count[idx_ii_15_2], 1);
-                exp_off[11] = (int)_atomic_old_19;
+                unsigned int _atomic_fetch_add_19 = atomicAdd(&smem_expert_count[idx_ii_15_2], 1);
+                exp_off[11] = (int)_atomic_fetch_add_19;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_2 << 16);
         } else {
@@ -456,8 +456,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_12 = ((local_idx_13 >= 0 && local_idx_13 < extent_13 && (local_idx_13 & stride_mask_13) == 0) ? 1 : 0);
                     exp_off[8] = 0;
                     if (is_local_12 != 0) {
-                        unsigned int _atomic_old_20 = atomicAdd(&smem_expert_count[idx_ii_13], 1);
-                        exp_off[8] = (int)_atomic_old_20;
+                        unsigned int _atomic_fetch_add_20 = atomicAdd(&smem_expert_count[idx_ii_13], 1);
+                        exp_off[8] = (int)_atomic_fetch_add_20;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_13 << 16);
                 }
@@ -477,8 +477,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_14 = ((local_idx_14 >= 0 && local_idx_14 < extent_14 && (local_idx_14 & stride_mask_14) == 0) ? 1 : 0);
                     exp_off[9] = 0;
                     if (is_local_14 != 0) {
-                        unsigned int _atomic_old_21 = atomicAdd(&smem_expert_count[idx_ii_14], 1);
-                        exp_off[9] = (int)_atomic_old_21;
+                        unsigned int _atomic_fetch_add_21 = atomicAdd(&smem_expert_count[idx_ii_14], 1);
+                        exp_off[9] = (int)_atomic_fetch_add_21;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_14 << 16);
                 }
@@ -498,8 +498,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_15 = ((local_idx_15 >= 0 && local_idx_15 < extent_15 && (local_idx_15 & stride_mask_15) == 0) ? 1 : 0);
                     exp_off[10] = 0;
                     if (is_local_15 != 0) {
-                        unsigned int _atomic_old_22 = atomicAdd(&smem_expert_count[idx_ii_16], 1);
-                        exp_off[10] = (int)_atomic_old_22;
+                        unsigned int _atomic_fetch_add_22 = atomicAdd(&smem_expert_count[idx_ii_16], 1);
+                        exp_off[10] = (int)_atomic_fetch_add_22;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_15 << 16);
                 }
@@ -519,8 +519,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_16 = ((local_idx_16 >= 0 && local_idx_16 < extent_16 && (local_idx_16 & stride_mask_16) == 0) ? 1 : 0);
                     exp_off[11] = 0;
                     if (is_local_16 != 0) {
-                        unsigned int _atomic_old_23 = atomicAdd(&smem_expert_count[idx_ii_17], 1);
-                        exp_off[11] = (int)_atomic_old_23;
+                        unsigned int _atomic_fetch_add_23 = atomicAdd(&smem_expert_count[idx_ii_17], 1);
+                        exp_off[11] = (int)_atomic_fetch_add_23;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_17 << 16);
                 }
@@ -540,8 +540,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_17 = ((local_idx_18 >= 0 && local_idx_18 < extent_17 && (local_idx_18 & stride_mask_17) == 0) ? 1 : 0);
             exp_off[12] = 0;
             if (is_local_17 != 0) {
-                unsigned int _atomic_old_24 = atomicAdd(&smem_expert_count[idx_ii_18], 1);
-                exp_off[12] = (int)_atomic_old_24;
+                unsigned int _atomic_fetch_add_24 = atomicAdd(&smem_expert_count[idx_ii_18], 1);
+                exp_off[12] = (int)_atomic_fetch_add_24;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_18 << 16);
             expanded = grid_tid + 13 * grid_threads;
@@ -555,8 +555,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_3 = ((local_idx_3_3 >= 0 && local_idx_3_3 < extent_4_3 && (local_idx_3_3 & stride_mask_5_3) == 0) ? 1 : 0);
             exp_off[13] = 0;
             if (is_local_6_3 != 0) {
-                unsigned int _atomic_old_25 = atomicAdd(&smem_expert_count[idx_ii_1_3], 1);
-                exp_off[13] = (int)_atomic_old_25;
+                unsigned int _atomic_fetch_add_25 = atomicAdd(&smem_expert_count[idx_ii_1_3], 1);
+                exp_off[13] = (int)_atomic_fetch_add_25;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_3 << 16);
             expanded = grid_tid + 14 * grid_threads;
@@ -570,8 +570,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_3 = ((local_idx_10_3 >= 0 && local_idx_10_3 < extent_11_3 && (local_idx_10_3 & stride_mask_12_3) == 0) ? 1 : 0);
             exp_off[14] = 0;
             if (is_local_13_3 != 0) {
-                unsigned int _atomic_old_26 = atomicAdd(&smem_expert_count[idx_ii_8_3], 1);
-                exp_off[14] = (int)_atomic_old_26;
+                unsigned int _atomic_fetch_add_26 = atomicAdd(&smem_expert_count[idx_ii_8_3], 1);
+                exp_off[14] = (int)_atomic_fetch_add_26;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_3 << 16);
             expanded = grid_tid + 15 * grid_threads;
@@ -585,8 +585,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_3 = ((local_idx_17_3 >= 0 && local_idx_17_3 < extent_18_3 && (local_idx_17_3 & stride_mask_19_3) == 0) ? 1 : 0);
             exp_off[15] = 0;
             if (is_local_20_3 != 0) {
-                unsigned int _atomic_old_27 = atomicAdd(&smem_expert_count[idx_ii_15_3], 1);
-                exp_off[15] = (int)_atomic_old_27;
+                unsigned int _atomic_fetch_add_27 = atomicAdd(&smem_expert_count[idx_ii_15_3], 1);
+                exp_off[15] = (int)_atomic_fetch_add_27;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_3 << 16);
         } else {
@@ -605,8 +605,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_18 = ((local_idx_19 >= 0 && local_idx_19 < extent_19 && (local_idx_19 & stride_mask_18) == 0) ? 1 : 0);
                     exp_off[12] = 0;
                     if (is_local_18 != 0) {
-                        unsigned int _atomic_old_28 = atomicAdd(&smem_expert_count[idx_ii_19], 1);
-                        exp_off[12] = (int)_atomic_old_28;
+                        unsigned int _atomic_fetch_add_28 = atomicAdd(&smem_expert_count[idx_ii_19], 1);
+                        exp_off[12] = (int)_atomic_fetch_add_28;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_19 << 16);
                 }
@@ -626,8 +626,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_19 = ((local_idx_20 >= 0 && local_idx_20 < extent_20 && (local_idx_20 & stride_mask_20) == 0) ? 1 : 0);
                     exp_off[13] = 0;
                     if (is_local_19 != 0) {
-                        unsigned int _atomic_old_29 = atomicAdd(&smem_expert_count[idx_ii_20], 1);
-                        exp_off[13] = (int)_atomic_old_29;
+                        unsigned int _atomic_fetch_add_29 = atomicAdd(&smem_expert_count[idx_ii_20], 1);
+                        exp_off[13] = (int)_atomic_fetch_add_29;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_20 << 16);
                 }
@@ -647,8 +647,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_21 = ((local_idx_21 >= 0 && local_idx_21 < extent_21 && (local_idx_21 & stride_mask_21) == 0) ? 1 : 0);
                     exp_off[14] = 0;
                     if (is_local_21 != 0) {
-                        unsigned int _atomic_old_30 = atomicAdd(&smem_expert_count[idx_ii_21], 1);
-                        exp_off[14] = (int)_atomic_old_30;
+                        unsigned int _atomic_fetch_add_30 = atomicAdd(&smem_expert_count[idx_ii_21], 1);
+                        exp_off[14] = (int)_atomic_fetch_add_30;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_21 << 16);
                 }
@@ -668,8 +668,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_22 = ((local_idx_22 >= 0 && local_idx_22 < extent_22 && (local_idx_22 & stride_mask_22) == 0) ? 1 : 0);
                     exp_off[15] = 0;
                     if (is_local_22 != 0) {
-                        unsigned int _atomic_old_31 = atomicAdd(&smem_expert_count[idx_ii_22], 1);
-                        exp_off[15] = (int)_atomic_old_31;
+                        unsigned int _atomic_fetch_add_31 = atomicAdd(&smem_expert_count[idx_ii_22], 1);
+                        exp_off[15] = (int)_atomic_fetch_add_31;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_22 << 16);
                 }
@@ -689,8 +689,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_23 = ((local_idx_23 >= 0 && local_idx_23 < extent_23 && (local_idx_23 & stride_mask_23) == 0) ? 1 : 0);
             exp_off[16] = 0;
             if (is_local_23 != 0) {
-                unsigned int _atomic_old_32 = atomicAdd(&smem_expert_count[idx_ii_23], 1);
-                exp_off[16] = (int)_atomic_old_32;
+                unsigned int _atomic_fetch_add_32 = atomicAdd(&smem_expert_count[idx_ii_23], 1);
+                exp_off[16] = (int)_atomic_fetch_add_32;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_23 << 16);
             expanded = grid_tid + 17 * grid_threads;
@@ -704,8 +704,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_4 = ((local_idx_3_4 >= 0 && local_idx_3_4 < extent_4_4 && (local_idx_3_4 & stride_mask_5_4) == 0) ? 1 : 0);
             exp_off[17] = 0;
             if (is_local_6_4 != 0) {
-                unsigned int _atomic_old_33 = atomicAdd(&smem_expert_count[idx_ii_1_4], 1);
-                exp_off[17] = (int)_atomic_old_33;
+                unsigned int _atomic_fetch_add_33 = atomicAdd(&smem_expert_count[idx_ii_1_4], 1);
+                exp_off[17] = (int)_atomic_fetch_add_33;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_4 << 16);
             expanded = grid_tid + 18 * grid_threads;
@@ -719,8 +719,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_4 = ((local_idx_10_4 >= 0 && local_idx_10_4 < extent_11_4 && (local_idx_10_4 & stride_mask_12_4) == 0) ? 1 : 0);
             exp_off[18] = 0;
             if (is_local_13_4 != 0) {
-                unsigned int _atomic_old_34 = atomicAdd(&smem_expert_count[idx_ii_8_4], 1);
-                exp_off[18] = (int)_atomic_old_34;
+                unsigned int _atomic_fetch_add_34 = atomicAdd(&smem_expert_count[idx_ii_8_4], 1);
+                exp_off[18] = (int)_atomic_fetch_add_34;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_4 << 16);
             expanded = grid_tid + 19 * grid_threads;
@@ -734,8 +734,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_4 = ((local_idx_17_4 >= 0 && local_idx_17_4 < extent_18_4 && (local_idx_17_4 & stride_mask_19_4) == 0) ? 1 : 0);
             exp_off[19] = 0;
             if (is_local_20_4 != 0) {
-                unsigned int _atomic_old_35 = atomicAdd(&smem_expert_count[idx_ii_15_4], 1);
-                exp_off[19] = (int)_atomic_old_35;
+                unsigned int _atomic_fetch_add_35 = atomicAdd(&smem_expert_count[idx_ii_15_4], 1);
+                exp_off[19] = (int)_atomic_fetch_add_35;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_4 << 16);
         } else {
@@ -754,8 +754,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_24 = ((local_idx_24 >= 0 && local_idx_24 < extent_24 && (local_idx_24 & stride_mask_24) == 0) ? 1 : 0);
                     exp_off[16] = 0;
                     if (is_local_24 != 0) {
-                        unsigned int _atomic_old_36 = atomicAdd(&smem_expert_count[idx_ii_24], 1);
-                        exp_off[16] = (int)_atomic_old_36;
+                        unsigned int _atomic_fetch_add_36 = atomicAdd(&smem_expert_count[idx_ii_24], 1);
+                        exp_off[16] = (int)_atomic_fetch_add_36;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_24 << 16);
                 }
@@ -775,8 +775,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_25 = ((local_idx_25 >= 0 && local_idx_25 < extent_25 && (local_idx_25 & stride_mask_25) == 0) ? 1 : 0);
                     exp_off[17] = 0;
                     if (is_local_25 != 0) {
-                        unsigned int _atomic_old_37 = atomicAdd(&smem_expert_count[idx_ii_25], 1);
-                        exp_off[17] = (int)_atomic_old_37;
+                        unsigned int _atomic_fetch_add_37 = atomicAdd(&smem_expert_count[idx_ii_25], 1);
+                        exp_off[17] = (int)_atomic_fetch_add_37;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_25 << 16);
                 }
@@ -796,8 +796,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_26 = ((local_idx_26 >= 0 && local_idx_26 < extent_26 && (local_idx_26 & stride_mask_26) == 0) ? 1 : 0);
                     exp_off[18] = 0;
                     if (is_local_26 != 0) {
-                        unsigned int _atomic_old_38 = atomicAdd(&smem_expert_count[idx_ii_26], 1);
-                        exp_off[18] = (int)_atomic_old_38;
+                        unsigned int _atomic_fetch_add_38 = atomicAdd(&smem_expert_count[idx_ii_26], 1);
+                        exp_off[18] = (int)_atomic_fetch_add_38;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_26 << 16);
                 }
@@ -817,8 +817,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_27 = ((local_idx_27 >= 0 && local_idx_27 < extent_27 && (local_idx_27 & stride_mask_27) == 0) ? 1 : 0);
                     exp_off[19] = 0;
                     if (is_local_27 != 0) {
-                        unsigned int _atomic_old_39 = atomicAdd(&smem_expert_count[idx_ii_27], 1);
-                        exp_off[19] = (int)_atomic_old_39;
+                        unsigned int _atomic_fetch_add_39 = atomicAdd(&smem_expert_count[idx_ii_27], 1);
+                        exp_off[19] = (int)_atomic_fetch_add_39;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_27 << 16);
                 }
@@ -838,8 +838,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_28 = ((local_idx_28 >= 0 && local_idx_28 < extent_28 && (local_idx_28 & stride_mask_28) == 0) ? 1 : 0);
             exp_off[20] = 0;
             if (is_local_28 != 0) {
-                unsigned int _atomic_old_40 = atomicAdd(&smem_expert_count[idx_ii_28], 1);
-                exp_off[20] = (int)_atomic_old_40;
+                unsigned int _atomic_fetch_add_40 = atomicAdd(&smem_expert_count[idx_ii_28], 1);
+                exp_off[20] = (int)_atomic_fetch_add_40;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_28 << 16);
             expanded = grid_tid + 21 * grid_threads;
@@ -853,8 +853,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_5 = ((local_idx_3_5 >= 0 && local_idx_3_5 < extent_4_5 && (local_idx_3_5 & stride_mask_5_5) == 0) ? 1 : 0);
             exp_off[21] = 0;
             if (is_local_6_5 != 0) {
-                unsigned int _atomic_old_41 = atomicAdd(&smem_expert_count[idx_ii_1_5], 1);
-                exp_off[21] = (int)_atomic_old_41;
+                unsigned int _atomic_fetch_add_41 = atomicAdd(&smem_expert_count[idx_ii_1_5], 1);
+                exp_off[21] = (int)_atomic_fetch_add_41;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_5 << 16);
             expanded = grid_tid + 22 * grid_threads;
@@ -868,8 +868,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_5 = ((local_idx_10_5 >= 0 && local_idx_10_5 < extent_11_5 && (local_idx_10_5 & stride_mask_12_5) == 0) ? 1 : 0);
             exp_off[22] = 0;
             if (is_local_13_5 != 0) {
-                unsigned int _atomic_old_42 = atomicAdd(&smem_expert_count[idx_ii_8_5], 1);
-                exp_off[22] = (int)_atomic_old_42;
+                unsigned int _atomic_fetch_add_42 = atomicAdd(&smem_expert_count[idx_ii_8_5], 1);
+                exp_off[22] = (int)_atomic_fetch_add_42;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_5 << 16);
             expanded = grid_tid + 23 * grid_threads;
@@ -883,8 +883,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_5 = ((local_idx_17_5 >= 0 && local_idx_17_5 < extent_18_5 && (local_idx_17_5 & stride_mask_19_5) == 0) ? 1 : 0);
             exp_off[23] = 0;
             if (is_local_20_5 != 0) {
-                unsigned int _atomic_old_43 = atomicAdd(&smem_expert_count[idx_ii_15_5], 1);
-                exp_off[23] = (int)_atomic_old_43;
+                unsigned int _atomic_fetch_add_43 = atomicAdd(&smem_expert_count[idx_ii_15_5], 1);
+                exp_off[23] = (int)_atomic_fetch_add_43;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_5 << 16);
         } else {
@@ -903,8 +903,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_29 = ((local_idx_29 >= 0 && local_idx_29 < extent_29 && (local_idx_29 & stride_mask_29) == 0) ? 1 : 0);
                     exp_off[20] = 0;
                     if (is_local_29 != 0) {
-                        unsigned int _atomic_old_44 = atomicAdd(&smem_expert_count[idx_ii_29], 1);
-                        exp_off[20] = (int)_atomic_old_44;
+                        unsigned int _atomic_fetch_add_44 = atomicAdd(&smem_expert_count[idx_ii_29], 1);
+                        exp_off[20] = (int)_atomic_fetch_add_44;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_29 << 16);
                 }
@@ -924,8 +924,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_30 = ((local_idx_30 >= 0 && local_idx_30 < extent_30 && (local_idx_30 & stride_mask_30) == 0) ? 1 : 0);
                     exp_off[21] = 0;
                     if (is_local_30 != 0) {
-                        unsigned int _atomic_old_45 = atomicAdd(&smem_expert_count[idx_ii_30], 1);
-                        exp_off[21] = (int)_atomic_old_45;
+                        unsigned int _atomic_fetch_add_45 = atomicAdd(&smem_expert_count[idx_ii_30], 1);
+                        exp_off[21] = (int)_atomic_fetch_add_45;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_30 << 16);
                 }
@@ -945,8 +945,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_31 = ((local_idx_31 >= 0 && local_idx_31 < extent_31 && (local_idx_31 & stride_mask_31) == 0) ? 1 : 0);
                     exp_off[22] = 0;
                     if (is_local_31 != 0) {
-                        unsigned int _atomic_old_46 = atomicAdd(&smem_expert_count[idx_ii_31], 1);
-                        exp_off[22] = (int)_atomic_old_46;
+                        unsigned int _atomic_fetch_add_46 = atomicAdd(&smem_expert_count[idx_ii_31], 1);
+                        exp_off[22] = (int)_atomic_fetch_add_46;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_31 << 16);
                 }
@@ -966,8 +966,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_32 = ((local_idx_32 >= 0 && local_idx_32 < extent_32 && (local_idx_32 & stride_mask_32) == 0) ? 1 : 0);
                     exp_off[23] = 0;
                     if (is_local_32 != 0) {
-                        unsigned int _atomic_old_47 = atomicAdd(&smem_expert_count[idx_ii_32], 1);
-                        exp_off[23] = (int)_atomic_old_47;
+                        unsigned int _atomic_fetch_add_47 = atomicAdd(&smem_expert_count[idx_ii_32], 1);
+                        exp_off[23] = (int)_atomic_fetch_add_47;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_32 << 16);
                 }
@@ -987,8 +987,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_33 = ((local_idx_33 >= 0 && local_idx_33 < extent_33 && (local_idx_33 & stride_mask_33) == 0) ? 1 : 0);
             exp_off[24] = 0;
             if (is_local_33 != 0) {
-                unsigned int _atomic_old_48 = atomicAdd(&smem_expert_count[idx_ii_33], 1);
-                exp_off[24] = (int)_atomic_old_48;
+                unsigned int _atomic_fetch_add_48 = atomicAdd(&smem_expert_count[idx_ii_33], 1);
+                exp_off[24] = (int)_atomic_fetch_add_48;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_33 << 16);
             expanded = grid_tid + 25 * grid_threads;
@@ -1002,8 +1002,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_6 = ((local_idx_3_6 >= 0 && local_idx_3_6 < extent_4_6 && (local_idx_3_6 & stride_mask_5_6) == 0) ? 1 : 0);
             exp_off[25] = 0;
             if (is_local_6_6 != 0) {
-                unsigned int _atomic_old_49 = atomicAdd(&smem_expert_count[idx_ii_1_6], 1);
-                exp_off[25] = (int)_atomic_old_49;
+                unsigned int _atomic_fetch_add_49 = atomicAdd(&smem_expert_count[idx_ii_1_6], 1);
+                exp_off[25] = (int)_atomic_fetch_add_49;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_6 << 16);
             expanded = grid_tid + 26 * grid_threads;
@@ -1017,8 +1017,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_6 = ((local_idx_10_6 >= 0 && local_idx_10_6 < extent_11_6 && (local_idx_10_6 & stride_mask_12_6) == 0) ? 1 : 0);
             exp_off[26] = 0;
             if (is_local_13_6 != 0) {
-                unsigned int _atomic_old_50 = atomicAdd(&smem_expert_count[idx_ii_8_6], 1);
-                exp_off[26] = (int)_atomic_old_50;
+                unsigned int _atomic_fetch_add_50 = atomicAdd(&smem_expert_count[idx_ii_8_6], 1);
+                exp_off[26] = (int)_atomic_fetch_add_50;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_6 << 16);
             expanded = grid_tid + 27 * grid_threads;
@@ -1032,8 +1032,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_6 = ((local_idx_17_6 >= 0 && local_idx_17_6 < extent_18_6 && (local_idx_17_6 & stride_mask_19_6) == 0) ? 1 : 0);
             exp_off[27] = 0;
             if (is_local_20_6 != 0) {
-                unsigned int _atomic_old_51 = atomicAdd(&smem_expert_count[idx_ii_15_6], 1);
-                exp_off[27] = (int)_atomic_old_51;
+                unsigned int _atomic_fetch_add_51 = atomicAdd(&smem_expert_count[idx_ii_15_6], 1);
+                exp_off[27] = (int)_atomic_fetch_add_51;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_6 << 16);
         } else {
@@ -1052,8 +1052,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_34 = ((local_idx_34 >= 0 && local_idx_34 < extent_34 && (local_idx_34 & stride_mask_34) == 0) ? 1 : 0);
                     exp_off[24] = 0;
                     if (is_local_34 != 0) {
-                        unsigned int _atomic_old_52 = atomicAdd(&smem_expert_count[idx_ii_34], 1);
-                        exp_off[24] = (int)_atomic_old_52;
+                        unsigned int _atomic_fetch_add_52 = atomicAdd(&smem_expert_count[idx_ii_34], 1);
+                        exp_off[24] = (int)_atomic_fetch_add_52;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_34 << 16);
                 }
@@ -1073,8 +1073,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_35 = ((local_idx_35 >= 0 && local_idx_35 < extent_35 && (local_idx_35 & stride_mask_35) == 0) ? 1 : 0);
                     exp_off[25] = 0;
                     if (is_local_35 != 0) {
-                        unsigned int _atomic_old_53 = atomicAdd(&smem_expert_count[idx_ii_35], 1);
-                        exp_off[25] = (int)_atomic_old_53;
+                        unsigned int _atomic_fetch_add_53 = atomicAdd(&smem_expert_count[idx_ii_35], 1);
+                        exp_off[25] = (int)_atomic_fetch_add_53;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_35 << 16);
                 }
@@ -1094,8 +1094,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_36 = ((local_idx_36 >= 0 && local_idx_36 < extent_36 && (local_idx_36 & stride_mask_36) == 0) ? 1 : 0);
                     exp_off[26] = 0;
                     if (is_local_36 != 0) {
-                        unsigned int _atomic_old_54 = atomicAdd(&smem_expert_count[idx_ii_36], 1);
-                        exp_off[26] = (int)_atomic_old_54;
+                        unsigned int _atomic_fetch_add_54 = atomicAdd(&smem_expert_count[idx_ii_36], 1);
+                        exp_off[26] = (int)_atomic_fetch_add_54;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_36 << 16);
                 }
@@ -1115,8 +1115,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_37 = ((local_idx_37 >= 0 && local_idx_37 < extent_37 && (local_idx_37 & stride_mask_37) == 0) ? 1 : 0);
                     exp_off[27] = 0;
                     if (is_local_37 != 0) {
-                        unsigned int _atomic_old_55 = atomicAdd(&smem_expert_count[idx_ii_37], 1);
-                        exp_off[27] = (int)_atomic_old_55;
+                        unsigned int _atomic_fetch_add_55 = atomicAdd(&smem_expert_count[idx_ii_37], 1);
+                        exp_off[27] = (int)_atomic_fetch_add_55;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_37 << 16);
                 }
@@ -1136,8 +1136,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_38 = ((local_idx_38 >= 0 && local_idx_38 < extent_38 && (local_idx_38 & stride_mask_38) == 0) ? 1 : 0);
             exp_off[28] = 0;
             if (is_local_38 != 0) {
-                unsigned int _atomic_old_56 = atomicAdd(&smem_expert_count[idx_ii_38], 1);
-                exp_off[28] = (int)_atomic_old_56;
+                unsigned int _atomic_fetch_add_56 = atomicAdd(&smem_expert_count[idx_ii_38], 1);
+                exp_off[28] = (int)_atomic_fetch_add_56;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_38 << 16);
             expanded = grid_tid + 29 * grid_threads;
@@ -1151,8 +1151,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_7 = ((local_idx_3_7 >= 0 && local_idx_3_7 < extent_4_7 && (local_idx_3_7 & stride_mask_5_7) == 0) ? 1 : 0);
             exp_off[29] = 0;
             if (is_local_6_7 != 0) {
-                unsigned int _atomic_old_57 = atomicAdd(&smem_expert_count[idx_ii_1_7], 1);
-                exp_off[29] = (int)_atomic_old_57;
+                unsigned int _atomic_fetch_add_57 = atomicAdd(&smem_expert_count[idx_ii_1_7], 1);
+                exp_off[29] = (int)_atomic_fetch_add_57;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_7 << 16);
             expanded = grid_tid + 30 * grid_threads;
@@ -1166,8 +1166,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_7 = ((local_idx_10_7 >= 0 && local_idx_10_7 < extent_11_7 && (local_idx_10_7 & stride_mask_12_7) == 0) ? 1 : 0);
             exp_off[30] = 0;
             if (is_local_13_7 != 0) {
-                unsigned int _atomic_old_58 = atomicAdd(&smem_expert_count[idx_ii_8_7], 1);
-                exp_off[30] = (int)_atomic_old_58;
+                unsigned int _atomic_fetch_add_58 = atomicAdd(&smem_expert_count[idx_ii_8_7], 1);
+                exp_off[30] = (int)_atomic_fetch_add_58;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_7 << 16);
             expanded = grid_tid + 31 * grid_threads;
@@ -1181,8 +1181,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_7 = ((local_idx_17_7 >= 0 && local_idx_17_7 < extent_18_7 && (local_idx_17_7 & stride_mask_19_7) == 0) ? 1 : 0);
             exp_off[31] = 0;
             if (is_local_20_7 != 0) {
-                unsigned int _atomic_old_59 = atomicAdd(&smem_expert_count[idx_ii_15_7], 1);
-                exp_off[31] = (int)_atomic_old_59;
+                unsigned int _atomic_fetch_add_59 = atomicAdd(&smem_expert_count[idx_ii_15_7], 1);
+                exp_off[31] = (int)_atomic_fetch_add_59;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_7 << 16);
         } else {
@@ -1201,8 +1201,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_39 = ((local_idx_39 >= 0 && local_idx_39 < extent_39 && (local_idx_39 & stride_mask_39) == 0) ? 1 : 0);
                     exp_off[28] = 0;
                     if (is_local_39 != 0) {
-                        unsigned int _atomic_old_60 = atomicAdd(&smem_expert_count[idx_ii_39], 1);
-                        exp_off[28] = (int)_atomic_old_60;
+                        unsigned int _atomic_fetch_add_60 = atomicAdd(&smem_expert_count[idx_ii_39], 1);
+                        exp_off[28] = (int)_atomic_fetch_add_60;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_39 << 16);
                 }
@@ -1222,8 +1222,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_40 = ((local_idx_40 >= 0 && local_idx_40 < extent_40 && (local_idx_40 & stride_mask_40) == 0) ? 1 : 0);
                     exp_off[29] = 0;
                     if (is_local_40 != 0) {
-                        unsigned int _atomic_old_61 = atomicAdd(&smem_expert_count[idx_ii_40], 1);
-                        exp_off[29] = (int)_atomic_old_61;
+                        unsigned int _atomic_fetch_add_61 = atomicAdd(&smem_expert_count[idx_ii_40], 1);
+                        exp_off[29] = (int)_atomic_fetch_add_61;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_40 << 16);
                 }
@@ -1243,8 +1243,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_41 = ((local_idx_41 >= 0 && local_idx_41 < extent_41 && (local_idx_41 & stride_mask_41) == 0) ? 1 : 0);
                     exp_off[30] = 0;
                     if (is_local_41 != 0) {
-                        unsigned int _atomic_old_62 = atomicAdd(&smem_expert_count[idx_ii_41], 1);
-                        exp_off[30] = (int)_atomic_old_62;
+                        unsigned int _atomic_fetch_add_62 = atomicAdd(&smem_expert_count[idx_ii_41], 1);
+                        exp_off[30] = (int)_atomic_fetch_add_62;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_41 << 16);
                 }
@@ -1264,8 +1264,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_42 = ((local_idx_42 >= 0 && local_idx_42 < extent_42 && (local_idx_42 & stride_mask_42) == 0) ? 1 : 0);
                     exp_off[31] = 0;
                     if (is_local_42 != 0) {
-                        unsigned int _atomic_old_63 = atomicAdd(&smem_expert_count[idx_ii_42], 1);
-                        exp_off[31] = (int)_atomic_old_63;
+                        unsigned int _atomic_fetch_add_63 = atomicAdd(&smem_expert_count[idx_ii_42], 1);
+                        exp_off[31] = (int)_atomic_fetch_add_63;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_42 << 16);
                 }
@@ -1285,8 +1285,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_43 = ((local_idx_43 >= 0 && local_idx_43 < extent_43 && (local_idx_43 & stride_mask_43) == 0) ? 1 : 0);
             exp_off[32] = 0;
             if (is_local_43 != 0) {
-                unsigned int _atomic_old_64 = atomicAdd(&smem_expert_count[idx_ii_43], 1);
-                exp_off[32] = (int)_atomic_old_64;
+                unsigned int _atomic_fetch_add_64 = atomicAdd(&smem_expert_count[idx_ii_43], 1);
+                exp_off[32] = (int)_atomic_fetch_add_64;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_43 << 16);
             expanded = grid_tid + 33 * grid_threads;
@@ -1300,8 +1300,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_8 = ((local_idx_3_8 >= 0 && local_idx_3_8 < extent_4_8 && (local_idx_3_8 & stride_mask_5_8) == 0) ? 1 : 0);
             exp_off[33] = 0;
             if (is_local_6_8 != 0) {
-                unsigned int _atomic_old_65 = atomicAdd(&smem_expert_count[idx_ii_1_8], 1);
-                exp_off[33] = (int)_atomic_old_65;
+                unsigned int _atomic_fetch_add_65 = atomicAdd(&smem_expert_count[idx_ii_1_8], 1);
+                exp_off[33] = (int)_atomic_fetch_add_65;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_8 << 16);
             expanded = grid_tid + 34 * grid_threads;
@@ -1315,8 +1315,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_8 = ((local_idx_10_8 >= 0 && local_idx_10_8 < extent_11_8 && (local_idx_10_8 & stride_mask_12_8) == 0) ? 1 : 0);
             exp_off[34] = 0;
             if (is_local_13_8 != 0) {
-                unsigned int _atomic_old_66 = atomicAdd(&smem_expert_count[idx_ii_8_8], 1);
-                exp_off[34] = (int)_atomic_old_66;
+                unsigned int _atomic_fetch_add_66 = atomicAdd(&smem_expert_count[idx_ii_8_8], 1);
+                exp_off[34] = (int)_atomic_fetch_add_66;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_8 << 16);
             expanded = grid_tid + 35 * grid_threads;
@@ -1330,8 +1330,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_8 = ((local_idx_17_8 >= 0 && local_idx_17_8 < extent_18_8 && (local_idx_17_8 & stride_mask_19_8) == 0) ? 1 : 0);
             exp_off[35] = 0;
             if (is_local_20_8 != 0) {
-                unsigned int _atomic_old_67 = atomicAdd(&smem_expert_count[idx_ii_15_8], 1);
-                exp_off[35] = (int)_atomic_old_67;
+                unsigned int _atomic_fetch_add_67 = atomicAdd(&smem_expert_count[idx_ii_15_8], 1);
+                exp_off[35] = (int)_atomic_fetch_add_67;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_8 << 16);
         } else {
@@ -1350,8 +1350,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_44 = ((local_idx_44 >= 0 && local_idx_44 < extent_44 && (local_idx_44 & stride_mask_44) == 0) ? 1 : 0);
                     exp_off[32] = 0;
                     if (is_local_44 != 0) {
-                        unsigned int _atomic_old_68 = atomicAdd(&smem_expert_count[idx_ii_44], 1);
-                        exp_off[32] = (int)_atomic_old_68;
+                        unsigned int _atomic_fetch_add_68 = atomicAdd(&smem_expert_count[idx_ii_44], 1);
+                        exp_off[32] = (int)_atomic_fetch_add_68;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_44 << 16);
                 }
@@ -1371,8 +1371,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_45 = ((local_idx_45 >= 0 && local_idx_45 < extent_45 && (local_idx_45 & stride_mask_45) == 0) ? 1 : 0);
                     exp_off[33] = 0;
                     if (is_local_45 != 0) {
-                        unsigned int _atomic_old_69 = atomicAdd(&smem_expert_count[idx_ii_45], 1);
-                        exp_off[33] = (int)_atomic_old_69;
+                        unsigned int _atomic_fetch_add_69 = atomicAdd(&smem_expert_count[idx_ii_45], 1);
+                        exp_off[33] = (int)_atomic_fetch_add_69;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_45 << 16);
                 }
@@ -1392,8 +1392,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_46 = ((local_idx_46 >= 0 && local_idx_46 < extent_46 && (local_idx_46 & stride_mask_46) == 0) ? 1 : 0);
                     exp_off[34] = 0;
                     if (is_local_46 != 0) {
-                        unsigned int _atomic_old_70 = atomicAdd(&smem_expert_count[idx_ii_46], 1);
-                        exp_off[34] = (int)_atomic_old_70;
+                        unsigned int _atomic_fetch_add_70 = atomicAdd(&smem_expert_count[idx_ii_46], 1);
+                        exp_off[34] = (int)_atomic_fetch_add_70;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_46 << 16);
                 }
@@ -1413,8 +1413,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_47 = ((local_idx_47 >= 0 && local_idx_47 < extent_47 && (local_idx_47 & stride_mask_47) == 0) ? 1 : 0);
                     exp_off[35] = 0;
                     if (is_local_47 != 0) {
-                        unsigned int _atomic_old_71 = atomicAdd(&smem_expert_count[idx_ii_47], 1);
-                        exp_off[35] = (int)_atomic_old_71;
+                        unsigned int _atomic_fetch_add_71 = atomicAdd(&smem_expert_count[idx_ii_47], 1);
+                        exp_off[35] = (int)_atomic_fetch_add_71;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_47 << 16);
                 }
@@ -1434,8 +1434,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_48 = ((local_idx_48 >= 0 && local_idx_48 < extent_48 && (local_idx_48 & stride_mask_48) == 0) ? 1 : 0);
             exp_off[36] = 0;
             if (is_local_48 != 0) {
-                unsigned int _atomic_old_72 = atomicAdd(&smem_expert_count[idx_ii_48], 1);
-                exp_off[36] = (int)_atomic_old_72;
+                unsigned int _atomic_fetch_add_72 = atomicAdd(&smem_expert_count[idx_ii_48], 1);
+                exp_off[36] = (int)_atomic_fetch_add_72;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_48 << 16);
             expanded = grid_tid + 37 * grid_threads;
@@ -1449,8 +1449,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_9 = ((local_idx_3_9 >= 0 && local_idx_3_9 < extent_4_9 && (local_idx_3_9 & stride_mask_5_9) == 0) ? 1 : 0);
             exp_off[37] = 0;
             if (is_local_6_9 != 0) {
-                unsigned int _atomic_old_73 = atomicAdd(&smem_expert_count[idx_ii_1_9], 1);
-                exp_off[37] = (int)_atomic_old_73;
+                unsigned int _atomic_fetch_add_73 = atomicAdd(&smem_expert_count[idx_ii_1_9], 1);
+                exp_off[37] = (int)_atomic_fetch_add_73;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_9 << 16);
             expanded = grid_tid + 38 * grid_threads;
@@ -1464,8 +1464,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_9 = ((local_idx_10_9 >= 0 && local_idx_10_9 < extent_11_9 && (local_idx_10_9 & stride_mask_12_9) == 0) ? 1 : 0);
             exp_off[38] = 0;
             if (is_local_13_9 != 0) {
-                unsigned int _atomic_old_74 = atomicAdd(&smem_expert_count[idx_ii_8_9], 1);
-                exp_off[38] = (int)_atomic_old_74;
+                unsigned int _atomic_fetch_add_74 = atomicAdd(&smem_expert_count[idx_ii_8_9], 1);
+                exp_off[38] = (int)_atomic_fetch_add_74;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_9 << 16);
             expanded = grid_tid + 39 * grid_threads;
@@ -1479,8 +1479,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_9 = ((local_idx_17_9 >= 0 && local_idx_17_9 < extent_18_9 && (local_idx_17_9 & stride_mask_19_9) == 0) ? 1 : 0);
             exp_off[39] = 0;
             if (is_local_20_9 != 0) {
-                unsigned int _atomic_old_75 = atomicAdd(&smem_expert_count[idx_ii_15_9], 1);
-                exp_off[39] = (int)_atomic_old_75;
+                unsigned int _atomic_fetch_add_75 = atomicAdd(&smem_expert_count[idx_ii_15_9], 1);
+                exp_off[39] = (int)_atomic_fetch_add_75;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_9 << 16);
         } else {
@@ -1499,8 +1499,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_49 = ((local_idx_49 >= 0 && local_idx_49 < extent_49 && (local_idx_49 & stride_mask_49) == 0) ? 1 : 0);
                     exp_off[36] = 0;
                     if (is_local_49 != 0) {
-                        unsigned int _atomic_old_76 = atomicAdd(&smem_expert_count[idx_ii_49], 1);
-                        exp_off[36] = (int)_atomic_old_76;
+                        unsigned int _atomic_fetch_add_76 = atomicAdd(&smem_expert_count[idx_ii_49], 1);
+                        exp_off[36] = (int)_atomic_fetch_add_76;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_49 << 16);
                 }
@@ -1520,8 +1520,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_50 = ((local_idx_50 >= 0 && local_idx_50 < extent_50 && (local_idx_50 & stride_mask_50) == 0) ? 1 : 0);
                     exp_off[37] = 0;
                     if (is_local_50 != 0) {
-                        unsigned int _atomic_old_77 = atomicAdd(&smem_expert_count[idx_ii_50], 1);
-                        exp_off[37] = (int)_atomic_old_77;
+                        unsigned int _atomic_fetch_add_77 = atomicAdd(&smem_expert_count[idx_ii_50], 1);
+                        exp_off[37] = (int)_atomic_fetch_add_77;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_50 << 16);
                 }
@@ -1541,8 +1541,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_51 = ((local_idx_51 >= 0 && local_idx_51 < extent_51 && (local_idx_51 & stride_mask_51) == 0) ? 1 : 0);
                     exp_off[38] = 0;
                     if (is_local_51 != 0) {
-                        unsigned int _atomic_old_78 = atomicAdd(&smem_expert_count[idx_ii_51], 1);
-                        exp_off[38] = (int)_atomic_old_78;
+                        unsigned int _atomic_fetch_add_78 = atomicAdd(&smem_expert_count[idx_ii_51], 1);
+                        exp_off[38] = (int)_atomic_fetch_add_78;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_51 << 16);
                 }
@@ -1562,8 +1562,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_52 = ((local_idx_52 >= 0 && local_idx_52 < extent_52 && (local_idx_52 & stride_mask_52) == 0) ? 1 : 0);
                     exp_off[39] = 0;
                     if (is_local_52 != 0) {
-                        unsigned int _atomic_old_79 = atomicAdd(&smem_expert_count[idx_ii_52], 1);
-                        exp_off[39] = (int)_atomic_old_79;
+                        unsigned int _atomic_fetch_add_79 = atomicAdd(&smem_expert_count[idx_ii_52], 1);
+                        exp_off[39] = (int)_atomic_fetch_add_79;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_52 << 16);
                 }
@@ -1583,8 +1583,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_53 = ((local_idx_53 >= 0 && local_idx_53 < extent_53 && (local_idx_53 & stride_mask_53) == 0) ? 1 : 0);
             exp_off[40] = 0;
             if (is_local_53 != 0) {
-                unsigned int _atomic_old_80 = atomicAdd(&smem_expert_count[idx_ii_53], 1);
-                exp_off[40] = (int)_atomic_old_80;
+                unsigned int _atomic_fetch_add_80 = atomicAdd(&smem_expert_count[idx_ii_53], 1);
+                exp_off[40] = (int)_atomic_fetch_add_80;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_53 << 16);
             expanded = grid_tid + 41 * grid_threads;
@@ -1598,8 +1598,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_10 = ((local_idx_3_10 >= 0 && local_idx_3_10 < extent_4_10 && (local_idx_3_10 & stride_mask_5_10) == 0) ? 1 : 0);
             exp_off[41] = 0;
             if (is_local_6_10 != 0) {
-                unsigned int _atomic_old_81 = atomicAdd(&smem_expert_count[idx_ii_1_10], 1);
-                exp_off[41] = (int)_atomic_old_81;
+                unsigned int _atomic_fetch_add_81 = atomicAdd(&smem_expert_count[idx_ii_1_10], 1);
+                exp_off[41] = (int)_atomic_fetch_add_81;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_10 << 16);
             expanded = grid_tid + 42 * grid_threads;
@@ -1613,8 +1613,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_10 = ((local_idx_10_10 >= 0 && local_idx_10_10 < extent_11_10 && (local_idx_10_10 & stride_mask_12_10) == 0) ? 1 : 0);
             exp_off[42] = 0;
             if (is_local_13_10 != 0) {
-                unsigned int _atomic_old_82 = atomicAdd(&smem_expert_count[idx_ii_8_10], 1);
-                exp_off[42] = (int)_atomic_old_82;
+                unsigned int _atomic_fetch_add_82 = atomicAdd(&smem_expert_count[idx_ii_8_10], 1);
+                exp_off[42] = (int)_atomic_fetch_add_82;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_10 << 16);
             expanded = grid_tid + 43 * grid_threads;
@@ -1628,8 +1628,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_10 = ((local_idx_17_10 >= 0 && local_idx_17_10 < extent_18_10 && (local_idx_17_10 & stride_mask_19_10) == 0) ? 1 : 0);
             exp_off[43] = 0;
             if (is_local_20_10 != 0) {
-                unsigned int _atomic_old_83 = atomicAdd(&smem_expert_count[idx_ii_15_10], 1);
-                exp_off[43] = (int)_atomic_old_83;
+                unsigned int _atomic_fetch_add_83 = atomicAdd(&smem_expert_count[idx_ii_15_10], 1);
+                exp_off[43] = (int)_atomic_fetch_add_83;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_10 << 16);
         } else {
@@ -1648,8 +1648,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_54 = ((local_idx_54 >= 0 && local_idx_54 < extent_54 && (local_idx_54 & stride_mask_54) == 0) ? 1 : 0);
                     exp_off[40] = 0;
                     if (is_local_54 != 0) {
-                        unsigned int _atomic_old_84 = atomicAdd(&smem_expert_count[idx_ii_54], 1);
-                        exp_off[40] = (int)_atomic_old_84;
+                        unsigned int _atomic_fetch_add_84 = atomicAdd(&smem_expert_count[idx_ii_54], 1);
+                        exp_off[40] = (int)_atomic_fetch_add_84;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_54 << 16);
                 }
@@ -1669,8 +1669,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_55 = ((local_idx_55 >= 0 && local_idx_55 < extent_55 && (local_idx_55 & stride_mask_55) == 0) ? 1 : 0);
                     exp_off[41] = 0;
                     if (is_local_55 != 0) {
-                        unsigned int _atomic_old_85 = atomicAdd(&smem_expert_count[idx_ii_55], 1);
-                        exp_off[41] = (int)_atomic_old_85;
+                        unsigned int _atomic_fetch_add_85 = atomicAdd(&smem_expert_count[idx_ii_55], 1);
+                        exp_off[41] = (int)_atomic_fetch_add_85;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_55 << 16);
                 }
@@ -1690,8 +1690,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_56 = ((local_idx_56 >= 0 && local_idx_56 < extent_56 && (local_idx_56 & stride_mask_56) == 0) ? 1 : 0);
                     exp_off[42] = 0;
                     if (is_local_56 != 0) {
-                        unsigned int _atomic_old_86 = atomicAdd(&smem_expert_count[idx_ii_56], 1);
-                        exp_off[42] = (int)_atomic_old_86;
+                        unsigned int _atomic_fetch_add_86 = atomicAdd(&smem_expert_count[idx_ii_56], 1);
+                        exp_off[42] = (int)_atomic_fetch_add_86;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_56 << 16);
                 }
@@ -1711,8 +1711,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_57 = ((local_idx_57 >= 0 && local_idx_57 < extent_57 && (local_idx_57 & stride_mask_57) == 0) ? 1 : 0);
                     exp_off[43] = 0;
                     if (is_local_57 != 0) {
-                        unsigned int _atomic_old_87 = atomicAdd(&smem_expert_count[idx_ii_57], 1);
-                        exp_off[43] = (int)_atomic_old_87;
+                        unsigned int _atomic_fetch_add_87 = atomicAdd(&smem_expert_count[idx_ii_57], 1);
+                        exp_off[43] = (int)_atomic_fetch_add_87;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_57 << 16);
                 }
@@ -1732,8 +1732,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_58 = ((local_idx_58 >= 0 && local_idx_58 < extent_58 && (local_idx_58 & stride_mask_58) == 0) ? 1 : 0);
             exp_off[44] = 0;
             if (is_local_58 != 0) {
-                unsigned int _atomic_old_88 = atomicAdd(&smem_expert_count[idx_ii_58], 1);
-                exp_off[44] = (int)_atomic_old_88;
+                unsigned int _atomic_fetch_add_88 = atomicAdd(&smem_expert_count[idx_ii_58], 1);
+                exp_off[44] = (int)_atomic_fetch_add_88;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_58 << 16);
             expanded = grid_tid + 45 * grid_threads;
@@ -1747,8 +1747,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_11 = ((local_idx_3_11 >= 0 && local_idx_3_11 < extent_4_11 && (local_idx_3_11 & stride_mask_5_11) == 0) ? 1 : 0);
             exp_off[45] = 0;
             if (is_local_6_11 != 0) {
-                unsigned int _atomic_old_89 = atomicAdd(&smem_expert_count[idx_ii_1_11], 1);
-                exp_off[45] = (int)_atomic_old_89;
+                unsigned int _atomic_fetch_add_89 = atomicAdd(&smem_expert_count[idx_ii_1_11], 1);
+                exp_off[45] = (int)_atomic_fetch_add_89;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_11 << 16);
             expanded = grid_tid + 46 * grid_threads;
@@ -1762,8 +1762,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_11 = ((local_idx_10_11 >= 0 && local_idx_10_11 < extent_11_11 && (local_idx_10_11 & stride_mask_12_11) == 0) ? 1 : 0);
             exp_off[46] = 0;
             if (is_local_13_11 != 0) {
-                unsigned int _atomic_old_90 = atomicAdd(&smem_expert_count[idx_ii_8_11], 1);
-                exp_off[46] = (int)_atomic_old_90;
+                unsigned int _atomic_fetch_add_90 = atomicAdd(&smem_expert_count[idx_ii_8_11], 1);
+                exp_off[46] = (int)_atomic_fetch_add_90;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_11 << 16);
             expanded = grid_tid + 47 * grid_threads;
@@ -1777,8 +1777,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_11 = ((local_idx_17_11 >= 0 && local_idx_17_11 < extent_18_11 && (local_idx_17_11 & stride_mask_19_11) == 0) ? 1 : 0);
             exp_off[47] = 0;
             if (is_local_20_11 != 0) {
-                unsigned int _atomic_old_91 = atomicAdd(&smem_expert_count[idx_ii_15_11], 1);
-                exp_off[47] = (int)_atomic_old_91;
+                unsigned int _atomic_fetch_add_91 = atomicAdd(&smem_expert_count[idx_ii_15_11], 1);
+                exp_off[47] = (int)_atomic_fetch_add_91;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_11 << 16);
         } else {
@@ -1797,8 +1797,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_59 = ((local_idx_59 >= 0 && local_idx_59 < extent_59 && (local_idx_59 & stride_mask_59) == 0) ? 1 : 0);
                     exp_off[44] = 0;
                     if (is_local_59 != 0) {
-                        unsigned int _atomic_old_92 = atomicAdd(&smem_expert_count[idx_ii_59], 1);
-                        exp_off[44] = (int)_atomic_old_92;
+                        unsigned int _atomic_fetch_add_92 = atomicAdd(&smem_expert_count[idx_ii_59], 1);
+                        exp_off[44] = (int)_atomic_fetch_add_92;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_59 << 16);
                 }
@@ -1818,8 +1818,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_60 = ((local_idx_60 >= 0 && local_idx_60 < extent_60 && (local_idx_60 & stride_mask_60) == 0) ? 1 : 0);
                     exp_off[45] = 0;
                     if (is_local_60 != 0) {
-                        unsigned int _atomic_old_93 = atomicAdd(&smem_expert_count[idx_ii_60], 1);
-                        exp_off[45] = (int)_atomic_old_93;
+                        unsigned int _atomic_fetch_add_93 = atomicAdd(&smem_expert_count[idx_ii_60], 1);
+                        exp_off[45] = (int)_atomic_fetch_add_93;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_60 << 16);
                 }
@@ -1839,8 +1839,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_61 = ((local_idx_61 >= 0 && local_idx_61 < extent_61 && (local_idx_61 & stride_mask_61) == 0) ? 1 : 0);
                     exp_off[46] = 0;
                     if (is_local_61 != 0) {
-                        unsigned int _atomic_old_94 = atomicAdd(&smem_expert_count[idx_ii_61], 1);
-                        exp_off[46] = (int)_atomic_old_94;
+                        unsigned int _atomic_fetch_add_94 = atomicAdd(&smem_expert_count[idx_ii_61], 1);
+                        exp_off[46] = (int)_atomic_fetch_add_94;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_61 << 16);
                 }
@@ -1860,8 +1860,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_62 = ((local_idx_62 >= 0 && local_idx_62 < extent_62 && (local_idx_62 & stride_mask_62) == 0) ? 1 : 0);
                     exp_off[47] = 0;
                     if (is_local_62 != 0) {
-                        unsigned int _atomic_old_95 = atomicAdd(&smem_expert_count[idx_ii_62], 1);
-                        exp_off[47] = (int)_atomic_old_95;
+                        unsigned int _atomic_fetch_add_95 = atomicAdd(&smem_expert_count[idx_ii_62], 1);
+                        exp_off[47] = (int)_atomic_fetch_add_95;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_62 << 16);
                 }
@@ -1881,8 +1881,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_63 = ((local_idx_63 >= 0 && local_idx_63 < extent_63 && (local_idx_63 & stride_mask_63) == 0) ? 1 : 0);
             exp_off[48] = 0;
             if (is_local_63 != 0) {
-                unsigned int _atomic_old_96 = atomicAdd(&smem_expert_count[idx_ii_63], 1);
-                exp_off[48] = (int)_atomic_old_96;
+                unsigned int _atomic_fetch_add_96 = atomicAdd(&smem_expert_count[idx_ii_63], 1);
+                exp_off[48] = (int)_atomic_fetch_add_96;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_63 << 16);
             expanded = grid_tid + 49 * grid_threads;
@@ -1896,8 +1896,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_12 = ((local_idx_3_12 >= 0 && local_idx_3_12 < extent_4_12 && (local_idx_3_12 & stride_mask_5_12) == 0) ? 1 : 0);
             exp_off[49] = 0;
             if (is_local_6_12 != 0) {
-                unsigned int _atomic_old_97 = atomicAdd(&smem_expert_count[idx_ii_1_12], 1);
-                exp_off[49] = (int)_atomic_old_97;
+                unsigned int _atomic_fetch_add_97 = atomicAdd(&smem_expert_count[idx_ii_1_12], 1);
+                exp_off[49] = (int)_atomic_fetch_add_97;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_12 << 16);
             expanded = grid_tid + 50 * grid_threads;
@@ -1911,8 +1911,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_12 = ((local_idx_10_12 >= 0 && local_idx_10_12 < extent_11_12 && (local_idx_10_12 & stride_mask_12_12) == 0) ? 1 : 0);
             exp_off[50] = 0;
             if (is_local_13_12 != 0) {
-                unsigned int _atomic_old_98 = atomicAdd(&smem_expert_count[idx_ii_8_12], 1);
-                exp_off[50] = (int)_atomic_old_98;
+                unsigned int _atomic_fetch_add_98 = atomicAdd(&smem_expert_count[idx_ii_8_12], 1);
+                exp_off[50] = (int)_atomic_fetch_add_98;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_12 << 16);
             expanded = grid_tid + 51 * grid_threads;
@@ -1926,8 +1926,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_12 = ((local_idx_17_12 >= 0 && local_idx_17_12 < extent_18_12 && (local_idx_17_12 & stride_mask_19_12) == 0) ? 1 : 0);
             exp_off[51] = 0;
             if (is_local_20_12 != 0) {
-                unsigned int _atomic_old_99 = atomicAdd(&smem_expert_count[idx_ii_15_12], 1);
-                exp_off[51] = (int)_atomic_old_99;
+                unsigned int _atomic_fetch_add_99 = atomicAdd(&smem_expert_count[idx_ii_15_12], 1);
+                exp_off[51] = (int)_atomic_fetch_add_99;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_12 << 16);
         } else {
@@ -1946,8 +1946,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_64 = ((local_idx_64 >= 0 && local_idx_64 < extent_64 && (local_idx_64 & stride_mask_64) == 0) ? 1 : 0);
                     exp_off[48] = 0;
                     if (is_local_64 != 0) {
-                        unsigned int _atomic_old_100 = atomicAdd(&smem_expert_count[idx_ii_64], 1);
-                        exp_off[48] = (int)_atomic_old_100;
+                        unsigned int _atomic_fetch_add_100 = atomicAdd(&smem_expert_count[idx_ii_64], 1);
+                        exp_off[48] = (int)_atomic_fetch_add_100;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_64 << 16);
                 }
@@ -1967,8 +1967,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_65 = ((local_idx_65 >= 0 && local_idx_65 < extent_65 && (local_idx_65 & stride_mask_65) == 0) ? 1 : 0);
                     exp_off[49] = 0;
                     if (is_local_65 != 0) {
-                        unsigned int _atomic_old_101 = atomicAdd(&smem_expert_count[idx_ii_65], 1);
-                        exp_off[49] = (int)_atomic_old_101;
+                        unsigned int _atomic_fetch_add_101 = atomicAdd(&smem_expert_count[idx_ii_65], 1);
+                        exp_off[49] = (int)_atomic_fetch_add_101;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_65 << 16);
                 }
@@ -1988,8 +1988,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_66 = ((local_idx_66 >= 0 && local_idx_66 < extent_66 && (local_idx_66 & stride_mask_66) == 0) ? 1 : 0);
                     exp_off[50] = 0;
                     if (is_local_66 != 0) {
-                        unsigned int _atomic_old_102 = atomicAdd(&smem_expert_count[idx_ii_66], 1);
-                        exp_off[50] = (int)_atomic_old_102;
+                        unsigned int _atomic_fetch_add_102 = atomicAdd(&smem_expert_count[idx_ii_66], 1);
+                        exp_off[50] = (int)_atomic_fetch_add_102;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_66 << 16);
                 }
@@ -2009,8 +2009,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_67 = ((local_idx_67 >= 0 && local_idx_67 < extent_67 && (local_idx_67 & stride_mask_67) == 0) ? 1 : 0);
                     exp_off[51] = 0;
                     if (is_local_67 != 0) {
-                        unsigned int _atomic_old_103 = atomicAdd(&smem_expert_count[idx_ii_67], 1);
-                        exp_off[51] = (int)_atomic_old_103;
+                        unsigned int _atomic_fetch_add_103 = atomicAdd(&smem_expert_count[idx_ii_67], 1);
+                        exp_off[51] = (int)_atomic_fetch_add_103;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_67 << 16);
                 }
@@ -2030,8 +2030,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_68 = ((local_idx_68 >= 0 && local_idx_68 < extent_68 && (local_idx_68 & stride_mask_68) == 0) ? 1 : 0);
             exp_off[52] = 0;
             if (is_local_68 != 0) {
-                unsigned int _atomic_old_104 = atomicAdd(&smem_expert_count[idx_ii_68], 1);
-                exp_off[52] = (int)_atomic_old_104;
+                unsigned int _atomic_fetch_add_104 = atomicAdd(&smem_expert_count[idx_ii_68], 1);
+                exp_off[52] = (int)_atomic_fetch_add_104;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_68 << 16);
             expanded = grid_tid + 53 * grid_threads;
@@ -2045,8 +2045,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_13 = ((local_idx_3_13 >= 0 && local_idx_3_13 < extent_4_13 && (local_idx_3_13 & stride_mask_5_13) == 0) ? 1 : 0);
             exp_off[53] = 0;
             if (is_local_6_13 != 0) {
-                unsigned int _atomic_old_105 = atomicAdd(&smem_expert_count[idx_ii_1_13], 1);
-                exp_off[53] = (int)_atomic_old_105;
+                unsigned int _atomic_fetch_add_105 = atomicAdd(&smem_expert_count[idx_ii_1_13], 1);
+                exp_off[53] = (int)_atomic_fetch_add_105;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_13 << 16);
             expanded = grid_tid + 54 * grid_threads;
@@ -2060,8 +2060,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_13 = ((local_idx_10_13 >= 0 && local_idx_10_13 < extent_11_13 && (local_idx_10_13 & stride_mask_12_13) == 0) ? 1 : 0);
             exp_off[54] = 0;
             if (is_local_13_13 != 0) {
-                unsigned int _atomic_old_106 = atomicAdd(&smem_expert_count[idx_ii_8_13], 1);
-                exp_off[54] = (int)_atomic_old_106;
+                unsigned int _atomic_fetch_add_106 = atomicAdd(&smem_expert_count[idx_ii_8_13], 1);
+                exp_off[54] = (int)_atomic_fetch_add_106;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_13 << 16);
             expanded = grid_tid + 55 * grid_threads;
@@ -2075,8 +2075,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_13 = ((local_idx_17_13 >= 0 && local_idx_17_13 < extent_18_13 && (local_idx_17_13 & stride_mask_19_13) == 0) ? 1 : 0);
             exp_off[55] = 0;
             if (is_local_20_13 != 0) {
-                unsigned int _atomic_old_107 = atomicAdd(&smem_expert_count[idx_ii_15_13], 1);
-                exp_off[55] = (int)_atomic_old_107;
+                unsigned int _atomic_fetch_add_107 = atomicAdd(&smem_expert_count[idx_ii_15_13], 1);
+                exp_off[55] = (int)_atomic_fetch_add_107;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_13 << 16);
         } else {
@@ -2095,8 +2095,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_69 = ((local_idx_69 >= 0 && local_idx_69 < extent_69 && (local_idx_69 & stride_mask_69) == 0) ? 1 : 0);
                     exp_off[52] = 0;
                     if (is_local_69 != 0) {
-                        unsigned int _atomic_old_108 = atomicAdd(&smem_expert_count[idx_ii_69], 1);
-                        exp_off[52] = (int)_atomic_old_108;
+                        unsigned int _atomic_fetch_add_108 = atomicAdd(&smem_expert_count[idx_ii_69], 1);
+                        exp_off[52] = (int)_atomic_fetch_add_108;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_69 << 16);
                 }
@@ -2116,8 +2116,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_70 = ((local_idx_70 >= 0 && local_idx_70 < extent_70 && (local_idx_70 & stride_mask_70) == 0) ? 1 : 0);
                     exp_off[53] = 0;
                     if (is_local_70 != 0) {
-                        unsigned int _atomic_old_109 = atomicAdd(&smem_expert_count[idx_ii_70], 1);
-                        exp_off[53] = (int)_atomic_old_109;
+                        unsigned int _atomic_fetch_add_109 = atomicAdd(&smem_expert_count[idx_ii_70], 1);
+                        exp_off[53] = (int)_atomic_fetch_add_109;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_70 << 16);
                 }
@@ -2137,8 +2137,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_71 = ((local_idx_71 >= 0 && local_idx_71 < extent_71 && (local_idx_71 & stride_mask_71) == 0) ? 1 : 0);
                     exp_off[54] = 0;
                     if (is_local_71 != 0) {
-                        unsigned int _atomic_old_110 = atomicAdd(&smem_expert_count[idx_ii_71], 1);
-                        exp_off[54] = (int)_atomic_old_110;
+                        unsigned int _atomic_fetch_add_110 = atomicAdd(&smem_expert_count[idx_ii_71], 1);
+                        exp_off[54] = (int)_atomic_fetch_add_110;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_71 << 16);
                 }
@@ -2158,8 +2158,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_72 = ((local_idx_72 >= 0 && local_idx_72 < extent_72 && (local_idx_72 & stride_mask_72) == 0) ? 1 : 0);
                     exp_off[55] = 0;
                     if (is_local_72 != 0) {
-                        unsigned int _atomic_old_111 = atomicAdd(&smem_expert_count[idx_ii_72], 1);
-                        exp_off[55] = (int)_atomic_old_111;
+                        unsigned int _atomic_fetch_add_111 = atomicAdd(&smem_expert_count[idx_ii_72], 1);
+                        exp_off[55] = (int)_atomic_fetch_add_111;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_72 << 16);
                 }
@@ -2179,8 +2179,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_73 = ((local_idx_73 >= 0 && local_idx_73 < extent_73 && (local_idx_73 & stride_mask_73) == 0) ? 1 : 0);
             exp_off[56] = 0;
             if (is_local_73 != 0) {
-                unsigned int _atomic_old_112 = atomicAdd(&smem_expert_count[idx_ii_73], 1);
-                exp_off[56] = (int)_atomic_old_112;
+                unsigned int _atomic_fetch_add_112 = atomicAdd(&smem_expert_count[idx_ii_73], 1);
+                exp_off[56] = (int)_atomic_fetch_add_112;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_73 << 16);
             expanded = grid_tid + 57 * grid_threads;
@@ -2194,8 +2194,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_14 = ((local_idx_3_14 >= 0 && local_idx_3_14 < extent_4_14 && (local_idx_3_14 & stride_mask_5_14) == 0) ? 1 : 0);
             exp_off[57] = 0;
             if (is_local_6_14 != 0) {
-                unsigned int _atomic_old_113 = atomicAdd(&smem_expert_count[idx_ii_1_14], 1);
-                exp_off[57] = (int)_atomic_old_113;
+                unsigned int _atomic_fetch_add_113 = atomicAdd(&smem_expert_count[idx_ii_1_14], 1);
+                exp_off[57] = (int)_atomic_fetch_add_113;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_14 << 16);
             expanded = grid_tid + 58 * grid_threads;
@@ -2209,8 +2209,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_14 = ((local_idx_10_14 >= 0 && local_idx_10_14 < extent_11_14 && (local_idx_10_14 & stride_mask_12_14) == 0) ? 1 : 0);
             exp_off[58] = 0;
             if (is_local_13_14 != 0) {
-                unsigned int _atomic_old_114 = atomicAdd(&smem_expert_count[idx_ii_8_14], 1);
-                exp_off[58] = (int)_atomic_old_114;
+                unsigned int _atomic_fetch_add_114 = atomicAdd(&smem_expert_count[idx_ii_8_14], 1);
+                exp_off[58] = (int)_atomic_fetch_add_114;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_14 << 16);
             expanded = grid_tid + 59 * grid_threads;
@@ -2224,8 +2224,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_14 = ((local_idx_17_14 >= 0 && local_idx_17_14 < extent_18_14 && (local_idx_17_14 & stride_mask_19_14) == 0) ? 1 : 0);
             exp_off[59] = 0;
             if (is_local_20_14 != 0) {
-                unsigned int _atomic_old_115 = atomicAdd(&smem_expert_count[idx_ii_15_14], 1);
-                exp_off[59] = (int)_atomic_old_115;
+                unsigned int _atomic_fetch_add_115 = atomicAdd(&smem_expert_count[idx_ii_15_14], 1);
+                exp_off[59] = (int)_atomic_fetch_add_115;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_14 << 16);
         } else {
@@ -2244,8 +2244,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_74 = ((local_idx_74 >= 0 && local_idx_74 < extent_74 && (local_idx_74 & stride_mask_74) == 0) ? 1 : 0);
                     exp_off[56] = 0;
                     if (is_local_74 != 0) {
-                        unsigned int _atomic_old_116 = atomicAdd(&smem_expert_count[idx_ii_74], 1);
-                        exp_off[56] = (int)_atomic_old_116;
+                        unsigned int _atomic_fetch_add_116 = atomicAdd(&smem_expert_count[idx_ii_74], 1);
+                        exp_off[56] = (int)_atomic_fetch_add_116;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_74 << 16);
                 }
@@ -2265,8 +2265,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_75 = ((local_idx_75 >= 0 && local_idx_75 < extent_75 && (local_idx_75 & stride_mask_75) == 0) ? 1 : 0);
                     exp_off[57] = 0;
                     if (is_local_75 != 0) {
-                        unsigned int _atomic_old_117 = atomicAdd(&smem_expert_count[idx_ii_75], 1);
-                        exp_off[57] = (int)_atomic_old_117;
+                        unsigned int _atomic_fetch_add_117 = atomicAdd(&smem_expert_count[idx_ii_75], 1);
+                        exp_off[57] = (int)_atomic_fetch_add_117;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_75 << 16);
                 }
@@ -2286,8 +2286,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_76 = ((local_idx_76 >= 0 && local_idx_76 < extent_76 && (local_idx_76 & stride_mask_76) == 0) ? 1 : 0);
                     exp_off[58] = 0;
                     if (is_local_76 != 0) {
-                        unsigned int _atomic_old_118 = atomicAdd(&smem_expert_count[idx_ii_76], 1);
-                        exp_off[58] = (int)_atomic_old_118;
+                        unsigned int _atomic_fetch_add_118 = atomicAdd(&smem_expert_count[idx_ii_76], 1);
+                        exp_off[58] = (int)_atomic_fetch_add_118;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_76 << 16);
                 }
@@ -2307,8 +2307,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_77 = ((local_idx_77 >= 0 && local_idx_77 < extent_77 && (local_idx_77 & stride_mask_77) == 0) ? 1 : 0);
                     exp_off[59] = 0;
                     if (is_local_77 != 0) {
-                        unsigned int _atomic_old_119 = atomicAdd(&smem_expert_count[idx_ii_77], 1);
-                        exp_off[59] = (int)_atomic_old_119;
+                        unsigned int _atomic_fetch_add_119 = atomicAdd(&smem_expert_count[idx_ii_77], 1);
+                        exp_off[59] = (int)_atomic_fetch_add_119;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_77 << 16);
                 }
@@ -2328,8 +2328,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_78 = ((local_idx_78 >= 0 && local_idx_78 < extent_78 && (local_idx_78 & stride_mask_78) == 0) ? 1 : 0);
             exp_off[60] = 0;
             if (is_local_78 != 0) {
-                unsigned int _atomic_old_120 = atomicAdd(&smem_expert_count[idx_ii_78], 1);
-                exp_off[60] = (int)_atomic_old_120;
+                unsigned int _atomic_fetch_add_120 = atomicAdd(&smem_expert_count[idx_ii_78], 1);
+                exp_off[60] = (int)_atomic_fetch_add_120;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_78 << 16);
             expanded = grid_tid + 61 * grid_threads;
@@ -2343,8 +2343,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_6_15 = ((local_idx_3_15 >= 0 && local_idx_3_15 < extent_4_15 && (local_idx_3_15 & stride_mask_5_15) == 0) ? 1 : 0);
             exp_off[61] = 0;
             if (is_local_6_15 != 0) {
-                unsigned int _atomic_old_121 = atomicAdd(&smem_expert_count[idx_ii_1_15], 1);
-                exp_off[61] = (int)_atomic_old_121;
+                unsigned int _atomic_fetch_add_121 = atomicAdd(&smem_expert_count[idx_ii_1_15], 1);
+                exp_off[61] = (int)_atomic_fetch_add_121;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_15 << 16);
             expanded = grid_tid + 62 * grid_threads;
@@ -2358,8 +2358,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_13_15 = ((local_idx_10_15 >= 0 && local_idx_10_15 < extent_11_15 && (local_idx_10_15 & stride_mask_12_15) == 0) ? 1 : 0);
             exp_off[62] = 0;
             if (is_local_13_15 != 0) {
-                unsigned int _atomic_old_122 = atomicAdd(&smem_expert_count[idx_ii_8_15], 1);
-                exp_off[62] = (int)_atomic_old_122;
+                unsigned int _atomic_fetch_add_122 = atomicAdd(&smem_expert_count[idx_ii_8_15], 1);
+                exp_off[62] = (int)_atomic_fetch_add_122;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_15 << 16);
             expanded = grid_tid + 63 * grid_threads;
@@ -2373,8 +2373,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             int is_local_20_15 = ((local_idx_17_15 >= 0 && local_idx_17_15 < extent_18_15 && (local_idx_17_15 & stride_mask_19_15) == 0) ? 1 : 0);
             exp_off[63] = 0;
             if (is_local_20_15 != 0) {
-                unsigned int _atomic_old_123 = atomicAdd(&smem_expert_count[idx_ii_15_15], 1);
-                exp_off[63] = (int)_atomic_old_123;
+                unsigned int _atomic_fetch_add_123 = atomicAdd(&smem_expert_count[idx_ii_15_15], 1);
+                exp_off[63] = (int)_atomic_fetch_add_123;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_15 << 16);
         } else {
@@ -2393,8 +2393,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_79 = ((local_idx_79 >= 0 && local_idx_79 < extent_79 && (local_idx_79 & stride_mask_79) == 0) ? 1 : 0);
                     exp_off[60] = 0;
                     if (is_local_79 != 0) {
-                        unsigned int _atomic_old_124 = atomicAdd(&smem_expert_count[idx_ii_79], 1);
-                        exp_off[60] = (int)_atomic_old_124;
+                        unsigned int _atomic_fetch_add_124 = atomicAdd(&smem_expert_count[idx_ii_79], 1);
+                        exp_off[60] = (int)_atomic_fetch_add_124;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_79 << 16);
                 }
@@ -2414,8 +2414,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_80 = ((local_idx_80 >= 0 && local_idx_80 < extent_80 && (local_idx_80 & stride_mask_80) == 0) ? 1 : 0);
                     exp_off[61] = 0;
                     if (is_local_80 != 0) {
-                        unsigned int _atomic_old_125 = atomicAdd(&smem_expert_count[idx_ii_80], 1);
-                        exp_off[61] = (int)_atomic_old_125;
+                        unsigned int _atomic_fetch_add_125 = atomicAdd(&smem_expert_count[idx_ii_80], 1);
+                        exp_off[61] = (int)_atomic_fetch_add_125;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_80 << 16);
                 }
@@ -2435,8 +2435,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_81 = ((local_idx_81 >= 0 && local_idx_81 < extent_81 && (local_idx_81 & stride_mask_81) == 0) ? 1 : 0);
                     exp_off[62] = 0;
                     if (is_local_81 != 0) {
-                        unsigned int _atomic_old_126 = atomicAdd(&smem_expert_count[idx_ii_81], 1);
-                        exp_off[62] = (int)_atomic_old_126;
+                        unsigned int _atomic_fetch_add_126 = atomicAdd(&smem_expert_count[idx_ii_81], 1);
+                        exp_off[62] = (int)_atomic_fetch_add_126;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_81 << 16);
                 }
@@ -2456,8 +2456,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     int is_local_82 = ((local_idx_82 >= 0 && local_idx_82 < extent_82 && (local_idx_82 & stride_mask_82) == 0) ? 1 : 0);
                     exp_off[63] = 0;
                     if (is_local_82 != 0) {
-                        unsigned int _atomic_old_127 = atomicAdd(&smem_expert_count[idx_ii_82], 1);
-                        exp_off[63] = (int)_atomic_old_127;
+                        unsigned int _atomic_fetch_add_127 = atomicAdd(&smem_expert_count[idx_ii_82], 1);
+                        exp_off[63] = (int)_atomic_fetch_add_127;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_82 << 16);
                 }
@@ -2468,8 +2468,8 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
     int local_expert_count = (int)smem_expert_count[thread_idx];
     int block_expert_offset = 0;
     if (thread_idx < num_experts) {
-        int _atomic_old_128 = atomicAdd(&expert_counts[thread_idx], local_expert_count);
-        block_expert_offset = _atomic_old_128;
+        int _atomic_fetch_add_128 = atomicAdd(&expert_counts[thread_idx], local_expert_count);
+        block_expert_offset = _atomic_fetch_add_128;
     }
     cooperative_groups::this_grid().sync();
     int count = 0;
@@ -2544,13 +2544,11 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         int mn_limit2 = scaled_0 + count;
         int _min_0 = ((scaled) < (mn_limit2) ? (scaled) : (mn_limit2));
         cta_idx_xy_to_mn_limit[exclusive + cta] = _min_0;
-        int _min_1 = ((scaled) < (_min_0 + (-_min_0 & 3)) ? (scaled) : (_min_0 + (-_min_0 & 3)));
-        int head_end = _min_1;
+        int head_end = ((scaled) < (_min_0 + (-_min_0 & 3)) ? (scaled) : (_min_0 + (-_min_0 & 3)));
         for (int head = _min_0; head < head_end; head++) {
             permuted_idx_to_token_idx[head] = -1;
         }
-        int _max_0 = ((scaled - head_end) > (0) ? (scaled - head_end) : (0));
-        int body_len = _max_0;
+        int body_len = ((scaled - head_end) > (0) ? (scaled - head_end) : (0));
         int tail_begin = head_end + (body_len >> 2 << 2);
         for (int body = head_end; body < tail_begin; body += 4) {
             {

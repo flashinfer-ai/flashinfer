@@ -244,7 +244,7 @@ class ThroughputLatencyMlaStaticWorkQueue(WorkQueue):
         self.batch_size = batch_size
         self.cache_seqs = cache_seqs
         self.cu_seqlens_q = cu_seqlens_q
-        self.enable_runtime_skip = cu_seqlens_q is not None
+        self.enable_runtime_skip = cache_seqs is not None or cu_seqlens_q is not None
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: WorkTileInfo):
@@ -327,7 +327,7 @@ class ThroughputLatencyMlaClcWorkQueue(WorkQueue):
         self.cfg = cfg
         self.cache_seqs = cache_seqs
         self.cu_seqlens_q = cu_seqlens_q
-        self.enable_runtime_skip = cu_seqlens_q is not None
+        self.enable_runtime_skip = cache_seqs is not None or cu_seqlens_q is not None
         self._clc_response_alloc = SmemAllocation(
             self.name + "_clc_response", dtype=cutlass.Int128, count=2, alignment=16
         )
@@ -2419,9 +2419,7 @@ class ThroughputLatencyMlaDecodeTs:
             cfg.use_multi_ctas_kv == 1
             and runtime_split_pruning_is_profitable(cfg.num_ctas_per_seq_kv)
         )
-        has_runtime_activity_guard = tile_sched_params is None and (
-            cu_seqlens_q is not None or enable_runtime_split_pruning
-        )
+        has_runtime_activity_guard = tile_sched_params is None
         if cutlass.const_expr(has_runtime_activity_guard):
             # Decode launch coordinates against the configured maximum grid,
             # then independently drop compact-Q padding and profitable split
@@ -2446,6 +2444,11 @@ class ThroughputLatencyMlaDecodeTs:
                     cta_idx_kv,
                 )
                 split_tile_is_active = cute.arch.make_warp_uniform(split_tile_is_active)
+            # An empty request publishes neither O/LSE nor split scratch.
+            # Cluster peers agree on this batch-owned predicate.
+            query_tile_is_active = query_tile_is_active & (
+                cache_seqs[batch_idx] > Int32(0)
+            )
             run_task_graph = query_tile_is_active and split_tile_is_active
         if cutlass.const_expr(tile_sched_params is not None):
             cta_idx_q = None

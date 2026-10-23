@@ -1,11 +1,14 @@
-"""Prepared fused projection, Sinkhorn, residual mixing and RMSNorm on SM100a/SM103a.
+"""Prepared fused projection, Sinkhorn, residual mixing and RMSNorm on SM100a/SM103a/SM107a.
 
-One generated source per schedule class (shifted x shared scale layout x the
-unroll and partition choices of a split-count class) serves every supported
-architecture; the loader compiles it with the exact flag set of the device it
-runs on and passes the split count, its FP8 norm partition count and the device
-SM count on the compile line. The token count is a run-time argument: the split
-count and the launch grid are chosen here from the same rules the producer uses.
+The FP8-output programs (hidden 5120, SM100a / SM103a) are one generated source
+per schedule class (shifted x shared scale layout x the unroll and partition
+choices of a split-count class); the loader compiles each with the exact flag
+set of the device it runs on and passes the split count, its FP8 norm partition
+count and the device SM count on the compile line. The BF16-output program
+(hidden 4096, normal mode, ``sf_layout="bf16"``, SM107a) takes the split count
+and the launch grid as kernel arguments, so one JIT module serves every SM
+count. The token count is a run-time argument everywhere: the split count and
+the launch grid are chosen here from the same rules the producer uses.
 """
 
 from __future__ import annotations
@@ -14,13 +17,35 @@ import functools
 from typing import Any
 
 GENERATED_ROOT = "csrc/experimental/deepgemm_mega_mhc/generated"
-CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 MAX_TOKENS = 1 << 20
 SPLIT_BARRIER_WORDS = 2 * (MAX_TOKENS // 64) * 16
+# The BF16-output route: hidden size, the pieces and padded rows of its split projection operand.
+BF16_HIDDEN = 4096
+FN_ROWS = 24
+FNP_PIECES = 3
+FNP_ROWS = 32
+# The output layouts a route serves: the FP8 layouts ("col" and "extra") share the FP8 programs.
+FP8_LAYOUTS = ("col", "extra")
 
 # Registry written by the exporter: one record per delivered source, and the
-# schedule keys (hidden, split count, shifted, shared scale layout) each source
-# serves with its compile-line defines.
+# schedule keys (hidden, split count, shifted, shared scale layout, output
+# layout) each source serves with its compile-line defines. A record may spell
+# its own ``arches``, ``compile_flags``, ``compile_options`` (the source build's
+# numerics, passed after ``--fmad=false``), ``arg_plan``, ``launch`` and
+# ``compile_time_sm_count``; a record without them takes the module-level
+# ARCHES, COMPILE_FLAGS and ARG_PLAN and the device SM count on the compile
+# line. A route with ``num_splits: "runtime"`` passes the split count to the
+# kernel instead of compiling it in; its ``sf_layout`` is "bf16" for the
+# BF16-output program and "fp8" (the default) for the FP8-output programs.
+# The second source of every record is the one shared host binding
+# (cake_mega_mhc_134570ae7cc112e9d84e_binding.cu): the exported bindings differed only in the
+# kernel symbol they launch and their host-shim namespace id, so load_program passes
+# the record's kernel_symbol as the CAKE_PROGRAM_KERNEL compile definition.
+# The four 40-split records build from the 27-split kernel source of their class:
+# the two sources differed only at sites now behind `#if NUM_SPLITS == 40` arms, which
+# the route's NUM_SPLITS define selects; each record keeps its own kernel symbol, so
+# the kept sources spell their kernel name through CAKE_PROGRAM_KERNEL as well.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_134570ae7cc112e9d84e": {
         "sources": [
@@ -37,7 +62,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_1576b7789968f04c8419": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_1576b7789968f04c8419",
         "hidden": 5120,
@@ -49,7 +74,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_2b99261aab173a941cb4": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_2b99261aab173a941cb4",
         "hidden": 5120,
@@ -61,7 +86,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_407321791585dc9fc44b": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_407321791585dc9fc44b",
         "hidden": 5120,
@@ -72,8 +97,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_41df2a8c4d3c4849adbf": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_41df2a8c4d3c4849adbf",
         "hidden": 5120,
@@ -85,7 +110,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_43b829c4b071416a4595": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_43b829c4b071416a4595",
         "hidden": 5120,
@@ -97,7 +122,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_8fd99969edc5072d3477": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_8fd99969edc5072d3477",
         "hidden": 5120,
@@ -108,8 +133,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_a5521c9dfaf81d2c0f1f": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_a5521c9dfaf81d2c0f1f",
         "hidden": 5120,
@@ -121,7 +146,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_b52ed5c3afc2fcbd2d0f": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_b52ed5c3afc2fcbd2d0f",
         "hidden": 5120,
@@ -133,7 +158,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_b73ed09be74eaa063166": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_b73ed09be74eaa063166",
         "hidden": 5120,
@@ -145,7 +170,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_b8c6c9ebebc80eb063b8": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_b8c6c9ebebc80eb063b8",
         "hidden": 5120,
@@ -156,8 +181,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_c7892aa3a7b985dcac4a": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_c7892aa3a7b985dcac4a",
         "hidden": 5120,
@@ -169,7 +194,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_dc85bbfab3b20cf209fc": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_dc85bbfab3b20cf209fc",
         "hidden": 5120,
@@ -180,8 +205,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_f7107723c112a3b117a9": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_f7107723c112a3b117a9",
         "hidden": 5120,
@@ -189,6 +214,60 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "shared_sf": False,
         "shared_sf_block_m": 0,
         "num_splits": [40],
+    },
+    "cake_mega_mhc_f24c2f3f98bfe3356398": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f24c2f3f98bfe3356398_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f24c2f3f98bfe3356398_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_f24c2f3f98bfe3356398",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
     },
 }
 ROUTES: list[dict[str, Any]] = [
@@ -320,6 +399,15 @@ ROUTES: list[dict[str, Any]] = [
         "program": "cake_mega_mhc_a5521c9dfaf81d2c0f1f",
         "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
     },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "bf16",
+        "program": "cake_mega_mhc_f24c2f3f98bfe3356398",
+        "defines": {},
+    },
 ]
 ARG_PLAN: list[list[str]] = [
     ["tma_buffer", "residual_map"],
@@ -409,9 +497,85 @@ def num_launch_sms(
     return num_sms
 
 
-def fp8_norm_partitions(hidden, splits):
-    """Hidden partitions the FP8 Norm workers split a token pair into."""
-    return hidden // 512 if splits > 16 and hidden // 256 > 8 else 2
+# Host rules of the BF16-output program (hidden 4096, 4 routes, 64 K blocks of 64
+# hidden x 4 routes): one text shared with the producer's own host rules and its
+# kernel tests, which check the three copies against each other.
+
+
+def mhc_infer_num_splits(
+    num_tokens: int, num_sms: int, deterministic: bool = False
+) -> int:
+    """Splits of the 64 K blocks (H4096, 4 routes), 16 when deterministic. The deepgemm_mega_mhc count fills one wave
+    of the SMs with the K blocks divided evenly, never below 16; when the tokens fit two rounds of the tail (twelve
+    tokens per CTA of the grid), a smaller count of at least ten whose tasks fit two waves of the grid and whose
+    waves x K blocks per task is smaller takes its place (the smallest such count), because the run then ends with
+    the coefficient chains of the last wave and not with the tail, which the idle CTAs of a partial last wave serve."""
+    if deterministic:
+        return 16
+    m_blocks = (num_tokens + 63) // 64
+    max_splits = min(64, max(16, num_sms // m_blocks))
+    longest = (64 + max_splits - 1) // max_splits
+    splits = (64 + longest - 1) // longest
+    grid = mhc_infer_num_ctas(num_tokens, num_sms, splits)
+    best = ((m_blocks * splits + grid - 1) // grid) * longest
+    if m_blocks * 64 <= 12 * grid:
+        for candidate in range(10, splits):
+            waves = (m_blocks * candidate + grid - 1) // grid
+            blocks = (64 + candidate - 1) // candidate
+            if waves <= 2 and waves * blocks < best:
+                splits, best = candidate, waves * blocks
+    return splits
+
+
+def mhc_infer_num_ctas(num_tokens: int, num_sms: int, num_splits: int) -> int:
+    """CTAs to launch: every projection task and every mix warp in one round, never more than the SMs; the kernel
+    strides tasks, tokens and m-block ownership by the grid, so any grid >= m_blocks is correct and this one is fast."""
+    m_blocks = (num_tokens + 63) // 64
+    return min(num_sms, max(m_blocks * num_splits, (num_tokens + 3) // 4))
+
+
+def mhc_infer_scratch_floats(num_tokens: int, num_splits: int) -> int:
+    """64 tokens x 24 mapping partials + 64 sum-of-squares words + 64 spare per task (the deepgemm_mega_mhc layout)."""
+    return ((num_tokens + 63) // 64) * num_splits * (1536 + 128)
+
+
+def mhc_infer_switch_points(num_sms: int, max_tokens: int = 1 << 20) -> tuple[int, ...]:
+    """Every T at which num_splits changes (the correctness tests cover both sides of each): the rule changes only at
+    m-block boundaries, so the scan steps by 64, and it stops once the tokens exceed two tail rounds of the SMs and the
+    count has returned to the deepgemm count (never below 16 from there on)."""
+    points, previous, t = [], mhc_infer_num_splits(1, num_sms), 65
+    while t <= max_tokens and (previous != 16 or t <= 12 * num_sms):
+        current = mhc_infer_num_splits(t, num_sms)
+        if current != previous:
+            points.append(t)
+            previous = current
+        t += 64
+    return tuple(points)
+
+
+def split_fn(fn, out=None):
+    """The projection operand of the BF16-output program: ``fn[24, 4H]`` FP32 as
+    three BF16 pieces ``fnp[3, 32, 4H]`` (rows 24..31 zero) with ``b1 = BF16(fn)``,
+    ``b2 = BF16(fn - b1)`` and ``b3 = BF16(fn - b1 - b2)``, each residual exact in
+    FP32, so ``b1 + b2 + b3`` carries ``fn`` to within 2^-27 relative. Torch
+    operations on the current stream only (CUDA Graph capturable); ``out`` is
+    the caller's ``[3, 32, 4H]`` BF16 buffer to overwrite, else a new one."""
+    import torch
+
+    rows, width = fn.shape
+    if out is None:
+        out = torch.empty(
+            (FNP_PIECES, FNP_ROWS, width), dtype=torch.bfloat16, device=fn.device
+        )
+    b1 = fn.to(torch.bfloat16)
+    r1 = fn - b1.float()
+    b2 = r1.to(torch.bfloat16)
+    b3 = (r1 - b2.float()).to(torch.bfloat16)
+    out[0, :rows].copy_(b1)
+    out[1, :rows].copy_(b2)
+    out[2, :rows].copy_(b3)
+    out[:, rows:].zero_()
+    return out
 
 
 @functools.cache
@@ -424,50 +588,129 @@ def device_facts(device_index):
     device = torch.device("cuda", device_index)
     capability = get_compute_capability(device)
     arch = CAPABILITIES.get(capability)
-    if arch is None or arch not in ARCHES:
+    if arch is None or arch not in shipped_arches():
         raise RuntimeError(
             f"Mega mHC has no exported programs for compute capability {capability}; "
-            f"supported: {ARCHES}"
+            f"supported: {shipped_arches()}"
         )
     return arch, get_device_sm_count(device)
 
 
-def select_program(hidden, splits, shifted, shared_sf):
-    """(source name, compile-line defines) serving the schedule key, or raise."""
+def record_arches(record):
+    """The architectures a program ships for: its own ``arches`` leaf, else ARCHES."""
+    return list(record.get("arches", ARCHES))
+
+
+def shipped_arches():
+    """Every architecture some exported program ships for: the records' own
+    ``arches`` leaves, else ARCHES."""
+    return sorted(
+        {arch for record in PROGRAMS.values() for arch in record_arches(record)}
+    )
+
+
+def record_arg_plan(record):
+    """The (kind, name) pairs of a program's ``run`` arguments: its own ``arg_plan``, else ARG_PLAN."""
+    return [tuple(pair) for pair in record.get("arg_plan", ARG_PLAN)]
+
+
+def record_compile_flags(record):
+    """The flags of a program's compile line after the architecture flags: its own
+    ``compile_flags`` (else COMPILE_FLAGS), then, for a record carrying the source
+    build's ``compile_options``, ``--fmad=false`` followed by those options (the
+    later flag wins, as the producer compiles)."""
+    flags = list(record.get("compile_flags", COMPILE_FLAGS))
+    options = record.get("compile_options")
+    if options is not None:
+        flags += ["--fmad=false", *options]
+    return flags
+
+
+def supported(arch, hidden, sf_layout):
+    """Whether an exported program serves ``hidden`` with the output layout
+    ``sf_layout`` on ``arch``, without loading anything."""
+    output = "bf16" if sf_layout == "bf16" else "fp8"
+    return any(
+        route["hidden"] == hidden
+        and route.get("sf_layout", "fp8") == output
+        and arch in record_arches(PROGRAMS[route["program"]])
+        for route in ROUTES
+    )
+
+
+def _support_matrix():
+    rows = sorted(
+        {
+            (
+                route["hidden"],
+                route.get("sf_layout", "fp8"),
+                tuple(record_arches(PROGRAMS[route["program"]])),
+            )
+            for route in ROUTES
+        }
+    )
+    return "; ".join(
+        f"hidden={hidden} output={output} on {list(arches)}"
+        for hidden, output, arches in rows
+    )
+
+
+def select_program(hidden, splits, shifted, shared_sf, sf_layout, arch):
+    """(source name, compile-line defines) serving the schedule key on ``arch``, or raise."""
+    output = "bf16" if sf_layout == "bf16" else "fp8"
     for route in ROUTES:
         if (
             route["hidden"] == hidden
-            and route["num_splits"] == splits
+            and route["num_splits"] in (splits, "runtime")
             and route["shifted"] == shifted
             and route["shared_sf"] == shared_sf
+            and route.get("sf_layout", "fp8") == output
+            and arch in record_arches(PROGRAMS[route["program"]])
         ):
             return route["program"], dict(route["defines"])
     raise NotImplementedError(
         f"No exported mHC program for hidden={hidden}, num_splits={splits}, "
-        f"shifted={shifted}, shared_sf={shared_sf}"
+        f"shifted={shifted}, shared_sf={shared_sf}, sf_layout={sf_layout!r} on {arch}; "
+        f"exported: {_support_matrix()}"
     )
 
 
 @functools.cache
 def load_program(name, arch, num_sms, defines):
-    """Build ``name`` for ``arch`` with the route's defines and ``NUM_SMS`` on the compile line."""
+    """Build ``name`` for ``arch`` with the route's defines, the program's kernel symbol
+    (``CAKE_PROGRAM_KERNEL``, read by the shared binding and by the kernel sources shared
+    between a 27-split and a 40-split program) and, for a record compiled per SM count,
+    ``NUM_SMS`` on the compile line."""
     from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+    from flashinfer.jit.core import (
+        gen_jit_spec,
+        sm100a_nvcc_flags,
+        sm103a_nvcc_flags,
+        sm107a_nvcc_flags,
+    )
 
-    arch_flags = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
-    values = (*defines, ("NUM_SMS", num_sms))
+    record = PROGRAMS[name]
+    arch_flags = {
+        "sm_100a": sm100a_nvcc_flags,
+        "sm_103a": sm103a_nvcc_flags,
+        "sm_107a": sm107a_nvcc_flags,
+    }[arch]
+    values = tuple(defines)
+    if record.get("compile_time_sm_count", True):
+        values = (*values, ("NUM_SMS", num_sms))
     spec = gen_jit_spec(
         name="_".join(
             [name, arch, *(f"{key.lower()}{value}" for key, value in values)]
         ),
         sources=[
             env.FLASHINFER_CSRC_DIR / path.removeprefix("csrc/")
-            for path in PROGRAMS[name]["sources"]
+            for path in record["sources"]
         ],
         extra_cuda_cflags=[
             *arch_flags,
-            *COMPILE_FLAGS,
+            *record_compile_flags(record),
             *(f"-D{key}={value}" for key, value in values),
+            f"-DCAKE_PROGRAM_KERNEL={PROGRAMS[name]['kernel_symbol']}",
             "--device-entity-has-hidden-visibility=false",
         ],
         extra_ldflags=["-lcuda"],
@@ -536,14 +779,22 @@ class MegaMHCPlan:
     """Bind a fused mHC operation and reuse its private invocation state.
 
     x/residual/rmsnorm_weight are BF16; projection and mixing coefficients are
-    FP32. The four residual routes produce BF16 normalized output plus FP8
-    E4M3 output and packed per-32 UE8M0 scales. ``sf_layout='col'`` stores
-    column-major scale words; ``'extra'`` also stores the shared-expert padded
-    row permutation. Any token count in [1, 2**20] is accepted; the split
-    count follows the token count (or ``deterministic``), and the program for
-    that split count must be exported for ``hidden``.
+    FP32. The four residual routes produce BF16 normalized output and, with
+    ``sf_layout='col'`` or ``'extra'`` (hidden 5120), FP8 E4M3 output with packed
+    per-32 UE8M0 scales: ``'col'`` stores column-major scale words, ``'extra'``
+    also stores the shared-expert padded row permutation. ``sf_layout='bf16'``
+    (hidden 4096, normal mode) stores the BF16 output alone: no FP8 values, no
+    scale words. Any token count in [1, 2**20] is accepted; the split count
+    follows the token count (or ``deterministic``), and the program for that
+    split count must be exported for ``hidden`` on the device's architecture.
 
-    Scratch, split_barriers and launch_epochs may be caller-owned. Fresh
+    The BF16-output program reads the projection ``fn`` through its three BF16
+    pieces (``split_fn``), built once here from ``fn`` as given to the plan, or
+    taken from the caller's ``fnp`` buffer. ``fn`` is captured at plan time: a
+    later change of ``fn`` reaches the kernel through ``update_fn()``, which
+    re-splits into the retained buffer on the current stream.
+
+    Scratch, split_barriers, launch_epochs and fnp may be caller-owned. Fresh
     barriers/epochs must be zeroed once before first use and retained across
     ordinary calls and CUDA Graph replay. Epoch storage always has num_sms
     entries, including CTAs omitted by a selected launch grid. One plan must
@@ -578,12 +829,13 @@ class MegaMHCPlan:
         scratch=None,
         split_barriers=None,
         launch_epochs=None,
+        fnp=None,
     ):
         import torch
 
         if x.device.type != "cuda":
             raise RuntimeError("Mega mHC requires a CUDA device")
-        if x.ndim != 2 or hc_mult != 4 or sf_layout not in ("bf16", "col", "extra"):
+        if x.ndim != 2 or hc_mult != 4 or sf_layout not in ("bf16", *FP8_LAYOUTS):
             raise ValueError(
                 "Expected x[T,H], four residual routes and col/extra/bf16 scale layout"
             )
@@ -594,31 +846,47 @@ class MegaMHCPlan:
             )
         if sf_layout == "extra" and shared_sf_block_m <= 0:
             raise ValueError("shared_sf_block_m must be positive")
-        if sf_layout == "bf16":
-            raise NotImplementedError(
-                "Exported mHC programs store the FP8 output; use sf_layout 'col' or 'extra'"
-            )
         arch, sms = device_facts(x.device.index)
         shifted = shifted_prev_mix is not None
-        splits = num_splits(tokens, hidden, sms, deterministic)
-        shared_sf = sf_layout == "extra"
-        program, defines = select_program(hidden, splits, shifted, shared_sf)
-        block_m = shared_sf_block_m if shared_sf else 0
-        if shared_sf and block_m != PROGRAMS[program]["shared_sf_block_m"]:
+        store_fp8 = sf_layout != "bf16"
+        if not store_fp8 and (hidden != BF16_HIDDEN or shifted):
             raise NotImplementedError(
-                f"Exported mHC programs use shared_sf_block_m={PROGRAMS[program]['shared_sf_block_m']}"
+                f"The BF16-output mHC program serves hidden={BF16_HIDDEN} in normal mode "
+                f"(shifted_prev_mix=None); got hidden={hidden}, shifted={shifted}. "
+                f"Exported: {_support_matrix()}"
             )
-        launch_sms = num_launch_sms(
-            tokens,
-            hidden,
-            sms,
-            splits,
-            shifted,
-            True,
-            sf_layout == "col",
-            deterministic,
+        shared_sf = sf_layout == "extra"
+        if store_fp8:
+            splits = num_splits(tokens, hidden, sms, deterministic)
+        else:
+            splits = mhc_infer_num_splits(tokens, sms, deterministic)
+        program, defines = select_program(
+            hidden, splits, shifted, shared_sf, sf_layout, arch
         )
-        self.config = dict(num_splits=splits, num_sms=sms, num_launch_sms=launch_sms)
+        record = PROGRAMS[program]
+        block_m = shared_sf_block_m if shared_sf else 0
+        if shared_sf and block_m != record["shared_sf_block_m"]:
+            raise NotImplementedError(
+                f"Exported mHC programs use shared_sf_block_m={record['shared_sf_block_m']}"
+            )
+        if store_fp8:
+            launch_sms = num_launch_sms(
+                tokens,
+                hidden,
+                sms,
+                splits,
+                shifted,
+                True,
+                sf_layout == "col",
+                deterministic,
+            )
+            scratch_shape = ((tokens + 63) // 64 * splits * (1536 + 128),)
+        else:
+            launch_sms = mhc_infer_num_ctas(tokens, sms, splits)
+            scratch_shape = (mhc_infer_scratch_floats(tokens, splits),)
+        self.config = dict(
+            num_splits=splits, num_sms=sms, num_launch_sms=launch_sms, program=program
+        )
         self.program = program
         self.defines = defines
 
@@ -639,9 +907,9 @@ class MegaMHCPlan:
             ("residual", residual, torch.bfloat16, (tokens, 4, hidden)),
             ("post_mix", post_mix, torch.float32, (tokens, 4, 1)),
             ("comb_res_mix", comb_res_mix, torch.float32, (tokens, 4, 4)),
-            ("fn", fn, torch.float32, (24, 4 * hidden)),
+            ("fn", fn, torch.float32, (FN_ROWS, 4 * hidden)),
             ("mix_scales", mix_scales, torch.float32, (3,)),
-            ("mix_bases", mix_bases, torch.float32, (24,)),
+            ("mix_bases", mix_bases, torch.float32, (FN_ROWS,)),
             ("rmsnorm_weight", rmsnorm_weight, torch.bfloat16, (hidden,)),
         ):
             require(name, tensor, dtype, shape)
@@ -662,24 +930,25 @@ class MegaMHCPlan:
             ("new_post_mix", torch.float32, (tokens, 4, 1)),
             ("new_comb_res_mix", torch.float32, (tokens, 4, 4)),
             ("y_bf16", torch.bfloat16, (tokens, hidden)),
-            ("y_fp8", torch.float8_e4m3fn, (tokens, hidden)),
         ):
             require(name, out[name], dtype, shape)
         if shifted:
             require("new_prev_mix", out["new_prev_mix"], torch.float32, (tokens, 4, 1))
-        primary = out["y_gemm_sf" if sf_layout == "col" else "y_routed_sf"]
-        require(
-            "primary scale words",
-            primary,
-            torch.int32,
-            (tokens, hidden // 128),
-            contiguous=False,
-        )
-        expected_stride = (
-            (1, (tokens + 3) // 4 * 4) if sf_layout == "col" else (hidden // 128, 1)
-        )
-        if primary.stride() != expected_stride:
-            raise ValueError(f"Primary scale strides must be {expected_stride}")
+        if store_fp8:
+            require("y_fp8", out["y_fp8"], torch.float8_e4m3fn, (tokens, hidden))
+            primary = out["y_gemm_sf" if sf_layout == "col" else "y_routed_sf"]
+            require(
+                "primary scale words",
+                primary,
+                torch.int32,
+                (tokens, hidden // 128),
+                contiguous=False,
+            )
+            expected_stride = (
+                (1, (tokens + 3) // 4 * 4) if sf_layout == "col" else (hidden // 128, 1)
+            )
+            if primary.stride() != expected_stride:
+                raise ValueError(f"Primary scale strides must be {expected_stride}")
         if shared_sf:
             rows = (tokens + block_m - 1) // block_m * ((block_m + 127) // 128 * 128)
             storage, shared = out["y_shared_sf_storage"], out["y_shared_sf"]
@@ -706,7 +975,6 @@ class MegaMHCPlan:
                 raise ValueError(
                     "Shared scales require the padded column-major storage and its first-T-row view"
                 )
-        scratch_shape = ((tokens + 63) // 64 * splits * (1536 + 128),)
         if scratch is None:
             scratch = torch.empty(scratch_shape, dtype=torch.float32, device=x.device)
         if split_barriers is None:
@@ -718,51 +986,102 @@ class MegaMHCPlan:
         require("scratch", scratch, torch.float32, scratch_shape)
         require("split_barriers", split_barriers, torch.uint64, (SPLIT_BARRIER_WORDS,))
         require("launch_epochs", launch_epochs, torch.uint64, (sms,))
-        dummy_u32 = torch.empty(1, dtype=torch.uint32, device=x.device)
-        dummy_float = torch.empty(1, dtype=torch.float32, device=x.device)
-        shared = out["y_shared_sf"] if shared_sf else dummy_u32
-        self.bindings = dict(
-            residual_map=residual,
-            x_map=x,
-            fn_map=fn,
-            post_map=post_mix.view(tokens, 4),
-            comb_map=comb_res_mix.view(tokens, 16),
-            prev_map=(shifted_prev_mix if shifted else post_mix).view(tokens, 4),
-            new_residual_map=out["new_residual"],
-            y_map=out["y_bf16"] if shifted else x,
-            mix_scales=mix_scales,
-            mix_bases=mix_bases,
-            new_prev_mix=out["new_prev_mix"] if shifted else dummy_float,
-            new_post_mix=out["new_post_mix"],
-            new_comb_res_mix=out["new_comb_res_mix"],
-            rmsnorm_weight=rmsnorm_weight,
-            new_residual=out["new_residual"],
-            y_bf16=out["y_bf16"],
-            y_fp8=out["y_fp8"].view(torch.uint8),
-            y_primary_sf=_raw_storage(primary),
-            y_shared_sf=_raw_storage(shared),
-            scratch=scratch,
-            split_barriers=split_barriers,
-            launch_epochs=launch_epochs,
-            num_tokens=tokens,
-            hc_norm_eps=hc_norm_eps,
-            hc_pre_eps=hc_pre_eps,
-            hc_post_scale=hc_post_scale,
-            sinkhorn_eps=sinkhorn_eps,
-            num_sinkhorn_iters=num_sinkhorn_iters,
-            rmsnorm_eps=rmsnorm_eps,
-            rmsnorm_scale=rmsnorm_scale,
-            primary_sf_stride_token=primary.stride(0),
-            primary_sf_stride_word=primary.stride(1),
-            shared_sf_stride_word=shared.stride(1) if shared_sf else 0,
-            grid_x=launch_sms,
-            grid_y=1,
-            grid_z=1,
-        )
+        if store_fp8:
+            if fnp is not None:
+                raise ValueError(
+                    "fnp is the BF16-output program's operand; the FP8 programs read fn"
+                )
+            dummy_u32 = torch.empty(1, dtype=torch.uint32, device=x.device)
+            dummy_float = torch.empty(1, dtype=torch.float32, device=x.device)
+            shared = out["y_shared_sf"] if shared_sf else dummy_u32
+            self.bindings = dict(
+                residual_map=residual,
+                x_map=x,
+                fn_map=fn,
+                post_map=post_mix.view(tokens, 4),
+                comb_map=comb_res_mix.view(tokens, 16),
+                prev_map=(shifted_prev_mix if shifted else post_mix).view(tokens, 4),
+                new_residual_map=out["new_residual"],
+                y_map=out["y_bf16"] if shifted else x,
+                mix_scales=mix_scales,
+                mix_bases=mix_bases,
+                new_prev_mix=out["new_prev_mix"] if shifted else dummy_float,
+                new_post_mix=out["new_post_mix"],
+                new_comb_res_mix=out["new_comb_res_mix"],
+                rmsnorm_weight=rmsnorm_weight,
+                new_residual=out["new_residual"],
+                y_bf16=out["y_bf16"],
+                y_fp8=out["y_fp8"].view(torch.uint8),
+                y_primary_sf=_raw_storage(primary),
+                y_shared_sf=_raw_storage(shared),
+                scratch=scratch,
+                split_barriers=split_barriers,
+                launch_epochs=launch_epochs,
+                num_tokens=tokens,
+                hc_norm_eps=hc_norm_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_post_scale=hc_post_scale,
+                sinkhorn_eps=sinkhorn_eps,
+                num_sinkhorn_iters=num_sinkhorn_iters,
+                rmsnorm_eps=rmsnorm_eps,
+                rmsnorm_scale=rmsnorm_scale,
+                primary_sf_stride_token=primary.stride(0),
+                primary_sf_stride_word=primary.stride(1),
+                shared_sf_stride_word=shared.stride(1) if shared_sf else 0,
+                grid_x=launch_sms,
+                grid_y=1,
+                grid_z=1,
+            )
+            retained = (dummy_u32, dummy_float)
+        else:
+            fnp_shape = (FNP_PIECES, FNP_ROWS, 4 * hidden)
+            if fnp is None:
+                fnp = split_fn(fn)
+            require("fnp", fnp, torch.bfloat16, fnp_shape)
+            self.bindings = dict(
+                residual_map=residual,
+                x_map=x,
+                fnp_map=fnp,
+                post_map=post_mix.view(tokens, 4),
+                comb_map=comb_res_mix.view(tokens, 16),
+                new_residual_map=out["new_residual"],
+                mix_scales=mix_scales,
+                mix_bases=mix_bases,
+                new_post_mix=out["new_post_mix"],
+                new_comb_res_mix=out["new_comb_res_mix"],
+                rmsnorm_weight=rmsnorm_weight,
+                new_residual=out["new_residual"],
+                y_bf16=out["y_bf16"],
+                scratch=scratch,
+                split_barriers=split_barriers,
+                launch_epochs=launch_epochs,
+                num_tokens=tokens,
+                num_splits=splits,
+                split_div=splits,
+                num_ctas=launch_sms,
+                hc_norm_eps=hc_norm_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_post_scale=hc_post_scale,
+                sinkhorn_eps=sinkhorn_eps,
+                num_sinkhorn_iters=num_sinkhorn_iters,
+                rmsnorm_eps=rmsnorm_eps,
+                rmsnorm_scale=rmsnorm_scale,
+                grid_x=launch_sms,
+                grid_y=1,
+                grid_z=1,
+            )
+            retained = (fnp,)
         module, self.library_path = load_program(
             program, arch, sms, tuple(sorted(defines.items()))
         )
-        args = tuple(self.bindings[name] for _kind, name in ARG_PLAN)
+        unbound = [
+            name for _kind, name in record_arg_plan(record) if name not in self.bindings
+        ]
+        if unbound:
+            raise RuntimeError(
+                f"The argument plan of {program} names {unbound}, which this plan does not bind"
+            )
+        args = tuple(self.bindings[name] for _kind, name in record_arg_plan(record))
         self._submission = (module["run"], args)
         self._retained = (
             module,
@@ -775,15 +1094,39 @@ class MegaMHCPlan:
             mix_scales,
             mix_bases,
             rmsnorm_weight,
-            dummy_u32,
-            dummy_float,
+            *retained,
         )
+        self.fn, self.fnp = fn, fnp
         self.outputs, self.scratch, self.split_barriers, self.launch_epochs = (
             out,
             scratch,
             split_barriers,
             launch_epochs,
         )
+
+    def update_fn(self, fn=None):
+        """Re-split the projection into the plan's ``fnp`` buffer on the current
+        stream: the plan's ``fn`` as it reads now, or ``fn`` (same shape and
+        dtype), which the plan retains from then on. Torch operations only, so a
+        CUDA Graph may capture it. The FP8 programs read the ``fn`` bound at
+        plan time in place: there this call is a no-op, and a replacement
+        tensor is refused rather than ignored."""
+        if self.fnp is None:
+            if fn is not None:
+                raise ValueError(
+                    "the FP8 programs read the fn bound at plan time; "
+                    "prepare a new plan to replace it"
+                )
+            return
+        if fn is not None:
+            if (
+                fn.shape != self.fn.shape
+                or fn.dtype != self.fn.dtype
+                or fn.device != self.fn.device
+            ):
+                raise ValueError("fn must keep the plan's shape, dtype and device")
+            self.fn = fn
+        split_fn(self.fn, out=self.fnp)
 
     def run(self):
         import tvm_ffi

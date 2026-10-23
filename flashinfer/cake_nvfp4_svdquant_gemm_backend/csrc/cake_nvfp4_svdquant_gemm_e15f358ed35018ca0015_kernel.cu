@@ -591,8 +591,7 @@ kernel_cake_nvfp4_svdquant_gemm_e15f358ed35018ca0015(const __grid_constant__ CUt
             _phase_acc_full_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
             float alpha_value = alpha[0];
-            float2 _f2_0 = make_float2(alpha_value, alpha_value);
-            float2 alpha_pair = _f2_0;
+            float2 alpha_pair = make_float2(alpha_value, alpha_value);
             #pragma unroll
             for (int subtile = 0; subtile < 4; subtile++) {
                 int tmem_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)(subtile * 32);
@@ -629,10 +628,8 @@ kernel_cake_nvfp4_svdquant_gemm_e15f358ed35018ca0015(const __grid_constant__ CUt
                     bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
                     bias_hi_bits = bias_pair & 4294901760u;
                     bias_hi = reinterpret_cast<float*>(&bias_hi_bits)[0];
-                    float2 _f2_1 = make_float2(_tmem_load_0[2 * j], _tmem_load_0[2 * j + 1]);
-                    float2 value_pair = _f2_1;
-                    float2 _f2_2 = make_float2(bias_lo, bias_hi);
-                    float2 bias_value_pair = _f2_2;
+                    float2 value_pair = make_float2(_tmem_load_0[2 * j], _tmem_load_0[2 * j + 1]);
+                    float2 bias_value_pair = make_float2(bias_lo, bias_hi);
                     float2 result_pair = fma_f32x2_rn_ftz(value_pair, alpha_pair, bias_value_pair);
                     result[2 * j] = result_pair.x;
                     result[2 * j + 1] = result_pair.y;

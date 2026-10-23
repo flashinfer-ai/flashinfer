@@ -70,16 +70,19 @@ The forward projection is also reachable from the stable grouped GEMM API:
 `flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")`
 (bfloat16 outputs only, no tactic index, `N % 256 == 0`, `K % 64 == 0`; rows
 of `a` past `m_indptr[-1]` are left untouched). Naming the backend is the
-opt-in and emits the experimental-backend warning once.
+opt-in and emits the experimental-backend warning once (FlashInfer's
+`ExperimentalWarning`). A copy of the package running without FlashInfer cannot
+reach this stable API; a direct `cake_backend.grouped_mm_bf16_cake` call there
+warns with the package's own `ExperimentalWarning` class instead (see
+"Standalone import" below).
 
 `cake_grouped_mm(x, w, offs, deterministic=True)` is a `torch.autograd.Function`
 wrapper (`CakeGroupedMm`): `backward` produces `x.grad` with the `dgrad`
 program and `w.grad` with the `wgrad` program in the dtype of `w`. The
 programs always reduce in a fixed order, so `deterministic=False` currently
 runs the same deterministic programs; `grouped_gemm_wgrad(..., out_dtype=torch.float32)`
-gives an fp32 weight gradient. `cake_autograd.py` also registers the three
-programs as FlashInfer custom ops (`flashinfer::cake_moe_grouped_gemm_{fwd,dgrad,wgrad}`)
-with fake implementations.
+gives an fp32 weight gradient. `CakeGroupedMm` calls the three programs as
+plain functions; no torch custom op is registered.
 
 ## Host plan
 
@@ -144,20 +147,41 @@ FlashInfer header. The 512-wide weight-gradient tile is registered for
 Measured on B200 (`sm_100a`), GB300 (`sm_103a`) and R200 (`sm_107a`); the
 performance summary is in the delivery pull requests.
 
+## Standalone import
+
+The package imports without a FlashInfer installation. Its experimental-API
+helpers (the once-per-function warning decorator and the once-per-(API, backend)
+warning) come from `flashinfer.api_logging` when that module is importable --
+a copy of the package loaded next to an importable FlashInfer binds to that
+installation and imports `flashinfer` when the copy is imported -- and
+otherwise (no FlashInfer in the process, `sys.modules["flashinfer"] = None` as
+a vendoring gate sets it, or a FlashInfer without these helpers) from the
+stand-ins in the package's `_experimental.py`. The stand-ins emit the same
+warning text, once per function and once per (API, backend) pair, with three
+differences: the category is the package's own `ExperimentalWarning` (a
+`UserWarning`; a filter on `flashinfer.experimental.ExperimentalWarning` does
+not match it), there is no API logging (`FLASHINFER_LOGLEVEL` is not read),
+and the set of warned (API, backend) pairs is package-local. Inside FlashInfer
+the bound helpers are FlashInfer's own and nothing changes. Only the loader's
+JIT fallback (`cake_build.py`) reaches FlashInfer after import, when a library
+is not prebuilt under `aot/`.
+
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_gemm.py tests/experimental/test_cake_moe_grouped_gemm_api.py
+pytest tests/experimental/test_cake_moe_grouped_gemm.py tests/experimental/test_cake_moe_grouped_gemm_api.py tests/experimental/test_cake_moe_grouped_gemm_standalone.py
 python benchmarks/bench_cake_moe_grouped_gemm.py --help
 ```
 
 The tests compare against a per-group fp64 reference (including an empty
 group, a one-row group, padded outputs, determinism and the fp32 output) and
 skip when no supported device or no registered program is present. The
-benchmark times the prepared launches against `torch._grouped_mm`, a
-per-group cuBLAS loop and `flashinfer.grouped_mm.grouped_mm_bf16` on the
-MoE projection rows of the design (E = 4 ragged distributions, E = 8 / 16 /
-32 balanced, fp32 weight gradients).
+standalone test copies the package under another name into a subprocess with
+`flashinfer` blocked and runs on CPU. The benchmark times the prepared
+launches against `torch._grouped_mm`, a per-group cuBLAS loop and
+`flashinfer.grouped_mm.grouped_mm_bf16` on the MoE projection rows of the
+design (E = 4 ragged distributions, E = 8 / 16 / 32 balanced, fp32 weight
+gradients).
 
 ## Limitations
 

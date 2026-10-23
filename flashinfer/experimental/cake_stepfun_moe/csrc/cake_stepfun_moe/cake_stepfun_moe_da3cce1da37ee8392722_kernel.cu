@@ -59,7 +59,7 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
     float* row_amax_smem = reinterpret_cast<float*>(smem_static_raw + 16);
     const int row_amax_smem_addr = (int)(unsigned long long)__cvta_generic_to_shared(row_amax_smem);
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int row_idx = bid;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (row_idx < m) {
@@ -88,33 +88,33 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
                 }
                 uint16_t _bf16_max_0;
                 asm("max.bf16 %0, %1, %2;" : "=h"(_bf16_max_0) : "h"((uint16_t)(pair_max & 65535)), "h"((uint16_t)(pair_max >> 16)));
-                float _cvt_f32_bf16_0;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_0) : "h"((uint16_t)(_bf16_max_0)));
-                float _max_0;
-                asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_0) : "f"(local_amax), "f"(_cvt_f32_bf16_0));
-                local_amax = _max_0;
+                float _cvt_f32_bf16_2;
+                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_2) : "h"((uint16_t)(_bf16_max_0)));
+                float _max_1;
+                asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_1) : "f"(local_amax), "f"(_cvt_f32_bf16_2));
+                local_amax = _max_1;
             }
             float warp_val = local_amax;
-            float _shfl_down_0 = __shfl_down_sync(0xFFFFFFFF, warp_val, 1, 32);
-            float _max_1;
-            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_1) : "f"(warp_val), "f"(_shfl_down_0));
-            warp_val = _max_1;
-            float _shfl_down_1 = __shfl_down_sync(0xFFFFFFFF, warp_val, 2, 32);
-            float _max_2;
-            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_2) : "f"(warp_val), "f"(_shfl_down_1));
-            warp_val = _max_2;
-            float _shfl_down_2 = __shfl_down_sync(0xFFFFFFFF, warp_val, 4, 32);
+            float _shfl_down_sync_4 = __shfl_down_sync(0xFFFFFFFF, warp_val, 1, 32);
             float _max_3;
-            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_3) : "f"(warp_val), "f"(_shfl_down_2));
+            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_3) : "f"(warp_val), "f"(_shfl_down_sync_4));
             warp_val = _max_3;
-            float _shfl_down_3 = __shfl_down_sync(0xFFFFFFFF, warp_val, 8, 32);
-            float _max_4;
-            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_4) : "f"(warp_val), "f"(_shfl_down_3));
-            warp_val = _max_4;
-            float _shfl_down_4 = __shfl_down_sync(0xFFFFFFFF, warp_val, 16, 32);
+            float _shfl_down_sync_6 = __shfl_down_sync(0xFFFFFFFF, warp_val, 2, 32);
             float _max_5;
-            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_5) : "f"(warp_val), "f"(_shfl_down_4));
+            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_5) : "f"(warp_val), "f"(_shfl_down_sync_6));
             warp_val = _max_5;
+            float _shfl_down_sync_8 = __shfl_down_sync(0xFFFFFFFF, warp_val, 4, 32);
+            float _max_7;
+            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_7) : "f"(warp_val), "f"(_shfl_down_sync_8));
+            warp_val = _max_7;
+            float _shfl_down_sync_10 = __shfl_down_sync(0xFFFFFFFF, warp_val, 8, 32);
+            float _max_9;
+            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_9) : "f"(warp_val), "f"(_shfl_down_sync_10));
+            warp_val = _max_9;
+            float _shfl_down_sync_12 = __shfl_down_sync(0xFFFFFFFF, warp_val, 16, 32);
+            float _max_11;
+            asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_11) : "f"(warp_val), "f"(_shfl_down_sync_12));
+            warp_val = _max_11;
             if (lane == 0) {
                 warp_aggregates[warp] = warp_val;
             }
@@ -123,27 +123,28 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
             if (tid == 0) {
                 #pragma unroll
                 for (int w_1 = 1; w_1 < 4; w_1++) {
-                    float _max_6;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_6) : "f"(row_amax), "f"(warp_aggregates[w_1]));
-                    row_amax = _max_6;
+                    float _max_13;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_13) : "f"(row_amax), "f"(warp_aggregates[w_1]));
+                    row_amax = _max_13;
                 }
                 row_amax_smem[0] = row_amax;
             }
             __syncthreads();
             row_amax = row_amax_smem[0];
-            float per_token = mul_f32_rn_ftz(row_amax, global_scale_inv);
+            float per_token;
+            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(per_token) : "f"(row_amax), "f"(global_scale_inv));
             if (tid == 0) {
                 *(reinterpret_cast<float*>(per_token_scale + row_idx) + (0)) = per_token;
             }
             __syncthreads();
             per_token = per_token_scale[row_idx];
             float global_encode_scale = 0.0f;
-            uint32_t _f32_setp_0_bits;
-            asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_f32_setp_0_bits) : "f"(per_token), "f"(0.0f));
-            bool _f32_setp_0 = _f32_setp_0_bits != 0;
-            if (_f32_setp_0) {
-                float _rcp_0 = approx_rcp(per_token);
-                global_encode_scale = _rcp_0;
+            uint32_t _setp_14_bits;
+            asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_setp_14_bits) : "f"(per_token), "f"(0.0f));
+            bool _setp_14 = _setp_14_bits != 0;
+            if (_setp_14) {
+                float _rcp_15 = approx_rcp(per_token);
+                global_encode_scale = _rcp_15;
             }
             for (unsigned int vec_idx2 = tid_u32; vec_idx2 < num_vecs_per_row; vec_idx2 += 128) {
                 unsigned int vec_offset2 = (unsigned int)row_idx * num_vecs_per_row + vec_idx2;
@@ -165,28 +166,27 @@ kernel_cake_stepfun_moe_da3cce1da37ee8392722(__nv_bfloat16* __restrict__ input, 
                 }
                 uint16_t _bf16_max_1;
                 asm("max.bf16 %0, %1, %2;" : "=h"(_bf16_max_1) : "h"((uint16_t)(vec_pair_max & 65535)), "h"((uint16_t)(vec_pair_max >> 16)));
-                float _cvt_f32_bf16_1;
-                asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_1) : "h"((uint16_t)(_bf16_max_1)));
-                float vec_max = _cvt_f32_bf16_1;
-                float _rcp_1 = approx_rcp(6.0f);
-                float sf_value = mul_f32_rn_ftz(global_encode_scale, mul_f32_rn_ftz(vec_max, _rcp_1));
-                uint16_t _e4m3x2_2;
-                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
-                uint8_t _e4m3_scalar_0 = (uint8_t)_e4m3x2_2;
-                uint32_t _f16x2_decode_3;
-                float _fp8_decode_0;
-                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_3) : "h"(_e4m3x2_2));
-                uint16_t _f16_decode_3 = (uint16_t)_f16x2_decode_3;
-                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_0) : "h"(_f16_decode_3));
-                float sf_decoded = _fp8_decode_0;
+                float vec_max;
+                asm("cvt.f32.bf16 %0, %1;" : "=f"(vec_max) : "h"((uint16_t)(_bf16_max_1)));
+                float _rcp_17 = approx_rcp(6.0f);
+                float sf_value;
+                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(sf_value) : "f"(global_encode_scale), "f"(mul_f32_rn_ftz(vec_max, _rcp_17)));
+                uint16_t _e4m3x2_19;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_19) : "f"(0.0f), "f"(sf_value));
+                uint8_t _cvt_satfinite_e4m3_f32_18 = (uint8_t)_e4m3x2_19;
+                uint32_t _f16x2_decode_20;
+                float sf_decoded;
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_20) : "h"(_e4m3x2_19));
+                uint16_t _f16_decode_20 = (uint16_t)_f16x2_decode_20;
+                asm("cvt.f32.f16 %0, %1;" : "=f"(sf_decoded) : "h"(_f16_decode_20));
                 float output_scale = 0.0f;
-                uint32_t _f32_setp_1_bits;
-                asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_f32_setp_1_bits) : "f"(vec_max), "f"(0.0f));
-                bool _f32_setp_1 = _f32_setp_1_bits != 0;
-                if (_f32_setp_1) {
-                    float _rcp_2 = approx_rcp(global_encode_scale);
-                    float _rcp_3 = approx_rcp(mul_f32_rn_ftz(sf_decoded, _rcp_2));
-                    output_scale = _rcp_3;
+                uint32_t _setp_21_bits;
+                asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_setp_21_bits) : "f"(vec_max), "f"(0.0f));
+                bool _setp_21 = _setp_21_bits != 0;
+                if (_setp_21) {
+                    float _rcp_23 = approx_rcp(global_encode_scale);
+                    float _rcp_22 = approx_rcp(mul_f32_rn_ftz(sf_decoded, _rcp_23));
+                    output_scale = _rcp_22;
                 }
                 unsigned int packed[2];
                 float values[8];

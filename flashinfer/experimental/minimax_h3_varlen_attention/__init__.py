@@ -16,10 +16,14 @@ limitations under the License.
 
 # Experimental Cake backend: MiniMax-H3 packed-varlen noncausal attention over
 # THD ``[T, H, 128]`` BF16 tensors for SM100 / SM103
-# (flashinfer-ai/flashinfer#4532, tracker #4254).  Two generated program
-# families live here: the BF16 kernel (``minimax_h3_varlen_attention``) and
-# the NVFP4-QK kernels with NVFP4 or FP8 PV plus their in-pipeline quantizers
-# (``minimax_h3_varlen_nvfp4_attention``).  The public entry points are
-# ``flashinfer.prefill.minimax_h3_varlen_attention`` and
+# (flashinfer-ai/flashinfer#4532, tracker #4254).  Three generated program
+# families live here: the BF16 kernel (``minimax_h3_varlen_attention``), the
+# NVFP4-QK kernels with NVFP4 or FP8 PV plus their in-pipeline quantizers
+# (``minimax_h3_varlen_nvfp4_attention``) and the all-FP8 kernel over E4M3
+# operands with per-tensor descales (``minimax_h3_varlen_fp8_attention``; an
+# in-tree generated program under ``csrc/cake_minimax_h3_varlen_fp8_attention``
+# with the loader ``flashinfer/jit/cake_minimax_h3_varlen_fp8_attention.py``).
+# The public entry points are ``flashinfer.prefill.minimax_h3_varlen_attention``,
+# ``flashinfer.prefill.minimax_h3_varlen_fp8_attention`` and
 # ``flashinfer.prefill.minimax_h3_varlen_nvfp4_attention``; host segment
 # planning, JIT registration and the generated sources live in this package.

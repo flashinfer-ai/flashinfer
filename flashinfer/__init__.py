@@ -37,6 +37,7 @@ from .gated_act_mxfp8 import (
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+    BatchDecodeWithAttentionSinkWrapper as BatchDecodeWithAttentionSinkWrapper,
     BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
@@ -124,6 +125,7 @@ from .quantization.fp8_quantization import (
     mxfp8_dequantize_host,
     mxfp8_grouped_quantize,
     mxfp8_quantize,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 from .attn_scores import min_block_table_width as min_block_table_width
 from .attn_scores import padded_seq_len as padded_seq_len

@@ -21,22 +21,23 @@ of a route (``world_rank`` is a kernel argument), PDL and the cooperative
 launch are runtime launch flags, and the SM100/SM103 programs share one source
 (the only per-architecture statement is guarded by ``__CUDA_ARCH__``).  Every
 kernel is compiled per architecture together with the one launcher
-translation unit ``cake_trtllm_moe_allreduce_union_launcher.cu``.
+translation unit ``cake_trtllm_moe_allreduce_union_launcher.cu``; a kernel
+whose record names a ``source`` is built from that sibling kernel's
+translation unit, with the record's ``defines`` selecting its program text.
 
 ``KERNELS`` lists the kernels; ``ROUTES`` maps one route key
 ``(arch, world_size, dtype, launch_with_pdl, specialization)`` to the kernel
-(or the per-rank kernels of a rank-specialised route) and its residency
-parameters; ``_SPECIALIZATION_RULES`` selects a specialization for the
-reviewed ``num_experts`` and token ranges, and ``_WIDE_MLP_CLASSES`` names the
-classes whose program outside those ranges is ``wide_mlp`` (``generic``
-otherwise).
+and its residency parameters; ``_SPECIALIZATION_RULES`` selects a
+specialization for the reviewed ``num_experts`` and token ranges, and
+``_WIDE_MLP_CLASSES`` names the classes whose program outside those ranges is
+``wide_mlp`` (``generic`` otherwise).
 """
 
 from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional, Sequence, Union
+from typing import Literal, NamedTuple, Optional, Sequence
 
 import torch
 
@@ -67,24 +68,31 @@ _DTYPE_CTYPE = {"float16": "__half", "bfloat16": "__nv_bfloat16"}
 
 
 class Kernel(NamedTuple):
-    """One generated kernel translation unit."""
+    """One generated kernel program.
+
+    ``source`` names the sibling kernel whose translation unit builds this
+    program (``None``: the kernel's own ``<name>.cu``); ``defines`` are the
+    compile definitions that select this program's text in that source.
+    """
 
     dtype: str
     world_size: int
     block: int
     cluster: int
+    source: Optional[str] = None
+    defines: tuple[str, ...] = ()
 
 
 class Route(NamedTuple):
-    """The kernel(s) and residency of one route.
+    """The kernel and residency of one route.
 
-    ``kernel`` is one kernel name, or one name per rank for the rank-specialised
-    routes.  ``persistent_ctas_per_sm`` and ``max_persistent_clusters`` size the
-    persistent cluster grid (see :func:`launch_grid_x`); ``cooperative`` launches
-    one co-resident cluster per token.
+    ``kernel`` is the kernel name.  ``persistent_ctas_per_sm`` and
+    ``max_persistent_clusters`` size the persistent cluster grid (see
+    :func:`launch_grid_x`); ``cooperative`` launches one co-resident cluster per
+    token.
     """
 
-    kernel: Union[str, tuple[str, ...]]
+    kernel: str
     persistent_ctas_per_sm: int
     max_persistent_clusters: Optional[int]
     cooperative: bool
@@ -93,7 +101,14 @@ class Route(NamedTuple):
 KERNELS: dict[str, Kernel] = {
     "ws2_bf16_wide_mlp": Kernel("bfloat16", 2, 224, 4),
     "ws2_bf16_wide_mlp_cta1": Kernel("bfloat16", 2, 896, 1),
-    "ws2_bf16_pipe2_u4": Kernel("bfloat16", 2, 224, 4),
+    "ws2_bf16_pipe2_u4": Kernel(
+        "bfloat16",
+        2,
+        224,
+        4,
+        source="ws2_bf16_pipe2_u4_b5",
+        defines=("-DCAKE_UNION_MIN_BLOCKS=0",),
+    ),
     "ws2_bf16_pipe2_u4_b5": Kernel("bfloat16", 2, 224, 4),
     "ws2_f16_pipe2_u4_b5": Kernel("float16", 2, 224, 4),
     "ws2_f16_wide_mlp": Kernel("float16", 2, 224, 4),
@@ -110,11 +125,32 @@ KERNELS: dict[str, Kernel] = {
     "ws8_f16_generic": Kernel("float16", 8, 224, 4),
     "ws8_f16_pipe1_u4_b5": Kernel("float16", 8, 224, 4),
     "ws2_bf16_generic": Kernel("bfloat16", 2, 224, 4),
-    "ws2_bf16_pipe1_u4_b5": Kernel("bfloat16", 2, 224, 4),
+    "ws2_bf16_pipe1_u4_b5": Kernel(
+        "bfloat16",
+        2,
+        224,
+        4,
+        source="ws2_bf16_pipe2_u4_b5",
+        defines=("-DCAKE_UNION_PIPE_DEPTH=1",),
+    ),
     "ws2_f16_generic": Kernel("float16", 2, 224, 4),
-    "ws2_f16_pipe1_u4_b5": Kernel("float16", 2, 224, 4),
+    "ws2_f16_pipe1_u4_b5": Kernel(
+        "float16",
+        2,
+        224,
+        4,
+        source="ws2_f16_pipe2_u4_b5",
+        defines=("-DCAKE_UNION_PIPE_DEPTH=1",),
+    ),
     "ws4_bf16_sm103_t1_t1_e8_serial_clear": Kernel("bfloat16", 4, 224, 4),
-    "ws8_bf16_pipe1": Kernel("bfloat16", 8, 224, 4),
+    "ws8_bf16_pipe1": Kernel(
+        "bfloat16",
+        8,
+        224,
+        4,
+        source="ws8_bf16_pipe1_u4_b5",
+        defines=("-DCAKE_UNION_MIN_BLOCKS=0", "-DCAKE_UNION_UNROLL=8"),
+    ),
     "ws8_bf16_push_g": Kernel("bfloat16", 8, 224, 4),
     "ws8_bf16_sm103_t1": Kernel("bfloat16", 8, 224, 4),
     "ws8_f16_push_g": Kernel("float16", 8, 224, 4),
@@ -380,10 +416,6 @@ def arch_for_capability(device_capability: Sequence[int]) -> Optional[str]:
     )
 
 
-def exported_arches() -> tuple[str, ...]:
-    return tuple(sorted({key[0] for key in ROUTES}))
-
-
 def select_specialization(
     arch: str,
     world_size: int,
@@ -507,11 +539,7 @@ def route_kernel(route: Route, world_rank: int, world_size: int) -> str:
 
     if not 0 <= int(world_rank) < int(world_size):
         raise ValueError(f"world_rank must be in [0, {world_size}), got {world_rank}")
-    if isinstance(route.kernel, str):
-        return route.kernel
-    if len(route.kernel) != int(world_size):
-        raise RuntimeError("rank-specialised route does not carry one kernel per rank")
-    return route.kernel[int(world_rank)]
+    return route.kernel
 
 
 def launch_grid_x(
@@ -571,7 +599,7 @@ def _source_dir() -> Path:
 
 
 def kernel_source(name: str) -> Path:
-    return _source_dir() / KERNEL_DIR / f"{name}.cu"
+    return _source_dir() / KERNEL_DIR / f"{KERNELS[name].source or name}.cu"
 
 
 def kernel_symbol(name: str) -> str:
@@ -579,7 +607,11 @@ def kernel_symbol(name: str) -> str:
 
 
 def kernel_defines(name: str) -> list[str]:
-    """Preprocessor definitions that bind the launcher to one kernel."""
+    """Preprocessor definitions that bind the launcher to one kernel.
+
+    The kernel's own ``defines`` follow the five launcher definitions; they
+    select the kernel's program text in a shared source (see ``Kernel``).
+    """
 
     kernel = KERNELS[name]
     return [
@@ -588,6 +620,7 @@ def kernel_defines(name: str) -> list[str]:
         f"-DCAKE_UNION_WORLD_SIZE={kernel.world_size}",
         f"-DCAKE_UNION_BLOCK={kernel.block}",
         f"-DCAKE_UNION_CLUSTER={kernel.cluster}",
+        *kernel.defines,
     ]
 
 
@@ -740,7 +773,6 @@ __all__ = [
     "Route",
     "arch_for_capability",
     "compile_flags",
-    "exported_arches",
     "kernel_defines",
     "kernel_source",
     "kernel_symbol",

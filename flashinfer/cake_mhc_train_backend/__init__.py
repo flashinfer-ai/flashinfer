@@ -786,10 +786,16 @@ def cake_mhc_train_backward_finish(
 class _MHCTrainState:
     """What the prepare and finish autograd nodes of one layer application share.
 
-    ``stats`` (dropped after the last forward use under checkpoint replay and
-    recomputed in the first backward node that needs it), the branch output
-    ``B``, ``dY`` and ``grad_stats`` (written by the finish node's backward,
-    read by the prepare node's backward), the parameters and the workspaces.
+    The parameters (detached), the constants, the workspaces, ``dY`` and
+    ``grad_stats`` (written by the finish node's backward, read by the prepare
+    node's backward) and, transiently, ``stats``: between the prepare and the
+    finish forward, and as the replay cache of the backward under
+    ``save_stats=False`` or of a finish forward rerun by a checkpoint region
+    that starts after the prepare.  Nothing the forward produced stays on the
+    handle once the finish forward has run: ``stats`` travels through
+    ``save_for_backward`` like the inputs, so an activation checkpoint
+    (non-reentrant ``torch.utils.checkpoint``) keeps no tensor of the layer
+    alive.
     """
 
     __slots__ = (
@@ -799,7 +805,6 @@ class _MHCTrainState:
         "stats",
         "grad_stats",
         "dY",
-        "B",
         "save_stats",
         "rms_eps",
         "hc_eps",
@@ -819,7 +824,7 @@ class _MHCTrainState:
         backward_workspace: Optional[torch.Tensor] = None,
     ) -> None:
         self.fn = self.scale = self.base = None
-        self.stats = self.grad_stats = self.dY = self.B = None
+        self.stats = self.grad_stats = self.dY = None
         self.save_stats = bool(save_stats)
         self.rms_eps, self.hc_eps, self.sinkhorn_iters = rms_eps, hc_eps, sinkhorn_iters
         self.workspace, self.backward_workspace = workspace, backward_workspace
@@ -869,17 +874,20 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
             workspace=state.workspace,
         )
         state.fn, state.scale, state.base = fn.detach(), scale.detach(), base.detach()
-        state.stats = stats
-        ctx.save_for_backward(X)
+        state.stats = stats  # read and released by the finish forward
+        if state.save_stats:
+            ctx.save_for_backward(X, stats)
+        else:
+            ctx.save_for_backward(X)
         ctx.state = state
         return U
 
     @staticmethod
     def backward(ctx, dU):
-        (X,) = ctx.saved_tensors
+        X, *saved = ctx.saved_tensors
         state = ctx.state
         rows = int(X.shape[0])
-        stats = state.statistics(X)
+        stats = saved[0] if saved else state.statistics(X)
         # ``Y`` did not reach the loss when the finish node's backward never ran:
         # the residual-mixing path then carries no gradient.
         dY = state.dY if state.dY is not None else torch.zeros_like(X)
@@ -892,7 +900,7 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
             X,
             dY,
             _as_bf16(dU, torch.empty((rows, HIDDEN), dtype=_BF16, device=X.device)),
-            state.B,
+            None,  # ``B``: validated when given, not read
             state.fn,
             state.scale,
             state.base,
@@ -911,28 +919,37 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
 
     Its backward is ``backward_prepare``: it returns ``dB`` for the external
     branch and leaves ``dY`` and the gradient statistics in the shared state for
-    the prepare node, which runs after the branch backward.
+    the prepare node, which runs after the branch backward.  When a checkpoint
+    region that starts after the prepare reruns this forward, the statistics
+    the handle already released are replayed bitwise from ``X``.
     """
 
     @staticmethod
     def forward(ctx, X, B, state):
-        if state.stats is None:
-            raise RuntimeError(
-                "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare"
-            )
-        Y = cake_mhc_train_forward_finish(X, B, state.stats)
-        state.B = B.detach()
-        if not state.save_stats:
-            state.stats = None  # checkpoint replay: recomputed by the first backward node that needs it
-        ctx.save_for_backward(X, B)
+        stats = state.stats
+        if stats is None:
+            if state.fn is None:
+                raise RuntimeError(
+                    "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare"
+                )
+            # Replay: a checkpoint region that starts after the prepare reruns the
+            # finish on a handle that already released its statistics; recompute
+            # them bitwise from ``X`` (released again below).
+            stats = state.statistics(X)
+        Y = cake_mhc_train_forward_finish(X, B, stats)
+        if state.save_stats:
+            ctx.save_for_backward(X, B, stats)
+        else:
+            ctx.save_for_backward(X, B)
+        state.stats = None  # nothing of the forward stays on the handle
         ctx.state = state
         return Y
 
     @staticmethod
     def backward(ctx, dY):
-        X, B = ctx.saved_tensors
+        X, B, *saved = ctx.saved_tensors
         state = ctx.state
-        stats = state.statistics(X)
+        stats = saved[0] if saved else state.statistics(X)
         dY = _as_bf16(dY, X)
         dB, grad_stats = cake_mhc_train_backward_prepare(dY, B, X, stats)
         state.dY, state.grad_stats = dY, grad_stats
@@ -961,9 +978,11 @@ def cake_mhc_train_prepare(
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
         As in :func:`cake_mhc_train_forward_prepare` (``1e-5``, ``1e-6``, ``20``).
     save_stats : bool
-        ``True`` (default): the per-token statistics are kept for the backward.
-        ``False``: they are dropped after the forward and recomputed from ``X``
-        in the backward (checkpoint replay); the gradients are bitwise the same.
+        ``True`` (default): the per-token statistics are saved for the backward
+        through the autograd saved tensors (an activation checkpoint frees and
+        recomputes them with the inputs).  ``False``: they are dropped after the
+        forward and recomputed from ``X`` in the backward (checkpoint replay);
+        the gradients are bitwise the same.
     workspace, backward_workspace : torch.Tensor, optional
         Caller-owned forward / backward workspaces; per-device defaults when omitted.
 
