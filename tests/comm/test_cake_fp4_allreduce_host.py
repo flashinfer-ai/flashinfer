@@ -1332,7 +1332,7 @@ def synthetic_oneshot_band(monkeypatch):
 
 
 def test_program_for_dispatches_the_one_shot_band_at_or_above_its_threshold(
-    synthetic_oneshot_band
+    synthetic_oneshot_band,
 ) -> None:
     """The rows filter is per call, whatever the kernel: on sm_100a the NVFP4 one-shot call runs the whole
     program below the threshold and the band at and above it (the call's row count, inclusive; the one-shot
