@@ -411,7 +411,9 @@ the states:
 then `dav_serial` (`dA_qk` alone; persistent grid over the chunk pairs) on
 the serial rows below 16 heads, and no `dav` launch elsewhere: the fused
 gradient hosts `dA_qk` (`dqkg_davq`) on the serial rows from 16 heads and on
-every segmented row, whose adjoint recurrence accumulates `dv`; the adjoint recurrence
+every segmented row, whose adjoint recurrence accumulates `dv` (on `sm_107a`
+above 16 heads the fused gradient is its `_nohint` build: the same kernel with
+the L2 prefetch and evict-first hints off); the adjoint recurrence
 `dhu` (the state gradient `dh` and `dv2`: `dhu_v1` / `dhu_v1_wt` or `dhu_v2t`
 on the serial forms; on the segmented route two launches around a reverse
 `seg_carry`, every form accumulating `dv1` itself: on the few-chain rows
@@ -446,7 +448,7 @@ backward from the plan's own light saved set).
 
 ### Programs by stage
 
-59 records naming 57 programs from 35 kernels (`fwdh_v3` and `fwdh_p3` are
+61 records naming 59 programs from 35 kernels (`fwdh_v3` and `fwdh_p3` are
 one program, the two passes of the segmented walk; `wy_bwd` and `wy_fwd_rows`
 are one program, the WY representation from the saved `Akk` on the backward
 and on the saving forward's overlap and paired serial rows; `fwdh_p3_o_ov`,
@@ -468,7 +470,7 @@ the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 | `bwd_prep` | `bwd_prep_g8`, `bwd_prep_g8_replay` | backward; one CTA per chunk and head; the replay form keeps the internal `dout` copy |
 | `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
 | `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3p_f`, `dhu_v3p_f_wt`, `dhu_v3p_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` `dhu_v3p_f*` (the form prefetching the next chunk's tiles) below `4 * sm_count` and `dhu_v3_f*` at the boundary alone -- else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
-| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; reads `q` / `k` / `v` on the token rows |
+| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` above 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
 | `glm_intra` | `glm_intra` | backward; reads `k` / `q` on the token rows |
 | `gate_epilogue` | `gate_epilogue` | backward |
 
@@ -653,7 +655,7 @@ The KCP kernels live beside the single-rank programs:
   `run_module(name, values, grid=, device_index=)`.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_<arch>` (57 programs x 3
+  `cake-build/1`): one entry per `<library>_<arch>` (59 programs x 3
   architectures) with its two translation units, digests, nvcc flags
   (`--use_fast_math`), closure digest and `aot/<name>.so` path.
   `cake_build.load_library(name)` loads the prebuilt library when `aot/` holds
@@ -666,14 +668,14 @@ The KCP kernels live beside the single-rank programs:
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include,
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` -- the generated device
-  and binding translation units of the 57 programs, shared by the three
+  and binding translation units of the 59 programs, shared by the three
   architectures (per-architecture lines under `#if __CUDA_ARCH__`) and
   compiled once per architecture.  The sources are identity-checked by the
   digests in `build.json`.
 
 ## Status
 
-The registry holds the 59 records (57 programs) for `sm_100a`, `sm_103a` and
+The registry holds the 61 records (59 programs) for `sm_100a`, `sm_103a` and
 `sm_107a`,
 exported from the kernel snapshot named in the pull request.
 
