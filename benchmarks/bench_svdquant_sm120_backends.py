@@ -255,6 +255,15 @@ def run_operation(
                 for backend in BACKENDS[1:]
             },
         }
+        # The CUTLASS-vs-CuTe-DSL and auto-selection summaries, when measured.
+        if {"cute-dsl", "cutlass-sm120"} <= medians.keys():
+            record["cutlass_speedup"] = medians["cute-dsl"] / medians["cutlass-sm120"]
+            if "auto" in medians:
+                record["auto_over_best_explicit"] = medians["auto"] / min(
+                    medians["cute-dsl"], medians["cutlass-sm120"]
+                )
+        if "auto" in accuracies:
+            record["auto_accuracy"] = accuracies["auto"]
         stream.write(json.dumps(record, allow_nan=False) + "\n")
         stream.flush()
         if options.output:
