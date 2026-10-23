@@ -15,7 +15,7 @@ limitations under the License.
 
 CPU tests of the KCP metadata layer (``cake_kcp_plan``): partitions against the rows of record, exchange
 splits and chain tables, head ownership, the plan rule, the byte queries, the private test knobs; the GPU parity test
-of the CPU-built chunk / segment tables against the ``table`` / ``seg_table`` programs (``-k gpu``); and the FP64
+of the CPU-built chunk tables against the ``table`` program (``-k gpu``); and the FP64
 fake backend against the unpartitioned FP64 reference (``-k fake``).  Rows, reference partitions and operands come
 from the reference harness (``kcp_shapes``, ``kcp_inputs``) and the reference module ``reference_kcp`` when they are on
 ``PYTHONPATH``; the harness-backed tests are skipped otherwise.
@@ -2147,8 +2147,11 @@ def test_partition_validation_and_defaults() -> None:
 
 
 def test_tables_follow_the_kernel_contract() -> None:
-    """chunk_bos / chunk_len / seq_chunk_start / seq_order / seg_chunk_start of the spec formulas; the table layout
-    equals the existing backend's with the segment table present."""
+    """chunk_bos / chunk_len / seq_chunk_start / seq_order / seg_chunk_start of the spec formulas; the four chunk tables
+    are laid out as the existing backend lays them out, and the boundary kernels' ``[NSEG + 1]`` segment table follows
+    them in the same 256 B-aligned form.  The existing backend's own fifth table is a different object since its segmented
+    recurrences took a block table (``seg_table``, ``NSEG + 2 * N + 1`` words): the two layouts agree on the first four
+    entries, and the KCP's fifth entry keeps the width the K1-K4 ``seq_chunk_start`` argument has."""
     cu = (0, 1, 1, 66, 130, 130, 193)  # 1 token, empty, 65, 64, empty, 63
     t = kp.chunk_tables(cu)
     assert t["seq_chunk_start"] == [0, 1, 1, 3, 4, 4, 5]
@@ -2175,7 +2178,16 @@ def test_tables_follow_the_kernel_contract() -> None:
         seg[9:12] == [3, 3, 3] and seg[12:15] == [4, 4, 4] and seg[15:18] == [4, 4, 4]
     )
     layout = kp.table_layout(nc_pad, 6, 18)
-    assert layout == cake_backend._table_layout(nc_pad, 6, 18)
+    assert layout[:4] == cake_backend._table_layout(nc_pad, 6, 0)
+    assert layout[4] == (
+        "seg_chunk_start",
+        256,
+        19,
+    )  # NSEG + 1 words in the slot after seq_order
+    assert cake_backend.TABLE_NAMES[:4] == kp.TABLE_NAMES[:4]
+    assert (
+        cake_backend._table_layout(nc_pad, 6, 18)[4][0] != kp.TABLE_NAMES[4]
+    )  # the backend's block table: not this table
     assert (
         kp.tables_bytes(nc_pad, 6, 18) == 4 * 64 * 5
     )  # five 256 B-aligned tables of < 64 words each
@@ -3149,15 +3161,17 @@ PARITY_EXTRA_P = (
     1,
     3,
     64,
-)  # segment counts launched beside the plan's own P (empty segments, P > chunks, P = 1)
+)  # segment counts checked beside the plan's own P (empty segments, P > chunks, P = 1)
 
 
 @HARNESS
 @pytest.mark.parametrize("case", PARITY_CASES, ids=PARITY_IDS)
 def test_gpu_table_parity(device, case) -> None:
-    """Gate 5 (R15): the CPU-built chunk_bos / chunk_len / seq_chunk_start / seq_order / seg_chunk_start are bitwise
-    the kda_chunk_train_layout_table_v1 / seg_table_v1 outputs on every rank of every C row, adversarial row and
-    ragged table (one launch of each program per rank and segment count; pad entries pre-filled with a sentinel)."""
+    """Gate 5 (R15): the CPU-built chunk_bos / chunk_len / seq_chunk_start / seq_order are bitwise the
+    kda_chunk_train_layout_table_v1 output on every rank of every C row, adversarial row and ragged table (one launch
+    per rank; pad entries pre-filled with a sentinel), and the boundary kernels' segment table follows its formula from
+    that output for the plan's P and the extra segment counts (its own program left the package with the segmented
+    recurrences' block table; the kernels that read it are covered by the FP64-referenced rows)."""
     name, W, layout = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, layout)
@@ -3233,23 +3247,12 @@ def test_gpu_table_parity(device, case) -> None:
                 failures.append((r, table))
         hp = ctx.heads(row.h)
         for P in sorted({hp.P, *PARITY_EXTRA_P}):
-            seg = torch.full((N * P + 1,), -7, dtype=i32, device=device)
-            cake_jit.run_module(
-                "seg_table",
-                {
-                    "seq_chunk_start": scs,
-                    "num_seqs": N,
-                    "segments": P,
-                    "seg_chunk_start": seg,
-                },
-                grid=(1, 1, 1),
-                device_index=device.index,
-            )
-            torch.cuda.synchronize(device)
+            # the segment table from the device-built seq_chunk_start (the table program's output) must equal the
+            # CPU formula from the CPU-built one; at the plan's P it is the head plan's table
             want_seg = kp.seg_chunk_start(list(ctx.seq_chunk_start), P)
             if P == hp.P:
                 assert tuple(want_seg) == hp.seg_chunk_start
-            equal = seg.cpu().tolist() == want_seg
+            equal = kp.seg_chunk_start(got["seq_chunk_start"], P) == want_seg
             checked += 1
             _evidence(
                 "parity",

@@ -184,6 +184,10 @@ P1_TIE_BASE = {
 ALIGN = 256  # every table starts on a 256 B boundary (cake_backend.ALIGN)
 LAYOUTS = ("contiguous", "zigzag", "zigzag_per_document")
 EXPLICIT_LAYOUT = "explicit"
+# The int32 tables of the KCP saved set, in buffer order: the four chunk tables of the existing chunk-parallel stages and
+# the boundary kernels' segment table (``[NSEG + 1]``, their ``seq_chunk_start`` argument).  The existing backend's own
+# fifth table is the block table of its segmented recurrences (``cake_backend.TABLE_NAMES[4]``, ``seg_table``), which
+# the KCP route does not launch.
 TABLE_NAMES = (
     "chunk_bos",
     "chunk_len",
@@ -579,7 +583,8 @@ def kcp_partition(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# CPU-built tables of the existing chunk-parallel stages (the ``table`` / ``seg_table`` programs' contract)
+# CPU-built tables: the four chunk tables of the existing chunk-parallel stages (the ``table`` program's contract) and the
+# boundary kernels' segment table
 
 
 def chunk_geometry(T: int, num_seqs: int) -> tuple[int, int, int]:
@@ -626,7 +631,8 @@ def chunk_tables(cu_seqlens_local: tuple[int, ...]) -> dict[str, list[int]]:
 
 def seg_chunk_start(seq_chunk_start: list[int], P: int) -> list[int]:
     """``seg_chunk_start[d * P + p] = seq_chunk_start[d] + (p * n_d) // P``, ``[N * P] = NC``: segment ``p`` of local
-    sequence ``d`` is pseudo-sequence ``d * P + p`` (bitwise the ``kda_chunk_train_seg_table_v1`` output)."""
+    sequence ``d`` is pseudo-sequence ``d * P + p`` -- the ``[NSEG + 1]`` segment table the boundary kernels (K1-K4) take
+    as their ``seq_chunk_start`` argument (the form of the earlier segment-table program of the chunk-parallel stages)."""
     N = len(seq_chunk_start) - 1
     P = int(P)
     if P < 1:
@@ -642,8 +648,11 @@ def seg_chunk_start(seq_chunk_start: list[int], P: int) -> list[int]:
 
 
 def table_layout(NC_pad: int, N: int, NSEG: int) -> tuple[tuple[str, int, int], ...]:
-    """``(name, word offset, words)`` of the five tables inside one int32 buffer, each 256 B aligned (the existing
-    ``cake_backend._table_layout`` with the segment table always present on the KCP route)."""
+    """``(name, word offset, words)`` of the five tables inside one int32 buffer, each 256 B aligned: the four chunk
+    tables as the existing backend lays them out (``cake_backend._table_layout`` without a segment table), then the
+    boundary kernels' ``[NSEG + 1]`` segment table in the same form, always present on the KCP route.  The existing
+    backend's fifth table (``seg_table``, ``NSEG + 2 * N + 1`` words: the block table of its segmented recurrences) is
+    another object: the KCP route never launches those recurrences and never hands this buffer to them."""
     words_per_align = ALIGN // 4
     tables = [
         ("chunk_bos", NC_pad),
