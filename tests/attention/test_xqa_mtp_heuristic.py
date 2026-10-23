@@ -130,3 +130,7 @@ def test_xqa_mtp_auto_graph_correctness_and_replan(
     assert not calls
     assert lse.shape == (batch * qlen, 32)
     torch.testing.assert_close(lse_out.float(), current_reference, atol=2e-3, rtol=1e-2)
+    # A fallback call must not invalidate the workspace used by captured XQA.
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), current_reference, atol=2e-3, rtol=1e-2)
