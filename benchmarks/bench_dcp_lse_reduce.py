@@ -61,8 +61,8 @@ def _nccl_a2a_lse_reduce(
     recv_lse: torch.Tensor,
 ) -> torch.Tensor:
     """Unfused NCCL all-to-all plus the LSE-weighted merge."""
-    send_o.copy_(partial_o.permute(2, 0, 1, 3))
-    send_lse.copy_(partial_lse.permute(2, 0, 1))
+    send_o.copy_(partial_o.permute(1, 0, 2, 3))
+    send_lse.copy_(partial_lse.permute(1, 0, 2))
     dist.all_to_all_single(recv_o, send_o)
     dist.all_to_all_single(recv_lse, send_lse)
     peer_o = recv_o.permute(1, 2, 0, 3)
@@ -100,16 +100,16 @@ def _benchmark_case(
 
     partial_o = torch.randn(
         batch,
-        local_heads,
         world_size,
+        local_heads,
         head_dim,
         dtype=dtype,
         device="cuda",
     )
     partial_lse = torch.randn(
         batch,
-        local_heads,
         world_size,
+        local_heads,
         dtype=torch.float32,
         device="cuda",
     )
@@ -131,9 +131,9 @@ def _benchmark_case(
             cp_size=world_size,
         )
 
-    nccl_send_o = torch.empty_like(partial_o.permute(2, 0, 1, 3).contiguous())
+    nccl_send_o = torch.empty_like(partial_o.permute(1, 0, 2, 3).contiguous())
     nccl_recv_o = torch.empty_like(nccl_send_o)
-    nccl_send_lse = torch.empty_like(partial_lse.permute(2, 0, 1).contiguous())
+    nccl_send_lse = torch.empty_like(partial_lse.permute(1, 0, 2).contiguous())
     nccl_recv_lse = torch.empty_like(nccl_send_lse)
 
     def nccl_baseline_call() -> torch.Tensor:
