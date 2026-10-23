@@ -122,7 +122,15 @@ into the saved set.
 A workspace is one arena (a `uint8` tensor) holding the internal-layout
 intermediates of one `(S, num_docs, H)` problem; `chunk_kda_fwd` /
 `chunk_kda_bwd` allocate only their outputs and the saved set when given one,
-and without one each call allocates a workspace of its own.  Buffers whose
+and without one each call allocates a workspace of its own.  The arena is not
+initialized: every element a launch reads is written earlier in the same
+call, so the content at allocation never reaches a result (`zero_init=True`
+zero-fills it for diagnostics).  The autograd node of `chunk_kda` holds a
+caller's workspace only weakly: the backward runs in it while the caller
+keeps it, and a workspace dropped after the forward (a per-call one, or any
+workspace of a forward under non-reentrant `torch.utils.checkpoint`) is freed
+at once, the backward then allocating its own; after a checkpointed forward
+the node keeps no arena and no saved tensor alive.  Buffers whose
 lifetimes within one call are disjoint share a slot: the lifetime tables
 `cake_backend.SLOTS[mode]` (`fwd`, `bwd` for the saved-set paths, `replay`,
 and their `*_tape` forms) list every occupant with its `[first write, last

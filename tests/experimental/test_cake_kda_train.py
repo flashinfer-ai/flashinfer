@@ -2046,6 +2046,209 @@ def _split(S: int, num_docs: int) -> tuple[int, ...]:
     return tuple(base + (1 if i < S % num_docs else 0) for i in range(num_docs))
 
 
+def _retained_after_checkpointed_forward(fn, *leaves) -> int:
+    """Bytes a forward of ``fn`` under non-reentrant ``torch.utils.checkpoint`` keeps allocated beyond its output:
+    the measure of the activation-checkpointing report (0 expected: only the saved tensors go through the saved-
+    tensor hooks, and anything else the node holds would be kept for every layer at once)."""
+    from torch.utils.checkpoint import checkpoint
+
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    out = checkpoint(fn, *leaves, use_reentrant=False)
+    torch.cuda.synchronize()
+    kept = torch.cuda.memory_allocated() - before - out.untyped_storage().nbytes()
+    del out
+    return kept
+
+
+def test_a_checkpointed_forward_retains_no_workspace(device, manifest) -> None:
+    """Three ways to run the autograd entry under activation checkpointing keep nothing beyond the output: the
+    implicit workspace, a per-call workspace created inside the checkpointed function (held by the node only
+    weakly) and a caller-owned workspace kept outside it.  The gradients through the checkpoint are the explicit
+    ones in every case."""
+    from torch.utils.checkpoint import checkpoint
+
+    lengths, heads = (100, 640, 77, 1000, 129), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    cu, dout = inputs["cu_seqlens"], inputs["dout"]
+    out, grads, _ = _run_fwd_bwd(inputs)
+    reference_out, reference_grads = _clone_all(out, grads)
+    del out, grads
+    plan = cake_backend.plan(
+        S, N, heads, cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    )
+    assert plan.arena_bytes(backward=True) > 0
+    leaves = [
+        inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+
+    def implicit(q, k, v, g, beta):
+        return cake_backend.chunk_kda(q, k, v, g, beta, cu)
+
+    def per_call(q, k, v, g, beta):
+        ws = KdaWorkspace(plan, device, backward=True)
+        return cake_backend.chunk_kda(q, k, v, g, beta, cu, workspace=ws)
+
+    shared = KdaWorkspace(plan, device, backward=True)
+
+    def on_shared(q, k, v, g, beta):
+        return cake_backend.chunk_kda(q, k, v, g, beta, cu, workspace=shared)
+
+    for fn in (implicit, per_call, on_shared):
+        warm = fn(
+            *leaves
+        )  # the programs are loaded and the allocator primed before the measurement
+        assert torch.equal(warm, reference_out), fn.__name__
+        del warm
+        assert _retained_after_checkpointed_forward(fn, *leaves) == 0, fn.__name__
+        for leaf in leaves:
+            leaf.grad = None
+        o = checkpoint(fn, *leaves, use_reentrant=False)
+        o.backward(dout)
+        for leaf, name in zip(leaves, ("dq", "dk", "dv", "dg", "dbeta"), strict=True):
+            assert torch.equal(leaf.grad, reference_grads[name]), (fn.__name__, name)
+
+
+def test_the_node_holds_the_workspace_weakly(device, manifest) -> None:
+    """A caller-owned workspace serves the backward (its launcher records the backward's launches); a per-call
+    workspace dropped after the forward is freed at once (the node holds no strong reference), and the backward
+    then runs in a workspace of its own, with the same gradients."""
+    import gc
+    import weakref
+
+    lengths, heads = (63, 1, 65), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    cu, dout = inputs["cu_seqlens"], inputs["dout"]
+    out, grads, _ = _run_fwd_bwd(inputs)
+    reference_out, reference_grads = _clone_all(out, grads)
+    del out, grads
+    plan = cake_backend.plan(
+        S, N, heads, cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    )
+    launched: list[str] = []
+
+    def recording(name, values, *, grid, device_index):
+        launched.append(name)
+        cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+
+    def leaves():
+        return [
+            inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+
+    def check(leaf_list):
+        for leaf, name in zip(
+            leaf_list, ("dq", "dk", "dv", "dg", "dbeta"), strict=True
+        ):
+            assert torch.equal(leaf.grad, reference_grads[name]), name
+
+    kept = KdaWorkspace(plan, device, backward=True, launcher=recording)
+    q, k, v, g, beta = held = leaves()
+    o = cake_backend.chunk_kda(q, k, v, g, beta, cu, workspace=kept)
+    assert torch.equal(o, reference_out)
+    assert launched == _expected_launches(plan, "fwd")
+    launched.clear()
+    o.backward(dout)
+    assert launched == _expected_launches(plan, plan.light_path)
+    check(held)
+    launched.clear()
+    dropped = KdaWorkspace(plan, device, backward=True, launcher=recording)
+    alive = weakref.ref(dropped)
+    q, k, v, g, beta = held = leaves()
+    o = cake_backend.chunk_kda(q, k, v, g, beta, cu, workspace=dropped)
+    assert torch.equal(o, reference_out)
+    del dropped
+    gc.collect()
+    assert alive() is None  # the autograd node did not keep it
+    launched.clear()
+    o.backward(dout)
+    assert (
+        launched == []
+    )  # the backward ran in a workspace of its own, not through the dropped one
+    check(held)
+
+
+def test_arena_content_never_reaches_a_result(device, manifest) -> None:
+    """Write-before-read: every element a launch reads is written earlier in the same call, so an arena filled
+    with NaN bytes gives the zero-filled arena's results bit for bit on every path (the forward with and without
+    a saved set, the backward from the light set, the replay, and the tape layouts), and the arenas need no fill
+    (``zero_init`` defaults to ``False``)."""
+    cases = (
+        ((129,), 2, "light"),
+        ((100, 640, 77, 1000, 129), 2, "light"),
+        ((63, 1, 65, 30), 2, "light"),
+        ((20, 20, 20, 20, 20, 20, 20), 8, "light"),
+        ((100, 640, 77, 1000, 129), 2, "tape"),
+    )
+    for lengths, heads, save_mode in cases:
+        S, N = sum(lengths), len(lengths)
+        inputs = make_inputs(lengths, heads, device)
+        q, k, v, g, beta, cu, dout = (
+            inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+        )
+        plan = cake_backend.plan(
+            S,
+            N,
+            heads,
+            cake_jit.sm_count(device.index),
+            cake_jit.device_arch(device.index),
+        )
+        zeroed = KdaWorkspace(
+            plan, device, backward=True, zero_init=True, save_mode=save_mode
+        )
+        assert zeroed.zero_init is True and not bool(zeroed.arena.any())
+        poisoned = KdaWorkspace(plan, device, backward=True, save_mode=save_mode)
+        assert poisoned.zero_init is False
+        assert KdaWorkspace.for_problem(S, N, heads, device).zero_init is False
+
+        def poison():
+            poisoned.arena.fill_(0xFF)  # NaN in every BF16 / FP32 view
+            torch.cuda.synchronize()
+
+        out, grads, saved = _run_fwd_bwd(inputs, workspace=zeroed)
+        reference_out, reference_grads = _clone_all(out, grads)
+        reference_aqk, reference_akk = saved.Aqk.clone(), saved.Akk.clone()
+        replay = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=None, workspace=zeroed
+        )
+        reference_replay = [t.clone() for t in replay]
+        nosave, _ = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, save_for_backward=False, workspace=zeroed
+        )
+        reference_nosave = nosave.clone()
+        del out, grads, saved, replay, nosave
+        case = (lengths, heads, save_mode)
+        poison()
+        out, saved = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=poisoned
+        )
+        assert torch.equal(out, reference_out), case
+        assert torch.equal(saved.Aqk, reference_aqk) and torch.equal(
+            saved.Akk, reference_akk
+        ), case
+        poison()
+        grads = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=poisoned
+        )
+        for t, name in zip(grads, ("dq", "dk", "dv", "dbeta", "dg"), strict=True):
+            assert torch.equal(t, reference_grads[name]), (case, name)
+        poison()
+        replay = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=None, workspace=poisoned
+        )
+        for t, ref in zip(replay, reference_replay, strict=True):
+            assert torch.equal(t, ref), case
+        poison()
+        nosave, _ = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, save_for_backward=False, workspace=poisoned
+        )
+        assert torch.equal(nosave, reference_nosave), case
+
+
 @pytest.mark.parametrize(("num_docs", "heads"), STATE_SHAPES, ids=["n1-h1", "n2-h2"])
 def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
     device, manifest, num_docs, heads

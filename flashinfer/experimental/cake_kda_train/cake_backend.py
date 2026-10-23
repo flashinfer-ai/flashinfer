@@ -114,6 +114,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import types
+import weakref
 from collections.abc import Callable
 from typing import Any
 
@@ -1040,8 +1041,11 @@ class KdaWorkspace:
     saved-set paths' layout and the replay's (both run in it).  ``save_mode`` is the default of the calls on this
     workspace and sizes the arena for the tape layouts.  ``views(mode)`` are the buffer views of one layout on
     the arena (``fwd`` / ``bwd`` / ``replay`` for the light layouts); the tables are not part of the workspace
-    (they travel with the saved set).  ``bytes`` is the arena's size (:func:`workspace_bytes`).  ``launcher``
-    replaces ``cake_jit.run_module`` for diagnostics only.
+    (they travel with the saved set).  ``bytes`` is the arena's size (:func:`workspace_bytes`).  The arena is
+    not initialized: every element a launch reads is written earlier in the same call (the layout note), so its
+    content at allocation never reaches a result; ``zero_init=True`` fills it with zeros for diagnostics (an
+    arena of 2.5 GiB takes about 0.35 ms per fill).  ``launcher`` replaces ``cake_jit.run_module`` for
+    diagnostics only.
     """
 
     def __init__(
@@ -1050,7 +1054,7 @@ class KdaWorkspace:
         device: torch.device | str,
         *,
         backward: bool = True,
-        zero_init: bool = True,
+        zero_init: bool = False,
         save_mode: str = "light",
         launcher: Launcher | None = None,
     ) -> None:
@@ -1070,8 +1074,10 @@ class KdaWorkspace:
         self.save_mode = save_mode
         self.launcher: Launcher = cake_jit.run_module if launcher is None else launcher
         self.bytes = plan.arena_bytes(backward=backward, save_mode=save_mode)
+        self.zero_init = zero_init
         # The pad-chunk rows of every buffer a consumer reads are written in the same call (see the layout note),
-        # so the content at allocation is irrelevant to the results; zeros keep the never-read pads defined.
+        # so the content at allocation is irrelevant to the results: no fill by default (``zero_init=True`` zeros
+        # the arena for diagnostics; the never-read pads are then defined too).
         self.arena = (torch.zeros if zero_init else torch.empty)(
             self.bytes, dtype=torch.uint8, device=self.device
         )
@@ -1898,7 +1904,10 @@ def _saved_extra(saved: KdaChunkSaved) -> tuple[torch.Tensor, ...]:
 class ChunkKDAFunction(torch.autograd.Function):
     """:func:`chunk_kda` as an autograd node: the forward saves the inputs and the saved set, the backward runs
     :func:`chunk_kda_bwd` from them.  Under ``torch.utils.checkpoint`` (``use_reentrant=False``) the forward is
-    re-run in the backward and the saved set recomputed; no special casing."""
+    re-run in the backward and the saved set recomputed; no special casing.  The node keeps nothing but the saved
+    tensors alive: the caller's workspace is held through a weak reference, so a workspace the caller dropped
+    after the forward (a per-call one, or any workspace of a checkpointed forward whose frame is gone) is freed,
+    and the backward then allocates its own (:func:`chunk_kda_bwd` without ``workspace``)."""
 
     @staticmethod
     def forward(ctx, q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode):
@@ -1926,7 +1935,10 @@ class ChunkKDAFunction(torch.autograd.Function):
             *saved.tables,
             *_saved_extra(saved),
         )
-        ctx.scale, ctx.workspace = scale, workspace
+        ctx.scale = scale
+        # a weak reference: the node must not keep a per-call arena alive until the backward (under activation
+        # checkpointing that would be one arena per layer)
+        ctx.workspace_ref = None if workspace is None else weakref.ref(workspace)
         ctx.version, ctx.n_tables = saved.version, len(saved.tables)
         ctx.problem = (saved.S, saved.H, saved.num_docs)
         return out
@@ -1948,6 +1960,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             dout = (
                 dout.contiguous()
             )  # autograd may hand over an expanded or permuted gradient
+        workspace = None if ctx.workspace_ref is None else ctx.workspace_ref()
         dq, dk, dv, dbeta, dg = chunk_kda_bwd(
             q,
             k,
@@ -1958,7 +1971,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             dout,
             saved=saved,
             scale=ctx.scale,
-            workspace=ctx.workspace,
+            workspace=workspace,
         )
         return dq, dk, dv, dg, dbeta, None, None, None, None
 
@@ -1978,8 +1991,12 @@ def chunk_kda(
     """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta``.
 
     With a ``workspace`` the forward and the backward both run in it (the backward overwrites the forward's
-    intermediates, not its saved set, which autograd holds); without one each call allocates its own.
-    ``save_mode`` (``None``: the workspace's default, ``"light"`` without one) selects the saved set's version.
+    intermediates, not its saved set, which autograd holds) as long as the caller keeps it: the autograd node
+    holds it weakly, so a workspace created for the call and dropped after the forward is freed at once, and the
+    backward allocates its own.  Without one each call allocates its own, for the forward and again for the
+    backward; the arenas are not zero-filled.  After a forward under ``torch.utils.checkpoint``
+    (``use_reentrant=False``) the node keeps no arena and no saved tensor alive.  ``save_mode`` (``None``: the
+    workspace's default, ``"light"`` without one) selects the saved set's version.
     """
     return ChunkKDAFunction.apply(
         q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode
