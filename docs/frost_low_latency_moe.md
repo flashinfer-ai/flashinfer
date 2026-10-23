@@ -80,6 +80,54 @@ smaller tensor-memory allocation reduce resources per independent route tile.
 PDL lets the Down weight producer start early while its activation producer
 waits for the preceding kernel to finish. This remains a multi-kernel pipeline.
 
+## Warm host submission
+
+Each Frost tactic has one compiled TVM-FFI entry for its projection,
+activation and combine launches. A warm call passes the current PyTorch tensors
+directly to that entry. DLPack conversion is used when compiling the entry, rather than once
+per tensor per launch. MX FMA's scale-workspace view and MX Tensor Core's
+pointer descriptors are formed inside the compiled entry.
+
+```mermaid
+flowchart LR
+  P[Public MoELayer: validate and pack this call] --> R[Prepacked runner]
+  R --> F[One compiled FFI entry: current tensors and current stream]
+  F --> K[Existing two FMA or four finalized MX TC launches]
+  C[Cache: executable and immutable specialization metadata] --> F
+```
+
+The compile cache owns no input/output tensors, workspace or CUDA stream.
+Independent calls bind independent storage, including when threads share a
+compiled entry. Callers must still warm up each specialization before CUDA
+Graph capture. The device kernels, numerical contracts, tactics and PDL
+dependencies are unchanged. Legacy `cudnn_frost` adapters retain their existing
+entry points. Existing Frost callers use the new entry automatically, with no
+API changes. Raw output still creates its identity-index tensor per call.
+
+Use `benchmarks/bench_frost_host_overhead.py` for a paired host comparison
+against a separate checkout:
+
+```bash
+python benchmarks/bench_frost_host_overhead.py \
+  --baseline-root /path/to/baseline-checkout --output host-ab.json
+python benchmarks/bench_frost_host_overhead.py \
+  --baseline-root /path/to/baseline-checkout --output host-ba.json --reverse
+python benchmarks/bench_frost_host_overhead.py \
+  --baseline-root "$PWD" --output host-aa.json
+```
+
+The benchmark records source hashes and requires identical shared API/dispatcher
+wrappers. Both sides use the same fixed tactic, prepared weight contents and
+shape. It measures public API, packing, prepacked runner and graph-replay CPU
+times separately, with device synchronization outside each CPU interval.
+CPU replay uses a graph without instrumentation. External CUDA event nodes
+inside a separate captured graph measure GPU time. Numerical checks compare both implementations and public/replay
+outputs after changing route IDs and weights. Compilation, initial selection,
+weight preparation and input quantization are outside timing. A/A controls and
+independent reversed-order runs help distinguish small GPU differences from
+measurement noise. Host savings do not imply a corresponding CUDA Graph
+GPU-time or model-throughput improvement.
+
 ## Current B300 kernel results
 
 Each comparison holds GPU, shape, activation, cache and routing pattern fixed.

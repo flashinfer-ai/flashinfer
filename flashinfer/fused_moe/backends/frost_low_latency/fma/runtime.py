@@ -11,7 +11,6 @@ import torch
 import cutlass
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver
 
 from .mxfp8.fma_fc1 import _kernel as fc1
 from .mxfp8.fma_fc2 import _kernel as fc2
@@ -78,6 +77,55 @@ def down(
     )
 
 
+@cute.jit
+def launch(
+    q,
+    sf,
+    w1,
+    s1,
+    ids,
+    mid,
+    sf_storage,
+    w2,
+    s2,
+    scores,
+    out,
+    logical: cutlass.Constexpr,
+    limit: cutlass.Constexpr,
+    alpha: cutlass.Constexpr,
+    beta: cutlass.Constexpr,
+    activation: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
+    parameters: cutlass.Constexpr,
+    narrow: cutlass.Constexpr,
+    finalize: cutlass.Constexpr,
+    stream,
+):
+    groups = cute.size(mid, mode=[1]) // 32
+    msf = cute.make_tensor(
+        sf_storage.iterator,
+        cute.make_layout((cute.size(ids), groups), stride=(groups, 1)),
+    )
+    gate_up(
+        q,
+        sf,
+        w1,
+        s1,
+        ids,
+        mid,
+        msf,
+        logical,
+        limit,
+        alpha,
+        beta,
+        activation,
+        gated,
+        parameters,
+        stream,
+    )
+    down(mid, msf, w2, s2, ids, scores, out, narrow, finalize, stream)
+
+
 def execute(inputs, config):
     # Use the same metadata-only compile cache and lock as the TC tactic.
     from ..runtime import _COMPILED, _COMPILE_LOCK
@@ -91,12 +139,10 @@ def execute(inputs, config):
     p = mid.shape[1]
     # FMA uses the linear prefix of the per-call TC scale workspace. No extra
     # allocation, weight packing, or GPU conversion is needed to switch tactic.
-    msf = sf_storage[: t * k * (p // 32)].view(t * k, p // 32)
     a = config.activation
-    name, parameters = lower_activation(a)
     finalize = config.finalize.do_finalize
     key = (
-        "ffma-v1",
+        "mx-ffma-ffi-v1",
         t,
         h,
         p,
@@ -111,22 +157,19 @@ def execute(inputs, config):
         q.device,
     )
     with torch.cuda.device(q.device):
-        stream = driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        first = tuple(from_dlpack(v) for v in (q, sf, w1, s1, ids, mid, msf))
-        second = tuple(
-            from_dlpack(v)
-            for v in (mid, msf, w2, s2, ids, scores, output if finalize else routes)
+        tensors = (
+            q,
+            sf,
+            w1,
+            s1,
+            ids,
+            mid,
+            sf_storage,
+            w2,
+            s2,
+            scores,
+            output if finalize else routes,
         )
-        first += (
-            config.experts.intermediate_size,
-            getattr(a, "limit", None),
-            getattr(a, "alpha", 1.0),
-            getattr(a, "beta", 0.0),
-            name,
-            a.is_gated,
-            parameters,
-        )
-        second += (narrow, finalize)
         compiled = _COMPILED.get(key)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
@@ -137,16 +180,24 @@ def execute(inputs, config):
                 compiled = _COMPILED.get(key)
                 if compiled is None:
                     major, minor = torch.cuda.get_device_capability(q.device)
-                    options = f"--gpu-arch sm_{major}{minor}a"
-                    compiled = (
-                        cute.compile(gate_up, *first, stream, options=options),
-                        cute.compile(down, *second, stream, options=options),
+                    name, parameters = lower_activation(a)
+                    compiled = cute.compile(
+                        launch,
+                        *(from_dlpack(v) for v in tensors),
+                        config.experts.intermediate_size,
+                        getattr(a, "limit", None),
+                        getattr(a, "alpha", 1.0),
+                        getattr(a, "beta", 0.0),
+                        name,
+                        a.is_gated,
+                        parameters,
+                        narrow,
+                        finalize,
+                        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
-        # Constexpr arguments specialize compilation and are erased from the
-        # executable ABI. Only the seven tensor bindings and stream remain.
-        compiled[0](*first[:7], stream)
-        compiled[1](*second[:7], stream)
+        compiled(*tensors)
         if finalize:
             return output
         mapping = torch.arange(t * k, device=q.device, dtype=torch.int32)
