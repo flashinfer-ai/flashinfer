@@ -104,15 +104,53 @@ dependencies are unchanged. Legacy `cudnn_frost` adapters retain their existing
 entry points. Existing Frost callers use the new entry automatically, with no
 API changes. Raw output still creates its identity-index tensor per call.
 
-Use `benchmarks/bench_frost_host_overhead.py` for a paired host comparison
-against a separate checkout:
+### B300 host qualification (preliminary)
+
+These results compare the #7053 head `df7511ec` with the host implementation
+whose production-source hashes are recorded in the
+[machine-readable results](frost_low_latency_host_b300.json).
+Final qualification against main after #7053 merges is still pending.
+
+Across 81 primary cases, two opposite-order processes give **2.96–4.89×**
+faster warm public API submission and **5.62–10.58×** for the prepacked runner.
+The cases cover BF16, MXFP4/MXFP8, MXFP8/MXFP8 and NVFP4, T=1/2/4, and
+SwiGLU/SiTU/SiLU. H=2048, physical I=1408, E=64, top-k=6. The same tactic,
+tensor contents and GPU workspace addresses are used on both sides.
+
+Representative T=1 SwiGLU rows below use the median of the two process medians.
+All times are microseconds; public and runner columns measure CPU enqueue,
+while the last column measures GPU time per MoE call.
+
+| Path | Public API before → after | Host speedup | Prepacked runner before → after | GPU before → after |
+|---|---:|---:|---:|---:|
+| BF16 FMA | 130.86 → 42.33 | 3.09× | 105.94 → 18.52 | 26.44 → 26.43 |
+| MXFP4 TC128 | 304.82 → 67.12 | 4.54× | 277.01 → 30.77 | 10.52 → 10.51 |
+| MXFP4 FMA | 184.32 → 54.93 | 3.36× | 147.12 → 17.45 | 17.27 → 17.27 |
+| MXFP8 TC128 | 305.23 → 68.12 | 4.48× | 263.49 → 29.91 | 10.72 → 10.72 |
+| MXFP8 FMA | 183.11 → 54.72 | 3.35× | 147.04 → 18.39 | 24.53 → 24.53 |
+| NVFP4 FMA | 198.73 → 56.35 | 3.53× | 158.49 → 19.31 | 13.23 → 13.23 |
+
+B300/SM103, PyTorch 2.14.1+cu130, CuTe DSL 4.8.0, Xeon Platinum 8570.
+The CPU is shared. A/A public timing ratios range from 0.994 to 1.012;
+GPU changes are within -0.22% to +0.24% across both process orders, compared
+with -0.20% to +0.36% for A/A. Plain graph-replay CPU time is about 3 µs
+per replay of a 50-call graph on both sides; it is not divided by 50.
+These results do not establish a GPU-time or model-throughput improvement.
+A smaller H=512/I=128/E=8/top-k=2 control covers 27 SwiGLU cases and gives
+2.99–4.50× public API and 5.53–8.68× prepacked-runner improvement.
+
+Use `benchmarks/bench_frost_host_overhead.py` with the recorded baseline and
+candidate revisions. The following commands reproduce the primary protocol
+against a separate baseline checkout:
 
 ```bash
-python benchmarks/bench_frost_host_overhead.py \
+args=(--tokens 1 2 4 --activations swiglu situ silu \
+      --repeats 101 --calls-per-graph 50)
+python benchmarks/bench_frost_host_overhead.py "${args[@]}" \
   --baseline-root /path/to/baseline-checkout --output host-ab.json
-python benchmarks/bench_frost_host_overhead.py \
+python benchmarks/bench_frost_host_overhead.py "${args[@]}" \
   --baseline-root /path/to/baseline-checkout --output host-ba.json --reverse
-python benchmarks/bench_frost_host_overhead.py \
+python benchmarks/bench_frost_host_overhead.py "${args[@]}" \
   --baseline-root "$PWD" --output host-aa.json
 ```
 
