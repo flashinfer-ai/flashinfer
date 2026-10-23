@@ -16,6 +16,8 @@ def sm120(request):
         torch.device("cuda")
     ) != (12, 0):
         pytest.skip("requires SM120")
+    if torch.cuda.get_device_properties("cuda").multi_processor_count != 156:
+        pytest.skip("public fast-path qualification requires RTX6000D / 156 SMs")
 
 
 def inputs(lengths=(64, 96), dtype=torch.bfloat16, index_dtype=torch.int32):

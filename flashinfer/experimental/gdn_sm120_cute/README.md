@@ -73,3 +73,8 @@ gains against current stable default routing, documented production usage,
 correctness/CI approval and a maintainable specialization policy. Otherwise keep
 it experimental only with a maintainer-approved extension, or remove it. This date
 is a review target, not a promise of stable graduation.
+
+Measured public-call evidence for code commit `3cd6473fd4` is in
+[the complete results](../../../benchmarks/results/README_gdn_sm120_cute.md):
+24 cases faster, 18 slower, 4 within 2% of official default, including all
+preallocated output/state copies. Older internal-kernel figures are superseded.

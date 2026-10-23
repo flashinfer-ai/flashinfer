@@ -1161,7 +1161,7 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
-    backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
+    backend : {"auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"}
         ``auto`` uses the native SM90/SM100/SM120 kernels and context-parallel
         routing, and may select cuDNN for measured SM100 raw-gate inference
         workloads. Automatic cuDNN selection requires both gate-fusion flags,
@@ -1238,7 +1238,8 @@ def chunk_gated_delta_rule(
         or a sequence of Python ints of length ``num_seqs + 1`` holding the
         same values (vLLM's ``query_start_loc_cpu``, the prefix sums of
         SGLang's ``extend_seq_lens_cpu``). Used by ``backend="cake_gdn"``
-        without CP and ignored by every other route. When given, the Cake
+        without CP and required by the explicit experimental ``sm120_cute`` route.
+        Other routes ignore it. When given, the Cake
         route validates it on the host (non-decreasing, first entry ``0``,
         last entry ``total_seq_len``; a mismatch raises before any launch),
         takes the exact longest sequence as the bound for variant selection,
