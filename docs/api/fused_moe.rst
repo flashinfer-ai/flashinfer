@@ -769,11 +769,18 @@ CuteDSL Fused MoE
 The CuteDSL backends are conditionally available when the
 ``nvidia-cutlass-dsl`` package is installed.
 
-For the Blackwell NVFP4-weight, BF16-activation (W4A16) design, see
+With NVFP4 expert weights on Blackwell, :func:`cute_dsl_fused_moe` and
+:class:`CuteDslMoEWrapper` support two activation-precision choices:
+
+* ``quant_mode="w4a4"`` uses packed NVFP4 activations and FP4 MMA.
+* ``quant_mode="w4a16"`` keeps activations in BF16 and dequantizes packed
+  NVFP4 weights online for BF16 MMA. The FC1-to-FC2 activation handoff also
+  remains BF16.
+
+The partial weight dequantization, FP32 epilogue scaling, and pipeline
+overlap behind the W4A16 path are described in
 `Faster-than-light NVFP4 decode—with precision
 <https://humansand.ai/blog/faster-than-light-nvfp4-decode>`_ by Ziang Li at humans& ai.
-The article explains partial weight dequantization,
-FP32 epilogue scaling, and overlap with BF16 Tensor Core computation.
 
 .. autosummary::
     :toctree: ../generated
