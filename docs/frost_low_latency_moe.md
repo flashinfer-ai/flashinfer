@@ -121,7 +121,10 @@ wrappers. Both sides use the same fixed tactic, prepared weight contents and
 shape. It measures public API, packing, prepacked runner and graph-replay CPU
 times separately, with device synchronization outside each CPU interval.
 CPU replay uses a graph without instrumentation. External CUDA event nodes
-inside a separate captured graph measure GPU time. Numerical checks compare both implementations and public/replay
+inside a separate captured graph measure GPU time. Both GPU timing graphs bind
+the same workspace addresses to avoid allocation-dependent A/A differences.
+Independent call buffers and per-replay output snapshots check correctness.
+Numerical checks compare both implementations and public/replay
 outputs after changing route IDs and weights. Compilation, initial selection,
 weight preparation and input quantization are outside timing. A/A controls and
 independent reversed-order runs help distinguish small GPU differences from

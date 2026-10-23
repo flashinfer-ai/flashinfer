@@ -9,8 +9,9 @@ tactic, tensor contents and weight layout. First-use compilation and selection
 are excluded. The public API includes validation and per-call workspace packing.
 
 CPU timing stops when Python returns, with device synchronization outside the
-timer. GPU timing uses external CUDA event nodes captured around one call; it
-does not include CPU submission. This is a kernel/host microbenchmark, not a
+timer. GPU timing uses external CUDA event nodes around one or more calls and
+reports time per call; it does not include CPU submission. Both timing graphs
+use the same workspace addresses. This is a kernel/host microbenchmark, not a
 model throughput measurement. Use --reverse in an independent process, and
 --baseline-root pointing to the candidate checkout for an A/A noise control.
 """
@@ -253,6 +254,7 @@ def main():
         "torch": torch.__version__,
         "dsl": version("nvidia-cutlass-dsl"),
         "graph_cpu_includes_timing_events": False,
+        "gpu_shared_workspace": True,
         "manifests": manifests,
         "rows": [],
     }
@@ -282,7 +284,8 @@ def main():
                     print(
                         "Warm", format_name, activation_name, tokens, tactic, flush=True
                     )
-                    calls, graphs = {}, {}
+                    calls, graphs, cpu_graphs = {}, {}, {}
+                    gpu_inputs = None
                     for label, cls in (
                         ("baseline", baseline),
                         ("candidate", FrostLowLatencyRunner),
@@ -298,27 +301,41 @@ def main():
                         layer.fixed_tactic = tactic
                         public = partial(layer, act, weights)
                         public()
-                        graphs[label] = capture(fn, args.calls_per_graph)
+                        if gpu_inputs is None:
+                            gpu_inputs = runner.pack_inputs(act, weights)
+                        # Use identical addresses for GPU timing. Different
+                        # workspace allocations can give sizable A/A deltas,
+                        # even though neither implementation changed.
+                        gpu_fn = partial(runner.forward, gpu_inputs, tactic=tactic)
+                        graphs[label] = capture(gpu_fn, args.calls_per_graph)
                         # Event nodes themselves add replay submission work.
-                        # CPU replay timing uses a separate uninstrumented graph.
-                        cpu_graph = capture(fn, args.calls_per_graph, timed=False)[0]
+                        # Independent call storage also checks pointer binding.
+                        cpu_graphs[label] = capture(
+                            fn, args.calls_per_graph, timed=False
+                        )
                         calls[label + "/runner"] = fn
                         calls[label + "/public"] = public
                         calls[label + "/pack"] = partial(
                             runner.pack_inputs, act, weights
                         )
-                        calls[label + "/graph_replay"] = cpu_graph.replay
+                        calls[label + "/graph_replay"] = cpu_graphs[label][0].replay
                     # Changed content after capture detects stale inputs/route weights.
                     act.topk_ids.add_(1).remainder_(args.experts)
                     act.topk_weights.copy_(torch.rand_like(act.topk_weights))
-                    for graph, _, _, _ in graphs.values():
+                    for graph, _, _, _ in cpu_graphs.values():
                         graph.replay()
                     torch.testing.assert_close(
-                        graphs["baseline"][3], graphs["candidate"][3], rtol=0, atol=0
+                        cpu_graphs["baseline"][3],
+                        cpu_graphs["candidate"][3],
+                        rtol=0,
+                        atol=0,
                     )
                     for label in graphs:
                         torch.testing.assert_close(
-                            graphs[label][3], calls[label + "/public"](), rtol=0, atol=0
+                            cpu_graphs[label][3],
+                            calls[label + "/public"](),
+                            rtol=0,
+                            atol=0,
                         )
                     host = host_times(calls, args.repeats, args.reverse)
                     gpu = {label: [] for label in graphs}
@@ -333,8 +350,17 @@ def main():
                             gpu[label].append(
                                 start.elapsed_time(end) * 1000 / args.calls_per_graph
                             )
+                    # Timing graphs share storage, so snapshot each replay
+                    # before the other implementation can overwrite its output.
+                    snapshots = {}
+                    for label, (graph, _, _, output) in graphs.items():
+                        graph.replay()
+                        snapshots[label] = output.clone()
+                        torch.testing.assert_close(
+                            snapshots[label], cpu_graphs[label][3], rtol=0, atol=0
+                        )
                     torch.testing.assert_close(
-                        graphs["baseline"][3], graphs["candidate"][3], rtol=0, atol=0
+                        snapshots["baseline"], snapshots["candidate"], rtol=0, atol=0
                     )
                     row = {
                         "format": format_name,
