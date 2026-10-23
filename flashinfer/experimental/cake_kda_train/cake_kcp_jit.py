@@ -989,6 +989,37 @@ def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
     return tuple(plan)
 
 
+_ARCH_BY_INDEX: dict[int, str] = {}
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _arch_of(device_index: int) -> str:
+    """:func:`device_arch` cached per device index (no capability query per launch)."""
+    arch = _ARCH_BY_INDEX.get(int(device_index))
+    if arch is None:
+        arch = _ARCH_BY_INDEX[int(device_index)] = device_arch(int(device_index))
+    return arch
+
+
+def _ffi_stream(device_index: int) -> Any:
+    """Trimmed host path: the FFI stream context of a trimmed launch -- the device's current torch stream as a raw handle
+    (``use_raw_stream``), the stream ``tvm_ffi.use_torch_stream()`` would set without building a torch.cuda.Stream."""
+    import torch  # noqa: PLC0415
+
+    dev = _FFI_DEVICES.get(int(device_index))
+    if dev is None:
+        dev = _FFI_DEVICES[int(device_index)] = tvm_ffi.device(
+            f"cuda:{int(device_index)}"
+        )
+    get = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    raw = (
+        int(get(int(device_index)))
+        if get is not None
+        else int(torch.cuda.current_stream(int(device_index)).cuda_stream)
+    )
+    return tvm_ffi.use_raw_stream(dev, raw)
+
+
 def run_module(
     name: str,
     values: Mapping[str, Any],
@@ -996,6 +1027,7 @@ def run_module(
     grid: tuple[int, int, int],
     device_index: int,
     module: Any | None = None,
+    trim: bool = False,
 ) -> None:
     """Launch record ``name`` with logical argument ``values`` on ``grid``.
 
@@ -1016,6 +1048,12 @@ def run_module(
                 raise ValueError(
                     f"record {name} needs logical argument {logical_name!r}"
                 ) from None
+    if trim:  # same module, same arguments, same stream; the arch and the FFI device are cached
+        if module is None:
+            module = load(name, _arch_of(device_index))
+        with _ffi_stream(device_index):
+            getattr(module, record["ffi_entry"])(*args)
+        return
     if module is None:
         module = load(name, device_arch(device_index))
     with tvm_ffi.use_torch_stream():
@@ -1221,7 +1259,7 @@ def _flat_pool(pool: Any, what: str) -> Any:
 
 
 def _pool_arguments(
-    ix: Any, *, what: str, H: int, nseg: int, device: str
+    ix: Any, *, what: str, H: int, nseg: int, device: str, trim: bool = False
 ) -> tuple[Any, Any, int, int, int | None]:
     """``(pool view, slot table, hg, n, tile_stride)`` of a compact pool as the kernels address it.
 
@@ -1238,6 +1276,18 @@ def _pool_arguments(
             1,
             None,
         )
+    meta = getattr(ix, "meta", None) if trim else None
+    H = int(H)
+    if meta is not None and meta.H == H and meta.device == device:
+        # the tables' precomputed addressing and device index table (cake_kcp._Tables.indexed_meta)
+        base_tile, hg, n, stride = meta.addr
+        if len(meta.index) != nseg:
+            raise ValueError(
+                f"{what}: the slot table has {len(meta.index)} entries, the problem {nseg} segments"
+            )
+        pool = _flat_pool(ix.pool, what)
+        view = pool[int(base_tile) * TILE :] if int(base_tile) else pool
+        return view, meta.dev_index, int(hg), int(n), int(stride)
     base_tile, hg, n, stride = ix.addressing(H)
     index = tuple(int(i) for i in ix.index)
     if len(index) != nseg:
@@ -1260,8 +1310,10 @@ def _local_values(call: Any) -> Mapping[str, Any]:
 
 
 def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> None:
-    walk = tuple(int(s) for s in args["walk"])
-    if not walk:
+    trim = int(getattr(call, "host_trim", 0)) == 1
+    walk_list = args["walk"]
+    n_walk = len(walk_list)
+    if not n_walk:
         return
     local = _local_values(call)
     H, nseg = int(call.H), int(call.tb.NSEG)
@@ -1273,21 +1325,37 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
                 f"{name}: the local stage values carry no {key!r} (needed by the walk)"
             )
         values[key] = local[key]
-    values.update(
-        num_heads=H,
-        num_seqs=nseg,
-        seg_chunk_start=_device_table(
-            tuple(int(x) for x in call.tb.hp.seg_chunk_start), "int32", device
-        ),
-        walk_seg=_device_table(walk, "int32", device),
-    )
+    if (
+        trim
+    ):  # the table set's identity-cached device copies of its own lists (same integers)
+        values.update(
+            num_heads=H,
+            num_seqs=nseg,
+            seg_chunk_start=call.tb.dev_list(call.tb.hp.seg_chunk_start, device),
+            walk_seg=call.tb.dev_list(walk_list, device),
+        )
+    else:
+        walk = tuple(int(s) for s in walk_list)
+        values.update(
+            num_heads=H,
+            num_seqs=nseg,
+            seg_chunk_start=_device_table(
+                tuple(int(x) for x in call.tb.hp.seg_chunk_start), "int32", device
+            ),
+            walk_seg=_device_table(walk, "int32", device),
+        )
     in_pool, out_pool = _WALK_POOLS[name]
     stride: int | None = None
     for key in (in_pool, out_pool):
         if key is None:
             continue
         pool, index, hg, n, pool_stride = _pool_arguments(
-            args.get(key), what=f"{name}.{key}", H=H, nseg=nseg, device=device
+            args.get(key),
+            what=f"{name}.{key}",
+            H=H,
+            nseg=nseg,
+            device=device,
+            trim=trim,
         )
         values.update(
             {key: pool, f"{key}_index": index, f"{key}_hg": hg, f"{key}_n": n}
@@ -1320,9 +1388,10 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
     run_module(
         record,
         values,
-        grid=launch_grid(record, n_walk=len(walk), num_heads=H),
+        grid=launch_grid(record, n_walk=n_walk, num_heads=H),
         device_index=device_index,
         module=module,
+        trim=trim,
     )
 
 
@@ -1386,12 +1455,19 @@ def _merge(args: Mapping[str, Any], call: Any, device_index: int) -> None:
         "write_states": int(args["write_states"]),
         "cols_per_cta": int(MODULES[record]["grid_rule"]["cols_per_cta"]),
     }
-    values.update(_chain_tables(chains, device))
+    trim = int(getattr(call, "host_trim", 0)) == 1
+    if trim and hasattr(
+        chains, "device_tables"
+    ):  # the chain set's own cached device tables (same integers)
+        values.update(chains.device_tables(device))
+    else:
+        values.update(_chain_tables(chains, device))
     run_module(
         record,
         values,
         grid=launch_grid(record, n_chains=n_chains, ncols=ncols),
         device_index=device_index,
+        trim=trim,
     )
 
 
