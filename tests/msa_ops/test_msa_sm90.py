@@ -1870,3 +1870,51 @@ def test_sparse_prefill_multi_kv_head_matches_reference(
         lambda r: (0, prefix + r),
     )
     torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("mult", [0.5, 1.0, 2.0])
+def test_sparse_prefill_honours_non_default_softmax_scale(
+    sm90_regression_backend, mult
+):
+    """An fp8 KV cache folds k_scale into softmax_scale, so it is not 1/sqrt(D).
+
+    The CuTe schedules bake the scale in at compile time rather than pre-scaling
+    q, so a non-default value has to reach the kernel exactly on both backends.
+    """
+    torch.manual_seed(int(mult * 10))
+    qlen, hq, hkv, mkt = 128, 8, 1, 16
+    base = (torch.randn(mkt, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.randint(0, mkt, (hkv, qlen, TOPK), dtype=torch.int32, device="cuda")
+    idx, _ = idx.sort(dim=-1)
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = torch.randperm(mkt, device="cuda").to(torch.int32).view(1, mkt)
+    seqused_k = torch.full((1,), mkt * BLK_KV - 13, dtype=torch.int32, device="cuda")
+    scale = mult / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    prefix = int(seqused_k[0]) - qlen
+    rows = [0, 1, qlen // 2, qlen - 1]
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_attn_rows(
+        q, kv, idx, page_table, seqused_k, scale, rows, lambda r: (0, prefix + r)
+    )
+    # Halving the scale flattens the softmax, so the outputs shrink toward the
+    # mean of V and the fp8 V quantisation dominates: the Cake route lands ~1%
+    # of elements just past a 3e-2 bound at mult=0.5. The point of this test is
+    # that the scale reaches the kernel at all, so bound it loosely.
+    torch.testing.assert_close(out[rows].float(), ref, atol=6e-2, rtol=6e-2)

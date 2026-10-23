@@ -614,7 +614,6 @@ def sparse_prefill_sm90(
             f"of {_MAX_BATCH} sequences, got {int(page_table.shape[0])}"
         )
     kv = _as_packed_kv(k, v, q.shape[-1], require_dense=True)
-    q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     cu = cu_seqlens_q.to(torch.int32).contiguous()
     sk = seqused_k.to(torch.int32).contiguous()
     pfx = (
@@ -631,6 +630,7 @@ def sparse_prefill_sm90(
         sk,
         pfx,
         out,
+        softmax_scale=softmax_scale,
     )
     if v_global_scale is not None and v_global_scale != 1.0:
         out.mul_(v_global_scale)

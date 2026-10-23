@@ -62,7 +62,7 @@ def _acc_to_operand(acc, operand_layout_tv, Element):
 
 
 class MsaSparseAttn:
-    def __init__(self, hq, hkv, nbuf=2):
+    def __init__(self, hq, hkv, nbuf=2, softmax_scale=None):
         """Record the head counts and KV ring depth this body is built for."""
         self.hq = hq
         self.hkv = hkv
@@ -72,7 +72,11 @@ class MsaSparseAttn:
         self.f16 = cutlass.Float16
         self.f32 = cutlass.Float32
         self.obf = cutlass.BFloat16
-        self.scale_log2 = (1.0 / math.sqrt(D)) / QSC * LOG2E
+        # softmax_scale is a compile-time constant: vLLM uses one scale per
+        # model (an fp8 cache folds k_scale into it), so this costs one extra
+        # compile rather than a per-call q prescale and its allocation.
+        scale = 1.0 / math.sqrt(D) if softmax_scale is None else float(softmax_scale)
+        self.scale_log2 = scale / QSC * LOG2E
 
     # Part 1 of a block step: QK GEMM issued async, V fp8->f16 conversion folded
     # into its shadow.  On return both SMEM buffers of this block are free.
@@ -670,7 +674,7 @@ class MsaSparseAttnFp8:
     """Same schedule as MsaSparseAttn but PV is a native FP8 WGMMA: no
     fp8->f16 V unpack, no SMEM staging of V beyond the TMA landing buffer."""
 
-    def __init__(self, hq, hkv):
+    def __init__(self, hq, hkv, softmax_scale=None):
         """Record the head counts this fp8 body is built for."""
         self.hq = hq
         self.hkv = hkv
@@ -679,7 +683,11 @@ class MsaSparseAttnFp8:
         self.f16 = cutlass.Float16
         self.f32 = cutlass.Float32
         self.obf = cutlass.BFloat16
-        self.scale_log2 = (1.0 / math.sqrt(D)) / QSC * LOG2E
+        # softmax_scale is a compile-time constant: vLLM uses one scale per
+        # model (an fp8 cache folds k_scale into it), so this costs one extra
+        # compile rather than a per-call q prescale and its allocation.
+        scale = 1.0 / math.sqrt(D) if softmax_scale is None else float(softmax_scale)
+        self.scale_log2 = scale / QSC * LOG2E
 
     @cute.jit
     def __call__(
@@ -1171,13 +1179,31 @@ def _stream():
     return st
 
 
-def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, out):
+def run(
+    q,
+    kv,
+    q2k_indices,
+    cu_seqlens_q,
+    page_table,
+    seqused_k,
+    prefix_lens,
+    out,
+    softmax_scale=None,
+):
     # Shape-only decisions (fp8-vs-f16 V feed, boxed extents, entry point) are
     # resolved once per shape signature; the steady-state call boxes pointers
     # and makes a single DSL invocation.
     """Run MSA sparse prefill with one query token per CTA. Writes ``p``."""
     ptshape = page_table.shape
-    sig = (q.shape[1], kv.shape[1], kv.shape[0], q.shape[0], ptshape[0], ptshape[1])
+    sig = (
+        q.shape[1],
+        kv.shape[1],
+        kv.shape[0],
+        q.shape[0],
+        ptshape[0],
+        ptshape[1],
+        softmax_scale,
+    )
     plan = _PLAN.get(sig)
     stream = _stream()
     pq = _I64(q.data_ptr())
@@ -1188,7 +1214,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
     ppfx = _I64(prefix_lens.data_ptr())
     po = _I64(out.data_ptr())
     if plan is None:
-        hq, hkv, npg, tq, nb, mpg = (int(v) for v in sig)
+        hq, hkv, npg, tq, nb, mpg = (int(v) for v in sig[:6])
         Tq, Npg, Nb, Mpg = _I32(tq), _I32(npg), _I32(nb), _I32(mpg)
         # Transpose amortization has Hkv-dependent wave-quantization break-evens.
         use_fp8 = tq * 3 >= npg
@@ -1200,10 +1226,10 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
             vshape = (npg, hkv, D, PG)
             vt = torch.empty(vshape, dtype=kv.dtype, device=kv.device)
             pvt = _I64(vt.data_ptr())
-            fn = _CACHE.get((hq, hkv, 8))
+            fn = _CACHE.get((hq, hkv, 8, softmax_scale))
             if fn is None:
                 fn = cute.compile(
-                    MsaSparseAttnFp8(hq, hkv),
+                    MsaSparseAttnFp8(hq, hkv, softmax_scale=softmax_scale),
                     pq,
                     pkv,
                     pvt,
@@ -1218,13 +1244,13 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
                     Mpg,
                     stream,
                 )
-                _CACHE[(hq, hkv, 8)] = fn
+                _CACHE[(hq, hkv, 8, softmax_scale)] = fn
         else:
             vshape = None
-            fn = _CACHE.get((hq, hkv))
+            fn = _CACHE.get((hq, hkv, softmax_scale))
             if fn is None:
                 fn = cute.compile(
-                    MsaSparseAttn(hq, hkv),
+                    MsaSparseAttn(hq, hkv, softmax_scale=softmax_scale),
                     pq,
                     pkv,
                     pidx,
@@ -1238,7 +1264,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
                     Mpg,
                     stream,
                 )
-                _CACHE[(hq, hkv)] = fn
+                _CACHE[(hq, hkv, softmax_scale)] = fn
         plan = (fn, vshape, Tq, Npg, Nb, Mpg)
         _PLAN[sig] = plan
     fn, vshape, Tq, Npg, Nb, Mpg = plan
