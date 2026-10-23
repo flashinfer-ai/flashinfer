@@ -183,6 +183,10 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_elems=2**31, dtype=torch.float16), "int32"),
         (dict(max_elems=1024, dtype=torch.int32), "dtype"),
         (dict(max_elems=1024, dtype="float16"), "dtype"),
+        (
+            dict(max_elems=1024, dtype=torch.float16, nvlink_kernel="unknown"),
+            "nvlink_kernel",
+        ),
         (dict(max_elems=1024, dtype=torch.float16, device="cpu"), "CUDA device"),
         (dict(max_elems=1024, dtype=torch.float16, device="cuda:999"), "device count"),
         # torch.device would silently wrap these into valid ordinals
@@ -661,6 +665,31 @@ def _destination_passing_body(rank, world_size, group, backend):
 
     comm.close()
     return ("ok", backend)
+
+
+def _portable_kernel_body(rank, world_size, group, _unused):
+    shape = (1, 11, 24, 34)
+    comm = UlyssesCommunicator(
+        group,
+        max_elems=shape[0] * shape[1] * shape[2] * shape[3],
+        dtype=torch.bfloat16,
+        backend="nvlink",
+        nvlink_kernel="portable",
+    )
+    try:
+        assert comm.nvlink_kernel == "portable"
+        torch.manual_seed(100 + rank)
+        x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+        out = comm.scatter_heads(x)
+        ref = _ref_scatter_heads(x, world_size, rank, group)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
+        gathered = comm.gather_heads(out)
+        torch.cuda.synchronize()
+        assert torch.equal(gathered, x)
+    finally:
+        comm.close()
+    return ("ok", "portable")
 
 
 def _head_chunk_body(rank, world_size, group, arg):
@@ -1342,15 +1371,24 @@ def _lifecycle_nvlink_body(rank, world_size, group, scenario):
 
 
 def _config_fault_body(rank, world_size, group, kind):
+    kernel = "auto"
     if kind == "invalid_one_rank":
         max_elems = -1 if rank == 0 else 1024
         expect = "invalid UlyssesCommunicator config"
-    else:  # inconsistent
+    elif kind == "kernel_mismatch":
+        max_elems = 1024
+        kernel = "portable" if rank == 0 else "cake"
+        expect = "inconsistent UlyssesCommunicator config"
+    else:  # inconsistent max_elems
         max_elems = 1024 if rank == 0 else 2048
         expect = "inconsistent UlyssesCommunicator config"
     try:
         UlyssesCommunicator(
-            group, max_elems=max_elems, dtype=torch.float16, backend="nccl"
+            group,
+            max_elems=max_elems,
+            dtype=torch.float16,
+            backend="nccl",
+            nvlink_kernel=kernel,
         )
         raise AssertionError("constructor must reject the config")
     except ValueError as e:
@@ -1515,6 +1553,10 @@ def test_correctness_forced_nvlink(world_size):
     _run_multi_rank("_correctness_body", world_size, "nvlink", allow_skip=True)
 
 
+def test_forced_portable_nvlink_kernel():
+    _run_multi_rank("_portable_kernel_body", 2, None, allow_skip=True)
+
+
 @pytest.mark.parametrize("world_size", [2, 3])
 def test_correctness_forced_nccl(world_size):
     # W=3 also proves the NCCL backend covers world sizes the fused kernel
@@ -1626,7 +1668,9 @@ def test_lifecycle_nvlink_two_ranks(scenario):
     _run_multi_rank("_lifecycle_nvlink_body", 2, scenario, allow_skip=True)
 
 
-@pytest.mark.parametrize("kind", ["invalid_one_rank", "inconsistent"])
+@pytest.mark.parametrize(
+    "kind", ["invalid_one_rank", "inconsistent", "kernel_mismatch"]
+)
 def test_config_fault_collective_safe(kind):
     _run_multi_rank("_config_fault_body", 2, kind)
 

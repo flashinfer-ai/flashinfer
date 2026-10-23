@@ -57,7 +57,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
         # Output staging buffer must hold the largest a2a output (== input numel).
         max_bytes = max(B * S * H * D for (B, S, H, D) in TEST_SHAPES) * 4  # fp32
         buffer_ptrs = comm.create_shared_buffer(max_bytes, group=group)
-        # Signal buffers: one Signal per rank (same layout as vLLM custom AR).
+        # The raw API keeps the original one-slot signal allocation.
         meta_ptrs = comm.create_shared_buffer(comm.vllm_meta_size(), group=group)
 
         custom_ptr = comm.init_ulysses_a2a(

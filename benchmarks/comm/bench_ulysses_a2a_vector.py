@@ -63,11 +63,19 @@ def main():
     parser.add_argument("--label", default="current")
     parser.add_argument("--lengths", default="4096,16384,65536")
     parser.add_argument("--head-dims", default="34,66")
+    parser.add_argument(
+        "--nvlink-kernel", choices=("auto", "portable", "cake"), default="auto"
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
     args = parser.parse_args()
     if args.include_dir:
+        if jit_env.get_aot_artifacts("ulysses_a2a"):
+            raise RuntimeError(
+                "--include-dir requires JIT; an installed Ulysses AOT artifact "
+                "would bypass the alternate header"
+            )
         jit_env.FLASHINFER_INCLUDE_DIR = args.include_dir.resolve()
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
@@ -89,6 +97,7 @@ def main():
                     dtype=x.dtype,
                     device=rank,
                     backend=backend,
+                    nvlink_kernel=args.nvlink_kernel,
                 )
                 try:
 
