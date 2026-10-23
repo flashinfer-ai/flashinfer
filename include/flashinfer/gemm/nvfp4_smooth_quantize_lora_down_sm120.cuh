@@ -288,7 +288,7 @@ __host__ __device__ __forceinline__ int small_m_quant_blocks(int m, int sf_cols)
 }
 
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
-          bool SignalLaunch = false, int Rank = 32>
+          bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false>
 __global__
 __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
@@ -302,8 +302,10 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   static_assert(!PackedL2T || Rank == 32);
   static_assert(!SignalLaunch || PackedL2T || Rank == 128,
                 "launch signaling is built for packed L2T and rank 128 only");
+  static_assert(!GateLaunchOnQuant || (SignalLaunch && Rank == 128),
+                "quantize-gated launch signaling is built for rank 128 only");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
-  if constexpr (SignalLaunch) {
+  if constexpr (SignalLaunch && !GateLaunchOnQuant) {
     // The PDL consumer can set up early, but waits for this grid before reading outputs.
     if (threadIdx.x == 0) {
       cudaTriggerProgrammaticLaunchCompletion();
@@ -312,6 +314,16 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   int const kPaddedM = (M + 127) / 128 * 128;
   int const kQuantBlocks =
       small_m_quant_blocks<BlockThreads, RowsPerQuantBlock, Rank>(M, K / quant::SF_VEC_SIZE);
+  if constexpr (GateLaunchOnQuant) {
+    // The consumer GEMM runs its FP4 mainloop without waiting for this grid and
+    // waits only before loading LoRA-down, so it may launch only once XQ/SF are
+    // written. Down CTAs signal now; quantize CTAs signal by exiting after
+    // fencing their stores, so the GEMM launches when the quantize half is done
+    // while LoRA-down keeps running under its mainloop.
+    if (static_cast<int>(blockIdx.x) >= kQuantBlocks && threadIdx.x == 0) {
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+  }
   constexpr int kDownWarps = BlockThreads / 32;
   int const kSfCols = K / quant::SF_VEC_SIZE;
   int const kDownKPerWarp = K / kDownWarps;
@@ -355,6 +367,10 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
         } else {
           sf[sf_offset] = 0u;
         }
+      }
+      if constexpr (GateLaunchOnQuant) {
+        // Exiting is this CTA's launch signal; see the top of the kernel.
+        __threadfence();
       }
       return;
     }
@@ -548,7 +564,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
 // everything derived from it are arguments, so one instantiation per tiling
 // serves every shape whose K divides the warp split.
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
-          bool SignalLaunch = false, int Rank = 32>
+          bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false>
 inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
                                              void const* l2t_smoothed, void* down, int m, int k,
@@ -575,8 +591,9 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     if (kRank <= 64 && quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
     int const grid_blocks = quant_blocks + ((m + 15) / 16) * kDownNTiles;
     // Keep the primary's ordinary stream dependency, including the preceding GEMM.
-    nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<
-        BlockThreads, DownTileCols, RowsPerQuantBlock, PackedL2T, SignalLaunch, Rank>
+    nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<BlockThreads, DownTileCols,
+                                                             RowsPerQuantBlock, PackedL2T,
+                                                             SignalLaunch, Rank, GateLaunchOnQuant>
         <<<grid_blocks, BlockThreads, 0, stream>>>(
             static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
             global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
@@ -1627,16 +1644,22 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   if (family == 1) {
     // At rank 128 the linear route lets the PDL-launched GEMM start its prologue
     // while this prefix runs; the GEMM waits on the grid before reading outputs.
-#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                               \
-  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                         \
-    if constexpr (Rank == 128) {                                                        \
-      if (signal_launch) {                                                              \
-        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank>(    \
-            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
-      }                                                                                 \
-    }                                                                                   \
-    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(       \
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);    \
+    // Address policy 1 instead holds the GEMM back until the quantize half is
+    // done and lets its mainloop run under LoRA-down (see GateLaunchOnQuant).
+#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                                  \
+  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                            \
+    if constexpr (Rank == 128) {                                                           \
+      if (signal_launch && address_policy == 1) {                                          \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, true>( \
+            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);   \
+      }                                                                                    \
+      if (signal_launch) {                                                                 \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank>(       \
+            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);   \
+      }                                                                                    \
+    }                                                                                      \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(          \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);       \
   }
     FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
 #undef FI_SVDQ_SMALL_CASE

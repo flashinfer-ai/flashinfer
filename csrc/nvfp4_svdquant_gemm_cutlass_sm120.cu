@@ -207,11 +207,14 @@ int nvfp4_svdquant_gemm_fallback_tactic(int m, int n, int k, int lora_rank) {
 
 // Fused residual NVFP4 GEMM + rank-32 LoRA-up: D @ L1ᵀ via the 2nd bf16 mma.sync in the custom
 // collective. 1/alpha folded into L1 so the epilogue yields alpha*residual + D@L1ᵀ + bias.
-void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa,
-                             void const* sfb, float const* alpha, void const* D, void const* L1,
-                             void const* bias, int m, int n, int k, int lora_rank, char* ws,
-                             size_t wsBytes, cudaStream_t stream, int tactic, bool enable_pdl) {
-  auto const rt = sd::decode_runtime_tactic(tactic);
+// defer_lora_down_wait: see RuntimeTacticSm120; only the fused linear route sets it.
+void nvfp4_svdquant_gemm_run_sm120(void* out, void const* A, void const* B, void const* sfa,
+                                   void const* sfb, float const* alpha, void const* D,
+                                   void const* L1, void const* bias, int m, int n, int k,
+                                   int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
+                                   int tactic, bool enable_pdl, bool defer_lora_down_wait) {
+  auto rt = sd::decode_runtime_tactic(tactic);
+  rt.defer_lora_down_wait = defer_lora_down_wait;
   // The production entry never supplies the inline-down pointers, so every config
   // selected by kCompileInlineDownSm120 runs the variant that compiles the dead
   // path out. The selection is per config because compiling it out regresses the
@@ -226,6 +229,14 @@ void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const
         return sd::run_tactic_no_inline_down<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, m, n,
                                                 k, lora_rank, ws, wsBytes, stream, enable_pdl);
       })
+}
+
+void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa,
+                             void const* sfb, float const* alpha, void const* D, void const* L1,
+                             void const* bias, int m, int n, int k, int lora_rank, char* ws,
+                             size_t wsBytes, cudaStream_t stream, int tactic, bool enable_pdl) {
+  nvfp4_svdquant_gemm_run_sm120(out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws,
+                                wsBytes, stream, tactic, enable_pdl, false);
 }
 
 void nvfp4_svdquant_gemm_run_inline_down(void* out, void const* A, void const* B, void const* sfa,
@@ -569,7 +580,8 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
                               TensorView alpha, TensorView d, TensorView l1,
                               Optional<TensorView> const& bias, TensorView out,
                               TensorView workspace_buffer, int64_t tactic, bool enable_pdl,
-                              void const* inline_down_x, void const* inline_down_l2t) {
+                              void const* inline_down_x, void const* inline_down_l2t,
+                              bool defer_lora_down_wait = false) {
   CHECK_INPUT_AND_TYPE(a, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(b, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(a_sf, SF_DTYPE);
@@ -677,12 +689,12 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
         reinterpret_cast<char*>(workspace_buffer.data_ptr()), requiredWorkspaceBytes, stream,
         tacticId, enable_pdl);
   } else {
-    flashinfer::gemm::nvfp4_svdquant_gemm_run(
+    flashinfer::gemm::nvfp4_svdquant_gemm_run_sm120(
         out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(), b_sf.data_ptr(),
         static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(loraRank),
         reinterpret_cast<char*>(workspace_buffer.data_ptr()), requiredWorkspaceBytes, stream,
-        tacticId, enable_pdl);
+        tacticId, enable_pdl, defer_lora_down_wait);
   }
 }
 
@@ -777,8 +789,13 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
         << "failed to configure case-7 XQ persisting-L2 window: " << cudaGetErrorString(status);
   }
+  // Under address policy 1 the rank-128 small-M prefix signals PDL launch only
+  // once its quantize CTAs have exited (XQ/SF fenced), so the GEMM may start its
+  // FP4 mainloop at once and wait for the prefix grid only before LoRA-down.
+  bool const defer_lora_down_wait =
+      producer_family == 1 && address_policy == 1 && down.size(1) == 128 && enable_pdl;
   nvfp4_svdquant_gemm_impl(xq, b, a_sf, b_sf, alpha, down, l1, bias, out, workspace_buffer, k3_row,
-                           enable_pdl, nullptr, nullptr);
+                           enable_pdl, nullptr, nullptr, defer_lora_down_wait);
   if (configure_case7_persisting_l2) {
     cudaError_t const status = clear_xq_persisting_l2(stream);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)

@@ -1860,7 +1860,16 @@ def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None
         # Every rank-128 producer, small-M included, reads K-major L2T.
         assert routes.sm120_variant_reads_kmajor_l2t(m, k, variant, 128)
         assert not routes.sm120_variant_packs_l2t(m, k, variant, 128)
-    assert routes.sm120_linear_route_abi_version(m, k, 128) == 14
+    # Each small-M tiling appears under policy 0 and then, appended after all of
+    # them, under policy 1 (the GEMM launches once the quantize half is done).
+    small_variants = variants[small:]
+    early = [tiling for _, tiling, policy in small_variants if policy == 0]
+    deferred = [tiling for _, tiling, policy in small_variants if policy == 1]
+    assert early and deferred == early
+    assert [policy for _, _, policy in small_variants] == [0] * len(early) + [1] * len(
+        deferred
+    )
+    assert routes.sm120_linear_route_abi_version(m, k, 128) == 15
 
 
 # Workspace provisioning and cached tactic feasibility.

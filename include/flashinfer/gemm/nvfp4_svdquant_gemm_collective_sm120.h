@@ -708,6 +708,10 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m{0};
     int inline_down_k{0};
     bool inline_down_wait_on_n{false};
+    // Set by the fused linear route when its prefix launches this GEMM only after
+    // XQ/SF are complete: the producer then waits for the prefix grid just before
+    // loading LoRA-down instead of before its first A load.
+    bool defer_lora_down_wait{false};
   };
 
   // Device side kernel params
@@ -793,6 +797,7 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m = 0;
     int inline_down_k = 0;
     bool inline_down_wait_on_n = false;
+    bool defer_lora_down_wait = false;
   };
 
   //
@@ -866,6 +871,7 @@ struct CollectiveMmaLoRaSm120 {
     params.inline_down_m = args.inline_down_m;
     params.inline_down_k = args.inline_down_k;
     params.inline_down_wait_on_n = args.inline_down_wait_on_n;
+    params.defer_lora_down_wait = args.defer_lora_down_wait;
     if constexpr (UseLoRaPipeline) {
       auto tensor_d_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_d);
       auto tensor_l1_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_l1);
@@ -1310,6 +1316,10 @@ struct CollectiveMmaLoRaSm120 {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
         }
+        if (params.defer_lora_down_wait) {
+          // LoRA-down is the one prefix output still in flight; see the producer.
+          cutlass::arch::wait_on_dependent_grids();
+        }
         if constexpr (UseRow80BiasPrefetch) {
           if (params.ptr_bias != nullptr) {
             auto const* bias_tile = params.ptr_bias + int(m_coord) * int(size<0>(TileShape{}));
@@ -1438,6 +1448,10 @@ struct CollectiveMmaLoRaSm120 {
       if (do_lora) {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
+        }
+        if (params.defer_lora_down_wait) {
+          // LoRA-down is the one prefix output still in flight; see the producer.
+          cutlass::arch::wait_on_dependent_grids();
         }
         if constexpr (UseRow80BiasPrefetch) {
           if (params.ptr_bias != nullptr) {
@@ -2485,7 +2499,14 @@ class GemmUniversalLoRaSm120 {
 
       // Mainloop Producer Warp
       else if (producer_warp_role == ProducerWarpRole::Mainloop) {
-        cutlass::arch::wait_on_dependent_grids();
+        if (params.mainloop.defer_lora_down_wait) {
+          // The prefix fenced XQ/SF and let this grid launch only after its quantize
+          // CTAs exited, so the FP4 mainloop overlaps the LoRA-down still running;
+          // load() waits for the prefix grid before the LoRA-down TMA.
+          asm volatile("fence.proxy.async.global;" ::: "memory");
+        } else {
+          cutlass::arch::wait_on_dependent_grids();
+        }
         bool do_load_order_arrive = true;
         bool requires_clc_query = true;
         while (work_tile_info.is_valid()) {

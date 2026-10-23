@@ -26,7 +26,7 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
-SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 14
+SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 15
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -353,8 +353,11 @@ def sm120_producer_variants(
 
     Producer families are enumerated from their own constraints, so a shape
     nobody measured still reaches the fused prefix and a card nobody measured on
-    ranks the candidates itself. The address policy is a large-M axis only; the
-    small-M kernel forms its addresses differently and takes 0.
+    ranks the candidates itself. The address policy is a large-M axis; the
+    small-M kernel forms its addresses differently and takes 0, except that at
+    rank 128 policy 1 repeats each small-M tiling with the PDL launch of the
+    GEMM held until the quantize half is done, so that the GEMM mainloop runs
+    under LoRA-down instead of after it.
     """
     if rank not in SM120_CUTLASS_LORA_RANKS:
         return ()
@@ -388,7 +391,8 @@ def sm120_producer_variants(
             if sm120_ws_tiling_is_valid(m, k, *tiling)
             for grid_mode in SM120_WS_GRID_MODES
         )
-        return large + ws + small
+        deferred = tuple((family, tiling, 1) for family, tiling, _ in small)
+        return large + ws + small + deferred
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)
