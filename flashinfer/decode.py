@@ -19,7 +19,7 @@ import math
 import os
 import warnings
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -1272,6 +1272,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -1361,6 +1362,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         if backend == "prims-ts":
             raise NotImplementedError(
@@ -1384,13 +1388,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._jit_module = get_batch_prefill_jit_module(
                     jit_args[0],
                     gen_customize_batch_prefill_module(
-                        backend, *jit_args
+                        backend, *jit_args, **(jit_kwargs or {})
                     ).build_and_load(),
                 )
             else:
                 self._jit_module = get_batch_decode_jit_module(
                     jit_args[0],
-                    gen_customize_batch_decode_module(*jit_args).build_and_load(),
+                    gen_customize_batch_decode_module(
+                        *jit_args, **(jit_kwargs or {})
+                    ).build_and_load(),
                 )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_decode/prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
@@ -2516,6 +2522,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "q_len_per_req > 1 is currently only supported on the "
                         "fa2 tensor-core backend."
                     )
+                if (
+                    self._backend == "fa2"
+                    and q_data_type == torch.float8_e4m3fn
+                    and not (
+                        get_compute_capability(self.device) == (12, 0)
+                        and kv_data_type == torch.float8_e4m3fn
+                        and o_data_type == torch.bfloat16
+                        and head_dim == 256
+                        and pos_encoding_mode == "NONE"
+                        and logits_soft_cap == 0
+                        and q_len_per_req == 1
+                        and num_qo_heads // num_kv_heads in (1, 2, 4, 8)
+                    )
+                ):
+                    raise NotImplementedError(
+                        "The fa2 tensor-core decode takes an e4m3 query only on SM120, "
+                        "for single-token requests with an e4m3 KV cache, bfloat16 "
+                        "output, head_dim 256, no RoPE or soft cap, and 1, 2, 4 or 8 "
+                        "query heads per KV head."
+                    )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -3366,6 +3392,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "maybe_k_cache_sf": key_block_scales,
+                            "maybe_v_cache_sf": value_block_scales,
                         },
                         args,
                     )
@@ -4638,7 +4666,9 @@ def trtllm_batch_decode_with_kv_cache(
 
         if backend == "cake":
             from .cake_fmha import (
+                CakeFmhaAlignedDecodeModule,
                 _resolve_cake_fmha_decode_module,
+                _run_cake_fmha_aligned_decode,
                 select_cake_fmha_decode_route,
             )
 
@@ -4679,6 +4709,23 @@ def trtllm_batch_decode_with_kv_cache(
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
             )
+            if isinstance(cake_module, CakeFmhaAlignedDecodeModule):
+                # Aligned hd128 q1 decode: a generated in-tree program whose
+                # binding takes the kernel's host parameters positionally plus
+                # the grid.  The route admits only BF16 / FP16 output in the
+                # query dtype without LSE, so ``out`` is the whole result; it
+                # needs no workspace or counter buffer and ignores enable_pdl.
+                _run_cake_fmha_aligned_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
             if not optimized_loaded:
                 # compat_v1 takes host scalar scales; only the optimized
                 # scale-pointer specialization preserves the device binding.
@@ -5104,6 +5151,18 @@ def fast_decode_plan(
                 "q_len_per_req > 1 is currently only supported on the fa2 "
                 "tensor-core backend."
             )
+    if (
+        getattr(self, "_backend", None) == "fa2"
+        and getattr(self, "_cached_q_data_type", None) == torch.float8_e4m3fn
+        and (
+            q_len_per_req != 1
+            or num_qo_heads not in [num_kv_heads * g for g in (1, 2, 4, 8)]
+        )
+    ):
+        raise NotImplementedError(
+            "The fa2 tensor-core decode takes an e4m3 query only for single-token "
+            "requests with 1, 2, 4 or 8 query heads per KV head."
+        )
     if self.is_cuda_graph_enabled:
         frozen_q_len = getattr(self, "_q_len_per_req", None)
         if frozen_q_len is not None and frozen_q_len != q_len_per_req:

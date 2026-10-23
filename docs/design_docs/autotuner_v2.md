@@ -172,10 +172,20 @@ cache. A missing or different policy is a profiling miss, not deletion; replay, 
 and direct `search_cache` lookups still accept the winner, even inside a tuning context.
 Entries without provenance are retuned by `choose_one` even under the default policy, including
 after a same-version build upgrade that leaves the environment directory unchanged.
-Retuning updates the same entry and its decoded memo only when the winning runner's key is
-unchanged. If a different runner wins, it is published under that runner's key; the previous
-runner's entry remains, as before. This is an additive v2 field, not a new schema, manifest
-identity, or operation key. Legacy v1 file-policy gating is unchanged.
+Successful retuning retires the previous candidates before publishing the new winner, including
+when the winning runner changes. A single-process replacement keeps the entry being republished
+on disk until its atomic overwrite, avoiding a missing-file window for concurrent readers.
+Single-process retuning preserves the previous winner if no candidate succeeds.
+Coordinated tuning must retire rejected selections before profiling, so a
+failed retune cannot restore a selection that the group already rejected (§2.7).
+
+`rank_tactics` uses the same measurement overrides, store/policy partition, and winner publication
+as `choose_one`. Full shortlists remain memory-only and are rebuilt after reload; their first
+tactic is persisted as the serving winner. Loaded v1 or bundled entries remain compatibility
+fallbacks unless that key has been retired in the active identity. This exclusion is local to
+the process and identity, survives `autotune_v2_reload`, and resets with `clear_cache`; it does
+not delete global v1 entries used by another identity. This is an additive v2 field, not a new
+schema, manifest identity, or operation key. Legacy v1 file-policy gating is unchanged.
 
 `"auto"` currently preserves legacy behavior. Flipping the default to `"cuda_graph"` (the
 dominant serving mode) is gated on validating capture-safety across the op suite.
@@ -218,12 +228,14 @@ Persistence and orchestration stay separate responsibilities.
 - **Shared filesystem**: per-entry publication prevents torn entries. It does not provide a
   snapshot across ranks: concurrent publishers or an interrupted run can produce mixed hits.
 - **Profiling participation**: with `set_autotune_process_group`, each profile first reduces
-  its hit flag. Only an all-hit group skips profiling; any miss makes all ranks discard that
+  its hit flag and a digest of the cached runner/tactic. Only an all-hit group with matching
+  selections skips profiling; any miss or disagreement makes all ranks discard that
   profile's old runner entries and re-profile. Invalidation covers memory and persistence so
   a different runner can win without an older entry taking precedence after reload. These
   collectives run only during tuning, outside CUDA Graph capture. The framework must still
   ensure matching op/profile/candidate order and skip lists across the group.
-- **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
+- **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
+  tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
   winners and ephemeral tactic shortlists, bulk re-hydrates the attached store's final
   published state into memory, and thereby makes shared keys use the store's final tactics

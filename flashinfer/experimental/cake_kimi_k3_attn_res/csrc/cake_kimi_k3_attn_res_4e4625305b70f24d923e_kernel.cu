@@ -162,7 +162,7 @@ kernel_cake_kimi_k3_attn_res_4e4625305b70f24d923e(__nv_bfloat16* __restrict__ ou
     float* out_stats = reinterpret_cast<float*>(smem_raw + 320);
     const int out_stats_addr = smem + 320;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     int warp_0 = warp;
     int token = bid;

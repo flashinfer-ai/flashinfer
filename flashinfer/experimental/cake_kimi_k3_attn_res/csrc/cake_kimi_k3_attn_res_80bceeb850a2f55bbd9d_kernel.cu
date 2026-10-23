@@ -166,7 +166,7 @@ kernel_cake_kimi_k3_attn_res_80bceeb850a2f55bbd9d(__nv_bfloat16* __restrict__ ou
     float* out_stats = reinterpret_cast<float*>(smem_raw + 448);
     const int out_stats_addr = smem + 448;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("griddepcontrol.wait;" ::: "memory");
     int warp_0 = warp;

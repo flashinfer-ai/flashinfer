@@ -176,6 +176,9 @@ def test_live_tactics_change_pool_key_for_all_cached_backends(monkeypatch, confi
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        "flashinfer.jit.cake_megamoe_topk_reduce.supports_device", lambda: False
+    )
     options = {"knobs": "cache"} if config_name.startswith("Sm107") else {}
     backend = create_mega_kernel(
         getattr(moe_ep, config_name)(intermediate_size=256, top_k=2, **options)
@@ -234,6 +237,9 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        "flashinfer.jit.cake_megamoe_topk_reduce.supports_device", lambda: False
+    )
     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
@@ -351,15 +357,22 @@ def test_duplicate_capacity_is_rejected_and_different_capacity_does_not_alias(
     layer.destroy()
 
 
-def test_default_capacity_handle_adopts_the_lazy_default_workspace():
+@pytest.mark.parametrize("live_tokens", [None, 8])
+def test_default_profile_handle_adopts_the_lazy_default_workspace(live_tokens):
     layer, _, _ = _make_layer()
+    layer._kernel.supports_live_token_tuning = True
+    layer._fleet_params = dataclasses.replace(
+        layer._fleet_params, tuning_live_tokens=live_tokens
+    )
     default_workspace = mock.MagicMock(name="default_workspace")
     layer._workspace = default_workspace
     with (
         mock.patch.object(layer._kernel, "validate_init"),
         mock.patch.object(layer._kernel, "prepare_workspace") as prepare_workspace,
     ):
-        handle = layer.create_workspace(layer._fleet_params.max_tokens_per_rank)
+        handle = layer.create_workspace(
+            layer._fleet_params.max_tokens_per_rank, live_tokens=live_tokens
+        )
 
     prepare_workspace.assert_not_called()
     assert handle._backend_workspace is default_workspace
@@ -372,6 +385,34 @@ def test_default_capacity_handle_adopts_the_lazy_default_workspace():
     destroy.assert_called_once_with(default_workspace)
     assert layer._default_workspace_handle is None
     layer.destroy()
+
+
+@pytest.mark.parametrize("initialize_default_first", [False, True])
+def test_full_capacity_handle_preserves_the_default_live_profile(
+    initialize_default_first,
+):
+    layer, _, _ = _make_layer()
+    layer._fleet_params = dataclasses.replace(layer._fleet_params, tuning_live_tokens=8)
+    default_workspace, full_workspace = object(), object()
+    with (
+        mock.patch.object(layer._kernel, "validate_init"),
+        mock.patch.object(
+            layer._kernel,
+            "prepare_workspace",
+            side_effect=lambda bootstrap, fleet: (
+                default_workspace if fleet.tuning_live_tokens == 8 else full_workspace
+            ),
+        ),
+        mock.patch.object(layer._kernel, "destroy"),
+    ):
+        if initialize_default_first:
+            assert layer._ensure_workspace() is default_workspace
+        handle = layer.create_workspace(layer._fleet_params.max_tokens_per_rank)
+        assert handle.live_tokens is None
+        assert handle._backend_workspace is full_workspace
+        assert layer._default_workspace_handle is None
+        assert layer._ensure_workspace() is default_workspace
+        layer.destroy()
 
 
 def test_forward_uses_selected_workspace_and_capacity_profile():
@@ -545,6 +586,89 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     assert launch.call_count == 3
 
 
+@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+def test_nvfp4_unfinalized_weights_follow_resolved_knobs(
+    monkeypatch, apply_topk_in_fc1
+):
+    import torch
+
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import nvfp4
+
+    def byte_view(shape, dtype):
+        tensor = torch.zeros(shape, dtype=torch.uint8)
+        return tensor, tensor
+
+    monkeypatch.setattr(nvfp4, "_sym_zeros_byte_view", byte_view)
+    monkeypatch.setattr(
+        nvfp4, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
+    )
+    monkeypatch.setattr(
+        nvfp4,
+        "_resolve_per_expert_epilogue",
+        lambda name, value, count: torch.ones(count),
+    )
+    kernel = create_mega_kernel(
+        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            do_finalize=False,
+            apply_topk_in_fc1=apply_topk_in_fc1,
+            knobs={"apply_topk_in_fc1": not apply_topk_in_fc1},
+        )
+    )
+    kernel.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    workspace = kernel._allocate_workspace(moe_ep.FleetParams(2, 1, 128))
+    frontend = workspace._frontend
+    assert frontend.config.apply_topk_in_fc1 is not apply_topk_in_fc1
+    workspace.topk_weights.copy_(torch.tensor([[0.25, 0.75]]))
+    partials = torch.tensor([1.0, 2.0]).view(1, 2, 1).expand(1, 2, 128).clone()
+    if frontend.config.apply_topk_in_fc1:
+        partials *= workspace.topk_weights.unsqueeze(-1)
+    monkeypatch.setattr(
+        frontend, "deferred_topk_reduce_workspace", lambda: (partials, partials, None)
+    )
+    monkeypatch.setattr(
+        kernel, "_prepared_thunk_state", lambda *args: (None, lambda: None, None)
+    )
+    monkeypatch.setattr(cutedsl_megamoe, "staged_tokens", lambda _: 1)
+
+    rows, weights, indices = kernel.compute_unfinalized(workspace, ())
+    reduced = (rows[indices.long()] * weights.unsqueeze(-1)).sum(dim=1)
+    torch.testing.assert_close(reduced, torch.full((1, 128), 1.75))
+
+
+def test_nvfp4_deferred_output_rejects_knobs_that_disable_it(monkeypatch):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import nvfp4
+
+    allocate = mock.Mock(
+        side_effect=AssertionError("allocation before mode validation")
+    )
+    monkeypatch.setattr(nvfp4, "_sym_zeros_byte_view", allocate)
+    kernel = create_mega_kernel(
+        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            do_finalize=False,
+            knobs={"defer_topk_reduce": False},
+        )
+    )
+    kernel.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    with pytest.raises(
+        ValueError, match="defer_topk_reduce=True cannot be disabled by knobs"
+    ):
+        kernel._allocate_workspace(moe_ep.FleetParams(2, 1, 128))
+    allocate.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "config_name",
     [
@@ -562,6 +686,9 @@ def test_finalized_and_unfinalized_workspaces_have_distinct_pool_keys(
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        "flashinfer.jit.cake_megamoe_topk_reduce.supports_device", lambda: False
+    )
     config = getattr(moe_ep, config_name)(intermediate_size=128, top_k=2)
     finalized = create_mega_kernel(config)
     unfinalized = create_mega_kernel(dataclasses.replace(config, do_finalize=False))

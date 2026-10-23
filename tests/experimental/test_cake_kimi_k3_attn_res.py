@@ -196,6 +196,17 @@ POLICY_ROWS = [
 # withdrawn, so every POLICY_ROWS cell takes the same program at 148 and 152 SMs.
 _ROUND_2_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {}
 
+# Round 5: the POLICY_ROWS cells whose program depends on the SM count after the round-5 route tables.
+# sm_103a (4096, 5) takes the held nc3 depth-3 K = 5 program at 152 SMs (``R2_PERSISTENT_KEY_CELLS``)
+# and keeps the early-consume nc4 program at 148 SMs.
+_ROUND_5_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
+    ("sm_103a", 4096, 5, 152): (
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2",
+        152,
+    ),
+}
+
 
 def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
     """The (grid, schedule id) a POLICY_ROWS cell takes on ``sm_count`` SMs: the native ports and the
@@ -212,7 +223,7 @@ def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
 @pytest.mark.parametrize("arch,M,K,pdl,kind,schedule_id,grid_x", POLICY_ROWS)
 def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
     grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
-    kind, schedule_id, grid_x = _ROUND_2_ROWS.get(
+    kind, schedule_id, grid_x = (_ROUND_2_ROWS | _ROUND_5_ROWS).get(
         (arch, M, K, sm_count), (kind, schedule_id, grid_x)
     )
     plan = plan_route(arch, sm_count, M, K, pdl)
@@ -329,6 +340,33 @@ def test_round_2_cells_take_their_table_program():
             )
             assert plan.fallback_from is None and plan.threads == cb.PERSISTENT_THREADS
             seen += 1
+    # Round 5: a write cell names the dense key of the program whose snapshot-write variant the cell
+    # runs (block K written); the dense cell itself keeps its own program.
+    for arch, sm_count, M, K, key in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
+        for pdl in (False, True):
+            plan = cb._plan_route_exact(arch, sm_count, M, K, pdl, block_write_idx=K)
+            assert plan.kind == "persistent" and plan.fallback_from is None, (plan, key)
+            assert plan.kernel_key == f"{key}_write", (
+                arch,
+                sm_count,
+                M,
+                K,
+                pdl,
+                plan.kernel_key,
+            )
+            assert (
+                plan.schedule_id.endswith("_write")
+                and plan.threads == cb.PERSISTENT_THREADS
+            )
+            assert 1 <= plan.grid_x <= max(M, sm_count)
+            dense = plan_route(arch, sm_count, M, K, pdl)
+            assert dense.kind == "persistent" and dense.kernel_key != key, (dense, key)
+            seen += 1
+    assert list(_r2_cells("WRITE_PERSISTENT_KEY_CELLS")) == [
+        ("sm_100a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+        ("sm_103a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+        ("sm_103a", 152, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+    ]
     for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS"):
         for pdl in (False, True):
             plan = plan_route(arch, sm_count, M, K, pdl)
@@ -579,6 +617,44 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
     for bad_idx in (K - 1, K + 1, MAX_BLOCKS):
         with pytest.raises(ValueError):
             cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=bad_idx)
+
+
+def test_write_cell_programs_serve_their_cells_only():
+    """A ``WRITE_PERSISTENT_KEY_CELLS`` program is the exact program of its cells and never the
+    registered-variant fallback of another snapshot-write plan (round 5 pins the (4096, 4) write
+    cell to a depth-2 program that would otherwise be the closest registered variant of every
+    unregistered depth-2 K = 4 write key), so pinning a write cell changes no other route."""
+    cells = {}
+    for arch, sm_count, M, K, key in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
+        cells[(arch, sm_count, M, K)] = f"{key}_write"
+    pinned = {
+        arch: {k for (a, _s, _m, _k), k in cells.items() if a == arch}
+        for arch in ARCHES
+    }
+    assert all(pinned[arch] for arch in ARCHES)
+    assert pinned == {arch: cb._cell_pinned_write_keys(arch) for arch in ARCHES}
+    seen = 0
+    for arch in ARCHES:
+        for sm_count in SM_COUNTS:
+            for K in range(1, MAX_BLOCKS):
+                for pdl in (False, True):
+                    for M in _table_edge_token_counts():
+                        plan = plan_route(arch, sm_count, M, K, pdl, block_write_idx=K)
+                        if (arch, sm_count, M, K) in cells:
+                            assert plan.kernel_key == cells[arch, sm_count, M, K]
+                            assert plan.fallback_from is None
+                            continue
+                        assert plan.kernel_key not in pinned[arch], (
+                            arch,
+                            sm_count,
+                            M,
+                            K,
+                            pdl,
+                            plan.kernel_key,
+                            plan.fallback_from,
+                        )
+                        seen += plan.fallback_from is not None
+    assert seen
 
 
 def test_snapshot_write_fallback_stays_in_the_write_family(monkeypatch):
@@ -941,7 +1017,7 @@ _ROUTE_BAND_START_ROWS = {
     ),
     5: (
         1, 5, 9, 12, 13, 16, 17, 33, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024,
-        1025, 1536, 1537, 2048, 2049, 4096, 4097,
+        1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193,
     ),
     6: (1, 2, 5, 17, 33, 129, 192, 193, 384, 513),
     7: (1, 5, 17, 33, 65, 129, 192, 193, 256, 257, 385, 513, 768, 769),

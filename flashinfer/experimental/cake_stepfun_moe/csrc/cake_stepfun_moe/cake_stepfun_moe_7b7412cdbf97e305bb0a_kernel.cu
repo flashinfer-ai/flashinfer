@@ -73,7 +73,7 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
     int* warp_totals = reinterpret_cast<int*>(smem_raw + 2048);
     const int warp_totals_addr = smem + 2048;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int rank = (int)cta_rank;
     int thread_idx = (int)tid;
     int lane_idx = (int)lane;
@@ -106,8 +106,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local = ((local_idx >= 0 && local_idx < extent && (local_idx & stride_mask) == 0) ? 1 : 0);
             exp_off[0] = 0;
             if (is_local != 0) {
-                unsigned int _atomic_old_0 = atomicAdd(&smem_expert_count[idx_ii], 1);
-                exp_off[0] = (int)_atomic_old_0;
+                unsigned int _atomic_fetch_add_0 = atomicAdd(&smem_expert_count[idx_ii], 1);
+                exp_off[0] = (int)_atomic_fetch_add_0;
             }
             expanded = cluster_tid + 8192;
             int idx_ii_0 = 0;
@@ -121,8 +121,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local_6 = ((local_idx_3 >= 0 && local_idx_3 < extent_4 && (local_idx_3 & stride_mask_5) == 0) ? 1 : 0);
             exp_off[1] = 0;
             if (is_local_6 != 0) {
-                unsigned int _atomic_old_1 = atomicAdd(&smem_expert_count[idx_ii_0], 1);
-                exp_off[1] = (int)_atomic_old_1;
+                unsigned int _atomic_fetch_add_1 = atomicAdd(&smem_expert_count[idx_ii_0], 1);
+                exp_off[1] = (int)_atomic_fetch_add_1;
             }
             expanded = cluster_tid + 16384;
             int idx_ii_7 = 0;
@@ -136,8 +136,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local_13 = ((local_idx_10 >= 0 && local_idx_10 < extent_11 && (local_idx_10 & stride_mask_12) == 0) ? 1 : 0);
             exp_off[2] = 0;
             if (is_local_13 != 0) {
-                unsigned int _atomic_old_2 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
-                exp_off[2] = (int)_atomic_old_2;
+                unsigned int _atomic_fetch_add_2 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
+                exp_off[2] = (int)_atomic_fetch_add_2;
             }
             expanded = cluster_tid + 24576;
             int idx_ii_14 = 0;
@@ -151,8 +151,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local_20 = ((local_idx_17 >= 0 && local_idx_17 < extent_18 && (local_idx_17 & stride_mask_19) == 0) ? 1 : 0);
             exp_off[3] = 0;
             if (is_local_20 != 0) {
-                unsigned int _atomic_old_3 = atomicAdd(&smem_expert_count[idx_ii_14], 1);
-                exp_off[3] = (int)_atomic_old_3;
+                unsigned int _atomic_fetch_add_3 = atomicAdd(&smem_expert_count[idx_ii_14], 1);
+                exp_off[3] = (int)_atomic_fetch_add_3;
             }
         } else {
             if (done == 0) {
@@ -171,8 +171,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_1 = ((local_idx_1 >= 0 && local_idx_1 < extent_1 && (local_idx_1 & stride_mask_1) == 0) ? 1 : 0);
                     exp_off[0] = 0;
                     if (is_local_1 != 0) {
-                        unsigned int _atomic_old_4 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
-                        exp_off[0] = (int)_atomic_old_4;
+                        unsigned int _atomic_fetch_add_4 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
+                        exp_off[0] = (int)_atomic_fetch_add_4;
                     }
                 }
             }
@@ -192,8 +192,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_2 = ((local_idx_2 >= 0 && local_idx_2 < extent_2 && (local_idx_2 & stride_mask_2) == 0) ? 1 : 0);
                     exp_off[1] = 0;
                     if (is_local_2 != 0) {
-                        unsigned int _atomic_old_5 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
-                        exp_off[1] = (int)_atomic_old_5;
+                        unsigned int _atomic_fetch_add_5 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
+                        exp_off[1] = (int)_atomic_fetch_add_5;
                     }
                 }
             }
@@ -213,8 +213,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_3 = ((local_idx_4 >= 0 && local_idx_4 < extent_3 && (local_idx_4 & stride_mask_3) == 0) ? 1 : 0);
                     exp_off[2] = 0;
                     if (is_local_3 != 0) {
-                        unsigned int _atomic_old_6 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
-                        exp_off[2] = (int)_atomic_old_6;
+                        unsigned int _atomic_fetch_add_6 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
+                        exp_off[2] = (int)_atomic_fetch_add_6;
                     }
                 }
             }
@@ -234,8 +234,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_4 = ((local_idx_5 >= 0 && local_idx_5 < extent_5 && (local_idx_5 & stride_mask_4) == 0) ? 1 : 0);
                     exp_off[3] = 0;
                     if (is_local_4 != 0) {
-                        unsigned int _atomic_old_7 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
-                        exp_off[3] = (int)_atomic_old_7;
+                        unsigned int _atomic_fetch_add_7 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
+                        exp_off[3] = (int)_atomic_fetch_add_7;
                     }
                 }
             }
@@ -255,8 +255,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local_5 = ((local_idx_6 >= 0 && local_idx_6 < extent_6 && (local_idx_6 & stride_mask_6) == 0) ? 1 : 0);
             exp_off[4] = 0;
             if (is_local_5 != 0) {
-                unsigned int _atomic_old_8 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
-                exp_off[4] = (int)_atomic_old_8;
+                unsigned int _atomic_fetch_add_8 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
+                exp_off[4] = (int)_atomic_fetch_add_8;
             }
             expanded = cluster_tid + 40960;
             int idx_ii_0_1 = 0;
@@ -270,8 +270,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local_6_1 = ((local_idx_3_1 >= 0 && local_idx_3_1 < extent_4_1 && (local_idx_3_1 & stride_mask_5_1) == 0) ? 1 : 0);
             exp_off[5] = 0;
             if (is_local_6_1 != 0) {
-                unsigned int _atomic_old_9 = atomicAdd(&smem_expert_count[idx_ii_0_1], 1);
-                exp_off[5] = (int)_atomic_old_9;
+                unsigned int _atomic_fetch_add_9 = atomicAdd(&smem_expert_count[idx_ii_0_1], 1);
+                exp_off[5] = (int)_atomic_fetch_add_9;
             }
             expanded = cluster_tid + 49152;
             int idx_ii_7_1 = 0;
@@ -285,8 +285,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local_13_1 = ((local_idx_10_1 >= 0 && local_idx_10_1 < extent_11_1 && (local_idx_10_1 & stride_mask_12_1) == 0) ? 1 : 0);
             exp_off[6] = 0;
             if (is_local_13_1 != 0) {
-                unsigned int _atomic_old_10 = atomicAdd(&smem_expert_count[idx_ii_7_1], 1);
-                exp_off[6] = (int)_atomic_old_10;
+                unsigned int _atomic_fetch_add_10 = atomicAdd(&smem_expert_count[idx_ii_7_1], 1);
+                exp_off[6] = (int)_atomic_fetch_add_10;
             }
             expanded = cluster_tid + 57344;
             int idx_ii_14_1 = 0;
@@ -300,8 +300,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int is_local_20_1 = ((local_idx_17_1 >= 0 && local_idx_17_1 < extent_18_1 && (local_idx_17_1 & stride_mask_19_1) == 0) ? 1 : 0);
             exp_off[7] = 0;
             if (is_local_20_1 != 0) {
-                unsigned int _atomic_old_11 = atomicAdd(&smem_expert_count[idx_ii_14_1], 1);
-                exp_off[7] = (int)_atomic_old_11;
+                unsigned int _atomic_fetch_add_11 = atomicAdd(&smem_expert_count[idx_ii_14_1], 1);
+                exp_off[7] = (int)_atomic_fetch_add_11;
             }
         } else {
             if (done == 0) {
@@ -320,8 +320,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_7 = ((local_idx_7 >= 0 && local_idx_7 < extent_7 && (local_idx_7 & stride_mask_7) == 0) ? 1 : 0);
                     exp_off[4] = 0;
                     if (is_local_7 != 0) {
-                        unsigned int _atomic_old_12 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
-                        exp_off[4] = (int)_atomic_old_12;
+                        unsigned int _atomic_fetch_add_12 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
+                        exp_off[4] = (int)_atomic_fetch_add_12;
                     }
                 }
             }
@@ -341,8 +341,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_8 = ((local_idx_8 >= 0 && local_idx_8 < extent_8 && (local_idx_8 & stride_mask_8) == 0) ? 1 : 0);
                     exp_off[5] = 0;
                     if (is_local_8 != 0) {
-                        unsigned int _atomic_old_13 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
-                        exp_off[5] = (int)_atomic_old_13;
+                        unsigned int _atomic_fetch_add_13 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
+                        exp_off[5] = (int)_atomic_fetch_add_13;
                     }
                 }
             }
@@ -362,8 +362,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_9 = ((local_idx_9 >= 0 && local_idx_9 < extent_9 && (local_idx_9 & stride_mask_9) == 0) ? 1 : 0);
                     exp_off[6] = 0;
                     if (is_local_9 != 0) {
-                        unsigned int _atomic_old_14 = atomicAdd(&smem_expert_count[idx_ii_9], 1);
-                        exp_off[6] = (int)_atomic_old_14;
+                        unsigned int _atomic_fetch_add_14 = atomicAdd(&smem_expert_count[idx_ii_9], 1);
+                        exp_off[6] = (int)_atomic_fetch_add_14;
                     }
                 }
             }
@@ -383,8 +383,8 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
                     int is_local_10 = ((local_idx_11 >= 0 && local_idx_11 < extent_10 && (local_idx_11 & stride_mask_10) == 0) ? 1 : 0);
                     exp_off[7] = 0;
                     if (is_local_10 != 0) {
-                        unsigned int _atomic_old_15 = atomicAdd(&smem_expert_count[idx_ii_10], 1);
-                        exp_off[7] = (int)_atomic_old_15;
+                        unsigned int _atomic_fetch_add_15 = atomicAdd(&smem_expert_count[idx_ii_10], 1);
+                        exp_off[7] = (int)_atomic_fetch_add_15;
                     }
                 }
             }
@@ -720,13 +720,11 @@ kernel_cake_stepfun_moe_7b7412cdbf97e305bb0a(int* __restrict__ topk_ids, __nv_bf
             int mn_limit2 = scaled_0 + count;
             int _min_0 = ((scaled) < (mn_limit2) ? (scaled) : (mn_limit2));
             cta_idx_xy_to_mn_limit[exclusive + cta] = _min_0;
-            int _min_1 = ((scaled) < (_min_0 + (-_min_0 & 3)) ? (scaled) : (_min_0 + (-_min_0 & 3)));
-            int head_end = _min_1;
+            int head_end = ((scaled) < (_min_0 + (-_min_0 & 3)) ? (scaled) : (_min_0 + (-_min_0 & 3)));
             for (int head = _min_0; head < head_end; head++) {
                 permuted_idx_to_token_idx[head] = -1;
             }
-            int _max_0 = ((scaled - head_end) > (0) ? (scaled - head_end) : (0));
-            int body_len = _max_0;
+            int body_len = ((scaled - head_end) > (0) ? (scaled - head_end) : (0));
             int tail_begin = head_end + (body_len >> 2 << 2);
             for (int body = head_end; body < tail_begin; body += 4) {
                 {

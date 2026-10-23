@@ -208,8 +208,7 @@ kernel_cake_kda_train_d7656e2b58b9bab49495(int* __restrict__ cu_seqlens, int num
             cnt_tile[tid_0] = n_j;
             __syncthreads();
             if (i_s < num_seqs) {
-                int _min_1 = ((num_seqs - jbase) < (256) ? (num_seqs - jbase) : (256));
-                int jn = _min_1;
+                int jn = ((num_seqs - jbase) < (256) ? (num_seqs - jbase) : (256));
                 for (int jj = 0; jj < jn; jj++) {
                     int n_o = cnt_tile[jj];
                     if (n_o > n_me) {
@@ -231,4 +230,3 @@ kernel_cake_kda_train_d7656e2b58b9bab49495(int* __restrict__ cu_seqlens, int num
 }
 
 } // extern "C"
-
