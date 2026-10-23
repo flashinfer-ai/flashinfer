@@ -152,6 +152,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
+    "cake_all_gather_matmul_72ae81d01ed72fe75fe8": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_8a259a5d2c971ec7f65c": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8a259a5d2c971ec7f65c_kernel.cu",
@@ -388,6 +396,7 @@ ROUTES: dict[str, str] = {
     "main_float16_ws2_k_major_cg2": "cake_all_gather_matmul_aa1b0acc28e1e23913d9",
     "main_float16_ws2_n_major": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
     "main_float16_ws4_k_major": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
+    "main_float16_ws4_k_major_cg2": "cake_all_gather_matmul_72ae81d01ed72fe75fe8",
     "main_float16_ws4_k_major_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
     "main_float16_ws4_n_major": "cake_all_gather_matmul_f0cbdce7150397ae0989",
     "main_float16_ws8_k_major": "cake_all_gather_matmul_f85e6d8165a64ac49252",
@@ -793,6 +802,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -805,6 +815,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
+            "main_cg2": "cake_all_gather_matmul_72ae81d01ed72fe75fe8",
         },
     },
     "float16_ws4_n_major_sm_100a": {
@@ -1013,6 +1024,7 @@ CG2_CLASSES: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major"],
         [2, "float16", "k_major"],
         [4, "bfloat16", "k_major"],
+        [4, "float16", "k_major"],
         [8, "bfloat16", "k_major"],
     ],
 }
@@ -1046,6 +1058,8 @@ CG2_REGIONS: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
         [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
         [2, "float16", "k_major", 1024, 1024, 2048, 2048],
+        [4, "bfloat16", "k_major", 512, 512, 2560, 2560],
+        [4, "float16", "k_major", 512, 512, 2560, 2560],
     ],
 }
 # Classes ``[world_size, dtype, b_layout, form]`` with a delivered spill-wave
