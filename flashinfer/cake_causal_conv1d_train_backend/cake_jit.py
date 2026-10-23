@@ -27,57 +27,71 @@ map.  What to compile -- sources, digests, nvcc flags -- is recorded once in
 and otherwise through FlashInfer's JIT from the same sources and flags,
 verifying every source digest before the first build.
 
-A route lists every program one public call may select: ``fwd`` (``y`` from
-``x``, ``weight`` and ``cu_seqlens``) and ``bwd`` (``dx`` and the deterministic
-FP32 ``dweight``).  The forward launches its route in order.  The backward
-route of an architecture may carry several programs of the kernel and selects
-exactly one per call, chosen by the channel count: a record's ``select_rule``
-(``channels_at_least``: ``C >= channels[arch]``) names the channel counts it
-owns, of several owners the one of the highest threshold runs, the record
-without a rule is the architecture's fallback, and :func:`selected_modules`
-applies that rule (a pure function of the architecture and ``C``; the host
-never reads the data).
-
-A backward call is two ordinary launches on one stream.  The selected program
-(persistent, ``grid_mult x ctas_per_sm x SM count`` CTAs) writes ``dx`` and
-one FP32 partial row of ``dweight`` per CTA into the workspace and signals its
-dependents; then the route's reduce program (``record["reduce"]``), launched
-programmatically dependent on it (``launch.use_pdl``: its binding sets the
-programmatic-stream-serialization attribute, and the kernel waits for the
-main grid before its first load), sums the rows per channel in a fixed order.
-Until round 6 the backward was one cooperative launch whose grid-wide barrier
-preceded the same reduction in-kernel.  A cooperative grid cannot start while
-any kernel is resident on another stream -- NCCL collectives are, for most of
-a training backward (FlashInfer issue #7038) -- whereas an ordinary launch
-whose CTAs find no free slot runs them in a later wave.  ``grid_mult``
-(``grid_rule["grid_mult"][arch]``) over-decomposes the token axis so that
-such a CTA trails by ``1 / grid_mult`` of a stream rather than a whole one;
-the partial rows grow with it.  The reduction order is unchanged, so
-``dweight`` is deterministic for a given ``(S, C, device)`` and, at
-``grid_mult`` 1, bitwise what the cooperative form produced.
+A route lists every program one public call may select.  The forward routes
+produce ``y`` from ``x``, ``weight`` and ``cu_seqlens``: ``fwd`` (FP32 taps),
+``fwd_dt`` (BF16 taps) and ``fwd_bias`` (a per-channel bias, FP32 or BF16 taps
+and bias).  The backward routes produce ``dx`` and the deterministic
+``dweight`` (and ``dbias``): ``bwd`` (FP32 taps and
+gradient, SiLU' at the BF16-rounded preactivation), ``bwd_dt`` (BF16 taps and
+/ or a BF16 ``dweight``), ``bwd_bias``, ``bwd_fp32g`` (SiLU' at the unrounded
+FP32 preactivation for the weight gradient) and ``bwd_bias_fp32g``;
+:func:`forward_route` / :func:`backward_route` map a call's arguments to its
+route and the ``flags`` bit mask (``FLAG_*``) tells a route's programs which
+of ``w``, ``dw``, ``b``, ``db`` are BF16.  A forward route launches its
+programs in order.  A backward route may carry several programs of the kernel
+and selects exactly one per call, chosen by the channel count: a record's
+``select_rule`` (``channels_at_least``: ``C >= channels[arch]``) names the
+channel counts it owns, of several owners the one of the highest threshold
+runs, the record without a rule is the route's fallback, and
+:func:`selected_modules` applies that rule (a pure function of the
+architecture, the route and ``C``; the host never reads the data).
 Token and channel counts are runtime scalars, so a changed problem size never
 recompiles anything; building every library of the architecture
 (:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
 capture.
 
-The host plan is the three functions :func:`plan` (the kernel scalars),
-:func:`launch_grid` (the grid: ``co_resident`` records launch ``ctas_per_sm
-x SM count`` CTAs, ``occupancy`` records ``grid_mult x ctas_per_sm x SM
-count``, ``channels_per_cta`` records ``ceil(C / channels_per_cta)``)
-and :func:`partial_rows` (the backward workspace rows); everything else
-derives from them.  The public workspace
-is sized by the largest grid of the architecture's backward programs
-(:func:`workspace_record`, the capacity owner); each program writes the
-leading rows of its own grid and its reduce program sums exactly those.
+A backward call is two ordinary launches on one stream.  The selected program
+(persistent, ``grid_mult x ctas_per_sm x SM count`` CTAs) writes ``dx`` and
+one FP32 partial row of ``dweight`` (and, on the bias routes, of ``dbias``)
+per CTA into the workspace and signals its dependents; then the route's reduce
+program (``record["reduce"]``), launched programmatically dependent on it
+(``launch.use_pdl``: its binding sets the programmatic-stream-serialization
+attribute, and the kernel waits for the main grid before its first load), sums
+the rows per channel in a fixed order and stores ``dw`` (and ``db``) in the
+dtypes ``flags`` names.  Until round 6 the backward was one cooperative launch
+whose grid-wide barrier preceded the same reduction in-kernel.  A cooperative
+grid cannot start while any kernel is resident on another stream -- NCCL
+collectives are, for most of a training backward (FlashInfer issue #7038) --
+whereas an ordinary launch whose CTAs find no free slot runs them in a later
+wave.  ``grid_mult`` (``grid_rule["grid_mult"][arch]``) over-decomposes the
+token axis so that such a CTA trails by ``1 / grid_mult`` of a stream rather
+than a whole one; the partial rows grow with it.  The reduction order is
+unchanged, so ``dweight`` is deterministic for a given ``(S, C, device)`` and
+route and, at ``grid_mult`` 1, bitwise what the cooperative form produced.
+Each backward route has its own reduce program: the default one, and builds
+of it with ``dtype_flags`` (the ``dw`` store form), ``bias`` (the fifth, dbias,
+slab and ``db``) and ``fp64`` (the ``_fp32g`` routes' FP64 sums).
+
+The host plan is the three functions :func:`plan` (the kernel scalars, with
+the channel tile rule :func:`channel_split`), :func:`launch_grid` (the grid:
+``co_resident`` records launch ``ctas_per_sm x SM count`` CTAs, ``occupancy``
+records ``grid_mult x ctas_per_sm x SM count``, ``channels_per_cta`` records
+``ceil(C / channels_per_cta)``) and :func:`partial_rows` (the backward
+workspace rows); everything else derives from them.  The public workspace is
+sized by the backward program of the largest ``grid_mult x ctas_per_sm x
+taps`` over every backward route (:func:`workspace_record`, the capacity
+owner; the bias programs' partials carry a fifth, dbias, slab); each program
+writes the leading rows of its own grid and its reduce program sums exactly
+those.
 
 The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
-from; the forward and the reduce program are built with their kernel files'
-default keywords; every backward program carries ``revision=6`` (the build
-revision of the split that retired the cooperative form; the exporter hashes
-it so the split programs replaced the cooperative ones under new names) and is
-built with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
+from; the forward and the default reduce program are built with their kernel
+files' default keywords; every backward program carries ``revision=6`` (the
+build revision of the split that retired the cooperative form; the exporter
+hashes it so the split programs replaced the cooperative ones under new names)
+and is built with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
 thread; 2-D TMA row copies) on sm_100a and sm_103a, with ``vec=8,
 min_blocks=2`` (two CTAs per SM) on sm_107a, and the backwards the
 ``channels_at_least`` rules select, builds of ``vec=8, copy="tma2d",
@@ -87,7 +101,11 @@ fast_roll=True`` (the dweight fold buffer over the stage slots, the stage body
 as two rolled passes of four tokens) on sm_103a for 512 <= C < 768 and on
 sm_107a for 512 <= C < 1024, as is on sm_107a for 1024 <= C < 2048, and
 with ``fast_roll=True, roll_prefetch=True`` (each rolled pass loads the
-next pass's rows before it computes) on sm_107a from 2048.
+next pass's rows before it computes) on sm_107a from 2048.  The programs of
+the six other routes are the same bodies built with ``dtype_flags=True`` (the
+``flags`` scalar; untyped tap / bias pointers) plus ``bias=True`` for the
+bias routes and ``grad_pre="fp32"`` for the ``_fp32g`` routes; each record's
+comment names its build.
 """
 
 from __future__ import annotations
@@ -595,6 +613,773 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
+    # Route ``fwd_dt`` (hand-written fallback): the forward with ``dtype_flags`` (the
+    # ``flags`` scalar selects the tap load form: bit 0 set reads BF16 taps); built from the
+    # forward kernel's default keywords plus ``dtype_flags=True``.  ``ctas_per_sm`` 4 as the
+    # forward's (the register limit at 128 threads; the occupancy query confirms it).
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_0f3982a5518f5a8696f6": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "workspace_rule": None,
+    },
+    # Route ``fwd_bias`` (hand-written fallback): the forward with a per-channel bias ``b``
+    # added after the four taps (FLA's order) and ``dtype_flags`` (bit 0: BF16 taps, bit 2:
+    # BF16 bias); built with ``bias=True, dtype_flags=True``.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_62cb38eb8aa667d46bc1": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "b"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "workspace_rule": None,
+    },
+    # Route ``bwd_dt`` (hand-written fallback, sm_100a / sm_103a): the fallback backward body
+    # ``vec=8, copy="tma2d"`` with ``dtype_flags=True`` (bit 0: BF16 taps; bit 1, the BF16
+    # ``dw`` store, is read by its reduce program); SiLU' at the BF16-rounded preactivation
+    # as the default route.  Like every backward program since the split it is an ordinary
+    # launch that writes ``dx`` and its partial rows; ``reduce`` names the program that sums
+    # them (the ``bwd_dt`` reduce: ``dtype_flags`` for the ``dw`` store form).
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_386c4447f3f52f0ca2b5": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 3,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_386c4447f3f52f0ca2b5",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_386c4447f3f52f0ca2b5",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_386c4447f3f52f0ca2b5",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_ea8f91038a9dea452ff2",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    # Route ``bwd_dt`` (hand-written fallback, sm_107a): the sm_107a fallback body ``vec=8,
+    # min_blocks=2`` with ``dtype_flags=True``.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_5a86d40863a7a43a4553": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_5a86d40863a7a43a4553",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_5a86d40863a7a43a4553",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_5a86d40863a7a43a4553",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_ea8f91038a9dea452ff2",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    # Route ``bwd_bias`` (hand-written fallback, sm_100a / sm_103a): the fallback body with
+    # ``bias=True`` (reads ``b``; the ``partial`` workspace grows a fifth slab, ``taps`` 5,
+    # of dbias partials that its reduce program sums into ``db``) and ``dtype_flags=True``
+    # (input bits 0 and 2; the store bits 1 and 3 are the reduce program's), ``min_blocks=2``
+    # (the bias accumulators do not fit the 168-register cap of three CTAs per SM).
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_64afdc97599db84884cd": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["buffer", "b"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_64afdc97599db84884cd",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_64afdc97599db84884cd",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_64afdc97599db84884cd",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_1c21c181af94e1635851",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 5,
+        },
+    },
+    # Route ``bwd_bias`` (hand-written fallback, sm_107a): the sm_107a fallback body with
+    # ``bias=True, dtype_flags=True``.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_65ffe261ea0b8bd284f9": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["buffer", "b"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_65ffe261ea0b8bd284f9",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_65ffe261ea0b8bd284f9",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_65ffe261ea0b8bd284f9",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_1c21c181af94e1635851",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 5,
+        },
+    },
+    # Route ``bwd_fp32g`` (hand-written fallback, sm_100a / sm_103a): the fallback body with
+    # ``grad_pre="fp32"`` (SiLU' at the unrounded FP32 preactivation; its reduce program
+    # sums the partial rows in FP64 with one rounding) and ``dtype_flags=True``.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_175cef5ba32c07763e9f": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 3,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_175cef5ba32c07763e9f",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_175cef5ba32c07763e9f",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_175cef5ba32c07763e9f",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_ce49146b9fef24adb47e",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    # Route ``bwd_fp32g`` (hand-written fallback, sm_107a): the sm_107a fallback body with
+    # ``grad_pre="fp32", dtype_flags=True``.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_f7350110926d9e9b9436": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_f7350110926d9e9b9436",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_f7350110926d9e9b9436",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_f7350110926d9e9b9436",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_ce49146b9fef24adb47e",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    # Route ``bwd_bias_fp32g`` (hand-written fallback, sm_100a / sm_103a): the fallback body
+    # with ``bias=True, grad_pre="fp32", dtype_flags=True``.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_4fc0dd753c847bdae996": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["buffer", "b"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_4fc0dd753c847bdae996",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_4fc0dd753c847bdae996",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_4fc0dd753c847bdae996",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_4d291f4b5c2cce6ef1ea",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 5,
+        },
+    },
+    # Route ``bwd_bias_fp32g`` (hand-written fallback, sm_107a): the sm_107a fallback body
+    # with ``bias=True, grad_pre="fp32", dtype_flags=True``.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_00d000bc2a1253f8438d": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["buffer", "b"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_00d000bc2a1253f8438d",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_00d000bc2a1253f8438d",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_00d000bc2a1253f8438d",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_4d291f4b5c2cce6ef1ea",
+        "role": "bwd",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 5,
+        },
+    },
     # The reduce program every backward route shares: the second launch of a
     # backward call.  Launched programmatically dependent on the main program
     # (``use_pdl``: the binding sets the programmatic-stream-serialization
@@ -654,16 +1439,246 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "reduce",
         "workspace_rule": None,
     },
+    # The reduce program of the ``bwd_dt`` route (hand-written; the render fills the name,
+    # symbol, argument plan and logical map): the default reduce built with ``dtype_flags=True``; it
+    # stores ``dw`` as BF16 when ``flags`` bit 1 says so;
+    # otherwise the default reduce's order and CTA shape (one warp per channel).
+    "cake_causal_conv1d_train_ea8f91038a9dea452ff2": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "partial"],
+            ["buffer", "dw"],
+            ["parameter", "C"],
+            ["parameter", "main_ctas"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "ct_vec"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "channels_per_cta": 4,
+            "cooperative": False,
+            "kind": "channels_per_cta",
+        },
+        "kernel": "cake_causal_conv1d_train_ea8f91038a9dea452ff2",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_ea8f91038a9dea452ff2",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_causal_conv1d_train_ea8f91038a9dea452ff2",
+        "logical": {
+            "C": "C",
+            "ct_vec": "ct_vec",
+            "dw": "dw",
+            "flags": "flags",
+            "main_ctas": "main_ctas",
+            "n_ch_tiles": "n_ch_tiles",
+            "partial": "partial",
+        },
+        "role": "reduce",
+        "workspace_rule": None,
+    },
+    # The reduce program of the ``bwd_bias`` route (hand-written; the render fills the name,
+    # symbol, argument plan and logical map): the default reduce built with ``bias=True, dtype_flags=True``; it
+    # sums the fifth, dbias, slab of the partial rows into ``db`` as well;
+    # stores ``dw`` / ``db`` as BF16 when ``flags`` bit 1 / 3 says so;
+    # otherwise the default reduce's order and CTA shape (one warp per channel).
+    "cake_causal_conv1d_train_1c21c181af94e1635851": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "partial"],
+            ["buffer", "dw"],
+            ["buffer", "db"],
+            ["parameter", "C"],
+            ["parameter", "main_ctas"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "ct_vec"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "channels_per_cta": 4,
+            "cooperative": False,
+            "kind": "channels_per_cta",
+        },
+        "kernel": "cake_causal_conv1d_train_1c21c181af94e1635851",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_1c21c181af94e1635851",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_causal_conv1d_train_1c21c181af94e1635851",
+        "logical": {
+            "C": "C",
+            "ct_vec": "ct_vec",
+            "db": "db",
+            "dw": "dw",
+            "flags": "flags",
+            "main_ctas": "main_ctas",
+            "n_ch_tiles": "n_ch_tiles",
+            "partial": "partial",
+        },
+        "role": "reduce",
+        "workspace_rule": None,
+    },
+    # The reduce program of the ``bwd_fp32g`` route (hand-written; the render fills the name,
+    # symbol, argument plan and logical map): the default reduce built with ``fp64=True, dtype_flags=True``; it
+    # sums in FP64 (lane sums and the xor tree) with one final rounding;
+    # stores ``dw`` as BF16 when ``flags`` bit 1 says so;
+    # otherwise the default reduce's order and CTA shape (one warp per channel).
+    "cake_causal_conv1d_train_ce49146b9fef24adb47e": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "partial"],
+            ["buffer", "dw"],
+            ["parameter", "C"],
+            ["parameter", "main_ctas"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "ct_vec"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "channels_per_cta": 4,
+            "cooperative": False,
+            "kind": "channels_per_cta",
+        },
+        "kernel": "cake_causal_conv1d_train_ce49146b9fef24adb47e",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_ce49146b9fef24adb47e",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_causal_conv1d_train_ce49146b9fef24adb47e",
+        "logical": {
+            "C": "C",
+            "ct_vec": "ct_vec",
+            "dw": "dw",
+            "flags": "flags",
+            "main_ctas": "main_ctas",
+            "n_ch_tiles": "n_ch_tiles",
+            "partial": "partial",
+        },
+        "role": "reduce",
+        "workspace_rule": None,
+    },
+    # The reduce program of the ``bwd_bias_fp32g`` route (hand-written; the render fills the name,
+    # symbol, argument plan and logical map): the default reduce built with ``bias=True, fp64=True, dtype_flags=True``; it
+    # sums the fifth, dbias, slab of the partial rows into ``db`` as well;
+    # sums in FP64 (lane sums and the xor tree) with one final rounding;
+    # stores ``dw`` / ``db`` as BF16 when ``flags`` bit 1 / 3 says so;
+    # otherwise the default reduce's order and CTA shape (one warp per channel).
+    "cake_causal_conv1d_train_4d291f4b5c2cce6ef1ea": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "partial"],
+            ["buffer", "dw"],
+            ["buffer", "db"],
+            ["parameter", "C"],
+            ["parameter", "main_ctas"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "ct_vec"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "channels_per_cta": 4,
+            "cooperative": False,
+            "kind": "channels_per_cta",
+        },
+        "kernel": "cake_causal_conv1d_train_4d291f4b5c2cce6ef1ea",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_4d291f4b5c2cce6ef1ea",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_causal_conv1d_train_4d291f4b5c2cce6ef1ea",
+        "logical": {
+            "C": "C",
+            "ct_vec": "ct_vec",
+            "db": "db",
+            "dw": "dw",
+            "flags": "flags",
+            "main_ctas": "main_ctas",
+            "n_ch_tiles": "n_ch_tiles",
+            "partial": "partial",
+        },
+        "role": "reduce",
+        "workspace_rule": None,
+    },
 }
 
+# Architecture -> route -> the records the route launches, in launch order.  The
+# default routes ``fwd`` / ``bwd`` are the shipped programs; the six round-6
+# routes each hold their hand-written fallback (above) and, once rendered, the
+# routed programs the exporter scaffolds from it.
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
             "cake_causal_conv1d_train_e08749684c395f2ab65e",
             "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
         ],
+        "bwd_bias": [
+            "cake_causal_conv1d_train_64afdc97599db84884cd",
+        ],
+        "bwd_bias_fp32g": [
+            "cake_causal_conv1d_train_4fc0dd753c847bdae996",
+        ],
+        "bwd_dt": [
+            "cake_causal_conv1d_train_386c4447f3f52f0ca2b5",
+        ],
+        "bwd_fp32g": [
+            "cake_causal_conv1d_train_175cef5ba32c07763e9f",
+        ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
+        ],
+        "fwd_bias": [
+            "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        ],
+        "fwd_dt": [
+            "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
         ],
     },
     "sm_103a": {
@@ -672,8 +1687,26 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
             "cake_causal_conv1d_train_be6f561d1572ef3c852a",
         ],
+        "bwd_bias": [
+            "cake_causal_conv1d_train_64afdc97599db84884cd",
+        ],
+        "bwd_bias_fp32g": [
+            "cake_causal_conv1d_train_4fc0dd753c847bdae996",
+        ],
+        "bwd_dt": [
+            "cake_causal_conv1d_train_386c4447f3f52f0ca2b5",
+        ],
+        "bwd_fp32g": [
+            "cake_causal_conv1d_train_175cef5ba32c07763e9f",
+        ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
+        ],
+        "fwd_bias": [
+            "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        ],
+        "fwd_dt": [
+            "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
         ],
     },
     "sm_107a": {
@@ -683,8 +1716,26 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_be6f561d1572ef3c852a",
             "cake_causal_conv1d_train_aeff6106e2822f313a0c",
         ],
+        "bwd_bias": [
+            "cake_causal_conv1d_train_65ffe261ea0b8bd284f9",
+        ],
+        "bwd_bias_fp32g": [
+            "cake_causal_conv1d_train_00d000bc2a1253f8438d",
+        ],
+        "bwd_dt": [
+            "cake_causal_conv1d_train_5a86d40863a7a43a4553",
+        ],
+        "bwd_fp32g": [
+            "cake_causal_conv1d_train_f7350110926d9e9b9436",
+        ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
+        ],
+        "fwd_bias": [
+            "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        ],
+        "fwd_dt": [
+            "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
         ],
     },
 }
@@ -699,14 +1750,34 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 3): "sm_103a",
     (10, 7): "sm_107a",
 }
-KINDS = ("fwd", "bwd")
+# The routes (``ROUTES[arch]`` keys) a public call may resolve to.  ``fwd`` /
+# ``bwd`` are the default routes (FP32 taps, no bias, SiLU' at the BF16-rounded
+# preactivation); ``_dt`` routes take BF16 taps and / or store a BF16 gradient
+# (the ``flags`` scalar says which), ``_bias`` routes add the per-channel bias
+# and its gradient, ``_fp32g`` routes evaluate SiLU' at the unrounded FP32
+# preactivation for the weight gradient.  :func:`forward_route` and
+# :func:`backward_route` are the host's map from a call's arguments to a route.
+KINDS = (
+    "fwd",
+    "fwd_dt",
+    "fwd_bias",
+    "bwd",
+    "bwd_dt",
+    "bwd_bias",
+    "bwd_fp32g",
+    "bwd_bias_fp32g",
+)
+# The routes every exported architecture ships: the base forward and backward.
+# The other routes are optional per architecture; a call that needs one the
+# architecture lacks is refused with a ``ValueError`` naming the route.
+REQUIRED_KINDS = ("fwd", "bwd")
 # The role of a module record: a forward program, a backward program (the
 # first launch of a backward call) or the reduce program a backward record
 # names in ``record["reduce"]`` (the second launch).
 ROLES = ("fwd", "bwd", "reduce")
 # The grid-rule vocabulary (``record["grid_rule"]["kind"]``, see
 # :func:`launch_grid`): ``co_resident`` launches exactly ``ctas_per_sm x SM
-# count`` CTAs, the co-resident count (the forward's record and the
+# count`` CTAs, the co-resident count (the forward records and the
 # cooperative KCP programs of :mod:`.kcp_jit`, which share this host plan);
 # ``occupancy`` launches ``grid_mult[arch] x ctas_per_sm x SM count`` CTAs
 # normally (the backward programs since the split; ``grid_mult`` names every
@@ -718,6 +1789,15 @@ GRID_KINDS = ("co_resident", "occupancy", "channels_per_cta")
 # threshold runs, a backward record without a rule is its route's fallback and
 # a forward record never carries one.
 SELECT_KINDS = ("channels_at_least",)
+# The ``flags`` bit mask of the ``dtype_flags`` programs (every program of the
+# six round-6 routes): the host derives it from the tap tensor, the ACTUAL
+# ``dweight`` out tensor, the bias tensor and the ACTUAL ``dbias`` out tensor;
+# the kernel reads it once in its prologue (load form) and once in its epilogue
+# (store form).  The default routes' programs take no ``flags``.
+FLAG_W_BF16 = 1  # ``w`` holds BF16 taps (else FP32)
+FLAG_DW_BF16 = 2  # ``dw`` is stored as BF16 (else FP32)
+FLAG_B_BF16 = 4  # ``b`` holds BF16 (else FP32); bias programs
+FLAG_DB_BF16 = 8  # ``db`` is stored as BF16 (else FP32); bias programs
 # The convolution width: ``weight`` and ``dweight`` are ``[C, WIDTH]`` and tap
 # ``WIDTH - 1`` multiplies the current token.
 WIDTH = 4
@@ -738,8 +1818,14 @@ LOGICAL_TENSORS = (
     "dx",
     "dw",
     "partial",
+    "b",
+    "db",
 )
-# The scalars :func:`plan` derives from ``(S, C, num_docs)`` and a geometry.
+# The scalars :func:`plan` produces, in kernel order; ``flags`` (the dtype bit
+# mask of the ``dtype_flags`` programs) and ``main_ctas`` (the CTA count of the
+# selected backward program's launch, ``grid_x``, from which the reduce program
+# derives the partial rows of each channel tile, ``ceil((main_ctas - tile) /
+# n_ch_tiles)``) are set by the host beside them.
 PLAN_SCALARS = (
     "S",
     "C",
@@ -749,11 +1835,7 @@ PLAN_SCALARS = (
     "n_sub",
     "n_ch_tiles",
 )
-# ``main_ctas``, the CTA count of the selected backward program's launch
-# (``grid_x``), tells the reduce program how many partial rows each channel
-# tile holds (``ceil((main_ctas - tile) / n_ch_tiles)``); the host sets it from
-# the grid, not from :func:`plan`.
-LOGICAL_SCALARS = (*PLAN_SCALARS, "main_ctas")
+LOGICAL_SCALARS = (*PLAN_SCALARS, "flags", "main_ctas")
 
 
 def arch_for_capability(device_capability: Sequence[int]) -> str | None:
@@ -774,17 +1856,52 @@ def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
     return kind in ROUTES.get(arch, {})
 
 
-def route_modules(arch: str, kind: str) -> tuple[str, ...]:
-    """Ordered module names of one route on ``arch`` (every program the route may select).
-
-    The forward launches them all, in order; the backward launches the one
-    :func:`selected_modules` picks for the call's channel count, then that
-    record's ``reduce`` program (not listed in the route: the route is the
-    selection, and the reduce program is shared).
-    """
+def route_role(kind: str) -> str:
+    """``"fwd"`` or ``"bwd"``: the kernel a route's programs are built from (``ValueError`` for an unknown route)."""
 
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+    return "fwd" if kind.startswith("fwd") else "bwd"
+
+
+def forward_route(*, bias: bool, bf16_taps: bool) -> str:
+    """The forward route of a call: ``fwd_bias`` with a bias, else ``fwd_dt`` for BF16 taps, else ``fwd``.
+
+    A bias program always has a bias (no runtime switch: adding ``+0.0`` would
+    flip the sign of ``-0.0`` outputs), so ``bias=None`` never selects one; the
+    bias programs read FP32 or BF16 taps and bias through ``flags``.
+    """
+
+    if bias:
+        return "fwd_bias"
+    return "fwd_dt" if bf16_taps else "fwd"
+
+
+def backward_route(*, bias: bool, fp32_grad: bool, bf16_taps_or_dweight: bool) -> str:
+    """The backward route of a call.
+
+    ``bias`` selects ``bwd_bias`` / ``bwd_bias_fp32g`` (by ``fp32_grad``, the
+    ``silu_grad_preactivation="fp32"`` policy); without a bias ``fp32_grad``
+    selects ``bwd_fp32g``; else BF16 taps or a BF16 ``dweight`` out tensor
+    select ``bwd_dt``; else the default ``bwd``.  Every route but ``bwd``
+    reads the tap / gradient dtypes from ``flags``.
+    """
+
+    if bias:
+        return "bwd_bias_fp32g" if fp32_grad else "bwd_bias"
+    if fp32_grad:
+        return "bwd_fp32g"
+    return "bwd_dt" if bf16_taps_or_dweight else "bwd"
+
+
+def route_modules(arch: str, kind: str) -> tuple[str, ...]:
+    """Ordered module names of one route on ``arch`` (every program the route may launch).
+
+    A forward route launches them all, in order; a backward route launches the
+    one :func:`selected_modules` picks for the call's channel count.
+    """
+
+    route_role(kind)
     names = ROUTES.get(arch, {}).get(kind)
     if not names:
         raise ValueError(
@@ -832,22 +1949,23 @@ def _admits(rule: dict[str, Any], *, arch: str, C: int) -> bool:
 def selected_modules(
     arch: str, kind: str, *, C: int, S: int | None = None
 ) -> tuple[str, ...]:
-    """Ordered module names one public call selects on ``arch`` for ``C`` channels.
+    """Ordered module names one public call launches on ``arch`` for ``C`` channels.
 
-    The forward launches every program of its route (:func:`route_modules`).
-    The backward route may carry several programs of the kernel and selects
-    exactly one (the call launches it, then its ``reduce`` program): of the records whose :func:`select_rule` admits ``C`` on
+    A forward route launches every program of its route (:func:`route_modules`).
+    A backward route may carry several programs of the kernel and launches
+    exactly one: of the records whose :func:`select_rule` admits ``C`` on
     ``arch`` the one of the highest threshold, else the route's single fallback
     record (the one without a rule).  The choice is a pure function of the
-    architecture and the channel count -- ``S`` is accepted and unused, and the
-    host never reads the data -- so a given ``(S, C, device)`` always runs the
-    same program and ``dweight`` stays bitwise reproducible.  Two admitting
-    records of one threshold, or zero or several fallbacks, are registry errors
-    (``RuntimeError``); an unknown rule kind is a ``ValueError``.
+    architecture, the route and the channel count -- ``S`` is accepted and
+    unused, and the host never reads the data -- so a given ``(S, C, device)``
+    always runs the same program of a route and ``dweight`` stays bitwise
+    reproducible.  Two admitting records of one threshold, or zero or several
+    fallbacks, are registry errors (``RuntimeError``); an unknown rule kind is
+    a ``ValueError``.
     """
 
     names = route_modules(arch, kind)
-    if kind == "fwd":
+    if route_role(kind) == "fwd":
         return names
     positive: list[tuple[int, str]] = []
     fallback: list[str] = []
@@ -859,8 +1977,8 @@ def selected_modules(
             positive.append((_threshold(rule, arch=arch), name))
     if len(fallback) != 1:
         raise RuntimeError(
-            f"the exported backward route on {arch} declares {len(fallback)} fallback "
-            "programs (records without a select_rule); expected exactly one"
+            f"the exported backward route {kind!r} on {arch} declares {len(fallback)} "
+            "fallback programs (records without a select_rule); expected exactly one"
         )
     if not positive:
         return (fallback[0],)
@@ -868,28 +1986,40 @@ def selected_modules(
     if len(positive) > 1 and positive[0][0] == positive[1][0]:
         tied = [name for threshold, name in positive if threshold == positive[0][0]]
         raise RuntimeError(
-            f"the exported backward route on {arch} selects {len(tied)} programs "
-            f"for C={int(C)} at one threshold {positive[0][0]} ({tied}); thresholds "
-            "must be distinct"
+            f"the exported backward route {kind!r} on {arch} selects {len(tied)} "
+            f"programs for C={int(C)} at one threshold {positive[0][0]} ({tied}); "
+            "thresholds must be distinct"
         )
     return (positive[0][1],)
 
 
-def workspace_owners(arch: str) -> tuple[dict[str, Any], ...]:
-    """The backward module records of ``arch`` that own a ``partial`` workspace, in route order.
+def backward_kinds(arch: str) -> tuple[str, ...]:
+    """The backward routes ``arch`` exports, in :data:`KINDS` order."""
 
-    Every backward program declares a ``workspace_rule``; a route without one
-    is a registry error (``RuntimeError``).
+    return tuple(
+        kind
+        for kind in KINDS
+        if route_role(kind) == "bwd" and ROUTES.get(arch, {}).get(kind)
+    )
+
+
+def workspace_owners(arch: str) -> tuple[dict[str, Any], ...]:
+    """The backward module records of ``arch`` that own a ``partial`` workspace, over every backward route in
+    :data:`KINDS` order, each route in launch order.
+
+    Every backward program declares a ``workspace_rule``; an architecture
+    without one is a registry error (``RuntimeError``).
     """
 
     owners = tuple(
         MODULES[name]
-        for name in route_modules(arch, "bwd")
+        for kind in backward_kinds(arch)
+        for name in route_modules(arch, kind)
         if MODULES[name]["workspace_rule"] is not None
     )
     if not owners:
         raise RuntimeError(
-            f"the exported backward route on {arch} declares no workspace owner; "
+            f"the exported backward routes on {arch} declare no workspace owner; "
             "expected at least one"
         )
     return owners
@@ -898,14 +2028,14 @@ def workspace_owners(arch: str) -> tuple[dict[str, Any], ...]:
 def workspace_record(arch: str) -> dict[str, Any]:
     """The capacity owner of the backward ``partial`` workspace on ``arch``.
 
-    The public workspace serves every backward program of the route
+    The public workspace serves every backward program of every backward route
     (:func:`workspace_owners`), each of which writes the leading rows of its
     own grid.  The owners share one build geometry, so for every ``C`` their
-    rows, ``ceil(grid_mult x ctas_per_sm x SM count / n_ch_tiles)``, and bytes
-    grow with :func:`grid_per_sm` alone: the record with the largest
-    ``grid_mult[arch] x ctas_per_sm`` (route order breaks ties) bounds them
-    all.  Owners of different geometries are a registry error
-    (``RuntimeError``).
+    rows are ``ceil(grid_mult x ctas_per_sm x SM count / n_ch_tiles)`` with
+    one ``n_ch_tiles`` and their bytes ``4 x taps x C x rows``: the record
+    with the largest :func:`grid_per_sm` ``x taps`` (the bias programs' fifth
+    slab counts; :data:`KINDS` then route order break ties) bounds them all.
+    Owners of different geometries are a registry error (``RuntimeError``).
     """
 
     owners = workspace_owners(arch)
@@ -917,7 +2047,12 @@ def workspace_record(arch: str) -> dict[str, Any]:
             f"the backward programs on {arch} declare {len(geometries)} build "
             "geometries; one workspace serves them only when they share one"
         )
-    return max(owners, key=lambda owner: grid_per_sm(owner, arch))
+    return max(
+        owners,
+        key=lambda owner: (
+            grid_per_sm(owner, arch) * int(owner["workspace_rule"]["taps"])
+        ),
+    )
 
 
 def grid_mult(record: dict[str, Any], arch: str) -> int:
@@ -953,12 +2088,30 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-int(numerator) // int(denominator))
 
 
-def channel_split(C: int, *, geometry: dict[str, int]) -> tuple[int, int, int]:
+def channel_split(
+    C: int, *, geometry: dict[str, int], legacy: bool = False
+) -> tuple[int, int, int]:
     """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry.
 
-    ``ct_vec = min(C / vec, threads)`` channel vectors per channel tile (one
-    thread each), ``n_sub = threads // ct_vec`` token sub-tiles per CTA and
-    ``n_ch_tiles = ceil(C / vec / ct_vec)`` channel tiles.
+    ``ct_vec`` channel vectors per channel tile (one thread each), ``n_sub =
+    threads // ct_vec`` token sub-tiles per CTA and ``n_ch_tiles = ceil(C / vec
+    / ct_vec)`` channel tiles.  With ``cv = C / vec`` channel vectors: ``ct_vec
+    = cv`` when ``cv <= threads``; above that, the multiple of 32 dividing
+    ``cv`` (at most ``threads``) with the highest lane use ``ct_vec x (threads
+    // ct_vec)``, the larger ``ct_vec`` on a tie, and ``threads`` when no
+    multiple of 32 divides ``cv``.  So C = 1280 (160 vectors) runs five
+    32-vector tiles with four token sub-tiles each, (32, 4, 5), and C = 1536
+    (64, 2, 3) -- every lane busy -- instead of two 128-vector tiles at 62 % /
+    75 % lane use; C <= 1024 and 2048 / 4096 / 8192 are unchanged; C = 1344
+    (168 vectors, no divisor) keeps the legacy form (128, 1, 2).  The per
+    element arithmetic does not depend on the tiling, so ``y`` and ``dx`` are
+    bitwise the legacy plan's; ``dweight``'s fixed summation order follows the
+    tiling, so its bits differ from the legacy plan's (both are reproducible).
+    ``legacy=True`` is the rule the package shipped before round 6, ``ct_vec =
+    min(cv, threads)``; the KCP path keeps it (its kernels pick the grouped
+    path from ``ct_vec`` on the device and are measured under this rule).
+    This function is one of four copies kept in sync (the two tart kernel
+    modules, the kernel-tests reference and this one).
     """
 
     C = int(C)
@@ -967,27 +2120,43 @@ def channel_split(C: int, *, geometry: dict[str, int]) -> tuple[int, int, int]:
     if C <= 0 or C % vec:
         raise ValueError(f"C={C} must be a positive multiple of {vec}")
     channel_vectors = C // vec
-    ct_vec = min(channel_vectors, threads)
+    if legacy or channel_vectors <= threads:
+        ct_vec = min(channel_vectors, threads)
+    else:
+        candidates = [
+            width
+            for width in range(32, threads + 1, 32)
+            if channel_vectors % width == 0
+        ]
+        ct_vec = (
+            max(candidates, key=lambda width: (width * (threads // width), width))
+            if candidates
+            else threads
+        )
     return ct_vec, threads // ct_vec, _ceil_div(channel_vectors, ct_vec)
 
 
-def plan(S: int, C: int, num_docs: int, *, geometry: dict[str, int]) -> dict[str, int]:
+def plan(
+    S: int, C: int, num_docs: int, *, geometry: dict[str, int], legacy: bool = False
+) -> dict[str, int]:
     """The kernel's launch scalars for one problem under a record's build geometry.
 
     ``geometry`` is ``record["grid_rule"]["geometry"]``: ``threads`` per CTA
     and ``vec`` BF16 channels per thread.  The scalars are ``S``, ``C``,
     ``num_docs``, :func:`channel_split`'s ``ct_vec`` / ``n_sub`` /
-    ``n_ch_tiles`` and ``search_steps``, the number of halvings of the
-    device-side binary search over ``cu_seqlens`` (``max(1, ceil(log2
-    num_docs))``).  Every value is a pure function of ``(S, C, num_docs)`` and
-    the geometry: the host never reads ``cu_seqlens``, and the kernel derives
-    its token ranges from ``S`` and the grid.
+    ``n_ch_tiles`` (``legacy`` is passed on) and ``search_steps``, the number
+    of halvings of the device-side binary search over ``cu_seqlens`` (``max(1,
+    ceil(log2 num_docs))``).  Every value is a pure function of ``(S, C,
+    num_docs)`` and the geometry: the host never reads ``cu_seqlens``, and the
+    kernel derives its token ranges from ``S`` and the grid.  The ``flags``
+    scalar of the ``dtype_flags`` programs is not a plan value: the host
+    derives it from the tensors of the call.
     """
 
     S, C, num_docs = int(S), int(C), int(num_docs)
     if S < 0 or num_docs < 0:
         raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
-    ct_vec, n_sub, n_ch_tiles = channel_split(C, geometry=geometry)
+    ct_vec, n_sub, n_ch_tiles = channel_split(C, geometry=geometry, legacy=legacy)
     return {
         "S": S,
         "C": C,
@@ -1056,7 +2225,12 @@ def partial_rows(grid_x: int, n_ch_tiles: int) -> int:
 
 
 def partial_bytes(record: dict[str, Any], C: int, rows: int) -> int:
-    """Bytes of ``rows`` FP32 ``[C, taps]`` partial rows of the module's workspace rule."""
+    """Bytes of ``rows`` FP32 ``[C, taps]`` partial rows of the module's workspace rule.
+
+    ``taps`` is 4 for the dweight partials; a bias program's rule says 5: its
+    kernel lays the ``[rows, C, 4]`` tap slab out first and the ``[rows, C]``
+    dbias slab after it (the host view is capacity only).
+    """
 
     rule = record["workspace_rule"]
     if rule is None or rule["kind"] != "partial_rows":
@@ -1070,12 +2244,12 @@ def workspace_layout(
     """Byte layout of the caller-owned backward workspace of one module for ``C`` channels.
 
     The workspace is one CUDA ``uint8`` buffer holding the FP32 ``[rows, C, taps]``
-    ``dweight`` partials, ``rows = partial_rows(grid, n_ch_tiles)`` for the
-    device's launch grid (``grid_mult x ctas_per_sm x SM count``: the bytes
-    grow with the record's ``grid_mult``); it depends on ``C`` and the device
-    only, so one buffer serves every token count.  The kernel fully writes
-    the rows its reduce program sums, so nothing is zeroed between launches
-    or CUDA Graph replays.
+    ``dweight`` (and, ``taps`` 5, dbias) partials, ``rows = partial_rows(grid,
+    n_ch_tiles)`` for the device's launch grid (``grid_mult x ctas_per_sm x SM
+    count``: the bytes grow with the record's ``grid_mult``); it depends on
+    ``C`` and the device only, so one buffer serves every token count.  The
+    kernel fully writes the rows its reduce program sums, so nothing is zeroed
+    between launches or CUDA Graph replays.
     """
 
     grid_x = launch_grid(record, device_index=device_index)[0]
@@ -1171,6 +2345,10 @@ __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "CHANNEL_MULTIPLE",
+    "FLAG_B_BF16",
+    "FLAG_DB_BF16",
+    "FLAG_DW_BF16",
+    "FLAG_W_BF16",
     "GRID_KINDS",
     "INT32_MAX",
     "KINDS",
@@ -1178,13 +2356,17 @@ __all__ = [
     "LOGICAL_TENSORS",
     "MODULES",
     "PLAN_SCALARS",
+    "REQUIRED_KINDS",
     "ROLES",
     "ROUTES",
     "SELECT_KINDS",
     "WIDTH",
     "arch_for_capability",
+    "backward_kinds",
+    "backward_route",
     "channel_split",
     "device_arch",
+    "forward_route",
     "grid_mult",
     "grid_per_sm",
     "launch_grid",
@@ -1195,6 +2377,7 @@ __all__ = [
     "plan",
     "route_applies",
     "route_modules",
+    "route_role",
     "run_module",
     "select_rule",
     "selected_modules",
