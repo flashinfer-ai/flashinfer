@@ -4983,7 +4983,7 @@ def _small_m_variants(m: int, k: int, rank: int) -> list[int]:
         for variant, (family, _, _) in enumerate(
             routes.sm120_producer_variants(m, k, rank)
         )
-        if family == routes.SM120_FAMILY_SMALL_M
+        if family in (routes.SM120_FAMILY_SMALL_M, routes.SM120_FAMILY_SMALL_M_SPLIT)
     ]
 
 
@@ -4995,10 +4995,10 @@ def _small_m_variants(m: int, k: int, rank: int) -> list[int]:
         for variant in range(routes.sm120_producer_variant_count(m, k, 64))
     ]
     # Rank 128's large-M and warp-specialized families are covered by the
-    # complete-linear tests; every small-M tiling is swept here.
+    # complete-linear tests; every small-M and split-K small-M tiling is swept here.
     + [
         (128, m, k, variant)
-        for m, k in [(64, 3072), (537, 7168), (1024, 1536)]
+        for m, k in [(64, 3072), (537, 7168), (1024, 1536), (64, 11008), (200, 4096)]
         for variant in _small_m_variants(m, k, 128)
     ],
 )

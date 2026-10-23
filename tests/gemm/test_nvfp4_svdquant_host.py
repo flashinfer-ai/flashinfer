@@ -1847,12 +1847,20 @@ def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None
     variants = routes.sm120_producer_variants(m, k, 128)
     families = [family for family, _, _ in variants]
     small = families.index(routes.SM120_FAMILY_SMALL_M)
-    # Appended last, so the large-M and warp-specialized indices keep their meaning.
+    split = (
+        families.index(routes.SM120_FAMILY_SMALL_M_SPLIT)
+        if routes.SM120_FAMILY_SMALL_M_SPLIT in families
+        else len(families)
+    )
+    # Appended last, so the large-M and warp-specialized indices keep their meaning;
+    # the split-K small-M family follows every small-M variant for the same reason.
     assert set(families[:small]) == {
         routes.SM120_FAMILY_LARGE_M,
         routes.SM120_FAMILY_WS_RANK128,
     }
-    assert set(families[small:]) == {routes.SM120_FAMILY_SMALL_M}
+    assert set(families[small:split]) == {routes.SM120_FAMILY_SMALL_M}
+    assert set(families[split:]) <= {routes.SM120_FAMILY_SMALL_M_SPLIT}
+    assert (split < len(families)) == (m <= routes.SM120_SMALL_M_SPLIT_MAX_M)
     for variant in range(small, len(variants)):
         assert (
             routes.sm120_decode_producer_variant(m, k, variant, 128)
@@ -1861,16 +1869,20 @@ def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None
         # Every rank-128 producer, small-M included, reads K-major L2T.
         assert routes.sm120_variant_reads_kmajor_l2t(m, k, variant, 128)
         assert not routes.sm120_variant_packs_l2t(m, k, variant, 128)
-    # Each small-M tiling appears under policy 0 and then, appended after all of
-    # them, under policy 1 (the GEMM launches once the quantize half is done).
-    small_variants = variants[small:]
-    early = [tiling for _, tiling, policy in small_variants if policy == 0]
-    deferred = [tiling for _, tiling, policy in small_variants if policy == 1]
-    assert early and deferred == early
-    assert [policy for _, _, policy in small_variants] == [0] * len(early) + [1] * len(
-        deferred
-    )
-    assert routes.sm120_linear_route_abi_version(m, k, 128) == 15
+    # Each small-M (and split-K small-M) tiling appears under policy 0 and then,
+    # appended after all of them, under policy 1 (the GEMM launches once the
+    # quantize half is done).
+    for begin, end in ((small, split), (split, len(variants))):
+        family_variants = variants[begin:end]
+        if not family_variants:
+            continue
+        early = [tiling for _, tiling, policy in family_variants if policy == 0]
+        deferred = [tiling for _, tiling, policy in family_variants if policy == 1]
+        assert early and deferred == early
+        assert [policy for _, _, policy in family_variants] == [0] * len(early) + [
+            1
+        ] * len(deferred)
+    assert routes.sm120_linear_route_abi_version(m, k, 128) == 16
 
 
 # Workspace provisioning and cached tactic feasibility.
