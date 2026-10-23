@@ -180,8 +180,7 @@ class TmemPResource(MlaResource):
                     else:
                         scaled01 = fadd2(
                             fmul2(
-                                (s_arr[s_base + 0], s_arr[s_base + 1]),
-                                log2_scale_pair,
+                                (s_arr[s_base + 0], s_arr[s_base + 1]), log2_scale_pair
                             ),
                             neg_scaled_pair,
                         )
@@ -194,8 +193,7 @@ class TmemPResource(MlaResource):
                     else:
                         scaled23 = fadd2(
                             fmul2(
-                                (s_arr[s_base + 2], s_arr[s_base + 3]),
-                                log2_scale_pair,
+                                (s_arr[s_base + 2], s_arr[s_base + 3]), log2_scale_pair
                             ),
                             neg_scaled_pair,
                         )

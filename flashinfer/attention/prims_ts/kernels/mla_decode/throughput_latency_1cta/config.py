@@ -1904,11 +1904,10 @@ def configure_sparse_mla(
             if balanced
             else cfg.scheduler_regs,
         )
-    cfg = dataclass_replace(
+    return dataclass_replace(
         cfg,
         **roles,
         kv_stages=kv_stages,
         page_offsets_stages=page_stages,
         q_stages=1 if single or (reuse and profile.reuse_kv_stages) else cfg.q_stages,
     )
-    return cfg
