@@ -1212,7 +1212,11 @@ class ArmCakeNope:
 
     def backward_chunks(self, st):
         """Eager backward over the query chunks into one accumulate buffer (``None`` when the
-        eager NoPE entries are not available)."""
+        eager NoPE entries are not available).  The eager forward and the per-chunk global
+        rows and lengths are prepared once, on the first call: the timed region is the
+        chunked backward alone, so that a package whose torch glue does more per call (the
+        compacting glue of #7041) is compared on its kernels; the glue's own cost is the
+        index-glue table."""
         fwd = getattr(cake_backend, "forward_nope", None)
         bwd = getattr(cake_backend, "backward_nope", None)
         if fwd is None or bwd is None:
@@ -1223,15 +1227,16 @@ class ArmCakeNope:
             out, lse, o_lo = fwd(
                 inp.q, inp.kv, idx, topk_length=length, softmax_scale=DEFAULT_NOPE_SCALE
             )
-            self.eager = dict(
-                out=out, lse=lse, o_lo=o_lo, bounds=_chunk_bounds(inp, self.chunk)
-            )
+            chunks = []
+            for q0, q1, cu_q, cu_k, segments in _chunk_bounds(inp, self.chunk):
+                idx_c, len_c = _globalize(inp.idx_local[q0:q1], cu_q, cu_k)
+                chunks.append((q0, q1, idx_c, len_c, segments))
+            self.eager = dict(out=out, lse=lse, o_lo=o_lo, chunks=chunks)
         e = self.eager
         dkv_acc = torch.zeros(
             inp.total_k, D_LATENT, dtype=torch.float32, device=inp.q.device
         )
-        for q0, q1, cu_q, cu_k, segments in e["bounds"]:
-            idx_c, len_c = _globalize(inp.idx_local[q0:q1], cu_q, cu_k)
+        for q0, q1, idx_c, len_c, segments in e["chunks"]:
             bwd(
                 inp.q[q0:q1],
                 inp.kv,
