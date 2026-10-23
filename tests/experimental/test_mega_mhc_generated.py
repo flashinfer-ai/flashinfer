@@ -734,3 +734,49 @@ def test_h4096_shared_launch_epochs_must_launch_the_same_grid():
     gc.collect()
     big = prepare_mega_mhc(**inputs_h4096(4096), sf_layout="bf16", launch_epochs=epochs)
     assert big.launch_epochs is epochs
+
+
+def test_h4096_a_plans_own_launch_epochs_is_guarded_like_a_caller_owned_one():
+    """A plan's internally allocated ``launch_epochs`` handed to a second plan is
+    refused with another grid and shared with the same grid, exactly as a
+    caller-owned tensor: every plan registers its epoch storage."""
+    _skip_unless_exported(4096, "bf16")
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    first = prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16")
+    grid = first.config["num_launch_sms"]
+    assert grid < sms
+    with pytest.raises(
+        ValueError, match=f"launching {grid} CTAs; this plan launches {sms}"
+    ):
+        prepare_mega_mhc(
+            **inputs_h4096(4096), sf_layout="bf16", launch_epochs=first.launch_epochs
+        )
+    same = prepare_mega_mhc(
+        **inputs_h4096(64), sf_layout="bf16", launch_epochs=first.launch_epochs
+    )
+    assert same.launch_epochs is first.launch_epochs
+    for plan in (first, same):
+        plan.run()
+    torch.cuda.synchronize()
+    counts = first.launch_epochs.cpu().tolist()
+    assert counts[:grid] == [2] * grid and counts[grid:] == [0] * (sms - grid)
+
+
+def test_h4096_launch_epochs_must_own_its_whole_storage():
+    """A caller-owned ``launch_epochs`` that is a sliced or offset view of a larger
+    storage is refused (two views of overlapping memory would carry different
+    registry keys); a tensor owning its whole storage is accepted."""
+    _skip_unless_exported(4096, "bf16")
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    storage = torch.zeros((sms + 8,), dtype=torch.uint64, device="cuda")
+    for view in (storage[8:], storage[:sms]):
+        assert view.shape == (sms,)
+        with pytest.raises(ValueError, match="must own its whole storage"):
+            prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16", launch_epochs=view)
+    whole = torch.zeros((sms,), dtype=torch.uint64, device="cuda")
+    plan = prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16", launch_epochs=whole)
+    assert plan.launch_epochs is whole
+    plan.run()
+    torch.cuda.synchronize()
+    grid = plan.config["num_launch_sms"]
+    assert whole.cpu().tolist()[:grid] == [1] * grid
