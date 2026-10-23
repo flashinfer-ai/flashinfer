@@ -790,10 +790,12 @@ class _MHCTrainState:
     ``grad_stats`` (written by the finish node's backward, read by the prepare
     node's backward) and, transiently, ``stats``: between the prepare and the
     finish forward, and as the replay cache of the backward under
-    ``save_stats=False``.  Nothing the forward produced stays on the handle once
-    the finish forward has run: ``stats`` travels through ``save_for_backward``
-    like the inputs, so an activation checkpoint (non-reentrant
-    ``torch.utils.checkpoint``) keeps no tensor of the layer alive.
+    ``save_stats=False`` or of a finish forward rerun by a checkpoint region
+    that starts after the prepare.  Nothing the forward produced stays on the
+    handle once the finish forward has run: ``stats`` travels through
+    ``save_for_backward`` like the inputs, so an activation checkpoint
+    (non-reentrant ``torch.utils.checkpoint``) keeps no tensor of the layer
+    alive.
     """
 
     __slots__ = (
@@ -917,17 +919,23 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
 
     Its backward is ``backward_prepare``: it returns ``dB`` for the external
     branch and leaves ``dY`` and the gradient statistics in the shared state for
-    the prepare node, which runs after the branch backward.
+    the prepare node, which runs after the branch backward.  When a checkpoint
+    region that starts after the prepare reruns this forward, the statistics
+    the handle already released are replayed bitwise from ``X``.
     """
 
     @staticmethod
     def forward(ctx, X, B, state):
         stats = state.stats
         if stats is None:
-            raise RuntimeError(
-                "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare "
-                "(one finish per prepare)"
-            )
+            if state.fn is None:
+                raise RuntimeError(
+                    "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare"
+                )
+            # Replay: a checkpoint region that starts after the prepare reruns the
+            # finish on a handle that already released its statistics; recompute
+            # them bitwise from ``X`` (released again below).
+            stats = state.statistics(X)
         Y = cake_mhc_train_forward_finish(X, B, stats)
         if state.save_stats:
             ctx.save_for_backward(X, B, stats)
