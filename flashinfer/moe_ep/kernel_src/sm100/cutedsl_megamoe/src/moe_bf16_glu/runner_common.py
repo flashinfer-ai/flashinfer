@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from typing import Tuple
 
-from moe_nvfp4_swapab.runner_fc12_common import ImplDesc
+from ..moe_nvfp4_swapab.runner_fc12_common import ImplDesc
 
 
 @dataclass

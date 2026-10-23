@@ -10,13 +10,6 @@ that FlashInfer ``moe_ep`` consumes.
 
 from __future__ import annotations
 
-# The per-dtype modules import the raw kernel packages (moe_nvfp4_swapab,
-# common, ...) at module load, so ``src/`` must be on sys.path first.  The
-# bootstrap lives here in shim/ (not in src/, which is a verbatim kernel drop).
-from ._paths import bootstrap_paths
-
-bootstrap_paths()
-
 
 def _check_dsl_perf_floor() -> None:
     """Warn once if the installed CuTe-DSL predates the 4.5.2 perf floor.
@@ -167,8 +160,6 @@ from .quant_stage import (
 from .knob_cache import knob_cache_path, lookup_knobs, record_knobs, resolve_knobs
 
 __all__ = [
-    # paths
-    "bootstrap_paths",
     # quant_stage
     "forget_staged_tokens",
     "fused_quant_stage",

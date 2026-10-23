@@ -47,7 +47,7 @@ from .ptx_helpers import (
 from .flag_batch import GpuReleaseFlagBatchTracker
 from .sf_swizzle import sf_atom_int32_offset
 from cutlass._mlir import ir
-from moe_nvfp4_swapab.moe_utils import _nanosleep, spin_wait
+from ..moe_nvfp4_swapab.moe_utils import _nanosleep, spin_wait
 
 
 # ---------------------------------------------------------------------------

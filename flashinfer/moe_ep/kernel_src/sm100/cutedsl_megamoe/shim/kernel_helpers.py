@@ -24,9 +24,9 @@ from __future__ import annotations
 import importlib
 
 # --- eager: light, import-safe (no cutlass/nvshmem pulled at module load) ---
-from common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32
-from common.megamoe_constants import Mxfp8BlockSize, Nvfp4BlockSize
-from moe_nvfp4_swapab.runner_common import (
+from ..src.common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32
+from ..src.common.megamoe_constants import Mxfp8BlockSize, Nvfp4BlockSize
+from ..src.moe_nvfp4_swapab.runner_common import (
     Mxfp8ScaleDtype,
     _stack_byte_reinterpretable_tensors,
     ceil_div,
@@ -116,7 +116,7 @@ def __getattr__(name):  # PEP 562: keep cutlass out of the import-time path
         module, attr = _LAZY[name]
     except KeyError:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
-    return getattr(importlib.import_module(module), attr)
+    return getattr(importlib.import_module(f"..src.{module}", __package__), attr)
 
 
 __all__ = [

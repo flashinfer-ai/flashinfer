@@ -11,8 +11,9 @@
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../../../.." && pwd -P)"
 RUNNER="${SCRIPT_DIR}/runner_fc12.py"
+RUNNER_MODULE="flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.moe_mxfp8_bf16_glu.runner_fc12"
 PYTHON="${PYTHON:-${SCRIPT_DIR}/../../venv/bin/python}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -100,12 +101,12 @@ for entry in "${TESTS[@]}"; do
     echo
     echo "==========================================================================="
     echo "[TEST] $name"
-    echo "[CMD]  $PYTHON $RUNNER $args"
+    echo "[CMD]  $PYTHON -m $RUNNER_MODULE $args"
     echo "==========================================================================="
 
     test_start=$SECONDS
     # shellcheck disable=SC2086
-    "$PYTHON" "$RUNNER" $args
+    "$PYTHON" -m "$RUNNER_MODULE" $args
     rc=$?
     elapsed=$((SECONDS - test_start))
 

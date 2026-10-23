@@ -10,8 +10,8 @@ from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import Int32
 from cutlass._mlir import ir
 
-from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
-from moe_nvfp4_swapab.moe_utils import rewrite_tensor_shape
+from ..moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
+from ..moe_nvfp4_swapab.moe_utils import rewrite_tensor_shape
 
 
 class GluBf16Fc12SchedExtension(GluMxFp8Fc12SchedExtension):

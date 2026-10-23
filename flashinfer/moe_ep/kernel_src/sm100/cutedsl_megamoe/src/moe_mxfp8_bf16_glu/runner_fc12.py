@@ -17,11 +17,11 @@ from typing import List, Literal, Optional, Tuple
 
 import torch
 
-from common.host_utils import mxfp8_quantize_per_block_32_row
-from moe_bf16_glu.runner_common import TrainingImplDesc
-from moe_bf16_glu.runner_fc12 import SwigluBf16Fc12Tester
-from moe_nvfp4_swapab.runner_common import assemble_raw_scales_stacked_expert
-from moe_nvfp4_swapab.runner_fc12_common import (
+from ..common.host_utils import mxfp8_quantize_per_block_32_row
+from ..moe_bf16_glu.runner_common import TrainingImplDesc
+from ..moe_bf16_glu.runner_fc12 import SwigluBf16Fc12Tester
+from ..moe_nvfp4_swapab.runner_common import assemble_raw_scales_stacked_expert
+from ..moe_nvfp4_swapab.runner_fc12_common import (
     Fc12TesterBase,
     MiscDesc,
     ProblemDesc,
@@ -241,7 +241,7 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
 
     @property
     def _epilogue_token_tile(self) -> int:
-        from moe_mxfp8_bf16_glu.epilogue_mxfp8_bf16 import (
+        from .epilogue_mxfp8_bf16 import (
             EpilogueTokenTile,
         )
 
@@ -405,7 +405,7 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
     def _instantiate_kernel(self, common_kwargs: dict):
         import cutlass
 
-        from moe_mxfp8_bf16_glu.kernel_mxfp8_bf16_glu_fc12 import (
+        from .kernel_mxfp8_bf16_glu_fc12 import (
             Sm100SwapABMxfp8Bf16Fc12Kernel,
         )
 
@@ -447,14 +447,14 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
             return
         self._validate_host_tensor_contracts()
 
-        from moe_bf16_glu.mega_reference_bf16 import (
+        from ..moe_bf16_glu.mega_reference_bf16 import (
             _DenseGemmReferenceLauncher,
             reference_expert_fc12,
         )
-        from moe_mxfp8_bf16_glu.mega_reference_mxfp8_bf16 import (
+        from .mega_reference_mxfp8_bf16 import (
             mxfp8_weight_from_swizzled_to_bf16,
         )
-        from moe_mxfp8_bf16_glu.epilogue_mxfp8_bf16 import (
+        from .epilogue_mxfp8_bf16 import (
             Fc1GateUpInterleave,
         )
 

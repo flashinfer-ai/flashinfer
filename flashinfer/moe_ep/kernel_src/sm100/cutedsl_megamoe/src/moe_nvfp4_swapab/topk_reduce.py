@@ -31,8 +31,8 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import Float32, Int32, T
 from cutlass._mlir.dialects import llvm
 
-from common.megamoe_constants import Nvfp4E2M1RcpLimit
-from src.token_comm import CombineFormat
+from ..common.megamoe_constants import Nvfp4E2M1RcpLimit
+from ..src.token_comm import CombineFormat
 
 
 # ---------------------------------------------------------------------------

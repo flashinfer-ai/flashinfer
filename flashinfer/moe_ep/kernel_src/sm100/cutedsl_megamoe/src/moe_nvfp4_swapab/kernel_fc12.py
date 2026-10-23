@@ -15,7 +15,7 @@ cute_dsl_version = Version(cutlass.__version__)
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -32,15 +32,15 @@ from .fc1_fc2_fuse_sched import (
     MoEFusedFc12SchedulerParams,
 )
 from .custom_ext import SwapABSwigluFp4Fc12SchedExtension
-from common.megamoe_constants import (
+from ..common.megamoe_constants import (
     Nvfp4BlockSize,
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
-from common.host_utils import get_cutedsl_target_arch
+from ..common.host_utils import get_cutedsl_target_arch
 from .moe_utils import spin_wait
 from . import dynamic_mainloop
-from src.token_comm import CombineFormat
+from ..src.token_comm import CombineFormat
 
 
 # token_comm_args is an opaque subclass-owned bundle.  The base only forwards it

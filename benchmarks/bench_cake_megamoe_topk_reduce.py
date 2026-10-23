@@ -145,13 +145,10 @@ def _make_vendored_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim._paths import (
-            bootstrap_paths,
+        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+            CombineFormat,
+            TopkReduce,
         )
-
-        bootstrap_paths()
-        from moe_nvfp4_swapab.topk_reduce import TopkReduce
-        from src.token_comm import CombineFormat
     except Exception as error:
         raise RuntimeError(
             f"vendored CuTeDSL baseline {_CUTEDSL_SOURCE} is unavailable; "

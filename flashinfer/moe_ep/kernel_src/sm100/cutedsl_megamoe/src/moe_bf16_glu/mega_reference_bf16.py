@@ -23,9 +23,9 @@ from typing import Literal, Optional, Tuple, Type, Union, Any
 import torch
 import cutlass
 
-from common.host_utils import get_cutedsl_target_arch
-from moe_nvfp4_swapab.runner_common import swiglu_fold_interleave
-from moe_bf16_glu.epilogue_bf16 import Fc1GateUpInterleave
+from ..common.host_utils import get_cutedsl_target_arch
+from ..moe_nvfp4_swapab.runner_common import swiglu_fold_interleave
+from .epilogue_bf16 import Fc1GateUpInterleave
 
 
 def reference_expert_fc12(
@@ -1476,7 +1476,7 @@ class PersistentDenseGemmKernel:
         return True
 
 
-from moe_nvfp4_swapab.mega_reference import _to_cute_tensor
+from ..moe_nvfp4_swapab.mega_reference import _to_cute_tensor
 
 
 class _DenseGemmReferenceLauncher:

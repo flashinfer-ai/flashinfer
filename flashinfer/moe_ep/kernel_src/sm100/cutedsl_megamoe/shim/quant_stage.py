@@ -57,7 +57,7 @@ def _int32_routing_stager_class():
     """Adapt routing stores for GenPhase without changing the vendored kernel."""
     import cutlass
     import cutlass.cute as cute
-    from src.inputs_process import DataPreprocess
+    from ..src.src.inputs_process import DataPreprocess
 
     class Int32RoutingDataPreprocess(DataPreprocess):
         @cute.jit
@@ -237,7 +237,7 @@ def fused_quant_stage(
     stager = _STAGERS.get(key)
     if stager is None:
         ensure_not_capturing("fused staging construction")
-        from src.inputs_process import DataPreprocess
+        from ..src.src.inputs_process import DataPreprocess
 
         stager_class = (
             _int32_routing_stager_class()

@@ -192,7 +192,7 @@ class MegaMoEBf16Frontend:
         self._release_workspace()
         import cutlass
         import cutlass.cute as cute
-        from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
+        from ..src.moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
 
         c = self.config
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
@@ -254,7 +254,7 @@ class MegaMoEBf16Frontend:
 
     def _runtime_kwargs(self, inputs: MegaMoEBf16Inputs, mega: _CompiledMega) -> dict:
         import cuda.bindings.driver as cuda
-        from src.sym_buffer import SymBufferHost
+        from ..src.src.sym_buffer import SymBufferHost
 
         c = self.config
         mapper = SymBufferHost(

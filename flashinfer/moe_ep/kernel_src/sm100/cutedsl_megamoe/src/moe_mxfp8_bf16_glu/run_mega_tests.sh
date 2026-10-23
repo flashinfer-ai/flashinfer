@@ -12,8 +12,9 @@
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../../../.." && pwd -P)"
 RUNNER="${SCRIPT_DIR}/mega_runner.py"
+RUNNER_MODULE="flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.moe_mxfp8_bf16_glu.mega_runner"
 PYTHON="${PYTHON:-${SCRIPT_DIR}/../../venv/bin/python}"
 TORCHRUN="${TORCHRUN:-$(dirname -- "$PYTHON")/torchrun}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -143,13 +144,13 @@ for entry in "${TESTS[@]}"; do
     echo "[TEST] $name"
     case "$mode" in
         single)
-            echo "[CMD]  MEGA_NO_DIST=1 $PYTHON $RUNNER $args"
+            echo "[CMD]  MEGA_NO_DIST=1 $PYTHON -m $RUNNER_MODULE $args"
             ;;
         multi)
             if [ "$MEGA_NNODES" -gt 1 ]; then
-                echo "[CMD]  $TORCHRUN --nnodes=$MEGA_NNODES --node_rank=$MEGA_NODE_RANK --nproc_per_node=$NPROC --master_addr=$MEGA_MASTER_ADDR --master_port=$MEGA_MASTER_PORT $RUNNER $args"
+                echo "[CMD]  $TORCHRUN --nnodes=$MEGA_NNODES --node_rank=$MEGA_NODE_RANK --nproc_per_node=$NPROC --master_addr=$MEGA_MASTER_ADDR --master_port=$MEGA_MASTER_PORT --module $RUNNER_MODULE $args"
             else
-                echo "[CMD]  $TORCHRUN --nproc_per_node=$NPROC $RUNNER $args"
+                echo "[CMD]  $TORCHRUN --nproc_per_node=$NPROC --module $RUNNER_MODULE $args"
             fi
             ;;
         *)
@@ -162,7 +163,7 @@ for entry in "${TESTS[@]}"; do
     test_start=$SECONDS
     # shellcheck disable=SC2086
     if [ "$mode" = "single" ]; then
-        timeout 300 env MEGA_NO_DIST=1 "$PYTHON" "$RUNNER" $args
+        timeout 300 env MEGA_NO_DIST=1 "$PYTHON" -m "$RUNNER_MODULE" $args
     elif [ "$MEGA_NNODES" -gt 1 ]; then
         timeout 300 "$TORCHRUN" \
             --nnodes="$MEGA_NNODES" \
@@ -170,9 +171,9 @@ for entry in "${TESTS[@]}"; do
             --nproc_per_node="$NPROC" \
             --master_addr="$MEGA_MASTER_ADDR" \
             --master_port="$MEGA_MASTER_PORT" \
-            "$RUNNER" $args
+            --module "$RUNNER_MODULE" $args
     else
-        timeout 300 "$TORCHRUN" --nproc_per_node="$NPROC" "$RUNNER" $args
+        timeout 300 "$TORCHRUN" --nproc_per_node="$NPROC" --module "$RUNNER_MODULE" $args
     fi
     rc=$?
     elapsed=$((SECONDS - test_start))

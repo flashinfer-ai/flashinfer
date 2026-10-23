@@ -30,7 +30,7 @@ import cutlass.cute as cute
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover - older/newer CuTeDSL API location
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 from cutlass.cute.typing import AddressSpace
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -42,21 +42,21 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir.dialects import vector as mlir_vector
 
-from common.host_utils import get_cutedsl_target_arch
-from moe_mxfp8_bf16_glu.epilogue_mxfp8_bf16 import (
+from ..common.host_utils import get_cutedsl_target_arch
+from .epilogue_mxfp8_bf16 import (
     Fc1GateUpInterleave,
     MixedGluBf16Epilogue,
 )
-from moe_nvfp4_swapab.custom_ext import (
+from ..moe_nvfp4_swapab.custom_ext import (
     SwapABSwigluFp4Fc12SchedExtension,
     SwapABSwigluFp4Fc12WorkTileInfo,
 )
-from moe_nvfp4_swapab.epilogue_refactor import NvFp4OptinalEpiArgs
-from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
+from ..moe_nvfp4_swapab.epilogue_refactor import NvFp4OptinalEpiArgs
+from ..moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
     MoEFusedFc12SchedulerParams,
 )
-from moe_nvfp4_swapab.moe_utils import spin_wait
+from ..moe_nvfp4_swapab.moe_utils import spin_wait
 
 
 def _scale_partition_mxfp8(

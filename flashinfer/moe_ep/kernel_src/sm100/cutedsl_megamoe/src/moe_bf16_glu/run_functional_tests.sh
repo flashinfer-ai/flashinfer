@@ -45,8 +45,11 @@ export LDFLAGS="-B/usr/bin -fuse-ld=bfd"
 set -u  # fail on undefined vars; do NOT set -e (we want to continue on failures)
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../../../.." && pwd -P)"
 RUNNER="${SCRIPT_DIR}/runner_fc12.py"
+RUNNER_MODULE="flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.moe_bf16_glu.runner_fc12"
 PYTHON="${PYTHON:-python}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [ ! -f "$RUNNER" ]; then
     echo "ERROR: runner_fc12.py not found at ${RUNNER}" >&2
@@ -149,12 +152,12 @@ for entry in "${TESTS[@]}"; do
     echo
     echo "==========================================================================="
     echo "[TEST] $name"
-    echo "[CMD]  $PYTHON $RUNNER $args"
+    echo "[CMD]  $PYTHON -m $RUNNER_MODULE $args"
     echo "==========================================================================="
 
     test_start=$SECONDS
     # shellcheck disable=SC2086  # intentional word-splitting on $args
-    "$PYTHON" "$RUNNER" $args
+    "$PYTHON" -m "$RUNNER_MODULE" $args
     rc=$?
     elapsed=$((SECONDS - test_start))
 

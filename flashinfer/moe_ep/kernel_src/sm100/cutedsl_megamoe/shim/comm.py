@@ -47,7 +47,7 @@ def finalize_dist() -> None:
 
     if _no_dist() or not dist.is_initialized():
         return
-    from src.bootstrap import finalize_dist_and_nvshmem
+    from ..src.src.bootstrap import finalize_dist_and_nvshmem
 
     finalize_dist_and_nvshmem()
 
@@ -90,7 +90,7 @@ def bootstrap_dist():
         dev.set_current()
         return 0, 0, 1, dev
 
-    from src.bootstrap import init_dist_and_nvshmem
+    from ..src.src.bootstrap import init_dist_and_nvshmem
 
     return init_dist_and_nvshmem()
 

@@ -22,8 +22,8 @@ from .comm import (
     resolve_gate_up_clamp,
     sym_zeros,
 )
-from common.megamoe_constants import Mxfp8BlockSize
-from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+from ..src.common.megamoe_constants import Mxfp8BlockSize
+from ..src.moe_nvfp4_swapab.runner_common import ceil_div, round_up
 
 _KIND_TO_TORCH_DTYPE = {
     "mxfp8_e4m3": torch.float8_e4m3fn,
@@ -382,9 +382,9 @@ class MegaMoEMxfp8Frontend:
 
         import cutlass.cute as cute
 
-        from common.megamoe_constants import Mxfp8BlockSize, SfPaddingBlock
-        from moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel
-        from moe_nvfp4_swapab.epilogue import EpilogueTokenTile
+        from ..src.common.megamoe_constants import Mxfp8BlockSize, SfPaddingBlock
+        from ..src.moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel
+        from ..src.moe_nvfp4_swapab.epilogue import EpilogueTokenTile
 
         c = self.config
         static_expert_shape = (
@@ -528,8 +528,8 @@ class MegaMoEMxfp8Frontend:
         *,
         num_tokens: int,
     ) -> None:
-        from common.megamoe_constants import Mxfp8BlockSize
-        from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
+        from ..src.common.megamoe_constants import Mxfp8BlockSize
+        from ..src.moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
 
         c = self.config
         ab_dtype = c.torch_ab_dtype
@@ -682,7 +682,7 @@ class MegaMoEMxfp8Frontend:
         mega: _CompiledMega,
     ) -> dict:
         import cuda.bindings.driver as cuda
-        from src.sym_buffer import SymBufferHost
+        from ..src.src.sym_buffer import SymBufferHost
 
         c = self.config
         if inputs.activation_sf.shape[-1] % 4 != 0:
@@ -886,7 +886,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
     data_dtype = cfg.torch_ab_dtype
 
-    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
+    from ..src.moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
 
     sym_roots: list[torch.Tensor] = []
     x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
@@ -1087,12 +1087,12 @@ def _create_dummy_weights(
     kind: Mxfp8Kind,
 ) -> Tuple[TransformedWeights, TransformedWeights]:
     """Random MXFP8 weights + swizzled SF for local smoke scripts."""
-    from moe_mxfp8_glu.mega_runner import (
+    from ..src.moe_mxfp8_glu.mega_runner import (
         _make_e8m0_scale_tensor,
         _make_fp8_tensor,
     )
-    from moe_nvfp4_swapab.mega_runner import _stack_byte_reinterpretable_tensors
-    from moe_nvfp4_swapab.runner_common import to_blocked
+    from ..src.moe_nvfp4_swapab.mega_runner import _stack_byte_reinterpretable_tensors
+    from ..src.moe_nvfp4_swapab.runner_common import to_blocked
 
     data_dtype = _KIND_TO_TORCH_DTYPE[kind]
 
@@ -1200,7 +1200,10 @@ def create_dummy_inputs(
         kind=kind,
     )
 
-    from moe_mxfp8_glu.mega_runner import _make_e8m0_scale_tensor, _make_fp8_tensor
+    from ..src.moe_mxfp8_glu.mega_runner import (
+        _make_e8m0_scale_tensor,
+        _make_fp8_tensor,
+    )
 
     data_dtype = symm_buffer._frontend.config.torch_ab_dtype
     activation = _make_fp8_tensor(
@@ -1302,7 +1305,7 @@ def _main() -> None:
             torch.cuda.synchronize()
         no_dist = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
         if not no_dist and dist.is_initialized():
-            from src.bootstrap import finalize_dist_and_nvshmem
+            from ..src.src.bootstrap import finalize_dist_and_nvshmem
 
             finalize_dist_and_nvshmem()
 

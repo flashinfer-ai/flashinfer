@@ -14,7 +14,7 @@ import cutlass.cute as cute
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -22,21 +22,21 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
-from moe_nvfp4_swapab.epilogue import SwapABSwigluFp4Epilogue, _TmemTranspose16x32Core
-from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
-from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
+from ..moe_nvfp4_swapab.epilogue import SwapABSwigluFp4Epilogue, _TmemTranspose16x32Core
+from .epilogue_mxfp8 import GluMxfp8Epilogue
+from ..moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
     MoEFusedFc12SchedulerParams,
 )
-from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
-from common.megamoe_constants import (
+from ..moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
+from ..common.megamoe_constants import (
     Mxfp8BlockSize,
     Nvfp4BlockSize,
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
-from common.host_utils import get_cutedsl_target_arch
-from moe_nvfp4_swapab.moe_utils import spin_wait
+from ..common.host_utils import get_cutedsl_target_arch
+from ..moe_nvfp4_swapab.moe_utils import spin_wait
 
 
 # =============================================================================
@@ -406,7 +406,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         # Raw gate+up SMEM (BF16, ping-pong) — only when generate_c=True.
         c_bytes_total = 0
         if self.generate_c:
-            from moe_mxfp8_glu.epilogue_mxfp8 import Fc1CTMAStages
+            from .epilogue_mxfp8 import Fc1CTMAStages
 
             self.num_c_raw_stage = Fc1CTMAStages
             c_bytes_total += self.epilogue.c_bytes_per_stage * self.num_c_raw_stage

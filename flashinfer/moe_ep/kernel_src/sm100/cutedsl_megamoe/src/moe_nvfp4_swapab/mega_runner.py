@@ -230,21 +230,16 @@ def _bf16_seq_sum_k(src: torch.Tensor) -> torch.Tensor:
     return dst
 
 
-# Ensure absolute package imports work when run as a script.
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PARENT_DIR = os.path.dirname(_PKG_DIR)
-if _PARENT_DIR not in sys.path:
-    sys.path.insert(0, _PARENT_DIR)
 
 import cutlass
 
-from moe_nvfp4_swapab.epilogue_refactor import (
+from .epilogue_refactor import (
     SwapABSwigluFp4Epilogue as _SwapABEpilogue,
 )
-from moe_nvfp4_swapab.mega_reference import compute_megamoe_reference
-from src.token_comm import CombineFormat
-from common.megamoe_constants import Nvfp4BlockSize
-from moe_nvfp4_swapab.runner_common import (
+from .mega_reference import compute_megamoe_reference
+from ..src.token_comm import CombineFormat
+from ..common.megamoe_constants import Nvfp4BlockSize
+from .runner_common import (
     _DataDtype,
     _Fp4DecodeTable,
     _ScaleDtype,
@@ -255,7 +250,7 @@ from moe_nvfp4_swapab.runner_common import (
     round_up,
     to_blocked,
 )
-from moe_nvfp4_swapab.runner_fc12 import (
+from .runner_fc12 import (
     ImplDesc,
     MiscDesc,
 )
@@ -638,8 +633,8 @@ def _generate_topk_weights(
 
 
 # MEGA_NO_DIST=1: opt out of torch.distributed + NVSHMEM init so the
-# runner can be launched as plain ``python mega_runner.py`` (e.g. under
-# compute-sanitizer).  Single-rank only; sym tensors degrade to plain
+# runner can be launched with ``python -m`` under compute-sanitizer.
+# Single-rank only; sym tensors degrade to plain
 # CUDA ``torch.zeros`` and the SymBuffer offsets list is hard-coded to
 # ``(0,) * world_size``.
 _NO_DIST: bool = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
@@ -1415,9 +1410,9 @@ class MegaMoETester:
         import cutlass.torch as cutlass_torch
         import cutlass.utils as utils
 
-        from common.megamoe_constants import SfPaddingBlock
-        from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel
-        from src.sym_buffer import SymBufferHost
+        from ..common.megamoe_constants import SfPaddingBlock
+        from .megamoe_kernel import Sm100MegaMoEKernel
+        from ..src.sym_buffer import SymBufferHost
 
         # -- 1. Kernel instance --
         # MegaMoE currently requires ``static_expert_shape != None`` (see
@@ -1949,7 +1944,7 @@ class MegaMoETester:
         clean validate runs.  All slicing assumes ``_kernel`` has cached
         the region specs (it does, after ``run_kernel``).
         """
-        from moe_nvfp4_swapab.megamoe_kernel import _layout_regions
+        from .megamoe_kernel import _layout_regions
 
         local_specs = self._kernel._local_region_specs
         shared_specs = self._kernel._shared_region_specs
@@ -2723,7 +2718,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     Launcher::
 
-        torchrun --nproc_per_node=4 -m moe_nvfp4_swapab.mega_runner \\
+        torchrun --nproc_per_node=4 -m flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.moe_nvfp4_swapab.mega_runner \\
             --num_total_experts 32 --route_distribution balanced
     """
     parser = _build_arg_parser()
@@ -2731,13 +2726,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if _NO_DIST:
         # MEGA_NO_DIST=1: bypass torch.distributed + NVSHMEM init so the
-        # script can be launched as plain ``python mega_runner.py`` under
+        # module can be launched with ``python -m`` under
         # compute-sanitizer / debugger.  Single-rank only.
         torch.cuda.set_device(0)
         rank = 0
         world_size = 1
     else:
-        from src.bootstrap import init_dist_and_nvshmem
+        from ..src.bootstrap import init_dist_and_nvshmem
 
         _local_rank, rank, world_size, _ = init_dist_and_nvshmem()
 

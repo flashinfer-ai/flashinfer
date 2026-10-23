@@ -24,10 +24,6 @@ Usage::
 
 from __future__ import annotations
 
-# Importing the shim puts ``kernel_src/sm100/cutedsl_megamoe/src`` on sys.path (via
-# shim/_paths.bootstrap_paths) before its modules resolve the raw kernel
-# packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
-# here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
     free_sym_tensor,
     resolve_gate_up_clamp,
@@ -53,7 +49,6 @@ from .shim import (
     PERF_KNOBS,
     TransformedWeights,
     _stack_byte_reinterpretable_tensors,
-    bootstrap_paths,
     ceil_div,
     create_dummy_bf16_inputs,
     create_dummy_bf16_mxfp8_inputs,
@@ -173,7 +168,6 @@ __all__ = [
     "autotune_bf16_mxfp8_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
-    "bootstrap_paths",
     "ceil_div",
     "combine_roundtrip_to_fp32",
     "compute_megamoe_reference_mxfp8",

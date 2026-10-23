@@ -243,7 +243,7 @@ class MegaMoEBf16Mxfp8Frontend:
         self, inputs: MegaMoEBf16Mxfp8Inputs, mega: _CompiledMega
     ) -> dict:
         import cuda.bindings.driver as cuda
-        from src.sym_buffer import SymBufferHost
+        from ..src.src.sym_buffer import SymBufferHost
 
         return {
             "activation": self._to_cute(inputs.activation),
@@ -279,8 +279,8 @@ class MegaMoEBf16Mxfp8Frontend:
         self.release()
         import cutlass
         import cutlass.cute as cute
-        from moe_mxfp8_bf16_glu.epilogue_mxfp8_bf16 import EpilogueTokenTile
-        from moe_mxfp8_bf16_glu.megamoe_kernel_mxfp8_bf16 import (
+        from ..src.moe_mxfp8_bf16_glu.epilogue_mxfp8_bf16 import EpilogueTokenTile
+        from ..src.moe_mxfp8_bf16_glu.megamoe_kernel_mxfp8_bf16 import (
             Sm100MegaMoEMxfp8Bf16Kernel,
         )
 

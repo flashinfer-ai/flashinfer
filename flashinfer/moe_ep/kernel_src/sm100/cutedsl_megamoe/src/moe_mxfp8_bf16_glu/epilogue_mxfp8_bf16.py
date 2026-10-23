@@ -34,20 +34,20 @@ import cutlass.pipeline as pipeline
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover - older CuTeDSL wheels
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 
-from common.moe_utils import fmax, fmin
-from moe_bf16_glu.epilogue_bf16 import swiglu_act
-from moe_nvfp4_swapab.epilogue_refactor import (
+from ..common.moe_utils import fmax, fmin
+from ..moe_bf16_glu.epilogue_bf16 import swiglu_act
+from ..moe_nvfp4_swapab.epilogue_refactor import (
     NvFp4OptinalEpiArgs,
     Region,
     SwapABFc2Epilogue,
     TmemTranspose16x32,
     _TmemTranspose16x32Core,
 )
-from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
-from src.flag_batch import GpuReleaseFlagBatchTracker
-from src.token_comm import CombineFormat
+from ..moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
+from ..src.flag_batch import GpuReleaseFlagBatchTracker
+from ..src.token_comm import CombineFormat
 
 
 Fc1GateUpInterleave = 16

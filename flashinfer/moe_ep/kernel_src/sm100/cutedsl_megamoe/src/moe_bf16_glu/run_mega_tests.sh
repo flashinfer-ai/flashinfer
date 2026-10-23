@@ -59,8 +59,11 @@ export LDFLAGS="-B/usr/bin -fuse-ld=bfd"
 set -u  # fail on undefined vars; do NOT set -e (continue on failures)
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../../../../.." && pwd -P)"
 RUNNER="${SCRIPT_DIR}/mega_runner.py"
+RUNNER_MODULE="flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.moe_bf16_glu.mega_runner"
 PYTHON="${PYTHON:-python}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [ ! -f "$RUNNER" ]; then
     echo "ERROR: mega_runner.py not found at ${RUNNER}" >&2
@@ -281,13 +284,13 @@ for entry in "${TESTS[@]}"; do
     echo "[TEST] $name"
     case "$mode" in
         single)
-            echo "[CMD]  env $test_env MEGA_NO_DIST=1 $PYTHON $RUNNER $args"
+            echo "[CMD]  env $test_env MEGA_NO_DIST=1 $PYTHON -m $RUNNER_MODULE $args"
             ;;
         multi)
             if [ "$MEGA_NNODES" -gt 1 ]; then
-                echo "[CMD]  env $test_env torchrun --nnodes=$MEGA_NNODES --node_rank=$MEGA_NODE_RANK --nproc_per_node=$NPROC --master_addr=$MEGA_MASTER_ADDR --master_port=$MEGA_MASTER_PORT $RUNNER $args"
+                echo "[CMD]  env $test_env torchrun --nnodes=$MEGA_NNODES --node_rank=$MEGA_NODE_RANK --nproc_per_node=$NPROC --master_addr=$MEGA_MASTER_ADDR --master_port=$MEGA_MASTER_PORT --module $RUNNER_MODULE $args"
             else
-                echo "[CMD]  env $test_env torchrun --nproc_per_node=$NPROC $RUNNER $args"
+                echo "[CMD]  env $test_env torchrun --nproc_per_node=$NPROC --module $RUNNER_MODULE $args"
             fi
             ;;
         *)
@@ -303,7 +306,7 @@ for entry in "${TESTS[@]}"; do
     # shellcheck disable=SC2086  # intentional word-splitting on $args / $test_env
     case "$mode" in
         single)
-            timeout 300 env $test_env MEGA_NO_DIST=1 "$PYTHON" "$RUNNER" $args
+            timeout 300 env $test_env MEGA_NO_DIST=1 "$PYTHON" -m "$RUNNER_MODULE" $args
             rc=$?
             ;;
         multi)
@@ -312,9 +315,9 @@ for entry in "${TESTS[@]}"; do
                     --nnodes="$MEGA_NNODES" --node_rank="$MEGA_NODE_RANK" \
                     --nproc_per_node="$NPROC" \
                     --master_addr="$MEGA_MASTER_ADDR" --master_port="$MEGA_MASTER_PORT" \
-                    "$RUNNER" $args
+                    --module "$RUNNER_MODULE" $args
             else
-                timeout 300 env $test_env torchrun --nproc_per_node="$NPROC" "$RUNNER" $args
+                timeout 300 env $test_env torchrun --nproc_per_node="$NPROC" --module "$RUNNER_MODULE" $args
             fi
             rc=$?
             ;;

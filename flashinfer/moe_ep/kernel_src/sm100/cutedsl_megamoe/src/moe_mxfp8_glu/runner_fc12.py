@@ -11,29 +11,19 @@ from typing import List, Optional, Tuple
 
 import torch
 
-## TODO: currently some common modules are located in moe_nvfp4_swapab,
-## which will be moved to common package later. These paths dependency
-## could be removed once the modules are moved.
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PARENT_DIR = os.path.dirname(_PKG_DIR)
-_NVFP4_DIR = os.path.join(_PARENT_DIR, "moe_nvfp4_swapab")
-for _p in (_PARENT_DIR, _NVFP4_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from moe_nvfp4_swapab.runner_fc12_common import (
+from ..moe_nvfp4_swapab.runner_fc12_common import (
     ProblemDesc,
     MiscDesc,
     Fc12TesterBase,
     add_common_fc12_arguments,
     parse_tuple,
 )
-from moe_mxfp8_glu.runner_common import TrainingImplDesc
-from moe_nvfp4_swapab.runner_common import (
+from .runner_common import TrainingImplDesc
+from ..moe_nvfp4_swapab.runner_common import (
     from_blocked,
     dequant_block_scale_to_fp32,
 )
-from common.host_utils import (
+from ..common.host_utils import (
     kind_data_dtype,
     kind_sf_vec_size,
     mxfp8_quantize_per_block_32,
@@ -73,7 +63,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         # the scheduler uses 128-aligned data_physical_offsets for all tensors.
         if self.impl.generate_c:
             return 128
-        from moe_nvfp4_swapab.epilogue import EpilogueTokenTile
+        from ..moe_nvfp4_swapab.epilogue import EpilogueTokenTile
 
         return EpilogueTokenTile
 
@@ -191,7 +181,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
 
     def _instantiate_kernel(self, common_kwargs: dict):
         import cutlass
-        from moe_mxfp8_glu.kernel_mxfp8_glu_fc12 import Sm100SwigluMxfp8Fc12Kernel
+        from .kernel_mxfp8_glu_fc12 import Sm100SwigluMxfp8Fc12Kernel
 
         _kind_to_cutlass_dtype = {
             "mxfp8_e4m3": cutlass.Float8E4M3FN,
@@ -253,7 +243,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
             print("[fc1 phase ablation] skipped (workspace or ref not populated)")
             return
 
-        from common.host_utils import compare_and_report_mismatches
+        from ..common.host_utils import compare_and_report_mismatches
 
         sf_vec_size = kind_sf_vec_size(self.problem.kind)
         K_sf = (self.problem.intermediate // 2) // sf_vec_size
@@ -301,7 +291,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
             print("[generate_c] reference fc1 gate+up not available — skipped.")
             return
 
-        from common.host_utils import compare_and_report_mismatches
+        from ..common.host_utils import compare_and_report_mismatches
 
         valid = self.valid_tokens_per_expert
         doff = self.data_physical_offsets

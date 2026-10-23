@@ -38,7 +38,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.arch import nvvm_wrappers
 from cutlass.cutlass_dsl import dsl_user_op, Boolean, Int32, Float32, T
 from cutlass._mlir import ir
-from common.megamoe_constants import Log2E, Fp32Max, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit
+from .megamoe_constants import Log2E, Fp32Max, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import cute as _cute_ir
 from cutlass._mlir.dialects import vector, arith

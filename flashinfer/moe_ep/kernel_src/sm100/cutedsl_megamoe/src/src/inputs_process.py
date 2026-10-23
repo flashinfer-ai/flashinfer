@@ -22,15 +22,13 @@ import os
 import sys
 from typing import Literal, Optional, Union
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Float32, Int32, Int64
 
-from common.megamoe_constants import (
+from ..common.megamoe_constants import (
     Fp8E4M3FNMax,
     Fp8E4M3RcpLimit,
     Fp8E5M2RcpLimit,
@@ -40,8 +38,8 @@ from common.megamoe_constants import (
     Nvfp4E2M1Max,
     Nvfp4E2M1RcpLimit,
 )
-from common.moe_utils import cvt_f32_to_f8_to_f32
-from src.ptx_helpers import max_abs_bf16x2, red_min_relaxed_gpu_u32_from_f32_raw
+from ..common.moe_utils import cvt_f32_to_f8_to_f32
+from .ptx_helpers import max_abs_bf16x2, red_min_relaxed_gpu_u32_from_f32_raw
 
 
 class DataPreprocess:
@@ -525,7 +523,7 @@ class DataPreprocess:
 # Correctness harness (GPU only; needs cutlass + torch fp4/e8m0 dtypes).
 # Runs each path and checks the quant output against the repo's bit-matched
 # reference quantizers, plus an exact routing-repack check.
-#   python -m src.inputs_process
+#   python -m flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.inputs_process
 # =============================================================================
 
 
@@ -534,8 +532,8 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
     import cuda.bindings.driver as cuda_driver
     from cutlass.torch import from_dlpack
 
-    from moe_nvfp4_swapab.runner_common import nvfp4_quantize_per_block_16, dequant_block_scale_to_fp32
-    from common.host_utils import mxfp8_quantize_per_block_32_row
+    from ..moe_nvfp4_swapab.runner_common import nvfp4_quantize_per_block_16, dequant_block_scale_to_fp32
+    from ..common.host_utils import mxfp8_quantize_per_block_32_row
 
     torch.manual_seed(0)
     is_nvfp4 = quant_type == "nvfp4"

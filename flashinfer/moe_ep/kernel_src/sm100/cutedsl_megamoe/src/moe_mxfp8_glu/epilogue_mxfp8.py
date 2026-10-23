@@ -15,7 +15,7 @@ import cutlass.cute as cute
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace
 import cutlass.utils as utils
@@ -27,23 +27,23 @@ from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op, Int32 as _epi_Int32, Int64
 
-from src.flag_batch import GpuReleaseFlagBatchTracker
-from src.token_comm import CombineFormat, TokenSrcMetadata
-from src.ptx_helpers import stg_e8m0_from_f32, stg_e8m0x8_from_f32
+from ..src.flag_batch import GpuReleaseFlagBatchTracker
+from ..src.token_comm import CombineFormat, TokenSrcMetadata
+from ..src.ptx_helpers import stg_e8m0_from_f32, stg_e8m0x8_from_f32
 
-from moe_nvfp4_swapab.contract import (
+from ..moe_nvfp4_swapab.contract import (
     Contract,
     FunctionMapping,
     Space,
     TensorWithContract,
     assert_contract_equivalent,
 )
-from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
-from common.megamoe_constants import Nvfp4BlockSize
+from ..moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
+from ..common.megamoe_constants import Nvfp4BlockSize
 
-from common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row
+from ..common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row
 from cutlass.cute.typing import Float32
-from moe_nvfp4_swapab.epilogue import (
+from ..moe_nvfp4_swapab.epilogue import (
     _TmemTranspose16x32Core,
     _red_add_release_gpu_s32,
     _red_add_relaxed_sys_v2_bf16x2,

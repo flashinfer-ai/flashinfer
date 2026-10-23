@@ -11,29 +11,19 @@ from typing import List, Optional, Tuple
 
 import torch
 
-## TODO: currently some common modules are located in moe_nvfp4_swapab,
-## which will be moved to common package later. These paths dependency
-## could be removed once the modules are moved.
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PARENT_DIR = os.path.dirname(_PKG_DIR)
-_NVFP4_DIR = os.path.join(_PARENT_DIR, "moe_nvfp4_swapab")
-for _p in (_PARENT_DIR, _NVFP4_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from moe_nvfp4_swapab.runner_fc12_common import (
+from ..moe_nvfp4_swapab.runner_fc12_common import (
     ProblemDesc,
     MiscDesc,
     Fc12TesterBase,
     add_common_fc12_arguments,
     parse_tuple,
 )
-from moe_bf16_glu.runner_common import TrainingImplDesc
-from moe_bf16_glu.epilogue_bf16 import Fc1GateUpInterleave
-from moe_nvfp4_swapab.runner_common import (
+from .runner_common import TrainingImplDesc
+from .epilogue_bf16 import Fc1GateUpInterleave
+from ..moe_nvfp4_swapab.runner_common import (
     offs_to_group_sizes,
 )
-from common.host_utils import compare_and_report_mismatches
+from ..common.host_utils import compare_and_report_mismatches
 
 
 # =============================================================================
@@ -98,7 +88,7 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         # the scheduler uses 128-aligned data_physical_offsets for all tensors.
         if self.impl.generate_c:
             return 128
-        from moe_nvfp4_swapab.epilogue import EpilogueTokenTile
+        from ..moe_nvfp4_swapab.epilogue import EpilogueTokenTile
 
         return EpilogueTokenTile
 
@@ -312,7 +302,7 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         if self.misc.skip_ref_check:
             return
 
-        from moe_bf16_glu.mega_reference_bf16 import (
+        from .mega_reference_bf16 import (
             _DenseGemmReferenceLauncher,
             reference_expert_fc12,
         )
@@ -603,7 +593,7 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
 
     def _instantiate_kernel(self, common_kwargs: dict):
         import cutlass
-        from moe_bf16_glu.kernel_bf16_glu_fc12 import Sm100SwigluBf16Fc12Kernel
+        from .kernel_bf16_glu_fc12 import Sm100SwigluBf16Fc12Kernel
 
         kernel = Sm100SwigluBf16Fc12Kernel(
             **common_kwargs,

@@ -16,7 +16,7 @@ import cutlass.cute as cute
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from ..src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace
 import cutlass.utils as utils
@@ -35,8 +35,8 @@ from .contract import (
     assert_contract_equivalent,
 )
 from .fc1_fc2_fuse_sched import BlockPhase
-from common.megamoe_constants import Nvfp4BlockSize
-from src.token_comm import TokenSrcMetadata
+from ..common.megamoe_constants import Nvfp4BlockSize
+from ..src.token_comm import TokenSrcMetadata
 
 Fc1GateUpInterleave = 16
 EpilogueTokenTile = 64
