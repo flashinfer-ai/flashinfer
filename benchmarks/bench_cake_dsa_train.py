@@ -101,6 +101,7 @@ Usage::
 """
 
 import argparse
+import dataclasses
 import inspect
 import json
 import statistics
@@ -311,6 +312,7 @@ NOPE_DOUT_LAYOUTS = ("head_major", "contiguous")
 
 
 NOPE_TWINS = (None, "stable")
+NOPE_HOLE_PATTERNS = (None, "every_other")
 
 
 def _nope_row(
@@ -321,6 +323,7 @@ def _nope_row(
     pools=None,
     dout_layout="head_major",
     twin=None,
+    holes=None,
 ):
     """One NoPE row: document lengths, the physical slot width, the index structure
     (``pooled``: P four-token pools plus the causal tail of the open pool; ``iid``: random
@@ -330,9 +333,12 @@ def _nope_row(
     2048, four tail keys, ``repro_compact_issue``: their descending-sorted twin), the pool
     capacity (default: the width's recorded capacity), the ``dout`` layout (default
     ``head_major``, the recorded trainer strides ``[512, Tq * 512, 1]``;
-    ``--nope-dout-layout`` overrides it for every row) and ``twin="stable"``: the row's
-    indices are the stable compaction of the draw (valid keys first in ascending slot order,
-    the same keys per row: the baseline-side control of a hole row, ``compacted_twin``)."""
+    ``--nope-dout-layout`` overrides it for every row), ``holes="every_other"``: every odd
+    slot of the draw is invalidated after it is drawn (:func:`_plant_holes`; a hole row at
+    any slot width, below the one-launch route's slot limit included), and ``twin="stable"``:
+    the row's indices are the stable compaction of the draw (valid keys first in ascending
+    slot order, the same keys per row: the baseline-side control of a hole row,
+    ``compacted_twin``; applied after the planted holes)."""
     if pools is None and index in ("pooled", "pooled_fixed_tail"):
         pools = nope_pools(k_slots)
     if dout_layout not in NOPE_DOUT_LAYOUTS:
@@ -341,6 +347,8 @@ def _nope_row(
         )
     if twin not in NOPE_TWINS:
         raise ValueError(f"twin must be one of {NOPE_TWINS}, got {twin!r}")
+    if holes not in NOPE_HOLE_PATTERNS:
+        raise ValueError(f"holes must be one of {NOPE_HOLE_PATTERNS}, got {holes!r}")
     return dict(
         seq_q=[int(x) for x in seq_q],
         seq_k=[int(x) for x in seq_k],
@@ -349,6 +357,27 @@ def _nope_row(
         pools=pools,
         dout_layout=dout_layout,
         twin=twin,
+        holes=holes,
+    )
+
+
+def _plant_holes(inp, pattern):
+    """``inp`` with holes planted in every row after the draw.  ``"every_other"`` invalidates the odd slots of
+    the per-document and the global rows alike: the valid keys of the even slots stay where they are, so a
+    position-preserving kernel scans each row to its last valid slot (about twice the valid count) while a
+    compacting one scans the valid count.  The lengths become the new valid counts and the index kind gains the
+    suffix ``+every_other``; ``compacted_twin`` of the result is the row's baseline-side control."""
+    if pattern != "every_other":
+        raise ValueError(f"unknown hole pattern {pattern!r}")
+    local, glob = inp.idx_local.clone(), inp.idx_global.clone()
+    local[:, 1::2] = -1
+    glob[:, 1::2] = -1
+    return dataclasses.replace(
+        inp,
+        idx_local=local,
+        idx_global=glob,
+        topk_length=(local >= 0).sum(-1).to(torch.int32).contiguous(),
+        index=inp.index + "+every_other",
     )
 
 
@@ -366,6 +395,10 @@ NOPE_ROWS: dict[str, dict] = {
     "nope_tail_1024x16384_k512": _nope_row([1024], [16384], k_slots=512),
     "nope_short_1024_k128": _nope_row([1024], [1024], k_slots=128),
     "nope_short_4096_k512": _nope_row([4096], [4096], k_slots=512),
+    # the two tables straddling the one-launch route's slot limit (524,288 and 1,048,576 slots; the tiny rows
+    # above are 131,072 and 524,288)
+    "nope_short_2048_k256": _nope_row([2048], [2048], k_slots=256),
+    "nope_short_4096_k256": _nope_row([4096], [4096], k_slots=256),
     "nope_glm53_a_p256": _nope_row(*GLM53_A, k_slots=1152, pools=256),
 }
 for _n in (4096, 16384, 65536):
@@ -406,10 +439,21 @@ NOPE_ROWS["nope_docs264x992_rank0_fixedtail"] = _nope_row(
 NOPE_ROWS["nope_docs264x992_rank0_fixedtail_compact"] = _nope_row(
     [31, 31] * 264, [31, 992] * 264, index="pooled_fixed_tail", twin="stable"
 )
+# A small hole row (131,072 slots: below the slot limit, the one-launch position-preserving route) and its stable
+# twin: every odd slot of the pooled draw is -1, so the row scans about twice its valid keys position-preserving
+# while the twin scans its valid count.  Graded against the previous version's own time (``--parity-rows``), not
+# against the twin.
+NOPE_ROWS["nope_short_1024_k128_holes"] = _nope_row(
+    [1024], [1024], k_slots=128, holes="every_other"
+)
+NOPE_ROWS["nope_short_1024_k128_holes_compact_stable"] = _nope_row(
+    [1024], [1024], k_slots=128, holes="every_other", twin="stable"
+)
 NOPE_HOLE_ROWS = tuple(
     name
     for name, spec in NOPE_ROWS.items()
-    if spec["index"] in ("pooled_fixed_tail", "repro_gap") and spec["twin"] is None
+    if (spec["index"] in ("pooled_fixed_tail", "repro_gap") or spec.get("holes"))
+    and spec["twin"] is None
 )
 NOPE_ARMS_DEFAULT = (
     "cake_nope,cake_rope_bridge,fa4_nope,fa4_nope_a2,flashmla_cudnn_nope"
@@ -1823,6 +1867,8 @@ def run_perf_nope_row(row, args, results):
         dout_layout=args.nope_dout_layout or spec["dout_layout"],
         device=args.device,
     )
+    if spec.get("holes"):
+        inp = _plant_holes(inp, spec["holes"])
     if spec.get("twin") == "stable":
         inp = compacted_twin(inp)
     entry = dict(
@@ -1837,6 +1883,7 @@ def run_perf_nope_row(row, args, results):
         pools=inp.pools,
         valid_keys=inp.valid_keys,
         twin=spec.get("twin"),
+        holes=spec.get("holes"),
         dout_layout=inp.dout_layout,
         dout_strides=list(inp.dout.stride()),
         inputs_gib=gib(inp.bytes_inputs()),

@@ -737,8 +737,9 @@ def validate_dsa_nope_inputs(
     ``>= S`` invalid), any ``K_slots >= 1`` -- no width alignment is required (rows whose stride and start are
     multiples of eight elements take the kernels' vector index path, the others the scalar path);
     ``topk_length``: contiguous int32 ``[T]`` or ``None`` (the kernel-level entries read the rows as given; the
-    public autograd entries compact rows with ``-1`` holes through the index-preparation stage first, see
-    :func:`nope_compact_indices`); ``dout``: BF16 ``[T, 64, 512]`` with ``T`` rows, under
+    public autograd entries compact rows with ``-1`` holes through the index-preparation stage first at or above
+    :data:`NOPE_CONVERT_SLOT_LIMIT` slots and read them as given below it, see :func:`nope_compact_indices`);
+    ``dout``: BF16 ``[T, 64, 512]`` with ``T`` rows, under
     the same layout rules as ``q_latent`` (:func:`_check_head_tensor`: unit channel stride, token and head strides
     positive multiples of 8 elements, head stride >= 512, 16-byte base) -- a dense array or a strided view such as
     the head-major ``[512, T * 512, 1]`` layout is consumed in place (the main stage reads it through a
@@ -3510,9 +3511,14 @@ def _bound_values_nope(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any
     values: dict[str, Any] = dict(plan.constants)
     values.update(t, indices=indices)
     # the converting forward's pointer operands under ``convert = 0``: the index operand stands as ``indices_out``
-    # and a per-device int32 constant as the prefix sums (valid pointers the kernel never reads)
+    # -- as the contiguous span of its storage when the rows are a strided view (a column slice of a wider
+    # buffer): the binding takes contiguous pointer operands and the kernel never reads it -- and a per-device
+    # int32 constant as the prefix sums (valid pointers the kernel never reads)
     inert_cu = _inert_cu_seqlens(t["indices"].device)
-    values.update(indices_out=indices, cu_seqlens_q=inert_cu, cu_seqlens_k=inert_cu)
+    indices_out = (
+        indices if indices.is_contiguous() else _index_storage_alias(t["indices"])[0]
+    )
+    values.update(indices_out=indices_out, cu_seqlens_q=inert_cu, cu_seqlens_k=inert_cu)
     if plan.backward:
         dst_map = (
             t["dkv_dst_map"] if t.get("dkv_dst_map") is not None else t["topk_length"]
@@ -4188,9 +4194,14 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
     Twelve forward inputs ``(q_latent, kv_latent, indices, topk_length, softmax_scale, key_passes, dkv_acc,
     dkv_dst_map, num_segments, derive_topk_length, dkv_direct, check_dst_map)``; returns ``(out, lse)``.  With
     ``derive_topk_length`` (the public entry's call without caller lengths; ``topk_length`` is then ``None``) the
-    forward compacts the index rows through the index-preparation stage's flat mode (:func:`_flat_forward_nope`)
-    and the backward reads the compacted rows and their counts; otherwise the caller's rows and lengths reach both
-    kernels as given (:func:`forward_nope`).  The backward returns ``(dq, dkv)`` for ``q_latent`` / ``kv_latent``
+    route follows the table size (:func:`nope_flat_index_mode`): below :data:`NOPE_CONVERT_SLOT_LIMIT` slots one
+    launch of the forward over the caller's rows as given, deriving each row's length (the last valid slot + 1)
+    into a fresh ``[T]`` vector, and the backward reads the caller's ``indices`` tensor with that vector -- the
+    rows are then a saved tensor, so autograd rejects an in-place edit of ``indices`` between the forward and the
+    backward (the stage route saves a fresh buffer and does not); at or above the limit the forward compacts the
+    rows through the index-preparation stage's flat mode (:func:`_flat_forward_nope`) and the backward reads the
+    compacted rows and their counts.  Otherwise the caller's rows and lengths reach both kernels as given
+    (:func:`forward_nope`).  The backward returns ``(dq, dkv)`` for ``q_latent`` / ``kv_latent``
     (``dkv`` is ``None`` when it went into ``dkv_acc``) and no gradient for the ten other inputs.  The FP32
     ``dkv`` of :func:`backward_nope` reaches a BF16 ``kv_latent`` leaf as BF16: the autograd engine casts a
     gradient to the leaf's dtype.  The FP32 contract
@@ -4219,10 +4230,28 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
         dkv_direct=None,
         check_dst_map=False,
     ):
-        if derive_topk_length and topk_length is None and q_latent.shape[0] > 0:
-            out, lse, o_lo, indices, topk_length = _flat_forward_nope(
-                q_latent, kv_latent, indices, softmax_scale
+        num_rows = int(q_latent.shape[0])
+        if derive_topk_length and topk_length is None and num_rows > 0:
+            small = (
+                indices.dim() == 2
+                and nope_flat_index_mode(num_rows, int(indices.shape[1])) == "mask"
             )
+            if small:
+                # the small-table route: one launch over the caller's rows as given; the forward derives each
+                # row's length (last valid slot + 1) into the fresh vector the backward reads with those rows
+                topk_length = _alloc((num_rows,), torch.int32, q_latent.device)
+                out, lse, o_lo = forward_nope(
+                    q_latent,
+                    kv_latent,
+                    indices,
+                    topk_length=topk_length,
+                    softmax_scale=softmax_scale,
+                    derive_topk_length=True,
+                )
+            else:
+                out, lse, o_lo, indices, topk_length = _flat_forward_nope(
+                    q_latent, kv_latent, indices, softmax_scale
+                )
         else:
             out, lse, o_lo = forward_nope(
                 q_latent,
@@ -4472,18 +4501,25 @@ def dsa_sparse_attention_nope(
     at forward time; every tensor this call produces for the backward is saved through ``ctx.save_for_backward``
     (a tensor ``dkv_acc`` stays caller-owned on the node) and a checkpointed forward retains nothing of this call.
     ``key_passes``, ``dkv_dst_map``, ``num_segments``, ``dkv_direct`` and
-    ``check_dst_map`` as in :func:`dsa_sparse_attention`.  Without ``topk_length`` the index rows (any row stride)
-    are compacted on device in one launch of the index-preparation stage right before the forward kernel: each
-    row's valid keys (``0 <= idx < S``) first in ascending slot order, then ``-1``, with the valid count as the
-    row's length -- into a fresh ``[T, K_slots]`` buffer and a ``[T]`` vector that the backward reads, so rows
-    with ``-1`` holes cost their valid slots in both kernels and the caller's tensor is left untouched.  With
-    ``topk_length`` the rows and lengths reach the kernels as given (slots ``>= topk_length[t]`` invalid; work up
-    to the last valid slot): callers with holes and lengths compact first with :func:`nope_compact_indices`.
+    ``check_dst_map`` as in :func:`dsa_sparse_attention`.  Without ``topk_length`` the route follows the table
+    size (:func:`nope_flat_index_mode`).  Below :data:`NOPE_CONVERT_SLOT_LIMIT` slots the forward kernel alone
+    reads the index rows (any row stride) as given and derives each row's length -- the last valid slot + 1 --
+    while it runs, into a ``[T]`` vector the backward reads with the caller's rows: one launch, a ``-1`` anywhere
+    stays a masked slot at its position, and the caller's ``indices`` tensor is a saved tensor until the backward
+    (autograd rejects an in-place edit of it in between).  At or above the limit the rows are compacted on device
+    in one launch of the index-preparation stage right before the forward kernel: each row's valid keys (``0 <=
+    idx < S``) first in ascending slot order, then ``-1``, with the valid count as the row's length -- into a fresh
+    ``[T, K_slots]`` buffer and a ``[T]`` vector that the backward reads, so rows with ``-1`` holes cost their
+    valid slots in both kernels and the caller's tensor is left untouched.  Hole-free rows give the same bytes on
+    either route.  With ``topk_length`` the rows and lengths reach the kernels as given (slots ``>=
+    topk_length[t]`` invalid; work up to the last valid slot): callers with holes and lengths compact first with
+    :func:`nope_compact_indices`.
     """
     kv_latent = _kv_latent_rows(kv_latent)
     if softmax_scale is None:
         softmax_scale = NOPE_SOFTMAX_SCALE
-    # the flat stage compacts the rows and derives their counts (derive_topk_length) when the caller gives none
+    # without caller lengths the Function derives them (derive_topk_length): in-kernel below the slot limit, as
+    # the counts of the flat stage at or above it
     derive = topk_length is None and q_latent.shape[0] > 0
     out, lse = DSASparseAttentionNopeFunction.apply(
         q_latent,
@@ -4512,14 +4548,19 @@ def dsa_sparse_attention_nope(
 # valid count as the row's length, after the position cut of an optional ``length_in`` vector; ``compact = 0`` is
 # the position-preserving rewrite with last valid slot + 1.  Its torch formulation, ``offset_gather_kv_indices``
 # (``compact=True`` for the compacting mode), is the reference the tests hold the stage to and the rope varlen
-# entry's fallback where the stage is not available; both varlen entries launch the stage.
+# entry's fallback where the stage is not available.  The rope varlen entry launches the stage at every size; the
+# NoPE entries launch it at or above :data:`NOPE_CONVERT_SLOT_LIMIT` slots and with caller lengths, and take the
+# one-launch position-preserving forward below it (:func:`nope_varlen_index_mode`, :func:`nope_flat_index_mode`).
 NOPE_INDEX_PREP_STAGE = "index_prep"
 INDEX_PREP_ROWS_PER_CTA = 4
 # Launch arguments a forward program that converts the per-document rows itself appends to its argument list
 # (``cake_launch.STAGE_ARGS["nope_fwd"]``), in this order: the prefix sums, the global-row output the backward
-# consumes, the document count and its search depth, the causal flag, and ``convert`` (0: global rows in, the
-# per-document operands never read; 1: per-document rows in, the lengths derived in-kernel).  The packed entry then
-# needs no index-preparation launch.
+# consumes, the document count and its search depth, the causal flag, and ``convert`` -- 0: global rows in, the
+# per-document operands never read; :data:`NOPE_CONVERT_COMPACT` (1): per-document rows in, written to
+# ``indices_out`` stably compacted (valid global keys first, then ``-1``) with the valid count as the length;
+# :data:`NOPE_CONVERT_MASK` (2): per-document rows in, written to ``indices_out`` position-preserving (the global
+# key or ``-1`` at the slot it came from) with the last valid slot + 1 as the length.  Both non-zero values derive
+# the lengths in-kernel; the packed entry then needs no index-preparation launch.
 NOPE_FWD_CONVERT_ARGS = (
     "cu_seqlens_q",
     "cu_seqlens_k",
@@ -4529,13 +4570,19 @@ NOPE_FWD_CONVERT_ARGS = (
     "causal",
     "convert",
 )
-# Index tables (``T x K_slots``) below this many slots would take the converting forward (one launch, no host gap
-# between a preparation launch and the forward).  Both routes compact the rows the same way (the forward's own
-# conversion writes the stable compaction and the valid counts since flour ae939ee44, bitwise the stage), so the
-# limit is a pure performance crossover: it stays 0 (the stage at every size) until the two-launch stage route and
-# the one-launch converting forward are measured against each other; a limit above zero takes the converting
-# forward below it.
-NOPE_CONVERT_SLOT_LIMIT = 0
+NOPE_CONVERT_COMPACT = 1
+NOPE_CONVERT_MASK = 2
+# Index tables (``T x K_slots``) with fewer slots than this take the one-launch position-preserving forward: the
+# rows reach the kernel as given (a ``-1`` anywhere stays a masked slot at its position) and the forward derives
+# each row's length -- the last valid slot + 1 -- itself, so no host gap separates a preparation launch from the
+# forward.  At or above the limit the compacting preparation stage runs first (valid keys first, the count as the
+# length) and the forward follows over its rows back to back; a caller ``topk_length`` takes the stage at every
+# size (the cut it applies before compacting).  The rule reads the table size alone -- the host cannot see holes
+# without a device sync -- so a small table with holes pays the position-preserving cost of its holes (bounded by
+# its size); hole-free rows give the same bytes on either route.  The value is a measured crossover: the largest
+# table at which the one-launch forward stays within 0.95x of the stage route on the eager forward and within
+# 1.02x on the GPU-busy step, plus one.  1 << 20 is the provisional value until the ladder of this round is run.
+NOPE_CONVERT_SLOT_LIMIT = 1 << 20
 _INT32_MAX = 2**31 - 1
 
 
@@ -4608,20 +4655,35 @@ def _nope_arch(tensor: torch.Tensor) -> str:
     return arch_for(tensor.device)
 
 
+def _small_index_table(num_queries: int, topk: int) -> bool:
+    """Whether a ``[num_queries, topk]`` index table is below :data:`NOPE_CONVERT_SLOT_LIMIT` slots."""
+    return int(num_queries) * int(topk) < NOPE_CONVERT_SLOT_LIMIT
+
+
 def nope_varlen_index_mode(
     num_queries: int, topk: int, *, caller_lengths: bool = False
 ) -> str:
     """The packed entry's index route for a ``[num_queries, topk]`` per-document index table, from its size alone
-    (no device or registry access): ``"index_prep"`` -- one launch of the index-preparation stage, which compacts
-    the rows (valid keys first, the count as the length), then the forward over its rows -- at or above
-    :data:`NOPE_CONVERT_SLOT_LIMIT` slots (0: every size) and always with a caller-given ``topk_length`` (the
-    cut the stage applies before compacting); ``"kernel"`` -- the forward converts and compacts the rows itself in
-    one launch (the same stable compaction and valid counts, derived in-kernel; it takes no caller cut) -- below the
-    limit without caller lengths, never while the limit is 0."""
+    (no device or registry access): ``"mask"`` -- the forward alone, in one launch, globalizes the rows
+    position-preserving (the global key or ``-1`` at the slot it came from) into the rows the backward reads and
+    derives each row's length as the last valid slot + 1 -- below :data:`NOPE_CONVERT_SLOT_LIMIT` slots without a
+    caller ``topk_length``; ``"index_prep"`` -- one launch of the index-preparation stage, which compacts the rows
+    (valid keys first, the count as the length), then the forward over its rows -- at or above the limit and always
+    with caller lengths (the cut the stage applies before compacting; the one-launch forward takes no cut).  The
+    compacting one-launch mode ``"kernel"`` is never selected by size: callers name it explicitly."""
     if caller_lengths:
         return "index_prep"
-    small = int(num_queries) * int(topk) < NOPE_CONVERT_SLOT_LIMIT
-    return "kernel" if small else "index_prep"
+    return "mask" if _small_index_table(num_queries, topk) else "index_prep"
+
+
+def nope_flat_index_mode(num_queries: int, topk: int) -> str:
+    """The flat autograd entry's index route without caller lengths for a ``[num_queries, topk]`` table of global
+    rows, the same size rule as :func:`nope_varlen_index_mode`: ``"mask"`` -- one launch of the forward over the
+    caller's rows as given, deriving each row's length (the last valid slot + 1) into a fresh vector the backward
+    reads with those rows -- below :data:`NOPE_CONVERT_SLOT_LIMIT` slots; ``"index_prep"`` -- the stage's flat mode
+    compacts the rows into a fresh buffer with the valid counts, then the forward follows over them -- at or above
+    it.  With caller lengths the flat entry launches the forward alone over the rows and lengths as given."""
+    return "mask" if _small_index_table(num_queries, topk) else "index_prep"
 
 
 def varlen_index_mode(
@@ -4630,11 +4692,10 @@ def varlen_index_mode(
     """The route :func:`nope_varlen_index_mode` selects for ``gather_kv_indices`` (``[T, K_slots]`` on a served
     device), restricted to what the registered program offers: a program without the converting forward
     (:func:`nope_fwd_converts_indices`) takes ``"index_prep"`` at every size, one without the index-preparation
-    stage takes ``"kernel"`` (never with caller lengths) -- the converting forward compacts the rows like the stage
-    (bitwise), so hole rows cost their valid slots on either route; only a caller ``topk_length`` needs the stage.
-    Raises ``NotImplementedError`` for a host tensor, a device the NoPE record does not serve, or a program with
-    neither.  The torch formulation :func:`offset_gather_kv_indices` is the tests' reference and the rope entry's
-    fallback, not a runtime mode of the NoPE entries."""
+    stage takes ``"mask"`` at every size (never with caller lengths: only the stage applies a caller cut).  Raises
+    ``NotImplementedError`` for a host tensor, a device the NoPE record does not serve, or a program with neither.
+    The torch formulation :func:`offset_gather_kv_indices` is the tests' reference and the rope entry's fallback,
+    not a runtime mode of the NoPE entries."""
     _nope_arch(gather_kv_indices)
     if gather_kv_indices.dim() != 2:
         raise ValueError("gather_kv_indices must be [T, K_slots]")
@@ -4642,12 +4703,12 @@ def varlen_index_mode(
     preferred = nope_varlen_index_mode(num_rows, topk, caller_lengths=caller_lengths)
     converts = nope_fwd_converts_indices()
     record = cake_jit.record(cake_jit.NOPE_PROGRAM)
-    if preferred == "kernel" and converts:
-        return "kernel"
+    if preferred == "mask" and converts:
+        return "mask"
     if NOPE_INDEX_PREP_STAGE in record:
         return "index_prep"
     if converts and not caller_lengths:
-        return "kernel"
+        return "mask"
     if converts:
         raise NotImplementedError(
             "a caller-given topk_length with the converting NoPE forward needs the index-preparation stage "
@@ -4982,10 +5043,13 @@ def _packed_forward_nope(
     slot order, then ``-1`` -- after the position cut of a caller ``topk_length`` passed as ``length_in``) into the
     fresh ``indices`` / ``lengths`` (the valid counts) and then the forward from pre-converted operands
     (:meth:`_NopeBinding.prebound_forward`) with nothing else in between; the forward reads the stage's rows and
-    counts whether or not the caller gave lengths.  ``mode == "kernel"`` lets the forward convert the rows itself
-    (``convert = 1``) in its single launch: its scan lanes write the same stable compaction to ``indices`` and the
-    valid counts to ``lengths`` (bitwise the stage; no caller cut).  ``indices`` (compacted global key rows) and
-    ``lengths`` are what the backward reads on either route."""
+    counts whether or not the caller gave lengths.  ``mode == "mask"`` lets the forward convert the rows itself in
+    its single launch (``convert = NOPE_CONVERT_MASK``): its scan lanes write the position-preserving global rows
+    to ``indices`` -- the global key or ``-1`` at the slot it came from, so a hole stays a masked slot -- and the
+    last valid slot + 1 to ``lengths``; no caller cut.  ``mode == "kernel"`` is the compacting single launch
+    (``convert = NOPE_CONVERT_COMPACT``): the scan lanes write the same stable compaction and valid counts as the
+    stage (bitwise); no caller cut, never selected by size.  ``indices`` (global key rows in the order the forward
+    processed them) and ``lengths`` are what the backward reads on every route."""
     arch = _nope_arch(gather_kv_indices)
     num_rows, topk = int(q_latent.shape[0]), int(gather_kv_indices.shape[1])
     device = q_latent.device
@@ -4995,13 +5059,15 @@ def _packed_forward_nope(
     )  # the global key rows: the backward's operand
     derived = _alloc(
         (num_rows,), torch.int32, device
-    )  # the row lengths the preparation writes (the valid counts)
-    if mode == "kernel":
+    )  # the row lengths the conversion writes (valid counts, or last valid + 1 in mask mode)
+    if mode in ("mask", "kernel"):
         # the forward reads the per-document rows (any row stride) and writes the global rows and the row
-        # lengths itself (``convert = 1`` derives the lengths: the entry selects this mode without caller lengths)
+        # lengths itself (a non-zero ``convert`` derives the lengths: the entry selects these modes without
+        # caller lengths)
         if topk_length is not None:
             raise ValueError(
-                "the converting NoPE forward derives the row lengths itself: no caller topk_length in kernel mode"
+                "the converting NoPE forward derives the row lengths itself: no caller topk_length in "
+                f"{mode} mode"
             )
         num_docs = int(cu_seqlens_q.numel()) - 1
         plan_indices, derive = gather_kv_indices, True
@@ -5012,9 +5078,9 @@ def _packed_forward_nope(
             num_docs=num_docs,
             search_iters=index_prep_search_iters(num_docs),
             causal=int(bool(causal)),
-            convert=1,
+            convert=NOPE_CONVERT_MASK if mode == "mask" else NOPE_CONVERT_COMPACT,
         )
-    else:
+    elif mode == "index_prep":
         plan_indices, derive, extra = indices, False, None
         if topk_length is not None and (
             topk_length.shape != (num_rows,)
@@ -5022,6 +5088,10 @@ def _packed_forward_nope(
             or not topk_length.is_contiguous()
         ):
             raise ValueError("topk_length must be a contiguous int32 [T] tensor")
+    else:
+        raise ValueError(
+            f"unknown NoPE index mode {mode!r}: expected 'mask', 'index_prep' or 'kernel'"
+        )
     lengths = derived
     key = forward_binding_key_nope(
         q_latent, kv_latent, plan_indices, lengths, scale, derive
@@ -5042,7 +5112,7 @@ def _packed_forward_nope(
         ),
         _NopeBinding,
     )
-    if mode == "kernel":
+    if extra is not None:  # the one-launch modes
         (out, lse, o_lo), launch = binding.prepared_forward(
             q_latent, kv_latent, plan_indices, lengths, extra
         )
@@ -5136,14 +5206,18 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
     Fifteen forward inputs ``(q_latent, kv_latent, gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal,
     topk_length, softmax_scale, key_passes, dkv_acc, dkv_dst_map, num_segments, dkv_direct, check_dst_map,
     mode)``; returns ``(out, lse)``.  The forward turns the per-document rows into global key rows on device --
-    ``mode == "index_prep"``: one launch of the index-preparation stage into a fresh ``indices [T, K_slots]`` and
-    the row lengths, every row stably compacted (valid keys first, then ``-1``; the length is the valid count)
-    after the position cut of a caller ``topk_length``; ``mode == "kernel"``: the forward kernel reads the
-    per-document rows and writes the same compacted global rows and counts to ``indices_out`` / the lengths itself
-    -- and the forward kernel follows with no host work in between: the plan lookup, the output allocation and
-    the forward's launch values are prepared before the first launch, and nothing on the path synchronizes with
-    the device.  The backward is that of :class:`DSASparseAttentionNopeFunction` over the saved global rows and
-    lengths (the stage's rows and counts on the ``"index_prep"`` route, also with caller lengths): every produced
+    ``mode == "mask"`` (below :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths): the forward kernel
+    alone, in one launch, writes the position-preserving global rows (the global key or ``-1`` at the slot it
+    came from) to a fresh ``indices [T, K_slots]`` and the last valid slot + 1 to the lengths; ``mode ==
+    "index_prep"``: one launch of the index-preparation stage into the fresh ``indices`` and the row lengths,
+    every row stably compacted (valid keys first, then ``-1``; the length is the valid count) after the position
+    cut of a caller ``topk_length``, then the forward kernel with no host work in between; ``mode == "kernel"``
+    (explicit only): the forward kernel writes the same compacted rows and counts as the stage itself.  On every
+    route the plan lookup, the output allocation and the forward's launch values are prepared before the first
+    launch, and nothing on the path synchronizes with the device.  The backward is that of
+    :class:`DSASparseAttentionNopeFunction` over the saved global rows and lengths -- the rows in the order the
+    forward processed them, so forward and backward see the same slots (the stage's rows and counts on the
+    ``"index_prep"`` route, also with caller lengths): every produced
     operand of the backward goes through ``ctx.save_for_backward`` and a tensor ``dkv_acc`` stays caller-owned on
     the node, so a checkpointed forward retains nothing; ``dkv_acc`` may be a callable resolved at backward time
     (:data:`DkvAccSource`).
@@ -5231,15 +5305,19 @@ def dsa_sparse_attention_nope_varlen(
     check_dst_map: bool = False,
     check_cu_seqlens: bool = False,
 ):
-    """Packed multi-document NoPE form: per-document key indices are turned into global key rows on device in
-    one launch of the record's index-preparation stage right before the forward kernel
-    (:func:`nope_varlen_index_mode`: at every table size while :data:`NOPE_CONVERT_SLOT_LIMIT` is 0), then the
-    flat kernels run over the packed rows.  Each row is compacted stably: its valid keys come first in ascending
-    slot order, then ``-1``, and the row's length is its valid count -- bitwise ``offset_gather_kv_indices(...,
-    compact=True)`` -- so rows with ``-1`` holes cost their valid slots in the forward and the backward, and rows
-    whose valid slots already come first give the results of the position-preserving form bitwise.  A caller
-    ``topk_length`` is a position cut applied before compaction (slots at positions ``>= topk_length[t]`` are
-    invalid regardless of content); the kernels then read the compacted rows and their counts.  Query and key
+    """Packed multi-document NoPE form: per-document key indices are turned into global key rows on device and
+    the flat kernels run over the packed rows.  The route follows the table size (:func:`nope_varlen_index_mode`).
+    Below :data:`NOPE_CONVERT_SLOT_LIMIT` slots, without caller lengths, the forward kernel alone converts the
+    rows in its single launch, position-preserving: the global key or ``-1`` at the slot it came from -- bitwise
+    ``offset_gather_kv_indices(...)`` -- and each row's length is its last valid slot + 1, so a ``-1`` before the
+    last valid key stays a masked slot the kernels process (small tables pay that for their holes).  At or above
+    the limit, and always with a caller ``topk_length``, one launch of the record's index-preparation stage runs
+    right before the forward kernel and compacts each row stably: its valid keys come first in ascending slot
+    order, then ``-1``, and the row's length is its valid count -- bitwise ``offset_gather_kv_indices(...,
+    compact=True)`` -- so rows with ``-1`` holes cost their valid slots in the forward and the backward.  Rows whose
+    valid slots already come first give the same bytes on both routes.  A caller ``topk_length`` is a position cut
+    applied before compaction (slots at positions ``>= topk_length[t]`` are invalid regardless of content); the
+    kernels then read the compacted rows and their counts.  Query and key
     segment lengths may differ (the query segment is the tail of its key prefix); ``causal=True`` also drops
     selected keys after the query's own position ``(seqlen_k - seqlen_q) + local_q``.  ``max_seqlen_q/k`` are
     accepted for signature parity and not used on the host.  The segment count ``len(cu_seqlens_k) - 1`` is passed
@@ -5317,7 +5395,9 @@ def forward_nope_varlen(
     """Kernel-level packed NoPE forward without autograd: the validation and the index route of
     :func:`dsa_sparse_attention_nope_varlen` (:func:`nope_varlen_index_mode`), returning
     ``(out, lse, o_lo, indices, topk_length)`` -- the forward outputs plus the global key rows and row lengths the
-    forward read: on the stage route the stably compacted rows (valid keys first, then ``-1``) and their valid
+    forward read: below :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths the position-preserving rows
+    (the global key or ``-1`` at the slot it came from) and the last valid slot + 1 per row, written by the
+    forward itself; on the stage route the stably compacted rows (valid keys first, then ``-1``) and their valid
     counts, after the cut of a caller ``topk_length``; the pair the kernel-level backward consumes::
 
         dq, _ = backward_nope(q_latent, kv_latent, indices, out, o_lo, lse, dout, topk_length=topk_length,

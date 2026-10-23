@@ -3433,12 +3433,13 @@ def test_nope_record_registers_the_index_prep_stage_first():
 
 
 def test_nope_index_prep_availability_and_mode_follow_the_record(monkeypatch):
-    """With the stage in the record the packed entry takes it at every table size (the compacting route;
-    ``NOPE_CONVERT_SLOT_LIMIT`` is 0).  Without the stage a forward program advertising the conversion operands
-    is the stage-less fallback (``"kernel"``: the forward converts the rows itself in its single launch; since
-    flour ae939ee44 its scan lanes write the stable compaction and the valid counts too, so both routes agree
-    bitwise on hole rows); a program with neither refuses on a served device (no torch fallback).  A limit above
-    zero (measurement only) re-enables the converting forward below it."""
+    """With the stage in the record the packed entry's route follows the table size: the one-launch
+    position-preserving forward (``"mask"``) below ``NOPE_CONVERT_SLOT_LIMIT`` slots, the compacting stage at or
+    above it and always with caller lengths.  Without the stage a forward program advertising the conversion
+    operands is the stage-less fallback (``"mask"`` at every size; a caller cut needs the stage); a program with
+    neither refuses on a served device (no torch fallback).  The shipped limit keeps both small bench tables
+    (1024 x 128 and 1024 x 512 slots) on the one-launch forward; a limit of 0 (measurement) is the stage at every
+    size."""
     record = dict(cake_jit.record(NOPE_PROGRAM))
     record.pop(NOPE_INDEX_PREP_STAGE, None)
     monkeypatch.setitem(cake_jit.MODULES, NOPE_PROGRAM, record)
@@ -3448,14 +3449,21 @@ def test_nope_index_prep_availability_and_mode_follow_the_record(monkeypatch):
         for name in cake_backend.NOPE_FWD_CONVERT_ARGS
     )
     assert cake_backend.nope_fwd_converts_indices() is converts
-    assert cake_backend.NOPE_CONVERT_SLOT_LIMIT == 0
+    limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    assert limit > 1024 * 512  # both small bench tables take the one-launch forward
+    assert cake_backend.nope_varlen_index_mode(1024, 128) == "mask"
+    assert cake_backend.nope_varlen_index_mode(1024, 512) == "mask"
     if not _device_supported():
         return
     idx = torch.zeros(4, 3, dtype=torch.int32, device="cuda")
     if converts:
-        assert cake_backend.varlen_index_mode(idx) == "kernel"
+        assert cake_backend.varlen_index_mode(idx) == "mask"
         with pytest.raises(NotImplementedError, match="index-preparation"):
             cake_backend.varlen_index_mode(idx, caller_lengths=True)
+        # the stage-less fallback does not depend on the size
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+        assert cake_backend.varlen_index_mode(idx) == "mask"
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", limit)
     else:
         with pytest.raises(NotImplementedError, match="index-preparation"):
             cake_backend.varlen_index_mode(idx)
@@ -3465,7 +3473,6 @@ def test_nope_index_prep_availability_and_mode_follow_the_record(monkeypatch):
         cake_backend.nope_compact_indices(idx, 8)
     record[NOPE_INDEX_PREP_STAGE] = dict(_INDEX_PREP_STAND_IN)
     assert cake_backend.nope_index_prep_available(torch.device("cuda")) is True
-    assert cake_backend.varlen_index_mode(idx) == "index_prep"
     assert cake_backend.varlen_index_mode(idx, caller_lengths=True) == "index_prep"
     monkeypatch.setitem(
         cake_launch.STAGE_ARGS,
@@ -3474,12 +3481,59 @@ def test_nope_index_prep_availability_and_mode_follow_the_record(monkeypatch):
         + list(cake_backend.NOPE_FWD_CONVERT_ARGS),
     )
     assert cake_backend.nope_fwd_converts_indices()
+    assert cake_backend.varlen_index_mode(idx) == "mask"  # 12 slots: below the limit
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
     assert cake_backend.varlen_index_mode(idx) == "index_prep"
-    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
-    assert cake_backend.varlen_index_mode(idx) == "kernel"
     assert cake_backend.varlen_index_mode(idx, caller_lengths=True) == "index_prep"
-    assert cake_backend.nope_varlen_index_mode(1024, 1023) == "kernel"
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
+    assert cake_backend.varlen_index_mode(idx) == "mask"
+    assert cake_backend.varlen_index_mode(idx, caller_lengths=True) == "index_prep"
+    assert cake_backend.nope_varlen_index_mode(1024, 1023) == "mask"
     assert cake_backend.nope_varlen_index_mode(1024, 1024) == "index_prep"
+    # a program without the converting forward: the stage at every size
+    monkeypatch.setitem(
+        cake_launch.STAGE_ARGS,
+        "nope_fwd",
+        [n for n in cake_launch.STAGE_ARGS["nope_fwd"] if n != "convert"],
+    )
+    assert not cake_backend.nope_fwd_converts_indices()
+    assert cake_backend.varlen_index_mode(idx) == "index_prep"
+
+
+def test_nope_index_modes_follow_the_slot_limit_on_the_host(monkeypatch):
+    """The size rule alone (no device, no registry): ``nope_varlen_index_mode`` and ``nope_flat_index_mode``
+    pick the one-launch position-preserving forward (``"mask"``) for ``T * K < NOPE_CONVERT_SLOT_LIMIT`` and the
+    compacting stage (``"index_prep"``) at or above it -- the boundary at ``T * K == limit - 1`` / ``== limit``
+    -- while caller lengths take the stage at every size and the compacting one-launch mode (``"kernel"``,
+    ``convert = 1``) is never selected by size.  The shipped limit keeps both small bench tables below it; a limit
+    of 0 is the stage at every size and the baseline's ``1 << 20`` splits 1024 x 1023 from 1024 x 1024."""
+    limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    varlen, flat = (
+        cake_backend.nope_varlen_index_mode,
+        cake_backend.nope_flat_index_mode,
+    )
+    assert isinstance(limit, int) and limit > 1024 * 512
+    for T, K in ((1024, 128), (1024, 512), (1, 1), (0, 2176), (limit - 1, 1)):
+        assert varlen(T, K) == "mask" and flat(T, K) == "mask", (T, K)
+        assert varlen(T, K, caller_lengths=True) == "index_prep"
+    for T, K in ((limit, 1), (1, limit), (16263, 2176), (limit + 1, 1)):
+        assert varlen(T, K) == "index_prep" and flat(T, K) == "index_prep", (T, K)
+        assert varlen(T, K, caller_lengths=True) == "index_prep"
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    assert varlen(1, 1) == "index_prep" and flat(1, 1) == "index_prep"
+    assert varlen(0, 1) == "index_prep" and flat(0, 1) == "index_prep"
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
+    assert varlen(1024, 1023) == "mask" and varlen(1024, 1024) == "index_prep"
+    assert flat(1024, 1023) == "mask" and flat(1024, 1024) == "index_prep"
+    assert varlen(4096, 255) == "mask" and varlen(4096, 256) == "index_prep"
+    modes = {
+        f(T, K)
+        for f in (varlen, flat)
+        for T in (0, 1, 1024, 4096, 16384)
+        for K in (1, 7, 128, 2176)
+    }
+    assert modes == {"mask", "index_prep"}
+    assert (cake_backend.NOPE_CONVERT_COMPACT, cake_backend.NOPE_CONVERT_MASK) == (1, 2)
 
 
 def test_kv_latent_rows_squeezes_the_one_head_form_only():
@@ -4000,14 +4054,17 @@ def test_nope_index_prep_launch_values(monkeypatch):
     the compaction mode (``nope_globalize_indices`` default ``compact=False`` keeps the position-preserving glue
     promise, ``compact=True`` compacts; a caller cut arrives as ``length_in`` with ``has_length_in = 1``, else the
     ``topk_length`` output pointer stands in and ``has_length_in = 0``), the four-rows-per-CTA grid -- and the
-    packed entry: always the compacting stage first (``compact = 1``), then the forward over its rows with
-    ``convert = 0`` reading the stage's counts; caller lengths reach the stage as the cut, never the forward."""
+    packed entry on the stage route (the limit set to 0 here: the example is below the shipped limit): the
+    compacting stage first (``compact = 1``), then the forward over its rows with ``convert = 0`` reading the
+    stage's counts; caller lengths reach the stage as the cut, never the forward."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
     T, K = (int(d) for d in local.shape)
-    assert cake_backend.varlen_index_mode(local) == "index_prep"
+    assert cake_backend.varlen_index_mode(local) == "mask"  # 45 slots: below the limit
     assert cake_backend.varlen_index_mode(local, caller_lengths=True) == "index_prep"
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    assert cake_backend.varlen_index_mode(local) == "index_prep"
     indices, lengths = nope_globalize_indices(local, cu_q, cu_k, causal=True)
     assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE]
     v = calls[0][1]
@@ -4126,53 +4183,97 @@ def test_nope_index_prep_launch_values(monkeypatch):
     assert calls == []
 
 
-def test_nope_flat_entry_compacts_through_the_stage_flat_mode(monkeypatch):
-    """The flat autograd entry without caller lengths: one launch of the stage in flat mode (``has_docs = 0``,
-    ``flat_bound = S - 1``, ``compact = 1``, no cut, the prefix sums inert) into a fresh ``[T, K]`` / ``[T]`` pair
-    that the forward (``convert = 0``, the counts as lengths) and the saved backward read; with caller lengths the
-    entry keeps today's path (the forward alone over the caller's rows and lengths).  ``nope_compact_indices`` is
-    the same flat launch exposed: the compacted rows and counts of global rows, with an optional cut.  The eager
-    ``forward_nope`` keeps raw-row semantics (the forward derives last-valid + 1 in-kernel)."""
+@pytest.mark.parametrize("route", ["mask", "index_prep"])
+def test_nope_flat_entry_route_follows_the_table_size(monkeypatch, route):
+    """The flat autograd entry without caller lengths (``nope_flat_index_mode``).  Below the slot limit
+    (``"mask"``): one launch of the forward over the caller's rows as given -- ``has_topk_length = 1,
+    derive_length = 1, convert = 0``, the forward deriving the last valid slot + 1 into a fresh ``[T]`` vector --
+    and the saved pair is the caller's rows with that vector.  At or above it (``"index_prep"``; the limit set to
+    0 here): one launch of the stage in flat mode (``has_docs = 0``, ``flat_bound = S - 1``, ``compact = 1``, no
+    cut, the prefix sums inert) into a fresh ``[T, K]`` / ``[T]`` pair that the forward (``convert = 0``, the
+    counts as lengths) and the saved backward read.  With caller lengths the entry keeps the forward alone over
+    the caller's rows and lengths on either route.  ``nope_compact_indices`` is the flat stage launch exposed: the
+    compacted rows and counts of global rows, with an optional cut.  The eager ``forward_nope`` keeps raw-row
+    semantics (the forward derives last-valid + 1 in-kernel)."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     T, S, K = 8, 64, 5
+    if route == "index_prep":
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    assert cake_backend.nope_flat_index_mode(T, K) == route
     q, kv, idx, _ = _nope_device_inputs(T, S, K)
     q.requires_grad_()
     out = cake_backend.dsa_sparse_attention_nope(q, kv, idx)
-    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
-    prep, fwd = calls[0][1], calls[1][1]
-    assert (prep["has_docs"], prep["flat_bound"], prep["write_out"]) == (0, S - 1, 1)
-    assert (prep["compact"], prep["has_length_in"], prep["causal"]) == (1, 0, 0)
-    assert (prep["num_docs"], prep["search_iters"]) == (1, 1)
-    assert (prep["num_rows"], prep["topk"], prep["idx_stride"]) == (T, K, K)
-    assert prep["indices"].data_ptr() == idx.data_ptr()
-    assert tuple(prep["out"].shape) == (T, K) and prep["out"].is_contiguous()
-    assert (
-        prep["out"].data_ptr() != idx.data_ptr()
-    )  # a fresh buffer: the caller's rows are not rewritten
-    for name in (
-        "cu_seqlens_q",
-        "cu_seqlens_k",
-    ):  # never read in flat mode, valid pointers all the same
-        assert prep[name].dtype == torch.int32 and prep[name].is_cuda
-    assert fwd["indices"].data_ptr() == prep["out"].data_ptr()
-    assert fwd["topk_length"] is prep["topk_length"]
-    assert (fwd["has_topk_length"], fwd["derive_length"], fwd["convert"]) == (1, 0, 0)
-    saved = (
-        out.grad_fn.saved_tensors
-    )  # (q, kv, out, lse, o_lo, rows, lengths): the stage's pair, not ``idx``
-    assert saved[5].data_ptr() == prep["out"].data_ptr()
-    assert saved[6].data_ptr() == prep["topk_length"].data_ptr()
-    assert out.grad_fn.nope_prep.has_topk_length
-    # a column slice of a wider buffer and a view inside a storage are read in place by the flat stage
+    saved = out.grad_fn.saved_tensors  # (q, kv, out, lse, o_lo, rows, lengths)
+    assert len(saved) == 7 and out.grad_fn.nope_prep.has_topk_length
     wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
     wide[:, 3 : 3 + K] = idx
-    del calls[:]
-    cake_backend.dsa_sparse_attention_nope(q, kv, wide[:, 3 : 3 + K])
-    prep = calls[0][1]
-    assert (prep["idx_stride"], prep["indices_offset"]) == (K + 8, 3)
-    assert prep["indices"].data_ptr() == wide.data_ptr()
-    # caller lengths: unchanged -- the forward alone over the caller's rows, no stage launch
+    if route == "mask":
+        assert [c[0] for c in calls] == ["nope_fwd"]
+        fwd = calls[0][1]
+        assert fwd["indices"].data_ptr() == idx.data_ptr()
+        assert (
+            fwd["indices_out"].data_ptr() == idx.data_ptr()
+        )  # never read: convert = 0
+        assert (fwd["has_topk_length"], fwd["derive_length"], fwd["convert"]) == (
+            1,
+            1,
+            0,
+        )
+        assert (fwd["num_docs"], fwd["search_iters"], fwd["causal"]) == (1, 1, 0)
+        assert tuple(fwd["topk_length"].shape) == (T,)
+        assert fwd["topk_length"].dtype == torch.int32 and fwd["topk_length"].is_cuda
+        # the saved pair: the caller's rows and the vector the forward filled
+        assert saved[5].data_ptr() == idx.data_ptr()
+        assert saved[6].data_ptr() == fwd["topk_length"].data_ptr()
+        # a column slice of a wider buffer is read in place by the forward (its stride and offset); the never-read
+        # ``indices_out`` operand is then the contiguous span of its storage (the binding takes contiguous pointers)
+        del calls[:]
+        cake_backend.dsa_sparse_attention_nope(q, kv, wide[:, 3 : 3 + K])
+        assert [c[0] for c in calls] == ["nope_fwd"]
+        fwd = calls[0][1]
+        assert (fwd["idx_stride"], fwd["indices_offset"]) == (K + 8, 3)
+        assert fwd["indices"].data_ptr() == wide.data_ptr()
+        assert fwd["indices_out"].is_contiguous()
+        assert fwd["indices_out"].data_ptr() == wide.data_ptr()
+    else:
+        assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
+        prep, fwd = calls[0][1], calls[1][1]
+        assert (prep["has_docs"], prep["flat_bound"], prep["write_out"]) == (
+            0,
+            S - 1,
+            1,
+        )
+        assert (prep["compact"], prep["has_length_in"], prep["causal"]) == (1, 0, 0)
+        assert (prep["num_docs"], prep["search_iters"]) == (1, 1)
+        assert (prep["num_rows"], prep["topk"], prep["idx_stride"]) == (T, K, K)
+        assert prep["indices"].data_ptr() == idx.data_ptr()
+        assert tuple(prep["out"].shape) == (T, K) and prep["out"].is_contiguous()
+        assert (
+            prep["out"].data_ptr() != idx.data_ptr()
+        )  # a fresh buffer: the caller's rows are not rewritten
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+        ):  # never read in flat mode, valid pointers all the same
+            assert prep[name].dtype == torch.int32 and prep[name].is_cuda
+        assert fwd["indices"].data_ptr() == prep["out"].data_ptr()
+        assert fwd["topk_length"] is prep["topk_length"]
+        assert (fwd["has_topk_length"], fwd["derive_length"], fwd["convert"]) == (
+            1,
+            0,
+            0,
+        )
+        # the stage's pair, not ``idx``
+        assert saved[5].data_ptr() == prep["out"].data_ptr()
+        assert saved[6].data_ptr() == prep["topk_length"].data_ptr()
+        # a column slice of a wider buffer and a view inside a storage are read in place by the flat stage
+        del calls[:]
+        cake_backend.dsa_sparse_attention_nope(q, kv, wide[:, 3 : 3 + K])
+        prep = calls[0][1]
+        assert (prep["idx_stride"], prep["indices_offset"]) == (K + 8, 3)
+        assert prep["indices"].data_ptr() == wide.data_ptr()
+    # caller lengths: unchanged on either route -- the forward alone over the caller's rows, no stage launch
     mine = torch.full((T,), 3, dtype=torch.int32, device="cuda")
     del calls[:]
     out_m = cake_backend.dsa_sparse_attention_nope(q, kv, idx, topk_length=mine)
@@ -4213,29 +4314,34 @@ def test_nope_flat_entry_compacts_through_the_stage_flat_mode(monkeypatch):
 
 
 def test_nope_varlen_index_mode_follows_the_table_size(monkeypatch):
-    """The route from the table size alone (``nope_varlen_index_mode``, no device access): with
-    ``NOPE_CONVERT_SLOT_LIMIT == 0`` the compacting stage at every size (and always with caller lengths), so a
-    hole row never costs its gap; ``varlen_index_mode`` applies it to the tensor's shape.  Through the packed
-    entry (stand-in launches) every table is the stage (``compact = 1``), then the forward over its rows with
-    ``convert = 0`` reading the stage's counts.  A limit above zero (measurement only) re-enables the converting
-    forward below it: one launch with ``convert = 1`` (the forward's scan lanes compact the rows like the stage,
-    flour ae939ee44; the lengths it derives are the valid counts)."""
+    """The route from the table size alone (``nope_varlen_index_mode``, no device access): the one-launch
+    position-preserving forward (``"mask"``) below ``NOPE_CONVERT_SLOT_LIMIT`` slots, the compacting stage at or
+    above it and always with caller lengths; ``varlen_index_mode`` applies it to the tensor's shape.  Through the
+    packed entry (stand-in launches; the limit at the baseline's ``1 << 20`` so that 1024 x 1023 and 1024 x 1024
+    straddle it): the small table is one ``nope_fwd`` launch over the caller's rows (their stride) with ``convert
+    = 2`` deriving the lengths (``has_topk_length = 1, derive_length = 1``) into a fresh ``indices_out`` / ``[T]``
+    pair; the large table is the stage (``compact = 1``), then the forward over its rows with ``convert = 0``
+    reading the stage's counts.  A limit of 0 (measurement) is the stage at every size.  The compacting one-launch
+    mode is explicit only (``_packed_forward_nope(..., "kernel")``: ``convert = 1``); neither one-launch mode
+    takes caller lengths."""
     limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
     mode = cake_backend.nope_varlen_index_mode
-    assert limit == 0
     for T, K in ((1024, 1023), (1024, 1024), (1, 1), (0, 2176), (16263, 2176)):
-        assert mode(T, K) == "index_prep" and mode(T, K, caller_lengths=True) == (
-            "index_prep"
-        )
+        want = "mask" if limit > T * K else "index_prep"
+        assert mode(T, K) == want and mode(T, K, caller_lengths=True) == "index_prep"
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     assert (
         cake_backend.nope_fwd_converts_indices()
     )  # the shipped tables carry the conversion operands
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
+    assert mode(1024, 1023) == "mask" and mode(1024, 1024) == "index_prep"
+    assert mode(1, 1) == "mask" and mode(0, 2176) == "mask"
+    assert mode(4, 3, caller_lengths=True) == "index_prep"
     large = torch.zeros(1024, 1024, dtype=torch.int32, device="cuda")
     small = large[:, :1023]
     assert cake_backend.varlen_index_mode(large) == "index_prep"
-    assert cake_backend.varlen_index_mode(small) == "index_prep"
+    assert cake_backend.varlen_index_mode(small) == "mask"
     assert cake_backend.varlen_index_mode(small, caller_lengths=True) == "index_prep"
     with pytest.raises(ValueError, match=r"\[T, K_slots\]"):
         cake_backend.varlen_index_mode(large[0])
@@ -4243,45 +4349,67 @@ def test_nope_varlen_index_mode_follows_the_table_size(monkeypatch):
     cu_k = torch.tensor([0, 1024], dtype=torch.int32, device="cuda")
     q, kv, _ = _nope_host_inputs(total_q=1024, total_k=1024, topk=1024, device="cuda")
     varlen = cake_backend.dsa_sparse_attention_nope_varlen
-    for table in (large, small):
-        del calls[:]
-        varlen(q, kv, table, cu_q, cu_k)
-        assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
-        prep, fwd = calls[0][1], calls[1][1]
-        assert (prep["num_rows"], prep["topk"], prep["write_out"]) == (
-            1024,
-            int(table.shape[1]),
-            1,
-        )
-        assert (prep["compact"], prep["has_length_in"]) == (1, 0)
-        assert prep["idx_stride"] == 1024
-        assert (
-            fwd["convert"] == 0 and fwd["indices"].data_ptr() == prep["out"].data_ptr()
-        )
-        assert fwd["topk_length"] is prep["topk_length"]
-        assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 0)
-        assert (fwd["idx_stride"], fwd["topk"]) == (
-            int(table.shape[1]),
-            int(table.shape[1]),
-        )
-    # the measurement route: a limit above zero re-enables the converting forward below it
-    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
-    assert mode(1024, 1023) == "kernel" and mode(1024, 1024) == "index_prep"
-    assert mode(1, 1) == "kernel" and mode(0, 2176) == "kernel"
-    assert mode(4, 3, caller_lengths=True) == "index_prep"
-    assert cake_backend.varlen_index_mode(large) == "index_prep"
-    assert cake_backend.varlen_index_mode(small) == "kernel"
-    assert cake_backend.varlen_index_mode(small, caller_lengths=True) == "index_prep"
+    # at or above the limit: the stage, then the forward over its rows
+    del calls[:]
+    varlen(q, kv, large, cu_q, cu_k)
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
+    prep, fwd = calls[0][1], calls[1][1]
+    assert (prep["num_rows"], prep["topk"], prep["write_out"]) == (1024, 1024, 1)
+    assert (prep["compact"], prep["has_length_in"]) == (1, 0)
+    assert prep["idx_stride"] == 1024
+    assert fwd["convert"] == 0 and fwd["indices"].data_ptr() == prep["out"].data_ptr()
+    assert fwd["topk_length"] is prep["topk_length"]
+    assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 0)
+    assert (fwd["idx_stride"], fwd["topk"]) == (1024, 1024)
+    # below the limit: the forward alone over the caller's rows, converting them position-preserving
     del calls[:]
     varlen(q, kv, small, cu_q, cu_k)
     assert [c[0] for c in calls] == ["nope_fwd"]
     fwd = calls[0][1]
-    assert fwd["convert"] == 1 and (fwd["idx_stride"], fwd["topk"]) == (1024, 1023)
+    assert fwd["convert"] == cake_backend.NOPE_CONVERT_MASK == 2
+    assert (fwd["idx_stride"], fwd["topk"]) == (1024, 1023)
     assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 1)
     assert fwd["indices"].data_ptr() == small.data_ptr()
-    with pytest.raises(ValueError, match="kernel mode"):
+    assert tuple(fwd["indices_out"].shape) == (1024, 1023)
+    assert (
+        fwd["indices_out"].is_contiguous() and fwd["indices_out"].dtype == torch.int32
+    )
+    assert fwd["indices_out"].data_ptr() != small.data_ptr()
+    assert tuple(fwd["topk_length"].shape) == (1024,)
+    assert fwd["cu_seqlens_q"] is cu_q and fwd["cu_seqlens_k"] is cu_k
+    assert (fwd["num_docs"], fwd["search_iters"], fwd["causal"]) == (1, 1, 0)
+    # the kernel-level pair returns the forward's rows and lengths
+    del calls[:]
+    _, _, _, rows, lengths = cake_backend.forward_nope_varlen(
+        q, kv, small, cu_q, cu_k, causal=True
+    )
+    assert [c[0] for c in calls] == ["nope_fwd"]
+    assert calls[0][1]["indices_out"] is rows and calls[0][1]["topk_length"] is lengths
+    assert calls[0][1]["causal"] == 1
+    # a limit of 0: the stage at every size
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    assert mode(1, 1) == "index_prep"
+    assert cake_backend.varlen_index_mode(small) == "index_prep"
+    del calls[:]
+    varlen(q, kv, small, cu_q, cu_k)
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
+    assert calls[1][1]["convert"] == 0
+    # the compacting one-launch mode, by name only
+    del calls[:]
+    cake_backend._packed_forward_nope(
+        q, kv, small, cu_q, cu_k, True, None, 1 / 16, "kernel"
+    )
+    assert [c[0] for c in calls] == ["nope_fwd"]
+    assert calls[0][1]["convert"] == cake_backend.NOPE_CONVERT_COMPACT == 1
+    assert (calls[0][1]["has_topk_length"], calls[0][1]["derive_length"]) == (1, 1)
+    for name in ("kernel", "mask"):
+        with pytest.raises(ValueError, match=f"{name} mode"):
+            cake_backend._packed_forward_nope(
+                q, kv, small, cu_q, cu_k, True, cu_q.new_zeros(1024), 1 / 16, name
+            )
+    with pytest.raises(ValueError, match="unknown NoPE index mode"):
         cake_backend._packed_forward_nope(
-            q, kv, small, cu_q, cu_k, True, cu_q.new_zeros(1024), 1 / 16, "kernel"
+            q, kv, small, cu_q, cu_k, True, None, 1 / 16, "torch"
         )
 
 
@@ -4403,7 +4531,8 @@ def test_nope_index_prep_route_issues_the_forward_with_nothing_left_to_do(
 ):
     """On the preparation route the packed entry allocates every buffer, binds the forward's values and converts
     its tensor operands before the stage launch; between the two launches nothing runs but the forward's binding
-    call.  The kernel route keeps its single launch without any conversion."""
+    call.  Below the slot limit without caller lengths the one-launch route keeps its single launch without any
+    conversion."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     events = []
@@ -4450,7 +4579,9 @@ def test_nope_index_prep_route_issues_the_forward_with_nothing_left_to_do(
         assert calls[0][1]["topk_length"] is lengths
         assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
         assert calls[1][1]["out"] is out and calls[1][1]["indices"] is indices
-    # without caller lengths the same two launches, in the same order
+    # without caller lengths at or above the limit (a limit of 0 here) the same two launches, in the same order
+    limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
     del events[:], calls[:]
     cake_backend.forward_nope_varlen(q, kv, local, cu_q, cu_k, causal=True)
     first = events.index(("launch", NOPE_INDEX_PREP_STAGE))
@@ -4460,27 +4591,32 @@ def test_nope_index_prep_route_issues_the_forward_with_nothing_left_to_do(
     ], events
     assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
     assert calls[0][1]["has_length_in"] == 0
-    # the measurement route (a limit above zero): one launch from the host tensors, nothing converted
-    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
+    # below the limit (the shipped route for this table): one launch from the host tensors, nothing converted
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", limit)
+    assert cake_backend.varlen_index_mode(local) == "mask"
     del events[:], calls[:]
     cake_backend.forward_nope_varlen(q, kv, local, cu_q, cu_k, causal=True)
     assert [e for e in events if e != "alloc"] == [("launch", "nope_fwd")], events
     assert [c[0] for c in calls] == ["nope_fwd"]
+    assert calls[0][1]["convert"] == cake_backend.NOPE_CONVERT_MASK
 
 
 def test_nope_kernel_level_packed_forward_is_the_public_entry_without_autograd(
     monkeypatch,
 ):
     """``forward_nope_varlen`` (no autograd) takes the packed entry's route and returns the outputs plus the
-    compacted global rows and their counts ``backward_nope`` consumes: with stand-in launches the compacting
-    stage then the forward over its rows (``convert = 0``) at every table size; a call without query rows launches
-    nothing.  Under a monkeypatched limit the small table takes the converting forward alone (``convert = 1``,
-    the fresh rows as ``indices_out``: the same stable compaction, written by the forward's scan lanes)."""
+    global rows and lengths ``backward_nope`` consumes.  With stand-in launches: at or above the slot limit (a
+    limit of 0 here) the compacting stage then the forward over its rows (``convert = 0``); below it (the shipped
+    route for the small example) the converting forward alone -- ``convert = 2``, the fresh rows as
+    ``indices_out`` (position-preserving, written by the forward's scan lanes) and the derived lengths; the
+    compacting one-launch mode by name (``convert = 1``).  A call without query rows launches nothing."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
     T, K = (int(d) for d in local.shape)
     q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
+    limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
     out, lse, o_lo, indices, lengths = cake_backend.forward_nope_varlen(
         q, kv, local, cu_q, cu_k, causal=True
     )
@@ -4501,7 +4637,9 @@ def test_nope_kernel_level_packed_forward_is_the_public_entry_without_autograd(
     assert calls[0][1]["out"] is idx2 and calls[0][1]["topk_length"] is len2
     assert calls[1][1]["indices"].data_ptr() == idx2.data_ptr()
     assert calls[1][1]["topk_length"] is len2 and calls[1][1]["convert"] == 0
-    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
+    # the shipped limit: the small example takes the one-launch position-preserving forward
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", limit)
+    assert cake_backend.varlen_index_mode(local) == "mask"
     del calls[:]
     out, lse, o_lo, indices, lengths = cake_backend.forward_nope_varlen(
         q, kv, local, cu_q, cu_k, causal=True
@@ -4510,6 +4648,17 @@ def test_nope_kernel_level_packed_forward_is_the_public_entry_without_autograd(
     v = calls[0][1]
     assert v["out"] is out and v["lse"] is lse and v["o_lo"] is o_lo
     assert v["indices_out"] is indices and v["topk_length"] is lengths
+    assert (v["convert"], v["causal"]) == (2, 1)
+    assert (v["has_topk_length"], v["derive_length"]) == (1, 1)
+    assert tuple(indices.shape) == (T, K) and tuple(lengths.shape) == (T,)
+    # the compacting one-launch mode, by name
+    del calls[:]
+    _, _, _, idx_k, len_k = cake_backend._packed_forward_nope(
+        q, kv, local, cu_q, cu_k, True, None, 1 / 16, "kernel"
+    )
+    assert [c[0] for c in calls] == ["nope_fwd"]
+    v = calls[0][1]
+    assert v["indices_out"] is idx_k and v["topk_length"] is len_k
     assert (v["convert"], v["causal"]) == (1, 1)
     del calls[:]
     e = cake_backend.forward_nope_varlen(
@@ -4520,23 +4669,33 @@ def test_nope_kernel_level_packed_forward_is_the_public_entry_without_autograd(
 
 
 @pytest.mark.parametrize(
+    "limit", ["shipped", 0, 1 << 40], ids=["shipped", "stage", "mask"]
+)
+@pytest.mark.parametrize(
     "seqs_q, seqs_k, topk",
     [
-        ([300, 517, 0, 1024], [400, 517, 64, 2048], 200),
+        ([300, 517, 0, 1024], [400, 517, 64, 2048], 200),  # 368,200 slots
         (
             [640, 512],
             [1024, 1024],
             1024,
-        ),  # at or above the slot limit: the preparation launch route
+        ),  # 1,179,648 slots: above the baseline's 1 << 20
     ],
 )
-def test_nope_kernel_level_packed_pair_matches_the_autograd_entry(seqs_q, seqs_k, topk):
+def test_nope_kernel_level_packed_pair_matches_the_autograd_entry(
+    seqs_q, seqs_k, topk, limit, monkeypatch
+):
     """The kernel-level pair -- ``forward_nope_varlen`` and ``backward_nope`` (and its prepared form through
     ``prepare_dsa_nope_train``) over the rows and lengths it returns -- against the autograd packed entry on both
-    index routes: ``out``, ``lse`` and ``dq`` bitwise, ``dkv`` (FP32 atomics into a caller buffer on both sides)
-    within the summation-order spread."""
+    index routes (the shipped limit, the stage forced by a limit of 0, the one-launch forward forced by a limit
+    above every table): ``out``, ``lse`` and ``dq`` bitwise, ``dkv`` (FP32 atomics into a caller buffer on both
+    sides) within the summation-order spread."""
     _require_nope_index_prep()
     _require_nope_program(backward=True)
+    if limit != "shipped":
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", limit)
+    if cake_backend.nope_varlen_index_mode(sum(seqs_q), topk) == "mask":
+        _require_nope_mask_route()
     inp = nope_ref.make_nope_inputs(
         seqs_q, seqs_k, seed=NOPE_SEED + 700 + topk, topk=topk, index="iid"
     )
@@ -4594,15 +4753,15 @@ def test_nope_kernel_level_packed_pair_matches_the_autograd_entry(seqs_q, seqs_k
     assert rel_l2(acc_r, acc) < 1e-5
 
 
-def test_nope_packed_entry_takes_the_stage_even_when_the_forward_program_converts(
-    monkeypatch,
-):
-    """A forward program that appends the conversion operands does not shortcut the packed entry: the compacting
-    stage runs first over the per-document rows (their own stride and offset through the flat alias) and the
-    forward takes its rows with ``convert = 0`` and valid pointers for the operands it never reads; caller lengths
-    reach the stage as the cut and the forward reads the stage's counts; a flat forward passes ``convert = 0``
-    with the index operand doubling as ``indices_out``.  Only a monkeypatched limit above zero (the measurement
-    route) lets the forward convert the rows itself -- ``convert = 1``, compacting like the stage."""
+def test_nope_packed_entry_route_when_the_forward_program_converts(monkeypatch):
+    """A forward program that appends the conversion operands: at or above the slot limit (a limit of 0 here) the
+    compacting stage runs first over the per-document rows (their own stride and offset through the flat alias)
+    and the forward takes its rows with ``convert = 0`` and valid pointers for the operands it never reads; caller
+    lengths reach the stage as the cut at any limit and the forward reads the stage's counts; a flat forward
+    passes ``convert = 0`` with the index operand doubling as ``indices_out``.  Below the limit (the shipped route
+    for the small example) the forward converts the rows itself in one launch -- ``convert = 2``,
+    position-preserving, the lengths derived -- and the compacting one-launch mode is reachable by name only
+    (``convert = 1``)."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     names = list(cake_launch.STAGE_ARGS["nope_fwd"])
@@ -4618,8 +4777,11 @@ def test_nope_packed_entry_takes_the_stage_even_when_the_forward_program_convert
     local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
     T, K = (int(d) for d in local.shape)
     assert cake_backend.nope_fwd_converts_indices()
-    assert cake_backend.varlen_index_mode(local) == "index_prep"
+    limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    assert cake_backend.varlen_index_mode(local) == "mask"
     assert cake_backend.varlen_index_mode(local, caller_lengths=True) == "index_prep"
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    assert cake_backend.varlen_index_mode(local) == "index_prep"
     wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
     wide[:, 3 : 3 + K] = local
     q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
@@ -4640,7 +4802,8 @@ def test_nope_packed_entry_takes_the_stage_even_when_the_forward_program_convert
     assert (v["num_docs"], v["search_iters"], v["causal"]) == (1, 1, 0)
     for name in ("cu_seqlens_q", "cu_seqlens_k"):
         assert v[name].dtype == torch.int32 and v[name].is_cuda and v[name].numel() >= 2
-    # caller lengths: the stage takes the cut, the forward reads the stage's counts with convert = 0
+    # caller lengths at any limit: the stage takes the cut, the forward reads the stage's counts with convert = 0
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", limit)
     mine = torch.full((T,), 2, dtype=torch.int32, device="cuda")
     del calls[:]
     varlen(q, kv, local, cu_q, cu_k, topk_length=mine)
@@ -4662,16 +4825,17 @@ def test_nope_packed_entry_takes_the_stage_even_when_the_forward_program_convert
     assert v["indices_out"].data_ptr() == idx.data_ptr()
     assert (v["num_docs"], v["search_iters"], v["causal"]) == (1, 1, 0)
     assert v["cu_seqlens_q"].dtype == torch.int32 and v["cu_seqlens_q"].numel() == 2
-    # the measurement route: the converting forward alone over the per-document rows (their stride and offset),
-    # the prefix sums, the document count and search depth, the causal flag, the fresh global-row buffer the
-    # backward reads (the forward's stable compaction) and the derived lengths (the valid counts)
-    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
-    assert cake_backend.varlen_index_mode(local) == "kernel"
+    # below the limit: the converting forward alone over the per-document rows (their stride and offset), the
+    # prefix sums, the document count and search depth, the causal flag, the fresh global-row buffer the backward
+    # reads (position-preserving: convert = 2) and the derived lengths (last valid slot + 1)
+    assert cake_backend.varlen_index_mode(local) == "mask"
     del calls[:]
-    varlen(q, kv, wide[:, 3 : 3 + K], cu_q, cu_k, causal=True)
+    out_m, lse_m = varlen(
+        q, kv, wide[:, 3 : 3 + K], cu_q, cu_k, causal=True, return_lse=True
+    )
     assert [c[0] for c in calls] == ["nope_fwd"]
     v = calls[0][1]
-    assert (v["convert"], v["causal"], v["num_docs"], v["search_iters"]) == (1, 1, 4, 3)
+    assert (v["convert"], v["causal"], v["num_docs"], v["search_iters"]) == (2, 1, 4, 3)
     assert v["cu_seqlens_q"] is cu_q and v["cu_seqlens_k"] is cu_k
     assert v["indices"].data_ptr() == wide.data_ptr()
     assert (v["idx_stride"], v["indices_offset"]) == (K + 8, 3)
@@ -4679,6 +4843,17 @@ def test_nope_packed_entry_takes_the_stage_even_when_the_forward_program_convert
     assert v["indices_out"].dtype == torch.int32
     assert (v["has_topk_length"], v["derive_length"]) == (1, 1)
     assert tuple(v["topk_length"].shape) == (T,)
+    assert v["out"] is out_m and v["lse"] is lse_m
+    # the compacting one-launch mode by name: the same operands with convert = 1
+    del calls[:]
+    cake_backend._packed_forward_nope(
+        q, kv, wide[:, 3 : 3 + K], cu_q, cu_k, True, None, 1 / 16, "kernel"
+    )
+    assert [c[0] for c in calls] == ["nope_fwd"]
+    v = calls[0][1]
+    assert (v["convert"], v["causal"], v["num_docs"], v["search_iters"]) == (1, 1, 4, 3)
+    assert (v["idx_stride"], v["indices_offset"]) == (K + 8, 3)
+    assert (v["has_topk_length"], v["derive_length"]) == (1, 1)
 
 
 def test_nope_plan_backward_fresh_and_accumulate_by_the_direct_rule(monkeypatch):
@@ -5827,6 +6002,42 @@ def _require_nope_compacting_stage():
         )
 
 
+def _require_nope_mask_route():
+    """The forward program of this checkout converts per-document rows position-preserving under ``convert =
+    NOPE_CONVERT_MASK`` (the small-table route): the conversion operands in its launch arguments, and one probe
+    launch below a raised limit that returns the globalized rows with their holes in place and the last valid slot
+    + 1 as lengths.  Skips until the render lands (a forward that still compacts under the new value)."""
+    _require_nope_program()
+    if not cake_backend.nope_fwd_converts_indices():
+        pytest.skip("the registered NoPE forward program has no conversion operands")
+    local = torch.tensor(
+        [[-1, 1, -1, 2], [0, -1, -1, -1]], dtype=torch.int32, device="cuda"
+    )
+    cu_q = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    q, kv, _ = _nope_host_inputs(total_q=2, total_k=8, topk=4, device="cuda")
+    old = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    cake_backend.NOPE_CONVERT_SLOT_LIMIT = 1 << 40
+    try:
+        assert cake_backend.varlen_index_mode(local) == "mask"
+        _, _, _, rows, lengths = cake_backend.forward_nope_varlen(
+            q, kv, local, cu_q, cu_k
+        )
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 -- the shipped kernel predates the mode
+        pytest.skip(
+            f"the NoPE forward of this checkout cannot convert position-preserving: {exc}"
+        )
+    finally:
+        cake_backend.NOPE_CONVERT_SLOT_LIMIT = old
+    if not (
+        torch.equal(rows, local) and torch.equal(lengths, local.new_tensor([4, 1]))
+    ):
+        pytest.skip(
+            "the NoPE forward of this checkout compacts under convert = 2 (the render has not landed)"
+        )
+
+
 def _compact_local_rows(local, glob):
     """The stable compaction of per-document rows ``local`` by the validity of their globalized rows ``glob``
     (``-1`` after the causal rule and the range checks): the twin the kernels must treat bitwise like ``local``."""
@@ -5876,7 +6087,7 @@ def test_nope_index_prep_matches_the_torch_glue_bitwise(
         seqs_q, seqs_k, topk, seed=NOPE_SEED + 500 + topk
     )
     S = int(cu_k[-1])
-    assert cake_backend.varlen_index_mode(local) in ("index_prep", "kernel")
+    assert cake_backend.varlen_index_mode(local) in ("index_prep", "mask")
     want_idx, want_len = offset_gather_kv_indices(
         local, cu_q, cu_k, causal=causal, return_topk_length=True
     )
@@ -5964,24 +6175,33 @@ def test_nope_index_prep_reads_strided_and_offset_index_views_in_place(topk, com
     check_flat(inside)
 
 
+@pytest.mark.parametrize("route", ["shipped", "stage"])
 @pytest.mark.parametrize(
     "seqs_q, seqs_k, topk, causal",
     [
-        ([300, 517, 0, 1024], [400, 517, 64, 2048], 200, False),
-        ([256, 128], [512, 512], 96, True),
-        ([640, 512], [1024, 1024], 1024, False),
+        ([300, 517, 0, 1024], [400, 517, 64, 2048], 200, False),  # 368,200 slots
+        ([256, 128], [512, 512], 96, True),  # 36,864 slots
+        ([640, 512], [1024, 1024], 1024, False),  # 1,179,648 slots
     ],
 )
 def test_nope_packed_entry_with_on_device_index_prep_is_bitwise_the_glue_path(
-    seqs_q, seqs_k, topk, causal
+    seqs_q, seqs_k, topk, causal, route, monkeypatch
 ):
-    """The backend's packed entry (the compacting stage, then the forward over its rows) against the explicit glue
-    -- ``offset_gather_kv_indices`` globalized rows, stably compacted by ``nope_compact_indices`` (== ``compact_rows``)
-    -- plus the flat entry with the counts as caller lengths: ``out``, ``lse`` and ``dq`` bitwise; ``dkv`` (FP32
-    atomics into a caller buffer on both sides) within the summation-order spread.  The random causal rows carry
-    holes (keys the causal rule drops), so the glue side must compact to agree."""
+    """The backend's packed entry against the explicit glue plus the flat entry with caller lengths: ``out``,
+    ``lse`` and ``dq`` bitwise; ``dkv`` (FP32 atomics into a caller buffer on both sides) within the
+    summation-order spread.  On the stage route (at or above the slot limit, or forced by a limit of 0) the glue
+    is ``offset_gather_kv_indices`` globalized rows stably compacted by ``nope_compact_indices`` (==
+    ``compact_rows``) with the counts as lengths: the random causal rows carry holes (keys the causal rule drops),
+    so the glue side must compact to agree.  Below the limit (the one-launch forward) the glue is the
+    position-preserving globalized rows themselves with the last valid slot + 1 as lengths, and the kernel-level
+    ``forward_nope_varlen`` returns exactly that pair."""
     _require_nope_compacting_stage()
     _require_nope_program(backward=True)
+    if route == "stage":
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    mode = cake_backend.nope_varlen_index_mode(sum(seqs_q), topk)
+    if mode == "mask":
+        _require_nope_mask_route()
     inp = nope_ref.make_nope_inputs(
         seqs_q, seqs_k, seed=NOPE_SEED + 600 + topk, topk=topk, index="iid"
     )
@@ -6000,7 +6220,7 @@ def test_nope_packed_entry_with_on_device_index_prep_is_bitwise_the_glue_path(
         leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
         acc = torch.zeros(S, D_LATENT, device="cuda")
         if fused:
-            assert cake_backend.varlen_index_mode(local) == "index_prep"
+            assert cake_backend.varlen_index_mode(local) == mode
             out, lse = cake_backend.dsa_sparse_attention_nope_varlen(
                 leaves[0],
                 leaves[1],
@@ -6015,9 +6235,17 @@ def test_nope_packed_entry_with_on_device_index_prep_is_bitwise_the_glue_path(
             glob = offset_gather_kv_indices(
                 local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=causal
             )
-            idx, lengths = cake_backend.nope_compact_indices(glob, S)
-            rows, counts = compact_rows(glob, S)
-            assert torch.equal(idx, rows) and torch.equal(lengths, counts)
+            if mode == "mask":
+                idx, lengths = glob, nope_ref.last_valid_plus_one(glob, S)
+            else:
+                idx, lengths = cake_backend.nope_compact_indices(glob, S)
+                rows, counts = compact_rows(glob, S)
+                assert torch.equal(idx, rows) and torch.equal(lengths, counts)
+            got = cake_backend.forward_nope_varlen(
+                inp.q, inp.kv, local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=causal
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(got[3], idx) and torch.equal(got[4], lengths)
             out, lse = cake_backend.dsa_sparse_attention_nope(
                 leaves[0],
                 leaves[1],
@@ -6142,15 +6370,19 @@ def _public_nope_step(entry, q, kv, dout, *args, **kw):
 
 
 @pytest.mark.parametrize("name", sorted(_HOLE_CASES))
-def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(name):
-    """Through ``forward_nope_varlen`` the hole rows and their stable per-document twin give ``out``, ``lse``,
-    ``o_lo`` bitwise, the same compacted global rows (``compact_rows`` of the glue's globalized rows) and the same
-    valid counts; ``backward_nope`` over the returned pair gives ``dq`` bitwise and ``dkv`` within the atomics
-    spread.  Through the public entries the varlen call on hole rows, the flat call on the compacted rows with the
-    counts as lengths and the flat call on the hole rows without lengths (the stage's flat mode) agree bitwise on
-    ``out`` / ``lse`` / ``dq``; no query rows give empty outputs and no launch."""
+def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(
+    name, monkeypatch
+):
+    """The stage route (at or above the slot limit; every hole case is below the shipped limit, so the limit is
+    set to 0 here).  Through ``forward_nope_varlen`` the hole rows and their stable per-document twin give
+    ``out``, ``lse``, ``o_lo`` bitwise, the same compacted global rows (``compact_rows`` of the glue's globalized
+    rows) and the same valid counts; ``backward_nope`` over the returned pair gives ``dq`` bitwise and ``dkv``
+    within the atomics spread.  Through the public entries the varlen call on hole rows, the flat call on the
+    compacted rows with the counts as lengths and the flat call on the hole rows without lengths (the stage's flat
+    mode) agree bitwise on ``out`` / ``lse`` / ``dq``; no query rows give empty outputs and no launch."""
     _require_nope_compacting_stage()
     _require_nope_program(backward=True)
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
     c = _hole_case_tensors(name, seed=NOPE_SEED + 800)
     a = cake_backend.forward_nope_varlen(
         c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
@@ -6227,6 +6459,123 @@ def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(
             assert torch.equal(x, y)
         _rel_or_equal(other[3], varlen[3], 1e-5)
     _rel_or_equal(varlen[3], ga[1], 1e-5)
+
+
+@pytest.mark.parametrize("name", sorted(_HOLE_CASES))
+def test_nope_hole_rows_below_the_limit_are_bitwise_the_position_preserving_forward(
+    name, monkeypatch
+):
+    """Below the slot limit (raised above every case here; every case but the 652,800-slot repro also sits below
+    the shipped limit) the packed entry converts in-kernel, position-preserving (``convert = 2``).  Through
+    ``forward_nope_varlen`` the hole rows give the globalized rows of ``offset_gather_kv_indices`` with their
+    holes in place and the last valid slot + 1 as lengths, and ``out`` / ``lse`` / ``o_lo`` bitwise the eager
+    ``forward_nope`` over those rows (the same kernel over the same slot order); ``backward_nope`` over the
+    returned pair gives ``dq`` bitwise the eager backward over the globalized rows with those lengths and ``dkv``
+    within the atomics spread.  Through the public entries the varlen call on hole rows, the flat call on the
+    globalized rows without lengths (one launch deriving the lengths) and the flat call with the derived lengths
+    agree bitwise on ``out`` / ``lse`` / ``dq``; the varlen Function saves exactly that pair; and the outputs and
+    gradients meet the FP64 floors evaluated on the raw slot order.  No query rows give empty outputs and no
+    launch."""
+    _require_nope_program(backward=True)
+    _require_nope_mask_route()
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 40)
+    c = _hole_case_tensors(name, seed=NOPE_SEED + 800)
+    lengths = nope_ref.last_valid_plus_one(c.glob, c.S)
+    if c.T:
+        assert cake_backend.varlen_index_mode(c.local) == "mask"
+        assert cake_backend.nope_flat_index_mode(c.T, int(c.glob.shape[1])) == "mask"
+    a = cake_backend.forward_nope_varlen(
+        c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
+    )
+    e = forward_nope(
+        c.q, c.kv, c.glob
+    )  # the eager kernel over the raw rows derives the same lengths
+    torch.cuda.synchronize()
+    assert torch.equal(a[3], c.glob) and torch.equal(a[4], lengths)
+    for x, y in zip(a[:3], e, strict=True):
+        assert torch.equal(x, y)
+    if c.T == 0:
+        assert tuple(a[0].shape) == (0, NUM_HEADS, D_LATENT) and a[3].numel() == 0
+        out_v = cake_backend.dsa_sparse_attention_nope_varlen(
+            c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
+        )
+        assert tuple(out_v.shape) == (0, NUM_HEADS, D_LATENT)
+        return
+    ga = backward_nope(
+        c.q,
+        c.kv,
+        a[3],
+        a[0],
+        a[2],
+        a[1],
+        c.dout,
+        topk_length=a[4],
+        num_segments=c.num_docs,
+    )
+    gb = backward_nope(
+        c.q,
+        c.kv,
+        c.glob,
+        e[0],
+        e[2],
+        e[1],
+        c.dout,
+        topk_length=lengths,
+        num_segments=c.num_docs,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(ga[0], gb[0])
+    _rel_or_equal(ga[1], gb[1], 1e-5)
+    varlen = _public_nope_step(
+        cake_backend.dsa_sparse_attention_nope_varlen,
+        c.q,
+        c.kv,
+        c.dout,
+        c.local,
+        c.cu_q,
+        c.cu_k,
+        causal=True,
+    )
+    flat_h = _public_nope_step(
+        cake_backend.dsa_sparse_attention_nope,
+        c.q,
+        c.kv,
+        c.dout,
+        c.glob,
+        num_segments=c.num_docs,
+    )
+    flat_l = _public_nope_step(
+        cake_backend.dsa_sparse_attention_nope,
+        c.q,
+        c.kv,
+        c.dout,
+        c.glob,
+        topk_length=lengths,
+        num_segments=c.num_docs,
+    )
+    assert torch.equal(varlen[0], a[0]) and torch.equal(varlen[1], a[1])
+    assert torch.equal(varlen[2], ga[0])
+    for other in (flat_h, flat_l):
+        for x, y in zip(varlen[:3], other[:3], strict=True):
+            assert torch.equal(x, y)
+        _rel_or_equal(other[3], varlen[3], 1e-5)
+    _rel_or_equal(varlen[3], ga[1], 1e-5)
+    # the saved pair of both Functions: the position-preserving rows and the last valid slot + 1
+    q_leaf = c.q.detach().clone().requires_grad_()
+    out_v = cake_backend.dsa_sparse_attention_nope_varlen(
+        q_leaf, c.kv, c.local, c.cu_q, c.cu_k, causal=True
+    )
+    saved = out_v.grad_fn.saved_tensors
+    assert torch.equal(saved[5], c.glob) and torch.equal(saved[6], lengths)
+    out_f = cake_backend.dsa_sparse_attention_nope(
+        q_leaf, c.kv, c.glob, num_segments=c.num_docs
+    )
+    saved = out_f.grad_fn.saved_tensors
+    assert saved[5].data_ptr() == c.glob.data_ptr() and torch.equal(saved[6], lengths)
+    # the FP64 floors on the raw slot order (the order both kernels process below the limit)
+    ref = nope_ref.reference_fp64_nope(c.q, c.kv, c.glob, dout=c.dout, compact=False)
+    _check_forward_nope(varlen[0], varlen[1], ref)
+    _check_backward_nope(varlen[2], varlen[3], ref)
 
 
 @pytest.mark.parametrize("name", ["interleaved", "k2177_runs", "repro_small"])
@@ -6307,16 +6656,25 @@ def test_nope_caller_cut_on_hole_rows_is_the_flat_entry_on_the_cut_compaction(na
     )
 
 
+@pytest.mark.parametrize("route", ["mask", "index_prep"])
 @pytest.mark.parametrize("topk", NOPE_SLOT_WIDTHS)
 @pytest.mark.parametrize("offset", [0, 3, 13])
-def test_nope_flat_entry_hole_variants_on_every_slot_width(topk, offset):
+def test_nope_flat_entry_hole_variants_on_every_slot_width(
+    topk, offset, route, monkeypatch
+):
     """Global rows with every third slot ``-1`` (and a fully masked row) at every slot width, read from a column
-    slice at offset 0 / 3 / 13 of a wider buffer: the flat entry without lengths compacts them through the stage's
-    flat mode in place (``nope_compact_indices`` of the view == ``compact_rows``) and is bitwise the flat entry on
-    the compacted rows with the counts."""
+    slice at offset 0 / 3 / 13 of a wider buffer, through the flat entry without lengths.  Below the slot limit
+    (``"mask"``, the shipped route for these 96-row tables): one launch over the view as given, bitwise the flat
+    entry on the view with the last valid slot + 1 as caller lengths and the eager kernel-level pair, the saved
+    pair being the view and those lengths.  At or above it (``"index_prep"``, the limit set to 0): the stage's
+    flat mode compacts the view in place (``nope_compact_indices`` of the view == ``compact_rows``) and the entry
+    is bitwise the flat entry on the compacted rows with the counts."""
     _require_nope_compacting_stage()
     _require_nope_program(backward=True)
     T, S = 96, 1024
+    if route == "index_prep":
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    assert cake_backend.nope_flat_index_mode(T, topk) == route
     gen = torch.Generator(device="cuda").manual_seed(NOPE_SEED + 820 + topk)
     wide = torch.randint(0, S, (T, topk + 16), device="cuda", generator=gen).to(
         torch.int32
@@ -6325,14 +6683,40 @@ def test_nope_flat_entry_hole_variants_on_every_slot_width(topk, offset):
     view[:, 1::3] = -1
     view[5] = -1
     q, kv, dout = _nope_qkv(T, S, seed=NOPE_SEED + 821 + topk)
-    rows, counts = compact_rows(view, S)
-    got = cake_backend.nope_compact_indices(view, S)
-    torch.cuda.synchronize()
-    assert torch.equal(got[0], rows) and torch.equal(got[1], counts)
     holes = _public_nope_step(cake_backend.dsa_sparse_attention_nope, q, kv, dout, view)
-    twin = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope, q, kv, dout, rows, topk_length=counts
-    )
+    if route == "mask":
+        lengths = nope_ref.last_valid_plus_one(view, S)
+        twin = _public_nope_step(
+            cake_backend.dsa_sparse_attention_nope,
+            q,
+            kv,
+            dout,
+            view,
+            topk_length=lengths,
+        )
+        out, lse, o_lo = forward_nope(q, kv, view)
+        dq, _ = backward_nope(q, kv, view, out, o_lo, lse, dout, topk_length=lengths)
+        torch.cuda.synchronize()
+        assert torch.equal(holes[0], out) and torch.equal(holes[1], lse)
+        assert torch.equal(holes[2], dq)
+        q_leaf = q.detach().clone().requires_grad_()
+        saved = cake_backend.dsa_sparse_attention_nope(
+            q_leaf, kv, view
+        ).grad_fn.saved_tensors
+        assert saved[5].data_ptr() == view.data_ptr() and torch.equal(saved[6], lengths)
+    else:
+        rows, counts = compact_rows(view, S)
+        got = cake_backend.nope_compact_indices(view, S)
+        torch.cuda.synchronize()
+        assert torch.equal(got[0], rows) and torch.equal(got[1], counts)
+        twin = _public_nope_step(
+            cake_backend.dsa_sparse_attention_nope,
+            q,
+            kv,
+            dout,
+            rows,
+            topk_length=counts,
+        )
     for x, y in zip(holes[:3], twin[:3], strict=True):
         assert torch.equal(x, y)
     _rel_or_equal(holes[3], twin[3], 1e-5)
@@ -6340,16 +6724,20 @@ def test_nope_flat_entry_hole_variants_on_every_slot_width(topk, offset):
 
 
 def test_nope_kernel_route_compacts_like_the_stage_on_hole_rows(monkeypatch):
-    """The stage-less measurement route (a monkeypatched ``NOPE_CONVERT_SLOT_LIMIT`` above the table size: the
-    forward converts the per-document rows itself, ``convert = 1``) and the stage route agree bitwise on hole rows --
-    ``out``, ``lse``, ``o_lo``, the returned global rows (the stable compaction) and the lengths (the valid counts)
-    through ``forward_nope_varlen``, ``dq`` through the public entry: since flour ae939ee44 the forward's scan lanes
-    write the same compaction the stage does."""
+    """The compacting one-launch mode (``"kernel"``, ``convert = 1``; never selected by size, so the route
+    function is replaced here) and the stage route (the limit set to 0) agree bitwise on hole rows -- ``out``,
+    ``lse``, ``o_lo``, the returned global rows (the stable compaction) and the lengths (the valid counts) through
+    ``forward_nope_varlen``, ``dq`` through the public entry: the forward's scan lanes write the same compaction
+    the stage does."""
     _require_nope_compacting_stage()
     _require_nope_program(backward=True)
     if not cake_backend.nope_fwd_converts_indices():
         pytest.skip("the registered NoPE forward program has no conversion operands")
     c = _hole_case_tensors("interleaved", seed=NOPE_SEED + 835)
+    assert (
+        cake_backend.varlen_index_mode(c.local) == "mask"
+    )  # the shipped route of this table
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
     stage = cake_backend.forward_nope_varlen(
         c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
     )
@@ -6364,8 +6752,11 @@ def test_nope_kernel_route_compacts_like_the_stage_on_hole_rows(monkeypatch):
         causal=True,
     )
     torch.cuda.synchronize()
-    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
-    assert cake_backend.varlen_index_mode(c.local) == "kernel"
+    monkeypatch.setattr(
+        cake_backend,
+        "varlen_index_mode",
+        lambda rows, *, caller_lengths=False: "kernel",
+    )
     kernel = cake_backend.forward_nope_varlen(
         c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
     )
@@ -6484,17 +6875,26 @@ def test_nope_public_entries_capture_into_a_cuda_graph_on_hole_rows():
             assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("route", ["mask", "index_prep"])
 @pytest.mark.parametrize("construction", ["pooled_fixed_tail", "every_third"])
-def test_nope_flat_entry_hole_rows_meet_the_floor_on_the_compacted_order(construction):
-    """Precision of a compacting entry on hole rows against the FP64 reference with its floors evaluated on the
-    compacted order (``reference_fp64_nope(..., compact=True)``: the lazy-rescale floor walks 64-slot tiles in slot
-    order, so the floor depends on the slot order the kernel sees; the exact values do not): ``out`` / ``dq``
-    within 1.02x their floors plus the element-wise and row bands, ``dkv`` within 1.05x.  Constructions: the pooled
-    draw with the open pool's tail at a fixed column over a document that starts inside the query range (the R2
-    structure in miniature: a row has holes only while it holds fewer than ``pools`` complete pools, so the first
-    251 positions carry them) and iid rows with every third slot ``-1`` and a fully masked row."""
+def test_nope_flat_entry_hole_rows_meet_the_floor_on_their_processing_order(
+    construction, route, monkeypatch
+):
+    """Precision of the flat entry without lengths on hole rows (512 x 256 = 131,072 slots) against the FP64
+    reference with its floors evaluated on the order the route processes (the lazy-rescale floor walks 64-slot
+    tiles in slot order, so the floor depends on the slot order the kernel sees; the exact values do not): the raw
+    order below the slot limit (``"mask"``, the shipped route for this table: ``reference_fp64_nope(...,
+    compact=False)``), the compacted order on the stage route (``"index_prep"``, the limit set to 0:
+    ``compact=True``).  ``out`` / ``dq`` within 1.02x their floors plus the element-wise and row bands, ``dkv``
+    within 1.05x.  Constructions: the pooled draw with the open pool's tail at a fixed column over a document that
+    starts inside the query range (the R2 structure in miniature: a row has holes only while it holds fewer than
+    ``pools`` complete pools, so the first 251 positions carry them) and iid rows with every third slot ``-1`` and
+    a fully masked row."""
     _require_nope_compacting_stage()
     _require_nope_program(backward=True)
+    if route == "index_prep":
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    assert cake_backend.nope_flat_index_mode(512, 256) == route
     if construction == "pooled_fixed_tail":
         inp = _nope_inputs(
             512, 512, seed=NOPE_SEED + 850, topk=256, index="pooled_fixed_tail"
@@ -6517,10 +6917,92 @@ def test_nope_flat_entry_hole_rows_meet_the_floor_on_the_compacted_order(constru
         idx,
         dout=inp.dout,
         softmax_scale=NOPE_SOFTMAX_SCALE,
-        compact=True,
+        compact=route == "index_prep",
     )
     _check_forward_nope(out, lse, ref)
     _check_backward_nope(dq, acc, ref)
+
+
+@pytest.mark.parametrize("construction", ["every_third_causal", "pooled_fixed_tail"])
+def test_nope_autograd_backward_on_masked_rows_in_raw_order_matches_the_reference(
+    construction, monkeypatch
+):
+    """Autograd through both public entries on small tables with holes anywhere (below the slot limit, raised
+    here above both constructions): the varlen entry on per-document rows and the flat entry on their globalized
+    rows give ``out`` / ``lse`` / ``dq`` bitwise each other and bitwise the kernel-level pair (``forward_nope`` /
+    ``backward_nope`` over the globalized rows with the last valid slot + 1 as lengths), ``dkv`` within the atomics
+    spread, and all of them meet the FP64 floors evaluated on the raw slot order -- the order a position-preserving
+    forward and backward process.  Constructions: two documents with iid causal rows where every third slot is
+    ``-1`` and one row is fully masked (so the causal rule and the planted holes both leave masked slots before
+    valid ones), and the pooled draw with its tail at a fixed column over one document."""
+    _require_nope_program(backward=True)
+    _require_nope_mask_route()
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 40)
+    if construction == "every_third_causal":
+        inp = _nope_inputs([256, 128], [512, 512], seed=NOPE_SEED + 870, topk=96)
+        local = inp.idx_local.clone()
+        local[:, 1::3] = -1
+        local[7] = -1
+    else:
+        inp = _nope_inputs(
+            512, 512, seed=NOPE_SEED + 871, topk=256, index="pooled_fixed_tail"
+        )
+        local = inp.idx_local
+    S = inp.total_k
+    glob = offset_gather_kv_indices(
+        local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
+    )
+    assert bool(((glob == -1) & (glob.flip(-1).cummax(-1).values.flip(-1) >= 0)).any())
+    lengths = nope_ref.last_valid_plus_one(glob, S)
+    assert cake_backend.varlen_index_mode(local) == "mask"
+    varlen = _public_nope_step(
+        cake_backend.dsa_sparse_attention_nope_varlen,
+        inp.q,
+        inp.kv,
+        inp.dout,
+        local,
+        inp.cu_seqlens_q,
+        inp.cu_seqlens_k,
+        causal=True,
+    )
+    flat = _public_nope_step(
+        cake_backend.dsa_sparse_attention_nope,
+        inp.q,
+        inp.kv,
+        inp.dout,
+        glob,
+        num_segments=inp.num_segments,
+    )
+    out, lse, o_lo = forward_nope(inp.q, inp.kv, glob)
+    acc = torch.zeros(S, D_LATENT, device="cuda")
+    dq, none = backward_nope(
+        inp.q,
+        inp.kv,
+        glob,
+        out,
+        o_lo,
+        lse,
+        inp.dout,
+        topk_length=lengths,
+        dkv_acc=acc,
+        num_segments=inp.num_segments,
+    )
+    torch.cuda.synchronize()
+    assert none is None
+    for side in (varlen, flat):
+        assert torch.equal(side[0], out) and torch.equal(side[1], lse)
+        assert torch.equal(side[2], dq)
+        _rel_or_equal(side[3], acc, 1e-5)
+    ref = nope_ref.reference_fp64_nope(
+        inp.q,
+        inp.kv,
+        glob,
+        dout=inp.dout,
+        softmax_scale=NOPE_SOFTMAX_SCALE,
+        compact=False,
+    )
+    _check_forward_nope(varlen[0], varlen[1], ref)
+    _check_backward_nope(varlen[2], varlen[3], ref)
 
 
 def test_nope_issue_repro_rows_match_their_stable_twin_bitwise_large():

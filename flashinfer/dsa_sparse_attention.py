@@ -399,8 +399,15 @@ def dsa_sparse_attention_nope(
         ``out = 0``, ``lse = -inf`` and zero gradients.
     topk_length : Optional[torch.Tensor]
         int32 ``[T]``; slots ``>= topk_length[t]`` are invalid regardless of
-        their content.  Without it the per-row lengths are derived by the
-        forward kernel while it runs and saved for the backward.
+        their content.  Without it the route follows the table size
+        (``cake_backend.NOPE_CONVERT_SLOT_LIMIT`` slots): below the limit the
+        per-row lengths (last valid slot + 1) are derived by the forward kernel
+        while it runs and saved for the backward with the rows as given -- one
+        launch, a ``-1`` anywhere stays a masked slot; at or above it the rows
+        are compacted on device first (valid keys first in slot order, then
+        ``-1``, the valid count as the length) and the compacted pair is saved,
+        so rows with holes cost their valid slots.  Hole-free rows give the
+        same bytes on either route.
     softmax_scale : Optional[float]
         Defaults to ``1 / 16`` (``512 ** -0.5`` of the latent width is not
         used: the absorbed queries of this form carry their own scale).
@@ -546,9 +553,14 @@ def dsa_sparse_attention_nope_varlen(
     key position ``(seqlen_k[d] - seqlen_q[d]) + local_q``.
     ``gather_kv_indices`` ``[T, K_slots]`` int32 hold key positions relative
     to the row's document (``-1`` or ``>= seqlen_k[d]`` invalid; any ``K_slots
-    >= 1``) and are offset by ``cu_seqlens_k`` on device in one launch right
-    before the forward kernel; each row is compacted (valid keys first, in slot
-    order, then ``-1``) so rows with holes cost their valid slots, and a caller
+    >= 1``) and are offset by ``cu_seqlens_k`` on device.  The route follows
+    the table size (``cake_backend.NOPE_CONVERT_SLOT_LIMIT`` slots): below the
+    limit, without caller lengths, the forward kernel converts the rows itself
+    in its single launch, position-preserving (the global key or ``-1`` at the
+    slot it came from; the row's length is its last valid slot + 1); at or
+    above it, and always with a caller ``topk_length``, one launch right before
+    the forward kernel compacts each row (valid keys first, in slot order, then
+    ``-1``) so rows with holes cost their valid slots, and the caller's
     ``topk_length`` is a position cut applied before compaction.  Zero-length
     query segments contribute no rows; a row whose every slot is invalid gives
     ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
@@ -570,9 +582,11 @@ def dsa_sparse_attention_nope_varlen(
     document with ``seqlen_k < seqlen_q`` gives negative own positions
     (all-invalid rows under ``causal``), a non-monotonic prefix sum assigns
     rows to the wrong document.  The per-document rows are turned into global
-    key rows on device, compacted, in one launch right before the forward
-    kernel; a caller ``topk_length`` is a position cut applied before
-    compaction and the kernels read the compacted rows and their counts.
+    key rows on device: by the forward kernel itself below the slot limit
+    (position-preserving, one launch), else compacted in one launch right
+    before the forward kernel; a caller ``topk_length`` is a position cut
+    applied before compaction and the kernels then read the compacted rows and
+    their counts.
 
     Parameters
     ----------

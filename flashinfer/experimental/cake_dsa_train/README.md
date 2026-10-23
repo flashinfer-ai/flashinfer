@@ -35,24 +35,37 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
 * `indices [T, topk]` int32 (any row stride) hold **global** key rows; `-1` or `>= S` marks an
   invalid slot anywhere in the row; `topk_length [T]` int32 optionally
   invalidates slots `>= topk_length[t]`; any positive `topk`.  Without
-  `topk_length` the forward kernel derives each row's length (last valid slot
-  + 1) itself while it runs and the training entry hands that vector to the
-  backward, so both skip the trailing invalid key blocks of short rows; the
-  results are those of the full row.
+  `topk_length` the route follows the table size (`NOPE_CONVERT_SLOT_LIMIT`,
+  `nope_flat_index_mode`): below the limit the forward kernel derives each
+  row's length (last valid slot + 1) itself while it runs and the training
+  entry hands that vector to the backward with the rows as given -- one
+  launch, a `-1` anywhere stays a masked slot, both kernels skip only the
+  trailing invalid key blocks; at or above it the index-preparation stage
+  compacts the rows first (valid keys first in ascending slot order, then
+  `-1`, the valid count as the length) into a fresh buffer the forward and the
+  backward read, so rows with `-1` holes cost their valid slots.  The results
+  are those of the full row either way; hole-free rows give the same bytes on
+  both routes.
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
-  to `cu_seqlens_k[d]`) and turns them into global key rows on device in one
-  launch of the NoPE record's index-preparation stage right before the forward
-  kernel (`index_prep`, `compact = 1`, the forward launched behind it with the
-  programmatic-dependent-launch attribute, see below; the torch twin
-  `offset_gather_kv_indices(..., compact=True)` where the stage is not
-  available -- host tensors, an unserved device, a non-contiguous prefix sum --
-  with bitwise the same result).  Every row is compacted stably: its valid keys
-  come first in ascending slot order, then `-1`, and the row's length is its
-  valid count, so rows with `-1` holes cost their valid slots in the forward
-  and the backward; rows whose valid slots already come first are unchanged
-  bytes with the same length.  A caller `topk_length` is a position cut
-  applied before compaction (slots at positions `>= topk_length[t]` are
-  invalid regardless of content).  `cu_seqlens_q`
+  to `cu_seqlens_k[d]`) and turns them into global key rows on device.  The
+  NoPE entry follows the same size rule (`nope_varlen_index_mode`): below the
+  limit, without caller lengths, the forward kernel converts the rows itself in
+  its single launch, position-preserving -- the global key or `-1` at the slot
+  it came from, the length the last valid slot + 1, bitwise the torch twin
+  `offset_gather_kv_indices(...)`; at or above the limit, and always with a
+  caller `topk_length`, one launch of the NoPE record's index-preparation
+  stage right before the forward kernel (`index_prep`, `compact = 1`, the
+  forward launched behind it with the programmatic-dependent-launch attribute,
+  see below) compacts every row stably: its valid keys come first in ascending
+  slot order, then `-1`, and the row's length is its valid count (bitwise the
+  torch twin `offset_gather_kv_indices(..., compact=True)`), so rows with `-1`
+  holes cost their valid slots in the forward and the backward.  The rope varlen
+  entry always launches the compacting stage (the torch twin where the stage
+  is not available -- host tensors, an unserved device, a non-contiguous prefix
+  sum -- with bitwise the same result).  Rows whose valid slots already come
+  first are unchanged bytes with the same length on every route.  A caller
+  `topk_length` is a position cut applied before compaction (slots at positions
+  `>= topk_length[t]` are invalid regardless of content).  `cu_seqlens_q`
   and `cu_seqlens_k` are independent: a query segment may be shorter than its
   key segment, in which case it is the tail of that key prefix -- query
   `local_q` of document `d` sits at key position
@@ -356,12 +369,18 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   host; the gradient reaches that leaf through the view); `indices [T, K_slots]`
   int32 global key rows, `topk_length` and the validity rules as above.
   `softmax_scale` defaults to `1 / 16`.  Without `topk_length` the flat entry
-  compacts the rows on device in one launch of the index-preparation stage's
-  flat mode right before the forward (valid keys `0 <= idx < S` first in
-  ascending slot order, then `-1`; the valid count as the row's length) into a
-  fresh `[T, K_slots]` buffer and a `[T]` vector the backward reads, so rows
-  with `-1` holes cost their valid slots; the caller's tensor is untouched.
-  With `topk_length` the rows and lengths reach the kernels as given.
+  follows the table size (`nope_flat_index_mode`): below
+  `NOPE_CONVERT_SLOT_LIMIT` slots the forward alone reads the rows as given and
+  derives each row's length (last valid slot + 1) into a `[T]` vector the
+  backward reads with the caller's rows (one launch; the caller's tensor is
+  then a saved tensor, so autograd rejects an in-place edit of it before the
+  backward); at or above the limit it compacts the rows on device in one launch
+  of the index-preparation stage's flat mode right before the forward (valid
+  keys `0 <= idx < S` first in ascending slot order, then `-1`; the valid count
+  as the row's length) into a fresh `[T, K_slots]` buffer and a `[T]` vector
+  the backward reads, so rows with `-1` holes cost their valid slots and the
+  caller's tensor is untouched.  With `topk_length` the rows and lengths reach
+  the kernels as given.
 * Rows with holes and the kernel-level entries: `forward_nope`,
   `backward_nope` and the prepared runner read rows as given (work up to the
   last valid slot, or `topk_length`).  `nope_compact_indices(indices, S,
@@ -375,7 +394,9 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
 * Backend entries (`cake_backend`): `forward_nope`, `backward_nope`,
   `forward_nope_varlen` (the packed forward without autograd: the public
   entry's index route; returns `(out, lse, o_lo, indices, topk_length)`, the
-  compacted global rows and their valid counts `backward_nope` takes with
+  global rows and lengths of that route -- position-preserving rows with last
+  valid slot + 1 below the slot limit, compacted rows with their valid counts
+  on the stage route -- that `backward_nope` takes with
   `num_segments = cu_seqlens_k.numel() - 1` and a caller-zeroed `dkv_acc`),
   `nope_compact_indices`, `nope_globalize_indices(..., compact=False)` (one
   stage launch over per-document rows: the position-preserving rows and last
@@ -412,16 +433,29 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   main stage through a stride-carrying tensor map, the delta stage through the
   token / head strides (elements) and the element offset the launcher passes
   (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
-* Varlen: per-document indices become global key rows on device in one launch
-  of the record's index-preparation stage right before the forward
-  (`nope_varlen_index_mode`: `"index_prep"` at every table size, since
-  `NOPE_CONVERT_SLOT_LIMIT` is 0).  `index_prep` (one warp per index row, four
-  rows per 128-thread CTA, any index row stride read in place) runs with
-  `compact = 1`: every row stably compacted -- valid keys first in ascending
-  slot order, then `-1` -- and its valid count as the length, after the position
-  cut of a caller `topk_length` passed as `length_in`; the forward and the
-  saved backward read the stage's rows and counts in both cases (bitwise the
-  torch twin `offset_gather_kv_indices(..., compact=True)`).  Both forward
+* Varlen: per-document indices become global key rows on device; the route
+  follows the table size (`nope_varlen_index_mode`).  Below
+  `NOPE_CONVERT_SLOT_LIMIT` slots (`1 << 20`; both small bench tables, 1024 x
+  128 and 1024 x 512, sit below it) and without caller lengths the forward
+  converts the rows itself in its single launch (`convert = 2`): its scan lanes
+  write the position-preserving global rows -- the global key or `-1` at the
+  slot it came from -- into the fresh `indices_out` the backward reads and the
+  last valid slot + 1 as the row's length (bitwise the torch twin
+  `offset_gather_kv_indices(...)`), so no host gap separates a preparation
+  launch from the forward; a small table with holes scans them like the
+  previous version did (routing reads the table size alone: the host cannot
+  see holes without a device sync).  At or above the limit, and always with a
+  caller `topk_length`, one launch of the record's index-preparation stage runs
+  right before the forward: `index_prep` (one warp per index row, four rows per
+  128-thread CTA, any index row stride read in place) with `compact = 1`, every
+  row stably compacted -- valid keys first in ascending slot order, then `-1`
+  -- and its valid count as the length, after the position cut of a caller
+  `topk_length` passed as `length_in`; the forward and the saved backward read
+  the stage's rows and counts (bitwise the torch twin
+  `offset_gather_kv_indices(..., compact=True)`).  The limit is a measured
+  crossover (the largest table at which the one-launch forward stays within
+  0.95x of the stage route on the eager forward and 1.02x on the GPU-busy
+  step, plus one).  Both forward
   stages (`fwd`, `nope_fwd`) launch with the programmatic-dependent-launch
   attribute (`use_pdl` in their launch records, a fixed attribute of their
   bindings): `index_prep` signals `launch_dependents` at entry and the forward
@@ -432,15 +466,18 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   before the first launch, then issues the forward from those pre-bound values
   inside the same stream context, so only the forward's binding call sits
   between the two launches (it hides behind the stage's kernel).  The forward
-  program still carries its own conversion (`cu_seqlens_q`, `cu_seqlens_k`,
+  program's conversion operands (`cu_seqlens_q`, `cu_seqlens_k`,
   `indices_out`, `num_docs`, `search_iters`, `causal`, `convert` at the end of
-  its launch arguments; `convert = 1` globalizes the rows and, since flour
-  ae939ee44, writes the same stable compaction and valid counts as the stage,
-  bitwise): the `"kernel"` route below a limit above zero (a performance
-  crossover still to be measured; the limit is 0) and the fallback of a
-  registry without the stage, which takes no caller `topk_length`.
-  `causal=True` drops keys after the query's own position, query segments are
-  tails of their key prefix.  The NoPE entries have no torch fallback.
+  its launch arguments) take three values: `convert = 0` for global rows (the
+  operands never read), `convert = 2` (`NOPE_CONVERT_MASK`) for the
+  position-preserving conversion of the small-table route, and `convert = 1`
+  (`NOPE_CONVERT_COMPACT`) for the compacting single launch -- the same stable
+  compaction and valid counts as the stage, bitwise -- which no size selects
+  (`_packed_forward_nope(..., "kernel")` by name only).  A registry without the
+  stage takes the position-preserving single launch at every size and no
+  caller `topk_length`.  `causal=True` drops keys after the query's own
+  position, query segments are tails of their key prefix.  The NoPE entries
+  have no torch fallback.
 * Backward host order: the autograd wrappers settle their backward at forward
   time (the binding key without `dout`, the operands autograd does not save,
   the caller's `dkv_acc` validated once), so the backward's host work before
