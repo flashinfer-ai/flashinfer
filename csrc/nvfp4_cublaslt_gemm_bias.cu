@@ -95,19 +95,18 @@ class Descriptors {
     if (matmul_desc_ != nullptr) (void)cublasLtMatmulDescDestroy(matmul_desc_);
   }
 
-  cublasStatus_t Initialize(int m, int n, int k, void const* x_scale,
-                            void const* w_scale, void const* bias) {
-    cublasStatus_t status =
-        cublasLtMatmulDescCreate(&matmul_desc_, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  cublasStatus_t Initialize(int m, int n, int k, void const* x_scale, void const* w_scale,
+                            void const* bias) {
+    cublasStatus_t status = cublasLtMatmulDescCreate(&matmul_desc_, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     if (status != CUBLAS_STATUS_SUCCESS) return status;
 
     cublasOperation_t const trans_a = CUBLAS_OP_T;
     cublasOperation_t const trans_b = CUBLAS_OP_N;
-    status = cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_TRANSA,
-                                            &trans_a, sizeof(trans_a));
+    status = cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a,
+                                            sizeof(trans_a));
     if (status != CUBLAS_STATUS_SUCCESS) return status;
-    status = cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_TRANSB,
-                                            &trans_b, sizeof(trans_b));
+    status = cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b,
+                                            sizeof(trans_b));
     if (status != CUBLAS_STATUS_SUCCESS) return status;
 
     cublasLtPointerMode_t const pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
@@ -134,8 +133,7 @@ class Descriptors {
     status = cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
                                             &lt_b_scale, sizeof(lt_b_scale));
     if (status != CUBLAS_STATUS_SUCCESS) return status;
-    cublasLtMatmulMatrixScale_t const scale_mode =
-        CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtMatmulMatrixScale_t const scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
     status = cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
                                             &scale_mode, sizeof(scale_mode));
     if (status != CUBLAS_STATUS_SUCCESS) return status;
@@ -152,8 +150,8 @@ class Descriptors {
                                             &bias_pointer, sizeof(bias_pointer));
     if (status != CUBLAS_STATUS_SUCCESS) return status;
     cublasLtEpilogue_t const epilogue = CUBLASLT_EPILOGUE_BIAS;
-    return cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_EPILOGUE,
-                                          &epilogue, sizeof(epilogue));
+    return cublasLtMatmulDescSetAttribute(matmul_desc_, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+                                          sizeof(epilogue));
   }
 
   cublasLtMatmulDesc_t matmul_desc() const { return matmul_desc_; }
@@ -168,11 +166,9 @@ class Descriptors {
   cublasLtMatrixLayout_t output_layout_ = nullptr;
 };
 
-cublasStatus_t GetAlgorithms(int m, int n, int k, void const* x_scale,
-                             void const* w_scale, void const* bias,
-                             std::size_t workspace_bytes, cublasLtHandle_t handle,
-                             void* algorithm_buffer, int algorithm_capacity,
-                             int* algorithm_count) {
+cublasStatus_t GetAlgorithms(int m, int n, int k, void const* x_scale, void const* w_scale,
+                             void const* bias, std::size_t workspace_bytes, cublasLtHandle_t handle,
+                             void* algorithm_buffer, int algorithm_capacity, int* algorithm_count) {
   *algorithm_count = 0;
   Descriptors desc;
   cublasStatus_t status = desc.Initialize(m, n, k, x_scale, w_scale, bias);
@@ -181,9 +177,9 @@ cublasStatus_t GetAlgorithms(int m, int n, int k, void const* x_scale,
   cublasLtMatmulPreference_t preference = nullptr;
   status = cublasLtMatmulPreferenceCreate(&preference);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
-  status = cublasLtMatmulPreferenceSetAttribute(
-      preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes,
-      sizeof(workspace_bytes));
+  status =
+      cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                           &workspace_bytes, sizeof(workspace_bytes));
   if (status != CUBLAS_STATUS_SUCCESS) {
     (void)cublasLtMatmulPreferenceDestroy(preference);
     return status;
@@ -201,23 +197,23 @@ cublasStatus_t GetAlgorithms(int m, int n, int k, void const* x_scale,
   auto* serialized = static_cast<std::uint8_t*>(algorithm_buffer);
   int accepted = 0;
   for (int i = 0; i < returned && accepted < requested; ++i) {
-    if (results[i].state != CUBLAS_STATUS_SUCCESS ||
-        results[i].workspaceSize > workspace_bytes) {
+    if (results[i].state != CUBLAS_STATUS_SUCCESS || results[i].workspaceSize > workspace_bytes) {
       continue;
     }
-    std::memcpy(serialized + static_cast<std::size_t>(accepted) * kAlgorithmBytes,
-                &results[i].algo, kAlgorithmBytes);
+    std::memcpy(serialized + static_cast<std::size_t>(accepted) * kAlgorithmBytes, &results[i].algo,
+                kAlgorithmBytes);
     ++accepted;
   }
   *algorithm_count = accepted;
   return CUBLAS_STATUS_SUCCESS;
 }
 
-cublasStatus_t RunWithAlgorithm(
-    void const* x, void const* w, void const* x_scale, void const* w_scale,
-    float const* alpha, float const* beta, void const* bias, void* output, int m, int n, int k,
-    void* workspace, std::size_t workspace_bytes, cublasLtHandle_t handle, cudaStream_t stream,
-    void const* algorithm_buffer, int algorithm_index) {
+cublasStatus_t RunWithAlgorithm(void const* x, void const* w, void const* x_scale,
+                                void const* w_scale, float const* alpha, float const* beta,
+                                void const* bias, void* output, int m, int n, int k,
+                                void* workspace, std::size_t workspace_bytes,
+                                cublasLtHandle_t handle, cudaStream_t stream,
+                                void const* algorithm_buffer, int algorithm_index) {
   Descriptors desc;
   cublasStatus_t status = desc.Initialize(m, n, k, x_scale, w_scale, bias);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
@@ -226,9 +222,9 @@ cublasStatus_t RunWithAlgorithm(
               static_cast<std::uint8_t const*>(algorithm_buffer) +
                   static_cast<std::size_t>(algorithm_index) * kAlgorithmBytes,
               kAlgorithmBytes);
-  return cublasLtMatmul(handle, desc.matmul_desc(), alpha, w, desc.a_layout(), x,
-                        desc.b_layout(), beta, output, desc.output_layout(), output,
-                        desc.output_layout(), &algorithm, workspace, workspace_bytes, stream);
+  return cublasLtMatmul(handle, desc.matmul_desc(), alpha, w, desc.a_layout(), x, desc.b_layout(),
+                        beta, output, desc.output_layout(), output, desc.output_layout(),
+                        &algorithm, workspace, workspace_bytes, stream);
 }
 
 #endif  // FLASHINFER_NVFP4_CUBLASLT_BIAS_AVAILABLE
@@ -252,18 +248,15 @@ int64_t PadUp(int64_t value, int64_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
 
-int64_t SwizzledScaleSize(int64_t rows, int64_t k) {
-  return PadUp(rows, 128) * PadUp(k / 16, 4);
-}
+int64_t SwizzledScaleSize(int64_t rows, int64_t k) { return PadUp(rows, 128) * PadUp(k / 16, 4); }
 
 void CheckAlignment(TensorView tensor, std::uintptr_t alignment, char const* name) {
   TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % alignment, 0)
       << name << " data pointer must be " << alignment << "-byte aligned";
 }
 
-ProblemShape CheckProblem(TensorView x, TensorView w, TensorView x_scale,
-                          TensorView w_scale, TensorView bias, TensorView output,
-                          TensorView workspace) {
+ProblemShape CheckProblem(TensorView x, TensorView w, TensorView x_scale, TensorView w_scale,
+                          TensorView bias, TensorView output, TensorView workspace) {
   CHECK_INPUT_AND_TYPE(x, dl_uint8);
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(x_scale, dl_uint8);
@@ -313,8 +306,7 @@ ProblemShape CheckProblem(TensorView x, TensorView w, TensorView x_scale,
   cudaError_t const cuda_status = cudaGetDeviceProperties(&properties, x.device().device_id);
   TVM_FFI_ICHECK_EQ(cuda_status, cudaSuccess)
       << "cudaGetDeviceProperties failed: " << cudaGetErrorString(cuda_status);
-  TVM_FFI_ICHECK_GE(properties.major, 10)
-      << "cuBLASLt NVFP4 GEMM requires a Blackwell-class GPU";
+  TVM_FFI_ICHECK_GE(properties.major, 10) << "cuBLASLt NVFP4 GEMM requires a Blackwell-class GPU";
   return {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k)};
 }
 
@@ -330,20 +322,18 @@ std::size_t WorkspaceBytes(TensorView workspace) {
 
 }  // namespace
 
-int64_t nvfp4_cublaslt_bias_get_algorithms(
-    TensorView x, TensorView w, TensorView x_scale, TensorView w_scale, TensorView bias,
-    TensorView output, TensorView workspace, TensorView algorithm_buffer) {
+int64_t nvfp4_cublaslt_bias_get_algorithms(TensorView x, TensorView w, TensorView x_scale,
+                                           TensorView w_scale, TensorView bias, TensorView output,
+                                           TensorView workspace, TensorView algorithm_buffer) {
   ProblemShape const shape = CheckProblem(x, w, x_scale, w_scale, bias, output, workspace);
   CheckAlgorithmBuffer(algorithm_buffer);
 
 #if FLASHINFER_NVFP4_CUBLASLT_BIAS_AVAILABLE
-  int64_t const capacity =
-      algorithm_buffer.numel() / static_cast<int64_t>(kAlgorithmBytes);
+  int64_t const capacity = algorithm_buffer.numel() / static_cast<int64_t>(kAlgorithmBytes);
   TVM_FFI_ICHECK(capacity > 0 && capacity <= std::numeric_limits<int>::max());
   ffi::CUDADeviceGuard guard(x.device().device_id);
   cublasLtHandle_t handle = nullptr;
-  cublasStatus_t status =
-      flashinfer::gemm::cublaslt_bias::GetHandle(x.device().device_id, &handle);
+  cublasStatus_t status = flashinfer::gemm::cublaslt_bias::GetHandle(x.device().device_id, &handle);
   TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
       << "cublasLtCreate failed with status " << static_cast<int>(status);
   int count = 0;
@@ -362,10 +352,11 @@ int64_t nvfp4_cublaslt_bias_get_algorithms(
 #endif
 }
 
-void nvfp4_cublaslt_bias_run_with_algorithm(
-    TensorView x, TensorView w, TensorView x_scale, TensorView w_scale, TensorView alpha,
-    TensorView beta, TensorView bias, TensorView output, TensorView workspace,
-    TensorView algorithm_buffer, int64_t algorithm_count, int64_t algorithm_index) {
+void nvfp4_cublaslt_bias_run_with_algorithm(TensorView x, TensorView w, TensorView x_scale,
+                                            TensorView w_scale, TensorView alpha, TensorView beta,
+                                            TensorView bias, TensorView output,
+                                            TensorView workspace, TensorView algorithm_buffer,
+                                            int64_t algorithm_count, int64_t algorithm_index) {
   ProblemShape const shape = CheckProblem(x, w, x_scale, w_scale, bias, output, workspace);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(beta, dl_float32);
@@ -376,16 +367,14 @@ void nvfp4_cublaslt_bias_run_with_algorithm(
   CheckAlignment(alpha, alignof(float), "alpha");
   CheckAlignment(beta, alignof(float), "beta");
   CheckAlgorithmBuffer(algorithm_buffer);
-  int64_t const capacity =
-      algorithm_buffer.numel() / static_cast<int64_t>(kAlgorithmBytes);
+  int64_t const capacity = algorithm_buffer.numel() / static_cast<int64_t>(kAlgorithmBytes);
   TVM_FFI_ICHECK(algorithm_count > 0 && algorithm_count <= capacity);
   TVM_FFI_ICHECK(algorithm_index >= 0 && algorithm_index < algorithm_count);
 
 #if FLASHINFER_NVFP4_CUBLASLT_BIAS_AVAILABLE
   ffi::CUDADeviceGuard guard(x.device().device_id);
   cublasLtHandle_t handle = nullptr;
-  cublasStatus_t status =
-      flashinfer::gemm::cublaslt_bias::GetHandle(x.device().device_id, &handle);
+  cublasStatus_t status = flashinfer::gemm::cublaslt_bias::GetHandle(x.device().device_id, &handle);
   TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
       << "cublasLtCreate failed with status " << static_cast<int>(status);
   status = flashinfer::gemm::cublaslt_bias::RunWithAlgorithm(

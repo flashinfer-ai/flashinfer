@@ -18,11 +18,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-
-#include <cutlass/detail/sm100_blockscaled_layout.hpp>
 
 #include "cutlass/arch/arch.h"
 #include "cutlass/cutlass.h"
@@ -56,8 +55,7 @@ struct KernelConfig {
   using ElementAccumulator = float;
   using ElementCompute = float;
   using FusionOperation = std::conditional_t<
-      SwapAB,
-      cutlass::epilogue::fusion::LinCombPerRowBias<Output, float, Output, ElementC, float>,
+      SwapAB, cutlass::epilogue::fusion::LinCombPerRowBias<Output, float, Output, ElementC, float>,
       cutlass::epilogue::fusion::LinCombPerColBias<Output, float, Output, ElementC, float>>;
 
   static constexpr int kAlignmentAB = 32;
@@ -65,29 +63,30 @@ struct KernelConfig {
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, CtaShape, ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute,
-      ElementC, LayoutOutput, kAlignmentOutput, Output, LayoutOutput, kAlignmentOutput,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC,
+      LayoutOutput, kAlignmentOutput, Output, LayoutOutput, kAlignmentOutput,
       cutlass::epilogue::TmaWarpSpecialized, FusionOperation>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ElementA, LayoutA,
       kAlignmentAB, ElementB, LayoutB, kAlignmentAB, ElementAccumulator, CtaShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
       cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
 
   using Scheduler = std::conditional_t<UseStreamK, cutlass::gemm::StreamKScheduler,
                                        cutlass::gemm::StaticPersistentScheduler>;
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,
-                                                          CollectiveMainloop,
-                                                          CollectiveEpilogue, Scheduler>;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                           CollectiveEpilogue, Scheduler>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
 template <typename Gemm>
-typename Gemm::Arguments PrepareArguments(
-    void* output, void const* activation, void const* weight, void const* activation_scale,
-    void const* weight_scale, float const* alpha, void const* bias, int m, int n, int k) {
+typename Gemm::Arguments PrepareArguments(void* output, void const* activation, void const* weight,
+                                          void const* activation_scale, void const* weight_scale,
+                                          float const* alpha, void const* bias, int m, int n,
+                                          int k) {
   using ScaleConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
   using Output = typename Gemm::ElementD;
 
@@ -98,17 +97,17 @@ typename Gemm::Arguments PrepareArguments(
   args.mainloop.ptr_B = static_cast<cutlass::float_e2m1_t const*>(weight);
   args.mainloop.ptr_SFA = static_cast<cutlass::float_ue4m3_t const*>(activation_scale);
   args.mainloop.ptr_SFB = static_cast<cutlass::float_ue4m3_t const*>(weight_scale);
-  args.mainloop.dA = cutlass::make_cute_packed_stride(
-      typename Gemm::GemmKernel::StrideA{}, make_shape(m, k, 1));
-  args.mainloop.dB = cutlass::make_cute_packed_stride(
-      typename Gemm::GemmKernel::StrideB{}, make_shape(n, k, 1));
+  args.mainloop.dA =
+      cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, make_shape(m, k, 1));
+  args.mainloop.dB =
+      cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, make_shape(n, k, 1));
   args.mainloop.layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(args.problem_shape);
   args.mainloop.layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(args.problem_shape);
 
   args.epilogue.ptr_C = nullptr;
   args.epilogue.ptr_D = static_cast<Output*>(output);
-  args.epilogue.dC = cutlass::make_cute_packed_stride(
-      typename Gemm::GemmKernel::StrideC{}, make_shape(m, n, 1));
+  args.epilogue.dC =
+      cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideC{}, make_shape(m, n, 1));
   args.epilogue.dD = args.epilogue.dC;
   args.epilogue.thread.alpha = 1.0f;
   args.epilogue.thread.beta = 0.0f;
@@ -141,8 +140,7 @@ std::size_t Launch(void* output, void const* activation, void const* weight,
   if (activation == nullptr && weight == nullptr && output == nullptr) return required;
   if (required > workspace_bytes) {
     throw std::runtime_error("CUTLASS NVFP4 bias GEMM workspace is too small: required " +
-                             std::to_string(required) + ", got " +
-                             std::to_string(workspace_bytes));
+                             std::to_string(required) + ", got " + std::to_string(workspace_bytes));
   }
   cutlass::Status status = gemm.can_implement(args);
   if (status != cutlass::Status::kSuccess) {
@@ -162,24 +160,24 @@ std::size_t Launch(void* output, void const* activation, void const* weight,
   return required;
 }
 
-#define DISPATCH_TILE(CTA_M, CTA_N, CTA_K)                                                \
-  switch (tactic % 4) {                                                                  \
-    case 0:                                                                              \
-      return Launch<CTA_M, CTA_N, CTA_K, true, false>(                                    \
-          output, weight, activation, weight_scale, activation_scale, alpha, bias, n, m, \
-          k, workspace, workspace_bytes, stream);                                        \
-    case 1:                                                                              \
-      return Launch<CTA_M, CTA_N, CTA_K, false, false>(                                   \
-          output, activation, weight, activation_scale, weight_scale, alpha, bias, m, n, \
-          k, workspace, workspace_bytes, stream);                                        \
-    case 2:                                                                              \
-      return Launch<CTA_M, CTA_N, CTA_K, true, true>(                                     \
-          output, weight, activation, weight_scale, activation_scale, alpha, bias, n, m, \
-          k, workspace, workspace_bytes, stream);                                        \
-    default:                                                                             \
-      return Launch<CTA_M, CTA_N, CTA_K, false, true>(                                    \
-          output, activation, weight, activation_scale, weight_scale, alpha, bias, m, n, \
-          k, workspace, workspace_bytes, stream);                                        \
+#define DISPATCH_TILE(CTA_M, CTA_N, CTA_K)                                                      \
+  switch (tactic % 4) {                                                                         \
+    case 0:                                                                                     \
+      return Launch<CTA_M, CTA_N, CTA_K, true, false>(output, weight, activation, weight_scale, \
+                                                      activation_scale, alpha, bias, n, m, k,   \
+                                                      workspace, workspace_bytes, stream);      \
+    case 1:                                                                                     \
+      return Launch<CTA_M, CTA_N, CTA_K, false, false>(                                         \
+          output, activation, weight, activation_scale, weight_scale, alpha, bias, m, n, k,     \
+          workspace, workspace_bytes, stream);                                                  \
+    case 2:                                                                                     \
+      return Launch<CTA_M, CTA_N, CTA_K, true, true>(output, weight, activation, weight_scale,  \
+                                                     activation_scale, alpha, bias, n, m, k,    \
+                                                     workspace, workspace_bytes, stream);       \
+    default:                                                                                    \
+      return Launch<CTA_M, CTA_N, CTA_K, false, true>(                                          \
+          output, activation, weight, activation_scale, weight_scale, alpha, bias, m, n, k,     \
+          workspace, workspace_bytes, stream);                                                  \
   }
 
 std::size_t Dispatch(void* output, void const* activation, void const* weight,
@@ -256,19 +254,16 @@ void CheckProblem(TensorView activation, TensorView weight, TensorView activatio
 
 }  // namespace
 
-int64_t nvfp4_cutlass_gemm_bias_workspace_size(int64_t m, int64_t n, int64_t k,
-                                                int64_t tactic) {
+int64_t nvfp4_cutlass_gemm_bias_workspace_size(int64_t m, int64_t n, int64_t k, int64_t tactic) {
   return static_cast<int64_t>(flashinfer::gemm::cutlass_bias_sm120::Dispatch(
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<int>(m),
       static_cast<int>(n), static_cast<int>(k), nullptr, 0, nullptr, static_cast<int>(tactic)));
 }
 
-void nvfp4_cutlass_gemm_bias(TensorView activation, TensorView weight,
-                             TensorView activation_scale, TensorView weight_scale,
-                             TensorView alpha, TensorView bias, TensorView output,
-                             TensorView workspace, int64_t tactic) {
-  CheckProblem(activation, weight, activation_scale, weight_scale, alpha, bias, output,
-               workspace);
+void nvfp4_cutlass_gemm_bias(TensorView activation, TensorView weight, TensorView activation_scale,
+                             TensorView weight_scale, TensorView alpha, TensorView bias,
+                             TensorView output, TensorView workspace, int64_t tactic) {
+  CheckProblem(activation, weight, activation_scale, weight_scale, alpha, bias, output, workspace);
   int const m = static_cast<int>(activation.size(0));
   int const n = static_cast<int>(weight.size(0));
   int const k = static_cast<int>(activation.size(1) * 2);
@@ -283,8 +278,7 @@ int64_t nvfp4_cutlass_gemm_bias_tactic_num() { return 32; }
 
 }  // namespace torch_ext
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_cutlass_gemm_bias,
-                              torch_ext::nvfp4_cutlass_gemm_bias);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_cutlass_gemm_bias, torch_ext::nvfp4_cutlass_gemm_bias);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_cutlass_gemm_bias_workspace_size,
                               torch_ext::nvfp4_cutlass_gemm_bias_workspace_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_cutlass_gemm_bias_tactic_num,

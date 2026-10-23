@@ -1854,9 +1854,10 @@ def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None
     }
     assert set(families[small:]) == {routes.SM120_FAMILY_SMALL_M}
     for variant in range(small, len(variants)):
-        assert routes.sm120_decode_producer_variant(m, k, variant, 128) == variants[
-            variant
-        ]
+        assert (
+            routes.sm120_decode_producer_variant(m, k, variant, 128)
+            == variants[variant]
+        )
         # Every rank-128 producer, small-M included, reads K-major L2T.
         assert routes.sm120_variant_reads_kmajor_l2t(m, k, variant, 128)
         assert not routes.sm120_variant_packs_l2t(m, k, variant, 128)

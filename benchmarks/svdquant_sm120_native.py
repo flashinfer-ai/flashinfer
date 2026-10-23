@@ -54,10 +54,16 @@ class NativeOperands:
     bias: torch.Tensor
 
 
-def _quantize(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize(
+    x: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     packed, sf = nvfp4_quantize(
-        x, scale, sfLayout=SfLayout.layout_128x4, do_shuffle=False,
-        sf_vec_size=16, backend="cuda",
+        x,
+        scale,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+        sf_vec_size=16,
+        backend="cuda",
     )
     return packed.view(torch.uint8).contiguous(), sf.view(torch.uint8).contiguous()
 
@@ -70,13 +76,21 @@ def native_operands(case) -> NativeOperands:
     weight_global = (case.alpha.float() * case.global_sf.float()).reciprocal()
     alpha = (1.0 / (global_scale * weight_global)).reshape(1).float()
     xq, x_sf = _quantize(case.x, global_scale)
-    bias = case.bias if case.bias is not None else torch.zeros(
-        case.wq.shape[0], dtype=torch.bfloat16, device=case.x.device
+    bias = (
+        case.bias
+        if case.bias is not None
+        else torch.zeros(case.wq.shape[0], dtype=torch.bfloat16, device=case.x.device)
     )
     return NativeOperands(
-        case.x, global_scale, alpha,
+        case.x,
+        global_scale,
+        alpha,
         torch.zeros(1, dtype=torch.float32, device=case.x.device),
-        xq, x_sf, case.wq, case.w_sf.view(torch.uint8), bias,
+        xq,
+        x_sf,
+        case.wq,
+        case.w_sf.view(torch.uint8),
+        bias,
     )
 
 
@@ -92,31 +106,64 @@ def _launchers(backend: str, ops: NativeOperands, out: torch.Tensor, quantize: b
         module = _cutlass_module()
         tactics = list(range(int(module.nvfp4_cutlass_gemm_bias_tactic_num())))
         ws = torch.empty(
-            max(DEFAULT_WORKSPACE_SIZE, *(int(module.nvfp4_cutlass_gemm_bias_workspace_size(m, n, k, t)) for t in tactics)),
-            dtype=torch.uint8, device=device,
+            max(
+                DEFAULT_WORKSPACE_SIZE,
+                *(
+                    int(module.nvfp4_cutlass_gemm_bias_workspace_size(m, n, k, t))
+                    for t in tactics
+                ),
+            ),
+            dtype=torch.uint8,
+            device=device,
         )
 
         def factory(t: int) -> Callable[[], torch.Tensor]:
             def launch() -> torch.Tensor:
                 xq, x_sf = prefix()
-                module.nvfp4_cutlass_gemm_bias(xq, ops.wq, x_sf, ops.w_sf, ops.alpha, ops.bias, out, ws, t)
+                module.nvfp4_cutlass_gemm_bias(
+                    xq, ops.wq, x_sf, ops.w_sf, ops.alpha, ops.bias, out, ws, t
+                )
                 return out
+
             return launch
 
         return tactics, factory
     module = _cublaslt_module()
     ws = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
-    algos = torch.empty(CUBLASLT_MAX_ALGORITHMS * CUBLASLT_ALGORITHM_BYTES, dtype=torch.uint8, device="cpu")
-    count = int(module.nvfp4_cublaslt_bias_get_algorithms(ops.xq, ops.wq, ops.x_sf, ops.w_sf, ops.bias, out, ws, algos))
+    algos = torch.empty(
+        CUBLASLT_MAX_ALGORITHMS * CUBLASLT_ALGORITHM_BYTES,
+        dtype=torch.uint8,
+        device="cpu",
+    )
+    count = int(
+        module.nvfp4_cublaslt_bias_get_algorithms(
+            ops.xq, ops.wq, ops.x_sf, ops.w_sf, ops.bias, out, ws, algos
+        )
+    )
     if count <= 0:
-        raise RuntimeError("cuBLASLt returned no algorithm for the bias-enabled descriptor")
+        raise RuntimeError(
+            "cuBLASLt returned no algorithm for the bias-enabled descriptor"
+        )
 
     def factory(t: int) -> Callable[[], torch.Tensor]:
         def launch() -> torch.Tensor:
             xq, x_sf = prefix()
             module.nvfp4_cublaslt_bias_run_with_algorithm(
-                xq, ops.wq, x_sf, ops.w_sf, ops.alpha, ops.beta_zero, ops.bias, out, ws, algos, count, t)
+                xq,
+                ops.wq,
+                x_sf,
+                ops.w_sf,
+                ops.alpha,
+                ops.beta_zero,
+                ops.bias,
+                out,
+                ws,
+                algos,
+                count,
+                t,
+            )
             return out
+
         return launch
 
     return list(range(count)), factory
@@ -135,9 +182,13 @@ def _cold_graph_us(launch: Callable[[], torch.Tensor]) -> float:
     return statistics.median(samples) * 1000.0
 
 
-def native_call(backend: str, ops: NativeOperands, quantize: bool) -> tuple[Callable[[], torch.Tensor], int]:
+def native_call(
+    backend: str, ops: NativeOperands, quantize: bool
+) -> tuple[Callable[[], torch.Tensor], int]:
     """Return a launch pinned to the fastest runnable tactic, and that tactic."""
-    out = torch.empty(ops.x.shape[0], ops.wq.shape[0], dtype=torch.bfloat16, device=ops.x.device)
+    out = torch.empty(
+        ops.x.shape[0], ops.wq.shape[0], dtype=torch.bfloat16, device=ops.x.device
+    )
     tactics, factory = _launchers(backend, ops, out, quantize)
     best: tuple[float, int] | None = None
     for t in tactics:

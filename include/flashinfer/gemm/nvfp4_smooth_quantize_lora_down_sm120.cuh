@@ -475,58 +475,58 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
       for (int c = 0; c < kDownPrefetch; ++c) {
 #pragma unroll
         for (int fragment = 0; fragment < kNFragments; ++fragment) {
-          base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2],
-                                     d[fragment][3], a_lo[c].x, a_hi[c].x, a_lo[c].y,
-                                     a_hi[c].y, b[c][fragment].x, b[c][fragment].y);
-          base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2],
-                                     d[fragment][3], a_lo[c].z, a_hi[c].z, a_lo[c].w,
-                                     a_hi[c].w, b[c][fragment].z, b[c][fragment].w);
+          base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
+                                     a_lo[c].x, a_hi[c].x, a_lo[c].y, a_hi[c].y, b[c][fragment].x,
+                                     b[c][fragment].y);
+          base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
+                                     a_lo[c].z, a_hi[c].z, a_lo[c].w, a_hi[c].w, b[c][fragment].z,
+                                     b[c][fragment].w);
         }
       }
     }
   } else {
 #pragma unroll 1
-  for (int k_base = k_begin; k_base < k_end; k_base += 16) {
-    std::uint32_t a0 = 0u;
-    std::uint32_t a1 = 0u;
-    std::uint32_t a2 = 0u;
-    std::uint32_t a3 = 0u;
-    if (a_row < M) {
-      quant::Type const* a_base = x + static_cast<std::int64_t>(a_row) * K + k_base + pair_col;
-      a0 = base::load_bf16_pair(a_base);
-      a2 = base::load_bf16_pair(a_base + 8);
-    }
-    if (a_row + 8 < M) {
-      quant::Type const* a_upper =
-          x + (static_cast<std::int64_t>(a_row) + 8) * K + k_base + pair_col;
-      a1 = base::load_bf16_pair(a_upper);
-      a3 = base::load_bf16_pair(a_upper + 8);
-    }
-
-    quant::Type const* b_base =
-        l2t_smoothed + (static_cast<std::int64_t>(k_base) + pair_col) * kRank + b_col;
-#pragma unroll
-    for (int fragment = 0; fragment < kNFragments; ++fragment) {
-      std::uint32_t b0;
-      std::uint32_t b1;
-      if constexpr (PackedL2T) {
-        std::int64_t const packed_index =
-            (((static_cast<std::int64_t>(k_base) / 16 * kDownNTiles + tile_n) * kNFragments +
-              fragment) *
-             32) +
-            lane;
-        uint2 const packed_b = reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
-        b0 = packed_b.x;
-        b1 = packed_b.y;
-      } else {
-        quant::Type const* b_fragment = b_base + fragment * kMmaN;
-        b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-        b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+    for (int k_base = k_begin; k_base < k_end; k_base += 16) {
+      std::uint32_t a0 = 0u;
+      std::uint32_t a1 = 0u;
+      std::uint32_t a2 = 0u;
+      std::uint32_t a3 = 0u;
+      if (a_row < M) {
+        quant::Type const* a_base = x + static_cast<std::int64_t>(a_row) * K + k_base + pair_col;
+        a0 = base::load_bf16_pair(a_base);
+        a2 = base::load_bf16_pair(a_base + 8);
       }
-      base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
-                                 a1, a2, a3, b0, b1);
+      if (a_row + 8 < M) {
+        quant::Type const* a_upper =
+            x + (static_cast<std::int64_t>(a_row) + 8) * K + k_base + pair_col;
+        a1 = base::load_bf16_pair(a_upper);
+        a3 = base::load_bf16_pair(a_upper + 8);
+      }
+
+      quant::Type const* b_base =
+          l2t_smoothed + (static_cast<std::int64_t>(k_base) + pair_col) * kRank + b_col;
+#pragma unroll
+      for (int fragment = 0; fragment < kNFragments; ++fragment) {
+        std::uint32_t b0;
+        std::uint32_t b1;
+        if constexpr (PackedL2T) {
+          std::int64_t const packed_index =
+              (((static_cast<std::int64_t>(k_base) / 16 * kDownNTiles + tile_n) * kNFragments +
+                fragment) *
+               32) +
+              lane;
+          uint2 const packed_b = reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
+          b0 = packed_b.x;
+          b1 = packed_b.y;
+        } else {
+          quant::Type const* b_fragment = b_base + fragment * kMmaN;
+          b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
+          b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+        }
+        base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
+                                   a0, a1, a2, a3, b0, b1);
+      }
     }
-  }
   }
 
 #pragma unroll
@@ -864,7 +864,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
 
           int const b_col = warp * 8 + group;
           int const b_row = tile_k + local_k + pair_col;
-          quant::Type const* b_base = l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
+          quant::Type const* b_base =
+              l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
           std::uint32_t const b0 = base::pack_bf16_pair(b_base, b_base + kRank);
           std::uint32_t const b1 = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
           base::mma_m16n8k16_row_col(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
@@ -917,7 +918,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
           for (int f = 0; f < kFrags; ++f) {
             int const b_col = (warp * kFrags + f) * 8 + group;
             if constexpr (large_m_kmajor_l2(Rank)) {
-              quant::Type const* b_base = l2t_smoothed + static_cast<std::int64_t>(b_col) * K + b_row;
+              quant::Type const* b_base =
+                  l2t_smoothed + static_cast<std::int64_t>(b_col) * K + b_row;
               b0[ks][f] = base::load_bf16_pair(b_base);
               b1[ks][f] = base::load_bf16_pair(b_base + 8);
             } else {
@@ -941,9 +943,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
             std::uint32_t const a3 = base::load_bf16_pair(a_base + 8 * kTileStride + 8);
 #pragma unroll
             for (int f = 0; f < kFrags; ++f) {
-              base::mma_m16n8k16_row_col(wide_acc[f][mb][0], wide_acc[f][mb][1],
-                                         wide_acc[f][mb][2], wide_acc[f][mb][3], a0, a1, a2, a3,
-                                         b0[ks][f], b1[ks][f]);
+              base::mma_m16n8k16_row_col(wide_acc[f][mb][0], wide_acc[f][mb][1], wide_acc[f][mb][2],
+                                         wide_acc[f][mb][3], a0, a1, a2, a3, b0[ks][f], b1[ks][f]);
             }
           }
         }
@@ -1128,7 +1129,9 @@ constexpr int kStagedBSlices = 8;  // Rank / kStagedBCols column groups at rank 
 // share each column group's B slice: the CTA reads L2T once for twice the rows,
 // halving the L2T traffic per row (one CTA per SM, dynamic shared memory).
 constexpr int staged_b_row_split(int tile_m) { return tile_m > 80 ? 2 : 1; }
-constexpr int staged_b_down_warps(int tile_m) { return kStagedBSlices * staged_b_row_split(tile_m); }
+constexpr int staged_b_down_warps(int tile_m) {
+  return kStagedBSlices * staged_b_row_split(tile_m);
+}
 constexpr int staged_b_shared_bytes(int tile_m, int tile_k, bool long_k) {
   return 2 * tile_m * (tile_k + 8) * 2 + 2 * tile_k * 2 +
          (2 * (long_k ? tile_m * (tile_k / 16) : 1) + 15) / 16 * 16 +
@@ -1162,12 +1165,12 @@ __device__ __forceinline__ void copy_b_slice_async(quant::Type const* __restrict
 // warps' B source differs. Sized for two CTAs per SM.
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK, DynAddress Policy,
           int Rank>
-__global__ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void
-    nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel(
-        quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
-        float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
-        std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
-        quant::Type* __restrict__ down, int M, int K) {
+__global__
+__launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel(
+    quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
+    float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
+    std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
+    quant::Type* __restrict__ down, int M, int K) {
   constexpr int kRank = Rank;
   constexpr int kRowSplit = staged_b_row_split(KernelTileM);
   constexpr int kDownWarps = staged_b_down_warps(KernelTileM);
@@ -1204,8 +1207,7 @@ __global__ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) 
   XTile* const x_tiles = reinterpret_cast<XTile*>(staged_smem);
   ScaleTile* const scale_tiles = reinterpret_cast<ScaleTile*>(staged_smem + kXBytes);
   SfTile* const sf_tiles = reinterpret_cast<SfTile*>(staged_smem + kXBytes + kScaleBytes);
-  BSlice* const b_tiles =
-      reinterpret_cast<BSlice*>(staged_smem + kXBytes + kScaleBytes + kSfBytes);
+  BSlice* const b_tiles = reinterpret_cast<BSlice*>(staged_smem + kXBytes + kScaleBytes + kSfBytes);
   static_assert(kXBytes + kScaleBytes + kSfBytes + kStagedBSlices * kStagedBSliceBytes ==
                 staged_b_shared_bytes(KernelTileM, KernelTileK, LongK));
 
@@ -1433,8 +1435,8 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   constexpr bool kStagedB = large_m_stages_b(Rank, TileK);
   constexpr int kStagedSharedBytes = staged_b_shared_bytes(TileM, TileK, LongK);
   constexpr bool kInvalid =
-      kStagedB ? (BlockThreads <= staged_b_down_warps(TileM) * 32 || kStagedSharedBytes > 99 * 1024 ||
-                  TileM % (16 * staged_b_row_split(TileM)) != 0)
+      kStagedB ? (BlockThreads <= staged_b_down_warps(TileM) * 32 ||
+                  kStagedSharedBytes > 99 * 1024 || TileM % (16 * staged_b_row_split(TileM)) != 0)
                : ((kKernelTileM * kSfColsPerTile) % kQuantThreads != 0 || kSharedBytes > 48 * 1024);
   if constexpr (kInvalid) {
     return cudaErrorInvalidValue;
@@ -1455,28 +1457,24 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
       }
     }
     if constexpr (kStagedB) {
-      auto* const kernel =
-          nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel<BlockThreads, LongK,
-                                                                        kKernelTileM, TileK,
-                                                                        Policy, Rank>;
+      auto* const kernel = nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel<
+          BlockThreads, LongK, kKernelTileM, TileK, Policy, Rank>;
       if constexpr (kStagedSharedBytes > 48 * 1024) {
         static cudaError_t const attribute_status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStagedSharedBytes);
         if (attribute_status != cudaSuccess) return attribute_status;
       }
       kernel<<<grid_blocks, BlockThreads, kStagedSharedBytes, stream>>>(
-              static_cast<quant::Type const*>(x),
-              static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-              static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-              static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
+          static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+          global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+          static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
       return cudaGetLastError();
     } else {
       nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<BlockThreads, LongK, kKernelTileM,
                                                                TileK, Policy, Rank>
           <<<grid_blocks, BlockThreads, 0, stream>>>(
-              static_cast<quant::Type const*>(x),
-              static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-              static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+              static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+              global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
               static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
       return cudaGetLastError();
     }

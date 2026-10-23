@@ -299,11 +299,15 @@ _WS_RANK: Final = 128
 
 def _ws_shared_bytes(tile_m: int, tile_k: int, stages: int) -> int:
     """Mirrors WsConfig::kSmemBytes (128-byte-swizzled TMA tiles, 1 KB aligned)."""
-    stage = (tile_m * tile_k * 2 + _WS_RANK * tile_k * 2 + tile_k * 2 + 1023) // 1024 * 1024
+    stage = (
+        (tile_m * tile_k * 2 + _WS_RANK * tile_k * 2 + tile_k * 2 + 1023) // 1024 * 1024
+    )
     return 1024 + stages * stage + 2 * stages * 8
 
 
-def sm120_ws_tiling_is_valid(m: int, k: int, tile_m: int, tile_k: int, packed: int) -> bool:
+def sm120_ws_tiling_is_valid(
+    m: int, k: int, tile_m: int, tile_k: int, packed: int
+) -> bool:
     """Python counterpart of launch_ws_kernel's guards."""
     stages = packed // 100 % 10
     if tile_k % 64 or m <= 0 or k <= 0 or k % tile_k or m > (1 << 30) or stages <= 0:
@@ -420,7 +424,9 @@ def sm120_variant_packs_l2t(m: int, k: int, variant: int, rank: int = 32) -> boo
     return family in SM120_FAMILY_PACKS_L2T
 
 
-def sm120_variant_reads_kmajor_l2t(m: int, k: int, variant: int, rank: int = 32) -> bool:
+def sm120_variant_reads_kmajor_l2t(
+    m: int, k: int, variant: int, rank: int = 32
+) -> bool:
     """Whether the chosen producer reads L2T K-major (every rank-128 family).
 
     Mirrors large_m_kmajor_l2() and the Rank > 64 small-M path in
@@ -428,8 +434,7 @@ def sm120_variant_reads_kmajor_l2t(m: int, k: int, variant: int, rank: int = 32)
     """
     family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
     return (
-        family
-        in (SM120_FAMILY_LARGE_M, SM120_FAMILY_WS_RANK128, SM120_FAMILY_SMALL_M)
+        family in (SM120_FAMILY_LARGE_M, SM120_FAMILY_WS_RANK128, SM120_FAMILY_SMALL_M)
         and rank > 64
     )
 

@@ -2200,9 +2200,12 @@ def test_sm120_prepared_l2t_invalidates_on_mutation_and_release() -> None:
         source = torch.zeros((5120, 32), dtype=torch.int32)
         svdquant_sm120_cutlass.prepare_sm120_l2t(source)
         prepared = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
-        assert prepared is svdquant_sm120_cutlass._SM120_PREPARED_L2T[
-            svdquant_sm120_cutlass._prepared_l2t_key(source)
-        ][2]["m537"]
+        assert (
+            prepared
+            is svdquant_sm120_cutlass._SM120_PREPARED_L2T[
+                svdquant_sm120_cutlass._prepared_l2t_key(source)
+            ][2]["m537"]
+        )
         source.add_(1)
         mutated = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
         assert mutated is not prepared
@@ -5027,7 +5030,16 @@ def test_fused_prefix_observes_graph_weight_updates(
 
     def prefix() -> None:
         module.nvfp4_quantize_smooth_lora_down_dyn_sm120(
-            x, pqs, global_scale, l2t_read, xq, sf, down, family, *tiling, address_policy
+            x,
+            pqs,
+            global_scale,
+            l2t_read,
+            xq,
+            sf,
+            down,
+            family,
+            *tiling,
+            address_policy,
         )
 
     def check() -> None:
