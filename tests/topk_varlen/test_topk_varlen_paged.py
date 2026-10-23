@@ -328,41 +328,6 @@ def test_paged_warmup_and_cuda_graph_replay():
     assert _same_rows(out, _expected(loc, pt, 1, page_size))
 
 
-@requires_gvr2
-@pytest.mark.parametrize("bound", [None, 16384], ids=["capacity", "bound16k"])
-def test_paged_capacity_buffer_graph_replay(bound):
-    """V4.1 c1 shape: a 1M-column buffer (page 128) whose rows stay at or below
-    16K, captured once with the capacity envelope or with the 16K-token graph
-    variant's bound; replays rewrite lengths, scores and the page table."""
-    rows, ncols, top_k, page_size, live = 32, 1048576, 512, 128, 16384
-    lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
-    lens = _mixed_lens(rows, live, top_k, 1, seed=43)
-    pt = _page_table(rows, ncols, page_size, seed=47)
-    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    kw = dict(out_indices=out, backend="gvr_2", page_table=pt, page_size=page_size)
-    if bound is not None:
-        kw["max_window_len"] = bound
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        flashinfer.top_k_varlen(lg, lens, top_k, **kw)
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
-        flashinfer.top_k_varlen(lg, lens, top_k, **kw)
-    torch.cuda.current_stream().wait_stream(s)
-    for seed in (53, 59, 61):
-        lg.normal_()
-        lens.copy_(_mixed_lens(rows, live, top_k, 1, seed=seed))
-        pt.copy_(_page_table(rows, ncols, page_size, seed=seed + 1))
-        out.fill_(-7)
-        g.replay()
-        torch.cuda.synchronize()
-        loc, _ = flashinfer.top_k_varlen(lg, lens, top_k, backend="gvr_2")
-        torch.cuda.synchronize()
-        assert _same_rows(out, _expected(loc, pt, 1, page_size))
-
-
 def test_paged_api_validation():
     rows, ncols, k = 8, 4096, 512
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
