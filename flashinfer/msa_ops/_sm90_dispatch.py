@@ -459,6 +459,22 @@ def _as_packed_kv(
     return base
 
 
+def _cake_decode_available(q, k, v) -> bool:
+    """Whether the Cake decode program admits this geometry.
+
+    Mirrors its ``_admit_sparse_decode`` checks so an unadmitted shape picks the
+    CuTe DSL schedule instead of raising: head_dim and page size are fixed, q is
+    contiguous bf16 and the paged cache is fp8 e4m3 with matching k/v shapes.
+    """
+    if q.dtype != torch.bfloat16 or not q.is_contiguous():
+        return False
+    if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+        return False
+    if k.ndim != 4 or k.shape != v.shape:
+        return False
+    return int(k.shape[2]) == _BLK_KV and int(k.shape[3]) == int(q.shape[-1])
+
+
 def sparse_decode_sm90(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -483,8 +499,12 @@ def sparse_decode_sm90(
     ``seqlen_q``, which the program checks against ``q``, ``seqused_k`` and
     ``page_table``; the public entry rejects ``causal=False`` and ``q_offset``
     and validates the paged metadata before reaching this function.  The
-    program consumes bf16 ``q`` only and SM90 has no other decode schedule,
-    so any other ``q`` dtype raises here.
+    program consumes bf16 ``q`` only, so any other ``q`` dtype raises here.
+
+    The Cake program is the default: it is 2-10% faster than the CuTe DSL
+    schedule on every measured shape and needs no dense-packed rebuild. The
+    CuTe schedule is kept as the fallback for geometries Cake does not admit,
+    so this op is not single-sourced.
     """
     from .cake_hopper_sm90 import hopper_msa_sparse_decode_attention
 
@@ -493,17 +513,30 @@ def sparse_decode_sm90(
             f"SM90 msa_sparse_decode_attention serves bf16 q; got {q.dtype}"
         )
     _check_packed_kv(k, v)
-    hopper_msa_sparse_decode_attention(
-        q,
-        k,
-        v,
-        _i32(q2k_indices),
-        page_table=_i32(page_table),
-        seqused_k=_i32(seqused_k),
-        seqlen_q=seqlen_q,
-        softmax_scale=softmax_scale,
-        out=out,
-    )
+    if _cake_decode_available(q, k, v):
+        hopper_msa_sparse_decode_attention(
+            q,
+            k,
+            v,
+            _i32(q2k_indices),
+            page_table=_i32(page_table),
+            seqused_k=_i32(seqused_k),
+            seqlen_q=seqlen_q,
+            softmax_scale=softmax_scale,
+            out=out,
+        )
+    else:
+        from .cute_dsl.sparse_decode_sm90 import run as _decode
+
+        _decode(
+            q,
+            _as_packed_kv(k, v),
+            _i32(q2k_indices),
+            _i32(page_table),
+            _i32(seqused_k),
+            out,
+            softmax_scale=softmax_scale,
+        )
     if v_global_scale is not None and v_global_scale != 1.0:
         out.mul_(v_global_scale)
     return out
