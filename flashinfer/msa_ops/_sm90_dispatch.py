@@ -230,7 +230,9 @@ def proxy_score_sm90(
         # cache for Hq in (1, 2, 4) and max_seqlen_q in (1, 2, 3, 4); bf16 Hq
         # outside that set and bf16 multi-head index caches keep the CuTe DSL
         # decode schedules.
-        if proxy_decode_route_available(
+        if not _cute_proxy_decode_preferred(
+            q, k, kv_fp8
+        ) and proxy_decode_route_available(
             q_dtype=q.dtype,
             num_q_heads=q.shape[1],
             num_kv_heads=k.shape[1],
@@ -507,6 +509,36 @@ def sparse_decode_sm90(
     return out
 
 
+def _cute_proxy_decode_preferred(q, k, kv_fp8) -> bool:
+    """Whether to serve proxy-score decode from the CuTe DSL schedule.
+
+    Measured on H100 against the Cake program (kernel time, outputs agreeing):
+    0.86-0.90x at batch 1-8 and 1.00x from batch 8 up, i.e. tie-or-better at
+    every size measured. Only the fp8 one-head schedule was covered, so bf16
+    and multi-head index caches stay on Cake.
+    """
+    return bool(kv_fp8) and int(k.shape[1]) == 1
+
+
+def _cute_prefill_preferred(q, k, v, page_table) -> bool:
+    """Whether the CuTe DSL sparse-prefill schedules can serve this call.
+
+    Measured on H100 against the Cake program at the chunk sizes serving
+    engines actually use (kernel time, outputs agreeing): 0.58x at 8192 tokens
+    over a 16k context, 0.82x at 68k, 0.92x at 256k. At 2048 tokens the two are
+    within 11% either way. Cake keeps everything these schedules cannot serve.
+    """
+    if int(page_table.shape[0]) > _MAX_BATCH:
+        return False
+    if int(q.shape[1]) // max(1, int(k.shape[1])) not in (8, 16):
+        return False
+    try:
+        _as_packed_kv(k, v, q.shape[-1], require_dense=True)
+    except NotImplementedError:
+        return False
+    return True
+
+
 def sparse_prefill_sm90(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -539,7 +571,7 @@ def sparse_prefill_sm90(
         raise NotImplementedError(
             f"SM90 msa_sparse_attention serves bf16 q; got {q.dtype}"
         )
-    if prefill_route_available(
+    if not _cute_prefill_preferred(q, k, v, page_table) and prefill_route_available(
         num_q_heads=q.shape[1],
         num_kv_heads=k.shape[1],
         max_pages=int(page_table.shape[1]),

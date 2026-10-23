@@ -1169,15 +1169,20 @@ def test_sm90_is_advertised_as_supporting_packed_kv():
 @pytest.fixture(params=["cake", "cute"])
 def sm90_regression_backend(request, monkeypatch):
     """Exercise the public Cake route and the retained CuTe fallback separately."""
-    if request.param == "cute":
-        from flashinfer.msa_ops import cake_hopper_sm90
+    from flashinfer.msa_ops import _sm90_dispatch, cake_hopper_sm90
 
+    if request.param == "cute":
         for route in (
             "prefill_route_available",
             "topk_route_available",
             "proxy_prefill_route_available",
         ):
             monkeypatch.setattr(cake_hopper_sm90, route, lambda **kwargs: False)
+    else:
+        # sparse prefill now prefers the CuTe schedules, so the Cake arm has to
+        # turn that preference off or this fixture would run CuTe on both arms.
+        for pref in ("_cute_prefill_preferred", "_cute_proxy_decode_preferred"):
+            monkeypatch.setattr(_sm90_dispatch, pref, lambda *a, **k: False)
     return request.param
 
 
