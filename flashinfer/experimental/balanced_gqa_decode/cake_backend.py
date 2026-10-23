@@ -44,7 +44,6 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
-    KINDS,
     PROGRAMS,
     load_cake_balanced_gqa_decode_module,
     select_module,
@@ -261,26 +260,12 @@ class BalancedGQADecodeRunner:
     def num_ctas(self) -> int:
         return int(self.main_kwargs["grid"][0])
 
-    def device_plan(self) -> tuple[int, int]:
-        """``(chunk_pairs, num_items)`` published by the last launch (syncs)."""
-        counters = self.main_kwargs["queue_counters"].tolist()
-        return int(counters[2]), int(counters[3])
-
 
 def program_kind(q_len_per_req: int) -> str:
     """``"row"`` or the packed MTP instance (``"mtp32"`` / ``"mtp64"``) for ``q_len_per_req``."""
     if uses_packed_mtp(q_len_per_req):
         return f"mtp{mtp_n_rows(q_len_per_req)}"
     return "row"
-
-
-def generated_program_available(device: torch.device, q_len_per_req: int = 1) -> bool:
-    """True when this checkout registers the program serving ``q_len_per_req`` on ``device``."""
-    arch = _device_arch(_device_index(device))
-    program = KINDS.get(program_kind(q_len_per_req))
-    return (
-        arch is not None and program is not None and arch in PROGRAMS[program]["arches"]
-    )
 
 
 def bind_decode_payload(
