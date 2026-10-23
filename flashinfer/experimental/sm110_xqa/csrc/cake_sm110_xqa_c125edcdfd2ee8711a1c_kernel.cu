@@ -42,21 +42,7 @@
 #define SMEM_TOTAL 230400
 #define LAUNCH_MIN_BLOCKS 1
 
-#if !defined(__CUDACC_RTC__)
-#include <stddef.h>
-#endif
-struct __align__(8) KVCacheList {
-    void* data;
-    const int* sequence_lengths;
-    unsigned int capacity;
-};
-static_assert(sizeof(KVCacheList) == 24, "KVCacheList size");
-static_assert(__alignof__(KVCacheList) == 8, "KVCacheList alignment");
-#if !defined(__CUDACC_RTC__)
-static_assert(offsetof(KVCacheList, data) == 0, "KVCacheList.data offset");
-static_assert(offsetof(KVCacheList, sequence_lengths) == 8, "KVCacheList.sequence_lengths offset");
-static_assert(offsetof(KVCacheList, capacity) == 16, "KVCacheList.capacity offset");
-#endif
+#include "cake_sm110_xqa_kv_cache_list_contig.h"
 
 #include <math_constants.h>
 #define CAKE_SM110_XQA_NEED_MBARRIER_WAIT_HINT

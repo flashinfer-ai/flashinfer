@@ -45,23 +45,7 @@
 #define SMEM_TOTAL 232448
 #define LAUNCH_MIN_BLOCKS 1
 
-#if !defined(__CUDACC_RTC__)
-#include <stddef.h>
-#endif
-struct __align__(8) KVCacheList {
-    void* pool;
-    const int* page_list;
-    const int* sequence_lengths;
-    unsigned int max_pages;
-};
-static_assert(sizeof(KVCacheList) == 32, "KVCacheList size");
-static_assert(__alignof__(KVCacheList) == 8, "KVCacheList alignment");
-#if !defined(__CUDACC_RTC__)
-static_assert(offsetof(KVCacheList, pool) == 0, "KVCacheList.pool offset");
-static_assert(offsetof(KVCacheList, page_list) == 8, "KVCacheList.page_list offset");
-static_assert(offsetof(KVCacheList, sequence_lengths) == 16, "KVCacheList.sequence_lengths offset");
-static_assert(offsetof(KVCacheList, max_pages) == 24, "KVCacheList.max_pages offset");
-#endif
+#include "cake_sm110_xqa_kv_cache_list_page128.h"
 
 #include <math_constants.h>
 #define CAKE_SM110_XQA_NEED_MBARRIER_TRY_WAIT

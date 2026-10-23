@@ -24,21 +24,7 @@
 #include <cstdint>
 #include <cstring>
 
-#if !defined(__CUDACC_RTC__)
-#include <stddef.h>
-#endif
-struct __align__(8) KVCacheList {
-    void* data;
-    const int* sequence_lengths;
-    unsigned int capacity;
-};
-static_assert(sizeof(KVCacheList) == 24, "KVCacheList size");
-static_assert(__alignof__(KVCacheList) == 8, "KVCacheList alignment");
-#if !defined(__CUDACC_RTC__)
-static_assert(offsetof(KVCacheList, data) == 0, "KVCacheList.data offset");
-static_assert(offsetof(KVCacheList, sequence_lengths) == 8, "KVCacheList.sequence_lengths offset");
-static_assert(offsetof(KVCacheList, capacity) == 16, "KVCacheList.capacity offset");
-#endif
+#include "cake_sm110_xqa_kv_cache_list_contig.h"
 
 extern "C" __global__ void kernel_cake_sm110_xqa_566f4afdf1aff7f72617(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
 
