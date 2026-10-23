@@ -216,3 +216,103 @@ def test_a_cold_bucket_under_capture_is_refused_typed(lru):
     state["capturing"] = False
     _bucket(api, 7)
     assert state["prepared"] == 1 and len(api._PLANS) == 1
+
+
+class _RecordingBlock:
+    """A stand-in for the vendored block: records the position tables every execute binds."""
+
+    def __init__(self):
+        self.bound = []
+
+    def execute(self, *args, **kw):
+        self.bound.append((kw["cos_pos"], kw["sin_pos"]))
+
+
+@pytest.fixture
+def functional(lru, monkeypatch):
+    """The functional decode entry on CPU through the real LRU and the real ``Qwen38BlockPlan.run``: the vendored block is the
+    recorder above and the per-call host checks that need device tensors (the weights, the operand binding, the workspace) are
+    stubbed, so what reaches ``execute`` is exactly what the entry bound."""
+    api, state = lru
+    block = _RecordingBlock()
+    fake_prepare = api.prepare
+
+    def prepare(form, **kw):
+        plan = fake_prepare(form, **kw)
+        plan._block = block
+        return plan
+
+    monkeypatch.setattr(api, "prepare", prepare)
+    monkeypatch.setattr(
+        api, "_device_of", lambda d: torch.device(d)
+    )  # the host's device passes the CUDA-only gate
+    monkeypatch.setattr(api, "_check_weights", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_page_size_of", lambda kv, layout, geometry: 16)
+    monkeypatch.setattr(
+        api.Qwen38BlockPlan,
+        "_bind",
+        lambda self, **call: dict(
+            call,
+            h=call["hidden_states"],
+            cos=call["rope_cos"],
+            sin=call["rope_sin"],
+            k_cache=None,
+            v_cache=None,
+            kv_lens=call["seq_lens"],
+            rank=2,
+            rows=self.num_tokens,
+        ),
+    )
+    monkeypatch.setattr(
+        api.Qwen38BlockPlan, "_workspace_for", lambda self, ws: self._workspace
+    )
+    return api, state, block
+
+
+def _tables(fill, n_pos=64):
+    return (
+        torch.full((1, n_pos, 64), fill, dtype=torch.bfloat16),
+        torch.full((1, n_pos, 64), -fill, dtype=torch.bfloat16),
+    )
+
+
+def test_a_functional_cache_hit_binds_this_calls_position_tables(functional):
+    """The four-call probe on ONE bucket: the first call compiles the plan with its tables; a hit with OTHER valid tables binds
+    THOSE (never the pair the first call compiled in); a call without tables is a typed error (never silently the plan's pair);
+    a too-short pair is the form's typed error -- and neither refused call launches."""
+    import types
+
+    api, state, block = functional
+    icache, ring = _side()
+    weights = types.SimpleNamespace(
+        w_qkvg=None, w_q_norm=None, w_k_norm=None, w_iq_norm=None, w_ik_norm=None
+    )
+    hidden = torch.zeros(2, 2560, dtype=torch.bfloat16)
+    kw = dict(
+        geometry=_geometry(),
+        kv_cache=torch.zeros(3, 2, 16, 2, 256, dtype=torch.bfloat16),
+        slot_mapping=torch.zeros(2, dtype=torch.int32),
+        block_table=torch.zeros(2, 4, dtype=torch.int32),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        index_kv_cache=icache,
+        index_state_cache=ring,
+        index_state_block_table=torch.zeros(2, 1, dtype=torch.int32),
+        out=torch.zeros(2, 2560, dtype=torch.bfloat16),
+    )
+    first, second = _tables(0.0), _tables(1.0)
+    api.decode(hidden, None, None, weights, None, position_tables=first, **kw)
+    api.decode(hidden, None, None, weights, None, position_tables=second, **kw)
+    assert state["prepared"] == 1, "one bucket: the second call is a cache hit"
+    assert len(block.bound) == 2
+    assert block.bound[0][0] is first[0] and block.bound[0][1] is first[1]
+    assert block.bound[1][0] is second[0] and block.bound[1][1] is second[1], (
+        "a cache hit bound the pair the FIRST call compiled in, not this call's"
+    )
+    with pytest.raises(ValueError, match="position_tables"):
+        api.decode(hidden, None, None, weights, None, position_tables=None, **kw)
+    with pytest.raises(ValueError, match="holds 32 positions"):
+        api.decode(
+            hidden, None, None, weights, None, position_tables=_tables(2.0, 32), **kw
+        )
+    assert len(block.bound) == 2, "a refused call must not launch"
+    assert state["prepared"] == 1

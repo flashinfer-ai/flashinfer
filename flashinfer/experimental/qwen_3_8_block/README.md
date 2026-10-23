@@ -116,11 +116,13 @@ out = w.run(hidden_states, None, None, weights, w_o,
   rows `block x cap + pos % cap`, `-1` = no write -- a stack's own circular-buffer slots; `ring_slots=False` derives them in the kernel.
   Bitwise; a compile key.
 - **`position_tables`**: `(cos_pos, sin_pos)` `[1, >= max_pages x page_size, rope_dim]` bf16 from
-  `qwen_3_8_block_rope_position_tables(cos_sin_cache, num_positions=...)`, formed ONCE at load and held by the plan: every rotation of the
+  `qwen_3_8_block_rope_position_tables(cos_sin_cache, num_positions=...)`, formed ONCE at load: every rotation of the
   step (the Q / K heads, the indexer queries, the completing block's key at its block START) reads them at the row's device-derived
   position. The block refuses a table shorter than the block table's reach by form; `num_positions` pads past the model's maximum
   position (rows no token reaches). With `rope_position_tables_only=False` the per-token `rope_cos` / `rope_sin` are read for the step's
-  own rows instead (the unfused arm's form; `qwen_3_8_block_rope_tables` builds them; bitwise the table arm).
+  own rows instead (the unfused arm's form; `qwen_3_8_block_rope_tables` builds them; bitwise the table arm). The functional entry
+  binds the pair of EACH call (required; checked against the bucket's plan -- a cache hit never rotates with the pair another call
+  compiled in); an explicit plan binds the pair it was prepared with unless its `run` is handed one.
 - **`hidden_states` / `out`**: contiguous `[T, d_model]` bf16 (or `[batch, q_len, d_model]`); `out` caller-owned for captured runs. Pad
   rows carry finite values (the GEMM reads them; a padded entry's `out` rows are exactly 0 regardless).
 - **`block_ids_out` / `block_lens_out`** (optional): `[T, top_k]` / `[T]` int32 buffers that receive the block's own per-row selection
@@ -230,13 +232,15 @@ pin at runtime (the same record as the Qwen 3.5 package's). The deployed process
 `tests/experimental/qwen_3_8_block/`: the decode form against the TWO-STAGE oracle (a torch reference prefill primes the pools, the ring
 and the paged compressed-key cache through the vendored compress kernel; then (1) the block's selection == the fp64 top-k of its own
 operands up to ties at the k-th boundary, the counts rule, the canonical list, (2) `out` within the block suite's budget of the fp32
-oracle fed THAT list; the written pool / ring / completed cache rows vs the reference) on the 24 / 2, 12 / 1 and 6 / 1 shards at `q_len`
-1 and 4, a padded entry, a sequence past the identity bound and one whose step completes a block, page 16 / 32 / 64 / 128, the UNIFIED
+oracle fed THAT list; the written pool / ring / completed cache rows vs the reference) on the served 24 / 2 geometry at `q_len` 1 and 4
+(the 12 / 1 and 6 / 1 shards are tested for their typed `proj_slab_route` decline only, at the probe and at `prepare`), a padded entry, a
+sequence past the identity bound and one whose step completes a block, page 16 / 32 / 64 / 128, the UNIFIED
 cache spelling bitwise the NHD one, the ring-slots arm bitwise the derived one, the fused prepare bitwise the unfused twin and the
 position-table arm bitwise the per-token arm, the launch census by kernel count (8 at a split), three carried steps with a rejected draft
 re-stepped (the cache rows bitwise a from-scratch compress of the accepted stream), CUDA-graph capture of the FIRST run under
 `set_sync_debug_mode("error")` replayed bitwise and over a new step, the functional decode captured through the plan cache and replayed
 after its eviction, a cached step under the same mode, the typed declines at plan time and at run time, the compiled-plan cache's reload,
+the functional entry binding each call's own position tables on a cache hit (another pair, a missing pair, a short pair; CPU),
 the weight packer on both spellings bitwise the cuDNN Frontend loader, the position tables bitwise the per-token rows, the plan cache's
 key and ownership contract on CPU, the admission grid (the probe's verdict == the vendored declaration's on geometries x step widths x
 list forms x cache dtypes x page sizes; a planted drift of every mirrored constant fires the tripwire) and the import-isolation tests

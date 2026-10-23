@@ -432,12 +432,28 @@ class Qwen38BlockPlan:
 
     @property
     def position_tables(self) -> Optional[PositionTables]:
-        """The ``(cos_pos, sin_pos)`` tables the plan was prepared with (handed to every run)."""
+        """The ``(cos_pos, sin_pos)`` tables the plan was prepared with: what a run binds when handed no pair of its own (the functional
+        entry hands its call's pair to every run)."""
         return self._position_tables
+
+    def _run_position_tables(self, tables: Optional[PositionTables]) -> PositionTables:
+        """The pair THIS run binds: the caller's, checked against the plan (``[1 or batch, >= max_pages x page_size, rope_dim]``, the
+        plan's dtype and device -- the functional entry hands its call's pair here on every call, cache hit or not, so a bucket never
+        rotates with the pair another call compiled in), else the pair the plan was prepared with."""
+        if tables is None:
+            return self._position_tables
+        return _check_position_tables(
+            tables,
+            self.geometry,
+            self.max_pages * self.page_size,
+            self.dtype,
+            self.device,
+        )
 
     def supports(self, **call) -> bool:
         """Whether a call with these keyword tensors (the ``run`` keywords) fits this plan: the host checks of ``run`` without a launch."""
         try:
+            self._run_position_tables(call.pop("position_tables", None))
             self._bind(**call)
         except (ValueError, TypeError):
             return False
@@ -641,8 +657,11 @@ class Qwen38BlockPlan:
         v_scale: Optional[torch.Tensor] = None,
         block_ids_out: Optional[torch.Tensor] = None,
         block_lens_out: Optional[torch.Tensor] = None,
+        position_tables: Optional[PositionTables] = None,
     ) -> torch.Tensor:
-        """Launch the plan on the current CUDA stream (capturable from the FIRST run; see the README's capture rules).  Returns ``out``."""
+        """Launch the plan on the current CUDA stream (capturable from the FIRST run; see the README's capture rules).  Returns ``out``.
+        ``position_tables`` binds that ``(cos_pos, sin_pos)`` pair for THIS run (checked against the plan: the form, the reach, the
+        dtype, the device); ``None`` binds the pair the plan was prepared with."""
         g, dev, dt = self.geometry, self.device, self.dtype
         if not self._captured and _capturing():
             self._captured = True  # a graph bakes this plan's workspace: the plan LRU must not free it at eviction
@@ -666,7 +685,7 @@ class Qwen38BlockPlan:
             block_lens_out=block_lens_out,
         )
         ws = self._workspace_for(workspace_buffer)
-        cos_pos, sin_pos = self._position_tables
+        cos_pos, sin_pos = self._run_position_tables(position_tables)
         o = (
             b["out"]
             if b["out"] is not None
@@ -883,11 +902,15 @@ def prepare(
     ring = _check_index_state_cache(
         index_state_cache, q, geometry, dtype, dev, ring_slots=ring_slots
     )
-    ring_table = (
-        _check_index_state_block_table(index_state_block_table, batch_size, dev)
-        if index_state_block_table is not None
-        else torch.zeros(batch_size, 1, dtype=torch.int32, device=dev)
-    )
+    if index_state_block_table is not None:
+        # the documented sample is [>= batch_size, 1]: a wider stack table's leading rows (the block_table sample's rule above); the
+        # run binds exactly [batch, 1]
+        rt = _tensor(index_state_block_table, "index_state_block_table")
+        ring_table = _check_index_state_block_table(
+            rt[:batch_size] if rt.dim() == 2 else rt, batch_size, dev
+        )
+    else:
+        ring_table = torch.zeros(batch_size, 1, dtype=torch.int32, device=dev)
     if position_tables is None:
         raise ValueError(
             f"{_PKG}: the decode form needs position_tables = (cos_pos, sin_pos) at prepare (qwen_3_8_block_rope_position_tables(cos_sin_cache, "
@@ -1244,7 +1267,8 @@ def cached_plan(
     geometry with its indexer fields, the dtype, the device, the pools' layout / shape / strides, the batch, the query rows, the table's
     columns and row stride, the KV bound, the split) plus the side caches' FORM (shapes, dtypes), the two input-contract flags, the knobs
     and the pools' dtype.  NOT in the key: the side caches' strides (symbolic in the kernels: a stack may re-allocate them with other
-    strides without a new plan) and the position tables' reach (a per-run form check against the plan's ``max_pages``).
+    strides without a new plan) and the position tables (the functional entry hands THIS call's pair to every run, checked against the
+    plan's form there; the pair the first call compiled in is only the plan's default for an explicit run that hands none).
 
     Under CUDA-graph capture only a bucket already cached is served (its plan is then retained past eviction); a cold bucket raises a
     typed ``RuntimeError`` naming the remedy -- one eager call outside the capture warms it."""
@@ -1349,6 +1373,12 @@ def decode(
     arms follow the arguments: ``rope_cos / rope_sin`` None = the position-table arm (``position_tables`` then REQUIRED), given = the
     per-token arm (the position tables still required for the block starts); ``index_state_slot_mapping`` given = the ring-slots arm."""
     if plan is None:
+        if position_tables is None:
+            raise ValueError(
+                f"{_PKG}: the functional decode entry binds THIS call's position_tables = (cos_pos, sin_pos) (qwen_3_8_block_rope_position_tables("
+                "cos_sin_cache, num_positions >= max_pages x page_size)) -- the bucket's cached plan never substitutes the pair another call "
+                "compiled in; a plan of your own (prepare_qwen_3_8_block_bf16 / Qwen38BlockWrapper) holds one"
+            )
         rows, _, _ = _api35._rows_of(hidden_states)
         q = int(q_len_per_req)
         if q <= 0 or rows % q:
@@ -1395,4 +1425,5 @@ def decode(
         index_state_slot_mapping=index_state_slot_mapping,
         block_ids_out=block_ids_out,
         block_lens_out=block_lens_out,
+        position_tables=position_tables,
     )

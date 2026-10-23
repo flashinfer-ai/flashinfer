@@ -61,10 +61,12 @@ def test_position_tables_pad_to_the_table_reach_and_cast():
         cos_pos[0, 100:], ref[0, 99:100].expand(12, 64)
     ), "the rows past the cache repeat the last row (positions no token reaches)"
     short, _ = qwen_3_8_block_rope_position_tables(cache, num_positions=10)
-    assert (
-        short.shape == (1, 10, 64)
-        and torch.equal(short[0], ref.float()[0, :10]) is False
-        or short.dtype == torch.float32
+    full, _ = qwen_3_8_block_rope_position_tables(cache)
+    assert short.shape == (1, 10, 64) and short.dtype == cache.dtype == torch.float32, (
+        "no dtype: the cache's own"
+    )
+    assert torch.equal(short[0], full[0, :10]), (
+        "a shorter table is the prefix of the full one"
     )
     with pytest.raises(ValueError, match="num_positions"):
         qwen_3_8_block_rope_position_tables(cache, num_positions=0)

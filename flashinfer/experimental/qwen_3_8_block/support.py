@@ -10,7 +10,9 @@ every lighter gate has passed, and the indexer rules this module mirrors from th
 
 ONE geometry gate, :meth:`Qwen38BlockGeometry.unsupported_reason`, serves both callers -- the probe and ``api.prepare`` (through
 :func:`require_served`) -- so a geometry the probe advertises is one the decode form's declaration admits, and a geometry it
-declines is a typed ``NotImplementedError`` at plan time before any vendored code runs.
+declines is a typed ``NotImplementedError`` at plan time before any vendored declaration is built (the geometry gate itself runs
+before any vendored import; the projection-route gate after it, :func:`proj_route_reason`, asks the vendored tile rule's host
+arithmetic and declines the TP 2 / TP 4 shards).
 """
 
 from __future__ import annotations

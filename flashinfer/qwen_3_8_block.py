@@ -318,7 +318,7 @@ def prepare_qwen_3_8_block_bf16(
         A sample ``[>= batch_size, 1]`` int32 ring table (form only; a zeros sample when ``None``).
     position_tables : (torch.Tensor, torch.Tensor)
         REQUIRED: ``(cos_pos, sin_pos)`` from :func:`qwen_3_8_block_rope_position_tables`, ``[1, >= max_pages x page_size, rope_dim]`` bf16,
-        held by the plan and handed to every run.
+        held by the plan: what its ``run`` binds unless handed a pair of its own (``position_tables=``, checked against the plan).
     rope_position_tables_only : bool
         ``True`` (default): every rotation reads the position tables at the row's device-derived position and ``run`` takes
         ``rope_cos=None, rope_sin=None``; ``False``: the per-token tables are required at ``run`` (the unfused arm's form; bitwise).
@@ -435,7 +435,9 @@ def qwen_3_8_block_bf16_decode(
         ``None`` (the ring rows derive in the kernel) or ``[batch * q_len_per_req]`` of ``slot_mapping``'s dtype: the stack's ring WRITE
         rows ``block x cap + pos % cap``, ``-1`` = no write (the ring-slots arm; bitwise).
     position_tables : (torch.Tensor, torch.Tensor)
-        ``(cos_pos, sin_pos)`` of :func:`qwen_3_8_block_rope_position_tables` (required without ``plan``).
+        ``(cos_pos, sin_pos)`` of :func:`qwen_3_8_block_rope_position_tables`, bound for THIS call and checked against the bucket's plan
+        (``[1 or batch, >= max_pages x page_size, rope_dim]``, its dtype and device): required without ``plan`` -- the cached plan never
+        substitutes the pair another call compiled in; with ``plan``, ``None`` binds the pair the plan was prepared with.
     q_len_per_req : int
     max_seq_len : Optional[int]
     decode_split_kv : Optional[int]
