@@ -296,9 +296,11 @@ def dsa_sparse_attention_varlen(
     ``(seqlen_k[d] - seqlen_q[d]) + local_q`` (a context-parallel tail or a
     GLM-style packed batch).  ``gather_kv_indices`` ``[T, topk]`` int32 hold
     key positions relative to the row's document (``-1`` or ``>= seqlen_k[d]``
-    invalid) and are offset by ``cu_seqlens_k`` on device before the flat
-    kernels run (this glue counts in the step time).  Zero-length query
-    segments contribute no rows; a row whose every slot is invalid gives
+    invalid) and are offset by ``cu_seqlens_k`` on device in one launch right
+    before the forward kernel; each row is compacted (valid keys first, in slot
+    order, then ``-1``) so rows with holes cost their valid slots, and a caller
+    ``topk_length`` is a position cut applied before compaction.  Zero-length
+    query segments contribute no rows; a row whose every slot is invalid gives
     ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
     positional mask of their own; the offset index rows define the key sets.
     ``max_seqlen_q`` / ``max_seqlen_k`` are accepted for signature parity with
@@ -544,9 +546,11 @@ def dsa_sparse_attention_nope_varlen(
     key position ``(seqlen_k[d] - seqlen_q[d]) + local_q``.
     ``gather_kv_indices`` ``[T, K_slots]`` int32 hold key positions relative
     to the row's document (``-1`` or ``>= seqlen_k[d]`` invalid; any ``K_slots
-    >= 1``) and are offset by ``cu_seqlens_k`` on device before the flat
-    kernels run (this glue counts in the step time).  Zero-length query
-    segments contribute no rows; a row whose every slot is invalid gives
+    >= 1``) and are offset by ``cu_seqlens_k`` on device in one launch right
+    before the forward kernel; each row is compacted (valid keys first, in slot
+    order, then ``-1``) so rows with holes cost their valid slots, and a caller
+    ``topk_length`` is a position cut applied before compaction.  Zero-length
+    query segments contribute no rows; a row whose every slot is invalid gives
     ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
     positional mask of their own; the offset index rows define the key sets.
     ``max_seqlen_q`` / ``max_seqlen_k`` are accepted for signature parity with
@@ -566,7 +570,9 @@ def dsa_sparse_attention_nope_varlen(
     document with ``seqlen_k < seqlen_q`` gives negative own positions
     (all-invalid rows under ``causal``), a non-monotonic prefix sum assigns
     rows to the wrong document.  The per-document rows are turned into global
-    key rows on device, in one launch right before the forward kernel.
+    key rows on device, compacted, in one launch right before the forward
+    kernel; a caller ``topk_length`` is a position cut applied before
+    compaction and the kernels read the compacted rows and their counts.
 
     Parameters
     ----------

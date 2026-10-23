@@ -97,8 +97,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_delta": {
-            "module": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
-            "library": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
+            "module": "cake_dsa_h64_nope_train_ae9db52dff326ae8409b",
+            "library": "cake_dsa_h64_nope_train_ae9db52dff326ae8409b",
             "ffi_entry": "run",
             "launch": {
                 "block": [256, 1, 1],
@@ -193,9 +193,11 @@ MODULES: dict[str, dict[str, Any]] = {
     # at least one key per query (``min_keys_per_query`` 1).  The compaction and
     # cast stages are rope-independent kernels shared with the RoPE program
     # (same libraries, same launch geometry; the cast runs over the one 512-wide
-    # accumulator, 16 groups per key); the delta stage is the strided form of
-    # the shared delta kernel (256 threads: it reads ``dout`` through its token
-    # and head strides, so a head-major gradient view is consumed in place);
+    # accumulator, 16 groups per key); the delta stage is the strided delta
+    # kernel, shared with the RoPE record like compact and cast (both records'
+    # ``bwd_delta`` / ``nope_bwd_delta`` name one library; 256 threads: it
+    # reads ``dout`` through its token and head strides, so a head-major
+    # gradient view is consumed in place by both programs);
     # the forward (320 threads, 222,464 B dynamic shared memory) and the four
     # main backward forms (640 threads, 214,208 B; permuted / natural-layout
     # accumulation, single-pass / key-range-pass) are the NoPE kernels.  Stage
