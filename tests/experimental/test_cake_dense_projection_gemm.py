@@ -58,6 +58,7 @@ default_stages = cake_backend.default_stages
 device_l2_bytes = cake_backend.device_l2_bytes
 epi_cols = cake_backend.epi_cols
 epi_mode = cake_backend.epi_mode
+exact_waves = cake_backend.exact_waves
 epi_slots = cake_backend.epi_slots
 generated_program_available = cake_backend.generated_program_available
 instance_key = cake_backend.instance_key
@@ -546,6 +547,7 @@ MLA_TEMPLATES = {
 # against: an export with another count fails here, at import, before any test
 # runs; a same-count substitution passes this pin and is left to the tests that
 # name templates (the planner tables above, the symbol and record pins below).
+
 EXPORTED_TEMPLATES = frozenset(
     template
     for arch in cake_jit.KERNELS
@@ -611,11 +613,46 @@ def _registered(arch):
     )
 
 
-def _assert_mirrors_cake(plan, cake_template, where, arch):
+# the knob tokens ``instance_symbol`` emits after ``_ht`` (the transposed store, the epilogue, the tail policies, the
+# raster forms, the load-warp prelude and the pair prologue form)
+_AFTER_HT = re.compile(
+    r"^(t|tma\d+|s\d+|box\d+|skx|skf|sks|stt|sb\d|bf|bg\d+|so[a-z]|pd\d+|sh\d+|c1|cg|or|lw|pro\d+)$"
+)
+
+
+def _rule_program(cake_template, rule):
+    """The program the planner names for a row whose rule pins ``htail``: the Cake launcher's template with the
+    ``_ht`` knob where the launcher's half-tail fit dropped it.  The planner's fit selects only the plan
+    (``plan.htail_plan``); the program a rule names stays (the round-2 shapes tranche measured the K 5120 thin input
+    gradients on that program with the whole-tile plan).  The knob is inserted at its ``instance_symbol`` position and
+    checked through the backend's decoder: every other knob of the launcher's template is unchanged."""
+    if not (rule and rule.get("htail")):
+        return cake_template
+    before = cake_backend._template_knobs(cake_template)
+    if before is None or before["htail"]:
+        return cake_template
+    tokens = cake_template.split("_")
+    at = next(
+        (i for i in range(4, len(tokens)) if _AFTER_HT.match(tokens[i])), len(tokens)
+    )
+    with_ht = "_".join(tokens[:at] + ["ht"] + tokens[at:])
+    after = cake_backend._template_knobs(with_ht)
+    assert (
+        after is not None and after["htail"] and {**after, "htail": False} == before
+    ), (
+        cake_template,
+        with_ht,
+    )
+    return with_ht
+
+
+def _assert_mirrors_cake(plan, cake_template, where, arch, rule=None):
     """The plan is the Cake launcher's plan when that instance is a generated program of ``arch``; otherwise (the
     batched small-M swap on a tiny T outside the export contract, a measured rule whose template exists only for
     the contract's T, or a default tail-T instance no contract row of this architecture produced -- all of which
-    the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program."""
+    the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program.  A rule that
+    pins ``htail`` names its ``_ht`` program on every device and T (``_rule_program``)."""
+    cake_template = _rule_program(cake_template, rule)
     registered = _registered(arch)
     assert registered <= EXPORTED_TEMPLATES, (
         arch,
@@ -635,9 +672,27 @@ def _assert_mirrors_cake(plan, cake_template, where, arch):
         assert plan.template in registered, (*where, cake_template, plan.template)
 
 
+def _registered_capabilities() -> str:
+    """The compute capabilities this checkout registers generated programs for (the architectures of
+    ``cake_jit.KERNELS``), spelled for the skip messages: ``10.0 or 10.7`` while ``build.json`` ships ``sm_100a`` and
+    ``sm_107a`` builds, ``10.0, 10.3 or 10.7`` once the ``sm_103a`` programs register (see README)."""
+    caps = [
+        f"{major}.{minor}"
+        for (major, minor), arch in sorted(
+            cake_backend.SUPPORTED_COMPUTE_CAPABILITIES.items()
+        )
+        if arch in cake_jit.KERNELS
+    ]
+    return (
+        " or ".join(caps)
+        if len(caps) <= 2
+        else ", ".join(caps[:-1]) + " or " + caps[-1]
+    )
+
+
 def _device_supported() -> bool:
-    """A device this checkout registers generated programs for (``build.json`` ships
-    ``sm_100a`` and ``sm_107a`` builds: compute capability 10.0 or 10.7; see README)."""
+    """A device this checkout registers generated programs for (an architecture of ``cake_jit.KERNELS``: compute
+    capability ``_registered_capabilities()``; see README)."""
     return torch.cuda.is_available() and generated_program_available(
         torch.device("cuda")
     )
@@ -647,7 +702,7 @@ def _require_program(template: str):
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     if not generated_program_available(torch.device("cuda"), template):
         pytest.skip(f"generated instance {template!r} not registered for this device")
@@ -660,7 +715,7 @@ def _registered_knobs(v, *candidates):
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     templates = [_plan_template(v, **knobs) for knobs in candidates]
     for knobs, template in zip(candidates, templates, strict=True):
@@ -1268,7 +1323,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 32
+        len(key) == 34
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1330,7 +1385,7 @@ def test_round15_store_hint_knob():
     key = instance_key(
         a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
     )
-    assert len(key) == 32 and key[22] == "evict_last"
+    assert len(key) == 34 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
     assert (
         instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
@@ -1372,7 +1427,7 @@ def test_round15_pd_sh_knobs():
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 32 and key[23] == 2 and key[24] == 0
+    assert len(key) == 34 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
     assert (
         instance_key(a_mn=False, b_mn=True)[23:]
@@ -1386,8 +1441,10 @@ def test_round15_pd_sh_knobs():
             False,
             False,
             0,
+            False,
+            False,
         )
-    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag and the round-33 pro knob (0 = off)
+    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag, the round-33 pro knob (0 = off) and the round-2 shapes tranche's sk_first / lw flags
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -1491,7 +1548,7 @@ def test_round13_knob_normalisation():
     # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
     # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 32 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 34 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1632,7 +1689,7 @@ def test_round19_sk_slab_knob():
     # one key); 3 needs an fp32 output through the TMA-store or the transposed register epilogue; 2 needs the eight warp
     # slabs (EPI_WARPS x epi_cols x 128 B) to fit the mainloop stage ring
     key = instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2)
-    assert len(key) == 32 and key[25] is True and key[26] == 2 and key[27] is False
+    assert len(key) == 34 and key[25] is True and key[26] == 2 and key[27] is False
     assert instance_symbol(key) == "dense_proj_gemm_nn_n256_m256_sks_sb2"
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2)[26] == 0
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2) == instance_key(
@@ -1703,7 +1760,7 @@ def test_round19_cta1_knob():
     # single-CTA fit and ``_s<n>`` is relative to it; it excludes the tall / 64-row families, the pair-level tail
     # policies / probes and the batched raster knob
     key = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True)
-    assert len(key) == 32 and key[27] is True and key[26] == 0 and key[5] == 7
+    assert len(key) == 34 and key[27] is True and key[26] == 0 and key[5] == 7
     assert instance_symbol(key) == "dense_proj_gemm_kk_n128_c1"
     assert b_stage_bytes(False, 128, 128, 1) == 2 * b_stage_bytes(False, 128) == 16384
     assert b_stage_bytes(True, 256, 128, 1) == 2 * b_stage_bytes(True, 256) == 32768
@@ -2802,7 +2859,7 @@ def test_round27_stt_knob(T):
         sk_sync=True,
         stt=True,
     )
-    assert len(on) == 32 and on[30] is True and on[25] is True and on[29] is False
+    assert len(on) == 34 and on[30] is True and on[25] is True and on[29] is False
     assert instance_symbol(on) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt"
     off = instance_key(
         a_mn=True,
@@ -2813,13 +2870,13 @@ def test_round27_stt_knob(T):
         hints=("evict_first", "evict_first"),
         sk_sync=True,
     )
-    assert len(off) == 32 and off[30] is False and off[:30] == on[:30]
+    assert len(off) == 34 and off[30] is False and off[:30] == on[:30]
     assert (
         instance_symbol(off) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks"
     )  # the round-18 symbol, byte-identical
     plain = instance_key(a_mn=True, b_mn=True, out_t=True, stt=True)
     assert (
-        len(plain) == 32
+        len(plain) == 34
         and plain[30] is True
         and plain[5] == off[5] == on[5]
         or plain[30] is True
@@ -2827,7 +2884,7 @@ def test_round27_stt_knob(T):
     assert instance_symbol(plain) == "dense_proj_gemm_nn_n256_t_stt"
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 32
+        len(default) == 34
         and default[30] is False
         and instance_symbol(default) == "dense_proj_gemm_kk_n256"
     )
@@ -3207,10 +3264,10 @@ def test_round33_pro_knob(T):
     # pair programs only (the single-CTA form refuses it); every other field is unchanged: the OFF form's key is the round-27 key plus a
     # trailing 0 and its symbol is the round-27 symbol
     on = instance_key(a_mn=False, b_mn=True, pro=7)
-    assert len(on) == 32 and on[31] == 7 and on[30] is False and on[27] is False
+    assert len(on) == 34 and on[31] == 7 and on[30] is False and on[27] is False
     assert instance_symbol(on) == "dense_proj_gemm_kn_n256_pro7"
     off = instance_key(a_mn=False, b_mn=True)
-    assert len(off) == 32 and off[31] == 0 and off[:31] == on[:31]
+    assert len(off) == 34 and off[31] == 0 and off[:31] == on[:31]
     assert (
         instance_symbol(off) == "dense_proj_gemm_kn_n256"
     )  # the round-2 symbol, byte-identical
@@ -3255,7 +3312,7 @@ def test_round33_pro_knob(T):
     )
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 32
+        len(default) == 34
         and default[31] == 0
         and instance_symbol(default) == "dense_proj_gemm_kk_n256"
     )
@@ -3332,10 +3389,10 @@ def test_round21_cgrp_knob(T):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(key) == 32 and key[28] is True and key[27] is False
+    assert len(key) == 34 and key[28] is True and key[27] is False
     assert instance_symbol(key) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 32 and off[:28] == key[:28] and off[28] is False
+    assert len(off) == 34 and off[:28] == key[:28] and off[28] is False
     assert instance_symbol(off) == "dense_proj_gemm_kk_n256_m256_ov_ht"
     assert (
         instance_symbol(instance_key(a_mn=False, b_mn=False, cgrp=True))
@@ -3490,26 +3547,26 @@ def test_round24_ovr_knob(T):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, htail=True, cgrp=True, ovr=True
     )
-    assert len(key) == 32 and key[29] is True and key[28] is True and key[16] is False
+    assert len(key) == 34 and key[29] is True and key[28] is True and key[16] is False
     assert instance_symbol(key) == "dense_proj_gemm_kk_n256_m256_ht_cg_or"
     solo = instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, ovr=True)
-    assert len(solo) == 32 and solo[29] is True and solo[28] is False
+    assert len(solo) == 34 and solo[29] is True and solo[28] is False
     assert instance_symbol(solo) == "dense_proj_gemm_kk_n256_m256_ht_or"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 32 and off[29] is False and off[16] is True
+    assert len(off) == 34 and off[29] is False and off[16] is True
     assert (
         instance_symbol(off) == "dense_proj_gemm_kk_n256_m256_ov_ht"
     )  # the round-21 symbol, byte-identical
     cg = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(cg) == 32 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
+    assert len(cg) == 34 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
     assert (
         instance_symbol(cg) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
     )  # test_round21_cgrp_knob's symbol, now on a 30-field key
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 32
+        len(default) == 34
         and default[29] is False
         and instance_symbol(default) == "dense_proj_gemm_kk_n256"
     )
@@ -3726,7 +3783,7 @@ def test_instance_key_rejects_bad_configurations():
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
     # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19), cgrp (29 fields
     # since round 21), ovr (30 fields since round 24)
-    assert len(key) == 32 and key[11:] == (
+    assert len(key) == 34 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -3748,6 +3805,8 @@ def test_instance_key_rejects_bad_configurations():
         False,
         False,  # stt (31 fields since round 27)
         0,  # pro (32 fields since round 33)
+        False,  # sk_first (33 fields: the round-2 shapes tranche)
+        False,  # lw (34 fields: the round-2 shapes tranche)
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
@@ -4055,6 +4114,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     _expected(EXPECTED_TEMPLATES, (row, op, out_dtype), T, sm_count),
                     (row, op, out_dtype, T, sm_count),
                     ARCH_OF_SM[sm_count],
+                    rule,
                 )
                 # round 19 (Cake W3): under the single-CTA form of a ``cta1`` rule the work items are CTA tiles, the
                 # concurrent units are the SMs and the grid is one CTA per work item (cluster dims 1)
@@ -4203,8 +4263,9 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     )
                     and exact_plan is None
                     and sync_plan is None
-                    and 0 < 2 * tail <= plan.sm_pairs
                 )
+                # the fit of the half items selects the plan, never the program the rule names
+                htail_plan = htail and 0 < 2 * tail <= plan.sm_pairs
                 parts = rule.get("sk_parts") if sync_plan is None else None
                 sk_rule = (
                     sk_parts_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, parts)
@@ -4213,6 +4274,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 )
                 assert plan.sk_exact == (exact if exact_plan is not None else 0)
                 assert plan.htail == htail
+                assert plan.htail_plan == htail_plan
                 assert plan.sk_sync == (sync_plan is not None)
                 assert ("_sks" in _nopro(plan.template)) == plan.sk_sync
                 # round 19 (Cake W2): the slab path of a rule's synchronised plan, with the launcher's yield rules for
@@ -4281,7 +4343,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     )
                     assert plan.sk_iters == tail
                     assert plan.ws_f32_elems == tail * 2 * plan.cta_rows * plan.block_n
-                elif htail:
+                elif htail_plan:
                     # 2 x tail half-height items of whole K: no partial slabs, no fixup, no counters in use beyond
                     # the tail tiles; the tall tile may exceed one wave of pairs
                     assert (
@@ -6032,10 +6094,10 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, False, False, False, False, 1024, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 4096, 2048, None), 16172, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 4096, 2048, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
-    (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
-    (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
-    (('sm_100a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
-    (('sm_100a', False, False, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
     (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 5120, 17408, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
@@ -6048,30 +6110,30 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, False, False, False, False, 17408, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
     (('sm_100a', False, True, False, False, False, 2048, 4096, None), 16172, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
     (('sm_100a', False, True, False, False, False, 2048, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
     (('sm_100a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
-    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
-    (('sm_100a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_100a', False, True, False, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
     (('sm_100a', False, True, False, False, False, 5120, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_100a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
@@ -6108,10 +6170,12 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, True, True, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
     (('sm_100a', False, True, True, False, False, 8192, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
     (('sm_100a', False, True, True, False, False, 8192, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n224_hne_cg_pro15'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n224_hne_cg_pro15'),
     (('sm_100a', True, True, False, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
     (('sm_100a', True, True, False, False, False, 4096, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
-    (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
-    (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
     (('sm_100a', True, True, False, False, False, 5120, None, 512), 16231, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
     (('sm_100a', True, True, False, False, False, 5120, None, 512), 16384, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
     (('sm_100a', True, True, False, False, False, 5120, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_cg_pro15'),
@@ -6120,8 +6184,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', True, True, False, False, False, 5120, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_100a', True, True, False, False, False, 6144, None, 12288), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_100a', True, True, False, False, False, 6144, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
-    (('sm_100a', True, True, False, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
-    (('sm_100a', True, True, False, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
+    (('sm_100a', True, True, False, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
     (('sm_100a', True, True, False, False, False, 12288, None, 6144), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_100a', True, True, False, False, False, 12288, None, 6144), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_100a', True, True, False, True, False, 32, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
@@ -6144,8 +6208,6 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', True, True, False, True, False, 128, None, 8192), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
     (('sm_100a', True, True, False, True, False, 512, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m64_hen_t_pro15'),
     (('sm_100a', True, True, False, True, False, 512, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m64_hen_t_pro15'),
-    (('sm_100a', True, True, False, True, False, 1024, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_hen_t_pro15'),
-    (('sm_100a', True, True, False, True, False, 1024, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_hen_t_pro15'),
     (('sm_100a', True, True, True, False, False, 4096, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n256_f32_tma1_cg_pro15'),
     (('sm_100a', True, True, True, False, False, 4096, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n256_f32_tma1_cg_pro15'),
     (('sm_100a', True, True, True, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
@@ -6212,10 +6274,10 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, False, False, False, False, 1024, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 2048, None), 16172, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 2048, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
-    (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
-    (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
-    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
-    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 5120, 17408, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
@@ -6228,30 +6290,30 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, False, False, False, False, 17408, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, True, False, False, False, 2048, 4096, None), 16172, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
     (('sm_103a', False, True, False, False, False, 2048, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_103a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_103a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
-    (('sm_103a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_103a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_103a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
     (('sm_103a', False, True, False, False, False, 5120, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_103a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
@@ -6292,8 +6354,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', True, True, False, False, False, 4096, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n224_hne_cg_pro15'),
     (('sm_103a', True, True, False, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
     (('sm_103a', True, True, False, False, False, 4096, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
-    (('sm_103a', True, True, False, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
-    (('sm_103a', True, True, False, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
     (('sm_103a', True, True, False, False, False, 5120, None, 512), 16231, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
     (('sm_103a', True, True, False, False, False, 5120, None, 512), 16384, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
     (('sm_103a', True, True, False, False, False, 5120, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_pro15'),
@@ -6302,8 +6364,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', True, True, False, False, False, 5120, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_103a', True, True, False, False, False, 6144, None, 12288), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_103a', True, True, False, False, False, 6144, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
-    (('sm_103a', True, True, False, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
-    (('sm_103a', True, True, False, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
+    (('sm_103a', True, True, False, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m256_skx_skf_pro7'),
     (('sm_103a', True, True, False, False, False, 12288, None, 6144), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_103a', True, True, False, False, False, 12288, None, 6144), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
     (('sm_103a', True, True, False, True, False, 32, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
@@ -6375,12 +6437,14 @@ PENDING_PROGRAMS: dict[str, frozenset[str]] = {
             "dense_proj_gemm_kk_n128_hen_pro15",
             "dense_proj_gemm_kk_n256_cg_pro15",
             "dense_proj_gemm_kk_n256_ht_cg_pro15",
-            "dense_proj_gemm_kk_n256_m256_ov_cg_pro7",
             "dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7",
             "dense_proj_gemm_kn_n256_cg_pro15",
             "dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15",
+            "dense_proj_gemm_kn_n256_ht_cg_pro15",
+            "dense_proj_gemm_kn_n256_ht_tma2_lw_pro15",
             "dense_proj_gemm_kn_n256_m256_ht_or_pro7",
-            "dense_proj_gemm_kn_n256_m256_ov_cg_pro7",
+            "dense_proj_gemm_kn_n256_m256_ov_ht_cg_pro7",
+            "dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15",
             "dense_proj_gemm_kn_n256_tma2_pd3_c1",
             "dense_proj_gemm_nn_n128_hen_f32_t_pro15",
             "dense_proj_gemm_nn_n128_hen_t_pro15",
@@ -6390,9 +6454,10 @@ PENDING_PROGRAMS: dict[str, frozenset[str]] = {
             "dense_proj_gemm_nn_n160_m256_bz64_hne_f32_v8_ef_cg_pro15",
             "dense_proj_gemm_nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
             "dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15",
+            "dense_proj_gemm_nn_n224_hne_cg_pro15",
             "dense_proj_gemm_nn_n224_m256_pro7",
             "dense_proj_gemm_nn_n256_f32_tma1_cg_pro15",
-            "dense_proj_gemm_nn_n256_hen_t_pro15",
+            "dense_proj_gemm_nn_n256_m256_skx_skf_pro7",
             "dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15",
             "dense_proj_gemm_nn_n256_m64_hen_t_pro15",
         }
@@ -6403,15 +6468,18 @@ PENDING_PROGRAMS: dict[str, frozenset[str]] = {
             "dense_proj_gemm_kk_n128_hen_pro15",
             "dense_proj_gemm_kk_n256_cg_pro15",
             "dense_proj_gemm_kk_n256_ht_cg_pro15",
-            "dense_proj_gemm_kk_n256_m256_ov_cg_pro7",
             "dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7",
             "dense_proj_gemm_kk_n256_pro7",
             "dense_proj_gemm_kn_n256_cg_pro15",
             "dense_proj_gemm_kn_n256_f32_tma1_pro7",
             "dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15",
+            "dense_proj_gemm_kn_n256_ht_cg_pro15",
+            "dense_proj_gemm_kn_n256_ht_tma2_lw_pro15",
             "dense_proj_gemm_kn_n256_m256_ht_or_pro7",
-            "dense_proj_gemm_kn_n256_m256_ov_cg_pro7",
+            "dense_proj_gemm_kn_n256_m256_ov_ht_cg_pro7",
+            "dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15",
             "dense_proj_gemm_kn_n256_tma1_pd2_pro15",
+            "dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15",
             "dense_proj_gemm_kn_n256_tma2_pd2_pro15",
             "dense_proj_gemm_kn_n256_tma2_pd3_c1",
             "dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7",
@@ -6428,6 +6496,7 @@ PENDING_PROGRAMS: dict[str, frozenset[str]] = {
             "dense_proj_gemm_nn_n256_m256_f32_tma1_pro7",
             "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7",
             "dense_proj_gemm_nn_n256_m256_sks_sb2_pro7",
+            "dense_proj_gemm_nn_n256_m256_skx_skf_pro7",
             "dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15",
             "dense_proj_gemm_nn_n256_m64_hen_t_pro15",
         }
@@ -6500,10 +6569,14 @@ def test_wgrad_swap_follows_the_measured_rule():
                 arch,
                 out_f32,
             )
-    # ... and 4096 -> 1024 bf16 swaps on sm_100a only
-    assert wgrad_swapped(1024, 4096, arch="sm_100a", out_f32=False)
-    assert not wgrad_swapped(1024, 4096, arch="sm_103a", out_f32=False)
-    assert not wgrad_swapped(1024, 4096, arch="sm_100a", out_f32=True)
+    # ... and 4096 -> 1024 runs direct on both architectures (the round-2 sm_100a bf16 rule moved from the swapped
+    # ``nn_n256_hen_t_pro15`` to the direct ``nn_n224_hne_cg_pro15`` the sm_103a rule names)
+    for arch in ("sm_100a", "sm_103a"):
+        for out_f32 in (False, True):
+            assert not wgrad_swapped(1024, 4096, arch=arch, out_f32=out_f32), (
+                arch,
+                out_f32,
+            )
     # rows with a rule in the heuristic's orientation and rows without a rule agree with the heuristic everywhere
     for arch in ("sm_100a", "sm_103a", "sm_107a", "sm_90a"):
         assert wgrad_swapped(32, 6144, arch=arch) and wgrad_swapped(
@@ -6537,6 +6610,497 @@ def test_wgrad_swap_follows_the_measured_rule():
         if a_mn and b_mn and not batched and K is None:
             mirror = (arch, True, True, out_f32, not out_t, False, M, None, N)
             assert mirror not in ROW_RULES, (key, mirror)
+
+
+def test_round2_knobs_name_their_programs():
+    """The round-2 shapes tranche's build knobs: ``sk_first`` (``_skf`` directly after ``_skx``) and ``lw`` (``_lw``
+    between ``_or`` and ``_pro``) in ``instance_key`` / ``instance_symbol``, their refusals, and the symbol decoder's
+    round trip of the five programs the round-2 rules name (the spelling the export must register)."""
+    nn, kn, kk = (
+        dict(a_mn=True, b_mn=True),
+        dict(a_mn=False, b_mn=True),
+        dict(a_mn=False, b_mn=False),
+    )
+    key = cake_backend.instance_key(
+        **nn, cta_rows=256, sk_exact=True, sk_first=True, pro=7
+    )
+    assert len(key) == 34 and key[32] is True and key[33] is False
+    assert (
+        cake_backend.instance_symbol(key) == "dense_proj_gemm_nn_n256_m256_skx_skf_pro7"
+    )
+    key = cake_backend.instance_key(
+        **kn, epi="tma", slots=2, htail=True, lw=True, pro=15
+    )
+    assert key[32] is False and key[33] is True
+    assert (
+        cake_backend.instance_symbol(key) == "dense_proj_gemm_kn_n256_ht_tma2_lw_pro15"
+    )
+    for knobs, template in (
+        (
+            dict(**kn, epi="tma", slots=2, pd=2, lw=True, pro=15),
+            "dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15",
+        ),
+        (
+            dict(**kn, epi="tma", slots=1, pd=2, lw=True, pro=15),
+            "dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15",
+        ),
+        (
+            dict(**kn, htail=True, cgrp=True, pro=15),
+            "dense_proj_gemm_kn_n256_ht_cg_pro15",
+        ),
+        (
+            dict(**kk, htail=True, cgrp=True, pro=15),
+            "dense_proj_gemm_kk_n256_ht_cg_pro15",
+        ),
+        (
+            dict(**kn, cgrp=True, lw=True, ovr=False, pro=12),
+            "dense_proj_gemm_kn_n256_cg_lw_pro12",
+        ),
+    ):
+        assert (
+            cake_backend.instance_symbol(cake_backend.instance_key(**knobs)) == template
+        )
+    # the knobs the symbol decoder reads back name the program again (the registry fallback's inverse)
+    for template in (
+        "dense_proj_gemm_nn_n256_m256_skx_skf_pro7",
+        "dense_proj_gemm_kn_n256_ht_tma2_lw_pro15",
+        "dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15",
+        "dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15",
+        "dense_proj_gemm_kn_n256_ht_cg_pro15",
+        "dense_proj_gemm_nn_n224_hne_cg_pro15",
+    ):
+        tokens = cake_backend._template_tokens(template)
+        knobs = cake_backend._template_knobs(template, sk_exact_parts=16)
+        assert knobs is not None, template
+        layout, out_f32, out_t = cake_backend._template_class(tokens)
+        key_knobs = {k: v for k, v in knobs.items() if v is not None}
+        key_knobs["sk_exact"] = bool(knobs["sk_exact"])
+        key = cake_backend.instance_key(
+            a_mn=layout[0] == "n",
+            b_mn=layout[1] == "n",
+            out_f32=out_f32,
+            out_t=out_t,
+            **key_knobs,
+        )
+        assert cake_backend.instance_symbol(key) == template
+        assert knobs["sk_first"] == ("skf" in tokens) and knobs["lw"] == (
+            "lw" in tokens
+        )
+    # refusals: sk_first needs the exact split and the plain item walk; lw needs the pair with the MMA-warp allocator
+    for bad in (
+        dict(**nn, cta_rows=256, sk_first=True, pro=7),
+        dict(**kn, epi="tma", slots=2, pd=2, sk_exact=True, sk_first=True, pro=15),
+        dict(**nn, cta_rows=256, htail=True, sk_first=True, pro=7),
+        dict(**nn, cta_rows=256, sk_sync=True, sk_first=True, pro=7),
+        dict(**kn, cta1=True, lw=True),
+        dict(**kn, lw=True, pro=3),
+        dict(**kn, lw=True, pro=0),
+        dict(**kn, lw=True),
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.instance_key(**bad)
+    for ok in (
+        dict(**kn, lw=True, pro=4),
+        dict(**kn, lw=True, pro=7),
+        dict(**kn, lw=True, pro=12),
+    ):
+        cake_backend.instance_key(**ok)
+    # the single-CTA fallback variant clears both (instance_key refuses them there)
+    assert {"sk_first", "lw"} <= set(cake_backend._CTA1_CLEARED)
+
+
+def test_round2_rules_plan_their_knobs():
+    """The round-2 rules through the planner at the measuring devices' SM count (152): the tail-first exact split of
+    the two 4096 x 12288 weight gradients, the half-tail column-grouped programs of the 4096 squares, the 12-column
+    raster groups of the N 5120 rows, the load-warp programs and the ``l2_256b`` promotion of the thin input gradients,
+    and the direct 4096 -> 1024 weight gradient on sm_100a; a rule-derived ``sk_first`` / ``lw`` yields to a caller-forced
+    form the program cannot carry."""
+    kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
+    for arch in ("sm_100a", "sm_103a"):
+        a = dict(kw, arch=arch)
+        # WGR2 A rows: sk_exact 16 + sk_first, cta_rows 256, pro 7 (units first: items [0, 64) are the K parts)
+        for M, N in ((12288, 4096), (4096, 12288)):
+            for T, k_blocks in ((16384, 256), (16231, 254)):
+                v = _class_views("nn", False, False, M, N, T)
+                plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+                assert plan.template == "dense_proj_gemm_nn_n256_m256_skx_skf_pro7", (
+                    arch,
+                    M,
+                    N,
+                    T,
+                    plan.template,
+                )
+                assert (plan.sk_exact, plan.sk_first, plan.cta_rows, plan.block_n) == (
+                    16,
+                    True,
+                    256,
+                    256,
+                )
+                assert (
+                    plan.num_full,
+                    plan.tail_tiles,
+                    plan.sk_units,
+                    plan.iters_per_unit,
+                ) == (380, 4, 64, 16), (arch, M, N, T)
+                assert (
+                    plan.k_blocks == k_blocks
+                    and plan.sk_iters == 16
+                    and plan.ws_f32_elems > 0
+                )
+                # a caller-forced synchronised plan or single-CTA form drops the rule's order with its split
+                forced, *_ = plan_dense_projection_gemm(
+                    v["A"], v["B"], v["out"], sk_sync=True, **a
+                )
+                assert (
+                    forced.sk_sync
+                    and not forced.sk_first
+                    and "_skf" not in forced.template
+                )
+                forced, *_ = plan_dense_projection_gemm(
+                    v["A"], v["B"], v["out"], sk=False, **a
+                )
+                assert (
+                    not forced.sk_exact
+                    and not forced.sk_first
+                    and forced.template == "dense_proj_gemm_nn_n256_m256_pro7"
+                )
+                with pytest.raises(ValueError):
+                    plan_dense_projection_gemm(
+                        v["A"], v["B"], v["out"], sk=False, sk_first=True, **a
+                    )
+        # LGF-R2: the 4096 squares take the half-tail column-grouped programs (group 16), the N 5120 rows group 12
+        for layout, template in (
+            ("kk", "dense_proj_gemm_kk_n256_ht_cg_pro15"),
+            ("kn", "dense_proj_gemm_kn_n256_ht_cg_pro15"),
+        ):
+            v = _class_views(layout, False, False, 16384, 4096, 4096)
+            plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+            assert (
+                plan.template == template
+                and plan.htail
+                and plan.cgrp
+                and plan.group_m == 16
+            ), (arch, layout)
+            assert (
+                plan.num_full,
+                plan.tail_tiles,
+                plan.sk_units,
+                plan.iters_per_unit,
+            ) == (988, 36, 72, 64)
+        for layout, N, K, template in (
+            ("kk", 5120, 5120, "dense_proj_gemm_kk_n256_cg_pro15"),
+            ("kn", 5120, 5120, "dense_proj_gemm_kn_n256_cg_pro15"),
+            ("kk", 17408, 5120, "dense_proj_gemm_kk_n256_cg_pro15"),
+        ):
+            v = _class_views(layout, False, False, 16384, N, K)
+            plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+            assert plan.template == template and plan.cgrp and plan.group_m == 12, (
+                arch,
+                layout,
+                N,
+                K,
+            )
+        # TK-R2: the one-K-step rows take the half-tail load-warp program the lane measured on both K layers
+        # (``_ht_tma2_lw``); the half-tail PLAN applies where the half items fit the 76 pairs (K 4096: 1024 tiles,
+        # tail 36 -> 72 half items) and the ``_ht`` program runs the whole-tile plan where they do not (K 5120: 1280
+        # tiles, tail 64 > 38 - the plan the lane measured); the K 128 rows the pd 2 load-warp program
+        for K_layer, plan_fields, half in (
+            (4096, (988, 36, 72, 1), True),
+            (5120, (1280, 0, 0, 1), False),
+        ):
+            template = "dense_proj_gemm_kn_n256_ht_tma2_lw_pro15"
+            for N_layer in (32, 48):
+                v = _class_views("kn", False, False, 16384, K_layer, N_layer)
+                plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+                assert plan.template == template and plan.lw and plan.pd == 0, (
+                    arch,
+                    K_layer,
+                    N_layer,
+                    plan.template,
+                )
+                assert plan.htail and plan.htail_plan == half
+                assert (
+                    plan.num_full,
+                    plan.tail_tiles,
+                    plan.sk_units,
+                    plan.iters_per_unit,
+                ) == plan_fields
+                # the load-warp form yields to a caller-forced single-CTA form or a pro without bit 4
+                forced, *_ = plan_dense_projection_gemm(
+                    v["A"], v["B"], v["out"], cta1=True, **a
+                )
+                assert not forced.lw and forced.template.endswith("_c1")
+                forced, *_ = plan_dense_projection_gemm(
+                    v["A"], v["B"], v["out"], pro=3, **a
+                )
+                assert not forced.lw and forced.template.endswith("_pro3")
+                with pytest.raises(ValueError):
+                    plan_dense_projection_gemm(
+                        v["A"], v["B"], v["out"], pro=3, lw=True, **a
+                    )
+        v = _class_views("kn", False, False, 16384, 5120, 128)
+        plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+        assert (
+            plan.template == "dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15"
+            and plan.pd == 2
+            and plan.lw
+        )
+        assert plan.group_m == (32 if arch == "sm_103a" else 16)
+    # the GB300-only round-2 picks: the 4096 -> 64 load-warp program, the l2_256b promotion of the N 512 input gradients
+    a = dict(kw, arch="sm_103a")
+    v = _class_views("kn", False, False, 16384, 4096, 64)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+    assert (
+        plan.template == "dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15"
+        and plan.group_m == 32
+    )
+    v = _class_views("kn", False, False, 16384, 4096, 512)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+    assert (
+        plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15"
+        and plan.promo == "l2_256b"
+    )
+    v = _class_views("kn", False, False, 16384, 5120, 512)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+    assert (
+        plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_pro15"
+        and plan.promo == "l2_256b"
+        and plan.group_m == 8
+    )
+    # ... and the GB200 rows that keep round 1
+    a = dict(kw, arch="sm_100a")
+    v = _class_views("kn", False, False, 16384, 4096, 64)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+    assert plan.template == "dense_proj_gemm_kn_n256_tma2_pd3_c1" and not plan.lw
+    v = _class_views("kn", False, False, 16384, 5120, 512)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+    assert (
+        plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_pro15"
+        and plan.promo == "none"
+        and plan.group_m == 8
+    )
+    # the column-grouped raster takes any group count; the pair raster still needs an even one
+    v = _class_views("kk", False, False, 16384, 5120, 5120)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=3, **a)
+    assert plan.group_m == 3 and plan.cgrp
+    with pytest.raises(ValueError):
+        plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=3, cgrp=False, **a)
+    # WGR2 E1: the 4096 -> 1024 bf16 weight gradient runs direct on sm_100a now (the sm_103a program)
+    v = _class_views("nn", False, False, 1024, 4096, 16384)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+    assert (
+        plan.template == "dense_proj_gemm_nn_n224_hne_cg_pro15"
+        and plan.block_n == 224
+        and plan.cgrp
+    )
+    assert not wgrad_swapped(1024, 4096, arch="sm_100a", out_f32=False)
+
+
+def _n224_rule_rows():
+    """Every (key, T) of a ``ROW_RULES`` entry that selects the exact-wave tile (BLOCK_N 224)."""
+    return [
+        (key, T)
+        for key, rule in sorted(ROW_RULES.items(), key=repr)
+        if rule.get("block_n") == cake_backend.EXACT_WAVE_BLOCK_N and not key[5]
+        for T in (16231, 16384)
+    ]
+
+
+def test_half_tail_fit_gates_the_plan_not_the_program(monkeypatch):
+    """The half-tail fit (``0 < 2 * tail <= pairs``) selects the plan, never the program: a rule or a caller that
+    names ``htail`` keeps the ``_ht`` program (``plan.htail``), which runs the row's whole-tile plan where its half
+    items do not fit the device's pairs (``plan.htail_plan`` False: the K 5120 thin input gradients, 1280 tiles on
+    76 pairs, tail 64 - the plan the lane measured) and the half-tail plan where they do (K 4096: tail 36, 72 half
+    items; K 5120 on 84 pairs: tail 20, 40 half items).  A row without a rule plans without the knob."""
+    kw = dict(sm_count=152, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    knobs = dict(epi="tma", slots=2, pro=15, htail=True, lw=True)
+    for K_layer, fields, half in (
+        (4096, (988, 36, 72, 1), True),
+        (5120, (1280, 0, 0, 1), False),
+    ):
+        v = _class_views("kn", False, False, 16384, K_layer, 32)
+        ruled, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+        assert ruled.template == "dense_proj_gemm_kn_n256_ht_tma2_lw_pro15"
+        assert ruled.htail and ruled.htail_plan == half
+        assert (
+            ruled.num_full,
+            ruled.tail_tiles,
+            ruled.sk_units,
+            ruled.iters_per_unit,
+        ) == fields
+        assert ruled.sk_iters == (72 if half else 0) and ruled.ws_f32_elems == 0
+        with monkeypatch.context() as m:
+            m.setattr(cake_backend, "ROW_RULES", {})
+            plain, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+            assert (
+                not plain.htail and not plain.htail_plan and "_ht" not in plain.template
+            )
+            forced, *_ = plan_dense_projection_gemm(
+                v["A"], v["B"], v["out"], **knobs, **kw
+            )
+            assert forced.template == ruled.template
+            assert forced.htail and forced.htail_plan == half
+            assert (
+                forced.num_full,
+                forced.tail_tiles,
+                forced.sk_units,
+                forced.iters_per_unit,
+            ) == fields
+    # the fit follows the device: on 84 pairs the K 5120 tail of 20 tiles fits as 40 half items
+    v = _class_views("kn", False, False, 16384, 5120, 32)
+    wide, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], **dict(kw, sm_count=168)
+    )
+    assert wide.htail and wide.htail_plan and "_ht_" in wide.template
+    assert (wide.num_full, wide.tail_tiles, wide.sk_units, wide.iters_per_unit) == (
+        1260,
+        20,
+        40,
+        1,
+    )
+    assert wide.sk_iters == 40 and wide.ws_f32_elems == 0
+
+
+def test_exact_wave_gate_follows_the_device_pair_count():
+    """The exact-wave gate: a BLOCK_N 224 rule fills the 76 pairs of the measuring devices (152 SMs) in whole waves and
+    plans as written there; on 74 pairs (148 SMs) its tiles need an extra, nearly empty wave, so the rule's BLOCK_N
+    yields to the default tile (``wave_fallback``: the plan the rule's other knobs make at BLOCK_N 256); on 80 pairs
+    (160 SMs) both tiles need the same waves and nothing changes; a caller-forced BLOCK_N is never touched."""
+    assert exact_waves(152, 76) and exact_waves(76, 76)
+    assert (
+        not exact_waves(152, 74) and not exact_waves(76, 74) and not exact_waves(76, 80)
+    )
+    rows = _n224_rule_rows()
+    assert rows and {key[0] for key, _ in rows} == {"sm_100a", "sm_103a"}
+    fired = set()
+    for key, T in rows:
+        arch = key[0]
+        v = _key_views(key, T)
+        base = dict(
+            l2_bytes=L2_BYTES, transposed_out=key[4], arch=arch, _fallback=False
+        )
+        plan, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], sm_count=152, **base
+        )
+        assert (
+            plan.block_n == 224 and not plan.wave_fallback and "_n224_" in plan.template
+        ), (key, T)
+        tiles_224 = plan.pair_tiles
+        tiles_256 = plan.L * (plan.m_tiles // 2) * -(-plan.N // 256)
+        for sm_count in (148, 160):
+            pairs = sm_count // 2
+            plan, *_ = plan_dense_projection_gemm(
+                v["A"], v["B"], v["out"], sm_count=sm_count, **base
+            )
+            expect = not exact_waves(tiles_224, pairs) and -(-tiles_224 // pairs) > -(
+                -tiles_256 // pairs
+            )
+            assert plan.wave_fallback == expect, (key, T, sm_count)
+            if sm_count == 160:
+                assert not plan.wave_fallback, (
+                    key,
+                    T,
+                )  # the same waves on 80 pairs: the rule's tile stays
+        plan, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], sm_count=148, **base
+        )
+        if plan.wave_fallback:
+            fired.add(key)
+            assert plan.block_n == 256 and "_n256_" in plan.template, (key, T)
+            forced, *_ = plan_dense_projection_gemm(
+                v["A"], v["B"], v["out"], sm_count=148, block_n=256, **base
+            )
+            assert dataclasses.replace(plan, wave_fallback=False) == forced, (key, T)
+            assert plan.pair_tiles == tiles_256 and -(-tiles_224 // 74) > -(
+                -tiles_256 // 74
+            ), (key, T)
+        else:
+            assert plan.block_n == 224 and (
+                exact_waves(tiles_224, 74) or -(-tiles_224 // 74) == -(-tiles_256 // 74)
+            ), (key, T)
+
+        kept, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], sm_count=148, block_n=224, **base
+        )
+        assert kept.block_n == 224 and not kept.wave_fallback, (key, T)
+    # the rows the gate protects on a 148-SM part: the 4096 x 4096 (152 tiles -> 128) and 4096 -> 1024 (76 -> 64)
+    # weight gradients of both architectures (bf16 and the sm_103a fp32 form)
+    assert fired == {
+        key for key, _ in rows if (key[6], key[8]) in ((4096, 4096), (4096, 1024))
+    }, sorted(fired, key=repr)
+    for key in fired:
+        plan, *_ = plan_dense_projection_gemm(
+            *(_key_views(key, 16384)[k] for k in ("A", "B", "out")),
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+            transposed_out=key[4],
+            arch=key[0],
+            _fallback=False,
+        )
+        assert (
+            plan.template
+            == {
+                (4096, False): "dense_proj_gemm_nn_n256_m256_pro7",
+                (1024, False): "dense_proj_gemm_nn_n256_hne_cg_pro15",
+                (1024, True): "dense_proj_gemm_nn_n256_f32_v8_ef_pro15",
+            }[(key[8], key[3])]
+        ), (key, plan.template)
+
+
+def test_batched_rows_satisfy_the_kernel_output_layout_predicate():
+    """The strides the host hands the kernel for the batched head-interleaved MLA rows (``[T, H, D]`` written as
+    ``[H, T, D]``, ``D`` a slice of a wider slot) satisfy the generated bindings' output-layout predicate: with ``rows`` /
+    ``cols`` the stored matrix's extents (``N`` / ``M`` under the transposed store), ``ldo >= cols``, ``out_l >= cols``
+    and either batch-major (``out_l >= rows * ldo``) or interleaved within a row (``ldo >= L * out_l``); a batch of
+    one passes the matrix span."""
+    checked = 0
+    for row in MLA_ROWS:
+        for op in ("fwd", "dgrad", "wgrad"):
+            for T in (1001, 16231):
+                v = _views("mla", row, op, "bf16", T)
+                plan, _, _, out3 = plan_dense_projection_gemm(
+                    v["A"],
+                    v["B"],
+                    v["out"],
+                    sm_count=152,
+                    l2_bytes=L2_BYTES,
+                    arch="sm_100a",
+                )
+                ldo, out_l = cake_backend._out_strides(out3)
+                rows, cols = (
+                    (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
+                )
+                assert ldo >= cols and out_l >= cols, (row, op, T, ldo, out_l)
+                assert out_l >= rows * ldo or ldo >= plan.L * out_l, (
+                    row,
+                    op,
+                    T,
+                    ldo,
+                    out_l,
+                    rows,
+                    plan.L,
+                )
+                assert MLA_ROWS[row]["H"] == plan.L
+                checked += 1
+    assert checked == 12
+    # the interleaved store of the qabs input gradient (D = 192 of a 256-wide slot): the second form, with equality
+    v = _views("mla", "qabs", "dgrad", "bf16", 33)
+    plan, _, _, out3 = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=152, l2_bytes=L2_BYTES
+    )
+    ldo, out_l = cake_backend._out_strides(out3)
+    assert (
+        (ldo, out_l, plan.L) == (64 * 256, 256, 64)
+        and out_l < plan.M * ldo
+        and ldo == plan.L * out_l
+    )
+    # a batch of one: the matrix span satisfies the batch-major form
+    v = _views("proj", "q_a", "fwd", "bf16", 1001)
+    plan, _, _, out3 = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=152, l2_bytes=L2_BYTES
+    )
+    ldo, out_l = cake_backend._out_strides(out3)
+    assert plan.L == 1 and ldo >= plan.N and out_l == plan.M * ldo
 
 
 def test_router_convenience_views_match_the_planner():
@@ -6657,7 +7221,7 @@ def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED)
     _require_program(_plan_template(v))
@@ -6679,7 +7243,7 @@ def test_mla_batched_rows_match_fp64_reference(row, op):
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     v = _make_inputs("mla", row, op, "bf16", 257, seed=SEED + 1)
     _require_program(_plan_template(v))
@@ -6695,7 +7259,7 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 2)
@@ -6754,7 +7318,7 @@ def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     # a swapped weight gradient on a half-width synthetic row (N = 32, K = 3072, T = 1001): stream-K "auto"
     # two-part split of a single partial wave with the deterministic in-kernel fixup.  The round-9 rules route
@@ -6798,7 +7362,7 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 6)
@@ -6858,7 +7422,7 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 7)
@@ -6915,7 +7479,7 @@ def test_convenience_path_memory_is_bounded_across_token_counts():
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     for a_mn, b_mn, out_t in (
         (False, False, False),
@@ -6987,7 +7551,7 @@ def test_pd2_stream_k_on_an_odd_k_completes():
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 11)
@@ -7037,7 +7601,7 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     v = _router_inputs(op, T, seed=SEED + 4)
     plan, *_ = plan_router_fp32_gemm(v["A"], v["B"], v["out"])
@@ -7091,7 +7655,7 @@ def test_fused_split_matches_the_torch_chain_bit_exactly():
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
+            f"(compute capability {_registered_capabilities()})"
         )
     device = torch.device("cuda")
     arch = cake_backend.arch_for(device)

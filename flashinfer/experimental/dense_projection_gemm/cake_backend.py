@@ -317,6 +317,18 @@ def sm_pairs(sm_count: int) -> int:
     return max(1, int(sm_count) // CTA_GROUP)
 
 
+EXACT_WAVE_BLOCK_N = 224  # the wave-quantisation tile width the exact-wave rules select (``exact_waves``)
+
+
+def exact_waves(pair_tiles: int, units: int) -> bool:
+    """Whether ``pair_tiles`` work items fill the device's ``units`` concurrent work items (CTA pairs, or SMs under
+    ``cta1``) in whole waves - ``((m_tiles // 2) * n_tiles * L) % sm_pairs == 0`` in the pair form.  The BLOCK_N 224
+    weight-gradient rules were chosen for this fit on the 76-pair measuring devices (152 SMs: the 4096 x 4096 row's
+    152 tall tiles are two waves, the 4096 x 1024 row's 76 tiles one); the exact-wave gate of
+    :func:`plan_dense_projection_gemm` reads it for the running device."""
+    return pair_tiles > 0 and pair_tiles % units == 0
+
+
 def sm_units(sm_count: int, cta_group: int = CTA_GROUP) -> int:
     """Concurrent work items of the launch: CTA pairs (``cta_group`` 2) or SMs (the single-CTA form ``cta1``,
     round 19).  [Cake ``_sm_units``]"""
@@ -554,6 +566,8 @@ def instance_key(
     ovr: bool = False,
     stt: bool = False,
     pro: int = 0,
+    sk_first: bool = False,
+    lw: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -610,6 +624,14 @@ def instance_key(
     it), 0..15, and bit 8 admits no diag probe but ``trace`` (the planner never emits diag); 0 renders the round-27
     program byte-identical.  The production value is the merged row rule's (``row_rule`` lays ``ARCH_RULE_DEFAULTS``
     under every row rule: 7 on sm_107a and sm_100a; a row rule may pin another value), zeroed on the ``cta1`` rows.
+    ``sk_first`` (the round-2 shapes tranche, field 33, symbol ``_skf`` directly after ``_skx``) is the tail-first
+    persistent order of the exact p-way split: pair work items ``[0, sk_units)`` are the K parts of the tail tiles and
+    item ``sk_units + w`` is whole tile ``w``; the plan arithmetic, the counters, the slabs and the launch contract are
+    ``sk_exact``'s - only the program differs.  It needs ``sk_exact`` and keeps the plain item walk (no ``pd`` 2,
+    ``sk_slab`` 2, ``stt``, ``sk_sync`` or ``htail``).  ``lw`` (the round-2 shapes tranche, field 34 = LAST, symbol
+    ``_lw`` after ``_or`` and before ``_pro``) lets the load warp leave the pair prelude before the post-allocation CTA
+    rendezvous (the first TMA loads issue once the cluster rendezvous and the barrier init are done); pair programs
+    whose MMA warp allocates TMEM only (``pro`` bit 4, never ``cta1``).
     [Cake ``instance_key``]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
@@ -886,6 +908,22 @@ def instance_key(
         raise ValueError(
             f"pro bit 8 (CTA-local exit) admits no diag probe except 'trace' (got diag={diag})"
         )
+    sk_first = bool(sk_first)
+    if sk_first and not sk_exact:
+        raise ValueError(
+            "sk_first (tail-first persistent order) needs the exact p-way split (sk_exact)"
+        )
+    if sk_first and (pd == 2 or sk_slab == 2 or stt or sk_sync or htail):
+        raise ValueError(
+            f"sk_first keeps the plain item walk - no pd 2, sk_slab 2, stt, sk_sync or htail (got pd={pd}, "
+            f"sk_slab={sk_slab}, stt={stt}, sk_sync={sk_sync}, htail={htail})"
+        )
+    lw = bool(lw)
+    if lw and (cta1 or not (pro & 4)):
+        raise ValueError(
+            f"lw (the load warp out of the pair prelude) needs the cluster pair with the MMA-warp allocator (pro bit 4); "
+            f"got cta1={cta1}, pro={pro}"
+        )
     return (
         a_mn,
         b_mn,
@@ -919,6 +957,8 @@ def instance_key(
         ovr,
         stt,
         pro,
+        sk_first,
+        lw,
     )
 
 
@@ -936,7 +976,9 @@ def instance_symbol(key: tuple) -> str:
     the single-CTA form (round 19; its default stage count is the single-CTA fit), ``_cg`` for the column-grouped
     raster (round 21) and ``_or`` for the tall epilogue released by row half (round 24); ``_stt`` directly
     after ``_sks`` for the transposed stmatrix / TMA-store staging (round 27); a trailing ``_pro<n>`` after ``_or`` for
-    the pair prologue / cleanup sync form (round 33; absent when 0 - the single-CTA ``_c1`` programs never carry it)).
+    the pair prologue / cleanup sync form (round 33; absent when 0 - the single-CTA ``_c1`` programs never carry it);
+    the round-2 shapes tranche adds ``_skf`` directly after ``_skx`` (``sk_first``) and ``_lw`` between ``_or`` and
+    ``_pro`` (``lw``)).
     [Cake ``instance_symbol``]"""
     (
         a_mn,
@@ -971,6 +1013,8 @@ def instance_symbol(key: tuple) -> str:
         ovr,
         stt,
         pro,
+        sk_first,
+        lw,
     ) = key
     cg = 1 if cta1 else CTA_GROUP
     so = {
@@ -1004,6 +1048,7 @@ def instance_symbol(key: tuple) -> str:
         )
         + (f"_box{box_rows}" if box_rows else "")
         + ("_skx" if sk_exact else "")
+        + ("_skf" if sk_first else "")
         + ("_sks" if sk_sync else "")
         + ("_stt" if stt else "")
         + (f"_sb{sk_slab}" if sk_slab else "")
@@ -1020,6 +1065,7 @@ def instance_symbol(key: tuple) -> str:
         + ("_c1" if cta1 else "")
         + ("_cg" if cgrp else "")
         + ("_or" if ovr else "")
+        + ("_lw" if lw else "")
         + (f"_pro{pro}" if pro else "")
         + "".join(f"_{d}" for d in diag)
     )
@@ -1164,27 +1210,27 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 128, 8192, None): {"pro": 15},
     ('sm_100a', False, False, False, False, False, 1024, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, False, False, False, False, 1024, 5120, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
-    ('sm_100a', False, False, False, False, False, 4096, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_100a', False, False, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, False, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8},
-    ('sm_100a', False, False, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_100a', False, False, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_100a', False, False, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8},
     ('sm_100a', False, False, False, False, False, 12288, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
-    ('sm_100a', False, False, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
-    ('sm_100a', False, True, False, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
-    ('sm_100a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
+    ('sm_100a', False, False, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
+    ('sm_100a', False, True, False, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
+    ('sm_100a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
-    ('sm_100a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "group_m": 32},
+    ('sm_100a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
     ('sm_100a', False, True, False, False, False, 4096, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2},
     ('sm_100a', False, True, False, False, False, 4096, 1024, None): {"pd": 2, "pro": 15},
-    ('sm_100a', False, True, False, False, False, 4096, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_100a', False, True, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
-    ('sm_100a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
-    ('sm_100a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
+    ('sm_100a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
+    ('sm_100a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 5120, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
-    ('sm_100a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
+    ('sm_100a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True},
     ('sm_100a', False, True, False, False, False, 5120, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8},
     ('sm_100a', False, True, False, False, False, 5120, 1024, None): {"pd": 2, "pro": 15},
-    ('sm_100a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_100a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_100a', False, True, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovr": True, "htail": True},
     ('sm_100a', False, True, False, False, False, 8192, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_100a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
@@ -1217,13 +1263,12 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', True, True, True, True, False, 128, None, 5120): {"cta_rows": 64, "pro": 15},
     ('sm_100a', True, True, True, True, False, 128, None, 8192): {"cta_rows": 64, "pro": 15},
     ('sm_100a', True, True, False, False, False, 4096, None, 4096): {"cta_rows": 256, "pro": 7, "block_n": 224},
-    ('sm_100a', True, True, False, False, False, 4096, None, 12288): {"cta_rows": 256, "pro": 7, "block_n": 224},
+    ('sm_100a', True, True, False, False, False, 4096, None, 12288): {"cta_rows": 256, "pro": 7, "sk_exact": 16, "sk_first": True},
     ('sm_100a', True, True, False, False, False, 5120, None, 512): {"block_n": 192, "b_swz": 64, "sk_sync": True, "sk_slab": 2, "sk_sync_m": 39, "pro": 15, "hints": ('none', 'evict_first')},
     ('sm_100a', True, True, False, False, False, 5120, None, 1024): {"block_n": 160, "b_swz": 64, "cta_rows": 256, "pro": 15, "hints": ('none', 'evict_first'), "cgrp": True, "group_m": 8},
     ('sm_100a', True, True, False, False, False, 5120, None, 5120): {"cta_rows": 256, "pro": 7, "sk_sync": True, "sk_slab": 2, "sk_sync_m": 32},
-    ('sm_100a', True, True, False, False, False, 12288, None, 4096): {"cta_rows": 256, "pro": 7, "block_n": 224},
+    ('sm_100a', True, True, False, False, False, 12288, None, 4096): {"cta_rows": 256, "pro": 7, "sk_exact": 16, "sk_first": True},
     ('sm_100a', True, True, False, True, False, 512, None, 4096): {"cta_rows": 64, "pro": 15, "hints": ('evict_first', 'none')},
-    ('sm_100a', True, True, False, True, False, 1024, None, 4096): {"pro": 15, "hints": ('evict_first', 'none')},
     ('sm_100a', True, True, True, False, False, 4096, None, 1024): {"slots": 1, "epi": 'tma', "pro": 15, "cgrp": True},
     ('sm_100a', True, True, True, False, False, 4096, None, 4096): {"cta_rows": 256, "pro": 7, "sk_sync": True, "sk_slab": 3, "sk_sync_m": 32},
     ('sm_100a', True, True, True, False, False, 4096, None, 12288): {"cta_rows": 256, "pro": 7, "sk_parts": 4},
@@ -1232,6 +1277,10 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', True, True, True, False, False, 5120, None, 5120): {"cta_rows": 256, "pro": 7, "sk_sync": True, "sk_slab": 3, "sk_sync_m": 32},
     ('sm_100a', True, True, True, False, False, 12288, None, 4096): {"cta_rows": 256, "pro": 7, "sk_parts": 4},
     ('sm_100a', True, True, True, True, False, 512, None, 4096): {"cta_rows": 64, "pro": 15, "hints": ('evict_first', 'none')},
+    # ---- sm_100a: the round-2 rules - the rows of the shapes tranche whose kernel-level round 2 selected another
+    #      program or launch parameter, measured on GB200 at T 16231 / 16384 against cuBLAS (rows not listed keep the
+    #      tranche's rule above) ----
+    ('sm_100a', True, True, False, False, False, 4096, None, 1024): {"block_n": 224, "pro": 15, "hints": ('none', 'evict_first'), "cgrp": True},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1247,29 +1296,29 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, False, False, False, False, 1024, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, False, False, False, False, 1024, 5120, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, False, False, False, False, 4096, 2048, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
-    ('sm_103a', False, False, False, False, False, 4096, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, False, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
-    ('sm_103a', False, False, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_103a', False, False, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8},
     ('sm_103a', False, False, False, False, False, 12288, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, False, False, False, False, 16384, 2048, None): {"cgrp": True, "group_m": 16, "pro": 15},
-    ('sm_103a', False, False, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_103a', False, False, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_103a', False, True, False, False, False, 2048, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
-    ('sm_103a', False, True, False, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "group_m": 32},
-    ('sm_103a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "group_m": 32},
-    ('sm_103a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
-    ('sm_103a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "group_m": 32},
-    ('sm_103a', False, True, False, False, False, 4096, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2},
+    ('sm_103a', False, True, False, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
+    ('sm_103a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
+    ('sm_103a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
+    ('sm_103a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
+    ('sm_103a', False, True, False, False, False, 4096, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "lw": True, "promo": 'l2_256b'},
     ('sm_103a', False, True, False, False, False, 4096, 1024, None): {"pd": 2, "pro": 15},
-    ('sm_103a', False, True, False, False, False, 4096, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_103a', False, True, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, True, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
-    ('sm_103a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
-    ('sm_103a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "group_m": 32},
+    ('sm_103a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
+    ('sm_103a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_103a', False, True, False, False, False, 5120, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
-    ('sm_103a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
-    ('sm_103a', False, True, False, False, False, 5120, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8},
+    ('sm_103a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
+    ('sm_103a', False, True, False, False, False, 5120, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "promo": 'l2_256b'},
     ('sm_103a', False, True, False, False, False, 5120, 1024, None): {"pd": 2, "pro": 15},
-    ('sm_103a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    ('sm_103a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_103a', False, True, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovr": True, "htail": True},
     ('sm_103a', False, True, False, False, False, 8192, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
@@ -1303,12 +1352,12 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', True, True, True, True, False, 128, None, 8192): {"cta_rows": 64, "pro": 15},
     ('sm_103a', True, True, False, False, False, 4096, None, 1024): {"block_n": 224, "pro": 15, "hints": ('none', 'evict_first'), "cgrp": True},
     ('sm_103a', True, True, False, False, False, 4096, None, 4096): {"cta_rows": 256, "pro": 7, "block_n": 224},
-    ('sm_103a', True, True, False, False, False, 4096, None, 12288): {"cta_rows": 256, "pro": 7, "block_n": 224},
+    ('sm_103a', True, True, False, False, False, 4096, None, 12288): {"cta_rows": 256, "pro": 7, "sk_exact": 16, "sk_first": True},
     ('sm_103a', True, True, False, False, False, 5120, None, 512): {"block_n": 192, "b_swz": 64, "sk_sync": True, "sk_slab": 2, "sk_sync_m": 39, "pro": 15, "hints": ('none', 'evict_first')},
     ('sm_103a', True, True, False, False, False, 5120, None, 1024): {"block_n": 160, "b_swz": 64, "cta_rows": 256, "pro": 15, "hints": ('none', 'evict_first')},
     ('sm_103a', True, True, False, False, False, 5120, None, 5120): {"cta_rows": 256, "pro": 7, "sk_sync": True, "sk_slab": 2, "sk_sync_m": 32},
     ('sm_103a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "pro": 7, "sk_sync": True, "sk_slab": 2},
-    ('sm_103a', True, True, False, False, False, 12288, None, 4096): {"cta_rows": 256, "pro": 7, "block_n": 224},
+    ('sm_103a', True, True, False, False, False, 12288, None, 4096): {"cta_rows": 256, "pro": 7, "sk_exact": 16, "sk_first": True},
     ('sm_103a', True, True, False, False, False, 12288, None, 6144): {"cta_rows": 256, "pro": 7, "sk_sync": True, "sk_slab": 2},
     ('sm_103a', True, True, False, True, False, 512, None, 4096): {"cta_rows": 64, "pro": 15, "hints": ('evict_first', 'none')},
     ('sm_103a', True, True, True, False, False, 4096, None, 1024): {"block_n": 224, "epi": 'reg', "f32_v8": True, "store_ef": True, "pro": 15},
@@ -1746,6 +1795,11 @@ class GemmPlan:
     park: bool = False
     ovl: bool = False
     htail: bool = False
+    # ... and whether the half-height tail PLAN is in effect: the ``_ht`` program's tail tiles run as 2 x tail whole-K
+    # half items only when there is a tail and its half items fit the device's pairs (``0 < 2 * tail <= pairs``);
+    # otherwise that program runs the row's plain / stream-K plan - the fit selects the plan, never the program a
+    # rule or a caller named  [Cake launcher]
+    htail_plan: bool = False
     # round-13 W3 knobs: MN-major B panel width (instance_key field 18) and the exact p-way tail split (field 19 is
     # the flag; ``sk_exact`` here is the part count p, 0 = off)
     b_swz: int = 128
@@ -1793,6 +1847,14 @@ class GemmPlan:
     # merged row rule (``ARCH_RULE_DEFAULTS`` 7 under every rule of sm_100a / sm_107a; a row rule may pin another
     # value), always 0 on the single-CTA form; it changes the program only - no launch argument, no plan arithmetic
     pro: int = 0
+    # the round-2 shapes tranche: the tail-first order of the exact split (instance_key field 33, ``_skf``; the plan
+    # arithmetic is ``sk_exact``'s) and the load warp leaving the pair prelude early (field 34, ``_lw``); programs only,
+    # no launch argument
+    sk_first: bool = False
+    lw: bool = False
+    # FlashInfer-only: the rule's exact-wave BLOCK_N (224) yielded to the default tile because the device's CTA pairs do
+    # not fit its tiles in whole waves and the default tile needs fewer waves (``exact_waves``)
+    wave_fallback: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1814,8 +1876,8 @@ class GemmPlan:
     @property
     def ws_f32_elems(self) -> int:
         """fp32 elements of the stream-K partial slabs (unit + tail-tile slabs); 0 without stream-K and
-        under the half-height tail wave (its items are whole-K tiles: no partial slabs, no fixup)."""
-        if not self.sk_units or self.htail:
+        under the half-height tail plan (its items are whole-K tiles: no partial slabs, no fixup)."""
+        if not self.sk_units or self.htail_plan:
             return 0
         if self.sk_sync:
             # one slab per tail tile (the first arriver of a tile stores its partial, the second adds it)  [Cake launcher]
@@ -1836,7 +1898,7 @@ class GemmPlan:
 
     @property
     def sk_iters(self) -> int:
-        """The launcher's linearised stream-K span; under ``htail`` every half item is one whole-K segment; the
+        """The launcher's linearised stream-K span; under the half-tail plan every half item is one whole-K segment; the
         exact split (``_skx`` instances) passes the part count p in this slot."""
         if self.sk_exact:
             return int(self.sk_exact)
@@ -1844,7 +1906,7 @@ class GemmPlan:
             # the ``_sks`` instance reads the main-unit count n_t here (s in ``iters_per_unit``; collectors =
             # num_cluster_tiles - num_full - n_t)  [Cake launcher]
             return int(self.tail_tiles)
-        return (self.sk_units if self.htail else self.tail_tiles) * self.k_blocks
+        return (self.sk_units if self.htail_plan else self.tail_tiles) * self.k_blocks
 
     @property
     def sk_collectors(self) -> int:
@@ -1898,6 +1960,8 @@ def plan_dense_projection_gemm(
     ovr: Optional[bool] = None,
     stt: Optional[bool] = None,
     pro: Optional[int] = None,
+    sk_first: Optional[bool] = None,
+    lw: Optional[bool] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1930,6 +1994,11 @@ def plan_dense_projection_gemm(
     rule) exactly as the launcher does and zeroed on the single-CTA programs (``instance_key`` refuses ``pro`` with
     ``cta1``); a caller-forced tile family drops the rule's ``pro`` with the rule's other family-bound knobs, a
     caller-forced ``pro`` is admitted or refused by ``instance_key``; no launch argument and no plan arithmetic change.
+    The round-2 shapes tranche: ``sk_first`` (``_skf``) is the tail-first order of the row's exact split - taken from the
+    rule with its ``sk_exact`` and dropped with it where the split is not admitted; ``lw`` (``_lw``) is the row's
+    load-warp prelude form - taken from the rule and dropped where the planned program cannot carry it (the single-CTA
+    form, a ``pro`` without bit 4, a caller-forced tile family); a caller-forced value of either is admitted or refused by
+    ``instance_key``.  Neither changes a launch argument or the plan arithmetic.
     [Cake ``dense_projection_gemm`` L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -1944,7 +2013,15 @@ def plan_dense_projection_gemm(
     each in the three ``pro`` forms), then every generated program of the class, nearest symbol first, with the
     knobs its symbol decodes to (``_registry_variants``); a caller-forced knob wins over a variant's.  Only a class
     without any generated program on ``arch`` keeps an unregistered plan (the launch binding raises
-    ``NotImplementedError`` naming it).  ``_fallback=False`` returns the pure mirror (unit tests of the planner)."""
+    ``NotImplementedError`` naming it).  ``_fallback=False`` returns the pure mirror (unit tests of the planner).
+
+    A second FlashInfer-only deviation, the exact-wave gate (``plan.wave_fallback``): a rule's BLOCK_N 224
+    (``EXACT_WAVE_BLOCK_N``) was measured for the whole-wave fit of its tiles on the 76-pair devices
+    (:func:`exact_waves`); on a device whose pairs do not fit them in whole waves and where the default tile needs fewer
+    waves (74 pairs of a 148-SM part: the 4096 x 4096 weight gradient's 152 tiles are 2.05 waves against 1.73, the
+    4096 x 1024 row's 76 tiles 1.03 against 0.86) the rule's BLOCK_N yields to the default tile; the rule's other knobs
+    stay, a caller-forced ``block_n`` is never touched, and the plan is the launcher's wherever the fit is exact or both
+    tiles need the same waves (152 and 160 SMs)."""
     _caller_knobs: dict[str, Any] = dict(
         transposed_out=transposed_out,
         sk=sk,
@@ -1979,6 +2056,8 @@ def plan_dense_projection_gemm(
         ovr=ovr,
         stt=stt,
         pro=pro,
+        sk_first=sk_first,
+        lw=lw,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -2065,6 +2144,7 @@ def plan_dense_projection_gemm(
                 "ovr",
                 "stt",
                 "pro",
+                "lw",
             )
         }
     if cta1 is None:
@@ -2101,6 +2181,21 @@ def plan_dense_projection_gemm(
         # form (a 48 KiB cta1 stage at BLOCK_N 256 fits 3-4 deep where the 32 KiB pair stage fits 5-7); the instance
         # default of the forced form applies  [Cake launcher]
         rule = {k: v for k, v in rule.items() if k != "stages"}
+    wave_fallback = False
+    if block_n is None and rule.get("block_n") == EXACT_WAVE_BLOCK_N:
+        # FlashInfer-only exact-wave gate: the rule's 224-column tile fills the measuring device's CTA pairs in whole
+        # waves (``exact_waves``); where the running device's pairs do not, and the default tile needs fewer waves, the
+        # narrower tile would cost a nearly empty extra wave, so the rule's BLOCK_N yields (its other knobs stay)
+        m_tiles_g = _ceil_div(M, int(cta_rows))
+        m_tiles_g += m_tiles_g % cg
+        units_g = sm_units(sm_count, cg)
+        tiles_rule = L * (m_tiles_g // cg) * _ceil_div(N, EXACT_WAVE_BLOCK_N)
+        tiles_default = L * (m_tiles_g // cg) * _ceil_div(N, default_block_n(N, b_mn))
+        if not exact_waves(tiles_rule, units_g) and _ceil_div(
+            tiles_rule, units_g
+        ) > _ceil_div(tiles_default, units_g):
+            rule = {k: v for k, v in rule.items() if k != "block_n"}
+            wave_fallback = True
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
     if stages is None:
@@ -2146,12 +2241,28 @@ def plan_dense_projection_gemm(
         # (instance_key refuses pro with cta1)  [Cake launcher]
         pro = 0 if cta1 else rule.get("pro", 0)
     pro = int(pro)
+    rule_lw = lw is None
+    if lw is None:
+        # the round-2 shapes tranche: the row's load-warp prelude form (the load warp leaves the pair prelude before the
+        # post-allocation CTA rendezvous), from the rule
+        lw = rule.get("lw", False)
+    lw = bool(lw)
+    if lw and rule_lw and (cta1 or not (pro & 4)):
+        # the form belongs to the pair programs whose MMA warp allocates TMEM (``pro`` bit 4): a caller-forced single-CTA
+        # form or another ``pro`` on the row keeps that form without it (a caller-forced ``lw`` is admitted or refused by
+        # ``instance_key``)
+        lw = False
     if htail is None:
         htail = rule.get("htail", False)
     if b_swz is None:
         b_swz = rule.get("b_swz", 128)
     if sk_exact is None:
         sk_exact = rule.get("sk_exact")
+    rule_sk_first = sk_first is None
+    if sk_first is None:
+        # the round-2 shapes tranche: the tail-first order of the row's exact split, from the rule
+        sk_first = rule.get("sk_first", False)
+    sk_first = bool(sk_first)
     rule_sk_sync = sk_sync is None
     if sk_sync is None:
         # round 18 (Cake W2): synchronised stream-K tail (main units + collectors) of the row's rule
@@ -2224,6 +2335,11 @@ def plan_dense_projection_gemm(
         if (sk_sync and sk == "auto" and sk_max_units is None and exact_plan is None)
         else None
     )
+    if sk_first and rule_sk_first and exact_plan is None:
+        # the row's tail-first order is its exact split's: where the split is not admitted (no tail, a part under
+        # ``SK_MIN_ITERS`` steps, a caller ``sk`` / ``sk_max_units`` / single-CTA form) the plain plan runs without it;
+        # a caller-forced ``sk_first`` is admitted or refused by ``instance_key``
+        sk_first = False
     parts = rule.get("sk_parts") if sk_parts is None else int(sk_parts)
     if sync_plan is not None:
         parts = None
@@ -2232,8 +2348,11 @@ def plan_dense_projection_gemm(
         # rule's.  [Cake L1296-L1301]
         sk, sk_max_units = sk_parts_plan(pair_tiles, k_blocks, units, int(parts))
     # Round 13 (Cake W1): deterministic half-height tail wave of the tall family - the tail tiles become 2 x tail
-    # standard-geometry items of full K (no partial slabs, no fixup), only when there is a tail and its half items fit
-    # the CTA pairs; otherwise the plain plan / stream-K policy of the row applies.  [Cake launcher]
+    # standard-geometry items of full K (no partial slabs, no fixup).  The knob is the row's (its rule or the caller:
+    # the ``_ht`` program, ``instance_key`` field 17); the half-tail PLAN applies only when there is a tail and its
+    # half items fit the CTA pairs, otherwise the ``_ht`` program runs the plain plan / stream-K policy of the row (the
+    # round-2 shapes tranche measured the K 5120 thin input gradients that way: 1280 tiles on 76 pairs, tail 64).  The
+    # fit never changes the program a rule or a caller named.  [Cake launcher]
     htail = (
         bool(htail)
         and int(cta_rows) in (128, 256)
@@ -2251,15 +2370,16 @@ def plan_dense_projection_gemm(
             and int(pd) == 0
             and not int(pf_eff)
         )
+    htail_plan = False
     if htail:
         tail_h = pair_tiles % units if pair_tiles > units else pair_tiles
-        htail = bool(tail_h) and 2 * tail_h <= units
+        htail_plan = bool(tail_h) and 2 * tail_h <= units
     if exact_plan is not None:
         num_full, tail_tiles, sk_units, iters_per_unit = exact_plan
     elif sync_plan is not None:
         # the ``_sks`` instance reads s in iters_per_unit and n_t in sk_iters; collectors = num_cluster_tiles - num_full - n_t
         num_full, tail_tiles, sk_units, iters_per_unit, _collectors = sync_plan
-    elif htail:
+    elif htail_plan:
         num_full, tail_tiles, sk_units, iters_per_unit = (
             pair_tiles - tail_h,
             tail_h,
@@ -2397,6 +2517,8 @@ def plan_dense_projection_gemm(
         ovr=ovr,
         stt=stt,
         pro=pro,
+        sk_first=sk_first,
+        lw=lw,
     )
     plan = GemmPlan(
         L=L,
@@ -2432,6 +2554,7 @@ def plan_dense_projection_gemm(
         park=bool(key[15]),
         ovl=bool(key[16]),
         htail=bool(key[17]),
+        htail_plan=htail_plan,
         b_swz=int(key[18]),
         sk_exact=int(sk_exact) if exact_plan is not None else 0,
         batch_group=int(key[20]),
@@ -2446,6 +2569,9 @@ def plan_dense_projection_gemm(
         ovr=bool(key[29]),
         stt=bool(key[30]),
         pro=int(key[31]),
+        sk_first=bool(key[32]),
+        lw=bool(key[33]),
+        wave_fallback=wave_fallback,
     )
     check_stream_k_plan(plan)
     if _fallback and plan.template not in KERNELS.get(arch, {}):
@@ -2573,6 +2699,8 @@ _CTA1_CLEARED = (
     "sk_max_units",
     "batch_group",
     "pro",
+    "sk_first",
+    "lw",
 )
 _TEMPLATE_PREFIX = "dense_proj_gemm_"
 _HINT_OF_LETTER = {"e": "evict_first", "l": "evict_last", "n": "none"}
@@ -2632,7 +2760,8 @@ def _template_knobs(
     under ``_use_rules=False`` names the template unless the row cannot take a knob (the planner raises) or its
     arithmetic drops a tail policy (the plan names the template without it).  Launch parameters (promo, group_m) are
     not in the symbol and stay unset; ``_skx`` carries no part count, so ``sk_exact`` takes ``sk_exact_parts`` (the
-    row's rule) or the kernel tests' 3 parts on 128-row / 2 on 64-row tiles; a single-CTA program leaves ``pro`` to
+    row's rule) or the kernel tests' 3 parts on 128-row / 2 on 64-row tiles (``_skf`` = its tail-first order,
+    ``_lw`` = the load-warp prelude form); a single-CTA program leaves ``pro`` to
     the planner (``instance_key`` refuses a forced one).  ``None`` for a symbol outside the family or carrying a token
     the planner never emits (``_box<rows>``, diagnostics)."""
     tokens = _template_tokens(template)
@@ -2665,6 +2794,8 @@ def _template_knobs(
         cgrp=False,
         ovr=False,
         pro=0,
+        sk_first=False,
+        lw=False,
     )
     for token in tokens[1:]:
         if token in ("f32", "t"):
@@ -2699,6 +2830,8 @@ def _template_knobs(
             knobs["sk_exact"] = int(
                 sk_exact_parts or (2 if knobs["cta_rows"] == 64 else 3)
             )
+        elif token == "skf":
+            knobs["sk_first"] = True
         elif token == "sks":
             knobs["sk_sync"] = True
         elif token == "stt":
@@ -2721,6 +2854,8 @@ def _template_knobs(
             knobs["cgrp"] = True
         elif token == "or":
             knobs["ovr"] = True
+        elif token == "lw":
+            knobs["lw"] = True
         elif m := re.fullmatch(r"pro(\d+)", token):
             knobs["pro"] = int(m[1])
         else:
