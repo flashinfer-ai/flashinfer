@@ -5696,9 +5696,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            if self._backend == "cudnn":
-                # CPU metadata needs a device mirror, not a new allocation on
-                # every replan. Never overwrite a caller-owned CUDA tensor.
+            if self._backend == "cudnn" or self._requested_backend == "auto":
+                # Auto resolves later in plan(), so its first call needs the
+                # same owned mirrors as subsequent cuDNN plans. Otherwise a
+                # replan can release the prefixes retained by an older capture.
+                # Never overwrite a caller-owned CUDA tensor.
                 self._qo_indptr_buf = self._stage_cudnn_indptr(
                     qo_indptr, 0, non_blocking
                 )
