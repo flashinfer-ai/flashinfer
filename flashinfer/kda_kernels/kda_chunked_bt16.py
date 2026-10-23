@@ -32,7 +32,7 @@ the `exp2(g_prefix)` exchange tile stays fused inside the raw-gate SMEM ring
 (which is FP32 and therefore big enough), while a 16-bit gate shrinks that ring
 to a 16-bit landing buffer and gives the FP32 exchange its own 4-deep ring
 (`gate_exchange_smem`).  Scale is a runtime FP32 argument. The
-torch reference below is the numerical contract used by the verify path.
+numerical contract is the torch reference in `tests/test_helpers/kda_prefill.py`.
 
 On top of the plain engine kernel this file adds a two-kernel decomposition of
 the same math.  A chunk-parallel factor-prep kernel (kernel 1) computes the
@@ -78,16 +78,12 @@ the initial state) are written directly to the selected rows of `state_ckpt`.
 
 Reproducing the results::
 
-    # single-shape correctness vs the torch MMA reference below
-    python kda_chunked_bt16.py --batch 1 --heads 32 --seqlen 8192
-
     # timing protocol used for the reported numbers: engine route =
     # CUPTI/Kineto device-time sum; decomp route = back-to-back wall clock
     # with one synchronize at the end (per-launch syncs both add ~10us of
     # launch overhead per sample and serialize the two kernels' tail).
 """
 
-import argparse
 import weakref
 from dataclasses import dataclass
 from functools import lru_cache
@@ -259,13 +255,8 @@ def pack_input_b16x2_to_i32(
 BT: int = 16
 DK: int = 128
 DV: int = 128
-DEFAULT_SEQLEN: int = 8192
-DEFAULT_BATCH: int = 1
-DEFAULT_HEADS: int = 32
 DEFAULT_SCALE: float = 1.0 / (DK**0.5)
 L2_NORM_EPS: float = 1.0e-6
-VERIFY_RTOL: float = 1.0e-2
-VERIFY_ATOL: float = 1.0e-3
 
 THREADS_PER_WARP: int = 32
 THREADS_PER_CTA: int = 16 * THREADS_PER_WARP
@@ -750,189 +741,6 @@ CLI_DTYPES: dict[str, type] = {
     "bf16": cutlass.BFloat16,
 }
 
-CLI_STATE_DTYPES: dict[str, type] = {
-    "bf16": cutlass.BFloat16,
-    "fp32": cutlass.Float32,
-}
-
-# Gate ABI dtype selectable from the CLI harness.  BF16 is the default (see the
-# module docstring); FP32 selects the historical build.
-CLI_GATE_DTYPES: dict[str, type] = {
-    "bf16": cutlass.BFloat16,
-    "fp32": cutlass.Float32,
-}
-
-
-# ---------------------------------------------------------------------------
-# Torch reference: current numerical contract
-# ---------------------------------------------------------------------------
-
-
-_LN_2: float = 0.6931471805599453
-
-
-def _torch_exp2(x: torch.Tensor) -> torch.Tensor:
-    """``torch.exp2`` via the ``exp`` identity.
-
-    ``torch.exp2`` lowers through the CUDA jiterator (a runtime NVRTC
-    compile), which fails when the pip NVRTC build predates the running
-    device's architecture; ``torch.exp`` is precompiled ATen and never
-    touches NVRTC.  The identity costs at most ~1 ulp on the FP32 reference
-    path, far below the kernel comparison tolerances.
-    """
-
-    return torch.exp(x * _LN_2)
-
-
-def _torch_l2_normalize_qk(
-    q: torch.Tensor, k: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply additive Q/K normalization in FP32."""
-
-    q, k = q.float(), k.float()
-    return (
-        q * torch.rsqrt(q.square().sum(dim=-1, keepdim=True) + L2_NORM_EPS),
-        k * torch.rsqrt(k.square().sum(dim=-1, keepdim=True) + L2_NORM_EPS),
-    )
-
-
-def _torch_mma_input(x: torch.Tensor, mma_dtype: torch.dtype) -> torch.Tensor:
-    """Round tensors as 16-bit MMA inputs while keeping FP32 accumulation sites."""
-
-    if mma_dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(f"mma_dtype must be fp16 or bf16, got {mma_dtype}")
-    return x.to(mma_dtype).float()
-
-
-def _torch_mma_input_mul(
-    lhs: torch.Tensor,
-    rhs: torch.Tensor,
-    mma_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Model packed 16-bit multiply used when materializing decay operands."""
-
-    return _torch_mma_input(
-        _torch_mma_input(lhs, mma_dtype) * _torch_mma_input(rhs, mma_dtype),
-        mma_dtype,
-    )
-
-
-def _torch_safe_gate_log2_increment(
-    raw_gate: torch.Tensor,
-    a_log: torch.Tensor | None,
-    dt_bias: torch.Tensor | None,
-    safe_gate: bool,
-    gate_lower_bound: float,
-) -> torch.Tensor:
-    """Apply FLA-compatible KDA gate preprocessing in log2-domain units.
-
-    safe_gate=True -> the bounded sigmoid gate;
-    safe_gate=False -> FLA's unbounded ``-exp(A_log) * softplus(g + dt_bias)``
-    activation, both returned as base-2 (log2) decay increments.
-    """
-
-    if a_log is None:
-        a_log = torch.zeros(
-            raw_gate.shape[1], dtype=torch.float32, device=raw_gate.device
-        )
-    if dt_bias is None:
-        dt_bias = torch.zeros(
-            raw_gate.shape[1],
-            raw_gate.shape[-1],
-            dtype=torch.float32,
-            device=raw_gate.device,
-        )
-    if a_log.shape != (raw_gate.shape[1],):
-        raise ValueError(f"a_log must be [H], got {a_log.shape}")
-    if dt_bias.shape != (raw_gate.shape[1], raw_gate.shape[-1]):
-        raise ValueError(
-            f"dt_bias must be [H,{raw_gate.shape[-1]}], got {dt_bias.shape}"
-        )
-
-    a_log_exp = _torch_exp2(a_log.float() * LOG2_E).view(1, raw_gate.shape[1], 1, 1)
-    biased_gate = raw_gate.float() + dt_bias.float().view(
-        1, raw_gate.shape[1], 1, raw_gate.shape[-1]
-    )
-    if safe_gate:
-        sigmoid = 0.5 * torch.tanh(0.5 * a_log_exp * biased_gate) + 0.5
-        return (gate_lower_bound * LOG2_E) * sigmoid
-    return -a_log_exp * torch.nn.functional.softplus(biased_gate) * LOG2_E
-
-
-def _state_vk_to_kv(state_vk: torch.Tensor) -> torch.Tensor:
-    """Interpret a VK `[B, H, DV, DK]` state tensor with the reference KV axes."""
-
-    if state_vk.shape[-2:] != (DV, DK):
-        raise ValueError(f"VK state must end with [{DV},{DK}], got {state_vk.shape}")
-    return state_vk.transpose(-1, -2)
-
-
-def _state_kv_to_vk(state_kv: torch.Tensor) -> torch.Tensor:
-    """Interpret a KV `[B, H, DK, DV]` reference state with kernel VK axes."""
-
-    if state_kv.shape[-2:] != (DK, DV):
-        raise ValueError(f"KV state must end with [{DK},{DV}], got {state_kv.shape}")
-    return state_kv.transpose(-1, -2)
-
-
-def _blockwise_inverse_unit_lower_bt16_mma(
-    strict_lower: torch.Tensor,
-    mma_dtype: torch.dtype,
-) -> torch.Tensor:
-    """BT=16 blockwise inverse mirroring the device auxiliary-MMA stage.
-
-    Hierarchical (GDN-style) block inverse expressed entirely as MMAs:
-
-        D    = blockdiag(L11, L22)        (strict-lower 8x8 diagonal blocks)
-        Binv = (I - D)(I + D^2)(I + D^4)  (exact: blocks nilpotent at 8)
-        A^-1 = Binv - Binv @ A21hat @ Binv  (exact: (Binv @ A21hat)^2 = 0)
-
-    Chain and combine operands are FP16 (FP32 accumulate) regardless of the
-    kernel input dtype, matching the device stage; only the staged A_inv
-    tile is rounded to `mma_dtype`.
-    """
-
-    if strict_lower.shape[-2:] != (BT, BT):
-        raise ValueError(
-            f"strict_lower must end with [{BT},{BT}], got {strict_lower.shape}"
-        )
-
-    chain_dtype = torch.float16
-    strict_lower = strict_lower.float()
-    eye = torch.eye(BT, dtype=torch.float32, device=strict_lower.device)
-
-    d = torch.zeros_like(strict_lower)
-    d[..., :8, :8] = strict_lower[..., :8, :8]
-    d[..., 8:, 8:] = strict_lower[..., 8:, 8:]
-    d16 = _torch_mma_input(d, chain_dtype)
-
-    d2 = _torch_mma_input(d16 @ d16, chain_dtype)
-    d4 = _torch_mma_input(d2 @ d2, chain_dtype)
-
-    b01_lhs = _torch_mma_input(eye - d, chain_dtype)
-    b01_rhs = _torch_mma_input(eye + d2, chain_dtype)
-    b01 = _torch_mma_input(b01_lhs @ b01_rhs, chain_dtype)
-    binv = b01 @ _torch_mma_input(eye + d4, chain_dtype)  # FP32 accumulator
-
-    a21hat = torch.zeros_like(strict_lower)
-    a21hat[..., 8:, :8] = strict_lower[..., 8:, :8]
-    t1 = _torch_mma_input(binv, chain_dtype) @ _torch_mma_input(a21hat, chain_dtype)
-    x21 = -(_torch_mma_input(t1, chain_dtype) @ _torch_mma_input(binv, chain_dtype))
-
-    ainv = binv.clone()
-    ainv[..., 8:, :8] = x21[..., 8:, :8]
-    return _torch_mma_input(ainv, mma_dtype)
-
-
-@dataclass(frozen=True)
-class PairwiseF16MmaTiles:
-    """Input-dtype-rounded tiles owned by the KDA auxiliary-MMA warp."""
-
-    kk: torch.Tensor
-    qk: torch.Tensor
-    strict_lower: torch.Tensor
-    a_inv: torch.Tensor
-
 
 @cute.jit
 def raw_f16_s128_smem_index(token_coord, dim):
@@ -1062,221 +870,6 @@ def raw_v_ldmatrix_trans_ptr(raw_v_smem, value_dim_base, lane):
     value_dim = value_dim_base + value_block * 8
     smem_idx = raw_f16_s128_smem_index(token_coord, value_dim)
     return raw_v_smem.subview(smem_idx).data_ptr()
-
-
-def _kda_pairwise_mma_tiles(
-    q_decay: torch.Tensor,
-    k_decay: torch.Tensor,
-    k_inv: torch.Tensor,
-    beta_chunk: torch.Tensor,
-    mma_dtype: torch.dtype,
-) -> PairwiseF16MmaTiles:
-    """Reference contract for the BT=16 KK/QK/inverse auxiliary-MMA path."""
-
-    expected_tile_shape = (BT, DK)
-    if q_decay.shape[-2:] != expected_tile_shape:
-        raise ValueError(
-            f"q_decay must end with {expected_tile_shape}, got {q_decay.shape}"
-        )
-    if k_decay.shape != q_decay.shape:
-        raise ValueError(f"k_decay must match q_decay, got {k_decay.shape}")
-    if k_inv.shape != q_decay.shape:
-        raise ValueError(f"k_inv must match q_decay, got {k_inv.shape}")
-    if beta_chunk.shape != q_decay.shape[:-1]:
-        raise ValueError(f"beta_chunk must be [...,{BT}], got {beta_chunk.shape}")
-
-    tril_strict = torch.tril(
-        torch.ones(BT, BT, dtype=torch.bool, device=q_decay.device), diagonal=-1
-    )
-    tril_inclusive = torch.tril(
-        torch.ones(BT, BT, dtype=torch.bool, device=q_decay.device), diagonal=0
-    )
-
-    kk = _torch_mma_input(
-        torch.einsum("...ik,...jk->...ij", k_decay, k_inv),
-        mma_dtype,
-    )
-    qk_full = _torch_mma_input(
-        torch.einsum("...ik,...jk->...ij", q_decay, k_inv),
-        mma_dtype,
-    )
-    kk_lower = torch.where(tril_strict, kk, torch.zeros_like(kk))
-    qk = _torch_mma_input(
-        torch.where(tril_inclusive, qk_full, torch.zeros_like(qk_full)),
-        mma_dtype,
-    )
-    strict_lower = _torch_mma_input(kk_lower * beta_chunk[..., :, None], mma_dtype)
-    a_inv = _blockwise_inverse_unit_lower_bt16_mma(strict_lower, mma_dtype)
-    return PairwiseF16MmaTiles(
-        kk=kk,
-        qk=qk,
-        strict_lower=strict_lower,
-        a_inv=a_inv,
-    )
-
-
-def _pad_chunk_to_bt(value: torch.Tensor, valid_tokens: int) -> torch.Tensor:
-    """Pad a `[B,H,T,...]` chunk to BT tokens with trailing zeros."""
-
-    if valid_tokens == BT:
-        return value
-    pad_shape = list(value.shape)
-    pad_shape[2] = BT - valid_tokens
-    return torch.cat([value, value.new_zeros(pad_shape)], dim=2)
-
-
-def _pad_beta_chunk_to_bt(value: torch.Tensor, valid_tokens: int) -> torch.Tensor:
-    """Pad a `[B,H,T]` beta chunk to BT tokens with trailing zeros."""
-
-    if valid_tokens == BT:
-        return value
-    pad_shape = list(value.shape)
-    pad_shape[2] = BT - valid_tokens
-    return torch.cat([value, value.new_zeros(pad_shape)], dim=2)
-
-
-def kda_chunked_mma_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    raw_gate: torch.Tensor,
-    beta_logits: torch.Tensor,
-    initial_state: torch.Tensor | None = None,
-    scale: float | None = None,
-    mma_dtype: torch.dtype | None = None,
-    a_log: torch.Tensor | None = None,
-    dt_bias: torch.Tensor | None = None,
-    safe_gate: bool = True,
-    gate_lower_bound: float = DEFAULT_GATE_LOWER_BOUND,
-    cu_seqlens: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunk KDA reference with dtype-rounded operands at MMA input boundaries."""
-
-    if cu_seqlens is not None:
-        if q.shape[0] != 1:
-            raise ValueError(f"packed q batch must be 1, got {q.shape[0]}")
-        boundaries = cu_seqlens.tolist()
-        num_sequences = len(boundaries) - 1
-        if initial_state is not None and initial_state.shape[0] != num_sequences:
-            raise ValueError("packed initial_state must have one row per sequence")
-        packed_out = torch.empty_like(v)
-        final_states: list[torch.Tensor] = []
-        for sequence_idx, (start, end) in enumerate(
-            zip(boundaries[:-1], boundaries[1:], strict=True)
-        ):
-            sequence_out, sequence_state = kda_chunked_mma_reference(
-                q[:, :, start:end, :],
-                k[:, :, start:end, :],
-                v[:, :, start:end, :],
-                raw_gate[:, :, start:end, :],
-                beta_logits[:, :, start:end],
-                None
-                if initial_state is None
-                else initial_state[sequence_idx : sequence_idx + 1],
-                scale,
-                mma_dtype,
-                a_log,
-                dt_bias,
-                safe_gate,
-                gate_lower_bound,
-            )
-            packed_out[:, :, start:end, :] = sequence_out
-            final_states.append(sequence_state)
-        return packed_out, torch.cat(final_states, dim=0)
-
-    if q.shape != k.shape:
-        raise ValueError(
-            f"q and k must have the same shape, got {q.shape} and {k.shape}"
-        )
-    if v.shape[:-1] != q.shape[:-1] or v.shape[-1] != DV:
-        raise ValueError(f"v must be [B,H,T,{DV}], got {v.shape}")
-    if raw_gate.shape != q.shape:
-        raise ValueError(f"raw_gate must be [B,H,T,{DK}], got {raw_gate.shape}")
-    if beta_logits.shape != q.shape[:-1]:
-        raise ValueError(f"beta_logits must be [B,H,T], got {beta_logits.shape}")
-
-    batch, heads, seqlen, d_k = q.shape
-    if d_k != DK:
-        raise ValueError(f"DK must be {DK}, got {d_k}")
-    if scale is None:
-        scale = 1.0 / (DK**0.5)
-    if mma_dtype is None:
-        mma_dtype = q.dtype
-
-    state = (
-        torch.zeros(batch, heads, DK, DV, dtype=torch.float32, device=q.device)
-        if initial_state is None
-        else initial_state.float().clone()
-    )
-    out = torch.empty(batch, heads, seqlen, DV, dtype=q.dtype, device=q.device)
-
-    q_f, k_f = _torch_l2_normalize_qk(q, k)
-    v_f = v.float()
-    gate_f = _torch_safe_gate_log2_increment(
-        raw_gate,
-        a_log,
-        dt_bias,
-        safe_gate,
-        gate_lower_bound,
-    )
-    beta_f = torch.tanh(beta_logits.float() * 0.5) * 0.5 + 0.5
-    for chunk_start in range(0, seqlen, BT):
-        chunk_end = min(chunk_start + BT, seqlen)
-        valid_tokens = chunk_end - chunk_start
-        q_chunk = _pad_chunk_to_bt(q_f[:, :, chunk_start:chunk_end, :], valid_tokens)
-        k_chunk = _pad_chunk_to_bt(k_f[:, :, chunk_start:chunk_end, :], valid_tokens)
-        v_chunk = _pad_chunk_to_bt(v_f[:, :, chunk_start:chunk_end, :], valid_tokens)
-        gate_chunk = _pad_chunk_to_bt(
-            gate_f[:, :, chunk_start:chunk_end, :],
-            valid_tokens,
-        )
-        beta_chunk = _pad_beta_chunk_to_bt(
-            beta_f[:, :, chunk_start:chunk_end],
-            valid_tokens,
-        )
-
-        g_prefix = torch.cumsum(gate_chunk, dim=2)
-        exp_g = _torch_exp2(g_prefix)
-        exp_neg_g = _torch_exp2(-g_prefix)
-        exp_g_last = _torch_exp2(g_prefix[:, :, -1, :])
-
-        q_decay = _torch_mma_input_mul(q_chunk, exp_g, mma_dtype)
-        k_decay = _torch_mma_input_mul(k_chunk, exp_g, mma_dtype)
-        k_inv = _torch_mma_input(k_chunk * exp_neg_g, mma_dtype)
-        k_restore = _torch_mma_input_mul(
-            k_inv,
-            exp_g_last[:, :, None, :],
-            mma_dtype,
-        )
-
-        pairwise_tiles = _kda_pairwise_mma_tiles(
-            q_decay,
-            k_decay,
-            k_inv,
-            beta_chunk,
-            mma_dtype,
-        )
-
-        state_mma = _torch_mma_input(state, mma_dtype)
-        state_k = torch.einsum("bhtk,bhkv->bhtv", k_decay, state_mma)
-        rhs = _torch_mma_input(
-            beta_chunk[:, :, :, None] * (v_chunk - state_k),
-            mma_dtype,
-        )
-        update = torch.einsum("bhij,bhjv->bhiv", pairwise_tiles.a_inv, rhs)
-        update_mma = _torch_mma_input(update, mma_dtype)
-
-        state_q = torch.einsum("bhtk,bhkv->bhtv", q_decay, state_mma)
-        intra = torch.einsum("bhij,bhjv->bhiv", pairwise_tiles.qk, update_mma)
-        out[:, :, chunk_start:chunk_end, :] = ((state_q + intra) * scale).to(q.dtype)[
-            :, :, :valid_tokens, :
-        ]
-
-        state = state * exp_g_last[:, :, :, None] + torch.einsum(
-            "bhtk,bhtv->bhkv", k_restore, update_mma
-        )
-
-    return out, state
 
 
 # ---------------------------------------------------------------------------
@@ -10212,7 +9805,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         # the flags makes prep 30-44% cheaper (H32-T8192 130.7 -> 91.2 us,
         # H12-2048x4 73.6 -> 41.5) and 4 of 5 decomp shapes tie or improve
         # end-to-end (H12-2048x4 -22.6%, H32-T8192 -13.0%) against a single 1.3%
-        # loss on H12-varlen -- with verify() bit-identical between the two.
+        # loss on H12-varlen -- with outputs bit-identical between the two.
         num_ctas, cpc = _k1_grid(total_chunks, heads)
         unified(
             q,
@@ -10493,10 +10086,10 @@ def _make_inputs(
     total_seqlen = sum(seq_lens)
     torch_dtype = DTYPE_MAP[dtype]
     torch_state_dtype = DTYPE_MAP[state_dtype]
-    # The gate is materialized in FP32 (RNG parity with the historical harness,
-    # byte-for-byte identical draws) and then ROUNDED to the ABI dtype.  The
-    # torch reference consumes THIS tensor, so it models the input rounding
-    # exactly while keeping every internal gate op in FP32.
+    # The gate is materialized in FP32 (byte-for-byte reproducible draws) and
+    # then ROUNDED to the ABI dtype, so a reference that consumes this tensor
+    # models the input rounding exactly while keeping every internal gate op
+    # in FP32.
     torch_gate_dtype = DTYPE_MAP[gate_dtype]
     q = 0.25 * torch.randn(1, total_seqlen, heads, DK, dtype=torch_dtype, device=device)
     k = 0.25 * torch.randn(1, total_seqlen, heads, DK, dtype=torch_dtype, device=device)
@@ -10513,8 +10106,8 @@ def _make_inputs(
                 device=device,
             )
         ).to(torch_gate_dtype)
-        # Safe path draws are unchanged (zeros consume no RNG): reproducible
-        # byte-for-byte vs the original harness.
+        # Zeros consume no RNG, so the safe path leaves the draw sequence
+        # reproducible byte-for-byte.
         a_log = torch.zeros(heads, dtype=torch.float32, device=device)
         dt_bias = torch.zeros(heads, DK, dtype=torch.float32, device=device)
     else:
@@ -10556,259 +10149,3 @@ def _make_inputs(
             device=device,
         )
     return q, k, v, raw_gate, a_log, dt_bias, beta, cu_seqlens, state
-
-
-def run(
-    compiled_fn: CompiledKDA,
-    batch: int = DEFAULT_BATCH,
-    heads: int = DEFAULT_HEADS,
-    seqlen: int = DEFAULT_SEQLEN,
-    dtype: type = cutlass.BFloat16,
-    state_dtype: type = cutlass.Float32,
-    gate_dtype: type = cutlass.BFloat16,
-    has_state_in: bool = True,
-    has_state_out: bool = True,
-    seq_lens: tuple[int, ...] | None = None,
-    scale: float = DEFAULT_SCALE,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run packed KDA with runtime scale and optionally return the VK state.
-
-    This public runtime helper is also re-exported by the Rubin specialization.
-    ``compiled_fn`` must use the same state-presence specialization selected by
-    ``has_state_in`` and ``has_state_out``.
-    """
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU required")
-    q, k, v, raw_gate, a_log, dt_bias, beta, cu_seqlens, state = _make_inputs(
-        batch,
-        heads,
-        seqlen,
-        dtype,
-        state_dtype,
-        device="cuda",
-        seq_lens=seq_lens,
-        gate_dtype=gate_dtype,
-    )
-    out = torch.zeros_like(v)
-    initial_state = state if has_state_in else None
-    final_state = torch.zeros_like(state) if has_state_out else None
-
-    # User-allocated opaque workspace: query bytes for the route this host will
-    # take, then allocate a raw (uninitialized) buffer. The host initializes it.
-    ws_bytes = compiled_fn.workspace_size(cu_seqlens, heads)
-    workspace = (
-        torch.empty(ws_bytes, dtype=torch.uint8, device=cu_seqlens.device)
-        if ws_bytes > 0
-        else None
-    )
-
-    stream = torch.cuda.current_stream(cu_seqlens.device).cuda_stream
-    compiled_fn(
-        q,
-        k,
-        v,
-        raw_gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        initial_state,
-        out,
-        final_state,
-        workspace,
-        stream,
-        scale,
-    )
-    torch.cuda.synchronize()
-    return out, final_state
-
-
-def verify(
-    batch: int = DEFAULT_BATCH,
-    heads: int = DEFAULT_HEADS,
-    seqlen: int = BT,
-    dtype: type = cutlass.BFloat16,
-    state_dtype: type = cutlass.Float32,
-    gate_dtype: type = cutlass.BFloat16,
-    compile_only: bool = True,
-    safe_gate: bool = True,
-    has_state_in: bool = True,
-    has_state_out: bool = True,
-    seq_lens: tuple[int, ...] | None = None,
-    scale: float = DEFAULT_SCALE,
-    mode: str = "engine",
-) -> None:
-    """Compile the kernel and optionally compare a device run to the MMA reference."""
-
-    compiled_fn = compile(
-        dtype=dtype,
-        state_dtype=state_dtype,
-        gate_dtype=gate_dtype,
-        safe_gate=safe_gate,
-        has_state_in=has_state_in,
-        has_state_out=has_state_out,
-        mode=mode,
-    )
-    print(
-        f"Compile KDA kernel (BT={BT}, runtime seqlen, dtype={dtype}, "
-        f"gate_dtype={gate_dtype}) OK"
-    )
-
-    if compile_only:
-        return
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU required")
-
-    q, k, v, raw_gate, a_log, dt_bias, beta, cu_seqlens, state = _make_inputs(
-        batch,
-        heads,
-        seqlen,
-        dtype,
-        state_dtype,
-        device="cuda",
-        random_state=True,
-        safe_gate=safe_gate,
-        seq_lens=seq_lens,
-        gate_dtype=gate_dtype,
-    )
-    out = torch.zeros_like(v)
-    initial_state = state if has_state_in else None
-    final_state = torch.zeros_like(state) if has_state_out else None
-
-    ws_bytes = compiled_fn.workspace_size(cu_seqlens, heads)
-    workspace = (
-        torch.empty(ws_bytes, dtype=torch.uint8, device=cu_seqlens.device)
-        if ws_bytes > 0
-        else None
-    )
-
-    stream_a = torch.cuda.current_stream(cu_seqlens.device).cuda_stream
-    compiled_fn(
-        q,
-        k,
-        v,
-        raw_gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_seqlens,
-        initial_state,
-        out,
-        final_state,
-        workspace,
-        stream_a,
-        scale,
-    )
-    torch.cuda.synchronize()
-
-    state_kv = _state_vk_to_kv(state) if has_state_in else None
-    # Reference keeps the head-major logical convention; permute the
-    # token-major user tensors to zero-copy [1, H, T, D] / [1, H, T] views.
-    out_ref, state_ref_kv = kda_chunked_mma_reference(
-        q.permute(0, 2, 1, 3),
-        k.permute(0, 2, 1, 3),
-        v.permute(0, 2, 1, 3),
-        raw_gate.permute(0, 2, 1, 3),
-        beta.permute(0, 2, 1),
-        state_kv,
-        mma_dtype=DTYPE_MAP[dtype],
-        a_log=a_log,
-        dt_bias=dt_bias,
-        safe_gate=safe_gate,
-        cu_seqlens=cu_seqlens,
-        scale=scale,
-    )
-    state_ref_vk = _state_kv_to_vk(state_ref_kv)
-    verify_atol = 1.0e-2 if dtype is cutlass.BFloat16 else VERIFY_ATOL
-    out_hm = out.permute(0, 2, 1, 3)
-    torch.testing.assert_close(
-        out_hm.float(), out_ref.float(), rtol=VERIFY_RTOL, atol=verify_atol
-    )
-    if has_state_out:
-        torch.testing.assert_close(
-            final_state,
-            state_ref_vk.to(final_state.dtype),
-            rtol=VERIFY_RTOL,
-            atol=verify_atol,
-        )
-    out_diff = (out_hm.float() - out_ref.float()).abs()
-    state_diff_text = "disabled"
-    if has_state_out:
-        state_diff = (final_state.float() - state_ref_vk.float()).abs()
-        state_diff_text = f"{state_diff.max().item():.6g}"
-    print(
-        "Run KDA staged-SMEM/TMA dtype-rounded MMA reference check: PASS "
-        f"max_out_abs={out_diff.max().item():.6g}, "
-        f"max_state_abs={state_diff_text}"
-    )
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="BT=16 KDA CUTLASS primitives kernel",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
-    parser.add_argument("--heads", type=int, default=DEFAULT_HEADS)
-    parser.add_argument("--seqlen", type=int, default=BT)
-    parser.add_argument("--scale", type=float, default=DEFAULT_SCALE)
-    parser.add_argument("--dtype", choices=sorted(CLI_DTYPES), default="bf16")
-    parser.add_argument(
-        "--state-dtype",
-        choices=sorted(CLI_STATE_DTYPES),
-        default="fp32",
-    )
-    parser.add_argument(
-        "--gate-dtype",
-        choices=sorted(CLI_GATE_DTYPES),
-        default="bf16",
-        help="gate input ABI dtype (bf16 = FlashKDA-aligned default)",
-    )
-    parser.add_argument(
-        "--no-initial-state",
-        action="store_true",
-        help="initialize the recurrent state to zero inside the kernel",
-    )
-    parser.add_argument(
-        "--no-final-state",
-        action="store_true",
-        help="skip the final recurrent-state global store",
-    )
-    parser.add_argument(
-        "--disable-safe-gate",
-        action="store_true",
-        help="interpret raw gate input as a precomputed log2-domain increment",
-    )
-    parser.add_argument(
-        "--run-kernel",
-        action="store_true",
-        help="run the current staged-SMEM/TMA device path after compile",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=("engine", "decomp", "auto"),
-        default="engine",
-        help="engine = plain kernel; decomp = two-kernel decomposition; "
-        "auto = two-way shape router (plain engine / decomp-DV2)",
-    )
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = _parse_args()
-    verify(
-        batch=args.batch,
-        heads=args.heads,
-        seqlen=args.seqlen,
-        dtype=CLI_DTYPES[args.dtype],
-        state_dtype=CLI_STATE_DTYPES[args.state_dtype],
-        gate_dtype=CLI_GATE_DTYPES[args.gate_dtype],
-        compile_only=not args.run_kernel,
-        safe_gate=not args.disable_safe_gate,
-        has_state_in=not args.no_initial_state,
-        has_state_out=not args.no_final_state,
-        scale=args.scale,
-        mode=args.mode,
-    )
