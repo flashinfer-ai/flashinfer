@@ -445,6 +445,21 @@ def test_fused_kda_decode_requires_matching_cache_slots():
         _fused_kda_decode(**inputs)
 
 
+@pytest.mark.parametrize("ds", [False, True], ids=["SD", "DS"])
+def test_fused_kda_decode_rejects_misaligned_conv_slots(ds):
+    inputs = _make_inputs(num_heads=16, num_rows=2)
+    conv_state = inputs["conv_state"]
+    slots, channels, history = conv_state.shape
+    slot_stride = conv_state.stride(0) + 2
+    strides = (slot_stride, 3, 1) if ds else (slot_stride, 1, channels)
+    inputs["conv_state"] = torch.empty_strided(
+        (slots, channels, history), strides, dtype=torch.bfloat16, device="cuda"
+    )
+
+    with pytest.raises(ValueError, match="conv_state slots must start 8-byte aligned"):
+        _fused_kda_decode(**inputs)
+
+
 def test_fused_kda_decode_compile_abi_orders_flags_and_metadata(monkeypatch):
     import importlib
 

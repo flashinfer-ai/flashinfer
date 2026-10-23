@@ -75,6 +75,17 @@ def _aligned_tensor(tensor, alignment):
     )
 
 
+def _ds_conv_chunks(conv_state, channel_in_warp, vector_idx, head_idx, slot):
+    """View one thread's DS conv state as three contiguous bf16x4 chunks.
+
+    In DS a channel's three history taps are adjacent, so the 4 channels x 3
+    taps a thread owns are 12 contiguous values; chunk c holds flat values
+    4c..4c+3, where flat value 3 * channel + tap.
+    """
+    taps = conv_state[(None, channel_in_warp, None, vector_idx, head_idx, slot)]
+    return cute.make_tensor(taps.iterator, cute.make_layout((4, 3), stride=(1, 4)))
+
+
 def _sigmoid(value):
     """Evaluate a cancellation-safe approximate sigmoid."""
     return cute.rcp(cute.exp(-value, fastmath=True) + 1.0, approx=True, ftz=True)
@@ -196,22 +207,27 @@ def _fused_kda_decode_kernel(
                 ),
                 weight_registers[(None, width_idx)],
             )
-        for history_idx in cutlass.range_constexpr(3):
-            if cutlass.const_expr(conv_dim_first):
-                # DS layout: a channel's history is contiguous, channels are
-                # not, so the four channels are loaded one by one.
-                for element_idx in cutlass.range_constexpr(4):
-                    conv_registers[(element_idx, history_idx)] = conv_state[
-                        (
-                            element_idx,
-                            channel_in_warp,
-                            history_idx,
-                            vector_idx,
-                            head_idx,
-                            slot,
-                        )
+        if cutlass.const_expr(conv_dim_first):
+            # DS layout: load the thread's 12 contiguous values as three
+            # coalesced vectors, then transpose to (channel, tap) in registers.
+            conv_chunks = _ds_conv_chunks(
+                conv_state, channel_in_warp, vector_idx, head_idx, slot
+            )
+            conv_flat = cute.make_rmem_tensor((4, 3), BF16)
+            for chunk_idx in cutlass.range_constexpr(3):
+                cute.copy(
+                    copy_bf16x4,
+                    _aligned_tensor(conv_chunks[(None, chunk_idx)], 8),
+                    conv_flat[(None, chunk_idx)],
+                )
+            for element_idx in cutlass.range_constexpr(4):
+                for history_idx in cutlass.range_constexpr(3):
+                    flat_idx = 3 * element_idx + history_idx
+                    conv_registers[(element_idx, history_idx)] = conv_flat[
+                        (flat_idx % 4, flat_idx // 4)
                     ]
-            else:
+        else:
+            for history_idx in cutlass.range_constexpr(3):
                 cute.copy(
                     copy_bf16x4,
                     _aligned_tensor(
@@ -252,20 +268,25 @@ def _fused_kda_decode_kernel(
             _aligned_tensor(mixed_warp[(None, thread_idx)], 16),
         )
         if is_live:
-            for history_idx in cutlass.range_constexpr(3):
-                if cutlass.const_expr(conv_dim_first):
-                    for element_idx in cutlass.range_constexpr(4):
-                        conv_state[
-                            (
-                                element_idx,
-                                channel_in_warp,
-                                history_idx,
-                                vector_idx,
-                                head_idx,
-                                slot,
-                            )
-                        ] = conv_registers[(element_idx, history_idx)]
-                else:
+            if cutlass.const_expr(conv_dim_first):
+                conv_chunks = _ds_conv_chunks(
+                    conv_state, channel_in_warp, vector_idx, head_idx, slot
+                )
+                conv_flat = cute.make_rmem_tensor((4, 3), BF16)
+                for element_idx in cutlass.range_constexpr(4):
+                    for history_idx in cutlass.range_constexpr(3):
+                        flat_idx = 3 * element_idx + history_idx
+                        conv_flat[(flat_idx % 4, flat_idx // 4)] = conv_registers[
+                            (element_idx, history_idx)
+                        ]
+                for chunk_idx in cutlass.range_constexpr(3):
+                    cute.copy(
+                        copy_bf16x4,
+                        conv_flat[(None, chunk_idx)],
+                        _aligned_tensor(conv_chunks[(None, chunk_idx)], 8),
+                    )
+            else:
+                for history_idx in cutlass.range_constexpr(3):
                     cute.copy(
                         copy_bf16x4,
                         conv_registers[(None, history_idx)],
@@ -971,6 +992,11 @@ def run_fused_kda_decode(
             "conv_state must have shape [slots, 3 * H * 128, 3] and use the SD "
             "(strides [slot, 1, 3 * H * 128]) or DS (strides [slot, 3, 1]) "
             "cache layout"
+        )
+    if conv_state.stride(0) % 4 or conv_state.data_ptr() % 8:
+        # Both layouts move conv state as bf16x4 vectors.
+        raise ValueError(
+            "conv_state slots must start 8-byte aligned (slot stride a multiple of 4)"
         )
     conv_dim_first = conv_state.stride(2) == 1
     if raw_gate.shape != (1, num_rows, num_heads, _HEAD_DIM):
