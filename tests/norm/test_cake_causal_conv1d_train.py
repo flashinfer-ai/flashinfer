@@ -667,13 +667,16 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
     assert [name for name, _, _ in launched] == list(loader.route_modules(arch, "fwd"))
 
 
-def test_backward_keeps_its_speed_beside_a_resident_side_kernel() -> None:
+def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
+    record_property,
+) -> None:
     """FlashInfer issue #7038's recipe: one 1-thread kernel resident on another stream must not stall the
     backward.
 
     The cooperative form waited for it (0.161 ms -> 17.85 ms on GB200); the two ordinary launches run beside it.
     Timed with CUDA events on the current stream, median of 7 after 3 warm-ups: ``busy <= 1.5 x alone``, and
-    ``dweight`` is bitwise equal with and without the side kernel.
+    ``dweight`` is bitwise equal with and without the side kernel.  Both medians and their ratio go to the
+    junit properties of the test.
     """
 
     device = _device()
@@ -711,6 +714,9 @@ def test_backward_keeps_its_speed_beside_a_resident_side_kernel() -> None:
         f"backward alone {alone:.3f} ms, beside a resident 1-thread kernel on another "
         f"stream {busy:.3f} ms ({busy / alone:.2f}x)"
     )
+    record_property("backward_alone_ms", f"{alone:.4f}")
+    record_property("backward_beside_side_kernel_ms", f"{busy:.4f}")
+    record_property("busy_over_alone", f"{busy / alone:.3f}")
     assert torch.equal(dw, dw_alone), "dweight changed beside the side kernel"
     assert busy <= 1.5 * alone, (
         f"the backward stalled behind a kernel resident on another stream: "
