@@ -236,7 +236,7 @@ def chunk_kda(
 def kda_train_arena(*, lean: bool = False, tail_passes: int = 1) -> Any:
     """The lower-memory arena option (a ``KdaArena``; the default, ``lean=False, tail_passes=1``, is the full
     layout).  ``lean=True`` selects the lean backward layouts (4108 B per internal token-head with one tail pass
-    instead of the full layout's 5376 / 5120; no checkpoint replay on such a workspace); ``tail_passes >= 2``
+    instead of the default's 4488, tape 3720; no checkpoint replay on such a workspace); ``tail_passes >= 2``
     (implies ``lean``) runs the backward's tail, the fused gradient / GLM intra / gate epilogue, once per range of
     ``ceil(NC_pad / tail_passes)`` chunks over per-range buffers: 2820 B per internal token-head plus three state
     blocks on the floor, the same gradients bitwise, some speed cost (see the package README)."""
