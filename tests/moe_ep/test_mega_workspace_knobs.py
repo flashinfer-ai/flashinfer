@@ -1091,6 +1091,7 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
         "sm100-genphase-6b9a6e2e-auto-v2",
         "sm100-genphase-3c1d1c2f-auto-v3",
         "sm100-genphase-shared-epilogue-v4",
+        "sm100-genphase-33482a9d-auto-v4",
     ):
         data["entries"][-1]["backend_revision"] = revision
         path.write_text(json.dumps(data))
