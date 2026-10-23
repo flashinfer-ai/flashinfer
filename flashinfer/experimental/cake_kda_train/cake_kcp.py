@@ -41,7 +41,7 @@ under ``b2``: the two R7 overlaps) and the separate walks stay selectable throug
 the test knobs ``schedule`` / ``fused_walks``.  Nothing launched between an issue
 and its wait reads that collective's buffers, so the bits are independent of the
 schedule and a checkpoint replay re-runs the same program order on every rank.
-CUDA-graph replay (adopted in this revision; keyword
+CUDA-graph replay (adopted in an earlier revision; keyword
 ``graph="replay"`` of :func:`chunk_kda_kcp`, :func:`chunk_kda_kcp_fwd` and
 :func:`chunk_kda_kcp_bwd`, shipped default ``GRAPH_DEFAULT = "off"``): the
 first call of a validity key runs eagerly, the second is captured into a
@@ -60,7 +60,7 @@ them and must run before ``torch.distributed.destroy_process_group()``.
 ``exchange="ring"``, ``debug_sequence`` and calls without a caller-owned
 workspace are never captured.
 
-Shipped walk-launch geometry (adopted in this revision;
+Shipped walk-launch geometry (adopted in an earlier revision;
 ``WALK_GEOMETRY_DEFAULT = "lpt_tape_one_cta_per_sm"``): the offset walk lists of
 K1 / K2 / K3 launch in LPT order (longest segment first, ties by segment number;
 the tape lists already did) and the tape programs ``fwdh_tape`` / ``dhu_tape``
@@ -217,7 +217,7 @@ COLS_RULES = (
 )  # D1: K4 cols_per_cta of the 128-column state launches: the backend's, or 8 up to COLS_RULE_CHAINS chains else 16
 COLS_RULE_CHAINS = 24  # D1 threshold (DECISIONS.md D1: <= 24 concurrent chains -> c8, otherwise c16; map launches stay c16)
 # Walk-launch geometry: the launch geometry of the K1 / K2 / K3 walk kernels, a test
-# knob until this revision made "lpt_tape_one_cta_per_sm" the shipped default.  "shipped" =
+# knob until an earlier revision made "lpt_tape_one_cta_per_sm" the shipped default.  "shipped" =
 # the earlier lists and launches (the offset / staging lists in segment order, the runtime's own occupancy); "lpt_chains" =
 # every walk list in LPT order (longest segment first, ties by segment number; the tape lists already are); "one_cta_per_sm" =
 # the K1 / K2 kernels (115712 B of dynamic shared memory: two CTAs fit an SM only at the full 228 KiB carveout) launched at
@@ -255,7 +255,7 @@ WALK_CAP_GEOMETRIES = tuple(WALK_CAP_PROGRAMS)
 GRAPH_MODES = (
     "off",
     "replay",
-)  # graph replay: "replay" = keyed CUDA-graph capture / replay of the per-rank call; public keyword graph= since this revision
+)  # graph replay: "replay" = keyed CUDA-graph capture / replay of the per-rank call; public keyword graph= since an earlier revision
 GRAPH_DEFAULT = "off"  # shipped: the eager path; "replay" is opt-in per call (section "CUDA-graph replay of a call" below)
 GRAPH_CAPS = (
     "none",

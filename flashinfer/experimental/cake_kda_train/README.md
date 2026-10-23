@@ -307,7 +307,8 @@ the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 The packed batch of one training step may be split over the ranks of a
 `torch.distributed` process group.  `kcp_partition` cuts the documents into
 per-rank fragments (`"contiguous"`, `"zigzag"` or `"zigzag_per_document"`
-layouts, or explicit cut points); `build_kcp_context` gives every rank the
+layouts, an explicit `fragments` table, or `cut_points` with the
+`"zigzag_per_document"` layout); `build_kcp_context` gives every rank the
 device tables of its fragments, the collectives that carry the per-document
 state recurrences and the convolution's history rows across the rank
 boundaries, and the segment plan of its fragment walks.  The per-rank entry
@@ -330,9 +331,11 @@ dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, be
                                           dout_local, saved=saved)
 ```
 
-CUDA-graph replay: every KCP entry point -- `chunk_kda_kcp`,
-`chunk_kda_kcp_fwd`, `chunk_kda_kcp_bwd` and `cake_causal_conv1d_kcp` -- takes
-`graph="replay"` (default `"off"`, the eager path). The first call of a
+CUDA-graph replay: the three KDA entry points -- `chunk_kda_kcp`,
+`chunk_kda_kcp_fwd` and `chunk_kda_kcp_bwd` -- take `graph="replay"`
+(default `"off"`, the eager path); the convolution halo takes `graph=` only
+through the backend module's function, the `cake_causal_conv1d_kcp` facade
+has no such parameter. The first call of a
 validity key runs eagerly, the second is captured into a CUDA graph and every
 later call of the key replays it: the same launches and collectives, bitwise
 the eager result, with no host work between them. The key is the call's kind,
@@ -347,8 +350,9 @@ and `LAST_CALL[kind]["graph_event"]` say what happened; a capture failure
 disables that key for the process), `exchange="ring"`, `debug_sequence` and
 calls without a caller-owned workspace are never captured. Memory: every
 cached key pins a private memory pool -- 0.7-9.0 GiB per rank per key on the
-the A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
-B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (LRU). Call
+A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
+B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (the oldest key is
+evicted). Call
 `graph_cache_clear()` (both modules) before
 `torch.distributed.destroy_process_group()` and whenever a layer's operands
 are gone for good. A replayed call keeps the tape programs at one CTA per SM:
@@ -416,14 +420,16 @@ automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
-chain cap the equal-segment wave rule, below it on one-fragment ranks the
+chain cap the equal-segment wave rule on ranks with at most three fragments,
+below it on one-fragment ranks the
 largest `P` that runs one CTA per SM (`floor(SM / H)`), on every other rank
 one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`) -- except that a rank
 with two or three fragments below the cap whose `P = 1` walks run one wave
 (`n_frag H <= SM`) takes `P = 1` when the longest-processing-time makespan of
 its actual fragment chunk counts at `P = 1` is not above the makespan at the
 occupancy `P` (such a rank runs no segment composition and no backward
-re-walk; equal two-fragment ranks tie, unequal ones keep `P > 1`);
+re-walk; at H = 64 on 152 SMs equal two-fragment ranks tie, unequal ones
+keep `P > 1`);
 `ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1_p1tie"`). The
 previous rules stay selectable through the private test knob `p_rule`, as
 does the fused form of the carry merges (`merge_fuse="carry"`: the two carry

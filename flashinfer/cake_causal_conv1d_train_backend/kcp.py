@@ -103,7 +103,7 @@ TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"  # the KCP route's private test-hook gate
 GRAPH_MODES = (
     "off",
     "replay",
-)  # graph replay: keyed CUDA-graph capture / replay of the halo calls; public keyword graph= since this revision
+)  # graph replay: keyed CUDA-graph capture / replay of the halo calls; public keyword graph= since an earlier revision
 GRAPH_DEFAULT = (
     "off"  # shipped: the eager path; the public keyword graph="replay" opts in per call
 )
