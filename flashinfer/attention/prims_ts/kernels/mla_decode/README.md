@@ -307,8 +307,10 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 - The latent/RoPE dimensions are fixed at 512/64.
 - Output is `torch.bfloat16` even when query/cache input is
   `torch.float8_e4m3fn`.
-- Only dense paged MLA cache addressing is exposed; sparse/indexed MLA,
-  sliding windows, attention sinks, and custom masks are not public features.
+- `BatchMLADecodePagedTSWrapper` exposes only dense paged MLA cache
+  addressing; sparse/indexed MLA is available through
+  `BatchSparseMLADecodePagedTSWrapper`. Sliding windows, attention sinks, and
+  custom masks are not public features of the dense wrapper.
 - Query and cache dtypes must match.
 - Automatic kernel selection is intentionally not user-selectable through the
   public wrapper.
