@@ -349,7 +349,7 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperFp8Frontend):
                 "selection_tokens must be an integer in [0, launch token count]"
             )
         c = self.config
-        shape = dict(
+        shape: Dict[str, Any] = dict(
             num_tokens=actual_tokens,
             hidden=c.hidden,
             intermediate=c.intermediate,
