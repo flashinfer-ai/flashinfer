@@ -201,7 +201,7 @@ def _worker(local_rank: int, master_port: int | None, world_size: int) -> None:
     assert not collective_support(local_rank != 0, dist.group.WORLD, device), (
         "one rank's failed initialization verdict must disable every rank"
     )
-    assert init_tp_moe_finalize_rmsnorm()
+    assert init_tp_moe_finalize_rmsnorm(backend="cute")
     assert torch.cuda.get_device_properties(device).multi_processor_count <= (
         finalize_module.NSLOT
     )
@@ -653,7 +653,7 @@ def _allocation_failure_worker(
 
         target.empty = fail
     try:
-        assert not init_tp_moe_finalize_rmsnorm()
+        assert not init_tp_moe_finalize_rmsnorm(backend="cute")
     finally:
         target.empty = original_empty
         dist.destroy_process_group()
@@ -677,7 +677,9 @@ def _path_worker(
             module._token_crossover = lambda nsm: 1
         elif path != "auto":
             module._select_path = lambda *_: path
-        assert init_tp_moe_finalize_rmsnorm()
+        # The CuTe paths are under test here (the selector and crossover are patched above); the Cake
+        # backend has its own tests below.
+        assert init_tp_moe_finalize_rmsnorm(backend="cute")
         crossover = module._token_crossover(module._WS.nsm)
         tokens = dict.fromkeys(
             n
