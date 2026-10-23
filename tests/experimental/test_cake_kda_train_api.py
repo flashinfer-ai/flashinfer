@@ -105,9 +105,14 @@ def test_entry_points_forward_every_keyword(monkeypatch: pytest.MonkeyPatch) -> 
                 "save_for_backward": False,
                 "workspace": workspace,
                 "save_mode": "tape",
+                "arena": None,
             },
         ),
-        ("bwd", (*operands, dout), {"saved": saved, "scale": 0.5, "workspace": None}),
+        (
+            "bwd",
+            (*operands, dout),
+            {"saved": saved, "scale": 0.5, "workspace": None, "arena": None},
+        ),
         (
             "autograd",
             operands,
@@ -115,8 +120,48 @@ def test_entry_points_forward_every_keyword(monkeypatch: pytest.MonkeyPatch) -> 
                 "scale": public_api.DEFAULT_SCALE,
                 "workspace": workspace,
                 "save_mode": None,
+                "arena": None,
             },
         ),
+    ]
+
+
+def test_arena_option_is_forwarded_and_the_factory_is_the_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arena = public_api.kda_train_arena(lean=True, tail_passes=4)
+    assert arena == cake_backend.KdaArena(lean=True, tail_passes=4)
+    assert public_api.kda_train_arena() == cake_backend.KdaArena()
+    assert public_api.kda_train_arena(
+        tail_passes=2
+    ).lean  # several passes imply the lean layouts
+    with pytest.raises(ValueError, match="tail_passes"):
+        public_api.kda_train_arena(tail_passes=0)
+    calls = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            calls.append((name, kwargs.get("arena")))
+            return name
+
+        return fake
+
+    monkeypatch.setattr(cake_backend, "chunk_kda_fwd", recorder("fwd"))
+    monkeypatch.setattr(cake_backend, "chunk_kda_bwd", recorder("bwd"))
+    monkeypatch.setattr(cake_backend, "chunk_kda", recorder("autograd"))
+    monkeypatch.setattr(cake_backend, "workspace_bytes", recorder("bytes"))
+    operands = tuple(object() for _ in range(6))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        public_api.chunk_kda_fwd(*operands, arena=arena)
+        public_api.chunk_kda_bwd(*operands, object(), arena=arena)
+        public_api.chunk_kda(*operands, arena=arena)
+        public_api.kda_train_workspace_bytes(1, 1, 1, sm_count=148, arena=arena)
+    assert calls == [
+        ("fwd", arena),
+        ("bwd", arena),
+        ("autograd", arena),
+        ("bytes", arena),
     ]
 
 
@@ -184,6 +229,7 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "save_for_backward",
         "workspace",
         "save_mode",
+        "arena",
     ]
     bwd = inspect.signature(public_api.chunk_kda_bwd).parameters
     assert list(bwd) == [
@@ -197,11 +243,18 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "saved",
         "scale",
         "workspace",
+        "arena",
     ]
-    for name in ("scale", "save_for_backward", "workspace", "save_mode"):
+    for name in ("scale", "save_for_backward", "workspace", "save_mode", "arena"):
         assert fwd[name].kind is inspect.Parameter.KEYWORD_ONLY
-    for name in ("saved", "scale", "workspace"):
+    for name in ("saved", "scale", "workspace", "arena"):
         assert bwd[name].kind is inspect.Parameter.KEYWORD_ONLY
+    autograd = inspect.signature(public_api.chunk_kda).parameters
+    assert list(autograd)[-4:] == ["scale", "workspace", "save_mode", "arena"]
+    factory = inspect.signature(public_api.kda_train_arena).parameters
+    assert list(factory) == ["lean", "tail_passes"] and all(
+        p.kind is inspect.Parameter.KEYWORD_ONLY for p in factory.values()
+    )
 
 
 def test_public_entries_run_the_backend() -> None:
@@ -239,5 +292,53 @@ def test_public_entries_run_the_backend() -> None:
         o.backward(dout)
         for leaf, expected in zip(
             leaves, (grads[0], grads[1], grads[2], grads[4], grads[3]), strict=True
+        ):
+            assert torch.equal(leaf.grad, expected)
+
+
+def test_public_arena_option_runs_the_backend() -> None:
+    device = _device_or_skip()
+    lengths, heads = (63, 1, 65), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device, batched=True)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    ref_out, ref_saved = cake_backend.chunk_kda_fwd(
+        q, k, v, g, beta, cu, scale=cake_backend.SCALE
+    )
+    ref_grads = cake_backend.chunk_kda_bwd(
+        q, k, v, g, beta, cu, dout, saved=ref_saved, scale=cake_backend.SCALE
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        arena = public_api.kda_train_arena(tail_passes=2)
+        ws = public_api.kda_train_workspace(S, N, heads, device, arena=arena)
+        assert ws.arena_option == arena
+        assert ws.bytes == public_api.kda_train_workspace_bytes(
+            S, N, heads, arena=arena
+        )
+        assert ws.bytes < public_api.kda_train_workspace_bytes(S, N, heads)
+        out, saved = public_api.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
+        assert torch.equal(out, ref_out)
+        grads = public_api.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
+        )
+        for mine, theirs in zip(grads, ref_grads, strict=True):
+            assert torch.equal(mine, theirs)
+        grads = public_api.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, arena=arena
+        )
+        for mine, theirs in zip(grads, ref_grads, strict=True):
+            assert torch.equal(mine, theirs)
+        with pytest.raises(ValueError, match="lean=False"):
+            public_api.chunk_kda_bwd(q, k, v, g, beta, cu, dout, workspace=ws)
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
+        o = public_api.chunk_kda(*leaves, cu, arena=arena)
+        o.backward(dout)
+        for leaf, expected in zip(
+            leaves,
+            (ref_grads[0], ref_grads[1], ref_grads[2], ref_grads[4], ref_grads[3]),
+            strict=True,
         ):
             assert torch.equal(leaf.grad, expected)
