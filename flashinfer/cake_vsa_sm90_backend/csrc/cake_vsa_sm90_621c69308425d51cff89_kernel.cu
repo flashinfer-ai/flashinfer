@@ -47,7 +47,7 @@ struct CakeParamArray {
 };
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
+#define NUM_MAIN_1_STAGES 1
 #define SMEM_MSTATS_OFF 148480
 #define SMEM_MSTATS_STAGE_BYTES 1024
 #define SMEM_MSTATS_STRIDE 1024
@@ -244,7 +244,7 @@ kernel_cake_vsa_sm90_621c69308425d51cff89(const __grid_constant__ CUtensorMap Q,
         }
     }
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int item = bid;
     int mb = seqlen_q / 64;
     int plan_base = item * 5;
