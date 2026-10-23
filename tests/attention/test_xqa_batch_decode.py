@@ -638,7 +638,7 @@ def generate_causal_mask(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
 )
-def test_batch_decode_tensor_cores_mtp_uses_xqa_decode_path():
+def test_batch_decode_tensor_cores_mtp_preserves_fallback():
     batch_size = 4
     q_len_per_req = 2
     page_size = 16
@@ -706,7 +706,7 @@ def test_batch_decode_tensor_cores_mtp_uses_xqa_decode_path():
         block_tables=page_table,
         q_len_per_req=q_len_per_req,
     )
-    assert wrapper._use_xqa_mtp_decode
+    assert not wrapper._use_xqa_mtp_decode
 
     output_wrapper = wrapper.run(q, kv_cache)
 
@@ -736,8 +736,7 @@ def test_batch_decode_tensor_cores_mtp_uses_xqa_decode_path():
         kv_data_type=torch.bfloat16,
         q_len_per_req=q_len_per_req,
     )
-    assert wrapper_implicit._use_xqa_mtp_decode
-    torch.testing.assert_close(wrapper_implicit._block_tables, page_table)
+    assert not wrapper_implicit._use_xqa_mtp_decode
 
     output_wrapper_implicit = wrapper_implicit.run(q, kv_cache)
 
