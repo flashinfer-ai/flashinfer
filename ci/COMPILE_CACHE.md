@@ -49,11 +49,13 @@ As with the existing process-local compiler cache, dependencies must not be
 replaced inside a live Python process. Unversioned edits to external editable
 dependencies are not captured by wheel metadata.
 
-Strict source hashing follows static imports, resolvable literal dynamic
-imports, and explicit package exports. It hashes implicit parent initializers
-without following all their public reexports. Nonliteral imports and runtime
-file reads remain the caller's responsibility through `extra_key_files`; this
-is not a general Python dependency analyzer.
+Strict source hashing follows static imports and resolvable literal dynamic
+imports. Package initializers are resolved per name a kernel looks up, so a
+re-export leads to its source rather than to everything the package exports;
+their import-time code is keyed, while an added re-export or `__all__` entry
+is not. Import-time side effects of modules no keyed code imports or uses,
+nonliteral imports, and runtime file reads are not covered: list the latter
+through `extra_key_files`. This is not a general Python dependency analyzer.
 
 ## Validation and measurement
 

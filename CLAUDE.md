@@ -629,12 +629,18 @@ kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`. The SHA256 covers only the files a caller
 passes as `extra_key_files` (often just `__file__`); with
 `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` it also covers every flashinfer module
-those files transitively import, including parent initializer bytes and literal
-`importlib.import_module` calls. Implicit initializer reexports are not traversed;
-explicit package exports are followed when they can shadow a submodule.
+those files can run. Plain modules are keyed by content with everything they
+import, including literal `importlib.import_module` calls. Package initializers
+are resolved name by name: a name looked up in a package follows the binding
+that defines it (a re-export to its source, a function into its body, a module
+through the attributes read from it) plus the submodule of that name. The code
+an initializer runs at import is followed for every keyed file in its package.
+Each initializer is keyed by that code and the import lines of used names, so a
+new re-export or `__all__` entry invalidates nothing. Not keyed: import-time
+side effects of modules that keyed code neither imports nor uses, nonliteral
+dynamic imports, and runtime file reads; list the latter in `extra_key_files`.
 `version.py` and `_build_meta.py` are excluded to avoid keying on the checkout
-commit. Nonliteral dynamic imports and runtime file reads still require explicit
-`extra_key_files`. This is intended for long-lived caches shared across commits.
+commit. This is intended for long-lived caches shared across commits.
 Task-scheduled attention shares this cache through
 `flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
 options, and embedded device-capacity constants. It hashes the attention source

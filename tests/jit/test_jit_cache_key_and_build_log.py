@@ -59,11 +59,9 @@ def fake_package(tmp_path, monkeypatch):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     monkeypatch.setattr(cute_dsl_core, "_PACKAGE_DIR", pkg.resolve())
-    cute_dsl_core._direct_package_imports.cache_clear()
-    cute_dsl_core._package_import_closure.cache_clear()
+    cute_dsl_core._import_closure.cache_clear()
     yield pkg.resolve()
-    cute_dsl_core._direct_package_imports.cache_clear()
-    cute_dsl_core._package_import_closure.cache_clear()
+    cute_dsl_core._import_closure.cache_clear()
 
 
 def test_import_closure_follows_helpers_but_not_unkeyed_files(fake_package):
@@ -191,8 +189,7 @@ def test_strict_key_tracks_imported_helpers(fake_package, monkeypatch):
     strict_before = cute_dsl_core._hash_source_files((kernel,))
 
     helper.write_text("SCALE = 3\n")
-    cute_dsl_core._direct_package_imports.cache_clear()
-    cute_dsl_core._package_import_closure.cache_clear()
+    cute_dsl_core._import_closure.cache_clear()
 
     assert cute_dsl_core._hash_source_files((kernel,)) != strict_before
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY")
