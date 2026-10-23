@@ -8,9 +8,8 @@ GEMM through split-BF16x3 tensor-core emulation with chunked FP32 promotion
 
 Both the API and the backend are experimental: no compatibility guarantee.
 SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) is built
-from the same sources; the SM103 (B300 / GB300) programs of the measured
-`sm_103a` rules register with their export (`cake_jit.KERNELS` lists the
-registered architectures).  A device whose architecture the registry does not
+from the same sources; SM103 (B300 / GB300) ships its own builds of the
+same programs (`cake_jit.KERNELS` lists the registered architectures).  A device whose architecture the registry does not
 list raises `NotImplementedError` naming the missing instance.  The feature has
 no core entry point yet (importing this package is
 the explicit opt-in) and does not participate in automatic backend selection,
@@ -232,10 +231,9 @@ one program per template, shared by `sm_100a` and `sm_107a` wherever the generat
 template lists are `KERNELS` in `cake_jit.py`; `K1_TEMPLATES` of the exporter
 is the source of truth and is regenerated whenever `ROW_RULES` resolve a new
 instance).  `build.json` ships the builds of the architectures `cake_jit.KERNELS`
-lists (`sm_100a` and `sm_107a`; the `sm_103a` programs of the measured rules
-register with their export, together with the programs the shapes tranche and
-its round 2 name on `sm_100a` -- until then those rows run the nearest
-generated program through the registry fallback).  An entry point raises
+lists (`sm_100a`, `sm_103a` and `sm_107a`); every program the measured
+`sm_100a` / `sm_103a` rules name is registered, so the registry fallback only
+serves a caller that forces a template no export generated.  An entry point raises
 `NotImplementedError` naming the missing instance for a template that no
 export has generated and for every template on a device whose architecture the
 registry does not list.
