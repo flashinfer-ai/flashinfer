@@ -114,8 +114,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 }
 
 __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
-    const unsigned int w = *reinterpret_cast<const unsigned int*>(&v);
-    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+    return __bfloat1622float2(v);
 }
 
 extern "C" {

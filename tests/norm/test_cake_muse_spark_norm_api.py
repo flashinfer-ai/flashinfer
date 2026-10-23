@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = Path(pkg.__file__).parent
 OP = pkg.GATED_RESIDUAL_NEXT_RMSNORM
 OP_A = "gated_residual_rmsnorm"
+OP_C = "rmsnorm_sigmoid_gate"
 BLACKWELL = ("sm_100a", "sm_103a")
 # The kernel parameters of each operator's programs, in binding order (the grid triple follows).
 PARAMETERS = {
@@ -51,12 +52,76 @@ PARAMETERS = {
         "eps",
         "gain_center",
     ),
+    OP_C: ("x", "gate", "tokens", "heads", "x_stride", "gate_stride", "eps"),
+}
+# The logical names of op C's parameters (ops A and B map every parameter to itself but ``M`` -> ``rows``).
+LOGICAL_C = {
+    "x": "input",
+    "gate": "gate",
+    "tokens": "tokens",
+    "heads": "heads",
+    "x_stride": "input_stride",
+    "gate_stride": "gate_stride",
+    "eps": "eps",
 }
 # The variants with exported programs: three of op B's four forms (the fourth runs through the post_weight
 # programs), both modes of op A in the plain and the PDL build.
 SHIPPED_VARIANTS = {
     OP: ("alpha_tensor_pw", "alpha_scalar_nopw", "alpha_scalar_pw"),
     OP_A: ("mode0", "mode0_pdl", "mode1", "mode1_pdl"),
+    OP_C: ("bf16",),
+}
+# Op C's windows of record per head count: (heads, above, at_most) -> the selecting build keywords.
+OP_C_WINDOWS = {
+    (128, 0, 8): {
+        "threads": 256,
+        "lanes": 32,
+        "cluster": 16,
+        "tcluster": 1,
+        "order": "tokens",
+    },
+    (128, 8, 256): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 16,
+        "order": "tokens",
+    },
+    (128, 256, None): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "heads",
+    },
+    (32, 0, 1024): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 16,
+        "order": "tokens",
+    },
+    (32, 1024, None): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "tokens",
+    },
+    (16, 0, 1024): {
+        "threads": 128,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 16,
+        "order": "tokens",
+    },
+    (16, 1024, None): {
+        "threads": 128,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "tokens",
+    },
 }
 FAMILY_FLAGS = ("--prec-div=true", "--prec-sqrt=true", "--ftz=false")
 NAME = re.compile(r"cake_muse_spark_norm_[0-9a-f]{20}")
@@ -67,7 +132,23 @@ def _variant(op: str, build: dict) -> str:
         return pkg.gated_residual_next_rmsnorm_variant(
             build["tensor_alpha"], build["post_weight"]
         )
+    if op == OP_C:
+        return "bf16"
     return f"mode{build['mode']}" + ("_pdl" if build["pdl"] else "")
+
+
+def _cluster_dims(build: dict) -> tuple:
+    """The launch cluster of a build: the cluster over one row's CTAs, or op C's token-axis cluster
+    (``(1, tcluster, 1)`` under the head-major order)."""
+    if build["cluster"] > 1 or "tcluster" not in build:
+        return (build["cluster"], 1, 1)
+    if build["tcluster"] <= 1:
+        return (1, 1, 1)
+    return (
+        (1, build["tcluster"], 1)
+        if build["order"] == "heads"
+        else (build["tcluster"], 1, 1)
+    )
 
 
 def test_variant_and_route_helpers():
@@ -94,8 +175,13 @@ def test_variant_and_route_helpers():
     assert loader.arch_for_capability((10,)) is None
     assert tuple(loader.ARCHES) == ("sm_100a", "sm_103a", "sm_107a")
     assert set(loader.ARCH_BY_CAPABILITY.values()) == set(loader.ARCHES)
-    assert tuple(loader.OPS) == (OP, OP_A)
+    assert tuple(loader.OPS) == (OP, OP_A, OP_C)
     assert loader.route_key(OP_A, "mode1_pdl") == f"{OP_A}_mode1_pdl"
+    assert loader.route_key(OP_C, "bf16") == f"{OP_C}_bf16"
+    assert loader.SELECT_KINDS == (loader.SELECT_KIND, "tokens_heads_between")
+    assert loader.GRID_KINDS == ("rows", "persistent_rows", "tokens_heads")
+    with pytest.raises(ValueError, match="unknown variant"):
+        loader.route_key(OP_C, "fp8")
     with pytest.raises(ValueError, match="unknown variant"):
         loader.route_key(OP_A, "mode2")
     for op in loader.OPS:
@@ -151,13 +237,14 @@ def test_registry_records_reference_the_build_manifest():
         arches = tuple(record["arches"])
         assert arches and set(arches) <= set(BLACKWELL), name
         build = record["build"]
-        assert build["H"] == pkg.HIDDEN_SIZE
+        if op != OP_C:
+            assert build["H"] == pkg.HIDDEN_SIZE
         variant = _variant(op, build)
         assert variant in SHIPPED_VARIANTS[op], name
         assert record["route"] == loader.route_key(op, variant)
         launch = record["launch"]
         assert tuple(launch["block"]) == (build["threads"], 1, 1)
-        assert tuple(launch["cluster"]) == (build["cluster"], 1, 1)
+        assert tuple(launch["cluster"]) == _cluster_dims(build)
         assert launch["cooperative"] is False
         assert launch["use_pdl"] is build["pdl"]
         if op == OP:
@@ -170,10 +257,24 @@ def test_registry_records_reference_the_build_manifest():
         )
         rule = record["grid_rule"]
         assert rule["cluster"] == build["cluster"]
-        assert rule["kind"] == ("persistent_rows" if build["persistent"] else "rows")
+        if op == OP_C:
+            assert rule["kind"] == "tokens_heads"
+            assert rule["rows_per_cta"] == (
+                build["threads"] // build["lanes"] * build["rows_per_thread"]
+            )
+            assert rule["tcluster"] == build["tcluster"]
+            assert rule["order"] == build["order"]
+            assert rule["interleave"] == build["interleave"]
+            assert build["tail"] == "none"
+        else:
+            assert rule["kind"] == (
+                "persistent_rows" if build["persistent"] else "rows"
+            )
         assert rule["kind"] in loader.GRID_KINDS
         select = record["select_rule"]
-        assert select["kind"] == loader.SELECT_KIND
+        assert select["kind"] == (
+            loader.SELECT_KINDS[1] if op == OP_C else loader.SELECT_KIND
+        )
         assert set(select["windows"]) == set(arches)
         parameters = [key for kind, key in record["arg_plan"] if kind != "grid"]
         assert tuple(parameters) == PARAMETERS[op]
@@ -182,9 +283,11 @@ def test_registry_records_reference_the_build_manifest():
             "grid_y",
             "grid_z",
         ]
-        assert record["logical"] == {
-            key: ("rows" if key == "M" else key) for key in PARAMETERS[op]
-        }
+        assert record["logical"] == (
+            LOGICAL_C
+            if op == OP_C
+            else {key: ("rows" if key == "M" else key) for key in PARAMETERS[op]}
+        )
         logical_values |= set(record["logical"].values())
         for arch in arches:
             library = loader.library_name(name, arch)
@@ -231,27 +334,42 @@ def test_routes_partition_the_row_counts():
                 if record["route"] == route and arch in record["arches"]
             }
             assert set(names) == owners
-            windows = sorted(
-                (int(above), at_most, name)
-                for name in names
-                for above, at_most in loader.MODULES[name]["select_rule"]["windows"][
-                    arch
-                ]
+            keyed = (
+                loader.MODULES[names[0]]["select_rule"]["kind"]
+                == "tokens_heads_between"
             )
-            assert windows[0][0] == 0
-            assert [w[1] for w in windows[:-1]] == [w[0] for w in windows[1:]]
-            assert windows[-1][1] is None and all(
-                w[1] is not None for w in windows[:-1]
-            )
-            top = windows[-1][0] + 2
-            for rows in range(1, top + 1):
-                (owner,) = [
-                    name
-                    for above, at_most, name in windows
-                    if above < rows <= (at_most or rows)
-                ]
-                assert loader.selected_module(arch, route, rows) == owner
-            assert loader.selected_module(arch, route, 10**6) == windows[-1][2]
+            classes: dict = {}
+            for name in names:
+                for window in loader.MODULES[name]["select_rule"]["windows"][arch]:
+                    *head, above, at_most = window
+                    assert len(head) == (1 if keyed else 0)
+                    classes.setdefault(head[0] if head else None, []).append(
+                        (int(above), at_most, name)
+                    )
+            assert set(classes) == ({128, 32, 16} if keyed else {None})
+            for heads, windows in classes.items():
+                windows.sort()
+                assert windows[0][0] == 0
+                assert [w[1] for w in windows[:-1]] == [w[0] for w in windows[1:]]
+                assert windows[-1][1] is None and all(
+                    w[1] is not None for w in windows[:-1]
+                )
+                top = windows[-1][0] + 2
+                for rows in range(1, top + 1):
+                    (owner,) = [
+                        name
+                        for above, at_most, name in windows
+                        if above < rows <= (at_most or rows)
+                    ]
+                    assert loader.selected_module(arch, route, rows, heads) == owner
+                assert (
+                    loader.selected_module(arch, route, 10**6, heads) == windows[-1][2]
+                )
+            if keyed:
+                with pytest.raises(ValueError, match="needs the head count"):
+                    loader.selected_module(arch, route, 1)
+                with pytest.raises(NotImplementedError, match="of 64 heads"):
+                    loader.selected_module(arch, route, 1, 64)
     assert not loader.route_available(
         "sm_107a", loader.route_key(OP, "alpha_tensor_pw")
     )
@@ -270,6 +388,85 @@ def test_routes_partition_the_row_counts():
     assert not loader.admits(rule, 1, "sm_103a")
     with pytest.raises(ValueError, match="unknown Cake norm select rule"):
         loader.admits({"kind": "always"}, 1, "sm_100a")
+    keyed = {
+        "kind": "tokens_heads_between",
+        "windows": {"sm_100a": [[128, 0, 8], [32, 1024, None]]},
+    }
+    assert [
+        r for r in (1, 8, 9, 1024, 1025) if loader.admits(keyed, r, "sm_100a", 128)
+    ] == [1, 8]
+    assert [
+        r for r in (1, 8, 9, 1024, 1025) if loader.admits(keyed, r, "sm_100a", 32)
+    ] == [1025]
+    assert not loader.admits(keyed, 1, "sm_100a", 16)
+    assert not loader.admits(keyed, 1, "sm_103a", 128)
+    with pytest.raises(ValueError, match="needs the head count"):
+        loader.admits(keyed, 1, "sm_100a")
+
+
+def test_rmsnorm_sigmoid_gate_routes_window_the_token_count_per_head_count():
+    """Op C's one route per architecture holds six programs over seven windows: three head counts (128 / 32 / 16),
+    each partitioning the token counts, the 16-CTA token-cluster program shared by the 128-head mid band and the
+    32-head band; the launch cluster follows the build (a cluster over the head blocks, a token-axis cluster, or
+    none) and the grid is the kernel's two-dimensional one."""
+    for arch in BLACKWELL:
+        route = loader.route_key(OP_C, "bf16")
+        names = loader.route_modules(arch, route)
+        assert len(names) == 6, (arch, route)
+        windows = {}
+        for name in names:
+            record = loader.MODULES[name]
+            for heads, above, at_most in record["select_rule"]["windows"][arch]:
+                windows[(heads, above, at_most)] = name
+        assert set(windows) == set(OP_C_WINDOWS)
+        for key, selecting in OP_C_WINDOWS.items():
+            record = loader.MODULES[windows[key]]
+            build = record["build"]
+            assert {k: build[k] for k in selecting} == selecting, key
+            assert build["tail"] == "none" and build["pdl"] is False
+            assert tuple(record["launch"]["cluster"]) == _cluster_dims(build), key
+            assert key[0] % record["grid_rule"]["rows_per_cta"] == 0, key
+        for heads, tokens, key in (
+            (128, 1, (128, 0, 8)),
+            (128, 8, (128, 0, 8)),
+            (128, 9, (128, 8, 256)),
+            (128, 256, (128, 8, 256)),
+            (128, 257, (128, 256, None)),
+            (128, 16384, (128, 256, None)),
+            (32, 1, (32, 0, 1024)),
+            (32, 1024, (32, 0, 1024)),
+            (32, 1025, (32, 1024, None)),
+            (16, 1024, (16, 0, 1024)),
+            (16, 1025, (16, 1024, None)),
+        ):
+            assert loader.selected_module(arch, route, tokens, heads) == windows[key]
+        assert windows[(128, 8, 256)] == windows[(32, 0, 1024)]
+        assert windows[(32, 1024, None)] != windows[(128, 256, None)]
+    cluster = loader.MODULES[windows[(128, 0, 8)]]
+    assert loader.launch_grid(cluster, 3, device_index=0, values={"heads": 128}) == (
+        16,
+        3,
+        1,
+    )
+    token_cluster = loader.MODULES[windows[(128, 8, 256)]]
+    assert loader.launch_grid(
+        token_cluster, 9, device_index=0, values={"heads": 128}
+    ) == (16, 4, 1)
+    assert loader.launch_grid(
+        token_cluster, 1024, device_index=0, values={"heads": 32}
+    ) == (1024, 1, 1)
+    head_major = loader.MODULES[windows[(128, 256, None)]]
+    assert loader.launch_grid(
+        head_major, 1024, device_index=0, values={"heads": 128}
+    ) == (4, 1024, 1)
+    plain = loader.MODULES[windows[(16, 1024, None)]]
+    assert loader.launch_grid(plain, 4096, device_index=0, values={"heads": 16}) == (
+        4096,
+        1,
+        1,
+    )
+    with pytest.raises(ValueError, match="must carry 'heads'"):
+        loader.launch_grid(plain, 4096, device_index=0)
 
 
 def test_gated_residual_rmsnorm_routes_window_the_row_count():
@@ -335,6 +532,25 @@ def test_launch_grid_and_args_follow_the_record(monkeypatch):
         )
     plain = {"library": "x", "grid_rule": {"kind": "rows", "cluster": 4}}
     assert loader.launch_grid(plain, 10, device_index=0) == (40, 1, 1)
+    two_d = {
+        "library": "x",
+        "grid_rule": {
+            "kind": "tokens_heads",
+            "cluster": 1,
+            "tcluster": 16,
+            "order": "tokens",
+            "interleave": 1,
+            "rows_per_cta": 32,
+        },
+    }
+    assert loader.launch_grid(two_d, 9, device_index=0, values={"heads": 128}) == (
+        16,
+        4,
+        1,
+    )
+    assert loader.tokens_heads_grid(two_d["grid_rule"], 9, 128) == (16, 4, 1)
+    with pytest.raises(ValueError, match="positive counts"):
+        loader.tokens_heads_grid(two_d["grid_rule"], 0, 128)
     with pytest.raises(ValueError, match="positive row count"):
         loader.launch_grid(plain, 0, device_index=0)
     with pytest.raises(ValueError, match="unknown Cake norm grid rule"):
