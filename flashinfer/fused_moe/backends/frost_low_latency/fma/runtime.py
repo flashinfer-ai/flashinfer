@@ -15,6 +15,7 @@ from cuda.bindings import driver
 
 from .mxfp8.fma_fc1 import _kernel as fc1
 from .mxfp8.fma_fc2 import _kernel as fc2
+from .activation_config import lower_activation
 
 
 @cute.jit
@@ -30,6 +31,9 @@ def gate_up(
     limit: cutlass.Constexpr,
     alpha: cutlass.Constexpr,
     beta: cutlass.Constexpr,
+    activation: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
+    parameters: cutlass.Constexpr,
     stream,
 ):
     # The alpha tensor argument belongs to the legacy contract and is pruned
@@ -43,13 +47,14 @@ def gate_up(
         ids,
         mid,
         msf,
-        "swiglu",
-        True,
+        activation,
+        gated,
         True,
         logical,
         limit,
         alpha,
         beta,
+        parameters,
     ).launch(grid=(cute.size(mid) // 32, 1, 1), block=(256, 1, 1), stream=stream)
 
 
@@ -88,6 +93,7 @@ def execute(inputs, config):
     # allocation, weight packing, or GPU conversion is needed to switch tactic.
     msf = sf_storage[: t * k * (p // 32)].view(t * k, p // 32)
     a = config.activation
+    name, parameters = lower_activation(a)
     finalize = config.finalize.do_finalize
     key = (
         "ffma-v1",
@@ -97,9 +103,7 @@ def execute(inputs, config):
         config.routing.num_experts,
         k,
         config.experts.intermediate_size,
-        a.limit,
-        a.alpha,
-        a.beta,
+        a,
         w1.dtype,
         scores.dtype,
         narrow,
@@ -113,7 +117,15 @@ def execute(inputs, config):
             from_dlpack(v)
             for v in (mid, msf, w2, s2, ids, scores, output if finalize else routes)
         )
-        first += (config.experts.intermediate_size, a.limit, a.alpha, a.beta)
+        first += (
+            config.experts.intermediate_size,
+            getattr(a, "limit", None),
+            getattr(a, "alpha", 1.0),
+            getattr(a, "beta", 0.0),
+            name,
+            a.is_gated,
+            parameters,
+        )
         second += (narrow, finalize)
         compiled = _COMPILED.get(key)
         if compiled is None:

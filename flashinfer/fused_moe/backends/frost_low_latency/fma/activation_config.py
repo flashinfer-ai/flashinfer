@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Import-light BF16 activation lowering; scalar semantics are not tactics."""
+"""Import-light activation lowering; scalar semantics are not tactics."""
 
 from ....api import (
     GELU,
@@ -33,9 +33,7 @@ def lower_activation(activation):
     try:
         name = ACTIVATIONS[type(activation)]
     except KeyError:
-        raise NotImplementedError(
-            f"Frost BF16 does not support {activation!r}"
-        ) from None
+        raise NotImplementedError(f"Frost does not support {activation!r}") from None
     if activation == type(activation)():
         # Keep the exact legacy device specialization for default semantics.
         return name, None
@@ -44,5 +42,5 @@ def lower_activation(activation):
     if isinstance(activation, SwiGLUStep):
         return name, (activation.limit,)
     raise NotImplementedError(
-        f"Frost BF16 requires default parameters for {type(activation).__name__}"
+        f"Frost requires default parameters for {type(activation).__name__}"
     )
