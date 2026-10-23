@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import typing
 import math
 import operator
 import os
@@ -46,7 +45,6 @@ from .gdn_kernels import (
     cp_delta_rule_dsl_sm100,
     cp_delta_rule_dsl_sm120,
 )
-from .gdn_kernels.delta_rule_dsl import delta_rule_prefill_pipeline32
 from .gdn_kernels.delta_rule_dsl.varlen_helper import (
     is_integer_dtype,
     should_use_cp_host,
@@ -1034,7 +1032,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
-    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
+    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"] = "auto",
     max_seqlen: Optional[int] = None,
     *,
     gate_domain: Literal["linear", "log"] = "linear",
@@ -1277,15 +1275,15 @@ def chunk_gated_delta_rule(
 
     Notes
     -----
+    - ``backend="sm120_cute"`` explicitly selects the experimental RTX 6000D
+      SM120 D=128 CuTe implementation. Fast calls require native finite FP32
+      log gates (``gate_domain="log"``), FP32 beta/state and matching immutable
+      ``cu_seqlens_cpu`` metadata. Unsupported calls, including checkpoints,
+      state pools, linear/raw gates and low-precision state, use FlashInfer's
+      official implementation. Stable automatic dispatch never selects it.
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - ``FLASHINFER_GDN_SM120_PIPELINE32=1`` opts the non-CP SM120 DSL path
-      into 32-token chunks. Use ``backend="flashinfer", use_cp=False`` to
-      select that path explicitly. It requires D=128, contiguous FP16/BF16
-      Q/K/V and FP32 state. Q/K normalization is applied before dispatch.
-      State pools, other SM12x capabilities and unavailable p32 kernels keep
-      the official route. Default dispatch and CP implementations are unchanged.
     - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
       path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
       structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
@@ -1295,8 +1293,40 @@ def chunk_gated_delta_rule(
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
     """
-    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
+    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend == "sm120_cute":
+        from .api_logging import warn_experimental_backend_once
+        from .experimental.gdn_sm120_cute import run
+
+        warn_experimental_backend_once("chunk_gated_delta_rule", "sm120_cute")
+        return run(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            use_cp=use_cp,
+            state_indices=state_indices,
+            _cp_chunk_len=_cp_chunk_len,
+            max_seqlen=max_seqlen,
+            gate_domain=gate_domain,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            beta_is_logit=beta_is_logit,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+        )
     if backend != "cudnn" and (
         gate_domain != "linear"
         or use_gate_in_kernel
@@ -1847,21 +1877,7 @@ def chunk_gated_delta_rule(
             output_state = torch.empty(
                 output_state_shape, dtype=torch.float32, device=device
             )
-        from .gdn_kernels.delta_rule_dsl.sm120_pipeline32_dispatch import (
-            sm120_pipeline32_prefill_enabled,
-        )
-
-        sm120_prefill: Callable[..., typing.Any] = chunk_gated_delta_rule_sm120
-        sm120_kwargs = {"state_indices": state_indices}
-        if (
-            sm120_pipeline32_prefill_enabled()
-            and _device_capability == (12, 0)
-            and state_indices is None
-            and delta_rule_prefill_pipeline32 is not None
-        ):
-            sm120_prefill = delta_rule_prefill_pipeline32
-            sm120_kwargs = {}
-        sm120_prefill(
+        chunk_gated_delta_rule_sm120(
             output,
             output_state,
             q,
@@ -1875,7 +1891,7 @@ def chunk_gated_delta_rule(
             state_checkpoints,
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
-            **sm120_kwargs,
+            state_indices=state_indices,
         )
     elif _arch_major == 9:
         # SM90 Hopper path (CuTe DSL kernel)
