@@ -2218,7 +2218,15 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     assert cake_kcp.KCP_SAVED_VERSION == 2
     fields = cake_kcp.KcpSaved.__dataclass_fields__
     assert "Aqk" not in fields and "Akk" not in fields
-    assert cake_kcp.KcpSaved._OPTIONAL == ("c1_recv", "M_seg")
+    assert cake_kcp.KcpSaved._OPTIONAL == ("c1_recv", "M_seg", "carry")
+    assert cake_kcp.KcpSaved.__dataclass_fields__["carry"].default is None
+    assert kp.kcp_saved_bytes(ctx) == kp.kcp_saved_bytes(
+        ctx, saved_carry=False
+    )  # the test knob's shipped default adds no term
+    assert (
+        kp.kcp_saved_bytes(ctx, saved_carry=True) - kp.kcp_saved_bytes(ctx)
+        == (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
+    )  # the whole carry plane of the P > 1 rank (fused walks: one extra slot per crossing fragment)
     assert (
         kp.kcp_saved_bytes(ctx, save_transfer=False, with_conv=False)
         == base - ctx.halo.n_hist_rows * 8192 * 2
@@ -2465,6 +2473,73 @@ def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
             cake_kcp._options({"_kcp_test_knobs": bad})
     with pytest.raises(TypeError):
         cake_kcp._options({"host_trim": 0})
+
+
+def test_saved_carry_knob_is_gated_and_validated(monkeypatch) -> None:
+    """``saved_carry`` is a private test knob: refused without ``CAKE_KCP_TEST_KNOBS=1``, never a public keyword,
+    validated against :data:`SAVED_CARRIES`; the shipped default is 0 (the saved-mode backward of a ``P > 1`` rank
+    re-walks the forward carries), 1 keeps the forward's carry plane in the saved set (``KcpSaved.carry``, an
+    optional tensor that travels through ``tensors()`` / ``flags()`` / ``from_tensors`` like the other two)."""
+    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    assert cake_kcp.SAVED_CARRY_DEFAULT == 0 and cake_kcp.SAVED_CARRIES == (0, 1)
+    assert cake_kcp.P2_KNOBS["saved_carry"] == cake_kcp.SAVED_CARRIES
+    assert cake_kcp._options({}).saved_carry == 0
+    assert "saved_carry" not in cake_kcp._OPTION_KEYS
+    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+        cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 1}})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"saved_carry": 1})
+    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 1}}).saved_carry == 1
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 0}}).saved_carry == 0
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": "1"}}).saved_carry == 1
+    o = cake_kcp._options(
+        {"_kcp_test_knobs": {"saved_carry": 1, "host_trim": 1, "fused_walks": 1}}
+    )
+    assert (o.saved_carry, o.host_trim, o.fused_walks) == (1, 1, 1)
+    for bad in ({"saved_carry": 2}, {"saved_carry": -1}):
+        with pytest.raises(ValueError):
+            cake_kcp._options({"_kcp_test_knobs": bad})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"saved_carry": 0})
+    # the saved set with and without the plane: flags / tensors / from_tensors round trip
+    meta = dict(
+        version=cake_kcp.KCP_SAVED_VERSION,
+        T_r=8,
+        H=4,
+        n_frag=1,
+        P=2,
+        Hg=4,
+        scale=0.5,
+        save_mode="light",
+        save_transfer=True,
+        offset_class="fla",
+        exchange="a2a",
+        precision_mode=0,
+        transfer_walk="tf32_hilo",
+    )
+    s_in, c1, m_seg, plane = (
+        torch.zeros(n, dtype=torch.float32) for n in (3, 5, 7, 11)
+    )
+    with_plane = cake_kcp.KcpSaved(
+        S_in=s_in, c1_recv=c1, M_seg=m_seg, carry=plane, ctx=None, **meta
+    )
+    without = cake_kcp.KcpSaved(S_in=s_in, c1_recv=c1, M_seg=m_seg, ctx=None, **meta)
+    assert without.carry is None and without.flags() == (True, True, False)
+    assert with_plane.flags() == (True, True, True)
+    assert [t.numel() for t in without.tensors()] == [3, 5, 7]
+    assert [t.numel() for t in with_plane.tensors()] == [3, 5, 7, 11]
+    assert with_plane.bytes - without.bytes == 11 * 4
+    for saved in (without, with_plane):
+        back = cake_kcp.KcpSaved.from_tensors(
+            saved.tensors(), saved.flags(), saved.meta(), None
+        )
+        assert back.flags() == saved.flags() and back.meta() == saved.meta()
+        assert (back.carry is None) == (saved.carry is None)
+        assert back.carry is None or back.carry is plane
+    assert (
+        "saved_carry" not in with_plane.meta()
+    )  # the plane's presence travels as a flag, not as metadata
 
 
 def test_ring_exchange_resolves_save_transfer() -> None:

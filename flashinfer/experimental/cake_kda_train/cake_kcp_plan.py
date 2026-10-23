@@ -2011,6 +2011,7 @@ def kcp_saved_bytes(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     with_conv: bool = True,
     C: int = 8192,
+    saved_carry: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
@@ -2018,11 +2019,14 @@ def kcp_saved_bytes(
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
     + [save_transfer] * N_out * 2 * s * Hg_r / H               # the owner's whole c1 receive tensor
     + [save_transfer] * [P > 1] * NSEG * s                     # M_seg of the segmented fragments (home rank)
+    + [saved_carry] * [P > 1] * (n_frag * (P - 1) + max(n_in, n_out)) * s   # the forward's carry plane (test knob)
     + [with_conv] * sum_cont hist_valid * C * 2                # the hist row pool (BF16)
     save_mode="tape": + NC_pad * H * 32768 + R * H * 256       # the forward's h tape and v_new
 
     ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since an earlier revision);
     the two ``[save_transfer]`` terms are the delta against the earlier recompute form (``save_transfer=False``).
+    ``saved_carry`` (default ``False`` = the shipped default of the test knob ``saved_carry``) adds the whole carry
+    plane of a ``P > 1`` rank under the shipped fused tape walks (one extra slot per crossing fragment).
 
     The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
     recomputes the internal rows in both modes.
@@ -2042,6 +2046,8 @@ def kcp_saved_bytes(
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
         if hp.P > 1:
             total += hp.NSEG * s
+    if saved_carry and hp.P > 1:
+        total += (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
     if with_conv:
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":
