@@ -784,7 +784,7 @@ def test_nvlink_one_sided(case: Case) -> None:
 def test_workspace_layout(cft: bool) -> None:
     """Regions are disjoint, aligned and fixed by the allocation-time capacities."""
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.kernels import (
-        get_nvlink_one_sided_module,
+        get_nvlink_one_sided_alltoall_module,
         layout_constants,
     )
 
@@ -794,7 +794,7 @@ def test_workspace_layout(cft: bool) -> None:
     combine_input_bytes = ep_size * capacity * hidden * 2
     combine_recv_bytes = ep_size * capacity * hidden if cft else 0
     layout = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
-    get_nvlink_one_sided_module().moe_a2a_get_workspace_layout(
+    get_nvlink_one_sided_alltoall_module().moe_a2a_get_workspace_layout(
         ep_size,
         capacity,
         top_k,

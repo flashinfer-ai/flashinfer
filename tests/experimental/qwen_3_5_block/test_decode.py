@@ -1,0 +1,726 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""The DECODE form against the fp32 oracle: the two Qwen3.5 TP-1 shard geometries, q_len 1 and 4, a short / a long / a padded
+sequence, both FlashInfer cache layouts, the functional entry point and the wrapper; the routed cells of the vendored decode
+levers (the 64-column tile in one token unit at q_len 3 / 4, two token units at q_len 8, the unpacked tile at q_len 32, the paged
+prefill route of a part-filling batch), the lowered small-M decode chain against its fused-fork control arm, the ``(k, v)`` pair
+at page 64 / 128, the explicit split and the unsplit tile (the gate as its own launch), the separate cache-write launch (the
+explicit control), the default decode chain -- programmatic dependent launch on, the write-through folded into the norm + RoPE
+launch -- bitwise the plain chain, the run-time typed declines, a cached step under ``set_sync_debug_mode("error")`` and the
+compiled-plan cache's reload path."""
+
+import pytest
+import torch
+
+from tests.test_helpers.qwen_3_5_block_cases import PagedCase
+
+pytestmark = [pytest.mark.arch_rubin, pytest.mark.usefixtures("rubin")]
+
+GEOMETRIES = {
+    "24_2": dict(d_model=2560, num_qo_heads=24, num_kv_heads=2),
+    "32_2": dict(d_model=4096, num_qo_heads=32, num_kv_heads=2),
+}
+LENS = (
+    100,
+    500,
+    0,
+)  # one KV tile with a tail, four tiles with a tail, a PADDED entry (block 0, slot -1, seq_len 0)
+
+
+def _geometry(name):
+    from flashinfer.qwen_3_5_block import Qwen35BlockGeometry
+
+    d = GEOMETRIES[name]
+    return Qwen35BlockGeometry(
+        d_model=d["d_model"],
+        num_qo_heads=d["num_qo_heads"],
+        num_kv_heads=d["num_kv_heads"],
+    )
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+@pytest.mark.parametrize("q_len", [1, 4])
+def test_decode_matches_the_oracle(name, q_len):
+    from flashinfer.qwen_3_5_block import qwen_3_5_block_bf16_decode
+
+    g = _geometry(name)
+    case = PagedCase(
+        g, LENS, [q_len if L else 0 for L in LENS], page_size=16, layout="NHD", seed=1
+    )
+    # a padded entry's rows: present in the batch (uniform q_len), zero-length in the case -- hand it finite rows
+    b = len(LENS)
+    h = torch.zeros(b * q_len, g.d_model, dtype=torch.bfloat16, device="cuda")
+    cos = torch.ones(b * q_len, g.rope_dim, dtype=torch.bfloat16, device="cuda")
+    sin = torch.zeros_like(cos)
+    slots = torch.full((b * q_len,), -1, dtype=torch.int32, device="cuda")
+    live = [i for i, L in enumerate(LENS) if L]
+    for j, i in enumerate(live):
+        h[i * q_len : (i + 1) * q_len] = case.hidden_states[j * q_len : (j + 1) * q_len]
+        cos[i * q_len : (i + 1) * q_len] = case.rope_cos[j * q_len : (j + 1) * q_len]
+        sin[i * q_len : (i + 1) * q_len] = case.rope_sin[j * q_len : (j + 1) * q_len]
+        slots[i * q_len : (i + 1) * q_len] = case.slot_mapping[
+            j * q_len : (j + 1) * q_len
+        ]
+    out = qwen_3_5_block_bf16_decode(
+        h,
+        cos,
+        sin,
+        case.weights,
+        case.w_o,
+        geometry=g,
+        kv_cache=case.kv_cache,
+        slot_mapping=slots,
+        block_table=case.block_table,
+        seq_lens=case.seq_lens,
+        q_len_per_req=q_len,
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (b * q_len, g.d_model) and out.dtype == torch.bfloat16
+    padded = [i for i, L in enumerate(LENS) if L == 0]
+    for i in padded:
+        assert (out[i * q_len : (i + 1) * q_len] == 0).all(), (
+            "a padded entry (seq_len 0) must yield out rows exactly 0"
+        )
+    rows = torch.cat([out[i * q_len : (i + 1) * q_len] for i in live])
+    case.check_out(rows, label=f"decode {name} q{q_len}")
+    case.check_written_rows(label=f"decode {name} q{q_len}")
+    assert (case.kv_cache[0] == 0).all(), (
+        "the NULL page (block 0) must never be written"
+    )
+
+
+def test_decode_layouts_are_bitwise():
+    """The same step through an NHD and an HND cache binds without a repack, two launches are bitwise, and the two layouts give
+    bitwise the same output."""
+    from flashinfer.qwen_3_5_block import qwen_3_5_block_bf16_decode
+
+    g = _geometry("24_2")
+    outs = {}
+    for layout in ("NHD", "HND"):
+        case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout=layout, seed=2)
+        args = dict(geometry=g, kv_layout=layout, q_len_per_req=2, **case.decode_args())
+        out = qwen_3_5_block_bf16_decode(
+            case.hidden_states,
+            case.rope_cos,
+            case.rope_sin,
+            case.weights,
+            case.w_o,
+            **args,
+        )
+        torch.cuda.synchronize()
+        case.check_out(out, label=f"decode {layout}")
+        again = qwen_3_5_block_bf16_decode(
+            case.hidden_states,
+            case.rope_cos,
+            case.rope_sin,
+            case.weights,
+            case.w_o,
+            **args,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out, again), "two launches of the same step differ"
+        outs[layout] = out.clone()
+    assert torch.equal(outs["NHD"], outs["HND"]), (
+        "NHD and HND pools holding the same values must give bitwise the same output"
+    )
+
+
+def test_wrapper_plan_run_and_the_declaration_facts():
+    from flashinfer.qwen_3_5_block import Qwen35BlockWrapper
+
+    g = _geometry("24_2")
+    case = PagedCase(
+        g, (257, 16), (1, 1), page_size=32, layout="NHD", seed=3, table_width=64
+    )
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    w = Qwen35BlockWrapper(ws, "NHD", geometry=g)
+    w.plan(
+        "decode",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=32,
+        batch_size=2,
+        q_len_per_req=1,
+        block_table=case.block_table,
+    )
+    plan = w.plan_info
+    assert (
+        plan.form == "decode"
+        and plan.page_size == 32
+        and plan.table_row_stride == 64
+        and plan.max_pages == 64
+    )
+    assert (
+        plan.workspace_size <= ws.numel()
+        and plan.declaration["decode_route"]["tile"] == "decode_d256_f16"
+    )
+    # the vendored decode levers' default chain at decode row counts (batch x q_len <= 128): stage (1) lowered to the small-M
+    # slab GEMM and the norm + RoPE pass, the paged write-through folded into that launch below 128 rows (no separate
+    # cache-write stage; the cuDNN Frontend default since d8b0a7ed5), programmatic dependent launch on the decode tile's routes
+    # on cc 10.7 (use_pdl=None resolves True); the sigmoid gate still rides the split combine
+    d = plan.declaration
+    assert (
+        d["gate_fused"]
+        and d["decode_split_kv"] >= 2
+        and d["fuse_norm_rope_effective"] is False
+    ), d
+    assert d["cache_write_fused"] is False and d["cache_write_in_norm_rope"] is True, d
+    assert "_QkNormRope" in d["stages"] and "_CacheWrite" not in d["stages"], d
+    assert (
+        d["use_pdl_requested"] is None
+        and d["use_pdl"] is True
+        and d["use_pdl_effective"] is True
+        and {"qk_norm_rope", "sdpa"} <= set(d["pdl_stages"])
+    ), d
+    assert (
+        d["decode_route"]["kv_streams"] == 1
+        and d["decode_route"]["policy"] == "single_unit"
+    ), d["decode_route"]
+    out = w.run(
+        case.hidden_states,
+        case.rope_cos,
+        case.rope_sin,
+        case.weights,
+        case.w_o,
+        **case.decode_args(),
+    )
+    torch.cuda.synchronize()
+    case.check_out(out, label="wrapper decode p32")
+    assert plan.supports(
+        hidden_states=case.hidden_states,
+        rope_cos=case.rope_cos,
+        rope_sin=case.rope_sin,
+        **case.decode_args(),
+    )
+    assert not plan.supports(
+        hidden_states=case.hidden_states[:1],
+        rope_cos=case.rope_cos,
+        rope_sin=case.rope_sin,
+        **case.decode_args(),
+    )
+    # a workspace too small for the plan is a typed ValueError naming the size
+    with pytest.raises(ValueError, match="workspace_size"):
+        Qwen35BlockWrapper(
+            torch.empty(16, dtype=torch.uint8, device="cuda"), "NHD", geometry=g
+        ).plan(
+            "decode",
+            weights=case.weights,
+            w_o=case.w_o,
+            kv_cache=case.kv_cache,
+            page_size=32,
+            batch_size=2,
+            q_len_per_req=1,
+            block_table=case.block_table,
+        )
+
+
+def test_declines_at_plan_time_are_typed_and_named():
+    from flashinfer.qwen_3_5_block import (
+        Qwen35BlockGeometry,
+        prepare_qwen_3_5_block_bf16,
+    )
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (64,), (1,), page_size=16, layout="NHD", seed=4)
+    common = dict(
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=16,
+        batch_size=1,
+        block_table=case.block_table,
+    )
+    with pytest.raises(NotImplementedError, match="decode envelope"):
+        prepare_qwen_3_5_block_bf16("decode", q_len_per_req=33, **common)
+    with pytest.raises(ValueError, match="page_size"):
+        prepare_qwen_3_5_block_bf16("decode", **dict(common, page_size=8))
+    with pytest.raises(
+        ValueError, match="kv_cache"
+    ):  # the cache's page size disagrees with the plan's
+        prepare_qwen_3_5_block_bf16("decode", **dict(common, page_size=32))
+    with pytest.raises(NotImplementedError, match="head_dim=256"):
+        prepare_qwen_3_5_block_bf16(
+            "decode",
+            **dict(
+                common,
+                geometry=Qwen35BlockGeometry(
+                    d_model=2560, num_qo_heads=24, num_kv_heads=2, head_dim=128
+                ),
+            ),
+        )
+    with pytest.raises(NotImplementedError, match="bfloat16"):
+        _fp16_entry(common)
+
+
+def _fp16_entry(common):
+    """The bf16 entry refuses f16 weights by name (the dtype is the entry's, not an argument)."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+
+    _api.prepare("decode", dtype=torch.float16, **common)
+
+
+def _plan_decode(case, g, **kw):
+    from flashinfer.qwen_3_5_block import prepare_qwen_3_5_block_bf16
+
+    return prepare_qwen_3_5_block_bf16(
+        "decode",
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=case.page_size,
+        batch_size=case.b,
+        block_table=case.block_table,
+        **kw,
+    )
+
+
+def _run(plan, case, **kw):
+    out = plan.run(
+        case.hidden_states,
+        case.rope_cos,
+        case.rope_sin,
+        case.weights,
+        case.w_o,
+        **case.decode_args(),
+        **kw,
+    )
+    torch.cuda.synchronize()
+    return out
+
+
+@pytest.mark.parametrize(
+    "q_len, expect",
+    [
+        (8, dict(pack_gqa=True, n_q=64, token_units=2, kv_streams=2)),
+        (32, dict(pack_gqa=False, n_q=32, token_units=1, kv_streams=12)),
+    ],
+    ids=["q8_two_units", "q32_unpacked"],
+)
+def test_decode_past_the_claimed_envelope_is_routed_and_declared(q_len, expect):
+    """q_len 5..32 past the claimed envelope at 24 / 2: 8 rides two token units of the 64-column decode tile with the group
+    packed (the vendored width table), 32 the 32-column tile unpacked (one Q head per CTA, a KV stream per head); both routed
+    and declared (``claimed`` False) with the kernel, width, token units and KV streams in the declaration; the oracle holds."""
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (q_len, q_len), page_size=16, layout="NHD", seed=21)
+    plan = _plan_decode(case, g, q_len_per_req=q_len)
+    route = plan.declaration["decode_route"]
+    assert (
+        route["tile"] == "decode_d256_f16"
+        and route["s_q"] == q_len
+        and route["claimed"] is False
+    ), route
+    assert {k: route[k] for k in expect} == expect, route
+    out = _run(plan, case)
+    case.check_out(out, label=f"decode q{q_len} routed")
+    case.check_written_rows(label=f"decode q{q_len} routed")
+
+
+@pytest.mark.parametrize(
+    "name, q_len", [("24_2", 3), ("32_2", 4)], ids=["24_2_q3", "32_2_q4"]
+)
+def test_decode_64_column_tile_in_one_token_unit(name, q_len):
+    """The 64-column decode tile (36 / 64 packed rows) in ONE token unit -- the KV streamed once -- routed and declared, not
+    claimed (the measured widths are 16 and 32); the oracle holds and the pools' step rows are written."""
+    g = _geometry(name)
+    case = PagedCase(g, (300, 77), (q_len, q_len), page_size=16, layout="NHD", seed=41)
+    plan = _plan_decode(case, g, q_len_per_req=q_len)
+    route = plan.declaration["decode_route"]
+    assert (
+        route["tile"],
+        route["n_q"],
+        route["token_units"],
+        route["pack_gqa"],
+        route["kv_streams"],
+        route["claimed"],
+    ) == ("decode_d256_f16", 64, 1, True, 1, False), route
+    out = _run(plan, case)
+    case.check_out(out, label=f"decode {name} q{q_len} 64-column tile")
+    case.check_written_rows(label=f"decode {name} q{q_len} 64-column tile")
+
+
+def test_decode_lowered_chain_against_the_fused_fork_control_arm():
+    """At decode row counts the vendored declaration lowers stage (1) to the unfused chain (the small-M slab GEMM and the norm +
+    RoPE pass with the paged write-through folded into it below 128 rows: the step measured faster on the cuDNN Frontend side);
+    ``fuse_norm_rope_small_m=True`` (through the adapter's test hook) keeps the fused fork with the write-through folded into its
+    epilogue -- the control arm.  Both hold the oracle, the two chains agree (two roundings of stage (1): not bitwise), and the
+    stage lists are the two chains'."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+    from tests.test_helpers.qwen_3_5_block_reference import cosine
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout="NHD", seed=43)
+    common = dict(
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=16,
+        batch_size=2,
+        q_len_per_req=2,
+        block_table=case.block_table,
+    )
+    dflt = _api.prepare("decode", **common)
+    ctl = _api.prepare(
+        "decode", _declaration_overrides={"fuse_norm_rope_small_m": True}, **common
+    )
+    d, c = dflt.declaration, ctl.declaration
+    assert d["fuse_norm_rope_effective"] is False and d["cache_write_fused"] is False, d
+    assert d["cache_write_in_norm_rope"] is True and "_CacheWrite" not in d["stages"], d
+    assert d["stages"][:3] == ["_Projection", "_QkNormRope", "_Sdpa"], d["stages"]
+    assert c["fuse_norm_rope_effective"] is True and c["cache_write_fused"] is True, c
+    assert c["cache_write_in_norm_rope"] is False, c
+    assert c["stages"][0] == "_FusedQkvProjection" and not (
+        {"_QkNormRope", "_CacheWrite"} & set(c["stages"])
+    ), c["stages"]
+    a = _run(dflt, case)
+    case.check_out(a, label="decode lowered chain (default)")
+    case.check_written_rows(label="decode lowered chain (default)")
+    b = _run(ctl, case)
+    case.check_out(b, label="decode fused fork (control)")
+    case.check_written_rows(label="decode fused fork (control)")
+    assert cosine(a, b) > 0.9999, (
+        "the lowered chain and the fused fork compute the same function"
+    )
+
+
+def test_decode_prefill_route_when_the_step_fills_the_part():
+    """32 / 2 at batch 32 x q_len 8: 128 packed rows per (sequence, KV head) -- past the decode tile's single-unit widths -- and
+    ``batch x num_kv_heads = 64`` CTAs fill the part, so the default route policy declares the paged d256 PREFILL tile with the
+    group packed (the extend form's kernel at the dense step's own envelope: unsplit, the gate in its epilogue, one KV stream);
+    256 rows in all, so stage (1) keeps the fused fork; the oracle holds on every sequence and the pools' step rows are written."""
+    g = _geometry("32_2")
+    lens = tuple(40 + 9 * i for i in range(32))
+    case = PagedCase(g, lens, (8,) * 32, page_size=16, layout="NHD", seed=47)
+    plan = _plan_decode(case, g, q_len_per_req=8)
+    d = plan.declaration
+    route = d["decode_route"]
+    assert (
+        route["tile"],
+        route["pack_gqa"],
+        route["token_units"],
+        route["kv_streams"],
+        route["claimed"],
+    ) == ("prefill_d256_f16", True, 0, 1, False), route
+    assert d["decode_split_kv"] == 1 and d["gate_fused"] is True, d
+    assert (
+        "_SigmoidGate" not in d["stages"] and d["fuse_norm_rope_effective"] is True
+    ), d
+    out = _run(plan, case)
+    case.check_out(out, label="decode prefill route (batch 32, q8)")
+    case.check_written_rows(label="decode prefill route (batch 32, q8)")
+
+
+def test_decode_kv_pair_spelling_at_page_64_hnd():
+    """A ``(k_cache, v_cache)`` pair of 4-D HND tensors at page 64: the functional entry reads the page size off the pair."""
+    from flashinfer.qwen_3_5_block import qwen_3_5_block_bf16_decode
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (200, 1000), (1, 1), page_size=64, layout="HND", seed=22)
+    kv = (case.kv_cache[:, 0], case.kv_cache[:, 1])
+    out = qwen_3_5_block_bf16_decode(
+        case.hidden_states,
+        case.rope_cos,
+        case.rope_sin,
+        case.weights,
+        case.w_o,
+        geometry=g,
+        kv_layout="HND",
+        kv_cache=kv,
+        slot_mapping=case.slot_mapping,
+        block_table=case.block_table,
+        seq_lens=case.seq_lens,
+    )
+    torch.cuda.synchronize()
+    case.check_out(out, label="decode (k, v) p64 HND")
+    case.check_written_rows(label="decode (k, v) p64 HND")
+
+
+def test_decode_page_128_max_seq_len_and_the_explicit_split():
+    """Page 128 with a logical KV bound; the split model's plan and an explicit ``decode_split_kv=2`` agree with the oracle."""
+    g = _geometry("24_2")
+    case = PagedCase(
+        g, (500, 130), (1, 1), page_size=128, layout="NHD", seed=23, table_width=8
+    )
+    auto = _plan_decode(case, g, max_seq_len=1024)
+    assert auto.max_seq_len == 1024 and auto.declaration["decode_split_kv"] >= 2
+    case.check_out(_run(auto, case), label="decode p128 split model")
+    explicit = _plan_decode(case, g, max_seq_len=1024, decode_split_kv=2)
+    d = explicit.declaration
+    assert (
+        d["decode_split_kv"] == 2
+        and d["gate_fused"] is True
+        and "_SigmoidGate" not in d["stages"]
+    )
+    case.check_out(_run(explicit, case), label="decode p128 split 2")
+
+
+def test_decode_unsplit_tile_runs_the_gate_as_its_own_launch():
+    """``decode_split_kv=1``: the decode tile runs unsplit, so the sigmoid gate cannot ride the split combine and runs as the
+    separate elementwise launch (the vendored ``kernels/elementwise.py`` arm); the same function as the split plan."""
+    g = _geometry("24_2")
+    case = PagedCase(
+        g, (500, 130), (1, 1), page_size=16, layout="NHD", seed=31, table_width=40
+    )
+    unsplit = _plan_decode(case, g, decode_split_kv=1)
+    d = unsplit.declaration
+    assert (
+        d["decode_split_kv"] == 1
+        and d["gate_fused"] is False
+        and "_SigmoidGate" in d["stages"]
+    ), d
+    out = _run(unsplit, case)
+    case.check_out(out, label="decode split 1 (gate launch)")
+    case.check_written_rows(label="decode split 1 (gate launch)")
+    split = _plan_decode(case, g, decode_split_kv=2)
+    assert split.declaration["gate_fused"] is True
+    from tests.test_helpers.qwen_3_5_block_reference import cosine
+
+    assert cosine(out, _run(split, case)) > 0.9999, (
+        "the unsplit and the split plans compute the same function"
+    )
+
+
+def test_decode_separate_cache_write_launch():
+    """The write-through as its own launch, by the explicit ``fuse_cache_write=False`` on the vendored declaration through the
+    adapter's test hook (the A/B control: since cuDNN Frontend d8b0a7ed5 the default folds it into the norm + RoPE launch below
+    128 rows, and the explicit False keeps the separate launch on every decode plan) -- the vendored ``kernels/cache_write.py``
+    arm writes the pools the oracle predicts."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout="NHD", seed=33)
+    plan = _api.prepare(
+        "decode",
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=16,
+        batch_size=2,
+        q_len_per_req=2,
+        block_table=case.block_table,
+        _declaration_overrides={"fuse_cache_write": False},
+    )
+    d = plan.declaration
+    assert d["cache_write_fused"] is False and "_CacheWrite" in d["stages"], d
+    assert d["cache_write_in_norm_rope"] is False, d
+    assert d["fuse_norm_rope_effective"] is False, d
+    out = _run(plan, case)
+    case.check_out(out, label="decode separate cache write")
+    case.check_written_rows(label="decode separate cache write")
+    assert (case.kv_cache[0] == 0).all(), "the NULL page must never be written"
+
+
+def test_decode_default_chain_is_bitwise_the_plain_chain():
+    """The vendored defaults of the decode step on cc 10.7 (cuDNN Frontend d8b0a7ed5): programmatic dependent launch on the decode
+    tile's routes (``use_pdl=None`` resolves True) and the paged write-through folded into the norm + RoPE launch below 128 rows
+    (``fuse_cache_write_small_m=None``: no separate cache-write stage, one launch fewer per step).  Both are performance-only: the
+    default plan reads them back and is BITWISE the plain chain declared through the adapter's test hook (``use_pdl=False``,
+    ``fuse_cache_write_small_m=False``: the switched stages launch plain, the separate cache write runs) on ``out`` and on the
+    pools; both hold the oracle."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout="NHD", seed=53)
+    common = dict(
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=16,
+        batch_size=2,
+        q_len_per_req=2,
+        block_table=case.block_table,
+    )
+    dflt = _api.prepare("decode", **common)
+    plain = _api.prepare(
+        "decode",
+        _declaration_overrides={"use_pdl": False, "fuse_cache_write_small_m": False},
+        **common,
+    )
+    d, p = dflt.declaration, plain.declaration
+    assert (
+        d["decode_route"]["tile"] == "decode_d256_f16"
+        and d["fuse_norm_rope_effective"] is False
+    ), d
+    assert (
+        d["use_pdl_requested"] is None
+        and d["use_pdl"] is True
+        and d["use_pdl_effective"] is True
+        and {"qk_norm_rope", "sdpa"} <= set(d["pdl_stages"])
+    ), d
+    assert d["cache_write_in_norm_rope"] is True and "_CacheWrite" not in d["stages"], d
+    assert (
+        p["use_pdl_requested"] is False
+        and p["use_pdl"] is False
+        and p["use_pdl_effective"] is False
+        and p["pdl_stages"] == []
+    ), p
+    assert p["cache_write_in_norm_rope"] is False and "_CacheWrite" in p["stages"], p
+    assert len(d["stages"]) == len(p["stages"]) - 1, (d["stages"], p["stages"])
+    a = _run(dflt, case)
+    case.check_out(a, label="decode default chain (PDL, folded write-through)")
+    case.check_written_rows(label="decode default chain (PDL, folded write-through)")
+    pools_default = case.kv_cache.clone()
+    b = _run(plain, case)
+    case.check_out(b, label="decode plain chain (control)")
+    case.check_written_rows(label="decode plain chain (control)")
+    assert torch.equal(a, b), (
+        "the default chain and the plain chain compute the same bytes"
+    )
+    assert torch.equal(pools_default, case.kv_cache), (
+        "the folded write-through and the separate launch write the same pool bytes"
+    )
+
+
+def test_vendored_cache_write_launcher_pins_every_operand_to_one_device():
+    """The vendored ``kernels/cache_write.py`` launcher (the ``_CacheWrite`` stage's kernel; its one-device check was carried as
+    patch P4 until cuDNN Frontend landed it -- byte-faithful since the ``d8b0a7ed5`` re-vendor): every operand on the
+    sources' CUDA device, typed and named, before any launch -- a CPU ``slot_mapping`` used to pass the dtype / rank / length checks
+    and reach the kernel as a host address.  The block's own execute preflight pins the pools and the slot mapping to ``h``'s device,
+    so the route was guarded; this is the launcher's standalone contract.  The well-formed launch still runs.  The vendored
+    recipe is compiled OUTSIDE a plan, so the adapter's cache redirection is applied first: the compiled-plan entry lands under
+    FlashInfer's cache root like every plan's, never under the tree's own default (``XDG_CACHE_HOME``)."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.cache_write import (
+        compile_cache_write,
+        run_cache_write,
+    )
+
+    _api.configure_vendored_tree()
+    dev = torch.device("cuda", 0)
+    r = compile_cache_write(
+        dtype=torch.bfloat16,
+        h=2,
+        d=256,
+        page_size=16,
+        slot_dtype=torch.int32,
+        two_operands=True,
+    )
+    src = torch.ones(8, 2, 256, device=dev, dtype=torch.bfloat16)
+    pool = torch.zeros(2, 2, 16, 256, device=dev, dtype=torch.bfloat16)
+    slot = torch.arange(8, device=dev, dtype=torch.int32)
+    s = torch.cuda.current_stream(dev).cuda_stream
+    with pytest.raises(ValueError, match="slot_mapping must live on"):
+        run_cache_write(r, src, src, pool, pool, slot.cpu(), stream=s)
+    with pytest.raises(ValueError, match="pool_b must live on"):
+        run_cache_write(r, src, src, pool, pool.cpu(), slot, stream=s)
+    with pytest.raises(ValueError, match="src_b must be on"):
+        run_cache_write(r, src, src.cpu(), pool, pool, slot, stream=s)
+    with pytest.raises(ValueError, match="src_a must be a CUDA tensor"):
+        run_cache_write(r, src.cpu(), src, pool, pool, slot, stream=s)
+    assert (pool == 0).all(), "a refused launch must not write"
+    run_cache_write(r, src, src, pool, pool, slot, stream=s)
+    torch.cuda.synchronize(dev)
+    assert (
+        (pool[0, :, :8] == 1).all()
+        and (pool[0, :, 8:] == 0).all()
+        and (pool[1] == 0).all()
+    )
+
+
+def test_run_time_declines_are_typed_and_named():
+    """Every malformed operand of a run is a ``ValueError`` naming it, host-side, before any launch."""
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (1, 1), page_size=16, layout="NHD", seed=29)
+    plan = _plan_decode(case, g)
+    a = case.decode_args()
+    w = (case.hidden_states, case.rope_cos, case.rope_sin, case.weights, case.w_o)
+    with pytest.raises(ValueError, match="seq_lens must be torch.int32"):
+        plan.run(*w, **dict(a, seq_lens=a["seq_lens"].to(torch.int64)))
+    with pytest.raises(ValueError, match="block_table must be"):
+        plan.run(*w, **dict(a, block_table=a["block_table"][:1]))
+    with pytest.raises(ValueError, match="kv_cache does not match the plan's pools"):
+        plan.run(*w, **dict(a, kv_cache=a["kv_cache"][:-1]))
+    with pytest.raises(ValueError, match="hidden_states must be torch.bfloat16"):
+        plan.run(case.hidden_states.float(), *w[1:], **a)
+    with pytest.raises(ValueError, match="w_o must be"):
+        plan.run(*w[:4], case.w_o.t().contiguous(), **a)
+    with pytest.raises(ValueError, match="workspace_size"):
+        plan.run(
+            *w, workspace_buffer=torch.empty(8, dtype=torch.uint8, device="cuda"), **a
+        )
+    with pytest.raises(ValueError, match="slot_mapping must be a 1-D tensor"):
+        plan.run(*w, **dict(a, slot_mapping=a["slot_mapping"][:-1]))
+    with pytest.raises(ValueError, match="kv_cache \\(K\\) must be torch.bfloat16"):
+        plan.run(*w, **dict(a, kv_cache=a["kv_cache"].to(torch.float16)))
+    assert not plan.supports(
+        hidden_states=case.hidden_states.float(),
+        rope_cos=case.rope_cos,
+        rope_sin=case.rope_sin,
+        **a,
+    )
+
+
+def test_a_cached_decode_step_runs_without_a_host_sync():
+    """The functional entry point over a cached plan under ``set_sync_debug_mode("error")``: no host read of device data."""
+    from flashinfer.qwen_3_5_block import qwen_3_5_block_bf16_decode
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout="NHD", seed=28)
+    args = dict(geometry=g, q_len_per_req=2, **case.decode_args())
+    w = (case.hidden_states, case.rope_cos, case.rope_sin, case.weights, case.w_o)
+    first = qwen_3_5_block_bf16_decode(
+        *w, **args
+    )  # the plan compiles here (a compile may synchronize)
+    torch.cuda.synchronize()
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        again = qwen_3_5_block_bf16_decode(*w, **args)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    torch.cuda.synchronize()
+    assert torch.equal(first, again)
+
+
+def test_compiled_plan_cache_lives_under_the_flashinfer_root_and_reloads():
+    """The vendored tree's compiled-plan cache and rendered GEMM sources sit under FlashInfer's cache root (unless the caller chose
+    another through the tree's own variables), and a second plan of the same bucket reloads the exported kernels from the files
+    once the in-process memo is cleared -- the reload path a serving process takes at its next start-up."""
+    import pathlib
+
+    from flashinfer.jit.env import FLASHINFER_CACHE_DIR
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost import compiled_cache
+
+    g = _geometry("24_2")
+    case = PagedCase(
+        g, (257, 16), (1, 1), page_size=32, layout="NHD", seed=3, table_width=64
+    )
+    plan = _plan_decode(case, g)
+    caches = plan.declaration["caches"]
+    import os
+
+    root = str(FLASHINFER_CACHE_DIR / "qwen_3_5_block")
+    if not os.environ.get("CUDNN_FRONTEND_COMPILED_CACHE"):
+        assert caches["compiled_plans"] == str(pathlib.Path(root) / "compiled_plans")
+    if not os.environ.get("CUDNN_FRONTEND_GEMM_KERNEL_CACHE"):
+        assert caches["gemm_sources"] == str(pathlib.Path(root) / "gemm_sources")
+    assert any(
+        pathlib.Path(caches["gemm_sources"]).glob("gen_*/generated_kernel.py")
+    ), "the rendered GEMM sources"
+    out = _run(plan, case)
+    case.check_out(out, label="decode before the reload")
+    if not caches["compiled_plans_enabled"]:
+        pytest.skip(
+            "the compiled-plan cache is disabled (CUDNN_FRONTEND_DISABLE_COMPILED_CACHE)"
+        )
+    assert any(pathlib.Path(caches["compiled_plans"]).rglob("kernel.o")), (
+        "the exported kernel objects"
+    )
+    compiled_cache.clear_memo()
+    compiled_cache.reset_stats()
+    again = _plan_decode(case, g)
+    stats = compiled_cache.stats()
+    assert stats["hits"] >= 1, stats
+    assert torch.equal(_run(again, case), out), (
+        "a plan reloaded from the files differs from the compiled one"
+    )

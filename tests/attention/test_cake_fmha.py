@@ -1670,7 +1670,9 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
     ("max_seq_len", "retain_kv_l2", "device_scale"),
     (
         (1024, True, False),
-        (4096, False, False),
+        # 2048 (not 4096): 128 x 4 tiles at a scalar scale stay on the present
+        # route only inside the aligned hd128 selector's c1 carve-out.
+        (2048, False, False),
         (4096, False, True),
     ),
 )
@@ -2736,6 +2738,7 @@ def test_cake_public_context_route_miss_canonicalizes_only_pinned_noop_skip(
         batch_size=2,
         cum_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
         cum_seq_lens_kv=torch.tensor([0, 16, 32], dtype=torch.int32),
+        window_right=0,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
     )
 

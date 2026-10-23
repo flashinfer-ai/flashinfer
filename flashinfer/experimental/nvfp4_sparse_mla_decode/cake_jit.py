@@ -1,753 +1,631 @@
 """
-Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+Copyright (c) 2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-http://www.apache.org/licenses/LICENSE-2.0
+  http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Host plan and loader glue of the Cake experimental NVFP4 sparse MLA decode
+program (SM100 / SM103), the ``backend="cake"`` of
+:func:`flashinfer.mla.nvfp4_sparse_mla_decode`.
+
+Contract of the program: ``out[t, h] = out_scale * softmax_k(qk_scale *
+q[t, h] . K[indices[t, k]]) @ V[indices[t, k]]`` over E4M3 ``[T, 16, 576]``
+queries (``q``, handed to the kernel as int32 words), 352-byte NVFP4 cache
+rows (``kv``, the flat uint8 row pool), int32 ``[T, topk]`` row ids with
+``-1`` marking an empty slot (``indices``) and a BF16 ``[T, 16, 512]`` output
+(``out``); ``qk_scale`` is the base-2 softmax scale (``bmm1_scale *
+log2(e)``), ``out_scale`` the output scale and ``keys_per_cta`` the keys each
+CTA of the token's cluster owns.  One thread-block cluster of ``C`` CTAs
+serves one query token (grid ``(T, C, 1)``, cluster ``(1, C, 1)``, 448
+threads): CTA ``c`` walks the keys ``[c * keys_per_cta, (c + 1) *
+keys_per_cta)`` in 32-key stages and either writes the normalized output
+directly (``C = 1``) or merges its fp32 partials with the cluster peers
+through distributed shared memory.  ``C`` is one of :data:`CLUSTER_SIZES`,
+one program per cluster size; :mod:`.cake_backend` plans it per launch.
+
+Every record of ``MODULES`` is one mechanically exported program: a CUDA
+device translation unit, a tvm-ffi binding and an occupancy query unit,
+compiled once per architecture.  A record carries the host plan only: the
+program's ``library`` stem (its ``build.json`` entries are
+``<library>_<arch>``), the architectures it is delivered for, the source
+``module`` and ``build`` keywords it was rendered from, its launch record,
+the argument plan of its ``run`` entry, the kernel-parameter -> logical-
+argument map, the cluster size and the stage constants of the host planner
+(``cluster``, ``keys_per_stage``, ``max_keys_per_cta``), the grid rule
+:func:`launch_grid` evaluates, the name of the occupancy entry
+(``occupancy_entry``: ``max_active_clusters(device, block_x, block_y,
+block_z, cluster_x, cluster_y, cluster_z, dynamic_smem_bytes, cooperative)``,
+the one-wave cluster capacity the planner asks each program for) and the
+workspace rule (``None``: the kernel owns no scratch).  What to compile --
+sources, digests, nvcc flags -- is recorded once in ``build.json`` next to
+this file; :mod:`.cake_build` serves the library from a prebuilt ``aot/``
+file when a builder compiled it and otherwise through FlashInfer's JIT from
+the same sources and flags.  Every ``build.json`` entry records
+``--use_fast_math`` (the flag the kernel was validated and measured with);
+the loader passes ``use_fast_math=False`` so that the manifest, not the
+loader, states it.
+
+The derived leaves of a record (``kernel_symbol``, ``launch.block``,
+``launch.cluster``, ``launch.cooperative``, ``launch.dynamic_smem_bytes``,
+``launch.use_pdl``, ``arg_plan``, ``logical``) are rewritten by the exporter
+from the rendered binding; every other field is the host plan.  Every value
+is a literal: FlashInfer's manifest checker and the exporter read this file
+with ``ast.literal_eval``.
+
+The program name ``cake_nvfp4_sparse_mla_decode_<20 hex>`` is the first
+twenty hex digits of the SHA-256 of the compact JSON ``{"build": <build
+keywords, sorted, every default spelled>, "module": <dotted source module>}``
+of the kernel the program was rendered from; a changed keyword is a new
+program.
 """
 
 from __future__ import annotations
 
 import functools
-import os
-import re
-from pathlib import Path
 from typing import Any
 
-from ...jit import env as jit_env
-from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
-from ...jit.utils import write_if_different
-from .jit import _header_dirs
+import tvm_ffi
 
-PROGRAM = "cake_nvfp4_sparse_mla_decode"
+from . import cake_build
+
+# Two delivered architectures: B200 / GB200 (``sm_100a``) and B300 / GB300
+# (``sm_103a``), each compiled with its exact ``-gencode`` flag set
+# (``build.json`` ``arch_flags``).
 ARCHES = ("sm_100a", "sm_103a")
-# Thread-block cluster sizes (CTAs per query token) the generated program is
-# rendered for: one physical module per (architecture, cluster size).  7 is not
-# a variant of the program (see ``cake_backend.PLAN_CTAS``).
+ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+}
+
+# Thread-block cluster sizes (CTAs per query token) the program is delivered
+# for, one record each; 7 is not a variant of the program (see
+# ``cake_backend.PLAN_CTAS``).
 CLUSTER_SIZES = (1, 2, 3, 4, 5, 6, 8)
 
-# Exact argument plan of every module's ``run`` entry: the kernel's buffers and
-# scalar parameters in signature order, then the launch grid.  ``q`` is the
-# E4M3 ``[T, 16, 576]`` query viewed as int32 words, ``kv`` the flat uint8 row
-# pool, ``indices`` int32 ``[T, topk]``, ``out`` BF16 ``[T, 16, 512]``;
-# ``qk_scale`` is ``bmm1_scale * log2(e)`` and ``out_scale`` is ``bmm2_scale``.
-ARG_PLAN: list[list[str]] = [
-    ["buffer", "q"],
-    ["buffer", "kv"],
-    ["buffer", "indices"],
-    ["buffer", "out"],
-    ["parameter", "topk"],
-    ["parameter", "keys_per_cta"],
-    ["parameter", "qk_scale"],
-    ["parameter", "out_scale"],
-    ["grid", "grid_x"],
-    ["grid", "grid_y"],
-    ["grid", "grid_z"],
-]
-
-# Explicit target-owned registration of the generated program.  One record per
-# (architecture, cluster size); each record carries the single physical stage
-# (the decode kernel of that cluster size) with its translation units, compile
-# flags, FFI entry, argument plan and launch resources (block, cluster,
-# cooperative flag, dynamic shared memory).  ``module`` / ``sources`` /
-# ``closure_sha256`` are ``None`` / empty until the generated-program export
-# fills them in verbatim (see ``csrc/cake_nvfp4_sparse_mla_decode/MANIFEST.todo``; the
-# sm_100a and sm_103a records of one cluster size share the same sources);
-# such a record is not registered.  Do not edit the exported values by hand.
-#
-# Launch resources are generated-kernel constants: 448 threads (8 math warps,
-# 4 softmax warps, 2 loader warps), cluster ``(1, C, 1)`` over the grid's y
-# axis, 192256 bytes of dynamic shared memory for ``C = 1`` and 226816 for
-# ``C > 1`` (the ``C = 1`` footprint plus the 34560-byte cluster landing zone).
+# The derived leaves of every record (``kernel_symbol``, ``launch.block``,
+# ``launch.cluster``, ``launch.cooperative``, ``launch.dynamic_smem_bytes``,
+# ``launch.use_pdl``, ``arg_plan`` and ``logical``) are rewritten by the
+# exporter from the rendered program; every other field is host plan.
+# ``launch.dynamic_smem_bytes`` is the kernel's computed shared memory at the
+# last render.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_nvfp4_sparse_mla_decode_c1_sm_100a": {
-        "arch": "sm_100a",
+    "cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 1,
+        },
         "cluster": 1,
-        "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_4a6efd3e450cf4ae4404",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_4a6efd3e450cf4ae4404_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_4a6efd3e450cf4ae4404_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "28da693a3c1e553613972b3d29b0b76bb58b27e69e1aeca556c9950ca4e40a31",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 1, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 192256,
-            },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
         },
-        "closure_sha256": "28da693a3c1e553613972b3d29b0b76bb58b27e69e1aeca556c9950ca4e40a31",
-    },
-    "cake_nvfp4_sparse_mla_decode_c1_sm_103a": {
-        "arch": "sm_103a",
-        "cluster": 1,
+        "kernel": "cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6",
         "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_4a6efd3e450cf4ae4404",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_4a6efd3e450cf4ae4404_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_4a6efd3e450cf4ae4404_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "28da693a3c1e553613972b3d29b0b76bb58b27e69e1aeca556c9950ca4e40a31",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 1, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 192256,
-            },
+        "launch": {
+            "block": (448, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 192256,
+            "use_pdl": False,
         },
-        "closure_sha256": "28da693a3c1e553613972b3d29b0b76bb58b27e69e1aeca556c9950ca4e40a31",
+        "library": "cake_nvfp4_sparse_mla_decode_b321ca1b7dfea243bca6",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys_per_cta": 2048,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_c2_sm_100a": {
-        "arch": "sm_100a",
+    "cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 2,
+        },
         "cluster": 2,
-        "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_215010cc2c515c9fd447",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_215010cc2c515c9fd447_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_215010cc2c515c9fd447_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "eab10630410ccb03dbb6c3f104088577ca630e66297c7661021b045a196136fd",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 2, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
         },
-        "closure_sha256": "eab10630410ccb03dbb6c3f104088577ca630e66297c7661021b045a196136fd",
-    },
-    "cake_nvfp4_sparse_mla_decode_c2_sm_103a": {
-        "arch": "sm_103a",
-        "cluster": 2,
+        "kernel": "cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e",
         "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_215010cc2c515c9fd447",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_215010cc2c515c9fd447_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_215010cc2c515c9fd447_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "eab10630410ccb03dbb6c3f104088577ca630e66297c7661021b045a196136fd",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 2, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "launch": {
+            "block": (448, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226816,
+            "use_pdl": False,
         },
-        "closure_sha256": "eab10630410ccb03dbb6c3f104088577ca630e66297c7661021b045a196136fd",
+        "library": "cake_nvfp4_sparse_mla_decode_9db88fc2ce17eaf2d27e",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys_per_cta": 2048,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_c3_sm_100a": {
-        "arch": "sm_100a",
+    "cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 3,
+        },
         "cluster": 3,
-        "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_1b2583534843f35f3489",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_1b2583534843f35f3489_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_1b2583534843f35f3489_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "ff56ae2146ccf19ea7d7cfd60d70e7c2886e1ada03266acb3ec82ea649d746d1",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 3, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
         },
-        "closure_sha256": "ff56ae2146ccf19ea7d7cfd60d70e7c2886e1ada03266acb3ec82ea649d746d1",
-    },
-    "cake_nvfp4_sparse_mla_decode_c3_sm_103a": {
-        "arch": "sm_103a",
-        "cluster": 3,
+        "kernel": "cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c",
         "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_1b2583534843f35f3489",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_1b2583534843f35f3489_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_1b2583534843f35f3489_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "ff56ae2146ccf19ea7d7cfd60d70e7c2886e1ada03266acb3ec82ea649d746d1",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 3, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "launch": {
+            "block": (448, 1, 1),
+            "cluster": (1, 3, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226816,
+            "use_pdl": False,
         },
-        "closure_sha256": "ff56ae2146ccf19ea7d7cfd60d70e7c2886e1ada03266acb3ec82ea649d746d1",
+        "library": "cake_nvfp4_sparse_mla_decode_525c3da3db366af4b77c",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys_per_cta": 2048,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_c4_sm_100a": {
-        "arch": "sm_100a",
+    "cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 4,
+        },
         "cluster": 4,
-        "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_576af3a84f3fbf1f9b76",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_576af3a84f3fbf1f9b76_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_576af3a84f3fbf1f9b76_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "c4b66a5f353240e5d483cc5a58f3b5fd323243cd639361c6df0643f1e3441934",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 4, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
         },
-        "closure_sha256": "c4b66a5f353240e5d483cc5a58f3b5fd323243cd639361c6df0643f1e3441934",
-    },
-    "cake_nvfp4_sparse_mla_decode_c4_sm_103a": {
-        "arch": "sm_103a",
-        "cluster": 4,
+        "kernel": "cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c",
         "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_576af3a84f3fbf1f9b76",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_576af3a84f3fbf1f9b76_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_576af3a84f3fbf1f9b76_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "c4b66a5f353240e5d483cc5a58f3b5fd323243cd639361c6df0643f1e3441934",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 4, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "launch": {
+            "block": (448, 1, 1),
+            "cluster": (1, 4, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226816,
+            "use_pdl": False,
         },
-        "closure_sha256": "c4b66a5f353240e5d483cc5a58f3b5fd323243cd639361c6df0643f1e3441934",
+        "library": "cake_nvfp4_sparse_mla_decode_b5c9cbf01c57fe28ab5c",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys_per_cta": 2048,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_c5_sm_100a": {
-        "arch": "sm_100a",
+    "cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 5,
+        },
         "cluster": 5,
-        "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_d47dc4e68d95712e7170",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_d47dc4e68d95712e7170_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_d47dc4e68d95712e7170_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "62fff9bfd4a9ea8ecea81035b72d4861695c976ea1dd39a2eb5bccaec21a2e76",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 5, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
         },
-        "closure_sha256": "62fff9bfd4a9ea8ecea81035b72d4861695c976ea1dd39a2eb5bccaec21a2e76",
-    },
-    "cake_nvfp4_sparse_mla_decode_c5_sm_103a": {
-        "arch": "sm_103a",
-        "cluster": 5,
+        "kernel": "cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd",
         "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_d47dc4e68d95712e7170",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_d47dc4e68d95712e7170_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_d47dc4e68d95712e7170_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "62fff9bfd4a9ea8ecea81035b72d4861695c976ea1dd39a2eb5bccaec21a2e76",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 5, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "launch": {
+            "block": (448, 1, 1),
+            "cluster": (1, 5, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226816,
+            "use_pdl": False,
         },
-        "closure_sha256": "62fff9bfd4a9ea8ecea81035b72d4861695c976ea1dd39a2eb5bccaec21a2e76",
+        "library": "cake_nvfp4_sparse_mla_decode_79fa77f600e1320149dd",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys_per_cta": 2048,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_c6_sm_100a": {
-        "arch": "sm_100a",
+    "cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 6,
+        },
         "cluster": 6,
-        "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_e6c1d41d5776b873899f",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_e6c1d41d5776b873899f_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_e6c1d41d5776b873899f_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "c708d7e0e8b4a5a52cf26a56a07f89dc4cf930a93a96eae27ff37d1016c173c8",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 6, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
         },
-        "closure_sha256": "c708d7e0e8b4a5a52cf26a56a07f89dc4cf930a93a96eae27ff37d1016c173c8",
-    },
-    "cake_nvfp4_sparse_mla_decode_c6_sm_103a": {
-        "arch": "sm_103a",
-        "cluster": 6,
+        "kernel": "cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4",
         "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_e6c1d41d5776b873899f",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_e6c1d41d5776b873899f_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_e6c1d41d5776b873899f_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "c708d7e0e8b4a5a52cf26a56a07f89dc4cf930a93a96eae27ff37d1016c173c8",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 6, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "launch": {
+            "block": (448, 1, 1),
+            "cluster": (1, 6, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226816,
+            "use_pdl": False,
         },
-        "closure_sha256": "c708d7e0e8b4a5a52cf26a56a07f89dc4cf930a93a96eae27ff37d1016c173c8",
+        "library": "cake_nvfp4_sparse_mla_decode_5339f8b94959bd44e7f4",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys_per_cta": 2048,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
     },
-    "cake_nvfp4_sparse_mla_decode_c8_sm_100a": {
-        "arch": "sm_100a",
+    "cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "kv"],
+            ["buffer", "indices"],
+            ["buffer", "out"],
+            ["parameter", "topk"],
+            ["parameter", "keys_per_cta"],
+            ["parameter", "qk_scale"],
+            ["parameter", "out_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "cluster": 8,
+        },
         "cluster": 8,
-        "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_788a6d133a5a217a83c1",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_788a6d133a5a217a83c1_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_788a6d133a5a217a83c1_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "694efff4998d63d8d64af182c335ed7accb1184bad1046c63056cb454a863ec6",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 8, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tokens_by_cluster",
         },
-        "closure_sha256": "694efff4998d63d8d64af182c335ed7accb1184bad1046c63056cb454a863ec6",
-    },
-    "cake_nvfp4_sparse_mla_decode_c8_sm_103a": {
-        "arch": "sm_103a",
-        "cluster": 8,
+        "kernel": "cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585",
+        "kernel_symbol": "kernel_cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585",
         "keys_per_stage": 32,
-        "max_keys_per_cta": 2048,
-        "main": {
-            "module": "cake_nvfp4_sparse_mla_decode_788a6d133a5a217a83c1",
-            "sources": [
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_788a6d133a5a217a83c1_kernel.cu",
-                "cake_nvfp4_sparse_mla_decode/cake_nvfp4_sparse_mla_decode_788a6d133a5a217a83c1_binding.cu",
-            ],
-            "compile_flags": ["--use_fast_math"],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "q"],
-                ["buffer", "kv"],
-                ["buffer", "indices"],
-                ["buffer", "out"],
-                ["parameter", "topk"],
-                ["parameter", "keys_per_cta"],
-                ["parameter", "qk_scale"],
-                ["parameter", "out_scale"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "694efff4998d63d8d64af182c335ed7accb1184bad1046c63056cb454a863ec6",
-            "launch": {
-                "block": [448, 1, 1],
-                "cluster": [1, 8, 1],
-                "cooperative": False,
-                "dynamic_smem_bytes": 226816,
-            },
+        "launch": {
+            "block": (448, 1, 1),
+            "cluster": (1, 8, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 226816,
+            "use_pdl": False,
         },
-        "closure_sha256": "694efff4998d63d8d64af182c335ed7accb1184bad1046c63056cb454a863ec6",
+        "library": "cake_nvfp4_sparse_mla_decode_79fc3ddfe4254b845585",
+        "logical": {
+            "indices": "indices",
+            "keys_per_cta": "keys_per_cta",
+            "kv": "kv",
+            "out": "out",
+            "out_scale": "out_scale",
+            "q": "q",
+            "qk_scale": "qk_scale",
+            "topk": "topk",
+        },
+        "max_keys_per_cta": 2048,
+        "module": "tart.mla_decode_dsv32_sparse_nvfp4_kv_fp8_q.sm100_sm103.flashinfer_blackwell_nvfp4_ds_mla_sparse_decode",
+        "occupancy_entry": "max_active_clusters",
+        "workspace_rule": None,
     },
 }
 
-STAGES = ("main",)
-ARCH_NVCC_FLAGS = {
-    "sm_100a": sm100a_nvcc_flags,
-    "sm_103a": sm103a_nvcc_flags,
-}
+
+def arch_for_capability(capability: tuple[int, int]) -> str | None:
+    """The exported architecture of one device capability, if any."""
+    values = tuple(int(value) for value in capability)
+    if len(values) != 2:
+        return None
+    return ARCH_BY_CAPABILITY.get((values[0], values[1]))
 
 
-def is_registered(record: dict[str, Any]) -> bool:
-    """True once the export filled in the record's physical module and sources."""
-    physical = record["main"]
-    return bool(physical["module"]) and bool(physical["sources"])
+@functools.cache
+def device_arch(device_index: int) -> str:
+    """Exported architecture of one CUDA device (``RuntimeError`` when the device
+    is not an exported target; the capability is immutable per process)."""
+    import torch
 
-
-def module_name(arch: str, cluster: int) -> str:
-    return f"{PROGRAM}_c{int(cluster)}_{arch}"
-
-
-def select_module(arch: str, cluster: int) -> str:
-    """Registered module name for ``arch`` and ``cluster`` CTAs per token."""
-    name = module_name(arch, cluster)
-    record = MODULES.get(name)
-    if record is None or not is_registered(record):
-        raise NotImplementedError(
-            f"The generated NVFP4 sparse MLA decode program (cluster size {cluster}) "
-            f"for {arch} is not registered in this checkout yet"
+    capability = tuple(torch.cuda.get_device_capability(device_index))
+    arch = arch_for_capability(capability)
+    if arch is None:
+        raise RuntimeError(
+            f"device {device_index} (capability {capability}) is not an exported "
+            f"Cake NVFP4 sparse MLA decode target; the exported architectures are {ARCHES}"
         )
-    return name
+    return arch
+
+
+@functools.cache
+def sm_count(device_index: int) -> int:
+    """Streaming multiprocessor count of one CUDA device (immutable per process)."""
+    import torch
+
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def record_for(cluster: int) -> str:
+    """The name of the one record of ``cluster`` CTAs per token (``RuntimeError``
+    when none or more than one is: the route has one program per cluster size)."""
+    names = [
+        name for name, record in MODULES.items() if int(record["cluster"]) == cluster
+    ]
+    if len(names) != 1:
+        raise RuntimeError(
+            f"Cake NVFP4 sparse MLA decode delivers {len(names)} programs of cluster "
+            f"size {cluster}; the delivered cluster sizes are {CLUSTER_SIZES}"
+        )
+    return names[0]
 
 
 def registered_clusters(arch: str) -> set[int]:
-    """Cluster sizes whose generated program is registered for ``arch``."""
+    """Cluster sizes whose program is delivered for ``arch``."""
     return {
         int(record["cluster"])
         for record in MODULES.values()
-        if record["arch"] == arch and is_registered(record)
+        if arch in record["arches"]
     }
 
 
-# ---------------------------------------------------------------------------
-# Occupancy helper
-# ---------------------------------------------------------------------------
-#
-# The generated binding launches the kernel (cluster attribute included) but
-# exposes no occupancy query.  The planner picks the cluster size whose
-# ``num_tokens`` clusters are co-resident in one wave, which the driver decides
-# from GPC placement (``cudaOccupancyMaxActiveClusters``), not from the SM count
-# alone.  This package adds one small translation unit per module that forwards
-# the kernel's host stub to that query with the same configuration the launch
-# uses (block, cluster dims, dynamic shared memory, cooperative flag).
-
-_KERNEL_DECLARATION = re.compile(
-    r'^extern "C" __global__ void (?P<symbol>kernel_[A-Za-z0-9_]+)\((?P<params>[^;]*)\);\s*$',
-    re.MULTILINE,
-)
-
-_OCCUPANCY_TEMPLATE = """\
-// Occupancy query for the generated cluster kernel {symbol}; rendered by
-// cake_jit.py from the kernel declaration of the generated binding.
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-
-#include "tvm_ffi_utils.h"
-
-#include <cstdint>
-
-{declaration}
-
-namespace {{
-
-int64_t MaxActiveClusters(int64_t device, int64_t block_x, int64_t block_y, int64_t block_z,
-                          int64_t cluster_x, int64_t cluster_y, int64_t cluster_z,
-                          int64_t dynamic_smem_bytes, bool cooperative) {{
-  int previous_device = -1;
-  TVM_FFI_CHECK(cudaGetDevice(&previous_device) == cudaSuccess, RuntimeError)
-      << "cudaGetDevice failed";
-  if (static_cast<int64_t>(previous_device) != device) {{
-    TVM_FFI_CHECK(cudaSetDevice(static_cast<int>(device)) == cudaSuccess, RuntimeError)
-        << "cudaSetDevice failed";
-  }}
-  const void* function = reinterpret_cast<const void*>(&{symbol});
-  if (dynamic_smem_bytes > 48 * 1024) {{
-    TVM_FFI_CHECK(cudaFuncSetAttribute(function, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                       static_cast<int>(dynamic_smem_bytes)) == cudaSuccess,
-                  RuntimeError)
-        << "cudaFuncSetAttribute(MaxDynamicSharedMemorySize) failed for {symbol}";
-  }}
-  cudaLaunchAttribute attrs[2]{{}};
-  int n = 0;
-  attrs[n].id = cudaLaunchAttributeClusterDimension;
-  attrs[n].val.clusterDim.x = static_cast<unsigned>(cluster_x);
-  attrs[n].val.clusterDim.y = static_cast<unsigned>(cluster_y);
-  attrs[n].val.clusterDim.z = static_cast<unsigned>(cluster_z);
-  ++n;
-  if (cooperative) {{
-    attrs[n].id = cudaLaunchAttributeCooperative;
-    attrs[n].val.cooperative = 1;
-    ++n;
-  }}
-  cudaLaunchConfig_t config{{}};
-  config.gridDim = dim3(static_cast<unsigned>(cluster_x), static_cast<unsigned>(cluster_y),
-                        static_cast<unsigned>(cluster_z));
-  config.blockDim = dim3(static_cast<unsigned>(block_x), static_cast<unsigned>(block_y),
-                         static_cast<unsigned>(block_z));
-  config.dynamicSmemBytes = static_cast<size_t>(dynamic_smem_bytes);
-  config.attrs = attrs;
-  config.numAttrs = static_cast<unsigned>(n);
-  int clusters = 0;
-  cudaError_t status = cudaOccupancyMaxActiveClusters(&clusters, function, &config);
-  if (static_cast<int64_t>(previous_device) != device) {{
-    cudaSetDevice(previous_device);
-  }}
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaOccupancyMaxActiveClusters for {symbol} failed: " << cudaGetErrorString(status);
-  return static_cast<int64_t>(clusters);
-}}
-
-}}  // namespace
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(max_active_clusters, MaxActiveClusters);
-"""
-
-
-def _kernel_declaration(binding_path: Path) -> tuple[str, str]:
-    """``(symbol, declaration)`` of the kernel declared by a generated binding."""
-    matches = _KERNEL_DECLARATION.findall(binding_path.read_text())
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"expected exactly one generated kernel declaration in {binding_path}, "
-            f"found {len(matches)}"
-        )
-    symbol, params = matches[0]
-    return symbol, f'extern "C" __global__ void {symbol}({params});'
-
-
-def _occupancy_source(spec_name: str, binding_path: Path) -> Path:
-    symbol, declaration = _kernel_declaration(binding_path)
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / spec_name
-    os.makedirs(gen_directory, exist_ok=True)
-    path = gen_directory / f"{symbol}_occupancy.cu"
-    write_if_different(
-        path, _OCCUPANCY_TEMPLATE.format(symbol=symbol, declaration=declaration)
-    )
-    return path
-
-
-@functools.cache
-def gen_nvfp4_sparse_mla_decode_cake_module(name: str, stage: str):
-    record = MODULES[name]
-    if not is_registered(record):
+def select_module(arch: str, cluster: int) -> str:
+    """The record name of the program of ``cluster`` CTAs per token delivered for
+    ``arch`` (``NotImplementedError`` when this checkout delivers none)."""
+    if int(cluster) not in registered_clusters(arch):
         raise NotImplementedError(
-            f"{name} is not registered in this checkout yet (no generated sources)"
+            f"The generated NVFP4 sparse MLA decode program (cluster size {cluster}) "
+            f"is not delivered for {arch} in this checkout"
         )
-    physical = record[stage]
-    root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in physical["sources"]]
-    spec_name = f"{name}_{stage}_" + physical["closure_sha256"][:20]
-    # Every module (the cluster-size-1 one included) gets the occupancy query so
-    # the planner can ask any registered variant for its one-wave capacity.
-    binding = next(path for path in sources if path.name.endswith("_binding.cu"))
-    sources.append(_occupancy_source(spec_name, binding))
-    return gen_jit_spec(
-        name=spec_name,
-        sources=sources,
-        extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[record["arch"]],
-            *physical["compile_flags"],
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
-        use_fast_math=False,
-    )
+    return record_for(int(cluster))
+
+
+def library_name(name: str, arch: str) -> str:
+    """``build.json`` library of record ``name`` built for ``arch``: ``<library>_<arch>``."""
+    record = MODULES[name]
+    if arch not in record["arches"]:
+        raise RuntimeError(
+            f"Cake NVFP4 sparse MLA decode record {name} is not delivered for {arch}; "
+            f"its architectures: {record['arches']}"
+        )
+    return f"{record['library']}_{arch}"
 
 
 @functools.cache
-def load_nvfp4_sparse_mla_decode_cake_module(name: str, stage: str):
-    return gen_nvfp4_sparse_mla_decode_cake_module(name, stage).build_and_load()
+def load(name: str, arch: str) -> Any:
+    """The loaded tvm-ffi module of record ``name`` built for ``arch`` (its ``run``
+    and ``max_active_clusters`` entries): the prebuilt ``aot/`` library when a
+    builder compiled it, else FlashInfer's JIT build of the same sources and
+    flags (``cake_build.load_library``)."""
+    return cake_build.load_library(library_name(name, arch))
+
+
+def specs_for_arch(arch: str) -> list[Any]:
+    """JIT specifications of every ``arch`` library without a prebuilt file (for
+    ahead-of-time warm-up through FlashInfer's ``build_jit_specs``)."""
+    return cake_build.jit_specs(arch)
+
+
+def launch_grid(record: dict[str, Any], *, num_tokens: int) -> tuple[int, int, int]:
+    """Launch grid of one record for ``num_tokens`` query tokens under its
+    ``tokens_by_cluster`` rule: one cluster of the record's ``cluster`` CTAs per
+    token, the cluster along the grid's y axis."""
+    rule = record["grid_rule"]
+    if rule["kind"] != "tokens_by_cluster":
+        raise ValueError(
+            f"unknown Cake NVFP4 sparse MLA decode grid rule: {rule['kind']!r}"
+        )
+    num_tokens, cluster = int(num_tokens), int(record["cluster"])
+    if num_tokens <= 0:
+        raise ValueError(
+            f"the grid rule needs a positive token count, got num_tokens={num_tokens}"
+        )
+    return (num_tokens, cluster, 1)
+
+
+def launch_args(
+    record: dict[str, Any], values: dict[str, Any], grid: tuple[int, int, int]
+) -> tuple[Any, ...]:
+    """The positional arguments of the record's ``run`` entry: ``values`` by the
+    logical name of each kernel parameter of ``arg_plan`` and the grid axes."""
+    logical = record["logical"]
+    args: list[Any] = []
+    for kind, key in record["arg_plan"]:
+        if kind == "grid":
+            args.append(int(grid["xyz".index(key[-1])]))
+            continue
+        if key not in logical:
+            raise ValueError(f"kernel parameter {key!r} has no logical name")
+        try:
+            args.append(values[logical[key]])
+        except KeyError:
+            raise ValueError(
+                f"the launch needs logical argument {logical[key]!r}"
+            ) from None
+    return tuple(args)
+
+
+def run_module(
+    name: str,
+    values: dict[str, Any],
+    *,
+    grid: tuple[int, int, int],
+    device_index: int,
+) -> None:
+    """Launch record ``name`` with logical argument ``values`` on ``grid`` (the
+    record's :func:`launch_grid`) on the current torch stream of the device."""
+    record = MODULES[name]
+    module = load(name, device_arch(device_index))
+    with tvm_ffi.use_torch_stream():
+        getattr(module, record["ffi_entry"])(*launch_args(record, values, grid))
+
+
+__all__ = [
+    "ARCHES",
+    "ARCH_BY_CAPABILITY",
+    "CLUSTER_SIZES",
+    "MODULES",
+    "arch_for_capability",
+    "device_arch",
+    "launch_args",
+    "launch_grid",
+    "library_name",
+    "load",
+    "record_for",
+    "registered_clusters",
+    "run_module",
+    "select_module",
+    "sm_count",
+    "specs_for_arch",
+]

@@ -71,6 +71,7 @@ from ..jit.cake_fp4_allreduce import (
     device_facts,
     evaluate_linear_form,
     get_cake_fp4_allreduce_module,
+    grid_max,
     program_for,
     program_record,
     target_arch,
@@ -267,8 +268,11 @@ class CakeFp4AllReduceWorkspace:
     (pre-quantised records).  ``capacity`` is the largest row count a call may
     carry (at most 103000 for world size 4).  The receive windows are shared
     through CUDA IPC, armed with their Lamport sentinels and published in the
-    peer window table; the call-state words start at zero.  The CTA count of
-    every launch is the SM count of the device and must agree on every rank.
+    peer window table; the control window (the registry's control words: one
+    four-word call-state slot per CTA) starts at zero.  The CTA count of every
+    launch is the SM count of the device, at most the grid bound of the
+    workspace's programs (the CTAs their control window provisions for), and
+    must agree on every rank.
     Construction loads (and on first use compiles) every program this
     workspace can launch for the device's exact target.  ``destroy()``
     releases the shared windows and is collective as well.
@@ -302,21 +306,17 @@ class CakeFp4AllReduceWorkspace:
         index = torch.cuda.current_device() if device.index is None else device.index
         self.device = torch.device("cuda", index)
         self.target = target_arch(index)
-        grid = device_facts(index).sm_count
-        if (family, self.world_size) == ("allreduce", 2) and grid > int(
-            LIMITS["tp2_oneshot_grid_max"]
-        ):
-            raise ValueError(
-                "the world-size-2 all-reduce holds call state for at most "
-                f"{LIMITS['tp2_oneshot_grid_max']} CTAs, the device has {grid} SMs"
-            )
-        self.grid = int(grid)
         self.plan = cake_fp4_allreduce_window_plan(
             family, self.world_size, input_format, self.capacity
         )
         self.programs = workspace_programs(
             family, self.world_size, input_format, self.target
         )
+        # Every CTA owns a four-word call-state slot of the control window, so
+        # the programs bound the CTA count (``grid_max``, the same on every
+        # path: one-shot, two-shot and fused norm); the launch uses the
+        # device's SM count up to that bound.
+        self.grid = min(int(device_facts(index).sm_count), grid_max(self.programs))
         self._modules = {
             program: get_cake_fp4_allreduce_module(program, self.target)
             for program in self.programs
@@ -334,7 +334,8 @@ class CakeFp4AllReduceWorkspace:
         if any(value != self.grid for value in grids):
             raise RuntimeError(
                 "the Cake NVFP4-transport all-reduce needs the same CTA count "
-                f"(SM count) on every rank, got {grids}"
+                f"(the SM count within the programs' grid bound) on every rank, "
+                f"got {grids}"
             )
         self._shared: dict[str, list[int]] = {}
         self._views: list[torch.Tensor] = []

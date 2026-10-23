@@ -447,14 +447,22 @@ def test_execution_uses_selected_backend_and_clears_destroyed_state(
         layer.compute_staged(output=output)
 
 
-def test_override_does_not_replace_allocated_default(make_layer):
+@pytest.mark.parametrize("live_tokens", [None, 8])
+def test_override_does_not_replace_allocated_default(make_layer, live_tokens):
     layer = make_layer()
+    layer._fleet_params = dataclasses.replace(
+        layer._fleet_params, tuning_live_tokens=live_tokens
+    )
     raw = layer._ensure_workspace()
     with pytest.raises(ValueError, match="already allocated default"):
-        layer.create_workspace(64, knobs={"flag_batch": 4})
+        layer.create_workspace(64, live_tokens=live_tokens, knobs={"flag_batch": 4})
+    other = layer.create_workspace(
+        64, live_tokens=8 if live_tokens is None else None, knobs={"flag_batch": 4}
+    )
+    assert other._backend_workspace is not raw
     assert layer._ensure_workspace() is raw
     raw.destroy.assert_not_called()
-    handle = layer.create_workspace(64)
+    handle = layer.create_workspace(64, live_tokens=live_tokens)
     assert handle._backend_workspace is raw
 
 

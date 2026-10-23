@@ -162,6 +162,7 @@ class TransportSession {
     TVM_FFI_ICHECK(runtime_version == kExpectedNcclVersion)
         << "Cake SM120 MegaMoE requires NCCL 2.30.7 (" << kExpectedNcclVersion << "), observed "
         << runtime_version;
+    nccl_version_ = runtime_version;
 
     int current_device = -1;
     CheckCuda(cudaGetDevice(&current_device), "cudaGetDevice");
@@ -286,11 +287,15 @@ class TransportSession {
   bool gin_available() const { return gin_available_; }
   int gin_type() const { return gin_type_; }
   int lsa_team_count() const { return lsa_team_count_; }
+  int nccl_version() const { return nccl_version_; }
   int context_count() const { return gin_available_ ? host_dev_comm_.ginContextCount : 0; }
   int signal_count() const { return gin_available_ ? host_dev_comm_.ginSignalCount : 0; }
   std::size_t window_count() const { return windows_.size(); }
   bool closed() const { return closed_; }
 
+  // Teardown only, never on a serving path: the device-wide synchronize makes sure
+  // no launch on any stream still reads the windows, and freeing the device
+  // communicator and the window memory below synchronizes the device anyway.
   void Close() {
     if (closed_) return;
     CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(close)");
@@ -328,6 +333,7 @@ class TransportSession {
   bool gin_available_ = false;
   int gin_type_ = 0;
   int lsa_team_count_ = 0;
+  int nccl_version_ = 0;
   std::vector<Window> windows_;
   std::vector<std::uintptr_t> peer_pointers_;
   std::vector<int> lsa_reachable_;
@@ -338,7 +344,12 @@ class TransportSession {
 };
 
 std::mutex g_registry_mutex;
-std::unordered_map<int64_t, std::unique_ptr<TransportSession>> g_sessions;
+// Never destroyed: a session adopts the ncclComm_t of a torch process group, which the
+// application may destroy (dist.destroy_process_group) before the process exits.  Releasing
+// such a session from a static destructor would deregister windows of a freed communicator,
+// so sessions still open at exit are left to the OS.
+std::unordered_map<int64_t, std::unique_ptr<TransportSession>>& g_sessions =
+    *new std::unordered_map<int64_t, std::unique_ptr<TransportSession>>();
 int64_t g_next_session_handle = 1;
 
 TransportSession& SessionOf(int64_t handle) {
@@ -423,7 +434,7 @@ void transport_session_properties(int64_t handle, TensorView out) {
   TVM_FFI_ICHECK(out.shape()[0] >= 8) << "properties output needs >= 8 slots";
   TransportSession& s = SessionOf(handle);
   auto* p = static_cast<int64_t*>(out.data_ptr());
-  p[0] = kExpectedNcclVersion;
+  p[0] = s.nccl_version();
   p[1] = s.gin_available() ? 1 : 0;
   p[2] = s.gin_type();
   p[3] = s.lsa_team_count();
@@ -433,6 +444,7 @@ void transport_session_properties(int64_t handle, TensorView out) {
   p[7] = s.closed() ? 1 : 0;
 }
 
+// Teardown only (see TransportSession::Close): synchronizes the device.
 void transport_session_close(int64_t handle) {
   std::unique_ptr<TransportSession> session;
   {
@@ -750,6 +762,9 @@ void probe_round(int64_t dev_comm, int64_t src, int64_t src_win, int64_t dst_win
                  row.shape()[0] == world && gin_targets.shape()[0] == world &&
                  gin_barrier_targets.shape()[0] == world && out.shape()[0] >= 2)
       << "probe argument extents do not match world";
+  // The GIN sender advances by chunk_bytes; zero would never finish.
+  TVM_FFI_ICHECK(chunk_bytes > 0 && chunk_bytes <= UINT32_MAX)
+      << "probe chunk_bytes must be in [1, 2^32), got " << chunk_bytes;
 
   ProbeArgs a{};
   a.comm = reinterpret_cast<ncclDevComm const*>(dev_comm);
@@ -985,15 +1000,25 @@ std::mutex g_function_mutex;
 std::unordered_map<int64_t, LoadedFunction> g_functions;
 int64_t g_next_function_handle = 1;
 
-LoadedFunction& FunctionOf(int64_t handle) {
+// Every access to an entry happens under g_function_mutex and only the
+// CUfunction is copied out, so module_unload_function can erase entries while
+// other handles are in use.
+CUfunction FunctionOf(int64_t handle) {
   std::lock_guard<std::mutex> guard(g_function_mutex);
   auto found = g_functions.find(handle);
   TVM_FFI_ICHECK(found != g_functions.end()) << "unknown kernel function handle " << handle;
-  return found->second;
+  return found->second.function;
 }
 
-void EnsureDynamicSmem(LoadedFunction& f, int smem_bytes) {
-  if (smem_bytes <= 48 * 1024 || smem_bytes <= f.dynamic_smem_opt_in) return;
+// Raises the function's dynamic shared-memory opt-in to `smem_bytes` when
+// needed and returns the function.  The opt-in is read-modify-written, so the
+// whole check-and-set holds the lock.
+CUfunction PrepareFunction(int64_t handle, int smem_bytes) {
+  std::lock_guard<std::mutex> guard(g_function_mutex);
+  auto found = g_functions.find(handle);
+  TVM_FFI_ICHECK(found != g_functions.end()) << "unknown kernel function handle " << handle;
+  LoadedFunction& f = found->second;
+  if (smem_bytes <= 48 * 1024 || smem_bytes <= f.dynamic_smem_opt_in) return f.function;
   CUdevice dev;
   CheckCu(cuCtxGetDevice(&dev), "cuCtxGetDevice");
   int optin_max = 0;
@@ -1006,6 +1031,7 @@ void EnsureDynamicSmem(LoadedFunction& f, int smem_bytes) {
       cuFuncSetAttribute(f.function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes),
       "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)");
   f.dynamic_smem_opt_in = smem_bytes;
+  return f.function;
 }
 
 }  // namespace
@@ -1017,34 +1043,48 @@ int64_t module_load_function(TensorView cubin, tvm::ffi::String symbol) {
   CheckCuda(cudaFree(nullptr), "cudaFree(nullptr) (context init)");
   LoadedFunction f;
   CheckCu(cuModuleLoadData(&f.module, cubin.data_ptr()), "cuModuleLoadData");
-  CheckCu(cuModuleGetFunction(&f.function, f.module, symbol.c_str()), "cuModuleGetFunction");
+  const CUresult status = cuModuleGetFunction(&f.function, f.module, symbol.c_str());
+  if (status != CUDA_SUCCESS) (void)cuModuleUnload(f.module);
+  CheckCu(status, "cuModuleGetFunction");
   std::lock_guard<std::mutex> guard(g_function_mutex);
   const int64_t handle = g_next_function_handle++;
   g_functions.emplace(handle, f);
   return handle;
 }
 
+// Unloads the module behind a handle of module_load_function and invalidates
+// the handle.  The caller guarantees that no launch of it is still in flight.
+void module_unload_function(int64_t handle) {
+  CUmodule module = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(g_function_mutex);
+    auto found = g_functions.find(handle);
+    TVM_FFI_ICHECK(found != g_functions.end()) << "unknown kernel function handle " << handle;
+    module = found->second.module;
+    g_functions.erase(found);
+  }
+  CheckCu(cuModuleUnload(module), "cuModuleUnload");
+}
+
 int64_t function_num_regs(int64_t handle) {
   int value = 0;
-  CheckCu(cuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_NUM_REGS, FunctionOf(handle).function),
+  CheckCu(cuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_NUM_REGS, FunctionOf(handle)),
           "cuFuncGetAttribute(NUM_REGS)");
   return value;
 }
 
 int64_t function_local_bytes(int64_t handle) {
   int value = 0;
-  CheckCu(
-      cuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, FunctionOf(handle).function),
-      "cuFuncGetAttribute(LOCAL_SIZE_BYTES)");
+  CheckCu(cuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, FunctionOf(handle)),
+          "cuFuncGetAttribute(LOCAL_SIZE_BYTES)");
   return value;
 }
 
 int64_t function_max_active_blocks(int64_t handle, int64_t block_size, int64_t smem_bytes) {
-  LoadedFunction& f = FunctionOf(handle);
-  EnsureDynamicSmem(f, static_cast<int>(smem_bytes));
+  const CUfunction function = PrepareFunction(handle, static_cast<int>(smem_bytes));
   int blocks = 0;
   CheckCu(cuOccupancyMaxActiveBlocksPerMultiprocessor(
-              &blocks, f.function, static_cast<int>(block_size), static_cast<size_t>(smem_bytes)),
+              &blocks, function, static_cast<int>(block_size), static_cast<size_t>(smem_bytes)),
           "cuOccupancyMaxActiveBlocksPerMultiprocessor");
   return blocks;
 }
@@ -1064,8 +1104,7 @@ void launch_cooperative(int64_t handle, int64_t grid_x, int64_t block_x, int64_t
   const int64_t n = arg_values.shape()[0];
   TVM_FFI_ICHECK(arg_widths.shape()[0] == n) << "arg_values / arg_widths length mismatch";
   TVM_FFI_ICHECK(n > 0 && n <= 256) << "unsupported kernel argument count " << n;
-  LoadedFunction& f = FunctionOf(handle);
-  EnsureDynamicSmem(f, static_cast<int>(smem_bytes));
+  const CUfunction function = PrepareFunction(handle, static_cast<int>(smem_bytes));
 
   // Every argument gets an 8-byte, 8-byte-aligned slot; cuLaunch reads
   // `width` bytes from each slot as declared by the kernel signature.
@@ -1076,12 +1115,19 @@ void launch_cooperative(int64_t handle, int64_t grid_x, int64_t block_x, int64_t
   for (int64_t i = 0; i < n; ++i) {
     TVM_FFI_ICHECK(widths[i] == 1 || widths[i] == 2 || widths[i] == 4 || widths[i] == 8)
         << "argument " << i << " has unsupported width " << static_cast<int>(widths[i]);
+    // A narrower argument accepts its signed or its unsigned image; anything
+    // else would be truncated by the driver.
+    const int bits = 8 * widths[i];
+    TVM_FFI_ICHECK(bits == 64 ||
+                   (values[i] >= -(int64_t{1} << (bits - 1)) && values[i] < (int64_t{1} << bits)))
+        << "argument " << i << " value " << values[i] << " does not fit in "
+        << static_cast<int>(widths[i]) << " bytes";
     storage[i] = values[i];
     pointers[i] = &storage[i];
   }
   cudaStream_t cuda_stream = StreamOf(device, stream);
   CheckCu(cuLaunchCooperativeKernel(
-              f.function, static_cast<unsigned>(grid_x), 1, 1, static_cast<unsigned>(block_x), 1, 1,
+              function, static_cast<unsigned>(grid_x), 1, 1, static_cast<unsigned>(block_x), 1, 1,
               static_cast<unsigned>(smem_bytes), reinterpret_cast<CUstream>(cuda_stream), pointers),
           "cuLaunchCooperativeKernel");
 }
@@ -1111,6 +1157,7 @@ CAKE_MEGAMOE_EXPORT(probe_round)
 CAKE_MEGAMOE_EXPORT(probe_read_gin_signals)
 CAKE_MEGAMOE_EXPORT(tma_encode_2d)
 CAKE_MEGAMOE_EXPORT(module_load_function)
+CAKE_MEGAMOE_EXPORT(module_unload_function)
 CAKE_MEGAMOE_EXPORT(function_num_regs)
 CAKE_MEGAMOE_EXPORT(function_local_bytes)
 CAKE_MEGAMOE_EXPORT(function_max_active_blocks)

@@ -38,7 +38,7 @@ from typing import Any, Optional
 
 import torch
 
-from ...api_logging import flashinfer_experimental_api
+from ._experimental import flashinfer_experimental_api
 
 __all__ = [
     "CakeGroupedMm",

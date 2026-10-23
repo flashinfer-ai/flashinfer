@@ -17,9 +17,14 @@ JIT loader of the Cake NVFP4-transport tensor-parallel all-reduce (SM100 / SM103
 
 The programs are generated into ``csrc/cake_fp4_allreduce`` and listed in
 :mod:`flashinfer.jit.cake_fp4_allreduce_programs` (``PROGRAMS``: one physical
-program per family, world size, input format, output format, phase-B variant,
-re-arm form, poll form and residual-prefetch form; ``WINDOWS``: the receive-window
-contract; ``SELECT_BV``, ``SELECT_PREFETCH`` and ``LIMITS``: the host rules).  Every program is an exact-architecture source:
+program per family, world size, input format, output format, phase-B variant
+and per-target build form -- the re-arm, the one-shot kernel's row-scale poll
+and launch-trigger placement, the two-shot kernel's first-load placement, bv-1
+poll grouping and pass-2 source, the fused norm's poll, quantizing pass 2 and
+sum-of-squares order, the call-state protocol and the residual prefetch -- with
+its launch facts and its grid bound; ``WINDOWS``: the receive-window contract,
+with the control words a window's programs need; ``SELECT_BV``,
+``SELECT_PREFETCH`` and ``LIMITS``: the host rules).  Every program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
 B300, ``sm_107a`` for SM107 devices) with that target's flag set, without fast math and with
 ``--fmad=false``, into a module named after the program, the target and a
@@ -33,6 +38,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Optional
 
@@ -320,11 +326,13 @@ def program_for(
     The candidates are the rows of (family, world size, input format, output
     format) compiled for ``target``; when they carry phase-B variants the one
     of :func:`select_bv` is kept, and when they carry a residual-prefetch form
-    the one of :func:`select_prefetch`.  The re-arm form and the fused norm's
-    poll form follow from the registry's per-target rows (a target has either
-    the bulk or the register-store form of a variant, and either the grouped
-    or the probe-all poll of a fused-norm input format), so this function
-    never restates those rules.
+    the one of :func:`select_prefetch`.  The per-target forms -- the one-shot
+    kernel's row-scale poll, launch-trigger placement and re-arm, the two-shot
+    kernel's first-load placement, bv-1 poll grouping, pass-2 source and
+    re-arm, the fused norm's poll, quantizing pass 2 and sum-of-squares order,
+    and the call-state protocol of both -- follow from the registry's rows (a
+    target builds exactly one form of each), so this function never restates
+    them.
     """
 
     candidates = programs(
@@ -381,6 +389,21 @@ def workspace_programs(
             f"on target {target!r}"
         )
     return selected
+
+
+def grid_max(programs: Iterable[str]) -> int:
+    """The largest CTA count every program of ``programs`` accepts: the least of their registry ``grid_max``.
+
+    A program's control window holds four call-state words per CTA, so its
+    ``grid_max`` is the CTA count the window of its registry row provisions
+    for; a workspace launches the device's SM count up to the bound of the
+    programs it can run.
+    """
+
+    bounds = [int(program_record(program)["grid_max"]) for program in programs]
+    if not bounds:
+        raise ValueError("grid_max needs at least one program")
+    return min(bounds)
 
 
 def window_contract(family: str, world_size: int, input_format: str) -> dict:
@@ -541,6 +564,7 @@ __all__ = [
     "gen_cake_fp4_allreduce_aot_modules",
     "gen_cake_fp4_allreduce_module",
     "get_cake_fp4_allreduce_module",
+    "grid_max",
     "module_name",
     "output_formats",
     "program_for",
