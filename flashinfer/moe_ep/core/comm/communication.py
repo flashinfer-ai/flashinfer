@@ -194,11 +194,6 @@ class MoEEpCommunication(ABC):
         Callable before construction; performs no collective work.
         """
 
-    def is_workload_feasible(self, runtime_max_tokens_per_rank: int) -> bool:
-        """Whether a step whose busiest rank dispatches
-        ``runtime_max_tokens_per_rank`` tokens fits this instance's buffers."""
-        return runtime_max_tokens_per_rank <= self.params.max_tokens_per_rank
-
     def _resolve_runtime_max_tokens_per_rank(
         self, runtime_max_tokens_per_rank: Optional[int]
     ) -> int:
