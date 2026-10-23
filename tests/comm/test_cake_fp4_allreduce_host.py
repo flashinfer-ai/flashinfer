@@ -1002,6 +1002,268 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# rows-dispatched programs: SELECT_ROWS and the rows filter of program_for
+# ---------------------------------------------------------------------------
+
+BAND_THRESHOLD = 6144
+# The synthetic bands the dispatch tests install beside the registry's whole programs of one target: the
+# fused-norm cell, the band kind, the name token and the record keys the band deviates in.  A prefix band
+# serves rows <= threshold, a suffix band rows >= threshold (both inclusive); the whole program serves
+# the other row counts.
+SYNTHETIC_BANDS = (
+    ("nvfp4", "bf16", "prefix", "_sop", {"ss_order": "perm"}),
+    ("bf16", "bf16", "suffix", "_w11", {"workers": 11, "block": 384}),
+)
+
+
+def _whole_program(
+    target: str, input_format: str, output_format: str, prefetch: bool
+) -> str:
+    (program,) = [
+        program
+        for program, record in PROGRAMS.items()
+        if record["family"] == "rmsnorm"
+        and record["input_format"] == input_format
+        and record["output_format"] == output_format
+        and record["prefetch"] is prefetch
+        and target in record["targets"]
+        and program not in loader.SELECT_ROWS
+    ]
+    return program
+
+
+@pytest.fixture
+def synthetic_bands(monkeypatch):
+    """A registry with rows-dispatched programs on sm_103a, installed over the loader's tables the way the
+    generator writes them: one PROGRAMS record per (band, prefetch form) carrying the whole program's record
+    with the band's keys and ``rows_kind`` / ``rows_threshold`` over it, and SELECT_ROWS naming each band with
+    the whole program per target.  Yields ``{(input_format, output_format, prefetch): (band, whole)}``."""
+
+    target = "sm_103a"
+    programs = dict(loader.PROGRAMS)
+    bands: dict[str, dict] = {}
+    cells: dict[tuple[str, str, bool], tuple[str, str]] = {}
+    for input_format, output_format, kind, token, extra in SYNTHETIC_BANDS:
+        for prefetch in (False, True):
+            whole = _whole_program(target, input_format, output_format, prefetch)
+            name = whole.replace("_pf", "") + token + ("_pf" if prefetch else "")
+            assert name not in programs
+            programs[name] = {
+                **PROGRAMS[whole],
+                **extra,
+                "targets": (target,),
+                "kernel_symbol": f"cake_fp4_allreduce_{name}",
+                "rows_kind": kind,
+                "rows_threshold": BAND_THRESHOLD,
+            }
+            bands[name] = {
+                "kind": kind,
+                "threshold": BAND_THRESHOLD,
+                "whole": {target: whole},
+            }
+            cells[(input_format, output_format, prefetch)] = (name, whole)
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    monkeypatch.setattr(loader, "SELECT_ROWS", bands)
+    loader.program_for.cache_clear()
+    yield cells
+    loader.program_for.cache_clear()
+
+
+def test_select_rows_rule_is_inclusive_at_the_threshold() -> None:
+    probes = (1, BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1, 16384)
+    assert [loader.select_rows(rows, "prefix", BAND_THRESHOLD) for rows in probes] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert [loader.select_rows(rows, "suffix", BAND_THRESHOLD) for rows in probes] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
+    with pytest.raises(ValueError):
+        loader.select_rows(BAND_THRESHOLD, "middle", BAND_THRESHOLD)
+    with pytest.raises(ValueError):
+        loader.select_rows(0, "prefix", BAND_THRESHOLD)
+
+
+def test_select_rows_bands_name_dispatched_programs_with_their_whole_program() -> None:
+    """Every band of the registry is a fused-norm program whose record carries the band, and names, per
+    target it ships for, the one whole program of its call (same input format, output format and prefetch
+    form, no band of its own) the row counts outside the band run; a whole program carries no band."""
+    for program, band in loader.SELECT_ROWS.items():
+        record = PROGRAMS[program]
+        assert record["family"] == "rmsnorm", program
+        assert set(band) == {"kind", "threshold", "whole"}, program
+        assert band["kind"] in ("prefix", "suffix"), program
+        assert isinstance(band["threshold"], int) and band["threshold"] >= 1, program
+        assert (record["rows_kind"], record["rows_threshold"]) == (
+            band["kind"],
+            band["threshold"],
+        ), program
+        assert tuple(band["whole"]) == record["targets"], program
+        for target, whole in band["whole"].items():
+            other = PROGRAMS[whole]
+            assert whole not in loader.SELECT_ROWS, (program, whole)
+            assert target in other["targets"], (program, whole)
+            assert (
+                other["input_format"],
+                other["output_format"],
+                other["prefetch"],
+            ) == (
+                record["input_format"],
+                record["output_format"],
+                record["prefetch"],
+            ), (program, whole)
+            assert (other["rows_kind"], other["rows_threshold"]) == (None, None), whole
+    for program, record in PROGRAMS.items():
+        if program not in loader.SELECT_ROWS:
+            assert (
+                record.get("rows_kind") is None and record.get("rows_threshold") is None
+            ), program
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_program_for_dispatches_the_band_inside_its_rows(
+    synthetic_bands, prefetch: bool
+) -> None:
+    """At threshold - 1 / threshold / threshold + 1 a prefix band's program is served / served / not served
+    and a suffix band's not served / served / served, the whole program otherwise; the prefetch form is
+    chosen first (rows per CTA), the band on the call's row count."""
+    target = "sm_103a"
+    grid = (
+        256 if prefetch else 148
+    )  # 6144 // 256 = 24 rows per CTA (prefetch), 6144 // 148 = 41 (plain)
+    probes = (BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1)
+    for rows in probes:
+        assert loader.select_prefetch(rows, grid) is prefetch
+    for input_format, output_format, kind, _, extra in SYNTHETIC_BANDS:
+        band, whole = synthetic_bands[(input_format, output_format, prefetch)]
+        expected = (band, band, whole) if kind == "prefix" else (whole, band, band)
+        for rows, program in zip(probes, expected, strict=True):
+            assert (
+                loader.program_for(
+                    family="rmsnorm",
+                    world_size=2,
+                    input_format=input_format,
+                    output_format=output_format,
+                    rows=rows,
+                    grid=grid,
+                    target=target,
+                )
+                == program
+            ), (input_format, output_format, rows)
+        far = (
+            (1 * grid + 1, 64 * grid) if kind == "prefix" else (64 * grid, 1 * grid + 1)
+        )
+        assert loader.select_prefetch(far[0], grid) is False
+        assert loader.select_prefetch(far[1], grid) is False
+        plain_band, plain_whole = synthetic_bands[(input_format, output_format, False)]
+        inside, outside = far
+        assert (
+            loader.program_for(
+                "rmsnorm", 2, input_format, output_format, inside, grid, target
+            )
+            == plain_band
+        )
+        assert (
+            loader.program_for(
+                "rmsnorm", 2, input_format, output_format, outside, grid, target
+            )
+            == plain_whole
+        )
+        # The band's record carries the band and the deviating keys over the whole program's record.
+        record = loader.PROGRAMS[band]
+        assert (record["rows_kind"], record["rows_threshold"]) == (kind, BAND_THRESHOLD)
+        for key, value in extra.items():
+            assert record[key] == value
+        assert loader.PROGRAMS[whole]["rows_kind"] is None
+        assert loader.SELECT_ROWS[band]["whole"][target] == whole
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_program_for_keeps_the_whole_program_without_a_band(
+    synthetic_bands, prefetch: bool
+) -> None:
+    """A cell without a band, and the dispatched cells on the other targets, resolve the whole program at
+    every probe (the 41-program behaviour); a whole program never carries rows fields."""
+    grid = 256 if prefetch else 148
+    probes = (BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1, 1024, 16384)
+    for target in TARGETS:
+        for input_format in INPUT_FORMATS:
+            for output_format in OUTPUT_FORMATS:
+                banded = target == "sm_103a" and any(
+                    (i, o) == (input_format, output_format)
+                    for i, o, *_ in SYNTHETIC_BANDS
+                )
+                if banded:
+                    continue
+                for rows in probes:
+                    program = loader.program_for(
+                        family="rmsnorm",
+                        world_size=2,
+                        input_format=input_format,
+                        output_format=output_format,
+                        rows=rows,
+                        grid=grid,
+                        target=target,
+                    )
+                    assert program not in loader.SELECT_ROWS, (
+                        target,
+                        input_format,
+                        output_format,
+                        rows,
+                    )
+                    assert loader.PROGRAMS[program][
+                        "prefetch"
+                    ] is loader.select_prefetch(rows, grid)
+                    assert loader.PROGRAMS[program]["rows_kind"] is None
+    # The rows filter does not touch the all-reduce families.
+    for target in TARGETS:
+        assert loader.program_for(
+            "allreduce", 2, "bf16", None, BAND_THRESHOLD, 148, target
+        ) == (f"tp2_oneshot_bf16{ONESHOT_BF16_FORMS[target]}")
+
+
+def test_program_for_refuses_two_bands_serving_one_call(
+    synthetic_bands, monkeypatch
+) -> None:
+    """Exactly one candidate must remain: a second band of the same cell inside the row count is refused,
+    as a cell left without a whole program is outside every band."""
+    band, whole = synthetic_bands[("bf16", "bf16", False)]
+    second = band + "_x"
+    programs = dict(loader.PROGRAMS)
+    programs[second] = dict(
+        programs[band], kernel_symbol=f"cake_fp4_allreduce_{second}"
+    )
+    bands = dict(loader.SELECT_ROWS)
+    bands[second] = dict(bands[band])
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    monkeypatch.setattr(loader, "SELECT_ROWS", bands)
+    loader.program_for.cache_clear()
+    with pytest.raises(RuntimeError, match="resolves 2 programs"):
+        loader.program_for("rmsnorm", 2, "bf16", "bf16", BAND_THRESHOLD, 148, "sm_103a")
+    assert (
+        loader.program_for(
+            "rmsnorm", 2, "bf16", "bf16", BAND_THRESHOLD - 1, 148, "sm_103a"
+        )
+        == whole
+    )
+    programs.pop(whole)
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    loader.program_for.cache_clear()
+    with pytest.raises(RuntimeError, match="resolves 0 programs"):
+        loader.program_for(
+            "rmsnorm", 2, "bf16", "bf16", BAND_THRESHOLD - 1, 148, "sm_103a"
+        )
+    loader.program_for.cache_clear()
+
+
 def test_grid_max_is_the_least_bound_of_the_programs(monkeypatch) -> None:
     """Every workspace's programs bound its grid at the CTAs its control window provisions (4096, on every
     path), and the bound of a selection is the least of its programs'."""

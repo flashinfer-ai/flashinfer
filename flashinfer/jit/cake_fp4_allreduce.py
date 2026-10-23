@@ -20,11 +20,14 @@ The programs are generated into ``csrc/cake_fp4_allreduce`` and listed in
 program per family, world size, input format, output format, phase-B variant
 and per-target build form -- the re-arm, the one-shot kernel's row-scale poll
 and launch-trigger placement, the two-shot kernel's first-load placement, bv-1
-poll grouping and pass-2 source, the fused norm's poll, quantizing pass 2 and
-sum-of-squares order, the call-state protocol and the residual prefetch -- with
-its launch facts and its grid bound; ``WINDOWS``: the receive-window contract,
-with the control words a window's programs need; ``SELECT_BV``,
-``SELECT_PREFETCH`` and ``LIMITS``: the host rules).  Every program is an exact-architecture source:
+poll grouping and pass-2 source, the fused norm's poll, quantizing pass 2,
+sum-of-squares order, pass-2 form and worker count, the call-state protocol
+and the residual prefetch -- with its launch facts and its grid bound;
+``WINDOWS``: the receive-window contract, with the control words a window's
+programs need; ``SELECT_BV``, ``SELECT_PREFETCH``, ``SELECT_ROWS`` -- the fused
+norm's rows-dispatched programs, each served instead of its call's whole
+program for one band of row counts -- and ``LIMITS``: the host rules).  Every
+program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
 B300, ``sm_107a`` for SM107 devices) with that target's flag set, without fast math and with
 ``--fmad=false``, into a module named after the program, the target and a
@@ -45,6 +48,7 @@ from typing import Any, Literal, NamedTuple, Optional
 import torch
 
 from ..compilation_context import CompilationContext
+from . import cake_fp4_allreduce_programs as _programs
 from . import env as jit_env
 from .cake_fp4_allreduce_programs import (
     LIMITS,
@@ -62,6 +66,13 @@ from .core import (
 )
 
 CakeFp4AllReduceTarget = Literal["sm_100a", "sm_103a", "sm_107a"]
+
+# SELECT_ROWS: per rows-dispatched fused-norm program, the band of row counts it
+# serves instead of the whole program of its call -- ``{"kind": "prefix" |
+# "suffix", "threshold": rows, "whole": {target: whole program}}``, the
+# threshold inclusive for both kinds (:func:`select_rows`).  A registry written
+# before the generator published the literal has no dispatched program.
+SELECT_ROWS: dict[str, dict[str, Any]] = dict(getattr(_programs, "SELECT_ROWS", {}))
 
 SOURCE_PACKAGE = "cake_fp4_allreduce"
 MODULE_PREFIX = "cake_fp4_allreduce"
@@ -311,6 +322,42 @@ def select_prefetch(rows: int, grid: int) -> bool:
     )
 
 
+def select_rows(rows: int, kind: str, threshold: int) -> bool:
+    """Whether a rows-dispatched program's band of ``kind`` at ``threshold`` serves ``rows``.
+
+    ``rows`` is the call's row count (not rows per CTA).  A ``"prefix"`` band
+    serves ``rows <= threshold``, a ``"suffix"`` band ``rows >= threshold``;
+    the threshold belongs to the band in both cases.  Every rank evaluates this
+    on the same row count, so every rank runs the same program.
+    """
+
+    if int(rows) <= 0:
+        raise ValueError(f"rows must be positive, got {rows}")
+    if kind == "prefix":
+        return int(rows) <= int(threshold)
+    if kind == "suffix":
+        return int(rows) >= int(threshold)
+    raise ValueError(f"unknown rows band kind {kind!r}; expected 'prefix' or 'suffix'")
+
+
+def _rows_candidates(candidates: tuple[str, ...], rows: int) -> tuple[str, ...]:
+    """The rows filter of :func:`program_for`: the band programs of ``SELECT_ROWS`` that
+    serve ``rows``, else the whole programs (a whole program serves the row counts outside
+    every band of its call)."""
+
+    inside = tuple(
+        program
+        for program in candidates
+        if program in SELECT_ROWS
+        and select_rows(
+            rows, SELECT_ROWS[program]["kind"], SELECT_ROWS[program]["threshold"]
+        )
+    )
+    if inside:
+        return inside
+    return tuple(program for program in candidates if program not in SELECT_ROWS)
+
+
 @functools.cache
 def program_for(
     family: str,
@@ -325,14 +372,17 @@ def program_for(
 
     The candidates are the rows of (family, world size, input format, output
     format) compiled for ``target``; when they carry phase-B variants the one
-    of :func:`select_bv` is kept, and when they carry a residual-prefetch form
-    the one of :func:`select_prefetch`.  The per-target forms -- the one-shot
-    kernel's row-scale poll, launch-trigger placement and re-arm, the two-shot
-    kernel's first-load placement, bv-1 poll grouping, pass-2 source and
-    re-arm, the fused norm's poll, quantizing pass 2 and sum-of-squares order,
-    and the call-state protocol of both -- follow from the registry's rows (a
-    target builds exactly one form of each), so this function never restates
-    them.
+    of :func:`select_bv` is kept, when they carry a residual-prefetch form the
+    one of :func:`select_prefetch`, and when one of them is a rows-dispatched
+    program (``SELECT_ROWS``) the band that serves ``rows`` is kept, else the
+    whole program (:func:`select_rows`; the prefetch form is chosen first, on
+    rows per CTA, then the band, on the call's row count).  The per-target
+    forms -- the one-shot kernel's row-scale poll, launch-trigger placement and
+    re-arm, the two-shot kernel's first-load placement, bv-1 poll grouping,
+    pass-2 source and re-arm, the fused norm's poll, pass-2 form, quantizing
+    pass 2 and sum-of-squares order, and the call-state protocol of both --
+    follow from the registry's rows (a target builds exactly one form of each),
+    so this function never restates them.
     """
 
     candidates = programs(
@@ -360,6 +410,8 @@ def program_for(
             for program in candidates
             if PROGRAMS[program]["prefetch"] == prefetch
         )
+    if any(program in SELECT_ROWS for program in candidates):
+        candidates = _rows_candidates(candidates, int(rows))
     if len(candidates) != 1:
         raise RuntimeError(
             "the Cake NVFP4-transport all-reduce registry resolves "
@@ -552,6 +604,7 @@ __all__ = [
     "SCALAR_PARAMS",
     "SELECT_BV",
     "SELECT_PREFETCH",
+    "SELECT_ROWS",
     "SOURCE_PACKAGE",
     "SUPPORTED_CAPABILITIES",
     "TARGET_CAPABILITIES",
@@ -573,6 +626,7 @@ __all__ = [
     "programs",
     "select_bv",
     "select_prefetch",
+    "select_rows",
     "supported_capability",
     "target_arch",
     "target_capabilities",
