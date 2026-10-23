@@ -99,6 +99,14 @@ fi
 #   with FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1 so a kernel is also keyed on
 #   the in-package helpers it imports, not only on its own file.
 # - The TRT-LLM DeepGEMM cache (~/.tensorrt_llm/cache), keyed on shapes only.
+#
+# Under it sits a shared layer in S3 (ci/compile_cache_s3.sh), so a new EC2
+# lease or a new runner does not start cold. CI_COMPILE_CACHE_S3_URL and
+# CI_COMPILE_CACHE_S3_LANE select the tarball every job may restore; a pull
+# request job merges it into the per-runner cache. A writer job (main pushes,
+# CI_COMPILE_CACHE_WRITER_DIR set) bypasses the per-runner cache, which pull
+# request jobs write into: it compiles in that fresh directory on top of the
+# S3 tarball alone, and the workflow uploads the result afterwards.
 
 # Containers may write as root, so the runner user may need sudo.
 remove_trees() {
@@ -121,7 +129,17 @@ prune_compile_cache() {
 }
 
 COMPILE_CACHE_DIR=""
-if [[ ${USE_GPU} == "true" && -n "${CI_COMPILE_CACHE_DIR:-}" ]]; then
+S3_RESTORE_MODE=""
+if [[ ${USE_GPU} == "true" && -n "${CI_COMPILE_CACHE_WRITER_DIR:-}" ]]; then
+    remove_trees "${CI_COMPILE_CACHE_WRITER_DIR}"
+    if mkdir -p "${CI_COMPILE_CACHE_WRITER_DIR}" 2>/dev/null; then
+        COMPILE_CACHE_DIR="${CI_COMPILE_CACHE_WRITER_DIR}"
+        S3_RESTORE_MODE="--writer"
+        echo "Compile cache: ${COMPILE_CACHE_DIR} (writer: S3 layer only)"
+    else
+        echo "WARNING: writer compile cache ${CI_COMPILE_CACHE_WRITER_DIR} is not writable; kernels will not be reused"
+    fi
+elif [[ ${USE_GPU} == "true" && -n "${CI_COMPILE_CACHE_DIR:-}" ]]; then
     CACHE_MAX_MB=${CI_COMPILE_CACHE_MAX_MB:-40960}
     CACHE_MIN_FREE_MB=${CI_COMPILE_CACHE_MIN_FREE_MB:-20480}
     if ! [[ ${CACHE_MAX_MB} =~ ^[0-9]+$ && ${CACHE_MIN_FREE_MB} =~ ^[0-9]+$ ]]; then
@@ -145,14 +163,21 @@ if [[ ${USE_GPU} == "true" && -n "${CI_COMPILE_CACHE_DIR:-}" ]]; then
             remove_trees "${CI_COMPILE_CACHE_DIR:?}"
         fi
         mkdir -p "${COMPILE_CACHE_DIR}" && touch "${COMPILE_CACHE_DIR}"
-        DOCKER_VOLUMNS="${DOCKER_VOLUMNS} -v ${COMPILE_CACHE_DIR}:/compile-cache"
-        DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_WORKSPACE_BASE=/compile-cache/flashinfer"
-        DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1"
-        DOCKER_ENV="${DOCKER_ENV} -e CUTE_DSL_CACHE_DIR=/tmp/cute-dsl-cache"
-        DOCKER_ENV="${DOCKER_ENV} -e TRITON_CACHE_DIR=/compile-cache/triton"
     else
         echo "WARNING: compile cache ${CI_COMPILE_CACHE_DIR} is not writable; kernels will not be reused"
     fi
+fi
+if [ -n "${COMPILE_CACHE_DIR}" ]; then
+    if [[ -n "${CI_COMPILE_CACHE_S3_URL:-}" && -n "${CI_COMPILE_CACHE_S3_LANE:-}" ]]; then
+        bash "${SCRIPT_DIR}/compile_cache_s3.sh" restore "${CI_COMPILE_CACHE_S3_URL}" \
+            "${DOCKER_IMAGE_NAME}" "${CI_COMPILE_CACHE_S3_LANE}" "${COMPILE_CACHE_DIR}" \
+            ${S3_RESTORE_MODE} || true
+    fi
+    DOCKER_VOLUMNS="${DOCKER_VOLUMNS} -v ${COMPILE_CACHE_DIR}:/compile-cache"
+    DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_WORKSPACE_BASE=/compile-cache/flashinfer"
+    DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1"
+    DOCKER_ENV="${DOCKER_ENV} -e CUTE_DSL_CACHE_DIR=/tmp/cute-dsl-cache"
+    DOCKER_ENV="${DOCKER_ENV} -e TRITON_CACHE_DIR=/compile-cache/triton"
 fi
 
 # Use nvidia-docker if the container is GPU.
