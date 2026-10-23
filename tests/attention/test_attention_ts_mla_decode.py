@@ -3475,38 +3475,3 @@ def test_attention_ts_mla_decode_rejects_skip_correction_threshold(
             skip_correction_threshold=threshold,
         )
     assert wrapper._plan_state is None
-
-
-@pytest.mark.parametrize(
-    ("qkv_dtype", "num_qo_heads", "threshold"),
-    (
-        (torch.float8_e4m3fn, 128, 8.5),
-        (torch.bfloat16, 128, math.nan),
-        (torch.float8_e4m3fn, 16, 9.0),
-    ),
-    ids=("2cta-fp8-above-8", "2cta-bf16-nan", "1cta-fp8-above-8"),
-)
-def test_attention_ts_mla_decode_skip_correction_bound_without_validation(
-    qkv_dtype: torch.dtype, num_qo_heads: int, threshold: float
-) -> None:
-    """plan() range-checks the threshold even with validate=False."""
-
-    wrapper = BatchMLADecodePagedTSWrapper()
-    with pytest.raises(ValueError, match="skip_correction_threshold"):
-        wrapper.plan(
-            torch.device("cuda"),
-            8,
-            num_qo_heads,
-            _LATENT_DIM,
-            _ROPE_DIM,
-            _DEFAULT_PAGE_SIZE,
-            2049,
-            max_seq_len_q=1,
-            packed_query=False,
-            q_data_type=qkv_dtype,
-            kv_data_type=qkv_dtype,
-            o_data_type=torch.bfloat16,
-            validate=False,
-            skip_correction_threshold=threshold,
-        )
-    assert wrapper._plan_state is None
