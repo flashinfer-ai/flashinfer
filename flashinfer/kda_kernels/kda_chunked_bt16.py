@@ -76,12 +76,11 @@ initial state first, followed by states at interior interval boundaries.  With
 indices, completed boundaries (including an aligned final boundary, excluding
 the initial state) are written directly to the selected rows of `state_ckpt`.
 
-Reproducing the results::
+Timing protocol of the reported numbers::
 
-    # timing protocol used for the reported numbers: engine route =
-    # CUPTI/Kineto device-time sum; decomp route = back-to-back wall clock
-    # with one synchronize at the end (per-launch syncs both add ~10us of
-    # launch overhead per sample and serialize the two kernels' tail).
+    # engine route = CUPTI/Kineto device-time sum; decomp route = back-to-back
+    # wall clock with one synchronize at the end (per-launch syncs both add
+    # ~10us of launch overhead per sample and serialize the two kernels' tail).
 """
 
 import weakref
