@@ -1164,9 +1164,8 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
     softmax_scale = ln 2 makes one logit unit one binade. Successive 256-slot
     groups, repeating every 1024 slots, raise the row maximum by threshold - 2
     (kept anchor), by more than threshold (rescale) and by threshold - 2 again.
-    A 256-slot group spans one K tile of each of two interleaved KV streams,
-    and every split covers at least two groups, so each stream or split ends
-    on a kept anchor. E4M3 bounds use the 1.75 probability scale.
+    Every split covers at least two groups, so each split ends on a kept
+    anchor. E4M3 bounds use the 1.75 probability scale.
     """
     torch.manual_seed(7)
     fp8 = dtype == torch.float8_e4m3fn
@@ -1191,6 +1190,15 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
     _, profile, *_ = _resolve_sparse_mla_plan(
         q.device, rows, heads, **args, skip_correction_threshold=None
     )
+    # An explicit value, including zero, replaces the schedule's deferral and
+    # reaches the kernel; the bitwise check below cannot see a dropped value
+    # on deferred schedules.
+    for value in (0.0, threshold):
+        _, explicit, spec, *_ = _resolve_sparse_mla_plan(
+            q.device, rows, heads, **args, skip_correction_threshold=value
+        )
+        assert not explicit.defer_max_update
+        assert spec.kernel.skip_corr_threshold == value
     results = {}
     for value in (None, threshold):
         wrapper = BatchSparseMLADecodePagedTSWrapper()
@@ -1200,6 +1208,16 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
             q, kv, **meta, sinks=sinks, softmax_scale=softmax_scale
         )
     out, lse = results[threshold]
+    eager, eager_lse = batch_sparse_mla_decode_with_paged_kv_cache(
+        q,
+        kv,
+        **meta,
+        sinks=sinks,
+        softmax_scale=softmax_scale,
+        return_lse=True,
+        skip_correction_threshold=threshold,
+    )
+    assert torch.equal(out, eager) and torch.equal(lse, eager_lse)
     ref, ref_lse, bound = _reference(
         q,
         kv,
@@ -1232,6 +1250,8 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
         (torch.bfloat16, 33.0, ValueError),
         (torch.bfloat16, -1.0, ValueError),
         (torch.bfloat16, True, TypeError),
+        (torch.bfloat16, float("nan"), ValueError),
+        (torch.float8_e4m3fn, float("inf"), ValueError),
     ],
 )
 def test_skip_correction_threshold_rejected(dtype, threshold, error):

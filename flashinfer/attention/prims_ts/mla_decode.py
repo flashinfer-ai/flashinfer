@@ -2404,8 +2404,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         behavior: some BF16 schedules keep the row anchor while a K tile
         raises it by at most 6 binades, and all others rescale on every new
         maximum. An explicit value applies to every schedule; ``0.0``
-        disables the skip, and a positive value also quantizes E4M3 P at
-        1.75 instead of 448, with the precision cost described there.
+        disables the skip (slower than ``None`` on the deferred BF16
+        schedules), and a positive value also quantizes E4M3 P at 1.75
+        instead of 448, with the precision cost described there.
         """
         (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
