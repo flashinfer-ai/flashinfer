@@ -1011,9 +1011,21 @@ BAND_THRESHOLD = 6144
 # fused-norm cell, the band kind, the name token and the record keys the band deviates in.  A prefix band
 # serves rows <= threshold, a suffix band rows >= threshold (both inclusive); the whole program serves
 # the other row counts.
+# (input format, output format, band kind, name token, the band record's keys over the whole program's record,
+# the whole program record's own keys): the third pair's whole program and band differ in more than one key --
+# the whole program triggers the dependent grid early, the band runs the direct pass 2 on eleven workers with the
+# plain trigger -- and the rows filter pairs them by cell all the same.
 SYNTHETIC_BANDS = (
-    ("nvfp4", "bf16", "prefix", "_sop", {"ss_order": "perm"}),
-    ("bf16", "bf16", "suffix", "_w11", {"workers": 11, "block": 384}),
+    ("nvfp4", "bf16", "prefix", "_sop", {"ss_order": "perm"}, {}),
+    ("bf16", "bf16", "suffix", "_w11", {"workers": 11, "block": 384}, {}),
+    (
+        "bf16",
+        "nvfp4",
+        "suffix",
+        "_p2d_w11",
+        {"pass2": "direct", "workers": 11, "early_launch": False, "block": 384},
+        {"early_launch": True},
+    ),
 )
 
 
@@ -1048,13 +1060,14 @@ def synthetic_bands(monkeypatch):
     }
     bands: dict[str, dict] = {}
     cells: dict[tuple[str, str, bool], tuple[str, str]] = {}
-    for input_format, output_format, kind, token, extra in SYNTHETIC_BANDS:
+    for input_format, output_format, kind, token, extra, whole_extra in SYNTHETIC_BANDS:
         for prefetch in (False, True):
             whole = _whole_program(target, input_format, output_format, prefetch)
             name = whole.replace("_pf", "") + token + ("_pf" if prefetch else "")
             assert name not in programs
+            programs[whole] = {**programs[whole], **whole_extra}
             programs[name] = {
-                **PROGRAMS[whole],
+                **programs[whole],
                 **extra,
                 "targets": (target,),
                 "kernel_symbol": f"cake_fp4_allreduce_{name}",
@@ -1138,7 +1151,7 @@ def test_program_for_dispatches_the_band_inside_its_rows(
 ) -> None:
     """At threshold - 1 / threshold / threshold + 1 a prefix band's program is served / served / not served
     and a suffix band's not served / served / served, the whole program otherwise; the prefetch form is
-    chosen first (rows per CTA), the band on the call's row count."""
+    chosen first (rows per CTA), the band on the call's row count, however many keys the pair differs in."""
     target = "sm_103a"
     grid = (
         256 if prefetch else 148
@@ -1146,7 +1159,7 @@ def test_program_for_dispatches_the_band_inside_its_rows(
     probes = (BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1)
     for rows in probes:
         assert loader.select_prefetch(rows, grid) is prefetch
-    for input_format, output_format, kind, _, extra in SYNTHETIC_BANDS:
+    for input_format, output_format, kind, _, extra, whole_extra in SYNTHETIC_BANDS:
         band, whole = synthetic_bands[(input_format, output_format, prefetch)]
         expected = (band, band, whole) if kind == "prefix" else (whole, band, band)
         for rows, program in zip(probes, expected, strict=True):
@@ -1186,6 +1199,10 @@ def test_program_for_dispatches_the_band_inside_its_rows(
         assert (record["rows_kind"], record["rows_threshold"]) == (kind, BAND_THRESHOLD)
         for key, value in extra.items():
             assert record[key] == value
+        # The whole program's own keys stay its own: a pair differing in several keys is still one cell.
+        for key, value in whole_extra.items():
+            assert loader.PROGRAMS[whole][key] == value, (whole, key)
+            assert record[key] != value, (band, key)
         assert loader.PROGRAMS[whole]["rows_kind"] is None
         assert loader.SELECT_ROWS[band]["whole"][target] == whole
 
