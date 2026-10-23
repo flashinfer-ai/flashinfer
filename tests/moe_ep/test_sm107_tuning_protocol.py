@@ -1,6 +1,7 @@
 """Rubin cache compatibility and deferred automatic tuning without a GPU."""
 
 import dataclasses
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,6 +12,7 @@ from flashinfer import autotune, autotune_v2
 from flashinfer.autotuner import AutoTuner
 from flashinfer.moe_ep import BootstrapConfig, FleetParams
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
 from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
     autotune as native,
     block_scaled,
@@ -98,7 +100,16 @@ def state(monkeypatch, tmp_path):
     tuner._managed_stores.clear()
 
 
-def test_deferred_search_persistence_and_shared_hit_file_output(state, tmp_path):
+@pytest.mark.parametrize("routing_before_fc2", [False, True])
+def test_deferred_search_persistence_and_shared_hit_file_output(
+    state, tmp_path, routing_before_fc2
+):
+    state.workspace.config = dataclasses.replace(
+        state.workspace.config, apply_routing_weights_before_fc2=routing_before_fc2
+    )
+    other = {"backend_revision": "other-backend", "knobs": {}, "max_tokens": 64}
+    contents = json.dumps({"version": KNOB_CACHE_VERSION, "entries": [other]})
+    state.path.write_text(contents)
     assert state.run() is None
     state.sweep.assert_not_called()
     with autotune(True, skip_ops={tuning_protocol.NAMESPACE}):
@@ -109,13 +120,19 @@ def test_deferred_search_persistence_and_shared_hit_file_output(state, tmp_path)
         assert list((tmp_path / "managed").glob("v2/*/entries/*.json"))
     state.sweep.assert_called_once()
     state.workspace.install_tuned_knobs.assert_called_once()
-    state.path.unlink()
+    cache = json.loads(state.path.read_text())
+    assert cache["version"] == KNOB_CACHE_VERSION
+    assert other in cache["entries"]
+    record = next(e for e in cache["entries"] if e != other)
+    assert record["apply_routing_weights_before_fc2"] is routing_before_fc2
+    assert "apply_topk_at_fc1" not in record
+    state.path.write_text(contents)
     state.tuner.clear_cache()
     state.tuner._managed_cache = None
     state.tuner._managed_stores.clear()
     with autotune_v2(mode="replay"):
         assert state.run() == {"fc2_use_bulk": False}
-    assert state.path.is_file()
+    assert json.loads(state.path.read_text()) == cache
     state.sweep.assert_called_once()
     assert state.workspace.install_tuned_knobs.call_count == 2
 
@@ -157,6 +174,14 @@ def test_record_fallback_and_numerical_contract_are_shared(state):
         )
     assert state.run() == {"fc2_use_bulk": True}
     state.sweep.assert_not_called()
+    state.workspace.config = dataclasses.replace(
+        state.workspace.config, apply_routing_weights_before_fc2=False
+    )
+    with autotune_v2(mode="replay"):
+        assert state.run() is None
+    state.workspace.config = dataclasses.replace(
+        state.workspace.config, apply_routing_weights_before_fc2=True
+    )
     # Identical geometry with a different activation must not reuse a record.
     state.workspace.config = dataclasses.replace(
         state.workspace.config, activation="situ", situ_beta=1.0, situ_linear_beta=1.0
@@ -185,6 +210,29 @@ def test_record_fallback_and_numerical_contract_are_shared(state):
     knob_cache.write_record(entries[1])
     with autotune(False):
         assert state.run() == {"fc2_use_bulk": True}
+
+
+@pytest.mark.parametrize("routing_before_fc2", [False, True])
+def test_native_cache_keyword_aliases(state, routing_before_fc2):
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    query = {
+        **protocol._query(4),
+        "apply_routing_weights_before_fc2": routing_before_fc2,
+    }
+    legacy_query = dict(query)
+    legacy_query["apply_topk_at_fc1"] = legacy_query.pop(
+        "apply_routing_weights_before_fc2"
+    )
+    knobs = {"fc2_use_bulk": False}
+    with pytest.warns(DeprecationWarning, match="apply_topk_at_fc1"):
+        knob_cache.record_knobs(knobs, **legacy_query)
+    assert knob_cache.lookup_knobs(**query) == knobs
+    with pytest.warns(DeprecationWarning, match="apply_topk_at_fc1"):
+        assert knob_cache.lookup_knobs(**legacy_query) == knobs
+    cache = json.loads(state.path.read_text())
+    assert cache["version"] == KNOB_CACHE_VERSION
+    assert cache["entries"][0]["apply_routing_weights_before_fc2"] is routing_before_fc2
+    assert "apply_topk_at_fc1" not in cache["entries"][0]
 
 
 @pytest.mark.parametrize("change", ["backend_revision", "environment", "resources"])
