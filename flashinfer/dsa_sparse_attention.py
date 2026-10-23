@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import os
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -112,7 +112,7 @@ def dsa_sparse_attention(
     return_lse: bool = False,
     key_passes: Optional[int] = None,
     backend: str = "cake",
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[Union[torch.Tensor, Callable]] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: Optional[bool] = None,
@@ -174,13 +174,20 @@ def dsa_sparse_attention(
         deterministic and the dK/dV accumulation is unchanged.
     backend : str
         Only ``"cake"``.
-    dkv_acc : Optional[torch.Tensor]
+    dkv_acc : Optional[torch.Tensor | Callable]
         Caller-owned FP32 ``[S_dst, >= 576]`` buffer (row stride a multiple of
         4 elements, 16-byte aligned) into which the backward accumulates the
         key gradients in place (``+=``; the caller zeroes it): latent
         dimensions in columns ``0:512``, rope dimensions in ``512:576``.  When
         given, the ``kv_latent`` / ``k_rope`` gradients of the autograd call
-        are ``None`` and no BF16 cast runs.
+        are ``None`` and no BF16 cast runs.  Instead of the tensor, a
+        zero-argument callable that returns it -- or an ``(accumulator,
+        dkv_dst_map)`` pair -- may be given; the backward calls it, so the
+        accumulator need not exist at forward time (under activation
+        checkpointing a tensor passed at forward time is alive for every
+        layer at once).  The autograd entries save every tensor they produce
+        for the backward through ``ctx.save_for_backward`` and retain nothing
+        else of a checkpointed forward; a tensor ``dkv_acc`` stays caller-owned.
     dkv_dst_map : Optional[torch.Tensor]
         int32 ``[S]`` destination row of ``dkv_acc`` for every key row
         (default identity).  Repeated destinations are allowed (the rows of a
@@ -273,7 +280,7 @@ def dsa_sparse_attention_varlen(
     return_lse: bool = False,
     key_passes: Optional[int] = None,
     backend: str = "cake",
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[Union[torch.Tensor, Callable]] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: Optional[bool] = None,
@@ -357,7 +364,7 @@ def dsa_sparse_attention_nope(
     return_lse: bool = False,
     key_passes: Optional[int] = None,
     backend: str = "cake",
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[Union[torch.Tensor, Callable]] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: Optional[bool] = None,
@@ -411,14 +418,21 @@ def dsa_sparse_attention_nope(
         dK + dV accumulation is unchanged.
     backend : str
         Only ``"cake"``.
-    dkv_acc : Optional[torch.Tensor]
+    dkv_acc : Optional[torch.Tensor | Callable]
         Caller-owned FP32 ``[S_dst, >= 512]`` buffer (row stride a multiple of
         4 elements and at least 512, 16-byte-aligned base) into which the
         backward accumulates ``dK + dV`` in place (``+=`` into columns
         ``0:512``; the caller zeroes it).  When given, the ``kv`` gradient of
         the autograd call is ``None``.  Chunked backward passes over one long
         row accumulate into one such buffer in FP32 with no intermediate
-        rounding.
+        rounding.  Instead of the tensor, a zero-argument callable that
+        returns it -- or an ``(accumulator, dkv_dst_map)`` pair -- may be
+        given; the backward calls it, so the accumulator need not exist at
+        forward time (under activation checkpointing a tensor passed at
+        forward time is alive for every layer at once).  The autograd entries
+        save every tensor they produce for the backward through
+        ``ctx.save_for_backward`` and retain nothing else of a checkpointed
+        forward; a tensor ``dkv_acc`` stays caller-owned.
     dkv_dst_map : Optional[torch.Tensor]
         int32 ``[S]`` destination row of ``dkv_acc`` for every key row
         (default identity).  Repeated destinations are allowed and combined
@@ -513,7 +527,7 @@ def dsa_sparse_attention_nope_varlen(
     return_lse: bool = False,
     key_passes: Optional[int] = None,
     backend: str = "cake",
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[Union[torch.Tensor, Callable]] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: Optional[bool] = None,
