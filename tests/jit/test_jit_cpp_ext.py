@@ -384,10 +384,52 @@ def test_xqa_mtp_decode_supports_hopper_q_len_two(monkeypatch):
     assert not is_supported(logits_soft_cap=1.0)
     assert not is_supported(fixed_split_size=1)
     assert not is_supported(has_jit_module=True)
+    assert not is_supported(uses_cudnn=True)
+    assert not is_supported(use_token_head_sf=True)
+    assert not is_supported(disable_split_kv=True)
+    assert is_supported(o_data_type=torch.bfloat16)
+    assert not is_supported(o_data_type=torch.float16)
+    assert not is_supported(o_data_type=torch.float8_e4m3fn)
     monkeypatch.setattr(
         flashinfer.decode, "get_compute_capability", lambda device: (8, 0)
     )
     assert not is_supported()
+
+
+def test_xqa_mtp_fast_plan_refreshes_metadata():
+    calls = []
+
+    def plan_impl(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "refreshed"
+
+    wrapper = SimpleNamespace(
+        _backend="fa2",
+        _requested_backend="fa2",
+        _cudnn_auto=False,
+        _use_xqa_mtp_decode=True,
+        _plan_impl=plan_impl,
+    )
+    indptr = torch.tensor([0, 2], dtype=torch.int32)
+    indices = torch.tensor([0, 1], dtype=torch.int32)
+    last_page_len = torch.tensor([16], dtype=torch.int32)
+    result = flashinfer.decode.fast_decode_plan(
+        wrapper,
+        indptr,
+        indices,
+        last_page_len,
+        32,
+        8,
+        128,
+        16,
+        q_len_per_req=2,
+    )
+    assert result == "refreshed"
+    assert len(calls) == 1
+    assert calls[0][0][0] is indptr
+    assert calls[0][0][1] is indices
+    assert calls[0][0][2] is last_page_len
+    assert calls[0][1]["q_len_per_req"] == 2
 
 
 def test_xqa_mtp_causal_mask_q_len_two():

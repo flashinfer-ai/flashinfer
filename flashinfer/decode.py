@@ -955,8 +955,17 @@ def _is_xqa_mtp_decode_supported(
     logits_soft_cap: float,
     fixed_split_size: int,
     has_jit_module: bool,
+    *,
+    uses_cudnn: bool = False,
+    use_token_head_sf: bool = False,
+    disable_split_kv: bool = False,
+    o_data_type: Optional[torch.dtype] = None,
 ) -> bool:
-    if not use_tensor_cores or has_jit_module:
+    if not use_tensor_cores or has_jit_module or uses_cudnn:
+        return False
+    if use_token_head_sf or disable_split_kv:
+        return False
+    if o_data_type is not None and o_data_type != q_data_type:
         return False
     if backend not in ("auto", "fa2", "fa3"):
         return False
@@ -2405,6 +2414,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             logits_soft_cap,
             fixed_split_size,
             self._jit_module is not None,
+            uses_cudnn=self._uses_cudnn,
+            use_token_head_sf=use_token_head_sf,
+            disable_split_kv=disable_split_kv,
+            o_data_type=o_data_type,
         )
         self._xqa_mtp_causal_mask = None
         self._xqa_mtp_q_len_per_req = q_len_per_req
@@ -5263,7 +5276,9 @@ def fast_decode_plan(
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
-    if wants_cudnn or self._cudnn_auto:
+    if wants_cudnn or self._cudnn_auto or getattr(self, "_use_xqa_mtp_decode", False):
+        # XQA needs its KV lengths and block table refreshed by the regular
+        # planner too; the FA2 copy-elision path leaves that metadata stale.
         # cuDNN (explicit or auto), and an auto wrapper leaving cuDNN, go
         # through the regular planner: it refreshes cuDNN's KV lengths and
         # block table (compatible prepared graphs are reused) or builds the
