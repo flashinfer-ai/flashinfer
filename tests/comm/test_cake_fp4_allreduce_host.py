@@ -1041,7 +1041,11 @@ def synthetic_bands(monkeypatch):
     the whole program per target.  Yields ``{(input_format, output_format, prefetch): (band, whole)}``."""
 
     target = "sm_103a"
-    programs = dict(loader.PROGRAMS)
+    # Every record carries the band keys (None for a whole program), as the generator writes them.
+    programs = {
+        name: {"rows_kind": None, "rows_threshold": None, **record}
+        for name, record in loader.PROGRAMS.items()
+    }
     bands: dict[str, dict] = {}
     cells: dict[tuple[str, str, bool], tuple[str, str]] = {}
     for input_format, output_format, kind, token, extra in SYNTHETIC_BANDS:
