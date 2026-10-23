@@ -15,7 +15,7 @@
  */
 
 // Host launcher of the Cake FP4-transport all-reduce family program
-// tp2_rmsnorm_nvfp4_mxfp8_pa_csp_sop: tensor-metadata checks, the one-time dynamic shared-memory
+// tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop: tensor-metadata checks, the one-time dynamic shared-memory
 // opt-in and one launch.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -27,7 +27,7 @@
 using tvm::ffi::TensorView;
 
 // clang-format off
-extern "C" __global__ void cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_csp_sop(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias);
+extern "C" __global__ void cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias);
 // clang-format on
 
 namespace {
@@ -35,15 +35,14 @@ namespace {
 constexpr int64_t kWorldSize = 2;
 constexpr int64_t kCapMax = 103563;
 constexpr int64_t kGridMax = 4096;
-constexpr int64_t kRecordBytes = 3456;
 constexpr int64_t kHidden = 6144;
-constexpr int64_t kOutRowBytes = 6144;
-constexpr int64_t kScalesPerRow = 192;
+constexpr int64_t kOutRowBytes = 3072;
+constexpr int64_t kScalesPerRow = 384;
 constexpr int64_t kScaleRowTile = 128;
 constexpr int64_t kTableEntries = 4;
 constexpr int64_t kCtrlWords = 16384;
-constexpr unsigned kThreads = 288;
-constexpr unsigned kDynamicSmemBytes = 211456;
+constexpr unsigned kThreads = 352;
+constexpr unsigned kDynamicSmemBytes = 226176;
 
 int64_t byte_size(const TensorView& t) { return t.numel() * get_element_size(t); }
 
@@ -54,10 +53,10 @@ bool is_matrix(const TensorView& t, int64_t rows, int64_t cols) {
 
 }  // namespace
 
-void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorView outq,
-         TensorView out_sf, TensorView gs_out, TensorView res_out, TensorView os_wire,
-         TensorView os_rs, TensorView peer_ptrs, TensorView ctrl, int64_t rank, int64_t rows,
-         int64_t cap, double eps, double wbias, int64_t grid_x, bool launch_with_pdl) {
+void run(TensorView x, TensorView res_in, TensorView w, TensorView outq, TensorView out_sf,
+         TensorView gs_out, TensorView res_out, TensorView os_wire, TensorView os_rs,
+         TensorView peer_ptrs, TensorView ctrl, int64_t rank, int64_t rows, int64_t cap, double eps,
+         double wbias, int64_t grid_x, bool launch_with_pdl) {
   TVM_FFI_CHECK(rank >= 0 && rank < kWorldSize, ValueError)
       << "rank must be in [0, " << kWorldSize << "), got " << rank;
   TVM_FFI_CHECK(cap >= 1 && cap <= kCapMax, ValueError)
@@ -68,40 +67,34 @@ void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorVi
       << "grid_x must be in [1, " << kGridMax << "], got " << grid_x;
   const int64_t wire_bytes = 20736 * cap;
   const int64_t rsplane_bytes = 96 * cap;
-  check_cuda_tensor(xq, "xq");
-  check_dtype(xq, dl_uint8, "xq");
-  check_contiguous(xq, "xq");
-  TVM_FFI_CHECK(is_matrix(xq, rows, kRecordBytes), ValueError)
-      << "xq must be [rows, " << kRecordBytes << "] NVFP4 records with rows = " << rows;
-  check_cuda_tensor(gs, "gs");
-  check_dtype(gs, dl_float32, "gs");
-  check_contiguous(gs, "gs");
-  check_same_device(gs, xq, "gs", "xq");
-  TVM_FFI_CHECK(gs.numel() >= kWorldSize, ValueError)
-      << "gs must hold one global scale per rank (" << kWorldSize << "), got " << gs.numel();
+  check_cuda_tensor(x, "x");
+  check_dtype(x, dl_bfloat16, "x");
+  check_contiguous(x, "x");
+  TVM_FFI_CHECK(is_matrix(x, rows, kHidden), ValueError)
+      << "x must be [rows, " << kHidden << "] with rows = " << rows;
   check_cuda_tensor(res_in, "res_in");
   check_dtype(res_in, dl_bfloat16, "res_in");
   check_contiguous(res_in, "res_in");
-  check_same_device(res_in, xq, "res_in", "xq");
+  check_same_device(res_in, x, "res_in", "x");
   TVM_FFI_CHECK(is_matrix(res_in, rows, kHidden), ValueError)
       << "res_in must be [rows, " << kHidden << "] with rows = " << rows;
   check_cuda_tensor(w, "w");
   check_dtype(w, dl_bfloat16, "w");
   check_contiguous(w, "w");
-  check_same_device(w, xq, "w", "xq");
+  check_same_device(w, x, "w", "x");
   TVM_FFI_CHECK(w.numel() == kHidden, ValueError)
       << "w must hold " << kHidden << " weights, got " << w.numel();
   check_cuda_tensor(outq, "outq");
-  TVM_FFI_CHECK(outq.dtype() == dl_uint8 || outq.dtype() == dl_float8_e4m3fn, TypeError)
-      << "outq must be uint8 or float8_e4m3fn";
+  check_dtype(outq, dl_uint8, "outq");
   check_contiguous(outq, "outq");
-  check_same_device(outq, xq, "outq", "xq");
+  check_same_device(outq, x, "outq", "x");
   TVM_FFI_CHECK(is_matrix(outq, rows, kOutRowBytes), ValueError)
       << "outq must be [rows, " << kOutRowBytes << "] quantized values with rows = " << rows;
   check_cuda_tensor(out_sf, "out_sf");
-  check_dtype(out_sf, dl_uint8, "out_sf");
+  TVM_FFI_CHECK(out_sf.dtype() == dl_uint8 || out_sf.dtype() == dl_float8_e4m3fn, TypeError)
+      << "out_sf must be uint8 or float8_e4m3fn";
   check_contiguous(out_sf, "out_sf");
-  check_same_device(out_sf, xq, "out_sf", "xq");
+  check_same_device(out_sf, x, "out_sf", "x");
   const int64_t sf_rows = (rows + kScaleRowTile - 1) / kScaleRowTile * kScaleRowTile;
   const int64_t scale_bytes = sf_rows * kScalesPerRow;
   TVM_FFI_CHECK(byte_size(out_sf) >= scale_bytes, ValueError)
@@ -110,30 +103,30 @@ void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorVi
   check_cuda_tensor(gs_out, "gs_out");
   check_dtype(gs_out, dl_float32, "gs_out");
   check_contiguous(gs_out, "gs_out");
-  check_same_device(gs_out, xq, "gs_out", "xq");
+  check_same_device(gs_out, x, "gs_out", "x");
   TVM_FFI_CHECK(gs_out.numel() >= 1, ValueError) << "gs_out must hold the output global scale";
   check_cuda_tensor(res_out, "res_out");
   check_dtype(res_out, dl_bfloat16, "res_out");
   check_contiguous(res_out, "res_out");
-  check_same_device(res_out, xq, "res_out", "xq");
+  check_same_device(res_out, x, "res_out", "x");
   TVM_FFI_CHECK(is_matrix(res_out, rows, kHidden), ValueError)
       << "res_out must be [rows, " << kHidden << "] with rows = " << rows;
   check_cuda_tensor(os_wire, "os_wire");
   check_contiguous(os_wire, "os_wire");
-  check_same_device(os_wire, xq, "os_wire", "xq");
+  check_same_device(os_wire, x, "os_wire", "x");
   TVM_FFI_CHECK(byte_size(os_wire) >= wire_bytes, ValueError)
       << "os_wire must hold at least " << wire_bytes << " bytes at cap = " << cap << ", got "
       << byte_size(os_wire);
   check_cuda_tensor(os_rs, "os_rs");
   check_contiguous(os_rs, "os_rs");
-  check_same_device(os_rs, xq, "os_rs", "xq");
+  check_same_device(os_rs, x, "os_rs", "x");
   TVM_FFI_CHECK(byte_size(os_rs) >= rsplane_bytes, ValueError)
       << "os_rs must hold at least " << rsplane_bytes << " bytes at cap = " << cap << ", got "
       << byte_size(os_rs);
   check_cuda_tensor(peer_ptrs, "peer_ptrs");
   check_dtype(peer_ptrs, dl_int64, "peer_ptrs");
   check_contiguous(peer_ptrs, "peer_ptrs");
-  check_same_device(peer_ptrs, xq, "peer_ptrs", "xq");
+  check_same_device(peer_ptrs, x, "peer_ptrs", "x");
   TVM_FFI_CHECK(peer_ptrs.numel() == kTableEntries, ValueError)
       << "peer_ptrs must hold exactly " << kTableEntries << " window addresses, got "
       << peer_ptrs.numel();
@@ -141,21 +134,20 @@ void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorVi
   TVM_FFI_CHECK(ctrl.dtype() == dl_uint32 || ctrl.dtype() == dl_int32, TypeError)
       << "ctrl must be uint32 or int32";
   check_contiguous(ctrl, "ctrl");
-  check_same_device(ctrl, xq, "ctrl", "xq");
+  check_same_device(ctrl, x, "ctrl", "x");
   TVM_FFI_CHECK(ctrl.numel() == kCtrlWords, ValueError)
       << "ctrl must hold exactly " << kCtrlWords << " control words, got " << ctrl.numel();
-  const DLDevice device = xq.device();
+  const DLDevice device = x.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const cudaStream_t stream = get_stream(device);
   const void* kernel =
-      reinterpret_cast<const void*>(&cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_csp_sop);
+      reinterpret_cast<const void*>(&cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop);
   static const cudaError_t smem_status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicSmemBytes));
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
       << "cudaFuncSetAttribute(MaxDynamicSharedMemorySize) failed: "
       << cudaGetErrorString(smem_status);
-  void* p_xq = xq.data_ptr();
-  void* p_gs = gs.data_ptr();
+  void* p_x = x.data_ptr();
   void* p_res_in = res_in.data_ptr();
   void* p_w = w.data_ptr();
   void* p_outq = outq.data_ptr();
@@ -171,24 +163,23 @@ void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorVi
   int32_t v_cap = static_cast<int32_t>(cap);
   float v_eps = static_cast<float>(eps);
   float v_wbias = static_cast<float>(wbias);
-  void* args[17];
-  args[0] = &p_xq;
-  args[1] = &p_gs;
-  args[2] = &p_res_in;
-  args[3] = &p_w;
-  args[4] = &p_outq;
-  args[5] = &p_out_sf;
-  args[6] = &p_gs_out;
-  args[7] = &p_res_out;
-  args[8] = &p_os_wire;
-  args[9] = &p_os_rs;
-  args[10] = &p_peer_ptrs;
-  args[11] = &p_ctrl;
-  args[12] = &v_rank;
-  args[13] = &v_rows;
-  args[14] = &v_cap;
-  args[15] = &v_eps;
-  args[16] = &v_wbias;
+  void* args[16];
+  args[0] = &p_x;
+  args[1] = &p_res_in;
+  args[2] = &p_w;
+  args[3] = &p_outq;
+  args[4] = &p_out_sf;
+  args[5] = &p_gs_out;
+  args[6] = &p_res_out;
+  args[7] = &p_os_wire;
+  args[8] = &p_os_rs;
+  args[9] = &p_peer_ptrs;
+  args[10] = &p_ctrl;
+  args[11] = &v_rank;
+  args[12] = &v_rows;
+  args[13] = &v_cap;
+  args[14] = &v_eps;
+  args[15] = &v_wbias;
   cudaLaunchAttribute attrs[1]{};
   unsigned num_attrs = 0;
   if (launch_with_pdl) {
@@ -205,7 +196,7 @@ void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorVi
   config.numAttrs = num_attrs;
   const cudaError_t status = cudaLaunchKernelExC(&config, kernel, args);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_csp_sop launch failed: "
+      << "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop launch failed: "
       << cudaGetErrorString(status);
 }
 

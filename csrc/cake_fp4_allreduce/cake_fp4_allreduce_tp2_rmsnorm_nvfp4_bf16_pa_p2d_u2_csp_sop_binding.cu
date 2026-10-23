@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-// Host launcher of the Cake FP4-transport all-reduce family program tp2_rmsnorm_nvfp4_bf16_csp_sop:
-// tensor-metadata checks, the one-time dynamic shared-memory opt-in and one launch.
+// Host launcher of the Cake FP4-transport all-reduce family program
+// tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop: tensor-metadata checks, the one-time dynamic
+// shared-memory opt-in and one launch.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -26,7 +27,7 @@
 using tvm::ffi::TensorView;
 
 // clang-format off
-extern "C" __global__ void cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_csp_sop(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias);
+extern "C" __global__ void cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias);
 // clang-format on
 
 namespace {
@@ -129,7 +130,7 @@ void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorVi
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const cudaStream_t stream = get_stream(device);
   const void* kernel =
-      reinterpret_cast<const void*>(&cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_csp_sop);
+      reinterpret_cast<const void*>(&cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop);
   static const cudaError_t smem_status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicSmemBytes));
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
@@ -182,7 +183,7 @@ void run(TensorView xq, TensorView gs, TensorView res_in, TensorView w, TensorVi
   config.numAttrs = num_attrs;
   const cudaError_t status = cudaLaunchKernelExC(&config, kernel, args);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_csp_sop launch failed: "
+      << "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop launch failed: "
       << cudaGetErrorString(status);
 }
 

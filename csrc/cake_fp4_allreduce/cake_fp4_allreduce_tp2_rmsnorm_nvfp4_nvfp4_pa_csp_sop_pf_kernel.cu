@@ -416,15 +416,10 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     uint32_t _sysv_u32_5;
                     asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_u32_5) : "l"(reinterpret_cast<unsigned int*>(os_wire + (s_row + (long long)(4 * (pp_4 >> 1))))) : "memory");
                     ps[5] = _sysv_u32_5 >> (unsigned int)(16 * (pp_4 & 1)) & 65535;
-                    uint32_t _sysv_poll32_group_0[1];
-                    do {
-                        asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
-                    } while (
-                        (_sysv_poll32_group_0[0] == 0x80000000u)
-                    );
-                    float rs_peer = __uint_as_float(_sysv_poll32_group_0[0]);
-                    float rs_a = ((first) ? own_rs : rs_peer);
-                    float rs_b = ((first) ? rs_peer : own_rs);
+                    unsigned int rsw[1];
+                    uint32_t _sysv_u32_6;
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_u32_6) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
+                    rsw[0] = _sysv_u32_6;
                     float ssx = 0.0f;
                     float ssy = 0.0f;
                     unsigned int d = 0;
@@ -476,7 +471,20 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                         pv[7] = _fp4_wire_values_0[7];
                         ps[1] = _fp4_wire_scales_0[1];
                     }
+                    int pending = __any_sync(0xFFFFFFFF, rsw[0] == 2147483648u);
+                    if (pending != 0) {
+                        uint32_t _sysv_poll32_group_0[1];
+                        do {
+                            asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
+                        } while (
+                            (_sysv_poll32_group_0[0] == 0x80000000u)
+                        );
+                        rsw[0] = _sysv_poll32_group_0[0];
+                    }
                     mbarrier_wait(rb_full_addr + (warp_1) * 8, kd & 1);
+                    float rs_peer_f = __uint_as_float(rsw[0]);
+                    float rs_a_f = ((first) ? own_rs : rs_peer_f);
+                    float rs_b_f = ((first) ? rs_peer_f : own_rs);
                     int pp_5 = lane_2;
                     unsigned int own[4];
                     unsigned int own_sc[1];
@@ -553,9 +561,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_1;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_1) : "h"((uint16_t)(_e4m3x2_to_f16x2_0 >> 16)));
                     float _mul_0;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_cvt_f32_f16_0), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_cvt_f32_f16_0), "f"(rs_a_f));
                     float _mul_1;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_cvt_f32_f16_1), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_cvt_f32_f16_1), "f"(rs_a_f));
                     float lo = _mul_0;
                     float hi = _mul_1;
                     if (fhi) {
@@ -719,9 +727,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_3;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_3) : "h"((uint16_t)(_e4m3x2_to_f16x2_1 >> 16)));
                     float _mul_2;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_cvt_f32_f16_2), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_cvt_f32_f16_2), "f"(rs_b_f));
                     float _mul_3;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_cvt_f32_f16_3), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_cvt_f32_f16_3), "f"(rs_b_f));
                     float lo_58 = _mul_2;
                     float hi_59 = _mul_3;
                     if (fhi) {
@@ -1089,9 +1097,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_5;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_5) : "h"((uint16_t)(_e4m3x2_to_f16x2_2 >> 16)));
                     float _mul_4;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_cvt_f32_f16_4), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_cvt_f32_f16_4), "f"(rs_a_f));
                     float _mul_5;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_cvt_f32_f16_5), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_cvt_f32_f16_5), "f"(rs_a_f));
                     float lo_172 = _mul_4;
                     float hi_173 = _mul_5;
                     if (fhi_163) {
@@ -1255,9 +1263,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_7;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_7) : "h"((uint16_t)(_e4m3x2_to_f16x2_3 >> 16)));
                     float _mul_6;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_cvt_f32_f16_6), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_cvt_f32_f16_6), "f"(rs_b_f));
                     float _mul_7;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_cvt_f32_f16_7), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_cvt_f32_f16_7), "f"(rs_b_f));
                     float lo_224 = _mul_6;
                     float hi_225 = _mul_7;
                     if (fhi_163) {
@@ -1674,9 +1682,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_9;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_9) : "h"((uint16_t)(_e4m3x2_to_f16x2_4 >> 16)));
                     float _mul_8;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_8) : "f"(_cvt_f32_f16_8), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_8) : "f"(_cvt_f32_f16_8), "f"(rs_a_f));
                     float _mul_9;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_9) : "f"(_cvt_f32_f16_9), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_9) : "f"(_cvt_f32_f16_9), "f"(rs_a_f));
                     float lo_343 = _mul_8;
                     float hi_344 = _mul_9;
                     if (fhi_334) {
@@ -1840,9 +1848,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_11;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_11) : "h"((uint16_t)(_e4m3x2_to_f16x2_5 >> 16)));
                     float _mul_10;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_10) : "f"(_cvt_f32_f16_10), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_10) : "f"(_cvt_f32_f16_10), "f"(rs_b_f));
                     float _mul_11;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_11) : "f"(_cvt_f32_f16_11), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_11) : "f"(_cvt_f32_f16_11), "f"(rs_b_f));
                     float lo_395 = _mul_10;
                     float hi_396 = _mul_11;
                     if (fhi_334) {
@@ -2210,9 +2218,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_13;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_13) : "h"((uint16_t)(_e4m3x2_to_f16x2_6 >> 16)));
                     float _mul_12;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_12) : "f"(_cvt_f32_f16_12), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_12) : "f"(_cvt_f32_f16_12), "f"(rs_a_f));
                     float _mul_13;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_13) : "f"(_cvt_f32_f16_13), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_13) : "f"(_cvt_f32_f16_13), "f"(rs_a_f));
                     float lo_513 = _mul_12;
                     float hi_514 = _mul_13;
                     if (fhi_504) {
@@ -2376,9 +2384,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_15;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_15) : "h"((uint16_t)(_e4m3x2_to_f16x2_7 >> 16)));
                     float _mul_14;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_14) : "f"(_cvt_f32_f16_14), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_14) : "f"(_cvt_f32_f16_14), "f"(rs_b_f));
                     float _mul_15;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_15) : "f"(_cvt_f32_f16_15), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_15) : "f"(_cvt_f32_f16_15), "f"(rs_b_f));
                     float lo_565 = _mul_14;
                     float hi_566 = _mul_15;
                     if (fhi_504) {
@@ -2795,9 +2803,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_17;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_17) : "h"((uint16_t)(_e4m3x2_to_f16x2_8 >> 16)));
                     float _mul_16;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_16) : "f"(_cvt_f32_f16_16), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_16) : "f"(_cvt_f32_f16_16), "f"(rs_a_f));
                     float _mul_17;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_17) : "f"(_cvt_f32_f16_17), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_17) : "f"(_cvt_f32_f16_17), "f"(rs_a_f));
                     float lo_684 = _mul_16;
                     float hi_685 = _mul_17;
                     if (fhi_675) {
@@ -2961,9 +2969,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_19;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_19) : "h"((uint16_t)(_e4m3x2_to_f16x2_9 >> 16)));
                     float _mul_18;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_18) : "f"(_cvt_f32_f16_18), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_18) : "f"(_cvt_f32_f16_18), "f"(rs_b_f));
                     float _mul_19;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_19) : "f"(_cvt_f32_f16_19), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_19) : "f"(_cvt_f32_f16_19), "f"(rs_b_f));
                     float lo_736 = _mul_18;
                     float hi_737 = _mul_19;
                     if (fhi_675) {
@@ -3331,9 +3339,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_21;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_21) : "h"((uint16_t)(_e4m3x2_to_f16x2_10 >> 16)));
                     float _mul_20;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_20) : "f"(_cvt_f32_f16_20), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_20) : "f"(_cvt_f32_f16_20), "f"(rs_a_f));
                     float _mul_21;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_21) : "f"(_cvt_f32_f16_21), "f"(rs_a));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_21) : "f"(_cvt_f32_f16_21), "f"(rs_a_f));
                     float lo_854 = _mul_20;
                     float hi_855 = _mul_21;
                     if (fhi_845) {
@@ -3497,9 +3505,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop_pf(uint8_t* __restrict__ x
                     float _cvt_f32_f16_23;
                     asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_23) : "h"((uint16_t)(_e4m3x2_to_f16x2_11 >> 16)));
                     float _mul_22;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_22) : "f"(_cvt_f32_f16_22), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_22) : "f"(_cvt_f32_f16_22), "f"(rs_b_f));
                     float _mul_23;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_23) : "f"(_cvt_f32_f16_23), "f"(rs_b));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_23) : "f"(_cvt_f32_f16_23), "f"(rs_b_f));
                     float lo_906 = _mul_22;
                     float hi_907 = _mul_23;
                     if (fhi_845) {
