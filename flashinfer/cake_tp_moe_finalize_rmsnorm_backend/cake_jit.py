@@ -271,1096 +271,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 2,
     },
-    "cake_tp_moe_finalize_rmsnorm_0abe7d79ff8afb150cef": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 1,
-            "trace": False,
-            "xp": 4,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 4,
-            "split": 1,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_0abe7d79ff8afb150cef",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 256,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_0abe7d79ff8afb150cef",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        76,
-                        152,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 4,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 786432,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 98304,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 16,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 65536,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_1532a68410888fbfe565": {
-        "arches": [
-            "sm_100a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 1,
-            "trace": False,
-            "xp": 8,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 8,
-            "split": 1,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_1532a68410888fbfe565",
-        "launch": {
-            "block": (
-                512,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_1532a68410888fbfe565",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp8",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        32,
-                        144,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 8,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1572864,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 196608,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 131072,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
-                    ],
-                },
-            ],
-        },
-        "world": 8,
-    },
-    "cake_tp_moe_finalize_rmsnorm_202488636c705e5779c8": {
-        "arches": [
-            "sm_100a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 8,
-            "trace": False,
-            "xp": 8,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 8,
-            "split": 8,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_202488636c705e5779c8",
-        "launch": {
-            "block": (
-                64,
-                1,
-                1,
-            ),
-            "cluster": (
-                8,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_202488636c705e5779c8",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp8",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        7,
-                        16,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 8,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 1572864,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 196608,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 131072,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
-                    ],
-                },
-            ],
-        },
-        "world": 8,
-    },
-    "cake_tp_moe_finalize_rmsnorm_2139560e1d30548bf633": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 4,
-            "trace": False,
-            "xp": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 4,
-            "split": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_2139560e1d30548bf633",
-        "launch": {
-            "block": (
-                128,
-                1,
-                1,
-            ),
-            "cluster": (
-                4,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 384,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_2139560e1d30548bf633",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        24,
-                        36,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 4,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 786432,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 98304,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 16,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 65536,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_25b2139380ebe718781f": {
-        "arches": [
-            "sm_100a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "parameter",
-                "b_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "multicast",
-            "fence": "auto",
-            "pack": "sector",
-            "pdl": False,
-            "push": "weak",
-            "split": 2,
-            "trace": False,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "eo",
-            "world": 8,
-            "split": 2,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_25b2139380ebe718781f",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                2,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_25b2139380ebe718781f",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "b_mcast": "partial_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "eo",
-        "route": "tp8",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        0,
-                        7,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "eo",
-            "world": 8,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 196608,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "partial",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 393216,
-                    "fill": 2147483648,
-                    "multicast": "b_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 4,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "partial",
-                    ],
-                },
-            ],
-        },
-        "world": 8,
-    },
     "cake_tp_moe_finalize_rmsnorm_344920d852fa95b34ddd": {
         "arches": [
             "sm_103a",
@@ -1533,230 +443,6 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "payload",
-                    ],
-                },
-            ],
-        },
-        "world": 4,
-    },
-    "cake_tp_moe_finalize_rmsnorm_36ed3486b7384a9ff4d9": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 2,
-            "trace": False,
-            "xp": 4,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 4,
-            "split": 2,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_36ed3486b7384a9ff4d9",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                2,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_36ed3486b7384a9ff4d9",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp4",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        36,
-                        76,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 4,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 786432,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 98304,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 16,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 65536,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
                     ],
                 },
             ],
@@ -2335,237 +1021,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 4,
     },
-    "cake_tp_moe_finalize_rmsnorm_66f0feaf6aa23c9c8748": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 2,
-            "trace": False,
-            "xp": 2,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 2,
-            "split": 2,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_66f0feaf6aa23c9c8748",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                2,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 256,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_66f0feaf6aa23c9c8748",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp2",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        64,
-                        74,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        64,
-                        76,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 2,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 393216,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 49152,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 8,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 32768,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
-                    ],
-                },
-            ],
-        },
-        "world": 2,
-    },
     "cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812": {
         "arches": [
             "sm_100a",
@@ -2755,461 +1210,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ],
         },
         "world": 8,
-    },
-    "cake_tp_moe_finalize_rmsnorm_95a435545d8c45dd507f": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 4,
-            "trace": False,
-            "xp": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 2,
-            "split": 4,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_95a435545d8c45dd507f",
-        "launch": {
-            "block": (
-                128,
-                1,
-                1,
-            ),
-            "cluster": (
-                4,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 384,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_95a435545d8c45dd507f",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp2",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        33,
-                        36,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        24,
-                        32,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 2,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 393216,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 49152,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 8,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 32768,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
-                    ],
-                },
-            ],
-        },
-        "world": 2,
-    },
-    "cake_tp_moe_finalize_rmsnorm_97e10b90e3eb95355aff": {
-        "arches": [
-            "sm_100a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "gemm2",
-            ],
-            [
-                "parameter",
-                "row_stride",
-            ],
-            [
-                "parameter",
-                "rows",
-            ],
-            [
-                "buffer",
-                "idx",
-            ],
-            [
-                "buffer",
-                "expert_weights",
-            ],
-            [
-                "parameter",
-                "weights_fp32",
-            ],
-            [
-                "buffer",
-                "norm_weight",
-            ],
-            [
-                "buffer",
-                "output",
-            ],
-            [
-                "parameter",
-                "n_tok",
-            ],
-            [
-                "parameter",
-                "slots",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "parameter",
-                "gain_center",
-            ],
-            [
-                "parameter",
-                "mode",
-            ],
-            [
-                "parameter",
-                "rank",
-            ],
-            [
-                "buffer",
-                "peer_table",
-            ],
-            [
-                "buffer",
-                "gen",
-            ],
-            [
-                "buffer",
-                "part",
-            ],
-            [
-                "buffer",
-                "ctr",
-            ],
-            [
-                "parameter",
-                "r_mcast",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "broadcast": "auto",
-            "coop": False,
-            "deliver": "push",
-            "exit_fence": False,
-            "jg": 0,
-            "pdl": False,
-            "poll": "auto",
-            "push": "weak",
-            "split": 2,
-            "trace": False,
-            "xp": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "token1",
-            "world": 2,
-            "split": 2,
-        },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_97e10b90e3eb95355aff",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                2,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 384,
-            "use_pdl": False,
-        },
-        "library": "cake_tp_moe_finalize_rmsnorm_97e10b90e3eb95355aff",
-        "logical": {
-            "gemm2": "gemm2_permuted",
-            "row_stride": "row_stride",
-            "rows": "rows",
-            "idx": "expanded_idx_to_permuted_idx",
-            "expert_weights": "expert_weights_words",
-            "weights_fp32": "weights_fp32",
-            "norm_weight": "norm_weight",
-            "output": "output",
-            "n_tok": "n_tok",
-            "slots": "slots",
-            "eps": "eps",
-            "gain_center": "gain_center",
-            "mode": "weight_before_norm",
-            "rank": "rank",
-            "peer_table": "peer_table",
-            "gen": "gen",
-            "part": "part",
-            "ctr": "ctr",
-            "r_mcast": "rows_multicast",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "program": "token1",
-        "route": "tp2",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        36,
-                        64,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": {
-            "kind": "lamport",
-            "program": "token1",
-            "world": 2,
-            "slot_parameter": "slots",
-            "buffers": [
-                {
-                    "name": "scatter",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 393216,
-                    "fill": 2147516416,
-                    "multicast": None,
-                    "view": None,
-                },
-                {
-                    "name": "row_ring",
-                    "placement": "symmetric",
-                    "bytes_per_slot": 49152,
-                    "fill": 2147516416,
-                    "multicast": "r_mcast",
-                    "view": None,
-                },
-                {
-                    "name": "gen_words",
-                    "placement": "local",
-                    "bytes_per_slot": 8,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "gen",
-                },
-                {
-                    "name": "part_sums",
-                    "placement": "local",
-                    "bytes_per_slot": 32768,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "part",
-                },
-                {
-                    "name": "ctr_words",
-                    "placement": "local",
-                    "bytes_per_slot": 32,
-                    "fill": 0,
-                    "multicast": None,
-                    "view": "ctr",
-                },
-            ],
-            "tables": [
-                {
-                    "parameter": "peer_table",
-                    "entries": [
-                        "scatter",
-                        "row_ring",
-                    ],
-                },
-            ],
-        },
-        "world": 2,
     },
     "cake_tp_moe_finalize_rmsnorm_a45000d7d3d45f110ee1": {
         "arches": [
@@ -3598,7 +1598,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 2,
     },
-    "cake_tp_moe_finalize_rmsnorm_ce32abaa59302c97c4aa": {
+    "cake_tp_moe_finalize_rmsnorm_56b5d24b4b1e5da142b6": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -3702,6 +1702,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "pdl": False,
             "poll": "auto",
             "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
             "split": 1,
             "trace": False,
             "xp": 2,
@@ -3712,7 +1714,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "world": 2,
             "split": 1,
         },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_ce32abaa59302c97c4aa",
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_56b5d24b4b1e5da142b6",
         "launch": {
             "block": (
                 512,
@@ -3728,7 +1730,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 384,
             "use_pdl": False,
         },
-        "library": "cake_tp_moe_finalize_rmsnorm_ce32abaa59302c97c4aa",
+        "library": "cake_tp_moe_finalize_rmsnorm_56b5d24b4b1e5da142b6",
         "logical": {
             "gemm2": "gemm2_permuted",
             "row_stride": "row_stride",
@@ -3829,7 +1831,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 2,
     },
-    "cake_tp_moe_finalize_rmsnorm_d938c110c36a1b554611": {
+    "cake_tp_moe_finalize_rmsnorm_6aa0b7c217a06ff8ddb6": {
         "arches": [
             "sm_103a",
         ],
@@ -3932,6 +1934,428 @@ MODULES: dict[str, dict[str, Any]] = {
             "pdl": False,
             "poll": "auto",
             "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 4,
+            "trace": False,
+            "xp": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 4,
+            "split": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_6aa0b7c217a06ff8ddb6",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                4,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 384,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_6aa0b7c217a06ff8ddb6",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        24,
+                        36,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 4,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 786432,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 98304,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 16,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 65536,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "parameter",
+                "b_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "multicast",
+            "fence": "auto",
+            "pack": "sector",
+            "pdl": False,
+            "push": "weak",
+            "split": 8,
+            "trace": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "eo",
+            "world": 8,
+            "split": 8,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f",
+        "launch": {
+            "block": (
+                64,
+                1,
+                1,
+            ),
+            "cluster": (
+                8,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "b_mcast": "partial_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "eo",
+        "route": "tp8",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        0,
+                        7,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "eo",
+            "world": 8,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 196608,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "partial",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 393216,
+                    "fill": 2147483648,
+                    "multicast": "b_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 4,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "partial",
+                    ],
+                },
+            ],
+        },
+        "world": 8,
+    },
+    "cake_tp_moe_finalize_rmsnorm_7e4186a464b51e96110a": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
             "split": 4,
             "trace": False,
             "xp": 2,
@@ -3942,7 +2366,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "world": 2,
             "split": 4,
         },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_d938c110c36a1b554611",
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_7e4186a464b51e96110a",
         "launch": {
             "block": (
                 128,
@@ -3958,7 +2382,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 256,
             "use_pdl": False,
         },
-        "library": "cake_tp_moe_finalize_rmsnorm_d938c110c36a1b554611",
+        "library": "cake_tp_moe_finalize_rmsnorm_7e4186a464b51e96110a",
         "logical": {
             "gemm2": "gemm2_permuted",
             "row_stride": "row_stride",
@@ -4053,7 +2477,466 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 2,
     },
-    "cake_tp_moe_finalize_rmsnorm_ef1d98e9454334b5cb0d": {
+    "cake_tp_moe_finalize_rmsnorm_803b9215e4eb8e2e867d": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 4,
+            "trace": False,
+            "xp": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 2,
+            "split": 4,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_803b9215e4eb8e2e867d",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                4,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 384,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_803b9215e4eb8e2e867d",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp2",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        33,
+                        36,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        24,
+                        32,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 2,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 393216,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 49152,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 8,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 32768,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 2,
+    },
+    "cake_tp_moe_finalize_rmsnorm_a1410d0f10e3631a618b": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 1,
+            "trace": False,
+            "xp": 4,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 4,
+            "split": 1,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_a1410d0f10e3631a618b",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 256,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_a1410d0f10e3631a618b",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        76,
+                        152,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 4,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 786432,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 98304,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 16,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 65536,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
+    "cake_tp_moe_finalize_rmsnorm_a8823e336d5a6dac59b9": {
         "arches": [
             "sm_100a",
         ],
@@ -4156,6 +3039,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "pdl": False,
             "poll": "auto",
             "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
             "split": 4,
             "trace": False,
             "xp": 8,
@@ -4166,7 +3051,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "world": 8,
             "split": 4,
         },
-        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_ef1d98e9454334b5cb0d",
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_a8823e336d5a6dac59b9",
         "launch": {
             "block": (
                 128,
@@ -4182,7 +3067,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 128,
             "use_pdl": False,
         },
-        "library": "cake_tp_moe_finalize_rmsnorm_ef1d98e9454334b5cb0d",
+        "library": "cake_tp_moe_finalize_rmsnorm_a8823e336d5a6dac59b9",
         "logical": {
             "gemm2": "gemm2_permuted",
             "row_stride": "row_stride",
@@ -4277,6 +3162,1143 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "world": 8,
     },
+    "cake_tp_moe_finalize_rmsnorm_bbc57b3ab6ab7500af32": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 1,
+            "trace": False,
+            "xp": 8,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 8,
+            "split": 1,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_bbc57b3ab6ab7500af32",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_bbc57b3ab6ab7500af32",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp8",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        32,
+                        144,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 8,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1572864,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 196608,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 131072,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 8,
+    },
+    "cake_tp_moe_finalize_rmsnorm_bd5332e0901148a642f3": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 2,
+            "trace": False,
+            "xp": 2,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 2,
+            "split": 2,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_bd5332e0901148a642f3",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                2,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 256,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_bd5332e0901148a642f3",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp2",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        64,
+                        74,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        64,
+                        76,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 2,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 393216,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 49152,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 8,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 32768,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 2,
+    },
+    "cake_tp_moe_finalize_rmsnorm_bdc6b9f9c8b20660ab67": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 2,
+            "trace": False,
+            "xp": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 2,
+            "split": 2,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_bdc6b9f9c8b20660ab67",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                2,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 384,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_bdc6b9f9c8b20660ab67",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp2",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        36,
+                        64,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 2,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 393216,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 49152,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 8,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 32768,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 2,
+    },
+    "cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 8,
+            "trace": False,
+            "xp": 8,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 8,
+            "split": 8,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1",
+        "launch": {
+            "block": (
+                64,
+                1,
+                1,
+            ),
+            "cluster": (
+                8,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp8",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        7,
+                        16,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 8,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 1572864,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 196608,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 131072,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 8,
+    },
+    "cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "gemm2",
+            ],
+            [
+                "parameter",
+                "row_stride",
+            ],
+            [
+                "parameter",
+                "rows",
+            ],
+            [
+                "buffer",
+                "idx",
+            ],
+            [
+                "buffer",
+                "expert_weights",
+            ],
+            [
+                "parameter",
+                "weights_fp32",
+            ],
+            [
+                "buffer",
+                "norm_weight",
+            ],
+            [
+                "buffer",
+                "output",
+            ],
+            [
+                "parameter",
+                "n_tok",
+            ],
+            [
+                "parameter",
+                "slots",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "parameter",
+                "mode",
+            ],
+            [
+                "parameter",
+                "rank",
+            ],
+            [
+                "buffer",
+                "peer_table",
+            ],
+            [
+                "buffer",
+                "gen",
+            ],
+            [
+                "buffer",
+                "part",
+            ],
+            [
+                "buffer",
+                "ctr",
+            ],
+            [
+                "parameter",
+                "r_mcast",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "broadcast": "auto",
+            "coop": False,
+            "deliver": "push",
+            "exit_fence": False,
+            "jg": 0,
+            "pdl": False,
+            "poll": "auto",
+            "push": "weak",
+            "rearm": "push",
+            "rearm_split": "all",
+            "split": 2,
+            "trace": False,
+            "xp": 4,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "token1",
+            "world": 4,
+            "split": 2,
+        },
+        "kernel_symbol": "kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                2,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117",
+        "logical": {
+            "gemm2": "gemm2_permuted",
+            "row_stride": "row_stride",
+            "rows": "rows",
+            "idx": "expanded_idx_to_permuted_idx",
+            "expert_weights": "expert_weights_words",
+            "weights_fp32": "weights_fp32",
+            "norm_weight": "norm_weight",
+            "output": "output",
+            "n_tok": "n_tok",
+            "slots": "slots",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "mode": "weight_before_norm",
+            "rank": "rank",
+            "peer_table": "peer_table",
+            "gen": "gen",
+            "part": "part",
+            "ctr": "ctr",
+            "r_mcast": "rows_multicast",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "program": "token1",
+        "route": "tp4",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        36,
+                        76,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": {
+            "kind": "lamport",
+            "program": "token1",
+            "world": 4,
+            "slot_parameter": "slots",
+            "buffers": [
+                {
+                    "name": "scatter",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 786432,
+                    "fill": 2147516416,
+                    "multicast": None,
+                    "view": None,
+                },
+                {
+                    "name": "row_ring",
+                    "placement": "symmetric",
+                    "bytes_per_slot": 98304,
+                    "fill": 2147516416,
+                    "multicast": "r_mcast",
+                    "view": None,
+                },
+                {
+                    "name": "gen_words",
+                    "placement": "local",
+                    "bytes_per_slot": 16,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "gen",
+                },
+                {
+                    "name": "part_sums",
+                    "placement": "local",
+                    "bytes_per_slot": 65536,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "part",
+                },
+                {
+                    "name": "ctr_words",
+                    "placement": "local",
+                    "bytes_per_slot": 32,
+                    "fill": 0,
+                    "multicast": None,
+                    "view": "ctr",
+                },
+            ],
+            "tables": [
+                {
+                    "parameter": "peer_table",
+                    "entries": [
+                        "scatter",
+                        "row_ring",
+                    ],
+                },
+            ],
+        },
+        "world": 4,
+    },
 }
 
 ROUTES: dict[str, dict[str, list[str]]] = {
@@ -4284,37 +4306,37 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "tp2": [
             "cake_tp_moe_finalize_rmsnorm_09a7bb8908c5bf9cdd04",
             "cake_tp_moe_finalize_rmsnorm_53bb267e88a98cd4ac00",
-            "cake_tp_moe_finalize_rmsnorm_95a435545d8c45dd507f",
-            "cake_tp_moe_finalize_rmsnorm_97e10b90e3eb95355aff",
-            "cake_tp_moe_finalize_rmsnorm_66f0feaf6aa23c9c8748",
-            "cake_tp_moe_finalize_rmsnorm_ce32abaa59302c97c4aa",
+            "cake_tp_moe_finalize_rmsnorm_803b9215e4eb8e2e867d",
+            "cake_tp_moe_finalize_rmsnorm_bdc6b9f9c8b20660ab67",
+            "cake_tp_moe_finalize_rmsnorm_bd5332e0901148a642f3",
+            "cake_tp_moe_finalize_rmsnorm_56b5d24b4b1e5da142b6",
             "cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded",
         ],
         "tp8": [
-            "cake_tp_moe_finalize_rmsnorm_25b2139380ebe718781f",
-            "cake_tp_moe_finalize_rmsnorm_202488636c705e5779c8",
-            "cake_tp_moe_finalize_rmsnorm_ef1d98e9454334b5cb0d",
-            "cake_tp_moe_finalize_rmsnorm_1532a68410888fbfe565",
+            "cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f",
+            "cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1",
+            "cake_tp_moe_finalize_rmsnorm_a8823e336d5a6dac59b9",
+            "cake_tp_moe_finalize_rmsnorm_bbc57b3ab6ab7500af32",
             "cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812",
         ],
     },
     "sm_103a": {
         "tp2": [
             "cake_tp_moe_finalize_rmsnorm_4b8865d07abb02c98d23",
-            "cake_tp_moe_finalize_rmsnorm_d938c110c36a1b554611",
-            "cake_tp_moe_finalize_rmsnorm_95a435545d8c45dd507f",
+            "cake_tp_moe_finalize_rmsnorm_7e4186a464b51e96110a",
+            "cake_tp_moe_finalize_rmsnorm_803b9215e4eb8e2e867d",
             "cake_tp_moe_finalize_rmsnorm_53bb267e88a98cd4ac00",
             "cake_tp_moe_finalize_rmsnorm_09a7bb8908c5bf9cdd04",
-            "cake_tp_moe_finalize_rmsnorm_66f0feaf6aa23c9c8748",
-            "cake_tp_moe_finalize_rmsnorm_ce32abaa59302c97c4aa",
+            "cake_tp_moe_finalize_rmsnorm_bd5332e0901148a642f3",
+            "cake_tp_moe_finalize_rmsnorm_56b5d24b4b1e5da142b6",
             "cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded",
         ],
         "tp4": [
             "cake_tp_moe_finalize_rmsnorm_344920d852fa95b34ddd",
             "cake_tp_moe_finalize_rmsnorm_665e3047bd7705211b89",
-            "cake_tp_moe_finalize_rmsnorm_2139560e1d30548bf633",
-            "cake_tp_moe_finalize_rmsnorm_36ed3486b7384a9ff4d9",
-            "cake_tp_moe_finalize_rmsnorm_0abe7d79ff8afb150cef",
+            "cake_tp_moe_finalize_rmsnorm_6aa0b7c217a06ff8ddb6",
+            "cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117",
+            "cake_tp_moe_finalize_rmsnorm_a1410d0f10e3631a618b",
             "cake_tp_moe_finalize_rmsnorm_a45000d7d3d45f110ee1",
         ],
     },

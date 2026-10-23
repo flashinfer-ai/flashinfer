@@ -622,8 +622,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y0_7 = ((mode != 0) ? _unpack_bf16_4[7] * gw8[7] : _unpack_bf16_4[7]);
             ssq0 = __fmaf_rn(y0_7, y0_7, ssq0);
             ssq8[0] = ssq0;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + src + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_22 = push_local + src;
+                __builtin_assume(__isGlobal(_gst_22));
+                reinterpret_cast<int4*>(_gst_22)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_23 = push_local + (src + 4096);
+                __builtin_assume(__isGlobal(_gst_23));
+                reinterpret_cast<int4*>(_gst_23)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             float s8_1[8];
             float _unpack_bf16_5[8];
             #pragma unroll
@@ -702,8 +710,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y1_7 = ((mode != 0) ? _unpack_bf16_7[7] * gw8[7] : _unpack_bf16_7[7]);
             ssq1 = __fmaf_rn(y1_7, y1_7, ssq1);
             ssq8[1] = ssq1;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 8192) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 12288) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_24 = push_local + (src + 8192);
+                __builtin_assume(__isGlobal(_gst_24));
+                reinterpret_cast<int4*>(_gst_24)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_25 = push_local + (src + 12288);
+                __builtin_assume(__isGlobal(_gst_25));
+                reinterpret_cast<int4*>(_gst_25)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             float s8_2[8];
             float _unpack_bf16_8[8];
             #pragma unroll
@@ -782,8 +798,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y2_7 = ((mode != 0) ? _unpack_bf16_10[7] * gw8[7] : _unpack_bf16_10[7]);
             ssq2 = __fmaf_rn(y2_7, y2_7, ssq2);
             ssq8[2] = ssq2;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 16384) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 20480) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_26 = push_local + (src + 16384);
+                __builtin_assume(__isGlobal(_gst_26));
+                reinterpret_cast<int4*>(_gst_26)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_27 = push_local + (src + 20480);
+                __builtin_assume(__isGlobal(_gst_27));
+                reinterpret_cast<int4*>(_gst_27)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             float s8_3[8];
             float _unpack_bf16_11[8];
             #pragma unroll
@@ -862,8 +886,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y3_7 = ((mode != 0) ? _unpack_bf16_13[7] * gw8[7] : _unpack_bf16_13[7]);
             ssq3 = __fmaf_rn(y3_7, y3_7, ssq3);
             ssq8[3] = ssq3;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 24576) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 28672) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_28 = push_local + (src + 24576);
+                __builtin_assume(__isGlobal(_gst_28));
+                reinterpret_cast<int4*>(_gst_28)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_29 = push_local + (src + 28672);
+                __builtin_assume(__isGlobal(_gst_29));
+                reinterpret_cast<int4*>(_gst_29)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             uint32_t _sysv_poll_group_1[32];
             do {
                 asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[0]), "=r"(_sysv_poll_group_1[1]), "=r"(_sysv_poll_group_1[2]), "=r"(_sysv_poll_group_1[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(push_local + (src + 32768))) : "memory");
@@ -970,8 +1002,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y4_7 = ((mode != 0) ? _unpack_bf16_16[7] * gw8[7] : _unpack_bf16_16[7]);
             ssq4 = __fmaf_rn(y4_7, y4_7, ssq4);
             ssq8[4] = ssq4;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 32768) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 36864) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_30 = push_local + (src + 32768);
+                __builtin_assume(__isGlobal(_gst_30));
+                reinterpret_cast<int4*>(_gst_30)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_31 = push_local + (src + 36864);
+                __builtin_assume(__isGlobal(_gst_31));
+                reinterpret_cast<int4*>(_gst_31)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             float s8_5[8];
             float _unpack_bf16_17[8];
             #pragma unroll
@@ -1050,8 +1090,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y5_7 = ((mode != 0) ? _unpack_bf16_19[7] * gw8[7] : _unpack_bf16_19[7]);
             ssq5 = __fmaf_rn(y5_7, y5_7, ssq5);
             ssq8[5] = ssq5;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 40960) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 45056) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_32 = push_local + (src + 40960);
+                __builtin_assume(__isGlobal(_gst_32));
+                reinterpret_cast<int4*>(_gst_32)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_33 = push_local + (src + 45056);
+                __builtin_assume(__isGlobal(_gst_33));
+                reinterpret_cast<int4*>(_gst_33)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             float s8_6[8];
             float _unpack_bf16_20[8];
             #pragma unroll
@@ -1130,8 +1178,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y6_7 = ((mode != 0) ? _unpack_bf16_22[7] * gw8[7] : _unpack_bf16_22[7]);
             ssq6 = __fmaf_rn(y6_7, y6_7, ssq6);
             ssq8[6] = ssq6;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 49152) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 53248) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_34 = push_local + (src + 49152);
+                __builtin_assume(__isGlobal(_gst_34));
+                reinterpret_cast<int4*>(_gst_34)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_35 = push_local + (src + 53248);
+                __builtin_assume(__isGlobal(_gst_35));
+                reinterpret_cast<int4*>(_gst_35)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             float s8_7[8];
             float _unpack_bf16_23[8];
             #pragma unroll
@@ -1210,8 +1266,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             float y7_7 = ((mode != 0) ? _unpack_bf16_25[7] * gw8[7] : _unpack_bf16_25[7]);
             ssq7 = __fmaf_rn(y7_7, y7_7, ssq7);
             ssq8[7] = ssq7;
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 57344) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_local + (src + 61440) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            {
+                auto _gst_36 = push_local + (src + 57344);
+                __builtin_assume(__isGlobal(_gst_36));
+                reinterpret_cast<int4*>(_gst_36)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
+            {
+                auto _gst_37 = push_local + (src + 61440);
+                __builtin_assume(__isGlobal(_gst_37));
+                reinterpret_cast<int4*>(_gst_37)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
             float _warp_reduce_0 = ssq8[0];
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
@@ -1294,9 +1358,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot0 = tot0 + warp_tab[parity + 104];
             tot0 = tot0 + warp_tab[parity + 112];
             tot0 = tot0 + warp_tab[parity + 120];
-            float _sqrt_22;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_22) : "f"(__fmaf_rn(tot0, 0.00024414062f, eps)));
-            float rs0 = __frcp_rn(_sqrt_22);
+            float _sqrt_38;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_38) : "f"(__fmaf_rn(tot0, 0.00024414062f, eps)));
+            float rs0 = __frcp_rn(_sqrt_38);
             float _unpack_bf16_26[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1356,9 +1420,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot1 = tot1 + warp_tab[parity + 104 + 1];
             tot1 = tot1 + warp_tab[parity + 112 + 1];
             tot1 = tot1 + warp_tab[parity + 120 + 1];
-            float _sqrt_23;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_23) : "f"(__fmaf_rn(tot1, 0.00024414062f, eps)));
-            float rs1 = __frcp_rn(_sqrt_23);
+            float _sqrt_39;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_39) : "f"(__fmaf_rn(tot1, 0.00024414062f, eps)));
+            float rs1 = __frcp_rn(_sqrt_39);
             float _unpack_bf16_27[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1418,9 +1482,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot2 = tot2 + warp_tab[parity + 104 + 2];
             tot2 = tot2 + warp_tab[parity + 112 + 2];
             tot2 = tot2 + warp_tab[parity + 120 + 2];
-            float _sqrt_24;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_24) : "f"(__fmaf_rn(tot2, 0.00024414062f, eps)));
-            float rs2 = __frcp_rn(_sqrt_24);
+            float _sqrt_40;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_40) : "f"(__fmaf_rn(tot2, 0.00024414062f, eps)));
+            float rs2 = __frcp_rn(_sqrt_40);
             float _unpack_bf16_28[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1480,9 +1544,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot3 = tot3 + warp_tab[parity + 104 + 3];
             tot3 = tot3 + warp_tab[parity + 112 + 3];
             tot3 = tot3 + warp_tab[parity + 120 + 3];
-            float _sqrt_25;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_25) : "f"(__fmaf_rn(tot3, 0.00024414062f, eps)));
-            float rs3 = __frcp_rn(_sqrt_25);
+            float _sqrt_41;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_41) : "f"(__fmaf_rn(tot3, 0.00024414062f, eps)));
+            float rs3 = __frcp_rn(_sqrt_41);
             float _unpack_bf16_29[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1542,9 +1606,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot4 = tot4 + warp_tab[parity + 104 + 4];
             tot4 = tot4 + warp_tab[parity + 112 + 4];
             tot4 = tot4 + warp_tab[parity + 120 + 4];
-            float _sqrt_26;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_26) : "f"(__fmaf_rn(tot4, 0.00024414062f, eps)));
-            float rs4 = __frcp_rn(_sqrt_26);
+            float _sqrt_42;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_42) : "f"(__fmaf_rn(tot4, 0.00024414062f, eps)));
+            float rs4 = __frcp_rn(_sqrt_42);
             float _unpack_bf16_30[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1604,9 +1668,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot5 = tot5 + warp_tab[parity + 104 + 5];
             tot5 = tot5 + warp_tab[parity + 112 + 5];
             tot5 = tot5 + warp_tab[parity + 120 + 5];
-            float _sqrt_27;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_27) : "f"(__fmaf_rn(tot5, 0.00024414062f, eps)));
-            float rs5 = __frcp_rn(_sqrt_27);
+            float _sqrt_43;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_43) : "f"(__fmaf_rn(tot5, 0.00024414062f, eps)));
+            float rs5 = __frcp_rn(_sqrt_43);
             float _unpack_bf16_31[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1666,9 +1730,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot6 = tot6 + warp_tab[parity + 104 + 6];
             tot6 = tot6 + warp_tab[parity + 112 + 6];
             tot6 = tot6 + warp_tab[parity + 120 + 6];
-            float _sqrt_28;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_28) : "f"(__fmaf_rn(tot6, 0.00024414062f, eps)));
-            float rs6 = __frcp_rn(_sqrt_28);
+            float _sqrt_44;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_44) : "f"(__fmaf_rn(tot6, 0.00024414062f, eps)));
+            float rs6 = __frcp_rn(_sqrt_44);
             float _unpack_bf16_32[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1728,9 +1792,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             tot7 = tot7 + warp_tab[parity + 104 + 7];
             tot7 = tot7 + warp_tab[parity + 112 + 7];
             tot7 = tot7 + warp_tab[parity + 120 + 7];
-            float _sqrt_29;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_29) : "f"(__fmaf_rn(tot7, 0.00024414062f, eps)));
-            float rs7 = __frcp_rn(_sqrt_29);
+            float _sqrt_45;
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_45) : "f"(__fmaf_rn(tot7, 0.00024414062f, eps)));
+            float rs7 = __frcp_rn(_sqrt_45);
             float _unpack_bf16_33[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1783,12 +1847,12 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             uint32_t _packed16_sanitize_8[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_30 = static_cast<uint32_t>(acc8_bf16[_p16s_word]);
-                uint32_t _p16s_lo_30 = _p16s_carrier_30 & 0x0000ffffu;
-                uint32_t _p16s_hi_30 = (_p16s_carrier_30 >> 16) & 0x0000ffffu;
-                if (_p16s_lo_30 == 0x00008000u) _p16s_lo_30 = 0u;
-                if (_p16s_hi_30 == 0x00008000u) _p16s_hi_30 = 0u;
-                _packed16_sanitize_8[_p16s_word] = _p16s_lo_30 | (_p16s_hi_30 << 16);
+                uint32_t _p16s_carrier_46 = static_cast<uint32_t>(acc8_bf16[_p16s_word]);
+                uint32_t _p16s_lo_46 = _p16s_carrier_46 & 0x0000ffffu;
+                uint32_t _p16s_hi_46 = (_p16s_carrier_46 >> 16) & 0x0000ffffu;
+                if (_p16s_lo_46 == 0x00008000u) _p16s_lo_46 = 0u;
+                if (_p16s_hi_46 == 0x00008000u) _p16s_hi_46 = 0u;
+                _packed16_sanitize_8[_p16s_word] = _p16s_lo_46 | (_p16s_hi_46 << 16);
             }
             int gcr = sr & 7;
             long long pub = bcast_gen_elems * (long long)gcr + bcast_cta;
@@ -1812,8 +1876,12 @@ kernel_cake_tp_moe_finalize_rmsnorm_c2d64c509754e42a7ded(__nv_bfloat16* __restri
             row4[1] = _sysv_poll_group_2[1];
             row4[2] = _sysv_poll_group_2[2];
             row4[3] = _sysv_poll_group_2[3];
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<unsigned int*>(output + ((long long)tok_d * 4096 + col64)) + (0)), "r"(row4[(0) + 0]), "r"(row4[(0) + 1]), "r"(row4[(0) + 2]), "r"(row4[(0) + 3]) : "memory");
-            asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(bcast_local + land + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+            reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(output + ((long long)tok_d * 4096 + col64)))[0] = reinterpret_cast<int4*>(row4)[0];
+            {
+                auto _gst_47 = bcast_local + land;
+                __builtin_assume(__isGlobal(_gst_47));
+                reinterpret_cast<int4*>(_gst_47)[0] = reinterpret_cast<int4*>(sent4)[0];
+            }
         }
     }
     int s_end = s0 + steps;
