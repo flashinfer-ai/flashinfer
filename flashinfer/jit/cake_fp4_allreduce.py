@@ -24,9 +24,10 @@ poll grouping and pass-2 source, the fused norm's poll, quantizing pass 2,
 sum-of-squares order, pass-2 form and worker count, the call-state protocol
 and the residual prefetch -- with its launch facts and its grid bound;
 ``WINDOWS``: the receive-window contract, with the control words a window's
-programs need; ``SELECT_BV``, ``SELECT_PREFETCH``, ``SELECT_ROWS`` -- the fused
-norm's rows-dispatched programs, each served instead of its call's whole
-program for one band of row counts -- and ``LIMITS``: the host rules).  Every
+programs need; ``SELECT_BV``, ``SELECT_PREFETCH``, ``SELECT_ROWS`` -- the
+rows-dispatched programs of the fused norm and of the world-size-2 all-reduce,
+each served instead of its call's whole program for one band of row counts --
+and ``LIMITS``: the host rules).  Every
 program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
 B300, ``sm_107a`` for SM107 devices) with that target's flag set, without fast math and with
@@ -67,11 +68,12 @@ from .core import (
 
 CakeFp4AllReduceTarget = Literal["sm_100a", "sm_103a", "sm_107a"]
 
-# SELECT_ROWS: per rows-dispatched fused-norm program, the band of row counts it
-# serves instead of the whole program of its call -- ``{"kind": "prefix" |
-# "suffix", "threshold": rows, "whole": {target: whole program}}``, the
-# threshold inclusive for both kinds (:func:`select_rows`).  A registry written
-# before the generator published the literal has no dispatched program.
+# SELECT_ROWS: per rows-dispatched program (a fused-norm or a world-size-2
+# all-reduce program), the band of row counts it serves instead of the whole
+# program of its call -- ``{"kind": "prefix" | "suffix", "threshold": rows,
+# "whole": {target: whole program}}``, the threshold inclusive for both kinds
+# (:func:`select_rows`).  A registry written before the generator published the
+# literal has no dispatched program.
 SELECT_ROWS: dict[str, dict[str, Any]] = dict(getattr(_programs, "SELECT_ROWS", {}))
 
 SOURCE_PACKAGE = "cake_fp4_allreduce"

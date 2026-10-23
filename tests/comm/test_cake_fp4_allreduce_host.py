@@ -1110,12 +1110,14 @@ def test_select_rows_rule_is_inclusive_at_the_threshold() -> None:
 
 
 def test_select_rows_bands_name_dispatched_programs_with_their_whole_program() -> None:
-    """Every band of the registry is a fused-norm program whose record carries the band, and names, per
-    target it ships for, the one whole program of its call (same input format, output format and prefetch
-    form, no band of its own) the row counts outside the band run; a whole program carries no band."""
+    """Every band of the registry is a fused-norm or a world-size-2 all-reduce program whose record carries
+    the band, and names, per target it ships for, the one whole program of its call (same family, world size,
+    input format, output format and prefetch form, no band of its own) the row counts outside the band run; a
+    whole program carries no band."""
     for program, band in loader.SELECT_ROWS.items():
         record = PROGRAMS[program]
-        assert record["family"] == "rmsnorm", program
+        assert record["family"] in ("rmsnorm", "allreduce"), program
+        assert record["world_size"] == 2, program
         assert set(band) == {"kind", "threshold", "whole"}, program
         assert band["kind"] in ("prefix", "suffix"), program
         assert isinstance(band["threshold"], int) and band["threshold"] >= 1, program
@@ -1129,10 +1131,14 @@ def test_select_rows_bands_name_dispatched_programs_with_their_whole_program() -
             assert whole not in loader.SELECT_ROWS, (program, whole)
             assert target in other["targets"], (program, whole)
             assert (
+                other["family"],
+                other["world_size"],
                 other["input_format"],
                 other["output_format"],
                 other["prefetch"],
             ) == (
+                record["family"],
+                record["world_size"],
                 record["input_format"],
                 record["output_format"],
                 record["prefetch"],
@@ -1244,7 +1250,7 @@ def test_program_for_keeps_the_whole_program_without_a_band(
                         "prefetch"
                     ] is loader.select_prefetch(rows, grid)
                     assert loader.PROGRAMS[program]["rows_kind"] is None
-    # The rows filter does not touch the all-reduce families.
+    # The all-reduce programs, with no band installed here, resolve as before.
     for target in TARGETS:
         assert loader.program_for(
             "allreduce", 2, "bf16", None, BAND_THRESHOLD, 148, target
@@ -1283,6 +1289,108 @@ def test_program_for_refuses_two_bands_serving_one_call(
             "rmsnorm", 2, "bf16", "bf16", BAND_THRESHOLD - 1, 148, "sm_103a"
         )
     loader.program_for.cache_clear()
+
+
+ONESHOT_BAND_THRESHOLD = 16384
+
+
+@pytest.fixture
+def synthetic_oneshot_band(monkeypatch):
+    """A registry with a rows-dispatched one-shot all-reduce program on sm_100a, installed the way the generator
+    writes it: the whole NVFP4 one-shot program's record with the band's re-arm and ``rows_kind`` /
+    ``rows_threshold`` over it, and SELECT_ROWS naming the band with the whole program.  Yields
+    ``(band, whole)``."""
+
+    target = "sm_100a"
+    whole, band = "tp2_oneshot_nvfp4", "tp2_oneshot_nvfp4_rsb"
+    programs = {
+        name: {"rows_kind": None, "rows_threshold": None, **record}
+        for name, record in loader.PROGRAMS.items()
+    }
+    assert programs[whole]["family"] == "allreduce"
+    assert target in programs[whole]["targets"]
+    assert band not in programs
+    programs[band] = {
+        **programs[whole],
+        "reset": "bulk",
+        "targets": (target,),
+        "kernel_symbol": f"cake_fp4_allreduce_{band}",
+        "rows_kind": "suffix",
+        "rows_threshold": ONESHOT_BAND_THRESHOLD,
+    }
+    bands = dict(loader.SELECT_ROWS)
+    bands[band] = {
+        "kind": "suffix",
+        "threshold": ONESHOT_BAND_THRESHOLD,
+        "whole": {target: whole},
+    }
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    monkeypatch.setattr(loader, "SELECT_ROWS", bands)
+    loader.program_for.cache_clear()
+    yield band, whole
+    loader.program_for.cache_clear()
+
+
+def test_program_for_dispatches_the_one_shot_band_at_or_above_its_threshold(
+    synthetic_oneshot_band
+) -> None:
+    """The rows filter is per call, whatever the kernel: on sm_100a the NVFP4 one-shot call runs the whole
+    program below the threshold and the band at and above it (the call's row count, inclusive; the one-shot
+    kernel has no prefetch form to choose first, and the grid plays no part); the BF16 one-shot call and the
+    other targets' NVFP4 calls keep their whole program at every probe, as do the fused-norm calls."""
+    band, whole = synthetic_oneshot_band
+    probes = (
+        1,
+        4096,
+        ONESHOT_BAND_THRESHOLD - 1,
+        ONESHOT_BAND_THRESHOLD,
+        ONESHOT_BAND_THRESHOLD + 1,
+        100000,
+    )
+    expected = (whole, whole, whole, band, band, band)
+
+    def resolve(fmt: str, rows: int, grid: int, target: str) -> str:
+        return loader.program_for("allreduce", 2, fmt, None, rows, grid, target)
+
+    for grid in (148, 4096):
+        for rows, program in zip(probes, expected, strict=True):
+            assert resolve("nvfp4", rows, grid, "sm_100a") == program, (rows, grid)
+    for target in ("sm_103a", "sm_107a"):
+        for rows in probes:
+            assert resolve("nvfp4", rows, 148, target) == whole, (target, rows)
+    for target in TARGETS:
+        bf16 = f"tp2_oneshot_bf16{ONESHOT_BF16_FORMS[target]}"
+        for rows in probes:
+            assert resolve("bf16", rows, 148, target) == bf16, (target, rows)
+    # The band's record: the bulk re-arm over the whole program's register stores, the band keys, one
+    # target; the whole program keeps its three targets and no band.
+    record, plain = loader.PROGRAMS[band], loader.PROGRAMS[whole]
+    assert (record["reset"], plain["reset"]) == ("bulk", "st")
+    assert (record["rows_kind"], record["rows_threshold"]) == (
+        "suffix",
+        ONESHOT_BAND_THRESHOLD,
+    )
+    assert (plain["rows_kind"], plain["rows_threshold"]) == (None, None)
+    assert (record["output_format"], record["prefetch"], record["bv"]) == (
+        None,
+        None,
+        None,
+    )
+    assert record["targets"] == ("sm_100a",)
+    assert plain["targets"] == TARGETS
+    assert loader.SELECT_ROWS[band] == {
+        "kind": "suffix",
+        "threshold": ONESHOT_BAND_THRESHOLD,
+        "whole": {"sm_100a": whole},
+    }
+    # The fused-norm calls of the same target and input format are untouched by the one-shot band.
+    for output_format in OUTPUT_FORMATS:
+        for rows in (ONESHOT_BAND_THRESHOLD - 1, ONESHOT_BAND_THRESHOLD):
+            program = loader.program_for(
+                "rmsnorm", 2, "nvfp4", output_format, rows, 148, "sm_100a"
+            )
+            assert program not in loader.SELECT_ROWS, (output_format, rows)
+            assert loader.PROGRAMS[program]["rows_kind"] is None
 
 
 def test_grid_max_is_the_least_bound_of_the_programs(monkeypatch) -> None:
