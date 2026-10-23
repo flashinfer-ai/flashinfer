@@ -42,7 +42,7 @@ from typing import Any, Callable, Optional
 import torch
 import tvm_ffi
 
-from ...api_logging import warn_experimental_backend_once
+from ._experimental import warn_experimental_backend_once
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
     PROGRAMS,

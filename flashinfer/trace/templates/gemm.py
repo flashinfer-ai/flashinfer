@@ -700,6 +700,7 @@ def _mm_bf16_fp4_cute_dsl_init(
         nvfp4_quantize,
         prepare_bf16_fp4_weights,
     )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
@@ -707,7 +708,7 @@ def _mm_bf16_fp4_cute_dsl_init(
     major, minor = torch.cuda.get_device_capability(torch.device(device))
     if not mm_bf16_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
         raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
-    if (major, minor) in ((10, 0), (10, 3)):
+    if _cute_dsl_uses_sm100_layout(major, minor):
         raise NotImplementedError(
             f"SM{major}{minor} prepares a different cute-dsl layout; use "
             "mm_bf16_fp4_cute_dsl_sm100_trace"
@@ -757,12 +758,13 @@ def _mm_bf16_fp4_cute_dsl_sm100_init(
         nvfp4_quantize,
         prepare_bf16_fp4_weights,
     )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
         raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(torch.device(device))
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if not _cute_dsl_uses_sm100_layout(major, minor):
         raise NotImplementedError(
             f"this template describes the SM100/103 cute-dsl layout; got "
             f"SM{major}{minor}"
@@ -1385,6 +1387,8 @@ def _fmha_v2_prefill_deepseek_reference(
     scale_bmm2=None,
     return_lse: bool = False,
     lse=None,
+    scale_bmm1_d=None,
+    scale_bmm2_d=None,
     **_unused,
 ) -> torch.Tensor:
     """Reference for fmha_v2_prefill_deepseek: per-batch causal SDPA on
@@ -1392,19 +1396,25 @@ def _fmha_v2_prefill_deepseek_reference(
     Mutates ``out`` in-place; returns it.
     """
     B, S, H, D = query.shape
-    s = float(scale_bmm1 or scale_softmax)
+    if scale_bmm1_d is not None:
+        scale_bmm1 = scale_bmm1_d.item()
+    if scale_bmm2_d is not None:
+        scale_bmm2 = scale_bmm2_d.item()
+    s = float(scale_bmm1) if scale_bmm1 is not None else 1.0
     b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
     q = query.to(torch.float32)
     k = key.to(torch.float32)
     v = value.to(torch.float32)
+    heads_per_kv = H // key.shape[2]
     # Per head, per batch: causal attention.
     for batch in range(B):
         for h in range(H):
-            logits = q[batch, :, h] @ k[batch, :, h].T * s
+            kv_h = h // heads_per_kv
+            logits = q[batch, :, h] @ k[batch, :, kv_h].T * s
             mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
             logits = logits + mask
             attn = torch.softmax(logits, dim=-1)
-            out[batch, :, h] = (attn @ v[batch, :, h] * b2).to(out.dtype)
+            out[batch, :, h] = (attn @ v[batch, :, kv_h] * b2).to(out.dtype)
     return out
 
 
@@ -1423,23 +1433,31 @@ def _fmha_v2_prefill_sm120_reference(
     causal: bool = True,
     return_lse: bool = False,
     lse=None,
+    scale_bmm1_d=None,
+    scale_bmm2_d=None,
     **_unused,
 ) -> torch.Tensor:
-    """Reference for FP8 SM120 FMHA v2 standard self-attention."""
+    """Reference for FP8 SM120 FMHA v2 MHA/GQA self-attention."""
     B, S, H, D = query.shape
-    s = float(scale_bmm1 or scale_softmax)
+    if scale_bmm1_d is not None:
+        scale_bmm1 = scale_bmm1_d.item()
+    if scale_bmm2_d is not None:
+        scale_bmm2 = scale_bmm2_d.item()
+    s = float(scale_bmm1) if scale_bmm1 is not None else 1.0
     b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
     q = query.to(torch.float32)
     k = key.to(torch.float32)
     v = value.to(torch.float32)
+    heads_per_kv = H // key.shape[2]
     for batch in range(B):
         for h in range(H):
-            logits = q[batch, :, h] @ k[batch, :, h].T * s
+            kv_h = h // heads_per_kv
+            logits = q[batch, :, h] @ k[batch, :, kv_h].T * s
             if causal:
                 mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
                 logits = logits + mask
             attn = torch.softmax(logits, dim=-1)
-            out[batch, :, h] = (attn @ v[batch, :, h] * b2).to(out.dtype)
+            out[batch, :, h] = (attn @ v[batch, :, kv_h] * b2).to(out.dtype)
     return out
 
 
@@ -1449,19 +1467,46 @@ def _fmha_v2_prefill_deepseek_init(
     seq_len: int = 128,
     scale_size: int = 1,
     num_heads: int = 32,
-    head_dim: int = 128,
+    head_dim: int = 192,
+    head_dim_vo: int = 128,
+    num_kv_heads: int | None = None,
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build inputs for ``fmha_v2_prefill_deepseek``."""
+    if head_dim in (128, 256):
+        inputs = _fmha_v2_prefill_sm120_init(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            scale_size=scale_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+            device=device,
+            seed=seed,
+        )
+        inputs.pop("causal")
+        return inputs
     del scale_size
     torch.manual_seed(seed)
+    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
     q = torch.randn(
         batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
     )
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    out = torch.empty_like(q)
+    k = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn(
+        batch_size,
+        seq_len,
+        num_kv_heads,
+        head_dim_vo,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    out = torch.empty(
+        batch_size, seq_len, num_heads, head_dim_vo, dtype=torch.bfloat16, device=device
+    )
     return {
         "query": q,
         "key": k,
@@ -1470,7 +1515,8 @@ def _fmha_v2_prefill_deepseek_init(
         "num_heads": int(num_heads),
         "head_dim": int(head_dim),
         "seq_len": int(seq_len),
-        "scale_softmax": 1.0 / math.sqrt(head_dim),
+        "scale_softmax": 0.0,
+        "scale_bmm1": 1.0 / math.sqrt(head_dim),
     }
 
 
@@ -1481,6 +1527,7 @@ def _fmha_v2_prefill_sm120_init(
     scale_size: int = 1,
     num_heads: int = 32,
     head_dim: int = 128,
+    num_kv_heads: int | None = None,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1495,9 +1542,11 @@ def _fmha_v2_prefill_sm120_init(
         return quantized, scale.item()
 
     shape = (batch_size, seq_len, num_heads, head_dim)
+    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+    kv_shape = (batch_size, seq_len, num_kv_heads, head_dim)
     q, q_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
-    k, k_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
-    v, v_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
+    k, k_scale = quantize(torch.randn(kv_shape, dtype=torch.bfloat16, device=device))
+    v, v_scale = quantize(torch.randn(kv_shape, dtype=torch.bfloat16, device=device))
     out = torch.empty(shape, dtype=torch.bfloat16, device=device)
     return {
         "query": q,
@@ -1522,11 +1571,17 @@ def _fmha_v2_prefill_sm120_init(
     }
 
 
+_fmha_v2_prefill_deepseek_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _fmha_v2_prefill_sm120_init,
+)
+
+
 fmha_v2_prefill_deepseek_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="fmha_v2_prefill_deepseek",
     description=(
-        "DeepSeek-specific FMHA v2 prefill: separate Q/K/V tensors, "
+        "DeepSeek MLA, GLM-4.7-Flash 256-dimension MLA context, and 128-dimension GQA "
+        "FMHA v2 prefill: separate Q/K/V tensors, "
         "fixed seq_len, causal SDPA per batch. Mutates ``out`` in-place."
     ),
     axes={
@@ -1534,14 +1589,16 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
+        "head_dim_vo": Var(),
+        "num_kv_heads": Var(),
         "scale_size": Var(),
     },
     inputs={
         "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "key": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim_vo"]),
         "out": Tensor(
-            ["batch_size", "seq_len", "num_heads", "head_dim"],
+            ["batch_size", "seq_len", "num_heads", "head_dim_vo"],
             description="In-place output buffer.",
         ),
         "num_heads": Scalar("int32"),
@@ -1563,7 +1620,7 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
     },
     outputs={
         "out": Tensor(
-            ["batch_size", "seq_len", "num_heads", "head_dim"], dtype_from="query"
+            ["batch_size", "seq_len", "num_heads", "head_dim_vo"], dtype_from="out"
         ),
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
@@ -1583,12 +1640,13 @@ fmha_v2_prefill_sm120_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
+        "num_kv_heads": Var(),
         "scale_size": Var(),
     },
     inputs={
         "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "key": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
         "out": Tensor(
             ["batch_size", "seq_len", "num_heads", "head_dim"],
             description="In-place output buffer.",

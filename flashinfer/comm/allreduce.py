@@ -52,8 +52,11 @@ Example usage:
         >>> workspace.destroy()
 """
 
-from typing import Union, Literal, Optional, Tuple, List, cast, Any
+from typing import TYPE_CHECKING, Union, Literal, Optional, Tuple, List, cast, Any
 from .workspace_base import AllReduceFusionWorkspace
+
+if TYPE_CHECKING:
+    from .mnnvl_cutedsl import MNNVLCuteDSLConfig
 
 import torch
 from torch.distributed import ProcessGroup
@@ -356,7 +359,7 @@ def _workspace_creation_heuristic(
 
 @flashinfer_api
 def create_allreduce_fusion_workspace(
-    backend: Literal["trtllm", "mnnvl", "auto"] = "auto",
+    backend: Literal["trtllm", "mnnvl", "mnnvl-cutedsl", "auto"] = "auto",
     world_size: int = None,
     rank: int = None,
     max_token_num: int = None,
@@ -366,6 +369,19 @@ def create_allreduce_fusion_workspace(
     comm_backend: Optional[CommBackend] = None,
     force_oneshot_support: bool = False,
     group: Optional[ProcessGroup] = None,
+    *,
+    top_k: Optional[int] = None,
+    rms_eps: Optional[float] = None,
+    weight_bias: Optional[float] = None,
+    routed_scaling_factor: Optional[float] = None,
+    include_shared_expert: Optional[bool] = None,
+    add_residual: Optional[bool] = None,
+    write_residual_output: Optional[bool] = None,
+    apply_rms_norm: Optional[bool] = None,
+    output_dtype: Optional[torch.dtype] = None,
+    dynamic_fp8: Optional[bool] = None,
+    write_norm_output: Optional[bool] = None,
+    config: Optional["MNNVLCuteDSLConfig"] = None,
 ) -> AllReduceFusionWorkspace:
     r"""Create workspace for AllReduce fusion operations.
 
@@ -381,9 +397,11 @@ def create_allreduce_fusion_workspace(
 
     Parameters
     ----------
-    backend : Literal["trtllm", "mnnvl", "auto"]
+    backend : Literal["trtllm", "mnnvl", "mnnvl-cutedsl", "auto"]
         Backend to use. ``"auto"`` uses a topology-based heuristic to pick
-        between ``"trtllm"`` and ``"mnnvl"``.
+        between ``"trtllm"`` and ``"mnnvl"``; it never selects
+        ``"mnnvl-cutedsl"``, which must be requested explicitly and builds an
+        :class:`~flashinfer.comm.mnnvl_cutedsl_ar.MNNVLCuteDSLAllReduceFusionWorkspace`.
     world_size : int
         Number of ranks in the process group.
     rank : int
@@ -408,14 +426,61 @@ def create_allreduce_fusion_workspace(
         backend needs to be initialized with the correct strategy; the
         TRT-LLM backend works for both.
     group : Optional[ProcessGroup]
-        Process group used for symmetric-memory rendezvous (TRT-LLM backend
-        only). Defaults to ``torch.distributed.group.WORLD``.
+        Process group used for symmetric-memory rendezvous (TRT-LLM and MNNVL
+        CuTe DSL backends). Defaults to ``torch.distributed.group.WORLD``.
+
+    The keyword-only arguments below configure ``backend="mnnvl-cutedsl"``
+    and are rejected by every other backend. The CuTe DSL kernels are
+    compiled for them when the workspace is built, so every call must use
+    the same values; ``None`` keeps the workspace default shown.
+
+    top_k : Optional[int]
+        Routed experts per token for the MoE finalize patterns; part of the
+        static profile key. Default ``10``.
+    rms_eps : Optional[float]
+        RMSNorm epsilon compiled into the kernels. Default ``1e-6``.
+    weight_bias : Optional[float]
+        Offset added to ``rms_gamma`` (``1.0`` for Gemma-style norms).
+        Default ``0.0``.
+    routed_scaling_factor : Optional[float]
+        Scale applied to the routed-expert sum of the finalize patterns.
+        Default ``1.0``.
+    include_shared_expert : Optional[bool]
+        Whether the finalize patterns add ``shared_expert_output``. Default
+        ``True``.
+    add_residual : Optional[bool]
+        Whether ``residual_in`` is added to the reduced sum. ``residual_in``
+        must then be identical on every rank. Default ``True``.
+    write_residual_output : Optional[bool]
+        Whether the pre-norm sum is written to ``residual_out``. Default
+        ``True``.
+    apply_rms_norm : Optional[bool]
+        Whether the RMSNorm is compiled in. With ``apply_rms_norm=False`` and
+        ``add_residual=False`` the workspace serves ``kAllReduce``. Default
+        ``True``.
+    output_dtype : Optional[torch.dtype]
+        ``torch.bfloat16`` (default) or ``torch.float8_e4m3fn`` for the FP8
+        quantized patterns.
+    dynamic_fp8 : Optional[bool]
+        Per-token dynamic FP8 scales (patterns 10 and 11) instead of a static
+        scale; requires ``output_dtype=torch.float8_e4m3fn``. Default
+        ``False``.
+    write_norm_output : Optional[bool]
+        Also write the BF16 norm for the ``*Out*`` FP8 patterns (4 and 11).
+        Default ``False``.
+    config : Optional[MNNVLCuteDSLConfig]
+        Static profiles and token-count routes. Defaults to
+        ``DEFAULT_CONFIG`` with the norm and ``NO_NORM_CONFIG`` without it.
+        Construction fails if no profile matches the shape and the device's
+        compute capability; :func:`~flashinfer.comm.is_mnnvl_cutedsl_supported`
+        checks this without raising.
 
     Returns
     -------
     AllReduceFusionWorkspace
-        Either a ``TRTLLMAllReduceFusionWorkspace`` or
-        ``MNNVLAllReduceFusionWorkspace``. The workspace type determines
+        A ``TRTLLMAllReduceFusionWorkspace``,
+        ``MNNVLAllReduceFusionWorkspace`` or
+        ``MNNVLCuteDSLAllReduceFusionWorkspace``. The workspace type determines
         which backend :func:`allreduce_fusion` will dispatch to.
 
     Raises
@@ -451,7 +516,71 @@ def create_allreduce_fusion_workspace(
     ...     dtype=torch.bfloat16,
     ... )
 
+    >>> # MNNVL CuTe DSL plain all-reduce (collective; every rank calls it)
+    >>> workspace = create_allreduce_fusion_workspace(
+    ...     backend="mnnvl-cutedsl",
+    ...     world_size=4,
+    ...     rank=rank,
+    ...     max_token_num=2048,
+    ...     hidden_dim=8192,
+    ...     dtype=torch.bfloat16,
+    ...     apply_rms_norm=False,
+    ...     add_residual=False,
+    ... )
+    >>> out = allreduce_fusion(
+    ...     input=x, workspace=workspace, pattern=AllReduceFusionPattern.kAllReduce
+    ... )
+
     """
+    cutedsl_options: dict[str, Any] = {
+        name: value
+        for name, value in (
+            ("top_k", top_k),
+            ("rms_eps", rms_eps),
+            ("weight_bias", weight_bias),
+            ("routed_scaling_factor", routed_scaling_factor),
+            ("include_shared_expert", include_shared_expert),
+            ("add_residual", add_residual),
+            ("write_residual_output", write_residual_output),
+            ("apply_rms_norm", apply_rms_norm),
+            ("output_dtype", output_dtype),
+            ("dynamic_fp8", dynamic_fp8),
+            ("write_norm_output", write_norm_output),
+            ("config", config),
+        )
+        if value is not None
+    }
+    if backend == "mnnvl-cutedsl":
+        ignored = [
+            name
+            for name, value in (
+                ("gpus_per_node", gpus_per_node),
+                ("comm_backend", comm_backend),
+            )
+            if value is not None
+        ]
+        if force_oneshot_support:
+            ignored.append("force_oneshot_support")
+        if ignored:
+            raise ValueError(
+                "backend='mnnvl-cutedsl' does not use: " + ", ".join(ignored)
+            )
+        from .mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
+
+        return MNNVLCuteDSLAllReduceFusionWorkspace(
+            tp_size=world_size,
+            tp_rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            group=group,
+            **cutedsl_options,
+        )
+    if cutedsl_options:
+        raise ValueError(
+            "Only backend='mnnvl-cutedsl' accepts: " + ", ".join(cutedsl_options)
+        )
+
     if gpus_per_node is None:
         gpus_per_node = min(torch.cuda.device_count(), world_size)
     # Determine the actual backend to use
@@ -537,6 +666,97 @@ def create_allreduce_fusion_workspace(
         )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
+
+
+def is_mnnvl_cutedsl_supported(
+    tp_size: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    *,
+    max_token_num: int,
+    top_k: int = 10,
+    apply_rms_norm: bool = True,
+    write_residual_output: bool = True,
+    output_dtype: torch.dtype = torch.bfloat16,
+    dynamic_fp8: bool = False,
+    write_norm_output: bool = False,
+    config: Optional["MNNVLCuteDSLConfig"] = None,
+    device: Optional[Union[torch.device, int, str]] = None,
+) -> bool:
+    r"""Whether this rank passes the ``backend="mnnvl-cutedsl"`` workspace checks.
+
+    Runs the checks of the MNNVL CuTe DSL workspace that neither allocate nor
+    communicate, and returns ``False`` instead of raising: the CuTe DSL is
+    importable, ``tp_size`` is 2, 4, 8 or 16, ``dtype`` is ``torch.bfloat16``,
+    ``max_token_num`` is positive, the output settings are a valid
+    combination, ``config`` has a static profile for
+    ``(tp_size, hidden_dim, top_k, dtype)`` on the device's compute capability
+    whose routes cover ``max_token_num`` and suit ``apply_rms_norm`` and
+    ``dynamic_fp8``, and the device is a Blackwell-class GPU with PyTorch
+    symmetric memory and NVLink multicast. The workspace constructor runs the
+    same checks with the same arguments.
+
+    ``True`` does not guarantee that construction succeeds: building the
+    workspace also allocates symmetric and multicast memory, which can fail
+    for lack of device memory or multicast resources, and compiles the
+    kernels.
+
+    The answer describes this rank only. Workspace construction is
+    collective, so combine the answers of all ranks (for example a ``MIN``
+    all-reduce of the flag) and build the workspace only when every rank
+    supports it.
+
+    Parameters
+    ----------
+    tp_size : int
+        Number of ranks in the tensor-parallel group.
+    hidden_dim : int
+        Hidden dimension of the communicated activations.
+    dtype : torch.dtype
+        Activation dtype.
+    max_token_num : int
+        Workspace capacity in tokens.
+    top_k : int
+        Routed experts per token; part of the profile key. Default ``10``.
+    apply_rms_norm : bool
+        Whether the workspace would compile the RMSNorm in. Default ``True``.
+    write_residual_output : bool
+        As the workspace argument. Default ``True``.
+    output_dtype : torch.dtype
+        As the workspace argument. Default ``torch.bfloat16``.
+    dynamic_fp8 : bool
+        As the workspace argument. Default ``False``.
+    write_norm_output : bool
+        As the workspace argument. Default ``False``.
+    config : Optional[MNNVLCuteDSLConfig]
+        Routing configuration. Defaults to ``DEFAULT_CONFIG`` with the norm
+        and ``NO_NORM_CONFIG`` without it, as the workspace does.
+    device : Optional[Union[torch.device, int, str]]
+        CUDA device to check. Defaults to the current device.
+
+    Returns
+    -------
+    bool
+        ``True`` if this rank passes every check.
+    """
+    try:
+        from .mnnvl_cutedsl_ar import _probe_support
+    except ImportError:
+        return False
+    return _probe_support(
+        tp_size,
+        hidden_dim,
+        dtype,
+        max_token_num=max_token_num,
+        top_k=top_k,
+        apply_rms_norm=apply_rms_norm,
+        write_residual_output=write_residual_output,
+        output_dtype=output_dtype,
+        dynamic_fp8=dynamic_fp8,
+        write_norm_output=write_norm_output,
+        config=config,
+        device=device,
+    )
 
 
 # ============================================================================
@@ -638,13 +858,21 @@ def allreduce_fusion(
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM,
         Cake on a TRT-LLM workspace, and the explicit MNNVL CuTe DSL backend.
 
+        The MNNVL CuTe DSL backend serves ``kAllReduce`` on a workspace built
+        with ``apply_rms_norm=False`` and ``add_residual=False``, and the norm
+        patterns on a workspace built with the norm.
+
         The MNNVL CuTe DSL backend supports static per-tensor E4M3 output
         through patterns 2, 4 and 12 on a workspace constructed with
         ``output_dtype=torch.float8_e4m3fn``. Patterns 2 and 12 require the
         workspace's ``write_norm_output=False``; pattern 4 requires ``True``
         and a caller-provided ``norm_out``. Patterns 1 and 7 require a BF16
         workspace, so pattern 7 returns BF16 ``norm_out`` on every backend.
-        Communication and residual outputs stay BF16.
+        Dynamic per-token E4M3 output (patterns 10 and 11) needs a workspace
+        constructed with ``output_dtype=torch.float8_e4m3fn`` and
+        ``dynamic_fp8=True``; pattern 10 requires ``write_norm_output=False``,
+        pattern 11 ``True``. Both write ``scale_out`` and take no
+        ``scale_factor``. Communication and residual outputs stay BF16.
     launch_with_pdl : bool
         Use Programmatic Dependent Launch. MNNVL CuTe DSL presets determine
         their compiled PDL mode and warn when it differs from this value.

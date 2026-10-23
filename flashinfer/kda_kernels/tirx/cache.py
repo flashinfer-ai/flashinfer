@@ -81,6 +81,8 @@ def _compiler_fingerprint():
 
 
 class _KdaTirxSpec(JitSpec):
+    toolchain = "tirx"
+
     def __init__(self, key, factory):
         digest = hashlib.sha256(
             repr((key, _compiler_fingerprint())).encode()

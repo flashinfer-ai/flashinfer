@@ -34,7 +34,10 @@ from flashinfer.cake_sampling import (
     top_k_top_p_sampling_from_probs,
 )
 from flashinfer.jit.cake_sampling import supported_capability
-from tests.test_helpers.sampling import required_num_trials
+from tests.test_helpers.sampling import (
+    required_num_collision_rows,
+    required_num_trials,
+)
 
 
 def _require_supported_device():
@@ -297,10 +300,18 @@ def test_different_seed_offset_produces_different_results(vocab_size):
     """Different seed/offset values produce different samples."""
     _require_supported_device()
     torch.manual_seed(42)
-    batch_size = 1000
+    # The reproducibility test above retains larger batch shapes.
+    batch_size = 16
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     k = min(100, vocab_size - 1)
+    # Collision probabilities must use top-p over the normalized top-k mass.
+    top_probs = normalized_prob.topk(k, dim=-1).values.double()
+    top_probs /= top_probs.sum(dim=-1, keepdim=True)
+    exclusive = top_probs.cumsum(dim=-1) - top_probs
+    filtered_probs = top_probs * (exclusive < 0.9)
+    num_rows = required_num_collision_rows(filtered_probs)
+    normalized_prob = normalized_prob[:num_rows]
     _pipeline_or_skip(normalized_prob, k)
 
     def draw(seed, offset):

@@ -4,7 +4,7 @@
  */
 
 // Host launcher for the Cake MoE finalize + all-reduce fusion kernels in
-// sm_100a/*_device.cu. One module per architecture links the twelve generated
+// cake_moe_finalize_kernels.cu. One module per architecture links the twelve
 // kernels (dtype x world size x optional NVFP4 epilogue); the launch
 // configuration is shared and PDL is a launch attribute chosen at run time.
 #include <cuda_bf16.h>

@@ -87,7 +87,7 @@ kernel_cake_rmsnorm_train_8757f6da86abf54363d5(__nv_bfloat16* __restrict__ x, __
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;
@@ -159,11 +159,11 @@ kernel_cake_rmsnorm_train_8757f6da86abf54363d5(__nv_bfloat16* __restrict__ x, __
                 }
             }
         }
-        float _warp_reduce_0 = sum_sq;
+        float _warp_reduce_2 = sum_sq;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-        sum_sq = _warp_reduce_0;
+            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
+        sum_sq = _warp_reduce_2;
         int par = (it & 1) * 2;
         if (lane == 0) {
             partials[par + warp_0] = sum_sq;
@@ -176,10 +176,9 @@ kernel_cake_rmsnorm_train_8757f6da86abf54363d5(__nv_bfloat16* __restrict__ x, __
         }
         it += 1;
         float mean = total * 0.001953125f;
-        float _sqrt_0;
-        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(mean + eps));
-        float _rcp_0 = __frcp_rn(_sqrt_0);
-        float rstd = _rcp_0;
+        float _sqrt_3;
+        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_3) : "f"(mean + eps));
+        float rstd = __frcp_rn(_sqrt_3);
         if (row < T) {
             if (gtid == 0) {
                 r[row] = rstd;
@@ -204,4 +203,3 @@ kernel_cake_rmsnorm_train_8757f6da86abf54363d5(__nv_bfloat16* __restrict__ x, __
 }
 
 } // extern "C"
-

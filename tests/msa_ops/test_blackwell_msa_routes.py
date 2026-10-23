@@ -18,6 +18,8 @@ is one the dispatcher derives from its inputs, and the input-derived
 predicates select exactly the registered programs.
 """
 
+from unittest import mock
+
 import pytest
 import torch
 
@@ -76,6 +78,9 @@ def _derive(route):
         return backend._long_prefill_route(
             paged=layout == "paged", group_size=int(gqa[3:])
         )
+    if kind == "kmaj_p":
+        layout, gqa = fields
+        return backend._kmaj_p_route(paged=layout == "paged", group_size=int(gqa[3:]))
     if kind == "decode_fp8_q1":
         (schedule,) = fields
         paged = schedule == "q1_paged_xform2"
@@ -96,7 +101,9 @@ def _derive(route):
             max_pages=32 if paged else 0,
         )
     if kind == "decode_uniform_fp8":
-        return "decode_uniform_fp8:paged"
+        # the single-token program serves every seqlen_q while lever D4b(dynpair) ships with its route off;
+        # a registered ``paged_dynpair`` route must be selectable by the mirror (even seqlen_q)
+        return backend._uniform_fp8_route(8 if fields == ["paged_dynpair"] else 1)
     raise AssertionError(f"unknown route kind {kind!r} in {route}")
 
 
@@ -225,6 +232,125 @@ def test_prefill_route_selects_the_gqa16_paged_mask_family():
     assert backend._prefill_route(
         **{**common, "paged": False}, causal=True, max_pages=0
     ).endswith(":any")
+
+
+def test_uniform_fp8_route_is_the_single_token_program_unless_dynpair_is_opted_in():
+    # Lever D4b(dynpair) ships with its route off by default: every
+    # seqlen_q takes the single-token program and only that route is registered.  The
+    # mirror switch keeps the dispatcher's predicate (even seqlen_q in [2, 32]); turning
+    # it on needs a re-export that registers the ``paged_dynpair`` route again.
+    assert backend._UNIFORM_FP8_DYNPAIR_ROUTE is False
+    single = "decode_uniform_fp8:paged"
+    for seqlen_q in range(1, 35):
+        assert backend._uniform_fp8_route(seqlen_q) == single, seqlen_q
+    with mock.patch.object(backend, "_UNIFORM_FP8_DYNPAIR_ROUTE", True):
+        for seqlen_q in range(1, 33):
+            expected = (
+                "decode_uniform_fp8:paged_dynpair"
+                if seqlen_q % 2 == 0
+                else "decode_uniform_fp8:paged"
+            )
+            assert backend._uniform_fp8_route(seqlen_q) == expected, seqlen_q
+        assert backend._uniform_fp8_route(34) == "decode_uniform_fp8:paged"
+    for target in ("sm100a", "sm103a"):
+        assert "decode_uniform_fp8:paged:main" in _route_keys(target)
+        assert "decode_uniform_fp8:paged_dynpair:main" not in _route_keys(target)
+
+
+_KMAJ_COMMON = dict(
+    q_dtype=torch.bfloat16,
+    k_dtype=torch.bfloat16,
+    v_dtype=torch.bfloat16,
+    causal=True,
+    q_offset_is_none=True,
+    return_temperature_lse=False,
+    lse_temperature_scale=1.0,
+)
+_KMAJ_PAGED16 = dict(paged=True, group_size=16, max_pages=200)
+_KMAJ_FLAT16 = dict(paged=False, group_size=16, max_pages=0)
+
+
+def _kmaj(q_lens, k_lens, **layout):
+    return backend._use_kmaj_p_prefill(
+        **_KMAJ_COMMON, **layout, q_lens=q_lens, k_lens=k_lens
+    )
+
+
+def test_persistent_route_takes_the_short_request_batches_the_long_route_declines():
+    # Every request at or above the long thresholds: the long route, never the
+    # persistent one; one request below them hands the whole batch over.
+    assert backend._use_long_prefill(
+        **_KMAJ_COMMON, **_KMAJ_PAGED16, q_lens=(8192, 8192), k_lens=(25000, 25000)
+    )
+    assert not _kmaj((8192, 8192), (25000, 25000), **_KMAJ_PAGED16)
+    assert not backend._use_long_prefill(
+        **_KMAJ_COMMON, **_KMAJ_PAGED16, q_lens=(8192, 100), k_lens=(85362, 11008)
+    )
+    assert _kmaj((8192, 100), (85362, 11008), **_KMAJ_PAGED16)
+    # The length-independent admission is the long route's, plus paged GQA-16
+    # batches of exactly 64 pages; below 64 pages, a non-causal batch or FP16
+    # operands stay on the union route.
+    assert _kmaj((100, 100), (8192, 8192), paged=True, group_size=16, max_pages=64)
+    assert not _kmaj((100, 100), (8000, 8000), paged=True, group_size=16, max_pages=63)
+    assert _kmaj((100, 100), (8192, 8192), paged=True, group_size=8, max_pages=64)
+    assert not backend._use_kmaj_p_prefill(
+        **{**_KMAJ_COMMON, "causal": False},
+        **_KMAJ_PAGED16,
+        q_lens=(100, 100),
+        k_lens=(25000, 25000),
+    )
+    assert not backend._use_kmaj_p_prefill(
+        **{**_KMAJ_COMMON, "q_dtype": torch.float16, "k_dtype": torch.float16},
+        **_KMAJ_PAGED16,
+        q_lens=(100, 100),
+        k_lens=(25000, 25000),
+    )
+    with pytest.raises(ValueError):
+        _kmaj((100, 100), (25000,), **_KMAJ_PAGED16)
+
+
+def test_persistent_route_shape_guards():
+    # Flat KV floor: the longest request spans more than 64 KV blocks.
+    assert not _kmaj((1024,), (64 * 128,), **_KMAJ_FLAT16)
+    assert _kmaj((1024,), (64 * 128 + 1,), **_KMAJ_FLAT16)
+    assert _kmaj((1024, 1500), (4096, 8320), **_KMAJ_FLAT16)
+    # Longest-request box: a request of 14336+ queries stays on the union route
+    # only when the batch's shortest KV is at most 12288 tokens; 14208 queries
+    # pass, and long requests over longer KV take the persistent route.
+    assert _kmaj((114, 14208), (11008, 85362), **_KMAJ_PAGED16)
+    assert not _kmaj((114, 14336), (11008, 85362), **_KMAJ_PAGED16)
+    assert not _kmaj((114, 15318), (11008, 85362), **_KMAJ_PAGED16)
+    assert not _kmaj((114, 14336), (85362, 12288), **_KMAJ_PAGED16)
+    assert _kmaj((114, 14336), (85362, 12289), **_KMAJ_PAGED16)
+    assert _kmaj((186, 16128), (26112, 50874), **_KMAJ_PAGED16)
+    assert _kmaj((574, 15744), (25728, 26942), **_KMAJ_PAGED16)
+    # No KV/request box: short requests over short KV take the persistent route.
+    assert _kmaj((2548, 4168), (14792, 20084), **_KMAJ_PAGED16)
+    assert _kmaj((2048,), (20480,), **_KMAJ_PAGED16)
+    assert _kmaj((182, 1623), (17718, 18007), **_KMAJ_PAGED16)
+    assert _kmaj((2048,), (8192,), paged=True, group_size=8, max_pages=64)
+    assert _kmaj(
+        (2048, 2048, 2048, 2048), (8192,) * 4, paged=True, group_size=16, max_pages=64
+    )
+    assert backend._kmaj_p_admits(q_lens=(100,), k_lens=(8192,), paged=True)
+    assert not backend._kmaj_p_admits(q_lens=(100,), k_lens=(8192,), paged=False)
+
+
+def test_persistent_route_keys_and_plans_are_registered():
+    # The dispatcher requests these keys for every admitted batch; the plans
+    # are the producer's and the BF16 combine's argument orders.
+    for target in ("sm100a", "sm103a"):
+        keys = _route_keys(target)
+        for layout, group in (("flat", 16), ("paged", 16), ("paged", 8)):
+            route = backend._kmaj_p_route(paged=layout == "paged", group_size=group)
+            assert route == f"kmaj_p:{layout}:gqa{group}"
+            for stage in ("main", "reduce"):
+                assert f"{route}:{stage}" in keys, (target, route, stage)
+    assert {"kmaj_p_main", "kmaj_p_reduce"} <= set(loader.ARG_PLANS)
+    main = [name for _kind, name in loader.ARG_PLANS["kmaj_p_main"]]
+    assert "partial_scale" not in main and "num_work_items" in main
+    reduce = [name for _kind, name in loader.ARG_PLANS["kmaj_p_reduce"]]
+    assert "partial_scale" not in reduce and "split_counts" in reduce
 
 
 def test_uniform_fp8_grid_uses_the_full_even_wave_when_available():

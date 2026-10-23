@@ -204,9 +204,10 @@ autograd entries resolve every switch once in the forward.  **The package reads
 no environment variable.**  The `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables are
 FlashInfer's own A/B knobs and are read by `flashinfer.chunked_lm_head` only: a
 switch keyword left at `None` there falls back to its variable and the resolved
-value is passed down; the two binding-cache variables are applied when that
-module is imported, through `BINDING_CACHE.configure`.  A build that vendors
-the package without the wrapper sees the backend defaults.
+value is passed down; the two binding-cache variables are read when that
+module is imported and applied through `BINDING_CACHE.configure` when it first
+reaches the backend.  A build that vendors the package without the wrapper
+sees the backend defaults.
 
 | Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
 | --- | --- | --- |
@@ -216,8 +217,8 @@ the package without the wrapper sees the backend defaults.
 | `dw_stream` (`"auto"`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM` | `0` / `false` / `off` / `no` -> `False`; `1` / `true` / `on` / `yes` -> `True`; else `"auto"` |
 | `hidden_count` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT` | `0` -> `False`, else `True` |
 | `gemm_tuning` (`{}`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | JSON object -> dict; unset / blank -> no knob; invalid -> `ValueError` |
-| `BINDING_CACHE.configure(enabled=...)` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `0` -> disabled (at import) |
-| `BINDING_CACHE.configure(capacity=...)` (`64`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | positive integer (at import) |
+| `BINDING_CACHE.configure(enabled=...)` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `0` -> disabled (read at import, applied on first use) |
+| `BINDING_CACHE.configure(capacity=...)` (`64`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | positive integer (read at import, applied on first use) |
 
 ## Kernel structure of one token chunk
 
@@ -351,12 +352,11 @@ Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 host from the chunk scalars.  A GEMM stage runs in thread-block clusters whose
 CTA count the record's geometry declares per GEMM (`logits_cluster_ctas`,
 `dx_cluster_ctas`, `dw_cluster_ctas`; the host rounds `m_tiles` up to it and
-checks it against the module's launch cluster): a statically scheduled
-instance launches a persistent grid capped by `resident`, the device's
-co-resident clusters of that width (`cluster_resident`: the SM pairs for a
-two-CTA cluster, the driver's occupancy answer for wider ones), while a
-dynamically scheduled instance launches its whole work-item domain.  The
-`dX` K-slice rule uses the same co-resident count.  A GEMM compiled for the
+checks it against the module's launch cluster): every registered GEMM
+instance launches a grid over its whole work-item domain (no grid rule reads
+a co-resident cluster count), and the `dX` K-slice rule uses the device's
+co-resident two-CTA clusters (`cluster_resident`: the SM pair
+count).  A GEMM compiled for the
 preferred-cluster launch (the generated host binding passes the preferred
 cluster dimension next to the required one, so the hardware forms the wider
 clusters where the GPC topology allows and the required ones elsewhere)
@@ -390,17 +390,22 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   path, the autograd `Function`s and the eager entry points.
 * `csrc/cake_lm_head_loss/` -- generated kernel translation units
   (`cake_lm_head_loss_<unit>_kernel.cu`, one architecture-neutral unit per
-  kernel shared by the records of both architectures, the per-architecture
-  lowering under `__CUDA_ARCH__` guards -- except the four logits GEMM forms,
-  whose sm_103a lowering stages the C tile in shared memory for a TMA store
-  behind a six-stage operand pipeline while sm_100a stores from registers
-  behind seven, so each of those has one unit per architecture) and their two-line launch stubs
-  (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL` + the include of the shared
+  kernel family shared by the records of both architectures, the sibling
+  forms of a family selected by compile definitions and the per-architecture
+  lowering under `__CUDA_ARCH__` guards -- the four logits GEMM forms share
+  one unit across both architectures, and their sm_103a lowering, which
+  stages the C tile in shared memory for a TMA store behind a six-stage
+  operand pipeline while sm_100a stores from registers behind seven, sits in
+  a definition-keyed arm of it) and their launch stubs
+  (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL`, the compile definitions the
+  shared launcher reads for that kernel, + the include of the shared
   launcher); `csrc/cake_lm_head_loss/shim/` -- the shared tvm-ffi launchers
-  (`cake_lm_head_loss_shim_<digest>.cuh`, one per distinct host contract:
-  descriptor encoders, argument checks, dynamic shared memory and launch
-  geometry); `csrc/cake_ffi_checks.h` -- the tvm-ffi tensor checks the
-  launchers include (shipped with the package, no FlashInfer header).
+  (`cake_lm_head_loss_shim_<digest>.cuh`, one per launch shape, the stub's
+  compile definitions selecting the operand types, the C descriptor form,
+  dynamic shared memory and cluster form within it: descriptor encoders,
+  argument checks, dynamic shared memory and launch geometry);
+  `csrc/cake_ffi_checks.h` -- the tvm-ffi tensor checks the launchers
+  include (shipped with the package, no FlashInfer header).
   `.clang-format` disables formatting: the sources are identity-checked by
   the manifest's digests.
 

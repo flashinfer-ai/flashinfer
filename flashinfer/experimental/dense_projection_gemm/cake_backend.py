@@ -87,7 +87,12 @@ Two host paths share one planner and one binding:
   strides, dtypes, storage offsets, alignment, flags); a call that hits the
   cache rebinds the caller's views and launches without planning, device
   queries or allocation (``out`` is allocated only when the caller passes
-  none).  See ``CONVENIENCE_CACHE_SIZE`` and :func:`clear_convenience_caches`.
+  none).  The cached launches of one device and stream share one workspace
+  arena (:class:`_Arena`: one growable buffer per workspace kind) instead of
+  owning a workspace each, so the memory the convenience path holds is bounded
+  by the largest geometry seen, not by the number of geometries (a ragged
+  token count).  See ``CONVENIENCE_CACHE_SIZE`` and
+  :func:`clear_convenience_caches`.
 
 The device facts a plan depends on (architecture, SM count, L2 size) are read
 once per device index (:func:`device_facts`).
@@ -96,9 +101,10 @@ once per device index (:func:`device_facts`).
 from __future__ import annotations
 
 import dataclasses
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Protocol, Tuple, Union
 
 import torch
 import tvm_ffi
@@ -2444,21 +2450,32 @@ def _device_index(device: torch.device) -> int:
 _DUMMIES: dict[tuple, torch.Tensor] = {}
 
 
+def _dummy_key(device: torch.device, dtype, tag: Optional[str] = None) -> tuple:
+    """Per-device-ordinal key of a dummy (``cuda`` and ``cuda:0`` are one device; cheaper than ``str(device)``
+    on the planning path)."""
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    return (index, dtype, tag)
+
+
 def _dummy(device: torch.device, dtype) -> torch.Tensor:
-    key = (str(device), dtype)
-    if key not in _DUMMIES:
-        _DUMMIES[key] = torch.zeros(16, device=device, dtype=dtype)
-    return _DUMMIES[key]
+    key = _dummy_key(device, dtype)
+    dummy = _DUMMIES.get(key)
+    if dummy is None:
+        dummy = _DUMMIES[key] = torch.zeros(16, device=device, dtype=dtype)
+    return dummy
 
 
 def _dummy_map(device: torch.device, dtype) -> torch.Tensor:
     """A ``[1, 256, 64]`` tensor for an output descriptor the instance never touches: it covers every output box (inner
     <= 64 elements, outer <= 256 rows - OUT_BOX_OUTER is EPI_COLS <= 256 on the stt programs (round 27), 32 / CH_T_COLS
     otherwise), so the dummy map encodes on every program.  [Cake ``_dummy_map``]"""
-    key = (str(device), dtype, "map")
-    if key not in _DUMMIES:
-        _DUMMIES[key] = torch.zeros((1, 256, 64), device=device, dtype=dtype)
-    return _DUMMIES[key]
+    key = _dummy_key(device, dtype, "map")
+    dummy = _DUMMIES.get(key)
+    if dummy is None:
+        dummy = _DUMMIES[key] = torch.zeros((1, 256, 64), device=device, dtype=dtype)
+    return dummy
 
 
 def flat_alias(t: torch.Tensor) -> torch.Tensor:
@@ -2477,15 +2494,26 @@ def flat_alias(t: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 # The convenience entry points keep the planned launches of a process per kind (K1 / K2) in a least-recently-used
-# cache of this many entries.  An entry owns the workspace of its plan (K1: the stream-K partial slabs and the
-# slice counters; K2: the BF16x3 stack, its fp32 scratch and the split-K workspace) and the resolved module entry,
-# never a caller's tensor: the operand views are rebound from the caller's tensors on every call.  The key holds
-# the raw stream, so launches on different streams never share a workspace, and launches of one entry are ordered
-# by their stream.  The caches are plain dicts under the GIL: concurrent threads may plan one key twice (both
-# results are valid; the later one is kept), and a hit whose entry another thread evicts between the lookup and
-# the recency refresh is a miss.  The bound is read on every insertion, so a process may set it after the import.
-# A CUDA Graph should capture a prepared launch, not the convenience path: an entry evicted after capture would
-# free the workspace the graph replays.
+# cache of this many entries.  An entry holds its plan, the resolved module entry and an argument template whose
+# per-call operands -- the caller's views and the workspace tensors -- are ``_Slot`` markers, never a caller's
+# tensor: the operand views are rebound from the caller's tensors on every call.  The workspace of a plan (K1:
+# the stream-K partial slabs and the slice counters; K2: the BF16x3 stack, its fp32 scratch and the split-K
+# partials) is not owned by the entry but carved at launch time out of the workspace arena of the entry's
+# (device index, raw stream) -- one growable buffer per kind shared by every entry of that device and stream
+# (:class:`_Arena`) -- so the memory held is bounded by the largest requirement seen per kind, however many
+# geometries (token counts) the cache has planned; an arena is released when its last entry is evicted and by
+# :func:`clear_convenience_caches`.  The key holds the raw stream, so launches on different streams never share
+# a workspace, and launches of one device and stream -- the only users of its arena -- are ordered by that
+# stream.  Threads: planning and the arena bookkeeping (creation, growth, reference counts, insertion, eviction,
+# ``clear_convenience_caches``) are serialised by the module lock ``_PLAN_LOCK`` (a miss re-checks the cache
+# under it, so a key is planned once); the K2 hit path holds its arena's lock from the carve of the workspace
+# views through the split-K reduction, so two threads issuing router launches of different geometries on one
+# stream cannot interleave their split / kernel / reduction on the shared BF16x3 stack and partials; the K1 hit
+# path and the cache lookup are lock-free (one self-contained kernel per call; a hit whose entry another thread
+# evicts between the lookup and the recency refresh is a miss).  The caller still owns the stream: a stream is
+# assumed to have one issuer at a time in the sense of CUDA stream semantics.  The bound is read on every
+# insertion, so a process may set it after the import.  A CUDA Graph should capture a prepared launch, not the
+# convenience path: a growth or an eviction after capture would replace or free the workspace the graph replays.
 CONVENIENCE_CACHE_SIZE = 64
 
 
@@ -2498,13 +2526,14 @@ class _Slot:
 
 def _view_key(t: torch.Tensor) -> tuple:
     """The geometry of a view that fixes its plan and its binding: shape, strides, dtype, storage offset and
-    the 16-byte alignment residue of its first element (the planner's alignment checks); never its address."""
+    the 16-byte alignment residue of its first element (the planner's alignment checks); never its address.
+    (``shape`` and ``stride()`` are tuples of ints already; this is on the hit path.)"""
     return (
-        tuple(int(s) for s in t.shape),
-        tuple(int(s) for s in t.stride()),
+        tuple(t.shape),
+        t.stride(),
         t.dtype,
-        int(t.storage_offset()),
-        int(t.data_ptr() & 15),
+        t.storage_offset(),
+        t.data_ptr() & 15,
     )
 
 
@@ -2538,15 +2567,22 @@ def _cache_put(
     key: tuple,
     entry: Any,
     bound: Optional[int] = None,
+    on_evict: Optional[Callable[[Any], None]] = None,
 ) -> Any:
     """Insert ``entry`` as the most recent and evict the least recent entries beyond ``bound``
-    (``CONVENIENCE_CACHE_SIZE`` at call time when ``None``)."""
+    (``CONVENIENCE_CACHE_SIZE`` at call time when ``None``); ``on_evict`` sees every entry that leaves the
+    cache -- the evicted ones and an earlier entry of ``key`` that ``entry`` replaces."""
     if bound is None:
         bound = CONVENIENCE_CACHE_SIZE
+    replaced = cache.get(key) if on_evict is not None else None
     cache[key] = entry
     cache.move_to_end(key)
+    if replaced is not None and replaced is not entry:
+        on_evict(replaced)
     while len(cache) > bound:
-        cache.popitem(last=False)
+        _, evicted = cache.popitem(last=False)
+        if on_evict is not None:
+            on_evict(evicted)
     return entry
 
 
@@ -2566,6 +2602,229 @@ def _same_cuda_device(
     ):
         raise ValueError("Expected A, B and out on one CUDA device")
     return device
+
+
+# ---------------------------------------------------------------------------
+# Convenience-path workspace arena (one per device index and raw stream)
+# ---------------------------------------------------------------------------
+
+# The workspace kinds an arena carves: ``(dtype, zero-initialised)``.  The kinds are separate buffers -- a K1
+# launch uses ``k1_ws`` + ``k1_counters``, a K2 launch ``k2_parts`` + ``k2_resid`` + ``k2_partials`` -- so no
+# launch depends on the carving of another kind and the slice-counter zero contract has a buffer of its own.
+_ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
+    "k1_ws": (
+        torch.float32,
+        False,
+    ),  # stream-K partial slabs (``GemmPlan.ws_f32_elems``)
+    "k1_counters": (
+        torch.uint32,
+        True,
+    ),  # stream-K slice counters (``GemmPlan.counters_alloc_u32``)
+    "k2_parts": (
+        torch.bfloat16,
+        False,
+    ),  # the BF16x3 stack of the split operand ``[3, *split_src.shape]``
+    "k2_resid": (
+        torch.float32,
+        False,
+    ),  # the fp32 scratch of the split ``split_src.shape``
+    "k2_partials": (
+        torch.float32,
+        False,
+    ),  # the split-K partials ``[splits, rows, cols]``
+}
+_ARENA_MIN_ELEMS = (
+    16  # a pointer parameter the instance never dereferences still needs a buffer
+)
+
+
+@dataclass
+class _Arena:
+    """The workspace of every cached convenience-path launch of one (device index, raw stream): one buffer per
+    kind of ``_ARENA_KINDS``, grown to the largest requirement a planned entry has asked for and never shrunk;
+    an entry's workspace tensors are views of these buffers, resolved at launch time (:func:`_entry_views`).
+
+    Why sharing one buffer per kind between every entry of the device and stream is safe:
+
+    * every launch that reads or writes the arena is issued on this stream, and the hit path allocates nothing,
+      so two uses of a buffer are always ordered by the stream;
+    * growing replaces a buffer while an earlier launch on this stream may still be in flight on the old one.
+      The old tensor stays referenced by the arguments of that launch until the FFI call has enqueued it, and
+      once freed its block returns to PyTorch's caching allocator, which is stream-ordered: a block is handed
+      out again only to a later allocation on the stream it was freed on (whose kernels run after the launch
+      in flight), or after a ``cudaFree`` that synchronises the device.  The new buffer is allocated on this
+      stream (the current stream of the calling thread is the arena's stream);
+    * ``k1_counters``: the stream-K zero contract -- the kernel resets every counter it uses (the last arriver
+      of a tail tile's slice writes zero after the fixup) and the lane-spread dummy counters above
+      ``SK_DUMMY_BASE`` only ever receive a fetch-add of 0 -- holds for a shared buffer because the launches
+      are serialised by the stream and each one leaves the whole buffer zero again (the buffer is
+      zero-initialised when allocated, by a memset on the same stream).  This is the contract the Cake
+      launcher's per-device counters rely on;
+    * ``k2_parts`` / ``k2_resid``: the split rewrites both in full before every launch (same stream);
+    * ``k2_partials``: written by the kernel and consumed by ``torch.sum(..., out=out)`` right after the
+      launch on the same stream; the next launch overwrites them only after that reduction has read them;
+    * ``k1_ws``: the stream-K slabs carry no state between launches (the first arriver of a slice stores, the
+      others add).
+
+    ``version`` counts the growths: an entry memoises the views it carved against the version it read before
+    carving and carves them again after a growth (:func:`_entry_views`); a growth also forgets every memo of
+    the arena, so no cached entry keeps a replaced buffer alive.  ``refs`` counts the cached entries of the
+    arena; the last eviction releases it (:func:`_release_entry`).
+
+    Threads.  The stream-ordering argument above assumes the launches of one stream are issued in the order
+    their host work happened, which one issuing thread per stream gives for free.  With several threads on one
+    stream: ``require`` / ``refs`` / the registry are only touched under ``_PLAN_LOCK`` (planning is
+    serialised; ``require`` is also monotone -- it keeps the larger of its own allocation and a concurrently
+    stored buffer), and the K2 hit path holds ``lock`` from the carve of its workspace views through the
+    split-K reduction (:func:`_launch_cached_router`), because a K2 call is three stream operations (the
+    split, the kernel, the reduction) on the shared BF16x3 stack and partials, which two threads must not
+    interleave.  A K1 call is one self-contained kernel (the slabs carry no state, the counters self-reset),
+    so the K1 hit path takes no lock.  A memo stored by a thread that carved before a concurrent growth is
+    stamped with the pre-growth version and is carved again on its next use.
+    """
+
+    device: torch.device
+    key: tuple[int, int]  # (device index, raw stream) -- the key of ``_ARENAS``
+    buffers: dict[str, torch.Tensor] = field(default_factory=dict, repr=False)
+    version: int = 0
+    refs: int = 0
+    lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def require(self, kind: str, numel: int) -> torch.Tensor:
+        """The buffer of ``kind`` with at least ``numel`` elements, grown (replaced by a larger allocation on the
+        current stream) when the present one is smaller; called when an entry is planned (under ``_PLAN_LOCK``),
+        never on a hit.  Monotone: if a larger buffer was stored meanwhile, that one is kept."""
+        buf = self.buffers.get(kind)
+        numel = max(int(numel), _ARENA_MIN_ELEMS)
+        if buf is None or buf.numel() < numel:
+            dtype, zeroed = _ARENA_KINDS[kind]
+            new = (torch.zeros if zeroed else torch.empty)(
+                numel, device=self.device, dtype=dtype
+            )
+            buf = self.buffers.get(kind)  # re-read: keep the larger buffer
+            if buf is None or buf.numel() < new.numel():
+                buf = self.buffers[kind] = new
+            self.version += 1
+            _forget_arena_views(self)
+        return buf
+
+    def nbytes(self) -> int:
+        """Bytes the arena holds (every kind)."""
+        return sum(int(b.numel()) * b.element_size() for b in self.buffers.values())
+
+
+class _CachedLaunch(Protocol):
+    """What the arena bookkeeping needs of a cached convenience-path entry (K1 :class:`_CachedGemm`, K2
+    :class:`_CachedRouter`): its arena, the memoised workspace views with the arena version they were carved
+    at, and the carve itself."""
+
+    arena: _Arena
+    views: Optional[dict[str, torch.Tensor]]
+    views_version: int
+
+    def carve(self, arena: _Arena) -> dict[str, torch.Tensor]: ...
+
+
+_ARENAS: dict[tuple[int, int], _Arena] = {}
+# Serialises planning and every mutation of the arenas and the caches (``_plan_entry``, ``clear_convenience_caches``);
+# the hit paths (``_cache_get``, ``_entry_views``) do not take it.
+_PLAN_LOCK = threading.Lock()
+
+
+def _arena_for(index: int, stream: int, device: torch.device) -> _Arena:
+    """The arena of (device ``index``, raw ``stream``), created on first use (under ``_PLAN_LOCK``)."""
+    key = (int(index), int(stream))
+    arena = _ARENAS.get(key)
+    if arena is None:
+        arena = _ARENAS[key] = _Arena(device, key)
+    return arena
+
+
+def _release_entry(entry: _CachedLaunch) -> None:
+    """``on_evict`` of the convenience caches: the arena of an evicted entry loses a reference and is released
+    (its buffers freed, stream-ordered) when no cached entry uses it any more."""
+    arena = entry.arena
+    arena.refs -= 1
+    if arena.refs <= 0 and _ARENAS.get(arena.key) is arena:
+        del _ARENAS[arena.key]
+
+
+def _plan_entry(
+    cache: "OrderedDict[tuple, Any]",
+    key: tuple,
+    index: int,
+    stream: int,
+    device: torch.device,
+    prepare: Callable[[_Arena], Any],
+) -> Any:
+    """Plan the entry of ``key`` with ``prepare(arena)`` -- which returns ``(entry, views)``: the entry and the
+    per-call operand views its fail-closed check already built for this first call -- against the arena of
+    (``index``, ``stream``), cache the entry (``_release_entry`` on eviction) and return both; all of it under
+    ``_PLAN_LOCK``.  The cache is re-checked under the lock: when another thread planned ``key`` meanwhile its
+    entry is returned with ``views = None`` (the caller rebuilds the views).  A failed plan leaves no arena
+    behind that nothing references, and a shared arena it had grown is rolled back to its earlier buffers."""
+    with _PLAN_LOCK:
+        entry = _cache_get(cache, key)
+        if entry is not None:
+            return entry, None
+        arena = _arena_for(index, stream, device)
+        buffers, version = dict(arena.buffers), arena.version
+        try:
+            entry, views = prepare(arena)
+        except BaseException:
+            if arena.refs <= 0 and _ARENAS.get(arena.key) is arena:
+                del _ARENAS[arena.key]
+            elif arena.version != version:
+                arena.buffers = buffers
+                arena.version += 1
+                _forget_arena_views(arena)
+            raise
+        _cache_put(cache, key, entry, on_evict=_release_entry)
+        return entry, views
+
+
+def _forget_arena_views(arena: _Arena) -> None:
+    """Drop the memoised workspace views of every cached entry of ``arena`` (a buffer was replaced)."""
+    entries: list[_CachedLaunch] = [*_K1_CACHE.values(), *_K2_CACHE.values()]
+    for entry in entries:
+        if entry.arena is arena:
+            entry.views = None
+
+
+def _numel(shape: tuple[int, ...]) -> int:
+    n = 1
+    for s in shape:
+        n *= int(s)
+    return n
+
+
+def _carve(buf: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    """The contiguous ``shape`` view over the first elements of the 1-D buffer ``buf`` (one strided view, no
+    slice-then-reshape pair)."""
+    strides = []
+    stride = 1
+    for s in reversed(shape):
+        strides.append(stride)
+        stride *= s
+    return buf.as_strided(shape, tuple(reversed(strides)))
+
+
+def _entry_views(entry: _CachedLaunch) -> dict[str, torch.Tensor]:
+    """The workspace views of a cached entry, carved out of its arena's buffers by ``entry.carve(arena)``
+    (K1: the slab and counter buffers themselves -- pointer parameters; K2: the ``[3, *split]`` parts, the
+    ``split`` scratch and the ``[splits, rows, cols]`` partials) and memoised until the arena grows."""
+    arena = entry.arena
+    views = entry.views
+    if views is None or entry.views_version != arena.version:
+        version = (
+            arena.version
+        )  # read before carving: a growth that interleaves leaves the memo stale
+        views = entry.carve(arena)
+        entry.views_version = version
+        entry.views = views
+    return views
 
 
 # ---------------------------------------------------------------------------
@@ -2662,14 +2921,15 @@ def _k1_values(
     B: Any,
     out3: Any,
     o_alias: Any,
-    ws: torch.Tensor,
-    counters: torch.Tensor,
+    ws: Any,
+    counters: Any,
     ldo: int,
     out_l: int,
 ) -> dict[str, Any]:
     """The keyword arguments of a K1 launch (:func:`bind_launch` orders them by the module's plan).  ``A`` /
-    ``B`` / ``out3`` / ``o_alias`` are the operand views -- or :class:`_Slot` markers for a cached launch that
-    rebinds them on every call; the plan decides which of them the instance dereferences."""
+    ``B`` / ``out3`` / ``o_alias`` are the operand views and ``ws`` / ``counters`` the workspace -- or
+    :class:`_Slot` markers for a cached launch that rebinds the views on every call and resolves the workspace
+    out of its arena; the plan decides which of the operands the instance dereferences."""
     dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
     tma_out, out_f32 = plan.tma_out, plan.out_f32
     return dict(
@@ -2852,7 +3112,9 @@ def _same_view(a: torch.Tensor, b: torch.Tensor) -> bool:
 @dataclass
 class _CachedGemm:
     """A planned K1 launch of the convenience path: the plan, the resolved module entry, the argument template
-    (constants and :class:`_Slot` markers in the module's plan order) and the workspace it owns."""
+    (constants and :class:`_Slot` markers in the module's plan order) and the arena its workspace is carved
+    from.  The plan holds the workspace requirement (``ws_f32_elems`` slabs, ``counters_alloc_u32`` counters)
+    the arena was grown to when the entry was planned."""
 
     module_name: str
     arch: str
@@ -2860,8 +3122,14 @@ class _CachedGemm:
     swapped: bool
     entry: Callable[..., Any] = field(repr=False)
     template: tuple = field(repr=False)
-    ws: torch.Tensor = field(repr=False)
-    counters: torch.Tensor = field(repr=False)
+    arena: _Arena = field(repr=False)
+    views: Optional[dict[str, torch.Tensor]] = field(default=None, repr=False)
+    views_version: int = -1
+
+    def carve(self, arena: _Arena) -> dict[str, torch.Tensor]:
+        """``ws`` and ``counters`` are pointer parameters (the binding checks dtype, device and contiguity
+        only): the arena buffers themselves, no slicing."""
+        return dict(ws=arena.buffers["k1_ws"], counters=arena.buffers["k1_counters"])
 
 
 _K1_CACHE: "OrderedDict[tuple, _CachedGemm]" = OrderedDict()
@@ -2874,7 +3142,10 @@ def _prepare_cached_gemm(
     *,
     transposed_out: bool,
     knobs: dict[str, Any],
-) -> _CachedGemm:
+    arena: _Arena,
+) -> tuple[_CachedGemm, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """``(entry, (a_desc, b_desc, out3))``: the planned entry and the per-call views of this first call (the
+    rebuild the fail-closed check validated against the planner's views)."""
     plan, a_desc, b_desc, O3, arch, module_name = _k1_plan(
         A, B, out, transposed_out=transposed_out, knobs=knobs
     )
@@ -2889,7 +3160,6 @@ def _prepare_cached_gemm(
             "dense_projection_gemm: the per-call operand views differ from the planner's; "
             "the convenience path cannot cache this binding (use prepare_dense_projection_gemm)"
         )
-    ws, counters = _k1_workspace(plan, device)
     ldo, out_l = _out_strides(O3)
     values = _k1_values(
         plan,
@@ -2898,13 +3168,19 @@ def _prepare_cached_gemm(
         B=_Slot("B"),
         out3=_Slot("out3"),
         o_alias=_Slot("o_alias"),
-        ws=ws,
-        counters=counters,
+        ws=_Slot("ws"),
+        counters=_Slot("counters"),
         ldo=ldo,
         out_l=out_l,
     )
     entry, template = _bind(module_name, values, plan.grid, arch)
-    return _CachedGemm(module_name, arch, plan, swapped, entry, template, ws, counters)
+    # the workspace is a slot: grow the arena only once the module and the grid are known to be good
+    arena.require("k1_ws", plan.ws_f32_elems)
+    arena.require("k1_counters", plan.counters_alloc_u32)
+    arena.refs += 1
+    return _CachedGemm(
+        module_name, arch, plan, swapped, entry, template, arena
+    ), rebuilt
 
 
 def _launch_cached_gemm(
@@ -2916,7 +3192,8 @@ def _launch_cached_gemm(
     **knobs: Any,
 ) -> torch.Tensor:
     """The convenience path of K1: plan on the first call for a (device, stream, geometry, knobs) key; rebind
-    the caller's views and launch on every call (no planning, no device query, no allocation)."""
+    the caller's views, resolve the workspace out of the arena of the device and stream and launch on every
+    call (no planning, no device query, no allocation)."""
     device = _same_cuda_device(A, B, out)
     index = _cuda_index(device)
     stream = _current_raw_stream(index)
@@ -2924,16 +3201,24 @@ def _launch_cached_gemm(
         index, stream, (bool(transposed_out), *sorted(knobs.items())), A, B, out
     )
     cached = _cache_get(_K1_CACHE, key)
+    operands = None
     if cached is None:
-        cached = _cache_put(
+        cached, operands = _plan_entry(
             _K1_CACHE,
             key,
-            _prepare_cached_gemm(A, B, out, transposed_out=transposed_out, knobs=knobs),
+            index,
+            stream,
+            device,
+            lambda arena: _prepare_cached_gemm(
+                A, B, out, transposed_out=transposed_out, knobs=knobs, arena=arena
+            ),
         )
-    a_desc, b_desc, O3 = _k1_views(A, B, out, swapped=cached.swapped)
-    arguments = _resolve_arguments(
-        cached.template, dict(A=a_desc, B=b_desc, out3=O3, o_alias=flat_alias(O3))
-    )
+    if operands is None:
+        operands = _k1_views(A, B, out, swapped=cached.swapped)
+    a_desc, b_desc, O3 = operands
+    views = dict(A=a_desc, B=b_desc, out3=O3, o_alias=flat_alias(O3))
+    views.update(_entry_views(cached))
+    arguments = _resolve_arguments(cached.template, views)
     with _ffi_stream_context(index, stream):
         cached.entry(*arguments)
     return out
@@ -3323,12 +3608,13 @@ def _k2_values(
     plan: RouterPlan,
     *,
     A: Any,
-    parts: torch.Tensor,
+    parts: Any,
     out32: Any,
     ldo: int,
     out_l: int,
 ) -> dict[str, Any]:
-    """The keyword arguments of a K2 launch; ``A`` / ``out32`` are views or :class:`_Slot` markers."""
+    """The keyword arguments of a K2 launch; ``A`` / ``parts`` / ``out32`` are views or :class:`_Slot`
+    markers."""
     return dict(
         A=A,
         B=parts,
@@ -3379,53 +3665,93 @@ def prepare_router_fp32_gemm(
 @dataclass
 class _CachedRouter:
     """A planned K2 launch of the convenience path: the plan, the resolved module entry, the argument template
-    and the workspace it owns (the BF16x3 stack, its scratch and the split-K partials)."""
+    and the shapes of the workspace it carves out of its arena (the BF16x3 stack ``[3, *split_shape]``, the
+    fp32 scratch ``split_shape`` and, for more than one split, the partials ``partials_shape``)."""
 
     module_name: str
     arch: str
     plan: RouterPlan
     entry: Callable[..., Any] = field(repr=False)
     template: tuple = field(repr=False)
-    parts: torch.Tensor = field(repr=False)
-    resid: torch.Tensor = field(repr=False)
-    workspace: Optional[torch.Tensor] = field(default=None, repr=False)
+    arena: _Arena = field(repr=False)
+    split_shape: tuple[int, ...]
+    partials_shape: Optional[tuple[int, ...]] = None
+    views: Optional[dict[str, torch.Tensor]] = field(default=None, repr=False)
+    views_version: int = -1
+
+    def carve(self, arena: _Arena) -> dict[str, torch.Tensor]:
+        """The ``parts`` stack (the TMA operand ``B``: exact shape), the ``resid`` scratch and the split-K
+        ``workspace`` as contiguous views over the first elements of the arena buffers."""
+        bufs = arena.buffers
+        views = dict(
+            parts=_carve(bufs["k2_parts"], (3, *self.split_shape)),
+            resid=_carve(bufs["k2_resid"], self.split_shape),
+        )
+        if self.partials_shape is not None:
+            views["workspace"] = _carve(bufs["k2_partials"], self.partials_shape)
+        return views
 
 
 _K2_CACHE: "OrderedDict[tuple, _CachedRouter]" = OrderedDict()
 
 
 def clear_convenience_caches() -> None:
-    """Drop every cached convenience-path launch (K1 and K2) and release their workspaces; a launch in flight
-    keeps a reference to the workspace it was bound with."""
-    _K1_CACHE.clear()
-    _K2_CACHE.clear()
+    """Drop every cached convenience-path launch (K1 and K2) and release every workspace arena; a launch in
+    flight keeps a reference to the buffers it was bound with until its FFI call has enqueued it, and the
+    freed blocks are reused stream-ordered (see :class:`_Arena`)."""
+    with _PLAN_LOCK:
+        _K1_CACHE.clear()
+        _K2_CACHE.clear()
+        _ARENAS.clear()
 
 
 def _prepare_cached_router(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
-) -> _CachedRouter:
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    splits: Optional[int],
+    arena: _Arena,
+) -> tuple[_CachedRouter, tuple[torch.Tensor, torch.Tensor]]:
+    """``(entry, (a_view, split_src))``: the planned entry and the per-call views of this first call (the
+    rebuild the fail-closed check validated against the planner's operands)."""
     plan, A_eff, B_eff, arch, module_name = _k2_plan(A, B, out, splits=splits)
-    _, split_src = _k2_checked_views(A, B, A_eff, B_eff, plan)
-    parts, resid, workspace = _k2_workspace(plan, split_src, out.device)
-    if workspace is not None:
-        out32, (ldo, out_l) = workspace, _k2_workspace_strides(workspace)
+    a_view, split_src = _k2_checked_views(A, B, A_eff, B_eff, plan)
+    split_shape = tuple(int(s) for s in split_src.shape)
+    n = split_src.numel()
+    partials_shape = None
+    if plan.splits > 1:
+        rows, cols = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
+        partials_shape = (plan.splits, rows, cols)
+        ldo, out_l = cols, rows * cols
     else:
-        out32, ldo, out_l = _Slot("out32"), int(out.stride(0)), 0
+        ldo, out_l = int(out.stride(0)), 0
     values = _k2_values(
-        plan, A=_Slot("A"), parts=parts, out32=out32, ldo=ldo, out_l=out_l
+        plan,
+        A=_Slot("A"),
+        parts=_Slot("parts"),
+        out32=_Slot("out32"),
+        ldo=ldo,
+        out_l=out_l,
     )
     entry, template = _bind(module_name, values, plan.grid, arch)
+    # the workspace is a slot: grow the arena only once the module and the grid are known to be good
+    arena.require("k2_parts", 3 * n)
+    arena.require("k2_resid", n)
+    if partials_shape is not None:
+        arena.require("k2_partials", _numel(partials_shape))
+    arena.refs += 1
     return _CachedRouter(
-        module_name, arch, plan, entry, template, parts, resid, workspace
-    )
+        module_name, arch, plan, entry, template, arena, split_shape, partials_shape
+    ), (a_view, split_src)
 
 
 def _launch_cached_router(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
 ) -> torch.Tensor:
     """The convenience path of K2: plan on the first call for a (device, stream, geometry, splits) key; on every
-    call re-split the second operand into the cached BF16x3 stack, launch and reduce the split-K partials into
-    ``out`` in the fixed order."""
+    call re-split the second operand into the BF16x3 stack carved out of the arena of the device and stream,
+    launch and reduce the split-K partials into ``out`` in the fixed order."""
     device = _same_cuda_device(A, B, out)
     index = _cuda_index(device)
     stream = _current_raw_stream(index)
@@ -3433,21 +3759,37 @@ def _launch_cached_router(
         index, stream, (None if splits is None else int(splits),), A, B, out
     )
     cached = _cache_get(_K2_CACHE, key)
+    operands = None
     if cached is None:
-        cached = _cache_put(
-            _K2_CACHE, key, _prepare_cached_router(A, B, out, splits=splits)
+        cached, operands = _plan_entry(
+            _K2_CACHE,
+            key,
+            index,
+            stream,
+            device,
+            lambda arena: _prepare_cached_router(A, B, out, splits=splits, arena=arena),
         )
-    a_view, split_src = _k2_views(A, B, cached.plan)
-    split_fp32_to_bf16x3_(split_src, cached.parts, cached.resid)
-    views: dict[str, torch.Tensor] = dict(A=a_view)
-    if cached.workspace is None:
-        views["out32"] = _k2_out32(out)
-    with _ffi_stream_context(index, stream):
-        cached.entry(*_resolve_arguments(cached.template, views))
-    if cached.workspace is not None:
-        torch.sum(
-            cached.workspace, dim=0, out=out
-        )  # fixed-order reduction of the partials
+    if operands is None:
+        operands = _k2_views(A, B, cached.plan)
+    a_view, split_src = operands
+    # One K2 call is three stream operations on the shared workspace (the split into ``parts`` / ``resid``,
+    # the kernel, the reduction of the partials): hold the arena's lock across them so another thread issuing
+    # on this stream cannot interleave its own split or reduction (enqueue-only critical section).
+    with cached.arena.lock:
+        ws = _entry_views(cached)
+        split_fp32_to_bf16x3_(split_src, ws["parts"], ws["resid"])
+        workspace = ws.get("workspace")
+        views = dict(
+            A=a_view,
+            parts=ws["parts"],
+            out32=_k2_out32(out) if workspace is None else workspace,
+        )
+        with _ffi_stream_context(index, stream):
+            cached.entry(*_resolve_arguments(cached.template, views))
+        if workspace is not None:
+            torch.sum(
+                workspace, dim=0, out=out
+            )  # fixed-order reduction of the partials
     return out
 
 

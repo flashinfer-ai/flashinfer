@@ -464,15 +464,13 @@ class ArmCake(ArmAutograd):
         super().__init__(inp, entry=entry, chunk=chunk)
         device = inp.X.device
         hidden, vocab = int(inp.X.shape[1]), int(inp.W.shape[0])
-        if not cake_backend.generated_program_available(
-            device, entry=entry, hidden=hidden, vocab=vocab
-        ):
+        if not cake_backend.generated_program_available(device, entry=entry):
             capability = torch.cuda.get_device_capability(device)
             raise RuntimeError(
                 f"generated chunked LM-head program ({entry} entry, H {hidden}, V {vocab}) not registered for "
                 f"compute capability {capability[0]}.{capability[1]} in this checkout"
             )
-        self.module_name, record = cake_backend.record_for(device, hidden, vocab)
+        self.module_name, record = cake_backend.record_for(device)
         self.abi = cake_backend.record_abi(record)
 
     def versions(self):

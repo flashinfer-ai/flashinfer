@@ -251,12 +251,17 @@ class SmemDeepSeekSfAbResource(MemoryResource):
 
         expert_idx = Int32(0)
         if cutlass.const_expr(self.tile_idx_view is not None):
-            expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
+            expert_idx = self.tile_idx_view.load(
+                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
+            )[0]
         tile_rows = self.cfg.tile_n if self.cfg.is_swap_ab else self.cfg.tile_m
         token_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit_view is not None):
             token_limit = self._local_tile_limit(
-                self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
+                self.mn_limit_view.load(
+                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
+                    vector_size=1,
+                )[0],
                 token_tile,
                 tile_rows,
             )

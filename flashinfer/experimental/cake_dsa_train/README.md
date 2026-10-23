@@ -40,8 +40,19 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
   backward, so both skip the trailing invalid key blocks of short rows; the
   results are those of the full row.
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
-  to `cu_seqlens_k[d]`) and offsets them on device before the flat kernels
-  run (one glue pass that also yields the per-row lengths).  `cu_seqlens_q`
+  to `cu_seqlens_k[d]`) and turns them into global key rows on device in one
+  launch of the NoPE record's index-preparation stage right before the forward
+  kernel (`index_prep`, `compact = 1`, the forward launched behind it with the
+  programmatic-dependent-launch attribute, see below; the torch twin
+  `offset_gather_kv_indices(..., compact=True)` where the stage is not
+  available -- host tensors, an unserved device, a non-contiguous prefix sum --
+  with bitwise the same result).  Every row is compacted stably: its valid keys
+  come first in ascending slot order, then `-1`, and the row's length is its
+  valid count, so rows with `-1` holes cost their valid slots in the forward
+  and the backward; rows whose valid slots already come first are unchanged
+  bytes with the same length.  A caller `topk_length` is a position cut
+  applied before compaction (slots at positions `>= topk_length[t]` are
+  invalid regardless of content).  `cu_seqlens_q`
   and `cu_seqlens_k` are independent: a query segment may be shorter than its
   key segment, in which case it is the tail of that key prefix -- query
   `local_q` of document `d` sits at key position
@@ -93,9 +104,15 @@ trainer's packed layouts (flashinfer-ai/flashinfer#5675) are consumed in place
   row stride at least the slice width and a multiple of 8 elements; base
   16-byte aligned (the TMA gather descriptors and the 16-byte rope loads).
 * `indices` rows stay contiguous int32 (any row stride; a column slice of a
-  wider index buffer is accepted); `dout` is made contiguous by the eager
-  backward and the autograd wrapper (`bwd_delta` addresses it as flat
-  `[T * 64, 512]` rows).
+  wider index buffer is accepted); `dout` follows the layout rules of
+  `q_latent` and is read in place -- the head-major `[512, T * 512, 1]` view an
+  output projection hands back included -- by the main stage (stride-carrying
+  tensor map) and by `bwd_delta` (the strided delta kernel shared with the
+  NoPE record: `dout_offset + token * dout_token_stride + head *
+  dout_head_stride + channel`).  The eager `backward` copies a `dout` only when
+  the descriptor cannot address it (base not 16-byte aligned, strides not
+  multiples of 8 elements, channel stride != 1); `prepare_dsa_train` rejects
+  such a view.
 * A strided view yields bitwise the same `out`, `lse` and `dq` as the
   contiguous copy (only descriptor fields and pointer offsets change); dK/dV
   agree within the FP32 `red.global` reduction spread.
@@ -131,6 +148,20 @@ context-parallel window):
   flashinfer's public wrapper `flashinfer.dsa_sparse_attention` maps
   `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` onto the keyword when the caller leaves
   it at `None`.
+* Through the autograd entries `dkv_acc` may also be a zero-argument callable
+  that returns the accumulator, or an `(accumulator, dkv_dst_map)` pair; the
+  backward calls it, so the buffer need not exist at forward time (a callable's
+  result is validated in the backward, where `check_dst_map` then
+  synchronizes).  The autograd `Function`s save every tensor their forward
+  produces for the backward -- `out`, `lse`, `o_lo`, the index rows, the
+  lengths -- through `ctx.save_for_backward` (a fixed list with a zero-size
+  placeholder for an absent `topk_length`, so non-reentrant
+  `torch.utils.checkpoint` can match the recomputed tensors by position) and
+  keep nothing else of size on `ctx`: after a checkpointed forward the entries
+  retain ~0 MiB (flashinfer-ai/flashinfer#7039).  A tensor `dkv_acc` (and
+  `dkv_dst_map`) is caller-owned and stays on the autograd node as before,
+  outside the saved list: zeroing or otherwise touching it in place between
+  the forward and the backward is fine.
 * With `dkv_acc` the backward returns `(dq_latent, dq_rope, None, None)`, the
   autograd wrapper returns `None` gradients for `kv_latent` / `k_rope`, and
   `dkv_fp32=True` is rejected.  The kernels' permuted FP32 accumulators remain
@@ -293,19 +324,197 @@ the same reds in another order.  `key_passes=` on the entry points overrides
 the policy (`1` = single pass, `n` = that many passes); a program without the
 pass stages serves the single pass only.
 
+## NoPE (zero-rope) program
+
+A second registry record, `cake_dsa_h64_nope_train`, carries the native kernels
+of the zero-rope form of the same attention (GLM-5.3 geometry: 64 heads, 512
+shared latent dimensions and no rope part, softmax scale `1 / 16`, top-k slot
+counts such as 2176 or 1152 -- any `K_slots >= 1`).  The score is the latent
+product alone, `softmax(scale * q . kv^T) . kv`, and the backward produces one
+combined gradient per key row, `dkv = dK + dV`, natural layout, FP32 `[S, 512]`.
+The rope entry points above are unchanged; the NoPE entries are additive.
+
+Slot-count rule: the host accepts every int32 `indices [T, K_slots]` with
+`K_slots >= 1` (any width, odd widths included; `topk_length` may be shorter
+per row) and rejects `K_slots <= 0`, a non-int32 dtype and a row stride below
+`K_slots` explicitly (`validate_dsa_nope_inputs`); the kernels bound the per-row
+work by `topk_length` and read no slot beyond `K_slots`.
+
+```python
+from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope, dsa_sparse_attention_nope_varlen
+
+out = dsa_sparse_attention_nope(q, kv, indices, topk_length=None, softmax_scale=None,
+                                return_lse=False, dkv_acc=None, dkv_dst_map=None)
+out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
+                                       max_seqlen_q=None, max_seqlen_k=None, causal=False,
+                                       topk_length=None, softmax_scale=None, return_lse=False,
+                                       dkv_acc=None, dkv_dst_map=None, check_cu_seqlens=True)
+```
+
+* `q [T, 64, 512]` BF16 (contiguous or a strided token / head view, consumed in
+  place); `kv [S, 512]` BF16 or its one-head form `[S, 1, 512]` (squeezed on the
+  host; the gradient reaches that leaf through the view); `indices [T, K_slots]`
+  int32 global key rows, `topk_length` and the validity rules as above.
+  `softmax_scale` defaults to `1 / 16`.  Without `topk_length` the flat entry
+  compacts the rows on device in one launch of the index-preparation stage's
+  flat mode right before the forward (valid keys `0 <= idx < S` first in
+  ascending slot order, then `-1`; the valid count as the row's length) into a
+  fresh `[T, K_slots]` buffer and a `[T]` vector the backward reads, so rows
+  with `-1` holes cost their valid slots; the caller's tensor is untouched.
+  With `topk_length` the rows and lengths reach the kernels as given.
+* Rows with holes and the kernel-level entries: `forward_nope`,
+  `backward_nope` and the prepared runner read rows as given (work up to the
+  last valid slot, or `topk_length`).  `nope_compact_indices(indices, S,
+  topk_length=None)` returns `(rows, counts)` -- one flat stage launch, any
+  row stride, optional `out=` / `counts=` buffers for a capturing caller -- to
+  pass as `indices` / `topk_length` to those entries and to the flat autograd
+  entry with caller lengths.  (A backward over raw hole rows could instead run
+  the key-range-pass form at one pass -- `nope_bwd_compact` writes each row's
+  valid keys compacted, `nope_bwd_main_pass*` consumes them with `dq_mode 0` --
+  which is not wired up in this round.)
+* Backend entries (`cake_backend`): `forward_nope`, `backward_nope`,
+  `forward_nope_varlen` (the packed forward without autograd: the public
+  entry's index route; returns `(out, lse, o_lo, indices, topk_length)`, the
+  compacted global rows and their valid counts `backward_nope` takes with
+  `num_segments = cu_seqlens_k.numel() - 1` and a caller-zeroed `dkv_acc`),
+  `nope_compact_indices`, `nope_globalize_indices(..., compact=False)` (one
+  stage launch over per-document rows: the position-preserving rows and last
+  valid slot + 1 by default, bitwise `offset_gather_kv_indices`; `compact=True`
+  the compacted rows and counts, with an optional `topk_length` cut),
+  `prepare_dsa_nope_train` / `DSANopeTrainRunner`, `dsa_nope_train_workspace_size`,
+  `validate_dsa_nope_inputs`, `DSASparseAttentionNopeFunction` (12 forward inputs,
+  gradients for `q` and `kv` only).  The binding cache is shared; the NoPE keys are
+  tagged (`"nope_fwd"` / `"nope_bwd"`) and never collide with the rope keys.
+* `dkv` semantics.  Fresh (no `dkv_acc`): `backward_nope` returns a new natural
+  FP32 `[S, 512]` buffer -- filled by the natural-layout main stage adding into
+  the zero-filled buffer when the record's direct rule selects it (`dkv_direct`:
+  `min_keys_per_query` 1, so whenever the row has at least one key per query --
+  every packed causal problem; measured faster than the permuted drain on every
+  row), else -- more query rows than keys, or `dkv_direct=False` -- by the cast
+  stage writing the permuted accumulator out densely (`out_f32`).  Accumulate
+  (`dkv_acc` FP32 `[S_dst, >= 512]`, optional `dkv_dst_map`): `+=` into columns
+  `0:512` of the caller's rows by the same two
+  paths and `None` for `dkv`; chunked backward passes of one long row sum into
+  one buffer without intermediate rounding.  Through autograd without
+  `dkv_acc`, the FP32 `dkv` becomes the `kv` gradient and the autograd engine
+  casts it to the leaf's dtype (BF16 for a BF16 leaf); `dkv_acc` may be the
+  tensor or a zero-argument callable producing it (or an `(accumulator,
+  dkv_dst_map)` pair) at backward time, as for the rope entries.  Both NoPE
+  autograd `Function`s save every produced backward operand -- the saved
+  outputs, `o_lo`, the global index rows, the lengths -- through
+  `ctx.save_for_backward` (seven tensors in a fixed order) and keep only
+  options, geometry keys and the caller-owned accumulator on `ctx`, so a
+  checkpointed forward retains nothing (flashinfer-ai/flashinfer#7039).
+* `dout` may be a head-major view (strides `[512, T * 512, 1]`) or any strided
+  `[T, 64, 512]` view under the layout rules of `q` (unit channel stride, token
+  and head strides multiples of 8 elements, 16-byte base): it is read in place
+  by every entry, the eager `backward_nope` and a prepared runner alike -- the
+  main stage through a stride-carrying tensor map, the delta stage through the
+  token / head strides (elements) and the element offset the launcher passes
+  (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
+* Varlen: per-document indices become global key rows on device in one launch
+  of the record's index-preparation stage right before the forward
+  (`nope_varlen_index_mode`: `"index_prep"` at every table size, since
+  `NOPE_CONVERT_SLOT_LIMIT` is 0).  `index_prep` (one warp per index row, four
+  rows per 128-thread CTA, any index row stride read in place) runs with
+  `compact = 1`: every row stably compacted -- valid keys first in ascending
+  slot order, then `-1` -- and its valid count as the length, after the position
+  cut of a caller `topk_length` passed as `length_in`; the forward and the
+  saved backward read the stage's rows and counts in both cases (bitwise the
+  torch twin `offset_gather_kv_indices(..., compact=True)`).  Both forward
+  stages (`fwd`, `nope_fwd`) launch with the programmatic-dependent-launch
+  attribute (`use_pdl` in their launch records, a fixed attribute of their
+  bindings): `index_prep` signals `launch_dependents` at entry and the forward
+  kernels execute `griddepcontrol.wait` after their barrier / TMEM prologue,
+  before any global read, so behind the stage the forward's prologue overlaps
+  the stage; behind any other kernel the attribute changes nothing.  The host prepares
+  the forward's plan, outputs and launch arguments and converts its operands
+  before the first launch, then issues the forward from those pre-bound values
+  inside the same stream context, so only the forward's binding call sits
+  between the two launches (it hides behind the stage's kernel).  The forward
+  program still carries its own conversion (`cu_seqlens_q`, `cu_seqlens_k`,
+  `indices_out`, `num_docs`, `search_iters`, `causal`, `convert` at the end of
+  its launch arguments; `convert = 1` globalizes the rows and, since flour
+  ae939ee44, writes the same stable compaction and valid counts as the stage,
+  bitwise): the `"kernel"` route below a limit above zero (a performance
+  crossover still to be measured; the limit is 0) and the fallback of a
+  registry without the stage, which takes no caller `topk_length`.
+  `causal=True` drops keys after the query's own position, query segments are
+  tails of their key prefix.  The NoPE entries have no torch fallback.
+* Backward host order: the autograd wrappers settle their backward at forward
+  time (the binding key without `dout`, the operands autograd does not save,
+  the caller's `dkv_acc` validated once), so the backward's host work before
+  its first launch is the key completion with `dout`'s geometry, the binding
+  lookup, the `dq` / `delta` allocations and the value binding; the zero fills
+  of the FP32 buffers the call owns and the delta / main stages then follow
+  back to back, with no allocation, validation or synchronization between the
+  launches.  The kernel-level `backward_nope` keeps the same launch order.
+  Every call checks the structure of the prefix sums (`validate_cu_seqlens`:
+  contiguous int32 `[num_docs + 1]` of one length) and never synchronizes with
+  the device; `check_cu_seqlens=True` also checks their values -- start at 0,
+  non-decreasing, `cu_seqlens_q[-1] == T`, `cu_seqlens_k[-1] == S` (a shorter
+  or longer key window is rejected, not truncated), `seqlen_q <= seqlen_k` per
+  document -- at the cost of one blocking device-to-host copy before any launch
+  (skipped during CUDA-graph capture).  The rope varlen entry launches the same
+  stage (compacting, caller lengths as the cut) and keeps the torch twin as its
+  fallback; its structural checks are unchanged.
+
+Stages of the record, in launch order and with the kernels they share with the
+rope program: `nope_fwd` (own kernel, 320 threads), `nope_bwd_delta` (the
+strided delta kernel, shared with the rope program's `bwd_delta`, 256 threads:
+the `[T * 64, 512]` rows of `dout` addressed as `dout_offset + token *
+dout_token_stride + head * dout_head_stride + channel`, strides and offset
+multiples of 8 elements; with contiguous strides it is bitwise the dense form
+it replaced),
+`nope_bwd_main` /
+`nope_bwd_main_natural` (own kernels, 640 threads: no rope operands, one
+accumulator `dkv_f32` with `dkv_stride >= 512`, a multiple of 4, and the
+destination map; a persistent token loop, so the host launches them through
+`nope_bwd_launch_grid(num_queries, num_kv, sm_count)`: one CTA per SM --
+`min(num_queries, SMs)`, CTA `b` taking tokens `b, b + grid, ...` of the
+launch's `num_queries` tokens (the whole row or the chunk) -- while the launch's
+FP32 `dkv` window `num_kv x 2048 B` is within 64 MiB, else one CTA per token;
+the SM count is read once per device), `nope_bwd_compact` (the rope compaction kernel),
+`nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
+and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
+`ceil(num_kv * 16 / 256)`).  `index_prep` (own kernel, 128 threads, grid
+`ceil(T / 4)`; arguments `compact`, `length_in`, `has_length_in` after
+`write_out`) is the index preparation of both varlen entries (document mode,
+`compact = 1`), of the flat NoPE entry without caller lengths and of
+`nope_compact_indices` (flat mode: `has_docs = 0`, `flat_bound = S - 1`, the
+prefix-sum operands never read); it is launched right before the forward and
+is not part of a prepared runner's step.  The key-range-pass policy of the record plans one
+pass on every row (`max_passes` 1, no per-architecture rules: one pass measured
+fastest on every row, build and GPU of this form), so the single-pass main stage
+is the default and `dq_partial` is not allocated; `key_passes=n` on the entry
+points forces the pass form, which plans with 2048 B of accumulator per key and
+a dQ partial of 131,072 B per token: the token chunk of a multi-pass backward is
+4736 at `K_slots` 2048 / 2176, 4864 at 1152 and 4992 at 128 (the 640 MiB budget,
+a multiple of 128).
+
+`generated_program_available(..., program=cake_jit.NOPE_PROGRAM)` reports
+whether the record registers the stages a call needs for the device; the NoPE
+GPU tests additionally skip while `build.json` lacks a registered NoPE library
+(the export delivers the libraries; `scripts/check_cake_build_manifests.py`
+reports that gap).
+
 ## Layout of this package
 
-* `cake_jit.py` -- the `MODULES` registry (one record for every architecture,
-  filled by the generated-program export: per stage the `library` stem of its
-  `build.json` entries, the FFI entry and the launch geometry), stage names
-  and the loader glue: `library_name(stage, arch)` is the `build.json` entry
-  `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch)` loads
-  through `cake_build`; `specs_for_arch(arch)` lists the JIT specs of an
-  architecture for `flashinfer.jit.build_jit_specs`.
+* `cake_jit.py` -- the `MODULES` registry (one record per program, the rope
+  `cake_dsa_h64_train` and the NoPE `cake_dsa_h64_nope_train`, each shared by
+  every architecture it compiles for; per stage the `library` stem of its
+  `build.json` entries, the FFI entry and the launch geometry -- block,
+  cluster, cooperative, dynamic shared memory, PDL -- that the export rewrites),
+  the stage names of both programs (`STAGES` / `NOPE_STAGES`, `PROGRAMS`) and
+  the loader glue: `library_name(stage, arch, program)` is the `build.json`
+  entry `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch,
+  program)` loads through `cake_build`; `specs_for_arch(arch)` lists the JIT
+  specs of an architecture for `flashinfer.jit.build_jit_specs`.  Stages of
+  the two programs that share a kernel name the same library stem.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`, written by the export): one entry per `<library>_<arch>`
-  (eight stages x three architectures) with its translation units, digests,
+  (fourteen libraries x three architectures) with its translation units, digests,
   nvcc flags (`--use_fast_math` per stage), closure digest and `aot/<name>.so`
   path.  `cake_build.load_library(name)` loads the prebuilt library when
   `aot/` holds it (next to the builder's `aot/build_info.json` sidecar, which
@@ -314,25 +523,30 @@ pass stages serves the single pass only.
   digest-verified first; `sm_107a` needs an nvcc that lists `compute_107`).
   `aot/` is never tracked (`.gitignore`).
 * `cake_launch.py` -- generated positional launchers and grid functions, one
-  per stage, over the kernels' own argument names.
+  per stage of either program, over the kernels' own argument names
+  (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include
   (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
-  eight pairs, one per stage (the main stage and its key-range-pass form each
-  with a natural-layout variant), shared by `sm_100a`, `sm_103a` and `sm_107a` and
+  one pair per library (the main stage and its key-range-pass form each with a
+  natural-layout variant; the delta, compaction and cast pairs serve both
+  programs), shared by `sm_100a`, `sm_103a` and `sm_107a` and
   compiled once per architecture (`.clang-format` disables formatting: the sources are
   identity-checked by the digests in `build.json`).
 
 ## Status
 
-The registry holds one program for `sm_100a`, `sm_103a` and `sm_107a` with the forward,
+The registry holds the rope program for `sm_100a`, `sm_103a` and `sm_107a` with the forward,
 backward preprocess, backward main (single-pass and key-range-pass form with
 its compaction, each with its natural-layout direct-accumulation variant) and
 cast stages plus the key-range-pass and direct-accumulation policies, exported
-from the kernel snapshot named in the pull request.
+from the kernel snapshot named in the pull request, and the NoPE program's
+record with its nine stages (the delta, compaction and cast kernels shared with
+the rope program) and its own key-range-pass and direct-accumulation policies
+(see "NoPE (zero-rope) program").
 
 Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
 only this package; skips without a registered program or a compute capability
