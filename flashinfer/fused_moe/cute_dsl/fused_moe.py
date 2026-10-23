@@ -526,13 +526,17 @@ def _moe_core_impl(
             ("gemm2", gemm2_mma_tiler, gemm2_mma_inst_shape, gemm2_cluster_shape_mn),
         ):
             if mma_tiler is None or mma_inst_shape is None:
-                continue
-            if not rubin_moe_cluster_covers_one_tile(
-                tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
-            ):
+                # No MMA CTA group size to check the cluster against, so
+                # keep requiring a single-CTA cluster along M.
+                supported = cluster_shape_mn[0] == 1
+            else:
+                supported = rubin_moe_cluster_covers_one_tile(
+                    tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
+                )
+            if not supported:
                 raise NotImplementedError(
-                    f"Rubin MoE {name} with mma_tiler={tuple(mma_tiler)}, "
-                    f"mma_inst_shape={tuple(mma_inst_shape)}, "
+                    f"Rubin MoE {name} with mma_tiler={mma_tiler}, "
+                    f"mma_inst_shape={mma_inst_shape}, "
                     f"cluster_shape_m={cluster_shape_mn[0]} at tile_size="
                     f"{tile_size} is not supported. Each cluster must cover "
                     "exactly one routing tile (mma_tiler[0] == tile_size and "
