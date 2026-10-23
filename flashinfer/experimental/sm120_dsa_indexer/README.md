@@ -59,24 +59,27 @@ need no reset.
 ## Performance
 
 Measured on an RTX PRO 6000 Blackwell Server Edition (188 SMs) with CUPTI
-kernel spans and a flushed L2. Each cell is compared against the fastest of
-these pipelines:
-- DeepGEMM logits followed by the top-k of vLLM, SGLang or FlashInfer;
+kernel spans and a flushed L2, with every JIT-built kernel compiled by CUDA
+13.4. Each cell is compared against the fastest of these pipelines:
+- DeepGEMM logits (vLLM's pin, `a7a9277`) followed by the top-k of vLLM,
+  SGLang or FlashInfer;
 - DeepGEMM logits followed by GVR;
 - b12x's fused indexer.
 
 | Form | Grid | Geomean speedup | Slower than 0.99x |
 |---|---|---|---|
-| Prefill, indices only | 152 cells: FP8 and MXFP4; H32 top-k 2048 and H64 top-k 512; fresh, append and mixed segments | 1.11x | none (worst 0.992x) |
-| Decode | 126 cells: B 1-32, `next_n` 1/2/6, 1K-256K | 1.05x | H32 top-k 512, B32, `next_n` 2, 64K: 0.977x |
+| Prefill, indices only | 152 cells: FP8 and MXFP4; H32 and H64; top-k 512 and 2048; fresh, append and mixed segments | 1.16x | none (worst 1.003x) |
+| Decode | 148 cells: B 1-32, `next_n` 1/2/6, 1K-256K, FP8 and MXFP4 | 1.05x | H32 top-k 512, B32, `next_n` 2, 64K: 0.979x |
 
 On the slower decode cell, the two-row scan is about 1.5% behind DeepGEMM and
-the selection is about 2 us behind GVR's.
-Four more cells read 0.94-0.98x inside the grid's single process. Measured
-in a fresh process, they are at parity or faster:
-- H64 B32 `next_n` 6 at 64K;
-- H32 top-k 512 B1 at 256K;
-- H64 top-k 2048 B1 at 1K and at 8K.
+the selection is about 2 us behind GVR's. Cells that read below 0.99x inside
+the grid's single process were re-measured in fresh processes; all others are
+at parity or faster there.
+
+The MXFP4 prefill scan is sensitive to the CUDA toolchain's instruction
+scheduling: on the H64 resident path, a CUDA 13.0 build runs about 1% faster
+than a 13.4 build, a 12.9 build about 8% slower and a 13.2 build about 12%
+slower.
 
 On an RTX PRO 5500 configuration (170 SMs, 112 MB L2) the tests pass, and
 spot checks keep the same picture.

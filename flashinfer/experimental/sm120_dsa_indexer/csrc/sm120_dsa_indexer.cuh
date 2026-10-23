@@ -101,7 +101,10 @@ __device__ __forceinline__ void mma_fp8(float (&d)[4], const uint32_t (&a)[4],
 }
 
 // MXFP4 (e2m1, packed two per byte) with ue8m0 scales per 32 elements: one
-// K-step covers 64 elements; sfa / sfb are the two scale bytes of the step.
+// K-step covers 64 elements. sfa / sfb hold the scale bytes of two K-steps;
+// kByte (0 or 2) selects this step's pair in the instruction, so both steps
+// read one register instead of a shifted copy each.
+template <int kByte>
 __device__ __forceinline__ void mma_fp4(float (&d)[4], const uint32_t (&a)[4],
                                         const uint32_t (&b)[2], uint32_t sfa, uint32_t sfb) {
   asm volatile(
@@ -111,7 +114,17 @@ __device__ __forceinline__ void mma_fp4(float (&d)[4], const uint32_t (&a)[4],
       "{%12, %13};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sfa), "r"(sfb),
-        "n"(0), "n"(0));
+        "n"(kByte), "n"(0));
+}
+
+// K-step ks (0 or 1) of an MXFP4 MMA from the two-step scale words.
+__device__ __forceinline__ void mma_fp4_step(float (&d)[4], const uint32_t (&a)[4],
+                                             const uint32_t (&b)[2], uint32_t sfa, uint32_t sfb,
+                                             int ks) {
+  if (ks == 0)
+    mma_fp4<0>(d, a, b, sfa, sfb);
+  else
+    mma_fp4<2>(d, a, b, sfa, sfb);
 }
 
 // Row bytes per format: FP8 rows are 128 bytes (128B TMA swizzle), packed
@@ -1385,10 +1398,6 @@ constexpr int kSelWarp0 = kNumMathThreads / 32 + 1;  // warps 9-11 (8 issues TMA
 constexpr int kSelWarps = 3;
 
 struct SelShared {
-  // sw: the warp's scan total, written by sel_rank but not read. Kept: the
-  // H64 MXFP4 selectors measured 4-10% slower without it (their code is
-  // sensitive to layout and scheduling).
-  int sw[kSelWarps];
   int bin, rem, cnt, m;
 };
 
@@ -1409,7 +1418,6 @@ __device__ __forceinline__ int sel_rank(const uint32_t* hist, int want, int t, S
     const int y = __shfl_up_sync(0xffffffffu, incl, o);
     if (lane >= o) incl += y;
   }
-  if (lane == 31) ss.sw[0] = incl;
   __syncwarp();
   if (incl >= want && incl - sum < want) {
     int r = want - (incl - sum), j = 0;
@@ -2239,8 +2247,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
                 if constexpr (kFp4) qsf = sqsf[qi * kNumHeads + nt * 8 + g];
               }
               if constexpr (kFp4) {
-                mma_fp4(acc[nt], kf[ks], b, (ksf >> (16 * ks)) & 0xffffu,
-                        (qsf >> (16 * ks)) & 0xffffu);
+                mma_fp4_step(acc[nt], kf[ks], b, ksf, qsf, ks);
               } else {
                 mma_fp8(acc[nt], kf[ks], b);
               }

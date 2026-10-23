@@ -335,8 +335,8 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
 #pragma unroll
             for (int qi = 0; qi < kNextN; ++qi) {
               if constexpr (kFp4) {
-                mma_fp4(acc[qi], kf[ks], qf[qi][ks][nt], (ksf >> (16 * ks)) & 0xffffu,
-                        (qsf_r[qi][nt] >> (16 * ks)) & 0xffffu);
+                mma_fp4<0>(acc[qi], kf[ks], qf[qi][ks][nt], (ksf >> (16 * ks)) & 0xffffu,
+                           (qsf_r[qi][nt] >> (16 * ks)) & 0xffffu);
               } else {
                 mma_fp8(acc[qi], kf[ks], qf[qi][ks][nt]);
               }
