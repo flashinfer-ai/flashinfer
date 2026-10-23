@@ -8,7 +8,7 @@ tactic from being selected as a silent fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, ClassVar
 
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
@@ -69,10 +69,30 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
     fc1_store_offload: bool | None = None
     fc1_early_done_publish: bool | None = None
     fold_producer_warps: bool | None = None
+    # One dispatch pull slot per active warp instead of four (frees shared
+    # memory for AB stages when active_dispatch_warps < 4). Not a tactic field.
+    compact_pull_buffer: bool = False
     routing_profile: str = field(
         default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
         kw_only=True,
     )
+
+    _weight_format: ClassVar[str] = "MXFP4"
+    _kind_contract: ClassVar[str] = "MXFP4 x FP8 Humming"
+
+    def _validate_weight_format(self) -> None:
+        if self.humming_max_range != 11:
+            raise ValueError(
+                "the production Humming ABI fixes humming_max_range=11; "
+                f"got {self.humming_max_range}"
+            )
+
+    def _validate_active_dispatch_warps(self) -> None:
+        if self.active_dispatch_warps is not None and (
+            isinstance(self.active_dispatch_warps, bool)
+            or self.active_dispatch_warps not in (1, 2, 4)
+        ):
+            raise ValueError("active_dispatch_warps must be 1, 2, or 4")
 
     def __post_init__(self) -> None:
         self.routing_profile = normalize_sm90_routing_profile(self.routing_profile)
@@ -84,23 +104,19 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
             raise ValueError(f"top_k must be positive, got {self.top_k}")
         if self.kind != "fp8_e4m3":
             raise ValueError(
-                f"SM90 MXFP4 x FP8 Humming requires kind='fp8_e4m3'; got {self.kind!r}"
+                f"SM90 {self._kind_contract} requires kind='fp8_e4m3'; got {self.kind!r}"
             )
         if self.fp8_scale_mode != "mxfp4_hybrid":
             raise ValueError(
-                "SM90 MXFP4 x FP8 requires fp8_scale_mode='mxfp4_hybrid'; "
+                f"SM90 {self._weight_format} x FP8 requires fp8_scale_mode='mxfp4_hybrid'; "
                 f"got {self.fp8_scale_mode!r}"
             )
         if self.fp8_accum_mode != "1xacc":
             raise ValueError(
-                "SM90 MXFP4 x FP8 currently requires fp8_accum_mode='1xacc'; "
+                f"SM90 {self._weight_format} x FP8 currently requires fp8_accum_mode='1xacc'; "
                 f"got {self.fp8_accum_mode!r}"
             )
-        if self.humming_max_range != 11:
-            raise ValueError(
-                "the production Humming ABI fixes humming_max_range=11; "
-                f"got {self.humming_max_range}"
-            )
+        self._validate_weight_format()
         if self.preprocess_expert_chunk_size <= 0:
             raise ValueError(
                 "preprocess_expert_chunk_size must be positive, got "
@@ -111,12 +127,14 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
             if value is not None and not isinstance(value, bool):
                 raise ValueError(f"{field_name} must be a bool when set")
         if self.swap_ab is False:
-            raise ValueError("SM90 MXFP4 x FP8 supports only the swap-AB kernel")
+            raise ValueError(
+                f"SM90 {self._weight_format} x FP8 supports only the swap-AB kernel"
+            )
         if not isinstance(self.enable_in_kernel_fc2_reduce, bool):
             raise ValueError("enable_in_kernel_fc2_reduce must be a bool")
         if self.enable_in_kernel_fc2_reduce:
             raise ValueError(
-                "SM90 MXFP4 x FP8 currently requires standalone top-k reduce"
+                f"SM90 {self._weight_format} x FP8 currently requires standalone top-k reduce"
             )
         if self.load_balance_mode is not None and self.load_balance_mode not in (
             "static",
@@ -137,20 +155,18 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
                 raise ValueError(f"{field_name} must be a bool when set")
         if not isinstance(self.grouped_token_back, bool):
             raise ValueError("grouped_token_back must be a bool")
+        if not isinstance(self.compact_pull_buffer, bool):
+            raise ValueError("compact_pull_buffer must be a bool")
         if self.grouped_token_back:
             raise ValueError(
-                "the production MXFP4 BF16-combine profile does not support "
+                f"the production {self._weight_format} BF16-combine profile does not support "
                 "grouped_token_back"
             )
         if self.combine_format != "bf16":
             raise ValueError(
-                "the production MXFP4 profile requires combine_format='bf16'"
+                f"the production {self._weight_format} profile requires combine_format='bf16'"
             )
-        if self.active_dispatch_warps is not None and (
-            isinstance(self.active_dispatch_warps, bool)
-            or self.active_dispatch_warps not in (1, 2, 4)
-        ):
-            raise ValueError("active_dispatch_warps must be 1, 2, or 4")
+        self._validate_active_dispatch_warps()
         if (
             self.fold_producer_warps is True
             and self.active_dispatch_warps is not None
