@@ -48,9 +48,7 @@ owns dispatch, expert compute, and combine; output is always BF16
 
 The `sm100_bf16_nvfp4_bf16_cutedsl` backend is the W4A16 variant: expert
 weights remain packed NVFP4 and expert activations remain BF16, including
-the FC1-to-FC2 handoff. Its online weight-dequantization pipeline
-can run ahead of token arrival, overlapping communication and computation.
-For this scheduling design and fused deterministic combine, see
+the FC1-to-FC2 handoff. For more on this backend's design and performance, see
 [Faster-than-light NVFP4 decode—with precision](https://humansand.ai/blog/faster-than-light-nvfp4-decode)
 by Ziang Li at humans& ai.
 

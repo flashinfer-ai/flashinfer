@@ -777,8 +777,7 @@ With NVFP4 expert weights on Blackwell, :func:`cute_dsl_fused_moe` and
   NVFP4 weights online for BF16 MMA. The FC1-to-FC2 activation handoff also
   remains BF16.
 
-The partial weight dequantization, FP32 epilogue scaling, and pipeline
-overlap behind the W4A16 path are described in
+For more on the W4A16 design and performance, see
 `Faster-than-light NVFP4 decode—with precision
 <https://humansand.ai/blog/faster-than-light-nvfp4-decode>`_ by Ziang Li at humans& ai.
 
