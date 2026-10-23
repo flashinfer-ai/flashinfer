@@ -15,7 +15,7 @@
 """Device-side index math and loads over the Sage scale buffers.
 
 The helpers turn coordinates into words of the flat scale tensors
-(``config.flat_scale_slot``) and of the prepared buffer
+(``config.sage_flat_scale_slot``) and of the prepared buffer
 (``layout._SageScaleLayout``): a sequence's first word, a section's first
 word and a Q tile row's word. They also load single FP32 scales. They hold
 no resource or pipeline state; each attention kernel moves the words it
@@ -26,7 +26,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
-from .config import flat_scale_slot
+from .config import sage_flat_scale_slot
 from .layout import _SageKSection, _SageQSection, _SageScaleLayout, _SageVSection
 
 
@@ -75,8 +75,37 @@ def sage_q_word(
 
 
 @cute.jit
-def _load_scale(scale_addr: Int64, index: Int32) -> Float32:
-    """Return one FP32 scale loaded from a global memory base address."""
+def load_sage_q_scale(
+    layout: cutlass.Constexpr[_SageScaleLayout],
+    scales: cute.Pointer,
+    *,
+    sequence_words: Int32,
+    q_tile_idx: Int32,
+    row_idx: Int32,
+) -> Float32:
+    """Return ``sfQ`` of row ``row_idx`` of Q tile ``q_tile_idx``.
+
+    ``sequence_words`` is the first word of the row's sequence
+    (``sage_sequence_words``). The word already holds the scale of the row's
+    token and Q head, the last token's for a row past the sequence's end
+    (``_SageQSection``). A softmax lane reads it once per work tile.
+    """
+    word = sage_q_word(
+        layout, sequence_words=sequence_words, q_tile_idx=q_tile_idx, row_idx=row_idx
+    )
+    return Float32(scales[word])
+
+
+@cute.jit
+def _load_sage_scale(scale_addr: Int64, index: Int32) -> Float32:
+    """Return one FP32 scale loaded from a global memory base address.
+
+    One 32-bit load per call; nothing widens it. The callers read single
+    words: the prepare gathers each prepared word from its own flat source
+    word, and the decode kernel stages a sequence's ``sfV`` row one channel
+    per lane, so a warp's loads coalesce. ``sfK`` atoms move in 16-byte units
+    instead.
+    """
     value_ptr = cutlass.inttoptr(
         scale_addr + Int64(index) * Int64(4),
         mem_space=1,
@@ -86,7 +115,7 @@ def _load_scale(scale_addr: Int64, index: Int32) -> Float32:
 
 
 @cute.jit
-def load_flat_scale(
+def load_sage_flat_scale(
     scale_addr: Int64,
     head_stride: Int32,
     *,
@@ -101,5 +130,5 @@ def load_flat_scale(
     A token past ``seq_len`` takes the last valid slot.
     """
     token_idx = cute.math.min(token_idx, seq_len - Int32(1))
-    slot = flat_scale_slot(batch_idx, token_idx, seq_len, log2_block)
-    return _load_scale(scale_addr, head_idx * head_stride + slot)
+    slot = sage_flat_scale_slot(batch_idx, token_idx, seq_len, log2_block)
+    return _load_sage_scale(scale_addr, head_idx * head_stride + slot)

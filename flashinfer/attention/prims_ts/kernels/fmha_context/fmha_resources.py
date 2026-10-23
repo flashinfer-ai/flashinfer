@@ -106,12 +106,12 @@ from .vc_resources import (
 from ..tcgen05_compat import tcgen05_ld_32x32b_max
 from ...sage.int32_scores import (
     INT32_SCORE_BIAS,
-    fill_score_seed_tile,
-    issue_score_seed_mma,
-    score_seed_tile_bytes,
-    score_seed_words,
+    fill_sage_score_seed_tile,
+    issue_sage_score_seed_mma,
+    sage_score_seed_tile_bytes,
+    sage_score_seed_words,
 )
-from ...sage.index import sage_section_word, sage_sequence_words
+from ...sage.index import load_sage_q_scale, sage_section_word, sage_sequence_words
 from ...sage.layout import _FLOAT4_WORDS, _SageScaleLayout
 from ...sage.modes import SageKTransport, SageScoreScaling
 from .helpers import (
@@ -126,7 +126,6 @@ from .helpers import (
 from .sage_scales import (
     SAGE_SCORE_BLOCK_COLS,
     load_sage_k_tile,
-    load_sage_q_scale,
     load_sage_v_channels,
     prefetch_sage_k_tile,
     sage_k_block_word,
@@ -483,7 +482,7 @@ class FmhaConfig:
     # the row's ``sfQ`` word, and the epilogue scales each output column by
     # ``sfV`` and adds ``v_mean``.
     sage_scale_layout: _SageScaleLayout | None = None
-    # Stages of the load warp's ``sfK`` ring (``SageKTransport.RING``): the K
+    # Stages of the load warp's ``sfK`` ring (``SageKTransport.SMEM``): the K
     # tiles the shared K/V ring keeps in flight, so the ring never throttles
     # the K loads.
     sage_k_scale_stages: int = 4
@@ -937,9 +936,9 @@ class FmhaConfig:
         return self.q_dtype == cutlass.Int8
 
     @property
-    def score_seed_tile_bytes(self) -> int:
+    def sage_score_seed_tile_bytes(self) -> int:
         """Return the bytes of the BF16 operand tile that seeds INT32 scores."""
-        return score_seed_tile_bytes(self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+        return sage_score_seed_tile_bytes(self.qk_mma_tiler[0], self.qk_mma_tiler[1])
 
     @property
     def sage_k_tile_words(self) -> int:
@@ -2096,7 +2095,7 @@ class SmemSageKScalesResource(MemoryResource):
 
     A tile of one-token K blocks has too many words to keep in the softmax
     lanes' registers or to broadcast-load from global memory
-    (``SageKTransport.RING``). After each K tile's TMA load the load warp
+    (``SageKTransport.SMEM``). After each K tile's TMA load the load warp
     copies the tile's atoms from the prepared scales into the acquired stage
     with lane-parallel 16-byte ``cp.async`` copies; the pipeline's
     ``AsyncLoad`` commit completes the stage once they land. Both softmax
@@ -3115,7 +3114,7 @@ class TmemSPResource(MemoryResource):
         if self._seed_alloc is None:
             self._seed_alloc = SmemAllocation(
                 f"{self.name}_score_seed",
-                self.cfg.score_seed_tile_bytes,
+                self.cfg.sage_score_seed_tile_bytes,
                 alignment=128,
             )
         return [self._seed_alloc]
@@ -3124,15 +3123,17 @@ class TmemSPResource(MemoryResource):
     def _score_seed_words(self, context: Any) -> cutlass.Array:
         """Return the seed MMA's operand tile; the second instance reads the first's."""
         owner = self if self.score_seed_owner is None else self.score_seed_owner
-        return score_seed_words(
-            context.smem_base, owner._seed_alloc.offset, self.cfg.score_seed_tile_bytes
+        return sage_score_seed_words(
+            context.smem_base,
+            owner._seed_alloc.offset,
+            self.cfg.sage_score_seed_tile_bytes,
         )
 
     @producer_work
     @cute.jit
     def seed_scores(self, stage_info: StageInfo) -> None:
         """Write ``INT32_SCORE_BIAS`` into the acquired S stage before its K wait."""
-        issue_score_seed_mma(
+        issue_sage_score_seed_mma(
             self.tmem_ptr_s_cached.subview(self._stage_col_offset(stage_info)),
             self._score_seed_words(stage_info.context),
             self.cfg.qk_mma_tiler[0],
@@ -3483,9 +3484,9 @@ class TmemSPResource(MemoryResource):
         ):
             # The MMA task is one warp; it fills the tile it will read.
             tidx, _, _ = cute.arch.thread_idx()
-            fill_score_seed_tile(
+            fill_sage_score_seed_tile(
                 self._score_seed_words(stage_info.context),
-                self.cfg.score_seed_tile_bytes // 4,
+                self.cfg.sage_score_seed_tile_bytes // 4,
                 tidx % Int32(32),
                 32,
             )
@@ -3796,7 +3797,7 @@ class TmemSPResource(MemoryResource):
     ) -> cutlass.Vector:
         """Load the current K tile's ``sfK`` words and warm L1 for the next tile.
 
-        The global transport (``SageKTransport.GLOBAL``), scheduled before
+        The global transport (``SageKTransport.GMEM``), scheduled before
         the wait for the tile's scores: the wait and the TMEM load then hide
         the load latency, which the compiler would otherwise expose by
         sinking the loads next to their first use. ``section=Tail`` loads the
@@ -3824,7 +3825,7 @@ class TmemSPResource(MemoryResource):
     ) -> cutlass.Vector:
         """Read the current K tile's ``sfK`` words from its waited ring stage.
 
-        The ring transport (``SageKTransport.RING``, protocol on
+        The ring transport (``SageKTransport.SMEM``, protocol on
         ``SmemSageKScalesResource``): ``sage_k_stage_words`` is the stage's
         shared-memory byte offset; one float4 load per four words.
         """

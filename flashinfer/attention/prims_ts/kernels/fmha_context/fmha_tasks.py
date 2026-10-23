@@ -2480,11 +2480,11 @@ def create_softmax_task(
     sage_scaling = tmem_sp.cfg.sage_score_scaling
     if use_sage and not p_in_smem:
         raise ValueError("Sage attention requires P in SMEM")
-    if sage_transport is SageKTransport.RING and sage_scaling is SageScoreScaling.BLOCK:
+    if sage_transport is SageKTransport.SMEM and sage_scaling is SageScoreScaling.BLOCK:
         # The P pass of block-scaled scores reuses the max pass's words, and
         # a ring stage is released after the max pass.
         raise ValueError("block-scaled Sage scores load their sfK words directly")
-    if sage_transport is SageKTransport.RING:
+    if sage_transport is SageKTransport.SMEM:
         if smem_sage_k is None:
             raise ValueError("this Sage K block size requires the sfK ring")
         src.append(smem_sage_k)
@@ -2625,7 +2625,7 @@ def create_softmax_task(
                 The global transport loads the words, so the wait hides their
                 latency; the ring transport waits for the load warp's stage and
                 returns its offset, read after the score wait."""
-                if sage_transport is SageKTransport.GLOBAL:
+                if sage_transport is SageKTransport.GMEM:
                     return sp.load_sage_k_words(
                         sage_k_first_atom=sage_k_first_atom, section=section
                     )
@@ -2637,7 +2637,7 @@ def create_softmax_task(
 
                 A ring stage's words are read after the score wait and the
                 stage is released after the max pass (``SmemSageKScalesResource``)."""
-                if sage_transport is SageKTransport.RING:
+                if sage_transport is SageKTransport.SMEM:
                     k_words = sp.read_staged_sage_k_words(sage_k_stage_words=k_words)
                 if sage_scaling is SageScoreScaling.BLOCK:
                     maxima = sp.sage_row_max(
@@ -2653,7 +2653,7 @@ def create_softmax_task(
                         sage_k_words=k_words,
                         section=section,
                     )
-                if sage_transport is SageKTransport.RING:
+                if sage_transport is SageKTransport.SMEM:
                     skr.release()
                 return maxima
 
@@ -3085,7 +3085,7 @@ def create_softmax_task(
     ) -> None:
         softmax_schedule_body(sp, vec, seq, wq, None, pb, skr)
 
-    if p_in_smem and sage_transport is SageKTransport.RING:
+    if p_in_smem and sage_transport is SageKTransport.SMEM:
         captured_schedule = _schedule_with_work_queue(
             softmax_schedule_pb_skr,
             tmem_sp,

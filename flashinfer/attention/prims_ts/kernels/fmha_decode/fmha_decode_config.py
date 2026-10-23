@@ -2853,7 +2853,7 @@ class FmhaDecodeConfig:
         ``sfK`` nor the INT32 bias. Other streamed geometries scale blocks of
         ``sage_k_scale_block_size`` columns, avoiding a TMEM round trip per
         tile. Every kind's words come through the ``SageKScalesResource`` ring
-        (``SageKTransport.RING``).
+        (``SageKTransport.SMEM``).
         """
         if not self.use_sage_attention:
             return None

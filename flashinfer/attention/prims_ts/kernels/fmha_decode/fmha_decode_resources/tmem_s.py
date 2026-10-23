@@ -45,10 +45,10 @@ from ...._block_sparse.prepared import _PREPARED_ROUTE_IS_FULL_FLAG
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
 from ....sage.int32_scores import (
     INT32_SCORE_BIAS,
-    fill_score_seed_tile,
-    issue_score_seed_mma,
-    score_seed_tile_bytes,
-    score_seed_words,
+    fill_sage_score_seed_tile,
+    issue_sage_score_seed_mma,
+    sage_score_seed_tile_bytes,
+    sage_score_seed_words,
 )
 from ...tcgen05_compat import tcgen05_ld_32x32b_max, tcgen05_mma_ws
 from ...placeholder_helpers import (
@@ -96,10 +96,9 @@ from .helpers_common import (
 from .smem_block_sparse_metadata import (
     _swaps_forwards_packed_route_full,
 )
-from ....sage.index import sage_sequence_words
+from ....sage.index import load_sage_q_scale, sage_sequence_words
 from ....sage.modes import SageScoreScaling
 from .sage_scales import (
-    load_q_scale,
     load_sage_k_fragment,
     sage_k_view,
 )
@@ -355,13 +354,13 @@ class TmemSResource(DecodeGenResourceBase):
     def _seed_mma_tile_bytes(self) -> int:
         """Return the byte size of the seeding MMA's operand tile."""
         _, mma_m, mma_n = _qk_mma_operand_contract_for_config(self.cfg)
-        return score_seed_tile_bytes(mma_m, mma_n)
+        return sage_score_seed_tile_bytes(mma_m, mma_n)
 
     @cute.jit
     def _seed_mma_tile_words(self, context: ResourceContext) -> cutlass.Array:
         """Return the seeding MMA's operand tile; the second instance reads the first's."""
         owner = self if self.score_seed_owner is None else self.score_seed_owner
-        return score_seed_words(
+        return sage_score_seed_words(
             context.smem_base, owner._seed_alloc.offset, owner._seed_mma_tile_bytes()
         )
 
@@ -383,7 +382,7 @@ class TmemSResource(DecodeGenResourceBase):
         """Fill the seeding MMA's constant operand tile with the whole CTA."""
         assert self.score_seed_owner is None, "only the owning instance fills the tile"
         tidx, _, _ = cute.arch.thread_idx()
-        fill_score_seed_tile(
+        fill_sage_score_seed_tile(
             self._seed_mma_tile_words(context),
             self._seed_mma_tile_bytes() // 4,
             tidx,
@@ -634,7 +633,7 @@ class TmemSResource(DecodeGenResourceBase):
         # 128-wide INT8 dot products.
         assert cfg.headdim == 128
         _, mma_m, mma_n = _qk_mma_operand_contract_for_config(cfg)
-        issue_score_seed_mma(
+        issue_sage_score_seed_mma(
             self._qk_tmem_col(stage_info, stage_slot_offset),
             self._seed_mma_tile_words(stage_info.context),
             mma_m,
@@ -2221,16 +2220,17 @@ class TmemSResource(DecodeGenResourceBase):
         kv_head_idx, batch_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        return load_q_scale(
-            cfg,
+        layout = cfg.sage_scale_layout(cfg.static_seq_len_kv)
+        return load_sage_q_scale(
+            layout,
             self.sage_scales_ptr,
             sequence_words=sage_sequence_words(
-                cfg.sage_scale_layout(cfg.static_seq_len_kv),
+                layout,
                 batch_idx=batch_idx,
                 kv_head_idx=kv_head_idx,
                 num_kv_heads=self.num_heads_kv,
             ),
-            q_group_idx=_logical_q_group_idx(cfg, stage_info, self.q_group_idx),
+            q_tile_idx=_logical_q_group_idx(cfg, stage_info, self.q_group_idx),
             row_idx=_keeps_row_idx(cfg, warp_grp_thread_idx),
         )
 
