@@ -79,6 +79,7 @@ kernel_cake_dsa_h64_nope_train_db791110b21a91be1388(int* __restrict__ indices, i
     const int stage_addr = (int)(unsigned long long)__cvta_generic_to_shared(stage);
 
     // === Task calls (declaration order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int t = blockIdx.x * 4 + warp;
     int lane_0 = lane;
     if (t < num_rows) {
@@ -563,7 +564,6 @@ kernel_cake_dsa_h64_nope_train_db791110b21a91be1388(int* __restrict__ indices, i
             }
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 } // extern "C"
