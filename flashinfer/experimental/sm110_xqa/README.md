@@ -19,12 +19,21 @@ The package is a self-contained Cake package (FlashInfer issue #6553):
 | `cake_build.py` | The loader shared by every Cake package: a prebuilt `aot/<library>.so` when a builder compiled it, else FlashInfer's JIT from the manifest's sources and flags (`use_fast_math=False`; the entry's own `--use_fast_math` is in `nvcc_flags`). |
 | `csrc/cake_ffi_checks.h` | The tvm-ffi checks the bindings use; no FlashInfer header is included. |
 | `csrc/cake_sm110_xqa_<digest>_{kernel,binding}.cu` | One device translation unit and one tvm-ffi binding (`run`, `build_cuda_version`) per program. |
+| `csrc/cake_sm110_xqa_device_abi.cuh` | The device ABI block every kernel translation unit includes first: fixed-width typedefs, the `CakeTensorMap64` / `CUtensorMap` size and alignment asserts, the CUDA headers, `make_warp_uniform` and `CAKE_INF`. |
+| `csrc/cake_sm110_xqa_device_helpers.cuh` | The device helper library the kernel translation units share; a unit selects the guarded helpers it uses with `CAKE_SM110_XQA_NEED_*` defines before the include. |
+| `csrc/cake_sm110_xqa_kv_cache_list_contig.h` | The `KVCacheList` record of the contiguous cache layout, included by each tree kernel of that layout and by its binding. |
+| `csrc/cake_sm110_xqa_kv_cache_list_page128.h` | The `KVCacheList` record of the `page128` cache layout, included by each tree kernel of that layout and by its binding. |
+| `csrc/cake_sm110_xqa_binding_helpers_tma_record.h` | The host helpers the tree bindings share (CUDA and driver error checks, tensor-view accessors, TMA extent and stride conversion, the cache record writer), included once per binding inside its namespace after `KERNEL_NAME`. |
+| `csrc/cake_sm110_xqa_binding_helpers_decode.h` | The host helpers the decode bindings share, included the same way. |
 | `backend.py` | Argument validation, routing, the workspace and the prepared launch. |
 
 Every generated file is written by the Cake exporter; `cake_jit.py` is read as
 a literal by `scripts/check_cake_build_manifests.py`, which checks the manifest
 against the registry and the sources. Edit the exporter, not the generated
 files.
+
+The six `csrc/cake_sm110_xqa_*` headers (`.cuh` and `.h`) are a hand fold of
+blocks the generated files shared, pending regeneration from the exporter.
 
 Native compilation and correctness checks have run with CUDA 13.4 on physical
 SM110 hardware. The interface supports two attention families:
@@ -183,7 +192,7 @@ is CUDA 13.4.
 Commands from a FlashInfer checkout:
 
 ```bash
-python scripts/check_cake_build_manifests.py --in-tree sm110_xqa
+python scripts/check_cake_build_manifests.py --in-tree --package sm110_xqa
 python -m pytest tests/experimental/test_cake_sm110_xqa.py -q
 python -m pytest tests/experimental/sm110_xqa/test_sm110_xqa.py -q
 python benchmarks/bench_sm110_xqa.py --warmup-ms 250 --output sm110-xqa-native.json
