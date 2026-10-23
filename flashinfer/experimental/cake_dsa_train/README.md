@@ -42,7 +42,8 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
   to `cu_seqlens_k[d]`) and turns them into global key rows on device in one
   launch of the NoPE record's index-preparation stage right before the forward
-  kernel (`index_prep`, `compact = 1`; the torch twin
+  kernel (`index_prep`, `compact = 1`, the forward launched behind it with the
+  programmatic-dependent-launch attribute, see below; the torch twin
   `offset_gather_kv_indices(..., compact=True)` where the stage is not
   available -- host tensors, an unserved device, a non-contiguous prefix sum --
   with bitwise the same result).  Every row is compacted stably: its valid keys
@@ -420,7 +421,14 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   slot order, then `-1` -- and its valid count as the length, after the position
   cut of a caller `topk_length` passed as `length_in`; the forward and the
   saved backward read the stage's rows and counts in both cases (bitwise the
-  torch twin `offset_gather_kv_indices(..., compact=True)`).  The host prepares
+  torch twin `offset_gather_kv_indices(..., compact=True)`).  Both forward
+  stages (`fwd`, `nope_fwd`) launch with the programmatic-dependent-launch
+  attribute (`use_pdl` in their launch records, a fixed attribute of their
+  bindings): `index_prep` signals `launch_dependents` once a row is written and
+  the forward kernels execute `griddepcontrol.wait` after their barrier / TMEM
+  prologue, before any global read, so behind the stage the forward's prologue
+  overlaps the stage's tail; behind any other kernel the attribute changes
+  nothing.  The host prepares
   the forward's plan, outputs and launch arguments and converts its operands
   before the first launch, then issues the forward from those pre-bound values
   inside the same stream context, so only the forward's binding call sits

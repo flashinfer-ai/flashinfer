@@ -93,7 +93,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "cluster": [1, 1, 1],
                 "cooperative": False,
                 "dynamic_smem_bytes": 231680,
-                "use_pdl": False,
+                "use_pdl": True,
             },
         },
         "bwd_delta": {
@@ -247,7 +247,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "cluster": [1, 1, 1],
                 "cooperative": False,
                 "dynamic_smem_bytes": 223488,
-                "use_pdl": False,
+                "use_pdl": True,
             },
         },
         "nope_bwd_delta": {
