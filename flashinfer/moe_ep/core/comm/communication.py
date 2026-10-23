@@ -36,7 +36,6 @@ time and are instantiated through :func:`create_communication`.
 
 from __future__ import annotations
 
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional
@@ -201,28 +200,9 @@ class MoEEpCommunication(ABC):
         return runtime_max_tokens_per_rank <= self.params.max_tokens_per_rank
 
     def _resolve_runtime_max_tokens_per_rank(
-        self,
-        runtime_max_tokens_per_rank: Optional[int],
-        max_tokens_per_rank: Optional[int] = None,
+        self, runtime_max_tokens_per_rank: Optional[int]
     ) -> int:
-        """The ``tokens_per_rank`` of one :meth:`dispatch`.
-
-        ``max_tokens_per_rank`` is the deprecated spelling of
-        ``runtime_max_tokens_per_rank``; passing both is an error.
-        """
-        if max_tokens_per_rank is not None:
-            if runtime_max_tokens_per_rank is not None:
-                raise TypeError(
-                    "dispatch() got both runtime_max_tokens_per_rank and its "
-                    "deprecated alias max_tokens_per_rank"
-                )
-            warnings.warn(
-                "dispatch(max_tokens_per_rank=...) is deprecated; use "
-                "runtime_max_tokens_per_rank=...",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-            runtime_max_tokens_per_rank = max_tokens_per_rank
+        """The ``tokens_per_rank`` of one :meth:`dispatch`."""
         capacity = self.params.max_tokens_per_rank
         if runtime_max_tokens_per_rank is None:
             return capacity
@@ -243,7 +223,6 @@ class MoEEpCommunication(ABC):
         hidden_states_scale: "torch.Tensor | None" = None,
         runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
     ) -> MoEEpDispatchResult:
         """Send each token to the ranks that own its selected experts.
 
@@ -268,8 +247,6 @@ class MoEEpCommunication(ABC):
         eplb_local_stats : torch.Tensor, optional
             This rank's expert-load statistics, all-gathered alongside the
             dispatch by backends that support it.
-        max_tokens_per_rank : int, optional
-            Deprecated alias of ``runtime_max_tokens_per_rank``.
         """
 
     @abstractmethod

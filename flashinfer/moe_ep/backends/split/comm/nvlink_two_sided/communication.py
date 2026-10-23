@@ -137,7 +137,6 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
         hidden_states_scale: "torch.Tensor | None" = None,
         runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
     ) -> MoEEpDispatchResult:
         import torch
 
@@ -148,7 +147,7 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
         if self._state is not None:
             raise RuntimeError("dispatch called twice without an intervening combine")
         tokens_per_rank = self._resolve_runtime_max_tokens_per_rank(
-            runtime_max_tokens_per_rank, max_tokens_per_rank
+            runtime_max_tokens_per_rank
         )
         if topk_ids.dtype != torch.int32:
             topk_ids = topk_ids.to(torch.int32)

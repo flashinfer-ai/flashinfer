@@ -21,10 +21,9 @@ class NVLinkOneSidedConfig:
     ``extra_payload_bytes_per_token`` reserves room for anything else sent per
     token. ``eplb_stats_num_experts`` enables all-gathering EPLB statistics of
     that many experts during dispatch. ``enable_rank_mask`` compiles in
-    rank-mask support for the ``active_ranks`` of ``dispatch``.
-    ``use_low_precision_combine`` sends combine payloads as FP8.
-    ``comm_backend`` exchanges the MNNVL memory handles and defaults to
-    torch.distributed over the bootstrap process group.
+    rank-mask support for ``active_rank_mask``. ``use_low_precision_combine``
+    sends combine payloads as FP8. ``comm_backend`` exchanges the MNNVL memory
+    handles and defaults to torch.distributed over the bootstrap process group.
 
     ``cft`` selects CFT counted writes, which push payloads over the NVLink
     fabric with ``fabric.try_put.counted`` and let the receiver wait on

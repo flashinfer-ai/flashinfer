@@ -448,13 +448,14 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask():
     )
     try:
         stats_base = torch.arange(num_experts, dtype=torch.int32, device="cuda")
+        mask = comm.active_rank_mask(range(world_size))
         received = comm.dispatch(
             x,
             topk_ids,
             topk_weights,
             runtime_max_tokens_per_rank=int(step_max),
             eplb_local_stats=stats_base + 1000 * rank,
-            active_ranks=range(world_size),
+            active_rank_mask=mask,
         )
         torch.testing.assert_close(
             received.eplb_gathered_stats,
@@ -474,7 +475,7 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask():
             torch.zeros((), device="cuda"),
         ).to(torch.bfloat16)
 
-        out = comm.combine(expert_output)
+        out = comm.combine(expert_output, active_rank_mask=mask)
 
         reference = x.float() * (topk_weights * (topk_ids.long() + 1).float()).sum(
             -1, keepdim=True

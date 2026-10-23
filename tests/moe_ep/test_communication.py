@@ -430,7 +430,7 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     with pytest.raises(ValueError, match="runtime_max_tokens_per_rank"):
         comm.dispatch(hidden, ids, weights, runtime_max_tokens_per_rank=4)
     with pytest.raises(ValueError, match="enable_rank_mask"):
-        comm.dispatch(hidden, ids, weights, active_ranks=[0, 1])
+        comm.dispatch(hidden, ids, weights, active_rank_mask=torch.ones(4))
     with pytest.raises(RuntimeError, match="before dispatch"):
         comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
 
@@ -438,33 +438,6 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     comm.destroy()
     with pytest.raises(RuntimeError, match="destroyed"):
         comm.dispatch(hidden, ids, weights)
-
-
-def test_cake_rank_mask(fake_cake) -> None:
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        CakeAlltoAllConfig,
-        create_communication,
-    )
-
-    comm = create_communication(
-        BootstrapConfig(world_size=2, rank=0),
-        _params(),
-        CakeAlltoAllConfig(enable_rank_mask=True),
-    )
-    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
-    ids = torch.tensor([[0, 3], [1, 2]])
-    comm.dispatch(hidden, ids, active_ranks=[0])
-    mask = fake_cake.calls["dispatch"][3]["active_rank_mask"]
-    assert mask.dtype == torch.uint64 and mask.tolist()[0] == 1
-    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
-    # The combine reuses the dispatch's mask.
-    assert fake_cake.calls["combine"][3]["active_rank_mask"] is mask
-
-    comm.dispatch(hidden, ids)
-    assert fake_cake.calls["dispatch"][3]["active_rank_mask"].tolist()[0] == 3
-    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
-    comm.destroy()
 
 
 def test_cake_rejects_dispatch_into_the_combine_region(fake_cake) -> None:
@@ -823,46 +796,22 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
 
     with pytest.raises(ValueError, match="runtime_max_tokens_per_rank"):
         comm.dispatch(hidden, ids, weights, runtime_max_tokens_per_rank=4)
-    with (
-        pytest.warns(DeprecationWarning, match="runtime_max_tokens_per_rank"),
-        pytest.raises(ValueError, match="runtime_max_tokens_per_rank=4"),
-    ):
-        comm.dispatch(hidden, ids, weights, max_tokens_per_rank=4)
-    with pytest.raises(TypeError, match="deprecated alias"):
-        comm.dispatch(
-            hidden,
-            ids,
-            weights,
-            runtime_max_tokens_per_rank=2,
-            max_tokens_per_rank=2,
-        )
     with pytest.raises(RuntimeError, match="before dispatch"):
         comm.combine(buffer)
 
 
 def test_nvlink_one_sided_rank_mask(fake_one_sided) -> None:
-    calls = fake_one_sided.module.calls
-    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
-    ids = torch.tensor([[0, 3], [1, 2]])
     comm = _one_sided(enable_rank_mask=True)
-
-    comm.dispatch(hidden, ids, active_ranks=[0])
-    mask = calls["dispatch"][3][9]
-    assert mask.dtype == torch.uint64 and mask.tolist() == [1, 0, 0, 0]
-    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
-    # The combine reuses the dispatch's mask.
-    assert calls["combine"][13] is mask
-
-    comm.dispatch(hidden, ids)
-    assert calls["dispatch"][3][9].tolist() == [3, 0, 0, 0]
-    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
-
+    mask = comm.active_rank_mask([0, 1, 255 % comm.ep_size])
+    assert mask.dtype == torch.uint64 and mask.tolist() == [3, 0, 0, 0]
     with pytest.raises(ValueError, match="out of range"):
-        comm.dispatch(hidden, ids, active_ranks=[0, 2])
+        comm.active_rank_mask([2])
     with pytest.raises(ValueError, match="enable_rank_mask"):
-        _one_sided().dispatch(hidden, ids, active_ranks=[0, 1])
-    _one_sided().dispatch(hidden, ids)
-    assert calls["dispatch"][3][9] is None
+        _one_sided().dispatch(
+            torch.ones(2, 8, dtype=torch.bfloat16),
+            torch.tensor([[0, 3], [1, 2]]),
+            active_rank_mask=mask,
+        )
 
 
 def test_nvlink_one_sided_validates_config(fake_one_sided) -> None:
