@@ -25,6 +25,17 @@ __device__ __forceinline__ std::uint32_t load_bf16_pair(quant::Type const* ptr) 
   return *reinterpret_cast<std::uint32_t const*>(ptr);
 }
 
+// Four 8x8 bf16 matrices from shared memory; lane l supplies the 16-byte row
+// address of row l % 8 of matrix l / 8, and r[j] receives matrix j in the mma
+// fragment layout (row = lane / 4, columns 2 * (lane % 4) and +1).
+__device__ __forceinline__ void ldmatrix_x4(std::uint32_t& r0, std::uint32_t& r1, std::uint32_t& r2,
+                                            std::uint32_t& r3, quant::Type const* row) {
+  std::uint32_t const address = static_cast<std::uint32_t>(__cvta_generic_to_shared(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(address));
+}
+
 __device__ __forceinline__ std::uint32_t pack_bf16_pair(quant::Type const* low,
                                                         quant::Type const* high) {
   std::uint32_t const low_bits = *reinterpret_cast<std::uint16_t const*>(low);
@@ -1272,14 +1283,20 @@ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void nvfp4_
       quant::Type* const slice = b_tiles[col_group];
       std::uint32_t b0[kKSteps][kFrags];
       std::uint32_t b1[kKSteps][kFrags];
+      // ldmatrix replaces four 32-bit shared loads per fragment pair (B) and per
+      // m16 block (A): at 32640x4096x11008 those loads were 29% of the stall
+      // samples (MIO throttle) and the A loads 80 instructions per warp per tile.
+      // Lane l addresses row l % 8 of matrix l / 8; the matrices are ordered as
+      // the mma operands below, so the fragments are bit-identical.
+      int const ld_row = lane % 8;
+      int const ld_matrix = lane / 8;
+      static_assert(kFrags == 2, "one ldmatrix.x4 covers both n8 fragments of a slice");
 #pragma unroll
       for (int ks = 0; ks < kKSteps; ++ks) {
-#pragma unroll
-        for (int f = 0; f < kFrags; ++f) {
-          quant::Type const* b_base = slice + (f * 8 + group) * kStagedBStride + ks * 16 + pair_col;
-          b0[ks][f] = base::load_bf16_pair(b_base);
-          b1[ks][f] = base::load_bf16_pair(b_base + 8);
-        }
+        // Matrix j: fragment j / 2, k half j % 2.
+        base::ldmatrix_x4(b0[ks][0], b1[ks][0], b0[ks][1], b1[ks][1],
+                          slice + ((ld_matrix / 2) * 8 + ld_row) * kStagedBStride + ks * 16 +
+                              (ld_matrix % 2) * 8);
       }
       // Once every warp reading this slice holds its fragments, the next tile's
       // copy can land in the same buffer; the end-of-tile cp.async wait and
@@ -1299,12 +1316,13 @@ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void nvfp4_
         int const local_k = ks * 16;
 #pragma unroll
         for (int mb = 0; mb < kMBlocks; ++mb) {
-          quant::Type const* a_base =
-              x_tile + (row_part * kWarpRows + mb * 16 + group) * kTileStride + local_k + pair_col;
-          std::uint32_t const a0 = base::load_bf16_pair(a_base);
-          std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
-          std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
-          std::uint32_t const a3 = base::load_bf16_pair(a_base + 8 * kTileStride + 8);
+          // Matrix j: rows 8 * (j % 2), k half j / 2 (a0, a1, a2, a3).
+          std::uint32_t a0, a1, a2, a3;
+          base::ldmatrix_x4(
+              a0, a1, a2, a3,
+              x_tile +
+                  (row_part * kWarpRows + mb * 16 + (ld_matrix % 2) * 8 + ld_row) * kTileStride +
+                  local_k + (ld_matrix / 2) * 8);
 #pragma unroll
           for (int f = 0; f < kFrags; ++f) {
             base::mma_m16n8k16_row_col(acc[f][mb][0], acc[f][mb][1], acc[f][mb][2], acc[f][mb][3],
