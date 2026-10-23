@@ -925,14 +925,28 @@ def _make_block_tables_from_indptr(
     indices: torch.Tensor,
     batch_size: int,
     device: torch.device,
+    *,
+    block_tables: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     blocks_per_seq = (
         indptr_host[1 : batch_size + 1] - indptr_host[:batch_size]
     ).tolist()
     max_blocks_per_seq = max(blocks_per_seq) if blocks_per_seq else 0
-    block_tables = torch.zeros(
-        (batch_size, max_blocks_per_seq), dtype=torch.int32, device=device
-    )
+    if block_tables is None:
+        block_tables = torch.zeros(
+            (batch_size, max_blocks_per_seq), dtype=torch.int32, device=device
+        )
+    else:
+        if (
+            block_tables.shape[0] != batch_size
+            or block_tables.shape[1] < max_blocks_per_seq
+        ):
+            raise ValueError(
+                "XQA MTP CUDA graph block table cannot grow after planning; "
+                "pass a fixed block_tables sized for the longest sequence "
+                "the graph will see."
+            )
+        block_tables.zero_()
     indptr_list = indptr_host.tolist()
     for i, num_blocks in enumerate(blocks_per_seq):
         if num_blocks == 0:
@@ -1590,6 +1604,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._use_xqa_mtp_decode = False
         self._xqa_mtp_causal_mask: Optional[torch.Tensor] = None
+        self._xqa_mtp_block_tables: Optional[torch.Tensor] = None
         self._xqa_mtp_q_len_per_req = 1
 
     @property
@@ -2096,6 +2111,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             path.
             ``q_len_per_req > 1`` is currently supported on the fa2
             tensor-core backend (and natively by trtllm-gen/cute-dsl).
+            In CUDA graph mode, an auto-built XQA block table keeps its
+            initial capacity. Pass ``block_tables`` sized for the longest
+            sequence the graph will see if the page count will grow.
             Under ``use_cuda_graph``, this value is part of the frozen
             shape (like the batch size): once the wrapper has been
             planned, re-planning with a different value raises.
@@ -2419,7 +2437,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             disable_split_kv=disable_split_kv,
             o_data_type=o_data_type,
         )
-        self._xqa_mtp_causal_mask = None
         self._xqa_mtp_q_len_per_req = q_len_per_req
         if self._use_xqa_mtp_decode:
             self._max_kv_len = int(kv_lens_arr_host.max().item())
@@ -2436,11 +2453,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
             if self._block_tables is None:
                 self._block_tables = _make_block_tables_from_indptr(
-                    indptr_host, self._paged_kv_indices_buf, batch_size, self.device
+                    indptr_host,
+                    self._paged_kv_indices_buf,
+                    batch_size,
+                    self.device,
+                    block_tables=self._xqa_mtp_block_tables
+                    if self.is_cuda_graph_enabled
+                    else None,
                 )
-            self._xqa_mtp_causal_mask = _make_xqa_mtp_causal_mask(
-                batch_size, q_len_per_req, self.device
-            )
+                self._xqa_mtp_block_tables = self._block_tables
+            if self._xqa_mtp_causal_mask is None or self._xqa_mtp_causal_mask.shape[
+                :2
+            ] != (batch_size, q_len_per_req):
+                self._xqa_mtp_causal_mask = _make_xqa_mtp_causal_mask(
+                    batch_size, q_len_per_req, self.device
+                )
         if q_len_per_req > 1 and is_causal:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:

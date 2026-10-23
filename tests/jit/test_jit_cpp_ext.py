@@ -452,6 +452,37 @@ def test_xqa_mtp_block_tables_from_indptr_preserves_offset():
     assert block_tables.tolist() == [[2, 3, 0], [4, 5, 6]]
 
 
+def test_xqa_mtp_block_tables_replan_preserves_storage():
+    table = torch.full((2, 3), -1, dtype=torch.int32)
+    captured_pointer = table.data_ptr()
+    result = flashinfer.decode._make_block_tables_from_indptr(
+        torch.tensor([0, 2, 3], dtype=torch.int32),
+        torch.tensor([9, 8, 7], dtype=torch.int32),
+        2,
+        torch.device("cpu"),
+        block_tables=table,
+    )
+    assert result.data_ptr() == captured_pointer
+    assert result.tolist() == [[9, 8, 0], [7, 0, 0]]
+    result = flashinfer.decode._make_block_tables_from_indptr(
+        torch.tensor([0, 1, 3], dtype=torch.int32),
+        torch.tensor([6, 5, 4], dtype=torch.int32),
+        2,
+        torch.device("cpu"),
+        block_tables=table,
+    )
+    assert result.data_ptr() == captured_pointer
+    assert result.tolist() == [[6, 0, 0], [5, 4, 0]]
+    with pytest.raises(ValueError, match="cannot grow"):
+        flashinfer.decode._make_block_tables_from_indptr(
+            torch.tensor([0, 4, 4], dtype=torch.int32),
+            torch.arange(4, dtype=torch.int32),
+            2,
+            torch.device("cpu"),
+            block_tables=table,
+        )
+
+
 def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     calls = []
 
