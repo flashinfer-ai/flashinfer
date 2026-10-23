@@ -2194,7 +2194,7 @@ def configure_sparse_mla(
             raw_record_ring=raw_record_ring,
         )
         kv_stages = 2
-    cfg = dataclass_replace(
+    return dataclass_replace(
         cfg,
         **roles,
         kv_stages=kv_stages,
@@ -2203,4 +2203,3 @@ def configure_sparse_mla(
         if retained_nvfp4_kv or single or (reuse and profile.reuse_kv_stages)
         else cfg.q_stages,
     )
-    return cfg
