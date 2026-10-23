@@ -41,6 +41,7 @@ def _reference(
     output_scale=1.0,
     sinks=None,
     softmax_scale=512**-0.5,
+    p_scale=448.0,
 ):
     rows, heads = query.numel() // (query.shape[-2] * 512), query.shape[-2]
     q = query.reshape(rows, heads, 512)
@@ -93,7 +94,10 @@ def _reference(
         ]
         bound[start:end] = (
             output_scale
-            * ((2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow)
+            * (
+                (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity
+                + (2**-10 / p_scale) * underflow
+            )
             + 1e-6
         ).masked_fill(empty[:, None, None], 0)
     return (
@@ -1138,3 +1142,99 @@ def test_softmax_score_jumps(heads, dtype):
         else:
             torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
         torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "dtype,rows,heads,capacity,threshold",
+    [
+        # Each case lands on a different measured schedule on 148-SM parts.
+        pytest.param(torch.bfloat16, 37, 32, 512, 32.0, id="bf16-2cta"),
+        pytest.param(torch.bfloat16, 74, 32, 512, 6.0, id="bf16-keep-deferred"),
+        pytest.param(torch.bfloat16, 74, 16, 512, 6.0, id="bf16-swap-deferred"),
+        pytest.param(torch.bfloat16, 16, 128, 512, 6.0, id="bf16-keep-bk64-split"),
+        pytest.param(torch.float8_e4m3fn, 16, 128, 512, 8.0, id="fp8-2cta"),
+        pytest.param(torch.float8_e4m3fn, 37, 32, 2048, 8.0, id="fp8-keep-split"),
+        pytest.param(torch.float8_e4m3fn, 1, 16, 512, 8.0, id="fp8-swap-split"),
+    ],
+)
+def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
+    """An explicit threshold reaches every sparse schedule.
+
+    softmax_scale = ln 2 makes one logit unit one binade. Successive 128-slot
+    tiles raise the row maximum by threshold - 2 (kept anchor), threshold + 3
+    (rescale) and threshold - 2 again, so the dominant last tile is weighted
+    against a kept anchor. E4M3 bounds use the 1.75 probability scale.
+    """
+    torch.manual_seed(7)
+    fp8 = dtype == torch.float8_e4m3fn
+    q = (torch.randn(rows, 1, heads, 512, device="cuda") * 0.1).to(dtype)
+    q[..., 0] = 1
+    kv = torch.randn(capacity, 1, 512, device="cuda") * 0.1
+    jump = 10.0 if fp8 else threshold + 3  # E4M3 represents 6, 16 and 22
+    levels = (0.0, threshold - 2, threshold - 2 + jump, 2 * threshold - 4 + jump)
+    for tile, level in enumerate(levels):
+        kv[tile * 128 : (tile + 1) * 128, :, 0] = level
+    kv = kv.to(dtype)
+    indices = torch.arange(capacity, device="cuda", dtype=torch.int32).repeat(
+        rows, 1, 1
+    )
+    sinks = torch.randn(heads, device="cuda")
+    sinks[0], sinks[1], sinks[2] = torch.inf, -torch.inf, 15.0
+    softmax_scale = 0.6931471805599453
+    args = dict(max_topk=capacity, q_data_type=dtype, has_sinks=True, return_lse=True)
+    assert get_prims_ts_sparse_mla_decode_workspace_size(
+        q.device, rows, heads, **args, skip_correction_threshold=threshold
+    ) == get_prims_ts_sparse_mla_decode_workspace_size(q.device, rows, heads, **args)
+    results = {}
+    for value in (None, threshold):
+        wrapper = BatchSparseMLADecodePagedTSWrapper()
+        wrapper.plan(q.device, rows, heads, **args, skip_correction_threshold=value)
+        meta = prepare_sparse_mla_indices(wrapper, q, kv, indices)
+        results[value] = wrapper.run(
+            q, kv, **meta, sinks=sinks, softmax_scale=softmax_scale
+        )
+    out, lse = results[threshold]
+    ref, ref_lse, bound = _reference(
+        q,
+        kv,
+        None,
+        indices,
+        sinks=sinks,
+        softmax_scale=softmax_scale,
+        p_scale=1.75,
+    )
+    assert torch.isfinite(out).all()
+    if fp8:
+        assert ((out.double() - ref).abs() <= bound).all()
+    else:
+        torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
+    torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+    default_out, default_lse = results[None]
+    if not fp8 and threshold == 6.0:
+        # The deferred BF16 schedules already keep the anchor within six
+        # binades; the explicit threshold must reproduce them exactly.
+        assert torch.equal(out, default_out)
+        assert torch.equal(lse, default_lse)
+    else:
+        assert not torch.equal(out, default_out)
+
+
+@pytest.mark.parametrize(
+    "dtype,threshold,error",
+    [
+        (torch.float8_e4m3fn, 8.5, ValueError),
+        (torch.bfloat16, 33.0, ValueError),
+        (torch.bfloat16, -1.0, ValueError),
+        (torch.bfloat16, True, TypeError),
+    ],
+)
+def test_skip_correction_threshold_rejected(dtype, threshold, error):
+    with pytest.raises(error, match="skip_correction_threshold"):
+        get_prims_ts_sparse_mla_decode_workspace_size(
+            torch.device("cuda"),
+            1,
+            16,
+            max_topk=128,
+            q_data_type=dtype,
+            skip_correction_threshold=threshold,
+        )

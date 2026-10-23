@@ -2170,6 +2170,7 @@ def _resolve_sparse_mla_plan(
     output_quant_block_size=None,
     out_scale_format="ue8m0",
     num_output_groups=None,
+    skip_correction_threshold=None,
 ):
     """Resolve sparse geometry and scratch sizing without allocation/compilation."""
     import cutlass
@@ -2213,6 +2214,10 @@ def _resolve_sparse_mla_plan(
         raise ValueError("native BF16 or E4M3 is required")
     if kv_layout not in ("NHD", "HND"):
         raise ValueError("kv_layout must be NHD or HND")
+    if skip_correction_threshold is not None:
+        skip_correction_threshold = _validate_mla_skip_correction_threshold(
+            skip_correction_threshold, q_dtype=q_data_type
+        )
     max_rows = batch_size * max_seq_len_q
     capacity = max(
         256,
@@ -2229,6 +2234,12 @@ def _resolve_sparse_mla_plan(
         dtype="bf16" if q_data_type == torch.bfloat16 else "fp8",
         sm_count=sm_count,
     )
+    skip_corr_threshold = 0.0
+    if skip_correction_threshold is not None:
+        # An explicit threshold replaces the schedule's fixed six-binade
+        # deferral; zero restores exact maxima for every schedule.
+        profile = replace(profile, defer_max_update=False)
+        skip_corr_threshold = skip_correction_threshold
     family, tile = profile.family, profile.tile_size_q
     splits, head_dim_ctas = profile.split_kv, profile.head_dim_ctas
     dtype_name = "bf16" if q_data_type == torch.bfloat16 else "e4m3"
@@ -2247,6 +2258,7 @@ def _resolve_sparse_mla_plan(
             seq_len_q=1,
             batch_size=max_rows,
             mask_type="dense",
+            skip_corr_threshold=skip_corr_threshold,
         )
         kernel.sparse_gather_warps = profile.gather_issue_warps
         kernel.sparse_kv_stages = profile.kv_pipeline_stages
@@ -2290,6 +2302,7 @@ def _resolve_sparse_mla_plan(
             tile_size_q=tile,
             sparse_profile=profile,
             mask_type="dense",
+            skip_corr_threshold=skip_corr_threshold,
         )
         core_bytes = compute_workspace_size(
             cfg=kernel._make_config(),
@@ -2371,6 +2384,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         output_quant_block_size=None,
         out_scale_format="ue8m0",
         num_output_groups=None,
+        skip_correction_threshold=None,
     ):
         """Plan D512 attention over one primary and an optional extra pool.
 
@@ -2383,6 +2397,15 @@ class BatchSparseMLADecodePagedTSWrapper:
         the local query-head count H. Blocks of 32 with UE8M0 scales implement
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
+
+        ``skip_correction_threshold`` has the meaning, unit and bounds of
+        :meth:`BatchMLADecodePagedTSWrapper.plan` (0 to 8 binades for E4M3,
+        0 to 32 for BF16). ``None`` (default) keeps each schedule's own
+        behavior: some BF16 schedules keep the row anchor while a K tile
+        raises it by at most 6 binades, and all others rescale on every new
+        maximum. An explicit value applies to every schedule; ``0.0``
+        disables the skip, and a positive value also quantizes E4M3 P at
+        1.75 instead of 448, with the precision cost described there.
         """
         (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
@@ -2401,6 +2424,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 output_quant_block_size=output_quant_block_size,
                 out_scale_format=out_scale_format,
                 num_output_groups=num_output_groups,
+                skip_correction_threshold=skip_correction_threshold,
             )
         )
         kernel = spec.kernel
@@ -2878,13 +2902,15 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     token_positions=None,
     cos_sin_cache=None,
     out_scale=None,
+    skip_correction_threshold=None,
 ):
     """Eager plan-and-run helper using separate source indices and lengths.
 
     Use a planned wrapper for CUDA Graph replay. Index conversion and scale
     composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
-    Source contracts, output quantization arguments and return layouts follow
+    Source contracts, output quantization arguments, ``skip_correction_threshold``
+    and return layouts follow
     :class:`BatchSparseMLADecodePagedTSWrapper`.
     """
     if torch.cuda.is_current_stream_capturing():
@@ -2918,6 +2944,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         output_quant_block_size=output_quant_block_size,
         out_scale_format=out_scale_format,
         num_output_groups=num_output_groups,
+        skip_correction_threshold=skip_correction_threshold,
     )
     return wrapper.run(
         query,
