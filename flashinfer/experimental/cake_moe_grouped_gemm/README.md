@@ -96,8 +96,9 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   group add one partial 256-row tile (`max_cluster_tiles_upper_bound`).
 - Weight-gradient k tile (`select_wgrad_tile`): 512 when `K % 512 == 0`, the
   architecture is listed for it and the average rows per group reach the
-  delivered threshold; 256 otherwise. The bf16 and fp32 outputs and the two
-  tiles are separate registered programs.
+  delivered threshold; 256 otherwise. The two tiles are separate registered
+  programs; the fp32 output is the compile-line specialization
+  `-DWGRAD_OUT=32` of the bf16 program.
 - Weight-gradient tail: the tiles of the last partial wave are split into
   `tail_splits` k-step chunks over all clusters (`wgrad_tail_tiles`,
   `wgrad_tail_plan`, a closed-form cost model of rounds, partial traffic and one
@@ -120,19 +121,24 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 
 The programs are exact-architecture tcgen05 payloads built for the exact
 targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`). Each
-physical program (`fwd`, `dgrad`, the weight-gradient main kernel for bf16 and
-fp32 outputs with a 256- or 512-wide k tile, and the weight-gradient
-tail-reduce for bf16 and fp32 outputs) has one kernel and one host-binding
-translation unit under `csrc/cake_moe_grouped_gemm/`, shared by the three
-architectures: the single architecture-dependent line is folded under
-`__CUDA_ARCH__`, and the tail-reduce k tile is a compile-line specialization
-(`-DWGRAD_TILE=256|512`). `cake_jit.PROGRAMS` lists each program once (its
-architecture-free `library` stem, FFI entry, argument plan and launch
+of the five physical programs (`fwd`, `dgrad`, the weight-gradient main
+kernel with a 256- or 512-wide k tile, and the weight-gradient tail-reduce)
+has one kernel and one host-binding translation unit under
+`csrc/cake_moe_grouped_gemm/`, shared by the three architectures: the single
+architecture-dependent line is folded under `__CUDA_ARCH__`, the tail-reduce
+k tile is a compile-line specialization (`-DWGRAD_TILE=256|512`), and so is
+the fp32 weight-gradient output (`-DWGRAD_OUT=32`; `WGRAD_OUT=16`, the bf16
+output, is the default). The shared weight-gradient sources, their registry
+rows and their manifest entries are a hand fold of the exported files; a
+later export regenerates them. `cake_jit.PROGRAMS` lists each program once
+(its architecture-free `library` stem, FFI entry, argument plan and launch
 geometry); `cake_jit.ROUTES` maps each public route (operation, output dtype,
 k tile) to its stage programs and specializations. `build.json` (schema
 `cake-build/1`, written by the export) is the only record of what to compile:
 one entry per build `<library>[<specialization tag>]_<arch>` -- the tag is
 `_wgrad_tile256` / `_wgrad_tile512` for the specialized tail-reduce builds,
+`_wgrad_out32` for the fp32 weight-gradient builds (composed on the fp32
+tail-reduce: `_wgrad_out32_wgrad_tile256` / `_wgrad_out32_wgrad_tile512`),
 empty otherwise -- with its translation units, digests, nvcc flags (the
 `-D` defines included), per-architecture closure digest and `aot/<name>.so`
 path. `cake_jit.load_module(program, arch, specializations)` loads that entry

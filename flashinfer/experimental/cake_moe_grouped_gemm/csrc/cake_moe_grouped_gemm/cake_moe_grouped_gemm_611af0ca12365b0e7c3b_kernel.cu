@@ -72,6 +72,15 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_EPILOGUE_WARPS 4
 #define CLUSTER_M 256
 #define EPI_CHUNK 16
+#ifndef WGRAD_OUT
+#define WGRAD_OUT 16
+#endif
+#if WGRAD_OUT != 16 && WGRAD_OUT != 32
+#error "WGRAD_OUT selects the output element width of this program: 16 (bf16, default) or 32 (fp32); define it on the compile line"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b
+#endif
 
 #include <math_constants.h>
 
@@ -166,7 +175,11 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ partials, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e)
+#if WGRAD_OUT == 32
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ partials, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e)
+#else
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ partials, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e)
+#endif
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -769,6 +782,22 @@ kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b(const __grid_constant__ CUtens
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     {
                         {
+#if WGRAD_OUT == 32
+                            float4 _v4 = make_float4(_tmem_load_0[0 + 0], _tmem_load_0[0 + 1], _tmem_load_0[0 + 2], _tmem_load_0[0 + 3]);
+                            *reinterpret_cast<float4*>((C + ((int)e_ue * stride_e + row_n * ldc + col0 + n_chunk * EPI_CHUNK)) + 0) = _v4;
+                        }
+                        {
+                            float4 _v4 = make_float4(_tmem_load_0[4 + 0], _tmem_load_0[4 + 1], _tmem_load_0[4 + 2], _tmem_load_0[4 + 3]);
+                            *reinterpret_cast<float4*>((C + ((int)e_ue * stride_e + row_n * ldc + col0 + n_chunk * EPI_CHUNK + 4)) + 0) = _v4;
+                        }
+                        {
+                            float4 _v4 = make_float4(_tmem_load_0[8 + 0], _tmem_load_0[8 + 1], _tmem_load_0[8 + 2], _tmem_load_0[8 + 3]);
+                            *reinterpret_cast<float4*>((C + ((int)e_ue * stride_e + row_n * ldc + col0 + n_chunk * EPI_CHUNK + 8)) + 0) = _v4;
+                        }
+                        {
+                            float4 _v4 = make_float4(_tmem_load_0[12 + 0], _tmem_load_0[12 + 1], _tmem_load_0[12 + 2], _tmem_load_0[12 + 3]);
+                            *reinterpret_cast<float4*>((C + ((int)e_ue * stride_e + row_n * ldc + col0 + n_chunk * EPI_CHUNK + 12)) + 0) = _v4;
+#else
                             {
                                 __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_0[0 + 0], _tmem_load_0[0 + 1]);
                                 unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -790,6 +819,7 @@ kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b(const __grid_constant__ CUtens
                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                     :: "l"((void*)(&((__nv_bfloat16*)(C + ((int)e_ue * stride_e + row_n * ldc + col0 + n_chunk * EPI_CHUNK)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
                             }
+#endif
                         }
                     }
                 }
@@ -860,6 +890,22 @@ kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b(const __grid_constant__ CUtens
                             if (whole_te == 1) {
                                 {
                                     {
+#if WGRAD_OUT == 32
+                                        float4 _v4 = make_float4(_tmem_load_1[0 + 0], _tmem_load_1[0 + 1], _tmem_load_1[0 + 2], _tmem_load_1[0 + 3]);
+                                        *reinterpret_cast<float4*>((C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK)) + 0) = _v4;
+                                    }
+                                    {
+                                        float4 _v4 = make_float4(_tmem_load_1[4 + 0], _tmem_load_1[4 + 1], _tmem_load_1[4 + 2], _tmem_load_1[4 + 3]);
+                                        *reinterpret_cast<float4*>((C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK + 4)) + 0) = _v4;
+                                    }
+                                    {
+                                        float4 _v4 = make_float4(_tmem_load_1[8 + 0], _tmem_load_1[8 + 1], _tmem_load_1[8 + 2], _tmem_load_1[8 + 3]);
+                                        *reinterpret_cast<float4*>((C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK + 8)) + 0) = _v4;
+                                    }
+                                    {
+                                        float4 _v4 = make_float4(_tmem_load_1[12 + 0], _tmem_load_1[12 + 1], _tmem_load_1[12 + 2], _tmem_load_1[12 + 3]);
+                                        *reinterpret_cast<float4*>((C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK + 12)) + 0) = _v4;
+#else
                                         {
                                             __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_1[0 + 0], _tmem_load_1[0 + 1]);
                                             unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -881,6 +927,7 @@ kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b(const __grid_constant__ CUtens
                                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                                 :: "l"((void*)(&((__nv_bfloat16*)(C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
                                         }
+#endif
                                     }
                                 }
                             }
