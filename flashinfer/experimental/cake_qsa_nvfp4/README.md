@@ -71,6 +71,24 @@ always on compute capability 8.x, the *split* form: the plain decode, then
 the separate merge (`(rows, ceil(num_qo_heads / heads_per_cta))` CTAs, one
 head per CTA above four splits, four at or below).
 
+**Program rule.** The plain decode has two programs. On compute capability
+8.x a split-form call is *wide* when both hold: its decode grid `rows *
+num_kv_heads * splits` exceeds one resident wave (two CTAs per SM times the
+SM count; 216 on an A100) and each of its CTAs walks a long tile stream,
+`ceil(tiles / splits) >= 16` (1024 selected tokens). A wide call launches
+`decode_whole_tile`, the previous release's `sm_80` program (whole-tile
+gather, no L2 cache hint, shift selector); every other call launches the
+K-first program `decode`, and compute capability 9.0 always does. On an
+A100 (108 SMs) at the owner's 24 x 2 heads and 2051 selections (33 tiles):
+rows 1-32 run at most one wave and take the K-first program; rows 64 (4
+splits, 512 CTAs, 9 tiles per CTA) take the K-first program; rows 128 (2
+splits, 512 CTAs, 17 tiles per CTA) and the 2048-row single-split call (33
+tiles per CTA) take the whole-tile program. Measured paired on two A100s
+(80 GB and 40 GB PCIe) under a memset flush, the K-first program is 1-7 %
+faster at rows 64 and the whole-tile program 6-8 % faster at rows 128, on
+both units. The rule reads the architecture, the SM count and the call's
+tile and split counts alone.
+
 **Workspace.** `partial_out` FP32 `[splits, rows, num_qo_heads, 256]`,
 `partial_lse` FP32 `[splits, rows, num_qo_heads]` and the fused form's
 counters uint32 `[rows * num_kv_heads]`. With `workspace_buffer` (a
@@ -101,6 +119,12 @@ and tensor metadata.
   and the normalised partial output of its group's heads in FP32 and, above
   one split, writes `partial_out` / `partial_lse`; with one split it writes
   the gated BF16 output.
+- `decode_whole_tile` (plain build, `sm_80` only): the previous release's
+  decode program with the same parameters, grid, launch bound and
+  shared-memory pool; it gathers each tile's K / V rows whole, issues its
+  copies without an L2 cache hint and selects the E2M1 nibbles by shift.
+  The program rule launches it on the wide grids: above one resident wave
+  with at least 16 tiles (1024 selected tokens) per CTA.
 - `decode_coop` (cooperative build): the same decode launched cooperatively;
   after its partials each CTA takes a slice of its (row, KV head) group's
   output, waits on the group's counter and merges every split's partial for
@@ -116,8 +140,8 @@ Every kernel is compiled with `--use_fast_math` (recorded on every
 
 | File | Role |
 | --- | --- |
-| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves), the rules as data (`select_records`, `launch_grid`), `run_module` |
-| `cake_backend.py` | the host plan: checks, split rule, form rule, workspace rule, launch sequence |
+| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves; a record lists the architectures it ships for), the rules as data (`select_records`, `launch_grid`), `run_module` |
+| `cake_backend.py` | the host plan: checks, split rule, form rule, program rule, workspace rule, launch sequence |
 | `build.json` | the manifest: one library per (program, architecture), sources with digests, nvcc flags |
 | `cake_build.py` | the loader: `aot/` prebuilt libraries first, else FlashInfer's JIT from `build.json` |
 | `csrc/` | per program: `<library>_kernel.cu` (device unit), `<library>_binding.cu` (tvm-ffi `run`); `cake_ffi_checks.h` |
@@ -129,6 +153,5 @@ The registry's derived leaves and everything under `csrc/`, `build.json` and
 ## Status
 
 Experimental. Validated against the default implementation's test suite with
-`backend="cake"` on compute capability 9.0 (`sm_90a`, H100). The `sm_80`
-libraries build from `build.json` but have not been run on a compute
-capability 8.x device.
+`backend="cake"` on compute capability 9.0 (`sm_90a`, H100) and 8.0 (`sm_80`,
+A100 80 GB and 40 GB PCIe).

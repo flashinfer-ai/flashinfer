@@ -340,7 +340,8 @@ def _check_contract(out, q, cache, selection, gate, splits):
 # The eight row counts of the owner's shape list at 24 x 2 heads, the 2048-row case (one
 # split, more CTAs than the device holds at once) and the group sizes 16 and 1.  On 132 SMs
 # the host rule gives 33, 33, 16, 8, 8, 4, 2, 1 splits for rows 1 .. 128; on 108 SMs 33, 33,
-# 27, 13, 6, 3, 4 and 2 (rows 64 and 128 then run the separate merge).
+# 27, 13, 6, 3, 4 and 2 (rows 64 and 128 then run the separate merge and, with the 2048-row
+# case, exceed one resident wave: on sm_80 they launch the whole-tile decode).
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize(
     "rows,num_qo_heads,num_kv_heads",
@@ -667,18 +668,38 @@ def test_capabilities_route_to_the_two_libraries():
 
 
 def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
-    """Three programs: the plain decode, the cooperative decode that merges its splits in
-    the launch, and the separate merge; 128 threads each, no cluster; the decode's
+    """Four programs: the plain decode, its whole-tile build delivered for sm_80 alone (the
+    split form on a multi-wave, long-stream grid), the cooperative decode that merges its
+    splits in the launch, and the separate merge; 128 threads each, no cluster; the decode's
     shared-memory pool as dynamic shared memory, the merge's static; the argument plan
     names every kernel parameter in order and then the grid."""
-    assert set(cake_jit.MODULES) == {"decode", "decode_coop", "merge"}
+    assert set(cake_jit.MODULES) == {
+        "decode",
+        "decode_whole_tile",
+        "decode_coop",
+        "merge",
+    }
+    assert cake_jit.SELECT_RULES == ("form", "form_grid")
+    whole_tile = cake_jit.MODULES["decode_whole_tile"]
+    assert whole_tile["stage"] == "decode" and whole_tile["variant"] == "whole_tile"
+    assert whole_tile["select_rule"] == {
+        "kind": "form_grid",
+        "value": "split",
+        "arch": "sm_80",
+        "grid": "multi_wave_long",
+    }
+    for key in ("grid_rule", "workspace_rule", "launch", "arg_plan", "logical"):
+        assert whole_tile[key] == cake_jit.MODULES["decode"][key], key
     for name, record in cake_jit.MODULES.items():
         assert re.fullmatch(r"cake_qsa_nvfp4_[0-9a-f]{20}", record["library"]), name
-        assert tuple(record["arches"]) == cake_jit.ARCHES, name
+        assert tuple(record["arches"]) == (
+            ("sm_80",) if name == "decode_whole_tile" else cake_jit.ARCHES
+        ), name
         assert record["ffi_entry"] == "run"
         assert record["kernel_symbol"] == "kernel_" + record["library"]
         assert isinstance(record["stage"], str) and record["stage"]
-        assert isinstance(record["select_rule"]["kind"], str)
+        assert record["select_rule"]["kind"] in cake_jit.SELECT_RULES
+        assert record["select_rule"]["value"] in cake_jit.FORMS
         assert isinstance(record["grid_rule"]["kind"], str)
         launch = record["launch"]
         assert tuple(launch["block"]) == (128, 1, 1), name
@@ -721,7 +742,9 @@ def test_manifest_holds_one_entry_per_program_and_architecture():
         for arch in record["arches"]
     }
     assert set(entries) == expected
-    assert len(entries) == len(cake_jit.MODULES) * len(cake_jit.ARCHES)
+    assert len(entries) == sum(
+        len(record["arches"]) for record in cake_jit.MODULES.values()
+    )
     for name, record in cake_jit.MODULES.items():
         for arch in record["arches"]:
             entry = entries[cake_jit.library_name(name, arch)]
