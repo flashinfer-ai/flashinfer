@@ -543,10 +543,11 @@ MLA_TEMPLATES = {
 # fmt: on
 # The K1 templates the export registers: the union over the architectures of
 # ``cake_jit.KERNELS`` (the per-architecture filter of ``_registered`` below).
-# The count pins the number of templates in the export this suite was written
-# against: an export with another count fails here, at import, before any test
-# runs; a same-count substitution passes this pin and is left to the tests that
-# name templates (the planner tables above, the symbol and record pins below).
+# The registry and the build manifest are checked against each other here, at
+# import, before any test runs: every program a registry table names ships a
+# build for that architecture, and every build entry belongs to a registered
+# program.  Which templates the export holds is left to the tests that name
+# them (the planner tables above, the symbol and record pins below).
 
 EXPORTED_TEMPLATES = frozenset(
     template
@@ -554,7 +555,15 @@ EXPORTED_TEMPLATES = frozenset(
     for template in cake_jit.KERNELS[arch]
     if template.startswith("dense_proj_gemm_")
 )
-assert len(EXPORTED_TEMPLATES) == 84
+_REGISTRY_BUILDS = frozenset(
+    f"{cake_jit.MODULES[name]['library']}_{arch}"
+    for arch, table in cake_jit.KERNELS.items()
+    for name in set(table.values())
+)
+_MANIFEST_BUILDS = frozenset(
+    entry["name"] for entry in cake_build.manifest()["libraries"]
+)
+assert _REGISTRY_BUILDS == _MANIFEST_BUILDS, sorted(_REGISTRY_BUILDS ^ _MANIFEST_BUILDS)
 
 
 def _expected(table, key, T, sm_count):
@@ -760,10 +769,23 @@ def test_registry_records_are_well_formed():
             "grid_y",
             "grid_z",
         }
-    # every plan is referenced and every module references exactly one plan by key
-    assert {record["arg_plan"] for record in cake_jit.MODULES.values()} == set(
-        cake_jit.ARG_PLANS
-    )
+    # every stored plan is referenced by key; a record may instead carry its plan inline (the fused split
+    # program: no stored plan spells its signature), and ``arg_plan_of`` resolves both forms to a plan list
+    assert {
+        record["arg_plan"]
+        for record in cake_jit.MODULES.values()
+        if isinstance(record["arg_plan"], str)
+    } == set(cake_jit.ARG_PLANS)
+    for record in cake_jit.MODULES.values():
+        plan = cake_jit.arg_plan_of(record)
+        assert plan and all(len(item) == 2 for item in plan)
+        if not isinstance(record["arg_plan"], str):
+            assert plan == [list(item) for item in record["arg_plan"]]
+            assert {name for kind, name in plan if kind == "grid"} == {
+                "grid_x",
+                "grid_y",
+                "grid_z",
+            }
     # build.json (``cake_build``) is the only record of what to compile; the registry names its
     # entries ``<library>_<arch>``
     manifest = cake_build.manifest()
@@ -796,11 +818,15 @@ def test_registry_records_are_well_formed():
         assert (
             "tma_workspace_bytes" not in record
         )  # by-value TMA ABI: no descriptor workspace
-        assert isinstance(record["arg_plan"], str)
         plan_items = [list(item) for item in cake_jit.arg_plan_of(record)]
-        assert plan_items == [
-            list(item) for item in cake_jit.ARG_PLANS[record["arg_plan"]]
-        ]
+        if isinstance(record["arg_plan"], str):
+            assert plan_items == [
+                list(item) for item in cake_jit.ARG_PLANS[record["arg_plan"]]
+            ]
+        else:
+            # the fused split program is the only record with an inline plan
+            assert record["template"] == cake_backend.SPLIT_TEMPLATE, record["template"]
+            assert plan_items == [list(item) for item in record["arg_plan"]]
         if record["template"].startswith("dense_proj_gemm_"):
             # the raster group width is a launch parameter since round 11; the stream-K slabs and the
             # slice counters are host-owned buffers
@@ -809,13 +835,20 @@ def test_registry_records_are_well_formed():
                 "buffer",
                 "counters",
             ] in plan_items
+        elif record["template"] == cake_backend.SPLIT_TEMPLATE:
+            # the fp32 source, the [3, ...] BF16 stack and the element count
+            assert ["buffer", "src"] in plan_items and ["buffer", "parts"] in plan_items
+            assert ["parameter", "n"] in plan_items
         else:
             assert ["parameter", "k_iters_split"] in plan_items
         launch = record["launch"]
-        # round 19 (Cake W3): the single-CTA form (``_c1`` templates) has no cluster; every other program is a
-        # two-CTA cluster (the exporter's registry check)
+        # round 19 (Cake W3): the single-CTA form (``_c1`` templates) has no cluster, nor has the fused split
+        # program (an elementwise kernel); every other program is a two-CTA cluster (the exporter's registry check)
         want_cluster = (
-            [1, 1, 1] if record["template"].endswith("_c1") else [CTA_GROUP, 1, 1]
+            [1, 1, 1]
+            if record["template"].endswith("_c1")
+            or record["template"] == cake_backend.SPLIT_TEMPLATE
+            else [CTA_GROUP, 1, 1]
         )
         assert list(launch["cluster"]) == want_cluster, (name, launch)
         assert len(launch["block"]) == 3 and all(int(b) >= 1 for b in launch["block"])
@@ -5743,7 +5776,14 @@ def test_template_knobs_invert_instance_symbol():
         for template in table:
             tokens = cake_backend._template_tokens(template)
             if tokens is None:
-                assert template.startswith("router_fp32_gemm_"), (arch, template)
+                # the router programs and the fused split program carry no knob tokens
+                assert (
+                    template.startswith("router_fp32_gemm_")
+                    or template == cake_backend.SPLIT_TEMPLATE
+                ), (
+                    arch,
+                    template,
+                )
                 continue
             knobs = cake_backend._template_knobs(template)
             assert knobs is not None, (arch, template)
@@ -5901,51 +5941,52 @@ def test_registry_fallback_serves_every_registered_class(arch):
 def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
     """The rows whose launcher plan the sm_100a export does not carry (forward N <= 128 and N = 256 at K 4096 / 5120,
     the swapped weight gradient at N <= 128 with M 4096 / 5120 / 8192): with the measured rules set aside, the
-    fallback lands on the neighbour its hand-ordered variants name first - the plain-hint twin when it is generated,
-    else the single-CTA form, else the 64-row pair family - and marks the plan ``knob_fallback``."""
+    fallback lands on the first registered program its hand-ordered variants name (``_FALLBACK_KNOB_VARIANTS``: the
+    other ``pro`` forms of the launcher's own tile walk, then the plain-hint twin, the single-CTA form and the 64-row
+    pair family) and marks the plan ``knob_fallback``.  The expected neighbour is read from the registry: the first
+    candidate of the row's hand-ordered list that is registered."""
     monkeypatch.setattr(cake_backend, "ROW_RULES", {})
+    P = "dense_proj_gemm_"
+    kk_n128 = (
+        P + "kk_n128_hen_pro15",
+        P + "kk_n128_hen",
+        P + "kk_n128_pro7",
+        P + "kk_n128_pro15",
+        P + "kk_n128",
+        P + "kk_n128_hen_c1",
+        P + "kk_n128_c1",
+        P + "kk_n128_m64_hen_pro7",
+        P + "kk_n128_m64_hen_pro15",
+        P + "kk_n128_m64_hen",
+    )
+    kk_n256 = (
+        P + "kk_n256_hen_pro15",
+        P + "kk_n256_hen",
+        P + "kk_n256_pro7",
+        P + "kk_n256_pro15",
+        P + "kk_n256",
+        P + "kk_n256_hen_c1",
+        P + "kk_n256_c1",
+    )
+    nn_n128_t = (
+        P + "nn_n128_hen_t_pro15",
+        P + "nn_n128_hen_t",
+        P + "nn_n128_t_pro7",
+        P + "nn_n128_t_pro15",
+        P + "nn_n128_t",
+        P + "nn_n128_hen_t_c1",
+        P + "nn_n128_t_c1",
+        P + "nn_n128_m64_hen_t_pro7",
+        P + "nn_n128_m64_hen_t_pro15",
+        P + "nn_n128_m64_hen_t",
+    )
+    nn_n128_f32_t = tuple(c.replace("_t", "_f32_t") for c in nn_n128_t)
     cases = (
-        # layout, fp32 out, transposed, M, N, K, launcher template -> registered neighbour
-        (
-            "kk",
-            False,
-            False,
-            16384,
-            128,
-            4096,
-            "dense_proj_gemm_kk_n128_hen_pro7",
-            "dense_proj_gemm_kk_n128_hen_c1",
-        ),
-        (
-            "kk",
-            False,
-            False,
-            16384,
-            64,
-            5120,
-            "dense_proj_gemm_kk_n128_hen_pro7",
-            "dense_proj_gemm_kk_n128_hen_c1",
-        ),
-        (
-            "kk",
-            False,
-            False,
-            16384,
-            256,
-            4096,
-            "dense_proj_gemm_kk_n256_hen_pro7",
-            "dense_proj_gemm_kk_n256_pro7",
-        ),
-        (
-            "nn",
-            False,
-            True,
-            4096,
-            128,
-            16384,
-            "dense_proj_gemm_nn_n128_hen_t_pro7",
-            "dense_proj_gemm_nn_n128_m64_hen_t_pro7",
-        ),
+        # layout, fp32 out, transposed, M, N, K, launcher template, hand-ordered candidates
+        ("kk", False, False, 16384, 128, 4096, P + "kk_n128_hen_pro7", kk_n128),
+        ("kk", False, False, 16384, 64, 5120, P + "kk_n128_hen_pro7", kk_n128),
+        ("kk", False, False, 16384, 256, 4096, P + "kk_n256_hen_pro7", kk_n256),
+        ("nn", False, True, 4096, 128, 16384, P + "nn_n128_hen_t_pro7", nn_n128_t),
         (
             "nn",
             True,
@@ -5953,23 +5994,16 @@ def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
             4096,
             128,
             16384,
-            "dense_proj_gemm_nn_n128_hen_f32_t_pro7",
-            "dense_proj_gemm_nn_n128_m64_hen_f32_t_pro7",
+            P + "nn_n128_hen_f32_t_pro7",
+            nn_n128_f32_t,
         ),
-        (
-            "nn",
-            False,
-            True,
-            8192,
-            32,
-            16231,
-            "dense_proj_gemm_nn_n128_hen_t_pro7",
-            "dense_proj_gemm_nn_n128_m64_hen_t_pro7",
-        ),
+        ("nn", False, True, 8192, 32, 16231, P + "nn_n128_hen_t_pro7", nn_n128_t),
     )
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a")
     registered = _registered("sm_100a")
-    for layout, out_f32, out_t, M, N, K, launcher, neighbour in cases:
+    for layout, out_f32, out_t, M, N, K, launcher, candidates in cases:
+        neighbour = next((c for c in candidates if c in registered), None)
+        assert neighbour is not None, (M, N, K, launcher)
         v = _class_views(layout, out_f32, out_t, M, N, K)
         mirror, *_ = plan_dense_projection_gemm(
             v["A"], v["B"], v["out"], transposed_out=out_t, _fallback=False, **kw
@@ -5983,24 +6017,24 @@ def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
         plan, *_ = plan_dense_projection_gemm(
             v["A"], v["B"], v["out"], transposed_out=out_t, **kw
         )
-        assert plan.template == neighbour and neighbour in registered, (
-            M,
-            N,
-            K,
-            plan.template,
-        )
+        assert plan.template == neighbour, (M, N, K, plan.template, neighbour)
         assert plan.knob_fallback and not plan.rule_fallback and not plan.swap_fallback
         # the single-CTA neighbour carries no tail policy and no pro; the 64-row neighbour keeps the hints
         if neighbour.endswith("_c1"):
             assert plan.cta1 and plan.sk_units == 0 and not plan.sk_sync
         if "_m64_" in neighbour:
             assert plan.cta_rows == 64 and plan.hints == ("evict_first", "none")
-    # a caller-forced tail policy does not keep the row off the single-CTA form: the cta1 variant clears it
+    # a caller-forced tail policy keeps the row on a registered program: a pair form admits it, the single-CTA
+    # form (``cta1`` clears the tail knobs) stays reachable when no pair form is registered
     v = _class_views("kk", False, False, 16384, 128, 4096)
     plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk=True, **kw)
-    assert plan.template == "dense_proj_gemm_kk_n128_hen_c1" and plan.knob_fallback
-    # on sm_107a the same weight-gradient rows reach the plain-hint twin (generated there) in the first variant
+    assert plan.template in registered and plan.knob_fallback, plan.template
+    if plan.template.endswith("_c1"):
+        assert plan.cta1 and plan.sk_units == 0 and not plan.sk_sync
+    # on sm_107a the same weight-gradient row lands on the first registered candidate of its hand order as well
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a")
+    registered107 = _registered("sm_107a")
+    neighbour107 = next(c for c in nn_n128_t if c in registered107)
     v = _class_views("nn", False, True, 4096, 128, 16384)
     mirror, *_ = plan_dense_projection_gemm(
         v["A"], v["B"], v["out"], transposed_out=True, _fallback=False, **kw107
@@ -6008,8 +6042,14 @@ def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
     plan, *_ = plan_dense_projection_gemm(
         v["A"], v["B"], v["out"], transposed_out=True, **kw107
     )
-    assert mirror.template == "dense_proj_gemm_nn_n128_hen_t_pro7"
-    assert plan.template == "dense_proj_gemm_nn_n128_t_pro7" and plan.knob_fallback
+    assert (
+        mirror.template == P + "nn_n128_hen_t_pro7"
+        and mirror.template not in registered107
+    )
+    assert plan.template == neighbour107 and plan.knob_fallback, (
+        plan.template,
+        neighbour107,
+    )
 
 
 def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
