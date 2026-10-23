@@ -2466,6 +2466,10 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
         torch.tensor([1.5, -0.75, 0.0, 0.5], device="cuda").repeat(e // 4)
     )
     ids = torch.randint(0, e // 2, (t, k), device="cuda", dtype=torch.int32)
+    if require_fma and t == 1:
+        # Even experts have a zero FC1 or FC2 input scale. Cover both zero- and
+        # nonzero-scale routes instead of relying on a one-token random draw.
+        ids[0] = torch.arange(k, device=ids.device, dtype=ids.dtype)
     scores = torch.rand(t, k, device="cuda")
     scores /= scores.sum(-1, keepdim=True)
     act = MoEActivationPack(xq, xsf, ids, scores)
