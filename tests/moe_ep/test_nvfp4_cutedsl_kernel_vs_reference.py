@@ -200,8 +200,15 @@ def test_blackwell_standard_nvfp4_padded_aot(monkeypatch, persistent):
     ):
         pytest.skip("requires SM100/SM103")
     from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from functools import partial
+    import cutlass.torch as cutlass_torch
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setattr(
+        cutlass_torch,
+        "from_dlpack",
+        partial(cutlass_torch.from_dlpack, enable_tvm_ffi=True),
+    )
     cfg = pkg.Sm100BlockScaledMoeConfig(
         num_total_experts=8,
         max_tokens_per_rank=1,
