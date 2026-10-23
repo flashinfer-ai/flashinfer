@@ -16,9 +16,7 @@
 
 #include "cake_moe_grouped_gemm_device.cuh"
 
-#define NUM_MAIN_STAGES 1
 #define THREADS 256
-#define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
 #define CLUSTER_M 256
@@ -47,13 +45,10 @@ CAKE_PROGRAM_KERNEL(float* __restrict__ partials, __nv_bfloat16* __restrict__ C,
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
 
 
     const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
 
-    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     const int threads_per_row = WGRAD_TILE / EPI_CHUNK;
