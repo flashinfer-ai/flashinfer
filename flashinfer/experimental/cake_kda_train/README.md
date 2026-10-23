@@ -437,15 +437,18 @@ families of a phase in one launch; off by default).
 
 The KCP kernels live beside the single-rank programs:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the seven KCP programs (the
+* `cake_kcp_jit.py` -- the `MODULES` registry of the nine KCP programs (the
   fragment walks of the forward and backward state recurrences in their
-  `offset` and `tape` forms, the TF32 hi/lo transfer walk and the affine
-  merge at `cols_per_cta` 8 and 16; selection by `always` or by `columns` on
-  the merge's `ncols`, grids by `kcp_segments_heads` or `kcp_chains`), the
-  logical vocabulary of the KCP arguments, and `run_program(name, args,
-  device_index=)`, the lowering of the host backend's walk and merge requests
-  to the registry's launches.  Its `TEST_MODULES` are test-only programs of
-  `build.test.json` (below).
+  `offset` and `tape` forms, the TF32 hi/lo transfer walk, the affine
+  merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
+  context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
+  `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
+  `kcp_chains`, `kcp_sm_bounded` or `kcp_pairs`), the logical vocabulary of
+  the KCP arguments, `run_program(name, args, device_index=)`, the lowering
+  of the host backend's walk and merge requests to the registry's launches,
+  and `run_module` for the two chunk stages.  Its `TEST_MODULES` are
+  test-only programs of `build.test.json` (below).
 * `cake_kcp_plan.py` -- the partition, the segment plan and the context's
   tables and collectives, with the byte queries.
 * `cake_kcp.py` -- the per-rank launch sequences, the saved set and workspace
@@ -458,7 +461,7 @@ The KCP kernels live beside the single-rank programs:
   entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
   also admits the test knobs (`precision_mode`, `transfer_walk`) of the
   package's own tests; without the file those tests skip.
-* `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the eleven KCP
+* `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the thirteen KCP
   programs, rendered like the single-rank ones (digests in `build.json` and
   `build.test.json`).
 
