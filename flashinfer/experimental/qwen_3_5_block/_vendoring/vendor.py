@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import collections
 import hashlib
 import json
 import os
@@ -64,7 +65,9 @@ GEN_HEADER = "# Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0
 # P2: datatypes.py binds the extension through importlib.import_module(package="cudnn") (not an import statement): bound to the
 #     shim instead.
 # P3 (REGEX_PATCHES below): comment / docstring lines that name an internal host or an internal file path, or use internal
-#     workflow vocabulary, are reworded (the sentence stays, the name goes).  No code changes.
+#     workflow vocabulary, are reworded (the sentence stays, the name goes).  No code changes.  Every pattern is anchored on
+#     text its replacement lacks (the exporter refuses a pattern that matches its own replacement), so the table is a no-op
+#     on an already exported tree.
 # P4 (RETIRED at the d8b0a7ed5 re-vendor; the id is not reused): the cache-write launcher's one-device check (`run_cache_write`
 #     pins every operand to src_a's CUDA device) was carried ahead of its upstream landing by the aba744cd6 / c9f3118a1 re-vendors;
 #     the pinned commit carries the same hunk, so `gated_attention_block/kernels/cache_write.py` is byte-faithful again.
@@ -228,7 +231,7 @@ REGEX_PATCHES = {
     "frost/tile_dsl/barrier.py": [
         (
             "P3",
-            r"4x1 chain 30000/30000 \([^:\n]+: heartbeat dump",
+            r"4x1 chain 30000/30000 \([^:\n]+\.md: heartbeat dump",
             "4x1 chain 30000/30000 (an internal hang record: heartbeat dump",
         ),
     ],
@@ -249,12 +252,12 @@ REGEX_PATCHES = {
     "sdpa/fwd/config_sm107.py": [
         (
             "P3",
-            r"# the contract \([^)\n]+\); they previously called the",
+            r"# the contract \([^)\n]+\.py\); they previously called the",
             "# the contract (an internal porting script); they previously called the",
         ),
         (
             "P3",
-            r"# the shared decode reads 4B\+4\.  Confirmed on [^:\n]+: 43 passed / 0",
+            r"# the shared decode reads 4B\+4\.  Confirmed on [\w-]*\d[\w-]*: 43 passed / 0",
             "# the shared decode reads 4B+4.  Confirmed on a Rubin dev node: 43 passed / 0",
         ),
     ],
@@ -703,8 +706,10 @@ def gen_vendor_md(
     target: Path,
     native: dict,
     binder_module: str = "",
+    licenses: dict | None = None,
 ) -> str:
-    lic = closure["licenses"]
+    # the manifest's per-file licences (the closure files AND the test-tree file), not closure.json's closure-only tally
+    lic = licenses if licenses is not None else closure["licenses"]
     lines = [
         "# Vendored cuDNN Frontend subset: the gated attention block's serving forms\n",
         f"Origin: {ORIGIN} (`python/cudnn`), commit `{commit}` (cuDNN Frontend {fe_version}).  Import path: `{package}`.\n",
@@ -714,7 +719,8 @@ def gen_vendor_md(
         f"`__init__.py`, `_compiled_module.py` (the shim) and these two notes.  Imports rewritten: {counts['rewritten_imports']} statements in {counts['files_with_rewrites']} files "
         f"(and {counts['string_sites']} importlib string references in `engines/manifest.py` / `gated_attention_block/qsa_topk.py`).\n",
         "## License\n",
-        f"Every vendored file keeps its original SPDX header verbatim: {lic.get('MIT', 0)} files `SPDX-License-Identifier: MIT`, {lic.get('Apache-2.0', 0)} files "
+        f"Every vendored file keeps its original SPDX header verbatim: {lic.get('MIT', 0)} files `SPDX-License-Identifier: MIT` (one of them the file from the FE test tree, "
+        f"`sdpa/fwd/_binding_reference.py`), {lic.get('Apache-2.0', 0)} files "
         f"`Apache-2.0`, {lic.get('Apache-2.0 AND MIT', 0)} file `Apache-2.0 AND MIT` (all `Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES`).  "
         "FlashInfer's root NOTICE must name this origin and commit; the MIT text ships as `licenses/LICENSE.cudnn-frontend-MIT.txt` next to the other third-party texts.  "
         "The generated files are FlashInfer-side (Apache-2.0).\n",
@@ -835,6 +841,13 @@ def main():
         args.package.rsplit(".", 1)[0] + "._sdpa_binder"
     )
 
+    for rel_, rows_ in REGEX_PATCHES.items():
+        for pid_, pattern_, new_ in rows_:
+            if re.search(pattern_, new_):
+                raise SystemExit(
+                    f"patch {pid_} on {rel_}: the pattern {pattern_!r} also matches its own replacement -- anchor it on text the replacement lacks "
+                    "(the table must be a no-op on an exported tree)"
+                )
     if target.exists():
         shutil.rmtree(target)
     target.mkdir(parents=True)
@@ -971,6 +984,7 @@ def main():
             target,
             native,
             binder_module,
+            dict(collections.Counter(f["license"] for f in manifest["files"])),
         )
     )
     manifest["counts"] = counts
