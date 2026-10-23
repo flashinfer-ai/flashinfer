@@ -8,7 +8,7 @@ registering a global `sources` package or loading Rubin kernels.
 ## Source
 
 - Provider base: `228a02d`.
-- Source revision: `f9a52924e16ea4b9107086d1445b0d1b292aae3a`.
+- Source revision: `02b7b7ebbe0a518aac45a3f24f485a9f59404d33`.
 - Exporter revision: `f2d13b3cb8277398ff281fc80ae5f725cf1b2f10`.
 - Exporter SHA-256: `0e578237d416970d099750606a2489c0bfe2c0fd39bc86fa7c83bc7343d87814`.
 - Entry points: `BlackwellInferenceMegaMoE` and `BlackwellInferenceGenphaseMegaMoE`.

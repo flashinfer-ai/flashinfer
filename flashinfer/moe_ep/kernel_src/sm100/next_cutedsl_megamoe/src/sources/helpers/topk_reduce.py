@@ -749,7 +749,8 @@ class TopkReduce:
                     if cutlass.const_expr(topk_indices is not None):
                         expert = topk_indices[token_idx, Int32(k)]
                         valid_route = (expert >= 0) & (expert < self.num_experts)
-                        term.fill(0)
+                        # Packed FP4 has no scalar DSL conversion; clear its bits.
+                        cute.recast_tensor(term, Int32).fill(0)
                         if valid_route:
                             cute.copy(
                                 load_atom, mark_alignment(codes[k, None], hidden_per_thread * act_dtype.width // 8), term
