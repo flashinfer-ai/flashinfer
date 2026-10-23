@@ -651,7 +651,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
         "logical": {
             "C": "C",
+            "ct_vec": "ct_vec",
             "dw": "dw",
+            "main_ctas": "main_ctas",
+            "n_ch_tiles": "n_ch_tiles",
             "partial": "partial",
             "rows": "rows",
         },
