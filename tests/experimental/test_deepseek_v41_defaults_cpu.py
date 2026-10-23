@@ -891,12 +891,12 @@ def test_source_hashes_stay_native_only():
     bindings = source_bindings()
     assert set(bindings) == {"PRIMS_TS_SOURCES"}
     sources = bindings["PRIMS_TS_SOURCES"]
-    assert "experimental/deepseek_v41/_sparse_views.py" in sources
-    assert "experimental/deepseek_v41/_metadata.py" not in sources
-    assert "experimental/deepseek_v41/_workspace.py" in sources
-    assert "experimental/deepseek_v41/prims_ts.py" in sources
-    assert "experimental/deepseek_v41/prims_ts_fp8.py" in sources
-    assert "experimental/deepseek_v41/prims_ts_resources.py" in sources
+    assert "experimental/deepseek_v41/prims_ts/_sparse_views.py" in sources
+    assert "experimental/deepseek_v41/prims_ts/_metadata.py" not in sources
+    assert "experimental/deepseek_v41/prims_ts/_workspace.py" in sources
+    assert "experimental/deepseek_v41/prims_ts/__init__.py" in sources
+    assert "experimental/deepseek_v41/prims_ts/kernel.py" in sources
+    assert "experimental/deepseek_v41/prims_ts/resources.py" in sources
     assert "cute_dsl/fp4_common.py" in sources
     assert "attention/prims_ts/kernels/mla_decode/helpers/ops.py" in sources
     assert "attention/prims_ts/kernels/mla_decode/helpers/sparse_indices.py" in sources

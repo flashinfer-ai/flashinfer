@@ -21,15 +21,17 @@ from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import SignalingThreads
 from cutlass.experimental.task_scheduling.resources import PipelineConfig, StageInfo
 
-from ...attention.prims_ts.kernels.mla_decode.helpers.ops import pack_float4_to_fp8_e4m3
-from ...attention.prims_ts.kernels.mla_decode.helpers.stage import MlaStage
-from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+from ....attention.prims_ts.kernels.mla_decode.helpers.ops import (
+    pack_float4_to_fp8_e4m3,
+)
+from ....attention.prims_ts.kernels.mla_decode.helpers.stage import MlaStage
+from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
     validate_split_softmax_scale_config,
 )
-from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
+from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
     SmemKvResource,
 )
-from . import hca_v41_primitives as hw
+from .. import hca_v41_primitives as hw
 from ._sparse_views import bind_combined_sparse_views
 
 

@@ -52,7 +52,9 @@ class DecodeBuffers:
 
     @property
     def views(self):
-        from flashinfer.experimental.deepseek_v41._workspace import workspace_views
+        from flashinfer.experimental.deepseek_v41.prims_ts._workspace import (
+            workspace_views,
+        )
 
         return workspace_views(
             self.workspace,
@@ -389,7 +391,7 @@ def test_prepare_buffers_before_capture(monkeypatch):
     prims_ts_gate()
     args = make_fp8_case(1, 64)
     buffers = DecodeBuffers.allocate(args[0], 64)
-    from flashinfer.experimental.deepseek_v41 import _workspace
+    from flashinfer.experimental.deepseek_v41.prims_ts import _workspace
 
     _workspace.device_sm_count.cache_clear()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -711,8 +713,8 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
     import cutlass.cute as cute
     import cutlass.utils as utils
     from cutlass.cute.runtime import from_dlpack
-    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_attention
-    from flashinfer.experimental.deepseek_v41.prims_ts_resources import (
+    from flashinfer.experimental.deepseek_v41.prims_ts.kernel import _make_fp8_attention
+    from flashinfer.experimental.deepseek_v41.prims_ts.resources import (
         MixedFp8SmemKvResource,
     )
 
@@ -1377,12 +1379,13 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     prims_ts_gate()
     from flashinfer.experimental.deepseek_v41 import decode as frost
     from flashinfer.experimental.deepseek_v41 import prims_ts
-    from flashinfer.experimental.deepseek_v41.prims_ts_resources import (
+    from flashinfer.experimental.deepseek_v41.prims_ts import kernel as adapter_kernel
+    from flashinfer.experimental.deepseek_v41.prims_ts.resources import (
         MixedFp8KvProducer,
     )
 
     recorded, launches = [], []
-    factory, compile_kernel = prims_ts._make_fp8_attention, prims_ts._compile
+    factory, compile_kernel = adapter_kernel._make_fp8_attention, prims_ts._compile
 
     def record(*args):
         attention = factory(*args)
@@ -1401,7 +1404,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("ordinary FP8 must not compile Frost")
 
-    monkeypatch.setattr(prims_ts, "_make_fp8_attention", record)
+    monkeypatch.setattr(adapter_kernel, "_make_fp8_attention", record)
     monkeypatch.setattr(prims_ts, "_compile", record_compile)
     monkeypatch.setattr(frost, "_compile", forbidden)
     compile_kernel.cache_clear()
