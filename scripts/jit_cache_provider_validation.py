@@ -184,10 +184,52 @@ def validate_provider(
         module_paths[parts[0]] = path
 
     require(module_paths, "Provider wheel contains no shared libraries")
+    # CuTe-DSL export_to_c objects embed device images as ordinary ELF data;
+    # cuobjdump cannot enumerate those images. Check the target/compiler/source
+    # metadata and exact object inventory separately from nvcc shared libraries.
+    cute_modules: dict[str, set[str]] = {}
+    for path in wheel.contents:
+        if not path.startswith(so_prefix) or not path.endswith(".o"):
+            continue
+        parts = path.removeprefix(so_prefix).split("/")
+        require(
+            len(parts) == 2
+            and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*_" + re.escape(provider) + r"_cute_dsl",
+                parts[0],
+            ),
+            f"Unexpected provider CuTe-DSL object path: {path}",
+        )
+        cute_modules.setdefault(parts[0], set()).add(parts[1].removesuffix(".o"))
+    declared_cute_modules = manifest.get("cute_dsl_kernels", {})
+    require(
+        {name: sorted(kernels) for name, kernels in cute_modules.items()}
+        == declared_cute_modules,
+        "Provider manifest CuTe-DSL kernels do not match packaged objects",
+    )
+    with zipfile.ZipFile(wheel.path) as archive:
+        for name in cute_modules:
+            meta_path = f"{so_prefix}{name}/meta.json"
+            require(
+                meta_path in wheel.contents, f"Missing CuTe-DSL metadata: {meta_path}"
+            )
+            meta = json.loads(archive.read(meta_path))
+            require(
+                meta.get("arch") == provider, "CuTe-DSL target does not match provider"
+            )
+            require(
+                bool(meta.get("cute_dsl_version"))
+                and meta["cute_dsl_version"] != "unknown",
+                "Missing CuTe-DSL compiler fingerprint",
+            )
+            require(
+                bool(re.fullmatch(r"[0-9a-f]{64}", meta.get("source_sha256", ""))),
+                "Invalid CuTe-DSL source fingerprint",
+            )
     manifest_modules = set(manifest.get("modules", []))
     require(
-        manifest_modules == set(module_paths),
-        "Provider manifest modules do not match packaged shared libraries",
+        manifest_modules == set(module_paths) | set(cute_modules),
+        "Provider manifest modules do not match packaged shared libraries and CuTe-DSL modules",
     )
 
     entry_points_path = wheel.metadata_path.replace("METADATA", "entry_points.txt")

@@ -240,9 +240,18 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
             lambda _settings: ["setuptools>=77"],
         )
 
-        expected = ["setuptools>=77", "nvidia-cutlass-dsl[cu13]>=4.6.2a0"]
+        expected = [
+            "setuptools>=77",
+            "nvidia-cutlass-dsl[cu13]>=4.8",
+        ]
         assert module.get_requires_for_build_wheel(None) == expected
         assert module.get_requires_for_build_editable(None) == expected
+
+        for provider_tag in ("sm100a", "sm103a"):
+            monkeypatch.setattr(config, "provider_tag", provider_tag)
+            expected = ["setuptools>=77", "nvidia-cutlass-dsl[cu13]>=4.6.2a0"]
+            assert module.get_requires_for_build_wheel(None) == expected
+            assert module.get_requires_for_build_editable(None) == expected
 
         monkeypatch.delenv(module.PROVIDER_PLATFORM_TAG_ENV, raising=False)
         assert module._provider_platform_tag("linux_x86_64") == "linux_x86_64"
