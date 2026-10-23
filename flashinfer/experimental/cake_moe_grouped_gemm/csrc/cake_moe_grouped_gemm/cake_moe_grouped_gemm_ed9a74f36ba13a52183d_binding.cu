@@ -24,144 +24,37 @@
 #include "cake_ffi_checks.h"
 
 #include <cstdint>
+#ifndef WGRAD_OUT
+#define WGRAD_OUT 16
+#endif
+#if WGRAD_OUT == 32
+#define CAKE_OUT_T float
+#define CAKE_OUT_DLDTYPE kDLFloat, 32, 1
+#else
+#define CAKE_OUT_T __nv_bfloat16
+#define CAKE_OUT_DLDTYPE kDLBfloat, 16, 1
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d
+#endif
+#ifndef CAKE_PROGRAM_SHIM
+#define CAKE_PROGRAM_SHIM cake_host_shim_5eab7c0b5564a84d
+#endif
+#define CAKE_STR_(x) #x
+#define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ partials, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e);
+extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, CAKE_OUT_T* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ partials, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e);
 
 
-namespace cake_host_shim_5eab7c0b5564a84d {
+namespace CAKE_PROGRAM_SHIM {
 
 using tvm::ffi::TensorView;
 
-// Opt the linked kernel into its dynamic shared memory once for every device
-// that accepts it. Function-local static initialization already serializes
-// the first call; no lock or per-device cache is needed.
-inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
-  cudaKernel_t kernel = nullptr;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetKernel(&kernel, symbol));
-  int device_count = 0;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
-  int configured = 0;
-  for (int device = 0; device < device_count; ++device) {
-    if (cudaKernelSetAttributeForDevice(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device) ==
-        cudaSuccess) {
-      ++configured;
-    } else {
-      (void)cudaGetLastError();
-    }
-  }
-  TVM_FFI_CHECK(configured > 0, RuntimeError)
-      << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
-  return true;
-}
+#include "cake_moe_grouped_gemm_binding_smem.h"
 
-// 3D TMA descriptor for buffer 'A' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_A(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'A' must have at least 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'A' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError)
-      << "TMA source 'A' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  check_dense_leading_dims(t, 1, "A");
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'A' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'A' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
-      << "TMA descriptor for 'A' resolved a non-positive global dim";
-  uint32_t box_dim[3] = {64u, 64u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2], ValueError)
-      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ") exceeds resolved global dims for 'A'";
-  int64_t carrier_stride_0 = s2;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'A' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'A' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'A' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'A' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'A' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'A' resolved global stride 2 to a non-whole-byte offset";
-  uint64_t global_strides[2] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-  };
-  uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (3D, 'A') failed: CUresult=" << (int)r;
-  return tm;
-}
+#include "cake_moe_grouped_gemm_binding_tma_a_box64x64.h"
 
-// 3D TMA descriptor for buffer 'B' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_B(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'B' must have at least 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'B' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError)
-      << "TMA source 'B' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  check_dense_leading_dims(t, 1, "B");
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'B' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'B' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
-      << "TMA descriptor for 'B' resolved a non-positive global dim";
-  uint32_t box_dim[3] = {64u, 64u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2], ValueError)
-      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ") exceeds resolved global dims for 'B'";
-  int64_t carrier_stride_0 = s2;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'B' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'B' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'B' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'B' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'B' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'B' resolved global stride 2 to a non-whole-byte offset";
-  uint64_t global_strides[2] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-  };
-  uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (3D, 'B') failed: CUresult=" << (int)r;
-  return tm;
-}
+#include "cake_moe_grouped_gemm_binding_tma_b_box64x64.h"
 
 void Run(TensorView arg_A, TensorView arg_B, TensorView arg_C, TensorView arg_offs, TensorView arg_tensormap_workspace, TensorView arg_partials, int64_t arg_tail_splits, int64_t arg_raster_rows, int64_t arg_num_groups, int64_t arg_sum_m, int64_t arg_N, int64_t arg_K, int64_t arg_ldc, int64_t arg_stride_e, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_A.device();
@@ -176,7 +69,7 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_C, TensorView arg_of
   check_cuda_tensor(arg_B, "B");
   check_dtype(arg_B, DLDataType{kDLBfloat, 16, 1}, "B");
   check_cuda_tensor(arg_C, "C");
-  check_dtype(arg_C, DLDataType{kDLBfloat, 16, 1}, "C");
+  check_dtype(arg_C, DLDataType{CAKE_OUT_DLDTYPE}, "C");
   check_contiguous(arg_C, "C");
   check_cuda_tensor(arg_offs, "offs");
   check_dtype(arg_offs, DLDataType{kDLInt, 32, 1}, "offs");
@@ -226,7 +119,7 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_C, TensorView arg_of
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
   CUtensorMap p_A = EncodeTma_A(arg_A);
   CUtensorMap p_B = EncodeTma_B(arg_B);
-  __nv_bfloat16* p_C = static_cast<__nv_bfloat16*>(arg_C.data_ptr());
+  CAKE_OUT_T* p_C = static_cast<CAKE_OUT_T*>(arg_C.data_ptr());
   int* p_offs = static_cast<int*>(arg_offs.data_ptr());
   uint8_t* p_tensormap_workspace = static_cast<uint8_t*>(arg_tensormap_workspace.data_ptr());
   float* p_partials = static_cast<float*>(arg_partials.data_ptr());
@@ -241,7 +134,7 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_C, TensorView arg_of
   void* kargs[] = {&p_A, &p_B, &p_C, &p_offs, &p_tensormap_workspace, &p_partials, &v_tail_splits, &v_raster_rows, &v_num_groups, &v_sum_m, &v_N, &v_K, &v_ldc, &v_stride_e};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d), 230400);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 230400);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(192u, 1u, 1u);
@@ -265,13 +158,13 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_C, TensorView arg_of
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d), kargs);
+      &config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d failed: "
+      << "cudaLaunchKernelExC for " CAKE_STR(CAKE_PROGRAM_KERNEL) " failed: "
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_5eab7c0b5564a84d
+}  // namespace CAKE_PROGRAM_SHIM
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_5eab7c0b5564a84d::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);

@@ -24,11 +24,29 @@
 #include "cake_ffi_checks.h"
 
 #include <cstdint>
+#ifndef WGRAD_OUT
+#define WGRAD_OUT 16
+#endif
+#if WGRAD_OUT == 32
+#define CAKE_OUT_T float
+#define CAKE_OUT_DLDTYPE kDLFloat, 32, 1
+#else
+#define CAKE_OUT_T __nv_bfloat16
+#define CAKE_OUT_DLDTYPE kDLBfloat, 16, 1
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c
+#endif
+#ifndef CAKE_PROGRAM_SHIM
+#define CAKE_PROGRAM_SHIM cake_host_shim_fb00ee5439be14fb
+#endif
+#define CAKE_STR_(x) #x
+#define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c(float* __restrict__ partials, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, int num_groups, int N, int K, int ldc, int stride_e, int num_clusters_1, int tail_splits, int raster_rows);
+extern "C" __global__ void CAKE_PROGRAM_KERNEL(float* __restrict__ partials, CAKE_OUT_T* __restrict__ C, int* __restrict__ offs, int num_groups, int N, int K, int ldc, int stride_e, int num_clusters_1, int tail_splits, int raster_rows);
 
 
-namespace cake_host_shim_fb00ee5439be14fb {
+namespace CAKE_PROGRAM_SHIM {
 
 using tvm::ffi::TensorView;
 
@@ -39,7 +57,7 @@ void Run(TensorView arg_partials, TensorView arg_C, TensorView arg_offs, int64_t
   check_dtype(arg_partials, DLDataType{kDLFloat, 32, 1}, "partials");
   check_contiguous(arg_partials, "partials");
   check_cuda_tensor(arg_C, "C");
-  check_dtype(arg_C, DLDataType{kDLBfloat, 16, 1}, "C");
+  check_dtype(arg_C, DLDataType{CAKE_OUT_DLDTYPE}, "C");
   check_contiguous(arg_C, "C");
   check_cuda_tensor(arg_offs, "offs");
   check_dtype(arg_offs, DLDataType{kDLInt, 32, 1}, "offs");
@@ -76,7 +94,7 @@ void Run(TensorView arg_partials, TensorView arg_C, TensorView arg_offs, int64_t
 
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
   float* p_partials = static_cast<float*>(arg_partials.data_ptr());
-  __nv_bfloat16* p_C = static_cast<__nv_bfloat16*>(arg_C.data_ptr());
+  CAKE_OUT_T* p_C = static_cast<CAKE_OUT_T*>(arg_C.data_ptr());
   int* p_offs = static_cast<int*>(arg_offs.data_ptr());
   int32_t v_num_groups = (int32_t)arg_num_groups;
   int32_t v_N = (int32_t)arg_N;
@@ -98,13 +116,13 @@ void Run(TensorView arg_partials, TensorView arg_C, TensorView arg_offs, int64_t
   config.dynamicSmemBytes = 0u;
   config.stream = stream;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c), kargs);
+      &config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c failed: "
+      << "cudaLaunchKernelExC for " CAKE_STR(CAKE_PROGRAM_KERNEL) " failed: "
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_fb00ee5439be14fb
+}  // namespace CAKE_PROGRAM_SHIM
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_fb00ee5439be14fb::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);

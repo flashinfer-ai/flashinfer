@@ -121,18 +121,12 @@ def _assert_bf16_close(out, ref):
 # ---------------------------------------------------------------------------
 
 
-def _constants():
-    if not HOST_PLAN_CONSTANTS:
-        pytest.skip("no host plan constants registered in this checkout")
-    return HOST_PLAN_CONSTANTS
-
-
 @pytest.mark.parametrize("sm_count", [148, 160, 212])
 @pytest.mark.parametrize(
     "sizes", [RAGGED_E4, RAGGED_E6, LONG_E3, [131072] * 1, [4096] * 32]
 )
 def test_plan_invariants(sm_count, sizes):
-    c = _constants()
+    c = HOST_PLAN_CONSTANTS
     sum_m, e = sum(sizes), len(sizes)
     cta_group = int(c["cta_group"])
     for op, n, k in (("fwd", 4096, 6144), ("dgrad", 4096, 6144)):
