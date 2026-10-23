@@ -780,8 +780,51 @@ class TmemSResource(MlaResource):
                         local_row_idx,
                         self.cu_seqlens_q,
                     )
+                fp8_token_sparse = cutlass.const_expr(
+                    cfg.is_dynamic_token_sparse
+                    and not cfg.is_dynamic_token_sparse_nvfp4
+                    and not needs_row_causal_mask
+                )
+                if cutlass.const_expr(fp8_token_sparse):
+                    # E4M3 token-sparse: this thread's 64 columns are tokens
+                    # [local_col_base, + 64) of the tile, validity words
+                    # (local_col_base >> 5) + {0, 1}.  One test covers the
+                    # common all-valid span; only a span that crosses the
+                    # token length or holds a -1 slot masks per column (the
+                    # per-column selects cost ~3x the softmax ALU work).
+                    from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
+
+                    fp8_mask_base = (
+                        Int32(self.page_offsets_kv.sparse_mask_word_base)
+                        + (tile_idx % Int32(SPARSE_MASK_SLOTS))
+                        * Int32(SPARSE_MASK_WORDS)
+                        + (local_col_base >> Int32(5))
+                    )
+                    fp8_word_a = Int32(self._sparse_mask_words[fp8_mask_base])
+                    fp8_word_b = Int32(
+                        self._sparse_mask_words[fp8_mask_base + Int32(1)]
+                    )
+                    span_end = (
+                        tile_offset_k
+                        + local_col_base
+                        + Int32(num_s_regs_per_thread(cfg))
+                    )
+                    if ((fp8_word_a & fp8_word_b) != Int32(-1)) | (
+                        span_end > row_seq_len_kv
+                    ):
+                        for reg_idx in cutlass.range_constexpr(
+                            num_s_regs_per_thread(cfg)
+                        ):
+                            token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
+                            mask_word = fp8_word_b if reg_idx >= 32 else fp8_word_a
+                            if (token_idx >= row_seq_len_kv) | (
+                                ((mask_word >> Int32(reg_idx & 31)) & Int32(1))
+                                == Int32(0)
+                            ):
+                                s_vals[reg_idx] = neg_max_f32()
                 if cutlass.const_expr(
-                    not (
+                    not fp8_token_sparse
+                    and not (
                         cfg.is_dynamic_token_sparse_nvfp4 and not needs_row_causal_mask
                     )
                 ):
@@ -796,7 +839,9 @@ class TmemSResource(MlaResource):
                             sparse=cfg.native_sparse_pages,
                         ):
                             s_vals[reg_idx] = neg_max_f32()
-                if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                if cutlass.const_expr(
+                    cfg.is_dynamic_token_sparse and not fp8_token_sparse
+                ):
                     from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
 
                     half_cols = cfg.tile_size_kv // 2
