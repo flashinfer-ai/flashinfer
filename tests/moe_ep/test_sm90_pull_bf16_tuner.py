@@ -274,6 +274,8 @@ class TestKnobCache:
         assert pkg.bf16_lookup_knobs(**self._KEY, max_tokens=8) is None
 
     def test_sm100_entries_never_cross_match(self, tmp_path, monkeypatch):
+        from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
         pkg = _pkg()
         path = tmp_path / "cache.json"
         monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
@@ -282,7 +284,7 @@ class TestKnobCache:
         path.write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": KNOB_CACHE_VERSION,
                     "entries": [
                         dict(
                             device="test-gpu",

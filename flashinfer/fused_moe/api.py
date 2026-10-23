@@ -2956,11 +2956,16 @@ class FrostLowLatencyConfig:
     Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
     Prepare other backend views as well to permit fallback for larger inputs.
 
-    MXFP4/MXFP8 weights with MXFP8 inputs support SwiGLU through TC or FMA.
+    MXFP4/MXFP8 weights with MXFP8 inputs support the same ten typed
+    activations as BF16, through TC or FMA. Non-gated weights omit gate rows.
     BF16 weights/inputs use FMA with gated or non-gated activations and top-k
     at most 32. BF16 rounds the activation to BF16 and combines BF16 expert
     outputs with ordered, separate FP32 multiplication and addition. This is
     distinct from the MX intermediate quantization/combine contract.
+
+    NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
+    and top-k at most 32. It retains BF16 activation/expert rounding and
+    separate FP32 multiply/add combine; the 4over6 recipe is not supported.
     """
 
     max_num_tokens: int = 2
@@ -2974,11 +2979,17 @@ class FrostLowLatencyConfig:
         return arch in (100, 103, 107)
 
     @staticmethod
-    def prepare_weights(w1, w1_scale, w2, w2_scale):
-        """Pack canonical prequantized MX weights without requantizing them."""
+    def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Pack canonical MX weights; pass activation for non-gated weights."""
         from .backends.frost_low_latency.prepare import prepare_weights
 
-        return prepare_weights(w1, w1_scale, w2, w2_scale)
+        return prepare_weights(
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            activation=SwiGLU() if activation is None else activation,
+        )
 
     @staticmethod
     def prepare_bf16_weights(w1, w2, *, activation=None):
@@ -2987,6 +2998,33 @@ class FrostLowLatencyConfig:
 
         return prepare_bf16_weights(
             w1, w2, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_nvfp4_weights(w1, w2, *, activation=None):
+        """Quantize BF16 source weights to the canonical CUTLASS NVFP4 view.
+
+        Requires H divisible by 512 and I by 128. Global scales are one;
+        activation inputs use the same linear scale pack as TRT-LLM.
+        """
+        from .backends.frost_low_latency.fma.activation_config import lower_activation
+
+        activation = SwiGLU() if activation is None else activation
+        lower_activation(activation)
+        if w2.ndim != 3:
+            raise ValueError("NVFP4 weights must be 3-D")
+        e, h, i = w2.shape
+        if e < 1 or h < 512 or h % 512 or i < 128 or i % 128:
+            raise ValueError(
+                "Frost NVFP4 requires positive E, H divisible by 512 and I by 128"
+            )
+        return CutlassNvfp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=e,
+            hidden_size=h,
+            intermediate_size=i,
+            activation=activation,
         )
 
 

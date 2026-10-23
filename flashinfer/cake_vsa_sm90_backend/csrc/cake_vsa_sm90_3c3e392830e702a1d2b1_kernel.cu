@@ -370,7 +370,8 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         if (elect_sync()) {
                             if (ti > 0) {
                                 if (valid_s_1 != 0) {
-                                    mbarrier_wait(q_empty_addr, ti - 1 & 1);
+                                    int _parity_q_empty = (int)((unsigned int)(ti - 1) % 2);
+                                    mbarrier_wait(q_empty_addr, _parity_q_empty);
                                     mbarrier_arrive_expect_tx(q_ready_addr, 16384);
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"

@@ -7562,6 +7562,7 @@ def trtllm_fused_moe_workspace_size(
     gemm2_weights: Optional[torch.Tensor] = None,
     gemm2_weights_scale: Optional[torch.Tensor] = None,
     device: Optional[torch.device] = None,
+    tactic: Optional[Tuple[int, int]] = None,
 ) -> int:
     """Return the ``workspace_buffer`` size in bytes for the trtllm-gen fused-MoE APIs.
 
@@ -7572,16 +7573,22 @@ def trtllm_fused_moe_workspace_size(
     intermediate GEMM outputs and batched-GEMM workspaces from that buffer
     instead of allocating and freeing them on every call.
 
-    The size is measured by the launcher's own allocation code, over every
-    tile size at ``max_num_tokens``, so one buffer fits whichever tactic the
-    autotuner or the default heuristic selects at that token count. The footprint grows with the token count, so a buffer sized
-    for ``max_num_tokens`` also serves smaller batches.
+    With ``tactic=None``, the size is measured by the launcher's own allocation
+    code, over every tile size at ``max_num_tokens``, so one buffer fits whichever
+    tactic the autotuner or the default heuristic selects at that token count.
+    The footprint grows with the token count, so a buffer sized for
+    ``max_num_tokens`` also serves smaller batches.
 
-    Autotuning profiles every tactic from the same buffer, so tuning needs no
-    scratch beyond it. Size the buffer for ``max(max_num_tokens,
+    With default sizing, autotuning profiles every tactic from the same buffer,
+    so tuning needs no scratch beyond it. Size the buffer for ``max(max_num_tokens,
     tune_max_num_tokens)``: a launch whose scratch exceeds the buffer (a larger
     token count or tuning bucket) allocates the tensors that do not fit per
     call.
+
+    With an explicit ``tactic=(tile_tokens_dim, config_index)``, only that
+    tactic's scratch is measured. Use this after tuning, with the tactic and
+    token count used by the launch. This size does not cover other tactics
+    selected for other tuning buckets or during subsequent autotuning.
 
     Parameters
     ----------
@@ -7637,6 +7644,12 @@ def trtllm_fused_moe_workspace_size(
     device : Optional[torch.device]
         CUDA device the buffer will be used on. Defaults to the device of the
         given weights, else the current device.
+    tactic : Optional[Tuple[int, int]]
+        Explicit ``(tile_tokens_dim, config_index)`` from the autotuner.
+        A config index of -1 selects the default valid config for that tile.
+        Defaults to None, which measures the maximum over supported tiles.
+        Unsupported tiles raise an error. Configurations that cannot run for
+        this problem return zero.
 
     Returns
     -------
@@ -7650,6 +7663,20 @@ def trtllm_fused_moe_workspace_size(
     micro-batches on separate streams each need their own buffer.
     ``workspace_buffer`` requires ``do_finalize=True``.
     """
+    if tactic is not None:
+        if (
+            not isinstance(tactic, (tuple, list))
+            or len(tactic) != 2
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in tactic
+            )
+            or tactic[0] <= 0
+            or tactic[1] < -1
+        ):
+            raise ValueError(
+                "tactic must be (tile_tokens_dim > 0, config_index >= -1), or None"
+            )
     if quant_mode not in _TRTLLM_MOE_WORKSPACE_QUANT_MODES:
         raise ValueError(
             f"quant_mode must be one of {_TRTLLM_MOE_WORKSPACE_QUANT_MODES}, "
@@ -7731,6 +7758,7 @@ def trtllm_fused_moe_workspace_size(
             valid_hidden_size=valid_hidden_size,
             valid_intermediate_size=valid_intermediate_size,
             device=device,
+            tactic=tactic,
             **weights,
         )
 
@@ -7753,6 +7781,7 @@ def _trtllm_fused_moe_workspace_size_impl(
     valid_hidden_size: Optional[int],
     valid_intermediate_size: Optional[int],
     device: torch.device,
+    tactic: Optional[Tuple[int, int]],
     gemm1_weights: Optional[torch.Tensor],
     gemm1_weights_scale: Optional[torch.Tensor],
     gemm2_weights: Optional[torch.Tensor],
@@ -7788,7 +7817,7 @@ def _trtllm_fused_moe_workspace_size_impl(
     logits = stub((T, num_experts), torch.float32)
     output = stub((T, valid_hidden_size or H), torch.bfloat16)
     method = int(RoutingMethodType.Default)
-    tactic = [-1, -1]
+    native_tactic = [-1, -1] if tactic is None else list(tactic)
     # Argument runs every entry point takes in this order; the size depends on none of the
     # routing knobs. The empty precomputed routing selects the routing-from-logits path.
     no_routing = (empty(torch.int32), empty(torch.bfloat16))  # expert ids, weights
@@ -7815,7 +7844,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             w2((E_local, H, I), torch.bfloat16),
             None, None, None, None,  # gemm1 lora_delta, alpha, beta, clamp_limit
             output, num_experts, top_k, *experts, method,
-            use_shuffled_weight, weight_layout, *launch, tactic, activation_type,
+            use_shuffled_weight, weight_layout, *launch, native_tactic, activation_type,
             *ordinary,
         )  # fmt: skip
     elif quant_mode == "fp8_per_tensor":
@@ -7826,7 +7855,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             w1((E_local, I_gemm1, H), fp8), scale, scale,
             w2((E_local, H, I), fp8), scale,
             output, num_experts, top_k, *experts,
-            use_routing_scales_on_input, method, *launch, tactic, activation_type,
+            use_routing_scales_on_input, method, *launch, native_tactic, activation_type,
             *ordinary,
             None,  # gemm1_clamp_limit
         )  # fmt: skip
@@ -7840,7 +7869,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             scale, scale,
             w2((E_local, H, I), fp8), w2_scale((E_local, H), torch.float32), scale,
             output, num_experts, top_k, *experts,
-            use_routing_scales_on_input, method, *launch, tactic, activation_type,
+            use_routing_scales_on_input, method, *launch, native_tactic, activation_type,
             True,  # norm_topk_prob
         )  # fmt: skip
     elif quant_mode in ("fp8_block_scale", "mxfp8"):
@@ -7868,7 +7897,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             w2((E_local, H, I), fp8), scales[1],
             None,  # gemm2_bias
             output, num_experts, top_k, num_fused_shared_experts, *experts, method,
-            use_shuffled_weight, weight_layout, *launch, tactic, int(quantization),
+            use_shuffled_weight, weight_layout, *launch, native_tactic, int(quantization),
             activation_type, *ordinary, *valid,
         )  # fmt: skip
     elif quant_mode in ("nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"):
@@ -7897,7 +7926,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             None, None, None, None,  # gemm2_bias, output1/output1_gate/output2 scales
             stub((T,), torch.float32) if use_per_token_scale else None,
             num_experts, top_k, num_fused_shared_experts, *experts, method, *launch,
-            activation_type, output, tactic, *ordinary, *valid,
+            activation_type, output, native_tactic, *ordinary, *valid,
         )  # fmt: skip
     else:  # mxint4
         fn = moe_op.trtllm_mxint4_block_scale_moe
@@ -7908,7 +7937,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             None, None, None, None,  # gemm1 alpha, beta, clamp_limit, lora_delta
             w2((E_local, H, I // 2), torch.uint8),
             w2_scale((E_local * H * I // 32,), torch.bfloat16),
-            num_experts, top_k, *experts, method, *launch, output, tactic,
+            num_experts, top_k, *experts, method, *launch, output, native_tactic,
             *ordinary, *valid,
         )  # fmt: skip
     # Every entry point ends with (workspace_buffer, query_workspace_size); the FP4

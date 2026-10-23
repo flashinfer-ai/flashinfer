@@ -192,7 +192,7 @@ def _reference_reduced(pkg, *, problem, symm_buffer, l1, l2, fp8_scale_mode, s1)
         fc1_weight=l1[0].unsqueeze(0),
         fc2_weight=l2[0].unsqueeze(0),
         ab_dtype=torch.float8_e4m3fn,
-        ref_compute_graph="deepgemm",  # matches the shim's apply_topk_in_fc1=True
+        ref_compute_graph="deepgemm",  # routing weights before FC2
         fp8_accum_mode="1xacc",
         mma_tiler_k=128,
         fc2_output_dtype=torch.bfloat16,

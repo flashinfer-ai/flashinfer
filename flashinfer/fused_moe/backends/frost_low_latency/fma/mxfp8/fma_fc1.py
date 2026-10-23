@@ -10,7 +10,7 @@ from flashinfer.quantization.quantization_cute_dsl_utils import float_to_ue8m0_f
 from flashinfer.fused_moe.backends.frost_low_latency.fma.activations import (
     apply_activation,
 )
-from flashinfer.fused_moe.backends.frost_low_latency.activation import swiglu
+from flashinfer.fused_moe.backends.frost_low_latency.activation import activate
 from flashinfer.fused_moe.backends.frost_low_latency.fma.mxfp8.fma_common import (
     _fp8x4,
     _inverse_scale,
@@ -42,6 +42,7 @@ def _kernel(
     limit: cutlass.Constexpr = None,
     act_alpha: cutlass.Constexpr = 1.0,
     act_beta: cutlass.Constexpr = 0.0,
+    activation_parameters: cutlass.Constexpr = None,
 ):
     bid, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
@@ -91,7 +92,7 @@ def _kernel(
                     for o in cutlass.range_constexpr(4):
                         for branch in cutlass.range_constexpr(branches):
                             weight_row = branch * i + row + o
-                            if cutlass.const_expr(unified):
+                            if cutlass.const_expr(unified and gated):
                                 # TC preparation stripes [gate64, up64]. Both
                                 # tactics read the same byte-preserving view.
                                 weight_row = (
@@ -108,13 +109,16 @@ def _kernel(
                 for o in cutlass.range_constexpr(4):
                     for branch in cutlass.range_constexpr(branches):
                         if cutlass.const_expr(unified):
-                            weight_row = (
-                                ((row + o) // 64) * 128
-                                + (1 - branch) * 64
-                                + (row + o) % 64
-                            )
+                            weight_row = row + o
+                            if cutlass.const_expr(gated):
+                                weight_row = (
+                                    ((row + o) // 64) * 128
+                                    + (1 - branch) * 64
+                                    + (row + o) % 64
+                                )
                             sw = ws[
-                                expert * 2 * i * cols + _sf_index(weight_row, col, cols)
+                                expert * branches * i * cols
+                                + _sf_index(weight_row, col, cols)
                             ]
                         else:
                             sw = ws[
@@ -138,7 +142,15 @@ def _kernel(
             if cutlass.const_expr(unified):
                 value = cutlass.Float32(0.0)
                 if row + o < logical:
-                    value = swiglu(up, gate, limit, act_alpha, act_beta)
+                    value = activate(
+                        up,
+                        gate,
+                        activation,
+                        limit,
+                        act_alpha,
+                        act_beta,
+                        activation_parameters,
+                    )
                 shared[warp * 4 + o] = value
             else:
                 if expert >= 0 and expert < experts:

@@ -4,6 +4,11 @@
 SM100/SM103/SM107. The MX Tensor Core path uses CuTe DSL and the existing FlashInfer low-latency blockscaled
 GEMM's TMA producers and epilogue. It does not depend on cuDNN.
 
+This backend is opt-in: the default `MoEConfig` candidate list does not include
+`FrostLowLatencyConfig`. Add it explicitly and prepare a `frost_low_latency`
+weight view to include it in cross-backend selection. Upgrading FlashInfer alone
+does not redirect existing calls to this backend.
+
 The backend owns both scalar FMA and Tensor Core tactics. FMA reuses the device
 implementation previously embedded in `cudnn_frost`. For MX, both tactics read
 the same prepared weights. Switching MX tactics needs no second
@@ -32,7 +37,7 @@ flowchart TD
   W[One prepared MX weight view] --> A[Low-latency runner and per-call workspace]
   A --> T[Tensor Core tactic: tile K 128 or 256]
   A --> F[FMA tactic: top-k at most 32]
-  T --> S[Shared FP32 SwiGLU and MXFP8 intermediate contract]
+  T --> S[Shared FP32 activation and MXFP8 intermediate contract]
   F --> S
   S --> O[BF16 expert results and ordered FP32 FMA combine]
   L[Legacy cudnn_frost callers] --> C[Compatibility adapters: original numerics]
@@ -45,7 +50,7 @@ Code sharing does not make the old and new numerical contracts interchangeable:
 | Boundary | Low-latency FMA and TC | Legacy MX FMA adapter |
 |---|---|---|
 | Activation before MXFP8 quantization | FP32 | Rounded to BF16 first |
-| Activation parameters | Layer's SwiGLU alpha/beta/limit | Existing admitted defaults |
+| Activation parameters | Layer's typed activation and supported scalar parameters | Existing admitted defaults |
 | Expert result | BF16 | BF16 |
 | Weighted combine | Slot-ordered FP32 FMA | Separate FP32 multiply and slot-ordered add |
 
@@ -58,7 +63,7 @@ independent reference tests enforce the documented numerical tolerances.
 flowchart LR
   X[MXFP8 input + linear UE8M0 scales] --> S[Pack input scales]
   R[Precomputed expert IDs] --> GU
-  S --> GU[Gate/up GEMM + SwiGLU + MXFP8 quantization]
+  S --> GU[Projection GEMM + activation + MXFP8 quantization]
   GU -->|PDL dependency| D[Down GEMM]
   D --> C[Ordered weighted combine]
   C --> Y[BF16 output]
@@ -74,6 +79,102 @@ sorting tokens into expert groups for tiny batches. Eight warps per CTA and a
 smaller tensor-memory allocation reduce resources per independent route tile.
 PDL lets the Down weight producer start early while its activation producer
 waits for the preceding kernel to finish. This remains a multi-kernel pipeline.
+
+## Warm host submission
+
+Each Frost tactic has one compiled TVM-FFI entry for its projection,
+activation and combine launches. A warm call passes the current PyTorch tensors
+directly to that entry. DLPack conversion is used when compiling the entry, rather than once
+per tensor per launch. MX FMA's scale-workspace view and MX Tensor Core's
+pointer descriptors are formed inside the compiled entry.
+
+```mermaid
+flowchart LR
+  P[Public MoELayer: validate and pack this call] --> R[Prepacked runner]
+  R --> F[One compiled FFI entry: current tensors and current stream]
+  F --> K[Existing two FMA or four finalized MX TC launches]
+  C[Cache: executable and immutable specialization metadata] --> F
+```
+
+The compile cache owns no input/output tensors, workspace or CUDA stream.
+Independent calls bind independent storage, including when threads share a
+compiled entry. Callers must still warm up each specialization before CUDA
+Graph capture. The device kernels, numerical contracts, tactics and PDL
+dependencies are unchanged. Legacy `cudnn_frost` adapters retain their existing
+entry points. Existing Frost callers use the new entry automatically, with no
+API changes. Raw output still creates its identity-index tensor per call.
+
+### B300 host qualification
+
+These results compare main `3f398977d` (after #7053 merged) with the host
+implementation measured at `91ae8a699`. Full revisions and production-source
+hashes are recorded in the [machine-readable results](frost_low_latency_host_b300.json).
+
+Across 81 primary cases, two opposite-order processes give **2.85–4.65×**
+faster warm public API submission and **5.35–9.77×** for the prepacked runner.
+The cases cover BF16, MXFP4/MXFP8, MXFP8/MXFP8 and NVFP4, T=1/2/4, and
+SwiGLU/SiTU/SiLU. H=2048, physical I=1408, E=64, top-k=6. The same tactic,
+tensor contents and GPU workspace addresses are used on both sides.
+
+Representative T=1 SwiGLU rows below use the median of the two process medians.
+All times are microseconds; public and runner columns measure CPU enqueue,
+while the last column measures GPU time per MoE call.
+
+| Path | Public API before → after | Host speedup | Prepacked runner before → after | GPU before → after |
+|---|---:|---:|---:|---:|
+| BF16 FMA | 106.04 → 35.81 | 2.96× | 83.25 → 14.64 | 26.63 → 26.65 |
+| MXFP4 TC128 | 260.85 → 61.85 | 4.22× | 217.82 → 24.90 | 10.33 → 10.33 |
+| MXFP4 FMA | 154.30 → 47.30 | 3.26× | 117.98 → 14.33 | 17.25 → 17.25 |
+| MXFP8 TC128 | 256.21 → 60.98 | 4.20× | 213.17 → 25.74 | 10.50 → 10.50 |
+| MXFP8 FMA | 152.79 → 47.38 | 3.23× | 116.25 → 15.13 | 24.52 → 24.52 |
+| NVFP4 FMA | 162.43 → 48.37 | 3.36× | 125.88 → 16.02 | 13.23 → 13.23 |
+
+B300/SM103, Python 3.12.15, PyTorch 2.14.1+cu130, CuTe DSL 4.8.0,
+apache-tvm-ffi 0.1.11, Xeon Platinum 8570. The CPU is shared. A/A public timing
+ratios range from 0.989 to 1.011; GPU changes are within
+-0.32% to +0.26% across both process orders, compared with
+-0.28% to +0.27% for A/A. Plain graph-replay CPU time
+has a median of 2.94 µs per replay of a 50-call graph; it is not divided by 50.
+GPU timing uses repeated fixed-input graph replay without an L2 flush.
+These results do not establish a GPU-time or model-throughput improvement.
+A smaller H=512/I=128/E=8/top-k=2 control covers 27 SwiGLU cases and gives
+2.93–4.22× public API and 5.57–8.43× prepacked-runner improvement.
+
+Current-main B300 qualification passed 166 tests. Two noncurrent-device cases
+were skipped because this allocation exposes one GPU.
+The same production sources previously passed 149 tests on SM107 before the
+main rebase. Tests cover fresh tensor bindings, concurrent threads/streams,
+changed-input graphs, storage ownership and independent numerical references.
+
+Use `benchmarks/bench_frost_host_overhead.py` with the recorded baseline and
+candidate revisions. The following commands reproduce the primary protocol
+against a separate baseline checkout:
+
+```bash
+args=(--tokens 1 2 4 --activations swiglu situ silu \
+      --repeats 101 --calls-per-graph 50)
+python benchmarks/bench_frost_host_overhead.py "${args[@]}" \
+  --baseline-root /path/to/baseline-checkout --output host-ab.json
+python benchmarks/bench_frost_host_overhead.py "${args[@]}" \
+  --baseline-root /path/to/baseline-checkout --output host-ba.json --reverse
+python benchmarks/bench_frost_host_overhead.py "${args[@]}" \
+  --baseline-root "$PWD" --output host-aa.json
+```
+
+The benchmark records source hashes and requires identical shared API/dispatcher
+wrappers. Both sides use the same fixed tactic, prepared weight contents and
+shape. It measures public API, packing, prepacked runner and graph-replay CPU
+times separately, with device synchronization outside each CPU interval.
+CPU replay uses a graph without instrumentation. External CUDA event nodes
+inside a separate captured graph measure GPU time. Both GPU timing graphs bind
+the same workspace addresses to avoid allocation-dependent A/A differences.
+Independent call buffers and per-replay output snapshots check correctness.
+Numerical checks compare both implementations and public/replay
+outputs after changing route IDs and weights. Compilation, initial selection,
+weight preparation and input quantization are outside timing. A/A controls and
+independent reversed-order runs help distinguish small GPU differences from
+measurement noise. Host savings do not imply a corresponding CUDA Graph
+GPU-time or model-throughput improvement.
 
 ## Current B300 kernel results
 
@@ -149,14 +250,16 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Input | E4M3 MXFP8 with linear group-32 UE8M0 scales, or unquantized BF16 |
-| Weights | MX input: packed E2M1 MXFP4 or E4M3 MXFP8, group-32 UE8M0; BF16 input: BF16 |
+| Input | E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16 |
+| Weights | MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; BF16 input: BF16 |
 | Output | BF16, finalized or raw token/slot-ordered expert rows |
-| MX activation | `SwiGLU(alpha, beta, limit)` |
+| MX activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
 | BF16 activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
 | BF16 parameters | SwiGLU alpha/beta/limit and SwiGLUStep limit; other activations require their default parameters |
+| MX parameters | Same typed scalar restrictions as BF16; activation remains FP32 before MXFP8 quantization |
+| NVFP4 | NVFP4 weights and inputs, BF16 output; shared FMA, the same ten activations, H divisible by 512, I by 128, top-k <= 32; no 4over6 intermediate quantization |
 | BF16 FMA | top-k <= 32; FC1 and FC2 output columns 1/2/4/8 (16 combinations), default 1 and 4; GELU/GeGLU require compiler `erf` support |
-| Geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
+| MX/BF16 geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
 | Token rows | 1–2 by default; explicitly configurable up to 8 |
 | Routing | Packed or unpacked precomputed IDs; valid IDs in `[0, E)` |
 | Parallelism | Local expert computation, including TP weight slices; no EP shards or communication |
@@ -175,6 +278,26 @@ bytes. `w1` is `[E, 2I, H/pack]` in **[up, gate]** order; `w2` is
 `[E, H, I/pack]`. `pack=2` for MXFP4 and 1 for MXFP8. Weight scales are
 `[E, rows, K/32]` UE8M0 bytes. Preparation pads I and rearranges gate/up tiles and
 scales; it does not dequantize or requantize the checkpoint.
+
+For non-gated MX activations, pass `activation=...` to `prepare_weights` and
+provide `w1` with shape `[E, I, H/pack]`. Both FMA and Tensor Core tactics omit
+the gate projection. Gated activations retain the existing striped weight view.
+The default remains SwiGLU, so existing four-argument preparation calls retain
+their layout and arithmetic. These additional activation combinations require
+their own measurements; the historical SwiGLU tables are not evidence for them.
+
+For NVFP4, `prepare_nvfp4_weights(w1_bf16, w2_bf16, activation=...)` reuses the
+canonical CUTLASS NVFP4 preparation with unit global scales. Prepare activations
+with `TrtllmFp4Config.prepare_activations(..., quant=quant)` and configure
+`QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4,
+nvfp4_4over6=None)`. The scale payload is linear E4M3 with groups of 16.
+The two FMA tactics compute two or four FC1 outputs per warp. FC1 rounds its
+activation to BF16 before NVFP4 quantization; FC2 rounds expert outputs to BF16
+and combines them with ordered separate FP32 multiplication and addition. Raw
+output retains token/slot order. This numerical contract is distinct from MX.
+The unified NVFP4 quantizer preserves exact E2M1 midpoint ties with
+round-to-nearest division; the legacy adapter retains its approximate-reciprocal
+behavior. An enabled 4over6 recipe is rejected, including a later environment change.
 
 ```python
 from flashinfer.autotuner import autotune
@@ -510,15 +633,15 @@ pipeline; it does not attribute those gains to the newly unified FMA tactic.
 The same route-wise schedule supports MXFP8 weights without changing the
 pipeline. Hidden size, expert count, top-k and logical intermediate size are
 parameters; they are not tied to one checkpoint. A model can use it only when
-its activation and quantization semantics match the selected dtype contract. MX SiTU and
-NVFP4 need separate implementation and qualification. They are not dtype aliases
-for the MX path.
+its activation and quantization semantics match the selected dtype contract.
+MX now shares all ten activation epilogues; NVFP4 uses its own group-16 E4M3
+quantizer and FMA bindings. They are not dtype aliases for the MX path.
 
 | Extension | What carries over | Remaining work |
 |---|---|---|
 | Other MXFP4/MXFP8 SwiGLU models | Route addressing, fused activation/quantization, PDL, weight preparation | Qualify the checkpoint's scale conventions, activation parameters and workload |
-| MX SiTU activation | Route schedule, weight loads and Down dependency | Extend the MX epilogue; BF16 already uses the shared SiTU FMA epilogue |
-| NVFP4 | Route schedule and dependency design | Group-16 E4M3 scales, global scales, FP4 activation quantization and MMA layout |
+| More MX activation workloads | Implemented shared activation epilogues, TC/FMA weight views and Down dependency | Qualify the checkpoint and workload; functional coverage does not imply a speedup |
+| NVFP4 Tensor Core | Implemented FMA route schedule, typed activations and quantization contract | Add a compatible block-16 MMA pipeline and measure the crossover |
 | BF16 Tensor Core | Prepared BF16 view, numerical contract and routing | Add non-blockscaled MMA, preserving the BF16 intermediate and combine contract |
 | More token rows | API and correctness contract | Expert reuse/grouping; the current per-route schedule can lose to native |
 

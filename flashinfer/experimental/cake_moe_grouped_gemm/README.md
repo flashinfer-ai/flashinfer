@@ -70,16 +70,19 @@ The forward projection is also reachable from the stable grouped GEMM API:
 `flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")`
 (bfloat16 outputs only, no tactic index, `N % 256 == 0`, `K % 64 == 0`; rows
 of `a` past `m_indptr[-1]` are left untouched). Naming the backend is the
-opt-in and emits the experimental-backend warning once.
+opt-in and emits the experimental-backend warning once (FlashInfer's
+`ExperimentalWarning`). A copy of the package running without FlashInfer cannot
+reach this stable API; a direct `cake_backend.grouped_mm_bf16_cake` call there
+warns with the package's own `ExperimentalWarning` class instead (see
+"Standalone import" below).
 
 `cake_grouped_mm(x, w, offs, deterministic=True)` is a `torch.autograd.Function`
 wrapper (`CakeGroupedMm`): `backward` produces `x.grad` with the `dgrad`
 program and `w.grad` with the `wgrad` program in the dtype of `w`. The
 programs always reduce in a fixed order, so `deterministic=False` currently
 runs the same deterministic programs; `grouped_gemm_wgrad(..., out_dtype=torch.float32)`
-gives an fp32 weight gradient. `cake_autograd.py` also registers the three
-programs as FlashInfer custom ops (`flashinfer::cake_moe_grouped_gemm_{fwd,dgrad,wgrad}`)
-with fake implementations.
+gives an fp32 weight gradient. `CakeGroupedMm` calls the three programs as
+plain functions; no torch custom op is registered.
 
 ## Host plan
 
@@ -93,8 +96,9 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   group add one partial 256-row tile (`max_cluster_tiles_upper_bound`).
 - Weight-gradient k tile (`select_wgrad_tile`): 512 when `K % 512 == 0`, the
   architecture is listed for it and the average rows per group reach the
-  delivered threshold; 256 otherwise. The bf16 and fp32 outputs and the two
-  tiles are separate registered programs.
+  delivered threshold; 256 otherwise. The two tiles are separate registered
+  programs; the fp32 output is the compile-line specialization
+  `-DWGRAD_OUT=32` of the bf16 program.
 - Weight-gradient tail: the tiles of the last partial wave are split into
   `tail_splits` k-step chunks over all clusters (`wgrad_tail_tiles`,
   `wgrad_tail_plan`, a closed-form cost model of rounds, partial traffic and one
@@ -117,19 +121,24 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 
 The programs are exact-architecture tcgen05 payloads built for the exact
 targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`). Each
-physical program (`fwd`, `dgrad`, the weight-gradient main kernel for bf16 and
-fp32 outputs with a 256- or 512-wide k tile, and the weight-gradient
-tail-reduce for bf16 and fp32 outputs) has one kernel and one host-binding
-translation unit under `csrc/cake_moe_grouped_gemm/`, shared by the three
-architectures: the single architecture-dependent line is folded under
-`__CUDA_ARCH__`, and the tail-reduce k tile is a compile-line specialization
-(`-DWGRAD_TILE=256|512`). `cake_jit.PROGRAMS` lists each program once (its
-architecture-free `library` stem, FFI entry, argument plan and launch
+of the five physical programs (`fwd`, `dgrad`, the weight-gradient main
+kernel with a 256- or 512-wide k tile, and the weight-gradient tail-reduce)
+has one kernel and one host-binding translation unit under
+`csrc/cake_moe_grouped_gemm/`, shared by the three architectures: the single
+architecture-dependent line is folded under `__CUDA_ARCH__`, the tail-reduce
+k tile is a compile-line specialization (`-DWGRAD_TILE=256|512`), and so is
+the fp32 weight-gradient output (`-DWGRAD_OUT=32`; `WGRAD_OUT=16`, the bf16
+output, is the default). The shared weight-gradient sources, their registry
+rows and their manifest entries are a hand fold of the exported files; a
+later export regenerates them. `cake_jit.PROGRAMS` lists each program once
+(its architecture-free `library` stem, FFI entry, argument plan and launch
 geometry); `cake_jit.ROUTES` maps each public route (operation, output dtype,
 k tile) to its stage programs and specializations. `build.json` (schema
 `cake-build/1`, written by the export) is the only record of what to compile:
 one entry per build `<library>[<specialization tag>]_<arch>` -- the tag is
 `_wgrad_tile256` / `_wgrad_tile512` for the specialized tail-reduce builds,
+`_wgrad_out32` for the fp32 weight-gradient builds (composed on the fp32
+tail-reduce: `_wgrad_out32_wgrad_tile256` / `_wgrad_out32_wgrad_tile512`),
 empty otherwise -- with its translation units, digests, nvcc flags (the
 `-D` defines included), per-architecture closure digest and `aot/<name>.so`
 path. `cake_jit.load_module(program, arch, specializations)` loads that entry
@@ -140,24 +149,54 @@ and the closure digest; FlashInfer's build-target rules --
 only). The bindings include the package's `csrc/cake_ffi_checks.h`, no
 FlashInfer header. The 512-wide weight-gradient tile is registered for
 `sm_100a` and `sm_103a`.
+The five kernel translation units share one device header,
+`cake_moe_grouped_gemm_device.cuh`, carrying their common preamble (typedefs,
+tensor-map ABI, math constants and the tcgen05 helpers behind need-guards): a
+hand fold of the exported preambles that no `build.json` entry lists, so the
+build's dependency tracking, not a manifest digest, covers it.
+The four main-kernel bindings share their dynamic shared-memory opt-in and
+TMA descriptor encoders the same way, through the fragment headers
+`cake_moe_grouped_gemm_binding_*.h` included inside each host-shim namespace
+(hand folds of exported text that no `build.json` entry lists).
 
 Measured on B200 (`sm_100a`), GB300 (`sm_103a`) and R200 (`sm_107a`); the
 performance summary is in the delivery pull requests.
 
+## Standalone import
+
+The package imports without a FlashInfer installation. Its experimental-API
+helpers (the once-per-function warning decorator and the once-per-(API, backend)
+warning) come from `flashinfer.api_logging` when that module is importable --
+a copy of the package loaded next to an importable FlashInfer binds to that
+installation and imports `flashinfer` when the copy is imported -- and
+otherwise (no FlashInfer in the process, `sys.modules["flashinfer"] = None` as
+a vendoring gate sets it, or a FlashInfer without these helpers) from the
+stand-ins in the package's `_experimental.py`. The stand-ins emit the same
+warning text, once per function and once per (API, backend) pair, with three
+differences: the category is the package's own `ExperimentalWarning` (a
+`UserWarning`; a filter on `flashinfer.experimental.ExperimentalWarning` does
+not match it), there is no API logging (`FLASHINFER_LOGLEVEL` is not read),
+and the set of warned (API, backend) pairs is package-local. Inside FlashInfer
+the bound helpers are FlashInfer's own and nothing changes. Only the loader's
+JIT fallback (`cake_build.py`) reaches FlashInfer after import, when a library
+is not prebuilt under `aot/`.
+
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_gemm.py tests/experimental/test_cake_moe_grouped_gemm_api.py
+pytest tests/experimental/test_cake_moe_grouped_gemm.py tests/experimental/test_cake_moe_grouped_gemm_api.py tests/experimental/test_cake_moe_grouped_gemm_standalone.py
 python benchmarks/bench_cake_moe_grouped_gemm.py --help
 ```
 
 The tests compare against a per-group fp64 reference (including an empty
 group, a one-row group, padded outputs, determinism and the fp32 output) and
 skip when no supported device or no registered program is present. The
-benchmark times the prepared launches against `torch._grouped_mm`, a
-per-group cuBLAS loop and `flashinfer.grouped_mm.grouped_mm_bf16` on the
-MoE projection rows of the design (E = 4 ragged distributions, E = 8 / 16 /
-32 balanced, fp32 weight gradients).
+standalone test copies the package under another name into a subprocess with
+`flashinfer` blocked and runs on CPU. The benchmark times the prepared
+launches against `torch._grouped_mm`, a per-group cuBLAS loop and
+`flashinfer.grouped_mm.grouped_mm_bf16` on the MoE projection rows of the
+design (E = 4 ragged distributions, E = 8 / 16 / 32 balanced, fp32 weight
+gradients).
 
 ## Limitations
 

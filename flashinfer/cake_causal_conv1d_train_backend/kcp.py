@@ -35,7 +35,13 @@ through the record's ``arg_plan`` / ``logical`` / ``ffi_entry`` and ``load``);
 logical tensor names are ``cake_jit.LOGICAL_TENSORS`` plus ``hist``,
 ``hist_row_off``, ``dpre_tail``, ``tail_row_off``, ``dpre_head``,
 ``head_row_off`` (``x_map`` / ``dy_map`` map to ``x`` / ``dy``); the scalars are
-``cake_jit.LOGICAL_SCALARS``.
+``cake_jit.PLAN_SCALARS`` (the KCP programs take no ``flags``).  The KCP path
+keeps the package's pre-round-6 contract: FP32 taps only (``_weight``'s default
+dtype set), no bias, and the legacy channel tile rule ``cake_jit.plan(...,
+legacy=True)`` (``ct_vec = min(C / 8, 128)``; its kernels pick the grouped path
+from ``ct_vec`` on the device and were validated and measured under that rule),
+so C = 1280 still plans (128, 1, 2) here while the training routes tile it as
+(32, 4, 5).
 
 Numerics against the zero-history kernels of this package: the forward runs
 the zero-history forward's instructions with history rows, so ``y`` is bitwise
@@ -51,6 +57,24 @@ and the same maximum between the two policies' FP32 oracles with no kernel
 involved; each kernel stays within one BF16 ulp of its own oracle.  ``dweight``
 is the rank's fixed-order FP32 partial; it is reproducible across launches and
 within ``5e-2 + 1e-4 |dw|`` of an FP64 oracle, not bitwise the no-CP partial.
+
+Shipped host path (this revision;
+``HOST_TRIM_DEFAULT = 1``): the context-derived host work of the eager halo
+call -- the validated ``cu`` / ``hist_index`` / row-offset tables and halo
+splits, the plan scalars, the grids, the record names and the loaded modules
+with their positional argument plans -- is computed once per context and
+reused, and the kernels launch through a raw-stream FFI context of the current
+stream (no ``torch.cuda.Stream`` object per launch).  ``_HOST_CACHE`` is keyed
+on the context object's identity (the entry pins the context) and, inside it,
+on ``(kind, S, C, device, cu_seqlens_local_cpu)`` -- host integers of the
+context and the shapes of the call, never a tensor's contents; it holds at most
+``HOST_CACHE_MAX = 64`` contexts (the oldest dropped) and
+:func:`host_cache_clear` empties it; ``_FFI_DEVICES`` caches the FFI device per
+device index.  The operand checks, the gather, the exchange, its wait and the
+kernel launches run as before with the same arguments on the same stream, so
+no bit changes; a replayed graph (``graph="replay"``) contains no host work.
+``_set_test_knobs({"host_trim": 0})`` (with ``CAKE_KCP_TEST_KNOBS=1``) selects
+the previous host path for the A/B record.
 """
 
 from __future__ import annotations
@@ -85,7 +109,7 @@ TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"  # the KCP route's private test-hook gate
 GRAPH_MODES = (
     "off",
     "replay",
-)  # graph replay: keyed CUDA-graph capture / replay of the halo calls; public keyword graph= since this revision
+)  # graph replay: keyed CUDA-graph capture / replay of the halo calls; public keyword graph= since an earlier revision
 GRAPH_DEFAULT = (
     "off"  # shipped: the eager path; the public keyword graph="replay" opts in per call
 )
@@ -221,17 +245,122 @@ def _context(ctx: Any, *, device: torch.device, T_r: int) -> tuple[torch.Tensor,
 # cached key; at most GRAPH_CACHE_MAX keys, the oldest dropped first); ``graph_cache_clear()`` releases them and must run
 # before ``torch.distributed.destroy_process_group()`` (a graph holding the NCCL collective blocks ``ncclCommDestroy``).
 
-_TEST_KNOBS: dict[str, Any] = {"graph": "off"}
+# Trimmed host path; shipped default:
+# 1 = the trimmed host path of the eager halo call (same launches, bitwise; the module docstring's "Shipped host path"),
+# 0 = the previous host path, selectable through _set_test_knobs for the A/B record.
+HOST_TRIMS = (0, 1)
+HOST_TRIM_DEFAULT = (
+    1  # shipped; 0 = the previous path, via _set_test_knobs({"host_trim": 0}) only
+)
+_TEST_KNOBS: dict[str, Any] = {"graph": "off", "host_trim": HOST_TRIM_DEFAULT}
 GRAPH_STATS: dict[str, int] = {"eager": 0, "capture": 0, "replay": 0, "fallback": 0}
 GRAPH_CACHE_MAX = 64
 LAST_CALL: dict[str, dict[str, Any]] = {}
 
+# -- the trimmed host path (host_trim=1): the per-context host state of the eager halo calls.  ``_HOST_CACHE[id(ctx)]`` holds the
+# context (pinned, so its id cannot be reused) and one entry per ``(kind, S, C, device, cu_seqlens_local_cpu)``: the
+# validated context tables and tensors (``cu``, ``hist_row_off``, ...), the plan scalars, the record names, the loaded
+# modules with their positional argument plans and grids.  Everything in an entry derives from host integers of the
+# context and the shapes of the call; no tensor content is read.  At most HOST_CACHE_MAX contexts (the oldest dropped).
+HOST_CACHE_MAX = 64
+_HOST_CACHE: dict[int, tuple[Any, dict[tuple, dict[str, Any]]]] = {}
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _host_cache_entry(ctx: Any, key: tuple) -> dict[str, Any]:
+    """The (possibly empty, to be filled) host-cache entry of ``ctx`` under ``key``."""
+    hit = _HOST_CACHE.get(id(ctx))
+    if hit is None or hit[0] is not ctx:
+        if len(_HOST_CACHE) >= HOST_CACHE_MAX:
+            del _HOST_CACHE[next(iter(_HOST_CACHE))]
+        hit = _HOST_CACHE[id(ctx)] = (ctx, {})
+    entry = hit[1].get(key)
+    if entry is None:
+        entry = hit[1][key] = {}
+    return entry
+
+
+def host_cache_clear() -> int:
+    """Drop the trimmed host path's per-context cache; returns the number of contexts dropped."""
+    n = len(_HOST_CACHE)
+    _HOST_CACHE.clear()
+    return n
+
+
+def _ffi_device(device_index: int) -> Any:
+    dev = _FFI_DEVICES.get(int(device_index))
+    if dev is None:
+        dev = _FFI_DEVICES[int(device_index)] = tvm_ffi.device(
+            f"cuda:{int(device_index)}"
+        )
+    return dev
+
+
+def _raw_stream(device_index: int) -> int:
+    get = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if get is not None:
+        return int(get(int(device_index)))
+    return int(torch.cuda.current_stream(int(device_index)).cuda_stream)
+
+
+def _launch_plan(
+    name: str, grid: tuple[int, int, int], device_index: int
+) -> tuple[Any, str, tuple[tuple[str | None, int], ...]]:
+    """``(module, ffi entry, plan)`` of record ``name`` for the trimmed launch: ``plan`` lists ``(None, grid value)``
+    per grid argument and ``(logical name, 0)`` per kernel parameter, in ``run`` order (the same arguments
+    :func:`run_module` / :func:`_launch_with_grid` build per call)."""
+    record = _loader.MODULES[name]
+    logical = record["logical"]
+    grid_values = {
+        "grid_x": int(grid[0]),
+        "grid_y": int(grid[1]),
+        "grid_z": int(grid[2]),
+    }
+    plan: list[tuple[str | None, int]] = []
+    for kind, key in record["arg_plan"]:
+        if kind == "grid":
+            plan.append((None, grid_values[key]))
+        else:
+            if key not in logical:
+                raise ValueError(
+                    f"module {name}: kernel parameter {key!r} has no logical name"
+                )
+            plan.append((logical[key], 0))
+    module = load(name, _loader.device_arch(device_index))
+    return module, record["ffi_entry"], tuple(plan)
+
+
+def _launch_trim(
+    info: tuple[Any, str, tuple[tuple[str | None, int], ...]],
+    values: dict[str, Any],
+    device_index: int,
+) -> None:
+    """Launch a cached :func:`_launch_plan` with the per-call ``values`` on the device's current torch stream (raw-stream
+    FFI context: the same stream ``tvm_ffi.use_torch_stream`` would set, without building a torch.cuda.Stream)."""
+    module, entry, plan = info
+    args = []
+    for logical_name, grid_value in plan:
+        if logical_name is None:
+            args.append(grid_value)
+        else:
+            try:
+                args.append(values[logical_name])
+            except KeyError:
+                raise ValueError(
+                    f"the launch needs logical argument {logical_name!r}"
+                ) from None
+    with tvm_ffi.use_raw_stream(_ffi_device(device_index), _raw_stream(device_index)):
+        getattr(module, entry)(*args)
+
 
 def _set_test_knobs(knobs: Optional[dict]) -> dict:
-    """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``); ``None`` restores the
-    defaults.  Refused without ``CAKE_KCP_TEST_KNOBS=1`` in the environment.  Returns the active knobs."""
+    """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``; ``host_trim``: ``1`` shipped =
+    the trimmed host path of the eager call | ``0`` the previous host path); a knob
+    the dict does not name keeps its shipped default; ``None`` restores the defaults.  Refused without
+    ``CAKE_KCP_TEST_KNOBS=1`` in the environment.  Returns the active knobs."""
     if knobs is None:
         _TEST_KNOBS["graph"] = "off"
+        _TEST_KNOBS["host_trim"] = HOST_TRIM_DEFAULT
         return dict(_TEST_KNOBS)
     if os.environ.get(TEST_KNOBS_ENV) != "1":
         raise ValueError(
@@ -239,17 +368,23 @@ def _set_test_knobs(knobs: Optional[dict]) -> dict:
         )
     if not isinstance(knobs, dict):
         raise TypeError(f"_set_test_knobs expects a dict, got {type(knobs).__name__}")
-    unknown = sorted(set(knobs) - {"graph"})
+    unknown = sorted(set(knobs) - {"graph", "host_trim"})
     if unknown:
         raise ValueError(
-            f"_set_test_knobs: unknown knob(s) {unknown}; known: ['graph']"
+            f"_set_test_knobs: unknown knob(s) {unknown}; known: ['graph', 'host_trim']"
         )
     graph = str(knobs.get("graph", "off"))
     if graph not in GRAPH_MODES:
         raise ValueError(
             f"_set_test_knobs: graph must be one of {GRAPH_MODES}, got {graph!r}"
         )
+    host_trim = knobs.get("host_trim", HOST_TRIM_DEFAULT)
+    if isinstance(host_trim, bool) or host_trim not in HOST_TRIMS:
+        raise ValueError(
+            f"_set_test_knobs: host_trim must be one of {HOST_TRIMS}, got {host_trim!r}"
+        )
     _TEST_KNOBS["graph"] = graph
+    _TEST_KNOBS["host_trim"] = int(host_trim)
     return dict(_TEST_KNOBS)
 
 
@@ -418,6 +553,8 @@ def _kcp_forward(
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
+    if _TEST_KNOBS["host_trim"] == 1:
+        return _kcp_forward_trim(x, weight, ctx, out=out, device=device)
     arch = _device_arch(device)
     S, C, x_flat = _tokens(x, "x_local", device=device)
     w = _weight(weight, C, device=device)
@@ -449,7 +586,7 @@ def _kcp_forward(
     (name,) = route_modules(arch, KCP_FWD)
     device_index = _device_index(device)
     record = _loader.MODULES[name]
-    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"])
+    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
     if scalars["n_ch_tiles"] > launch_grid(record, device_index=device_index)[0]:
         raise ValueError(
             f"C={C} spans more channel tiles than the forward's grid on this device holds"
@@ -468,6 +605,95 @@ def _kcp_forward(
     if work is not None:
         work.wait()
     run_module(name, values, device_index=device_index)
+    return y, hist
+
+
+def _kcp_forward_trim(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    *,
+    out: Optional[torch.Tensor],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trimmed host path: :func:`_kcp_forward` with the context-derived host work cached per ``(ctx, S, C, device,
+    cu_seqlens_local_cpu)``: the validated ``cu`` / ``hist_index`` / ``hist_row_off`` tables, the halo splits, the
+    record, its plan scalars and grid, the loaded module with its argument plan.  The operand checks, the gather, the
+    exchange, the wait and the kernel launch are the untrimmed call's, in the same order on the same stream."""
+
+    S, C, x_flat = _tokens(x, "x_local", device=device)
+    w = _weight(weight, C, device=device)
+    y = _output(out, "out", shape=tuple(x.shape), dtype=torch.bfloat16, device=device)
+    e = _host_cache_entry(
+        ctx, ("fwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu))
+    )
+    if not e:
+        arch = _device_arch(device)
+        cu, n_frag = _context(ctx, device=device, T_r=S)
+        halo = ctx.halo
+        e.update(
+            cu=cu,
+            n_frag=n_frag,
+            hist_index=_require_tensor(
+                ctx.halo_tables["hist_index"], "ctx.halo_tables['hist_index']"
+            ),
+            recv_rows=int(halo.n_hist_rows),
+            send_splits=tuple(halo.fwd_send_rows),
+            recv_splits=tuple(halo.fwd_recv_rows),
+        )
+        if S != 0:
+            e["hist_row_off"] = _table(
+                ctx,
+                "hist_row_off",
+                shape=(n_frag, HALO),
+                dtype=torch.int32,
+                device=device,
+            )
+            (name,) = route_modules(arch, KCP_FWD)
+            device_index = _device_index(device)
+            record = _loader.MODULES[name]
+            scalars = plan(
+                S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+            )
+            grid = launch_grid(record, device_index=device_index)
+            if scalars["n_ch_tiles"] > grid[0]:
+                raise ValueError(
+                    f"C={C} spans more channel tiles than the forward's grid on this device holds"
+                )
+            e["scalars"] = _scalars(scalars)
+            e["device_index"] = device_index
+            e["launch"] = _launch_plan(name, grid, device_index)
+    hist_index = e["hist_index"]
+    send = (
+        x_flat.index_select(0, hist_index)
+        if hist_index.numel()
+        else x_flat.new_empty((0, C))
+    )
+    hist, work = _exchange(
+        send,
+        recv_rows=e["recv_rows"],
+        send_splits=e["send_splits"],
+        recv_splits=e["recv_splits"],
+        ctx=ctx,
+    )
+    if S == 0:
+        if work is not None:
+            work.wait()
+        return y, hist
+    values: dict[str, Any] = {
+        "x": x_flat,
+        "w": w,
+        "cu": e["cu"],
+        "y": y.view(S, C),
+        "hist": hist
+        if hist.shape[0]
+        else _pool(0, C, dtype=torch.bfloat16, device=device),
+        "hist_row_off": e["hist_row_off"],
+        **e["scalars"],
+    }
+    if work is not None:
+        work.wait()
+    _launch_trim(e["launch"], values, e["device_index"])
     return y, hist
 
 
@@ -522,6 +748,10 @@ def _kcp_backward(
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
+    if _TEST_KNOBS["host_trim"] == 1:
+        return _kcp_backward_trim(
+            x, weight, ctx, dy, hist, dx=dx, dweight=dweight, device=device
+        )
     arch = _device_arch(device)
     S, C, x_flat = _tokens(x, "x_local", device=device)
     w = _weight(weight, C, device=device)
@@ -603,7 +833,7 @@ def _kcp_backward(
     )
     names = selected_modules(arch, KCP_BWD, C=C, S=S)
     record = _loader.MODULES[names[0]]
-    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"])
+    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
     grid_x = launch_grid(record, device_index=device_index)[0]
     if scalars["n_ch_tiles"] > grid_x:
         raise ValueError(
@@ -631,6 +861,178 @@ def _kcp_backward(
         work.wait()
     for name in names:
         run_module(name, values, device_index=device_index)
+    return dx_out, dw_out
+
+
+def _kcp_backward_trim(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    dy: torch.Tensor,
+    hist: torch.Tensor,
+    *,
+    dx: Optional[torch.Tensor],
+    dweight: Optional[torch.Tensor],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trimmed host path: :func:`_kcp_backward` with the context-derived host work cached per ``(ctx, S, C, device,
+    cu_seqlens_local_cpu)`` (tables, the head grid, the backward records, plan scalars, partial rows, the loaded modules
+    with their argument plans); the operand checks, allocations, exchange, wait and launches are the untrimmed call's."""
+
+    S, C, x_flat = _tokens(x, "x_local", device=device)
+    w = _weight(weight, C, device=device)
+    _, _, dy_flat = _tokens(dy, "dy", device=device, shape=tuple(x.shape))
+    hist_t = _require_tensor(hist, "hist")
+    if (
+        hist_t.ndim != 2
+        or int(hist_t.shape[1]) != C
+        or hist_t.dtype != torch.bfloat16
+        or not hist_t.is_contiguous()
+    ):
+        raise ValueError(
+            f"hist must be the forward's contiguous BF16 [n_hist_rows, {C}] pool, got {hist_t.dtype} {tuple(hist_t.shape)}"
+        )
+    if hist_t.shape[0] == 0:
+        hist_t = _pool(0, C, dtype=torch.bfloat16, device=device)
+    dx_out = _output(
+        dx, "dx", shape=tuple(x.shape), dtype=torch.bfloat16, device=device
+    )
+    dw_out = _output(
+        dweight, "dweight", shape=(C, WIDTH), dtype=torch.float32, device=device
+    )
+    e = _host_cache_entry(
+        ctx, ("bwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu))
+    )
+    if not e:
+        arch = _device_arch(device)
+        cu, n_frag = _context(ctx, device=device, T_r=S)
+        halo = ctx.halo
+        device_index = _device_index(device)
+        n_head = int(halo.n_head_rows)
+        e.update(
+            cu=cu,
+            n_frag=n_frag,
+            device_index=device_index,
+            n_head=n_head,
+            tail_rows=int(halo.n_tail_rows),
+            send_splits=tuple(halo.bwd_send_rows),
+            recv_splits=tuple(halo.bwd_recv_rows),
+            head=None,
+        )
+        if S > 0 and n_head > 0:
+            hist_row_off = _table(
+                ctx,
+                "hist_row_off",
+                shape=(n_frag, HALO),
+                dtype=torch.int32,
+                device=device,
+            )
+            head_row_off = _table(
+                ctx,
+                "head_row_off",
+                shape=(n_frag, HALO, HEAD_SLOTS),
+                dtype=torch.int32,
+                device=device,
+            )
+            (head_name,) = route_modules(arch, KCP_BWD_HEAD)
+            geometry = _loader.MODULES[head_name]["grid_rule"]["geometry"]
+            channels_per_cta = int(geometry["threads"]) * int(geometry["vec"])
+            grid = (max(1, n_frag * _ceil_div(C, channels_per_cta)), 1, 1)
+            e["head"] = (
+                _launch_plan(head_name, grid, device_index),
+                hist_row_off,
+                head_row_off,
+            )
+        if S != 0:
+            e["hist_row_off"] = _table(
+                ctx,
+                "hist_row_off",
+                shape=(n_frag, HALO),
+                dtype=torch.int32,
+                device=device,
+            )
+            e["tail_row_off"] = _table(
+                ctx,
+                "tail_row_off",
+                shape=(n_frag, HALO),
+                dtype=torch.int32,
+                device=device,
+            )
+            names = selected_modules(arch, KCP_BWD, C=C, S=S)
+            record = _loader.MODULES[names[0]]
+            scalars = plan(
+                S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+            )
+            grid_x = launch_grid(record, device_index=device_index)[0]
+            if scalars["n_ch_tiles"] > grid_x:
+                raise ValueError(
+                    f"C={C} spans more channel tiles than the backward's grid on this device holds"
+                )
+            e["rows"] = partial_rows(grid_x, scalars["n_ch_tiles"])
+            e["scalars"] = _scalars(scalars)
+            e["launches"] = tuple(
+                _launch_plan(
+                    name,
+                    launch_grid(_loader.MODULES[name], device_index=device_index),
+                    device_index,
+                )
+                for name in names
+            )
+    n_head = e["n_head"]
+    device_index = e["device_index"]
+    dpre_head = _pool(n_head, C, dtype=torch.float32, device=device)
+    if e["head"] is not None:
+        info, hist_row_off, head_row_off = e["head"]
+        _launch_trim(
+            info,
+            {
+                "x": x_flat,
+                "w": w,
+                "cu": e["cu"],
+                "dy": dy_flat,
+                "hist": hist_t,
+                "hist_row_off": hist_row_off,
+                "dpre_head": dpre_head,
+                "head_row_off": head_row_off,
+                "S": S,
+                "C": C,
+                "num_docs": e["n_frag"],
+            },
+            device_index,
+        )
+    dpre_tail, work = _exchange(
+        dpre_head[:n_head],
+        recv_rows=e["tail_rows"],
+        send_splits=e["send_splits"],
+        recv_splits=e["recv_splits"],
+        ctx=ctx,
+    )
+    if S == 0:
+        if work is not None:
+            work.wait()
+        dw_out.zero_()
+        return dx_out, dw_out
+    partial = torch.empty((e["rows"], C, WIDTH), dtype=torch.float32, device=device)
+    values: dict[str, Any] = {
+        "x": x_flat,
+        "w": w,
+        "cu": e["cu"],
+        "dy": dy_flat,
+        "dx": dx_out.view(S, C),
+        "dw": dw_out,
+        "partial": partial,
+        "hist": hist_t,
+        "hist_row_off": e["hist_row_off"],
+        "dpre_tail": dpre_tail
+        if dpre_tail.shape[0]
+        else _pool(0, C, dtype=torch.float32, device=device),
+        "tail_row_off": e["tail_row_off"],
+        **e["scalars"],
+    }
+    if work is not None:
+        work.wait()
+    for info in e["launches"]:
+        _launch_trim(info, values, device_index)
     return dx_out, dw_out
 
 

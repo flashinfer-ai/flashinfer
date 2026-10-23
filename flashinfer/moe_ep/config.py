@@ -16,6 +16,7 @@ backend's Fleet __init__.
 from __future__ import annotations
 
 import enum
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
@@ -27,6 +28,62 @@ if TYPE_CHECKING:
 class EpAlgorithm(enum.Enum):
     LOW_LATENCY = 0
     HIGH_THROUGHPUT = 1
+
+
+class FinalizeMode(enum.Enum):
+    """How a MegaMoE kernel reduces the per-route GEMM2 rows over top-k.
+
+    * ``AUTO`` — ``CAKE`` if the backend's Cake reducer supports the
+      problem, else ``PERSISTENT`` if ``num_valid_tokens_tensor`` is set, else
+      ``DEFAULT``.
+    * ``DEFAULT`` — non-persistent finalize kernel.
+    * ``PERSISTENT`` — persistent finalize kernel that reads
+      ``num_valid_tokens_tensor``.
+    * ``CAKE`` — frozen Cake top-k reducer.
+    * ``NONE`` — no finalize: ``MoEEpMegaLayer.forward_unfinalized`` returns
+      ``(rows, weights, route_map)`` for caller finalization.
+
+    Each backend accepts the subset it implements.
+
+    The former ``do_finalize`` option remains an alias on configs that exposed
+    it: ``True`` maps to ``AUTO`` and ``False`` to ``NONE``. Reading the alias
+    returns whether finalization is enabled. Use ``finalize_mode`` in new code.
+    """
+
+    AUTO = 0
+    DEFAULT = 1
+    PERSISTENT = 2
+    CAKE = 3
+    NONE = 4
+
+
+def validate_finalize_mode(
+    mode: FinalizeMode,
+    supported: Sequence[FinalizeMode],
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None,
+) -> None:
+    if not isinstance(mode, FinalizeMode):
+        raise TypeError(f"finalize_mode must be a FinalizeMode, got {mode!r}.")
+    if mode not in supported:
+        names = ", ".join(m.name for m in supported)
+        raise ValueError(
+            f"finalize_mode={mode.name} is unsupported; use one of {names}."
+        )
+    if mode is FinalizeMode.PERSISTENT and num_valid_tokens_tensor is None:
+        raise ValueError(
+            "finalize_mode=PERSISTENT requires num_valid_tokens_tensor: a "
+            "caller-owned CUDA int32 tensor of shape (1,) holding the live "
+            "token count."
+        )
+
+
+def warn_deprecated_config_field(old: str, new: str) -> None:
+    # stacklevel targets the caller of the dataclass __init__.
+    warnings.warn(
+        f"{old} is deprecated and will be removed in a future release; use {new}.",
+        DeprecationWarning,
+        stacklevel=4,
+    )
 
 
 class EpLayout(enum.Enum):

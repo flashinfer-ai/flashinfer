@@ -629,81 +629,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    # The 2cta_persistent program built with {"bias_path": "regs", "rank": 32}
-    # (round-3 final of the exact-dispatch rows below; the plan of ``63c7c8683df10c75591b``).
-    "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b": {
-        "arches": ["sm_100a", "sm_103a"],
-        # derived; rewritten by the exporter
-        "arg_plan": [
-            ["buffer", "D"],
-            ["buffer", "alpha"],
-            ["buffer", "bias"],
-            ["buffer", "out"],
-            ["parameter", "M"],
-            ["parameter", "N"],
-            ["parameter", "K_tiles"],
-            ["parameter", "tok_tiles"],
-            ["parameter", "w_tiles"],
-            ["parameter", "num_tiles"],
-            ["parameter", "raster_group"],
-            ["parameter", "has_bias"],
-            ["parameter", "rank"],
-            ["buffer", "A"],
-            ["buffer", "B"],
-            ["buffer", "SFA"],
-            ["buffer", "SFB"],
-            ["buffer", "L1"],
-            ["buffer", "L1_tail"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "build": {"bias_path": "regs", "rank": 32},
-        "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",  # derived; rewritten by the exporter
-        "launch": {  # derived; rewritten by the exporter
-            "block": (256, 1, 1),
-            "cluster": (2, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 228992,
-            "use_pdl": True,
-        },
-        "library": "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",
-        # derived; rewritten by the exporter
-        "logical": {
-            "A": "a",
-            "B": "b",
-            "D": "d",
-            "K_tiles": "K_tiles",
-            "L1": "l1",
-            "L1_tail": "l1",
-            "M": "M",
-            "N": "N",
-            "SFA": "a_sf",
-            "SFB": "b_sf",
-            "alpha": "alpha",
-            "bias": "bias",
-            "has_bias": "has_bias",
-            "num_tiles": "num_tiles",
-            "out": "out",
-            "rank": "rank",
-            "raster_group": "raster_group",
-            "tok_tiles": "tok_tiles",
-            "w_tiles": "w_tiles",
-        },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
-        "plan": {
-            "block_m": 256,
-            "block_n": 256,
-            "block_k": 256,
-            "grid_rule": "pair_persistent",
-            "pdl": True,
-            "rank_storage": 32,
-            "scale_elems": "uint32",
-            "variant": "bias",
-        },
-    },
     # The 2cta_persistent program built with {"clc_lead_kb": 8, "rank": 32}
     # (round-3 final of the exact-dispatch rows below; the plan of ``63c7c8683df10c75591b``).
     "cake_nvfp4_svdquant_gemm_1d78f2bd5722fb02b75a": {
@@ -912,81 +837,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_tiles": "num_tiles",
             "out": "out",
             "out_ptr": "out",
-            "rank": "rank",
-            "raster_group": "raster_group",
-            "tok_tiles": "tok_tiles",
-            "w_tiles": "w_tiles",
-        },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
-        "plan": {
-            "block_m": 256,
-            "block_n": 256,
-            "block_k": 256,
-            "grid_rule": "pair_persistent",
-            "pdl": True,
-            "rank_storage": 96,
-            "scale_elems": "uint32",
-            "variant": "bias",
-        },
-    },
-    # The 2cta_persistent program built with {"bias_path": "regs", "rank": 96}
-    # (round-3 final of the exact-dispatch rows below; the plan of ``be138d4583b02c247633``).
-    "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21": {
-        "arches": ["sm_100a", "sm_103a"],
-        # derived; rewritten by the exporter
-        "arg_plan": [
-            ["buffer", "D"],
-            ["buffer", "alpha"],
-            ["buffer", "bias"],
-            ["buffer", "out"],
-            ["parameter", "M"],
-            ["parameter", "N"],
-            ["parameter", "K_tiles"],
-            ["parameter", "tok_tiles"],
-            ["parameter", "w_tiles"],
-            ["parameter", "num_tiles"],
-            ["parameter", "raster_group"],
-            ["parameter", "has_bias"],
-            ["parameter", "rank"],
-            ["buffer", "A"],
-            ["buffer", "B"],
-            ["buffer", "SFA"],
-            ["buffer", "SFB"],
-            ["buffer", "L1"],
-            ["buffer", "L1_tail"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "build": {"bias_path": "regs", "rank": 96},
-        "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",  # derived; rewritten by the exporter
-        "launch": {  # derived; rewritten by the exporter
-            "block": (256, 1, 1),
-            "cluster": (2, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 228992,
-            "use_pdl": True,
-        },
-        "library": "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",
-        # derived; rewritten by the exporter
-        "logical": {
-            "A": "a",
-            "B": "b",
-            "D": "d",
-            "K_tiles": "K_tiles",
-            "L1": "l1",
-            "L1_tail": "l1",
-            "M": "M",
-            "N": "N",
-            "SFA": "a_sf",
-            "SFB": "b_sf",
-            "alpha": "alpha",
-            "bias": "bias",
-            "has_bias": "has_bias",
-            "num_tiles": "num_tiles",
-            "out": "out",
             "rank": "rank",
             "raster_group": "raster_group",
             "tok_tiles": "tok_tiles",
@@ -2332,10 +2182,12 @@ MODULES: dict[str, dict[str, Any]] = {
     # last partial wave run as two 256x128 half units each (``B_half``: a 64-row
     # box over the same ``b`` tensor), scheduled by :func:`tailsplit_units`;
     # otherwise the ``2cta_persistent`` program's whole-tile path.  One build per
-    # rank; routed only to the shapes where the split measured faster.  cake_r2:
-    # every tail-split route is a hinted launch (``K_tiles`` or ``w_tiles`` 48),
-    # so the program ships in its ``out_store="v8hint"`` form (the trailing
-    # ``out_ptr`` parameter is the raw ``out`` pointer).
+    # rank; routed only to the shapes where the split measured faster.  The rows
+    # by rank are hinted launches (``K_tiles`` or ``w_tiles`` 48), so those builds
+    # ship in the ``out_store="v8hint"`` form (the trailing ``out_ptr`` parameter
+    # is the raw ``out`` pointer); the two sm_100a K 3072 rows (M 6912 rank 96,
+    # M 16384 rank 32) take the TMA-store form with the register bias path (the
+    # last two records).
     "cake_nvfp4_svdquant_gemm_e4f1cd01b65bed25c4f1": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
@@ -2753,6 +2605,176 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
+    # The 2cta_tailsplit program built with {"bias_path": "regs", "rank": 96}: the
+    # TMA-store form with the register bias path, the plan of ``e4f1cd01b65bed25c4f1``
+    # without ``out_ptr``; the sm_100a route of (6912, 3072, 3072, 96, True), 324 pair
+    # tiles whose 20 / 28 tail tiles split on 152 / 148 SMs.
+    "cake_nvfp4_svdquant_gemm_0f7f27a483c337265bf9": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["parameter", "num_units"],
+            ["parameter", "full_units"],
+            ["parameter", "tail_split"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "B_half"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"bias_path": "regs", "rank": 96},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_0f7f27a483c337265bf9",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_0f7f27a483c337265bf9",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_0f7f27a483c337265bf9",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "B_half": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "full_units": "full_units",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "num_units": "num_units",
+            "out": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tail_split": "tail_split",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_tailsplit",
+            "pdl": True,
+            "rank_storage": 96,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
+    # The 2cta_tailsplit program built with {"bias_path": "regs", "rank": 32}: the
+    # TMA-store form with the register bias path, the plan of ``e4f1cd01b65bed25c4f1``
+    # without ``out_ptr``; the sm_100a route of (16384, 3072, 3072, 32, True), 768 pair
+    # tiles whose 8 / 28 tail tiles split on 152 / 148 SMs.
+    "cake_nvfp4_svdquant_gemm_c80322ffcfa97a956474": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["parameter", "num_units"],
+            ["parameter", "full_units"],
+            ["parameter", "tail_split"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "B_half"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"bias_path": "regs", "rank": 32},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_c80322ffcfa97a956474",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_c80322ffcfa97a956474",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_c80322ffcfa97a956474",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "B_half": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "full_units": "full_units",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "num_units": "num_units",
+            "out": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tail_split": "tail_split",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_tailsplit",
+            "pdl": True,
+            "rank_storage": 32,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
 }
 
 # The routing table: ordered predicate rows over the host scalars, the first
@@ -2785,11 +2807,11 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     #   (6889, 3072, 3072, 32, True) on both -> fdcf777b3acd972f8841
     #   (6912, 3072, 3072, 32, True) on both -> fdcf777b3acd972f8841
     #   (6912, 3072, 3072, 64, True) on both -> d16d801db12c7bdde4dc
-    #   (6912, 3072, 3072, 96, True) on sm_100a -> 96eddeb7b3a643b34a21
+    #   (6912, 3072, 3072, 96, True) on sm_100a -> 0f7f27a483c337265bf9
     #   (6912, 3072, 3072, 96, True) on sm_103a -> 5dc32691ea15528b11be
     #   (6912, 3072, 3072, 128, True) on both -> aa5225a75028cbb32391
     #   (9216, 3072, 3072, 32, True) on sm_100a -> b4be925d9e1e6959b702 (held: the shipped cake_r1 build)
-    #   (16384, 3072, 3072, 32, True) on sm_100a -> c832b08a912e4c58112b
+    #   (16384, 3072, 3072, 32, True) on sm_100a -> c80322ffcfa97a956474
     #   (16384, 3072, 3072, 32, True) on sm_103a -> fdcf777b3acd972f8841
     #   (16384, 12288, 3072, 32, True) on sm_100a -> b4be925d9e1e6959b702 (held: the shipped cake_r1 build)
     {
@@ -2931,7 +2953,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "k_max": 3072,
         "ranks": (96,),
         "bias": True,
-        "record": "cake_nvfp4_svdquant_gemm_96eddeb7b3a643b34a21",
+        "record": "cake_nvfp4_svdquant_gemm_0f7f27a483c337265bf9",
     },
     {
         "arches": ("sm_103a",),
@@ -2978,7 +3000,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "k_max": 3072,
         "ranks": (32,),
         "bias": True,
-        "record": "cake_nvfp4_svdquant_gemm_c832b08a912e4c58112b",
+        "record": "cake_nvfp4_svdquant_gemm_c80322ffcfa97a956474",
     },
     {
         "arches": ("sm_103a",),

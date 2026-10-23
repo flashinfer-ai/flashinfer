@@ -923,8 +923,9 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |

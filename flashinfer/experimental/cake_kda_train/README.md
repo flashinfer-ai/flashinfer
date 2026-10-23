@@ -17,15 +17,16 @@ from `build.json` otherwise (see "Layout of this package").
 ## Public entry points (`flashinfer/kda_train.py`)
 
 ```python
-from flashinfer.kda_train import chunk_kda, chunk_kda_fwd, chunk_kda_bwd, kda_train_workspace
+from flashinfer.kda_train import chunk_kda, chunk_kda_fwd, chunk_kda_bwd, kda_train_workspace, kda_train_arena
 
-out = chunk_kda(q, k, v, g, beta, cu_seqlens, scale=None, workspace=None, save_mode=None)  # autograd
+out = chunk_kda(q, k, v, g, beta, cu_seqlens, scale=None, workspace=None, save_mode=None, arena=None)  # autograd
 out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, scale=None,
-                           save_for_backward=True, workspace=None, save_mode=None)
+                           save_for_backward=True, workspace=None, save_mode=None, arena=None)
 dq, dk, dv, dbeta, dg = chunk_kda_bwd(q, k, v, g, beta, cu_seqlens, dout,
-                                      saved=saved, scale=None, workspace=None)
+                                      saved=saved, scale=None, workspace=None, arena=None)
 dq, dk, dv, dbeta, dg = chunk_kda_bwd(q, k, v, g, beta, cu_seqlens, dout)         # checkpoint replay
 ws = kda_train_workspace(S, num_docs, H, device, backward=True, save_mode="light")  # caller-owned
+ws = kda_train_workspace(S, num_docs, H, device, arena=kda_train_arena(tail_passes=4))  # lower-memory arena
 ```
 
 ### Contract
@@ -122,7 +123,15 @@ into the saved set.
 A workspace is one arena (a `uint8` tensor) holding the internal-layout
 intermediates of one `(S, num_docs, H)` problem; `chunk_kda_fwd` /
 `chunk_kda_bwd` allocate only their outputs and the saved set when given one,
-and without one each call allocates a workspace of its own.  Buffers whose
+and without one each call allocates a workspace of its own.  The arena is not
+initialized: every element a launch reads is written earlier in the same
+call, so the content at allocation never reaches a result (`zero_init=True`
+zero-fills it for diagnostics).  The autograd node of `chunk_kda` holds a
+caller's workspace only weakly: the backward runs in it while the caller
+keeps it, and a workspace dropped after the forward (a per-call one, or any
+workspace of a forward under non-reentrant `torch.utils.checkpoint`) is freed
+at once, the backward then allocating its own; after a checkpointed forward
+the node keeps no arena and no saved tensor alive.  Buffers whose
 lifetimes within one call are disjoint share a slot: the lifetime tables
 `cake_backend.SLOTS[mode]` (`fwd`, `bwd` for the saved-set paths, `replay`,
 and their `*_tape` forms) list every occupant with its `[first write, last
@@ -141,6 +150,167 @@ same call by their producer).  `backward=False` sizes the arena for the
 forward layout only; `save_mode="tape"` sizes it for the tape layouts (smaller
 arenas: `h` and `v_new` live in the saved set) and makes `"tape"` the default
 of the calls on it.
+
+### Lower-memory arena (`KdaArena`)
+
+The lower-memory arena option, off by default, shrinks the arena of a
+backward workspace; the gradients stay bitwise the same.
+`kda_train_arena(lean=False, tail_passes=1, batch_tokens=None,
+max_docs_per_batch=None)` in `flashinfer/kda_train.py` returns a `KdaArena`, a
+frozen dataclass with those four fields (`tail_passes >= 1`; `tail_passes > 1`
+implies `lean=True`; the two batching fields are described below), which
+`kda_train_workspace(...)`, `kda_train_workspace_bytes(...)`,
+`chunk_kda_fwd`, `chunk_kda_bwd` and `chunk_kda` take as the keyword-only
+`arena=`.  `None` takes the workspace's option (off without one); an option
+different from a given workspace's is refused with `ValueError`.  A workspace
+keeps its option as `arena_option` (its `arena` stays the `uint8` tensor).
+The autograd node of `chunk_kda` records the option, so a backward that
+allocates its own workspace (after a per-call forward, or a forward under
+non-reentrant `torch.utils.checkpoint`) uses the same one.  The forward's
+layout is the same under every option and smaller than the lean backward
+layouts (2560 B per internal token-head against at least 2820 in the light
+form), so the option changes nothing about the forward or the saved set.
+
+```python
+arena = kda_train_arena(lean=True, tail_passes=4)                # lean layouts, four tail passes
+nbytes = kda_train_workspace_bytes(S, num_docs, H, arena=arena)  # the arena it allocates
+ws = kda_train_workspace(S, num_docs, H, device, arena=arena)    # caller-owned, reused
+out = chunk_kda(q, k, v, g, beta, cu_seqlens, workspace=ws)      # the default arena's gradients, bitwise
+```
+
+`lean=True` sizes a backward workspace for the saved-set paths alone: the
+layouts `bwd_lean` / `bwd_tape_lean` (`cake_backend.LEAN_MODES`) take the
+place of the larger of the saved-set and replay layouts and drop the replay
+prep's internal `dout` copy (`do_int`).  Such a workspace serves no checkpoint
+replay: `chunk_kda_bwd` with `saved=None` raises `ValueError` on it.
+`torch.utils.checkpoint` is unaffected, since the node's backward always reads
+the recomputed saved set, never the replay path.  A lean arena also refuses
+the rows whose backward dispatches the separate dA / dv program `dav` (9 to 15
+heads) with `ValueError` when a backward workspace is built and in the byte
+queries; it serves the contract's head counts 1, 2, 4, 8, 16, 32 and 64.
+
+`tail_passes = B` runs the three chunk-parallel tail stages of the backward
+(the fused gradient `dqkg`, GLM intra `glm_intra` and the gate epilogue
+`gate_epilogue`: launch steps 6 to 8 of the backward's lifetime tables) once
+per range of `ceil(NC_pad / B)` chunks.  Each pass takes views of the
+whole-sequence buffers (`gk`, `v_new`, `dv2`, `beta_int`, the `h` / `dh`
+tapes) offset to the range's first chunk, the range's slices of the chunk
+tables and the per-pass buffers (`dq_f`, `dk_f`, `dg_f`, `db_f`, `dAkk`,
+`dAqk`, `dg_int`, `db_int`), which are sized for one range; the token tensors
+(`q`, `k`, `v`, `dout`, the saved `Aqk` / `Akk`, the gradients) are passed
+whole, every kernel reaching them through the absolute `chunk_bos` offsets.
+The same kernels address the same bytes as in one pass, so the gradients are
+bitwise those of the default arena; the cost is `B - 1` more launches per tail
+stage and the speed lost to their smaller grids.
+
+Sizes are in bytes per internal token-head (one of the `R = 64 * NC_pad`
+padded rows times one head), plus, on the segmented route, FP32 state blocks
+of `block = NSEG * H * 64 KiB` each.  A default backward workspace takes the
+larger of the saved-set layout (4360; tape 3592) and the replay layout (4488;
+tape 3720); one lean pass gives
+`4108 * R * H + max(0, 3 * block - 256 * R * H)` bytes (tape 3340), the three
+state blocks sharing a slot of 256 B per internal token-head as in the
+default layouts.  From two passes on the whole-sequence set is 2820 (tape
+2052) and the per-pass set, 2568 B per internal token-head of one range, is
+packed first-fit into the two whole-sequence slots that are dead before the
+tail (`qg` / `kg`, 512, and `w`, 256); the rest goes to an overflow slot
+shared with the state blocks.  Two passes give
+`2820 * R * H + max(3 * block, 516 * R * H)` (3336; tape 2568), four or more
+`2820 * R * H + 3 * block + slack` (tape: 2052 in place of 2820), where
+`slack` is the ceil slack of the last range (the per-pass buffers are sized
+for `R_b = 64 * ceil(NC_pad / tail_passes)` rows; it is zero when
+`tail_passes` divides `NC_pad`); passes above four buy nothing more.  Against
+the default's 4488 the light constants are about 8 % (one pass), 26 % (two
+passes) and 37 % (four or more) smaller.  The table gives the constants; the
+state blocks and the slack come on top where the formulas say so:
+
+| arena | light: B per internal token-head | tape: B per internal token-head | checkpoint replay (`saved=None`) |
+|---|---|---|---|
+| default (`KdaArena()`) | 4488 | 3720 | yes |
+| `lean=True`, one pass | 4108 | 3340 | no |
+| `tail_passes=2` | 3336 | 2568 | no |
+| `tail_passes >= 4` | 2820 | 2052 | no |
+
+The byte queries take the option too: `kda_train_workspace_bytes(..., arena=)`
+and `cake_backend.workspace_bytes(..., arena=)` give the configured arena for
+any `tail_passes`, and `cake_backend.memory_report(..., arena=)` adds the
+fields `lean`, `tail_passes`, `arena_bwd_default`, `arena_bwd_configured`,
+`arena_fwd_configured` and `arena_floor` (`2820 * R * H + 3 * block`; 2052 in
+place of 2820 for the tape forms) and recomputes its totals with the
+configured backward arena (the replay total keeps the default's).
+`cake_backend.lifetime_table(mode, tail_passes, plan=)` renders the lean
+layouts: their per-pass rows carry `unit="R_b*H"`, and from two passes on a
+`plan` is required, since the packing depends on the problem's geometry.  The
+context-parallel (KCP) entry points do not take the option in this version.
+
+#### Document groups (`batch_tokens`)
+
+`kda_train_arena(batch_tokens=B, max_docs_per_batch=M)` (`M` optional and
+needs `B`) runs the forward and the backward over groups of whole, contiguous
+documents of at most `B` tokens and `M` documents each, one group after
+another, in an arena sized for the largest group instead of the whole pack.
+`cake_backend.doc_batches(doc_lengths, B, M)` is the partition: greedy from the
+first document; a zero-length document joins the group before it; a document
+longer than `B` is refused, so the budget's floor is the longest document.  The
+calls then take `doc_lengths`, the documents' token counts as host integers in
+`cu_seqlens` order (`len == num_docs`, `sum == S`): the host reads no tensor,
+so `cu_seqlens` cannot supply them, and a device-side comparison trips an
+asynchronous assertion when the two disagree.  `kda_train_workspace(...,
+arena=, doc_lengths=)` and `kda_train_workspace_bytes(..., arena=,
+doc_lengths=)` size the arena for the exact groups; without `doc_lengths` the
+arena takes the bound of every group, `64 * even(ceil(min(B, S) / 64) +
+num_docs)` internal rows and the whole problem's segment count, at most
+`num_docs` chunks and `(num_docs - N_b) * P` state blocks above the largest
+group's.  The autograd node records `doc_lengths` with the option, so a
+backward that allocates its own workspace is sized for the exact groups too.
+
+Each group runs the whole problem's launch list through a view of the arena
+(`KdaWorkspace.batch_view`): the group's slice of `cu_seqlens`; the group's own
+tables (the segmented route's forward intra program writes them, the row's
+table program otherwise, one more launch per group on the backward, whose
+saved tables describe the whole problem); the whole token tensors and
+gradients (every program reaches the tokens through the absolute `chunk_bos`
+offsets of its tables); the group's slices of a saved `h` / `v_new` tape; and
+its state blocks, recomputed in the view on the `light` and `replay` paths,
+gathered from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
+`light_states` and `tape`, and scattered back from the view when the forward
+saves them.  The records, the segment count per document (`P`, with the
+non-proportional block table) and the saved set are the whole problem's; the
+saving forward therefore writes the whole problem's tables once with the
+saved-set paths' table program (`table_v3` / `table_v2`) before its groups.
+The views share the arena, the `eye` / `flags` buffer and one epoch counter
+(the overlap pair's release flags are stamped with the epoch).  The results
+are bitwise the whole problem's with one caveat: the paired WY programs
+(`wy_fwd`, `wy_bwd`) load the two chunks of a pair into one operand and
+accumulate `0 * partner` for the other chunk's rows, so an exactly-zero entry
+of `u` / `w` in a chunk whose pair partner changed (a group starting at an odd
+chunk, or a pad partner) may change sign; the package's tests compare bit
+patterns on rows built for this case.  The option refuses the rows whose block
+table gives the documents proportional segment counts (`num_docs * H <= 4` on
+the segmented route: a group of fewer documents would change every document's
+segments) and, on a lean workspace, the checkpoint replay (`saved=None`); a
+batched workspace that is not lean runs the replay group by group.  The costs
+per group are a table launch, the gathers (three state blocks of the group,
+`batch_scratch` of `memory_report`) and the smaller grids; the serial route's
+chains of different groups run one group after another.
+
+```python
+arena = kda_train_arena(lean=True, tail_passes=4, batch_tokens=120_000)
+ws = kda_train_workspace(S, num_docs, H, device, arena=arena, doc_lengths=lengths)
+out = chunk_kda(q, k, v, g, beta, cu_seqlens, workspace=ws, doc_lengths=lengths)
+```
+
+`cake_backend.memory_report(..., arena=, doc_lengths=)` adds `batch_tokens`,
+`max_docs_per_batch`, `arena_bwd_bound_batched` (the bound of every group),
+`batches` (`(d0, d1, S, N)` per group), `largest_batch_rows`, `batch_scratch`
+and `arena_floor_batched` (one document per group under the lean four-pass
+layouts: `2820 * R_min * H + 3 * P * H * 64 KiB`, `R_min` the internal rows of
+the longest document; 2052 for the tape forms).  `cake_backend.arena_for_budget(
+plan, budget, doc_lengths=)` and `KdaWorkspace.for_budget(S, num_docs, H,
+device, arena_budget_bytes=, doc_lengths=)` return the first option that fits a
+byte budget: the default, lean, two tail passes, four, then four passes over
+groups halving from half the pack down to one document per group (the rows
+that refuse an option skip it).
 
 ## Kernel structure of one training step
 
@@ -307,7 +477,8 @@ the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 The packed batch of one training step may be split over the ranks of a
 `torch.distributed` process group.  `kcp_partition` cuts the documents into
 per-rank fragments (`"contiguous"`, `"zigzag"` or `"zigzag_per_document"`
-layouts, or explicit cut points); `build_kcp_context` gives every rank the
+layouts, an explicit `fragments` table, or `cut_points` with the
+`"zigzag_per_document"` layout); `build_kcp_context` gives every rank the
 device tables of its fragments, the collectives that carry the per-document
 state recurrences and the convolution's history rows across the rank
 boundaries, and the segment plan of its fragment walks.  The per-rank entry
@@ -330,9 +501,11 @@ dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, be
                                           dout_local, saved=saved)
 ```
 
-CUDA-graph replay: every KCP entry point -- `chunk_kda_kcp`,
-`chunk_kda_kcp_fwd`, `chunk_kda_kcp_bwd` and `cake_causal_conv1d_kcp` -- takes
-`graph="replay"` (default `"off"`, the eager path). The first call of a
+CUDA-graph replay: the three KDA entry points -- `chunk_kda_kcp`,
+`chunk_kda_kcp_fwd` and `chunk_kda_kcp_bwd` -- take `graph="replay"`
+(default `"off"`, the eager path); the convolution halo takes `graph=` only
+through the backend module's function, the `cake_causal_conv1d_kcp` facade
+has no such parameter. The first call of a
 validity key runs eagerly, the second is captured into a CUDA graph and every
 later call of the key replays it: the same launches and collectives, bitwise
 the eager result, with no host work between them. The key is the call's kind,
@@ -347,17 +520,25 @@ and `LAST_CALL[kind]["graph_event"]` say what happened; a capture failure
 disables that key for the process), `exchange="ring"`, `debug_sequence` and
 calls without a caller-owned workspace are never captured. Memory: every
 cached key pins a private memory pool -- 0.7-9.0 GiB per rank per key on the
-the A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
-B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (LRU). Call
+A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
+B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (the oldest key is
+evicted). Call
 `graph_cache_clear()` (both modules) before
 `torch.distributed.destroy_process_group()` and whenever a layer's operands
-are gone for good. A captured call runs its one-CTA-per-SM tape programs
-without the device cache-config bracket of the shipped walk geometry (the
-bracket cannot be issued inside a capture): on the CP8 / CP16 rows replay is
-still 1.9-9.1 % faster than the eager default, on the CP4 row 1.3-2.3 % slower
-(the eager default keeps the full geometry gain; `graph="off"` is the shipped
-default). The A/B record was taken with pointer-stable harness inputs; its
-gain is an upper bound of what a framework sees.
+are gone for good. A replayed call keeps the tape programs at one CTA per SM:
+the device cache-config bracket of the eager path cannot be issued inside a
+capture, so right after each tape launch is captured the host sets the
+preferred shared-memory carveout as a launch attribute of the kernel node it
+just added (`cudaStreamGetCaptureInfo` + `cudaGraphKernelNodeSetAttribute`,
+host-only `ctypes` calls into the runtime that is already loaded) and the
+replayed graph carries the cap itself. Without those entry points, or when the
+runtime cannot name the captured node, the capture continues without the cap
+after one warning (`LAST_CALL[kind]["cache_config"] == "unavailable"`); the
+results are bitwise identical either way. The previous replay form stays
+reachable for A/B records through the private test knob `graph_cap`
+(`CAKE_KCP_TEST_KNOBS=1`); `graph="off"` is the shipped default. The A/B
+record was taken with pointer-stable harness inputs; its gain is an upper
+bound of what a framework sees.
 
 Limits of a partition: at most 65536 fragments per rank (the layout table's
 document search), at most 64 segments per fragment and no walk chain longer
@@ -366,6 +547,19 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 `kcp_comm_bytes(ctx, H=..., C=...)` size the rank's workspace, saved set and
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
+
+Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
+(the initial states of its fragments), with `save_transfer` the owner's c1
+receive tensor and `M_seg`, on a rank whose fragments are split into `P > 1`
+segments the forward's carry plane (the saved-mode backward replays its tape
+from it instead of re-walking the segments and re-merging the carries; the
+private test knob `saved_carry=0` selects the re-walk), and the call's
+scalars; the int32 tables are rebuilt from the context.  The token-row `Aqk` /
+`Akk` of the single-rank saved set are not part of it: the backward recomputes
+the internal rows in both modes (saved set and checkpoint replay run the same
+local programs), so `kcp_saved_bytes` counts the tables, `S_in`, the
+`save_transfer` tensors and the carry plane (and the convolution's history
+rows with `with_conv`).
 
 Walk-launch geometry: the walk kernels' CTA lists are issued
 longest-segment-first and the two tape programs (`fwdh_tape`, `dhu_tape`) run
@@ -378,6 +572,19 @@ itself (occupancy only -- results never depend on the geometry). The earlier
 geometry stays reachable for A/B records through the private test knob
 `walk_geometry` (`CAKE_KCP_TEST_KNOBS=1`).
 
+Host path: the eager KCP calls reuse the call-independent host work -- the
+validated options, the workspace's last tables and pool views, the local
+stages' launch templates and the table set's own device tables -- keyed on
+object identity plus host integers and bounded (`ID_CACHE_MAX = 256` entries
+per table-set cache; the conv halo module keeps at most `HOST_CACHE_MAX = 64`
+contexts). The launch templates live on the workspace's local arena and
+reference the table set only weakly, so a training loop that builds a new
+context and workspace per step releases everything with them. The kernels,
+their arguments and their order are unchanged, so the results are bitwise
+those of the previous host path, which stays reachable for A/B records
+through the private test knob `host_trim` (`CAKE_KCP_TEST_KNOBS=1`; the conv
+module's `_set_test_knobs({"host_trim": 0})`).
+
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
 exchange -- the default with the all-to-all exchange (an earlier revision).
@@ -387,22 +594,35 @@ automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
-chain cap the equal-segment wave rule, below it on one-fragment ranks the
+chain cap the equal-segment wave rule on ranks with at most three fragments,
+below it on one-fragment ranks the
 largest `P` that runs one CTA per SM (`floor(SM / H)`), on every other rank
-one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`);
-`ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1"`).
+one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`) -- except that a rank
+with two or three fragments below the cap whose `P = 1` walks run one wave
+(`n_frag H <= SM`) takes `P = 1` when the longest-processing-time makespan of
+its actual fragment chunk counts at `P = 1` is not above the makespan at the
+occupancy `P` (such a rank runs no segment composition and no backward
+re-walk; at H = 64 on 152 SMs equal two-fragment ranks tie, unequal ones
+keep `P > 1`);
+`ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1_p1tie"`). The
+previous rules stay selectable through the private test knob `p_rule`, as
+does the fused form of the carry merges (`merge_fuse="carry"`: the two carry
+families of a phase in one launch; off by default).
 
 The KCP kernels live beside the single-rank programs:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the seven KCP programs (the
+* `cake_kcp_jit.py` -- the `MODULES` registry of the nine KCP programs (the
   fragment walks of the forward and backward state recurrences in their
-  `offset` and `tape` forms, the TF32 hi/lo transfer walk and the affine
-  merge at `cols_per_cta` 8 and 16; selection by `always` or by `columns` on
-  the merge's `ncols`, grids by `kcp_segments_heads` or `kcp_chains`), the
-  logical vocabulary of the KCP arguments, and `run_program(name, args,
-  device_index=)`, the lowering of the host backend's walk and merge requests
-  to the registry's launches.  Its `TEST_MODULES` are test-only programs of
-  `build.test.json` (below).
+  `offset` and `tape` forms, the TF32 hi/lo transfer walk, the affine
+  merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
+  context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
+  `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
+  `kcp_chains`, `kcp_sm_bounded` or `kcp_pairs`), the logical vocabulary of
+  the KCP arguments, `run_program(name, args, device_index=)`, the lowering
+  of the host backend's walk and merge requests to the registry's launches,
+  and `run_module` for the two chunk stages.  Its `TEST_MODULES` are
+  test-only programs of `build.test.json` (below).
 * `cake_kcp_plan.py` -- the partition, the segment plan and the context's
   tables and collectives, with the byte queries.
 * `cake_kcp.py` -- the per-rank launch sequences, the saved set and workspace
@@ -415,7 +635,7 @@ The KCP kernels live beside the single-rank programs:
   entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
   also admits the test knobs (`precision_mode`, `transfer_walk`) of the
   package's own tests; without the file those tests skip.
-* `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the eleven KCP
+* `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the thirteen KCP
   programs, rendered like the single-rank ones (digests in `build.json` and
   `build.test.json`).
 

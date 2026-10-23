@@ -66,7 +66,7 @@ not FP32 partials).
 
 import logging
 import tempfile
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 import cutlass
 import cutlass.cute as cute
@@ -1571,6 +1571,8 @@ class _Ws:
     dev_ord = 0
     group = None
     scratch: tuple[torch.Tensor, torch.Tensor] | None = None
+    backend = "auto"
+    cake: Any = None
 
 
 _WS = _Ws()
@@ -1599,32 +1601,84 @@ class _WorkspaceAddresses(TypedDict):
 _PROGRAMS: dict[tuple, "_Program"] = {}
 
 
-def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
+_BACKENDS = ("auto", "cake", "cute")
+
+
+def _check_backend(backend: str) -> None:
+    if backend not in _BACKENDS:
+        raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
+
+
+def init_tp_moe_finalize_rmsnorm(group=None, backend: str = "auto") -> bool:
     """Collectively initialize the process-wide TP multicast workspace.
 
     ``group`` is the exact tensor-parallel group. Its size must exceed one and
     evenly divide ``K_EXPERTS``. The default process group is used when it is
-    omitted. Availability is reduced across the group, so every rank returns
-    the same verdict.
+    omitted. ``backend`` selects the kernels the group is prepared for:
+    ``"cute"`` the CuTe DSL kernels of this module, ``"cake"`` the Cake kernels
+    of :mod:`flashinfer.cake_tp_moe_finalize_rmsnorm_backend`, ``"auto"`` both
+    (a call then runs the Cake kernels where a Cake program serves its token
+    count on this architecture and world size, the CuTe kernels otherwise).
+    Availability is reduced across the group, so every rank returns the same
+    verdict: whether a prepared backend serves the group.
     """
+    _check_backend(backend)
     if _WS.initialized:
         if group is not None and group is not _WS.group:
             raise RuntimeError(
                 "TP MoE finalize is already initialized for another group"
             )
-        return _WS.available
+        if backend != _WS.backend:
+            raise RuntimeError(
+                f"TP MoE finalize is already initialized with backend {_WS.backend!r}"
+            )
+        return _WS.available or _WS.cake is not None
 
     import torch.distributed as dist
 
     if group is None:
         group = dist.group.WORLD
     _WS.group = group
+    _WS.backend = backend
     world_size = dist.get_world_size(group)
     if world_size <= 1 or K_EXPERTS % world_size != 0:
         _WS.initialized = True
         return False
 
     device = torch.device("cuda", torch.accelerator.current_device_index())
+    _WS.dev_ord = torch.cuda.current_device()
+    _WS.ws = world_size
+    _WS.rank = dist.get_rank(group)
+    if backend != "cake":
+        _WS.available = _init_cute(group, device, world_size)
+    if backend != "cute":
+        _WS.cake = _init_cake(group, device)
+    _WS.initialized = True
+    return _WS.available or _WS.cake is not None
+
+
+def _init_cake(group, device):
+    """The Cake backend of ``group``, or ``None`` when its kernels cannot serve
+    it (every rank agrees on the verdict)."""
+    try:
+        from ..cake_tp_moe_finalize_rmsnorm_backend.cake_backend import (
+            CakeTpMoeFinalize,
+        )
+    except ImportError as error:
+        importable = False
+        logger.warning("The Cake TP MoE finalize backend does not import: %s", error)
+    else:
+        importable = True
+    if not collective_support(importable, group, device):
+        return None
+    return CakeTpMoeFinalize.initialize(group, device=device)
+
+
+def _init_cute(group, device, world_size) -> bool:
+    """The CuTe kernels' workspace of ``group`` (every rank agrees on the
+    verdict)."""
+    import torch.distributed as dist
+
     props = torch.cuda.get_device_properties(device)
     capability = (props.major, props.minor)
     local_supported = (
@@ -1647,7 +1701,6 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
                 "TP MoE finalize is unavailable because another rank does not "
                 "satisfy the device or workspace-slot contract."
             )
-        _WS.initialized = True
         return False
 
     sm_count = torch.tensor(
@@ -1655,9 +1708,6 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     )
     dist.all_reduce(sm_count, op=dist.ReduceOp.MIN, group=group)
     _WS.nsm = int(sm_count.item())
-    _WS.dev_ord = torch.cuda.current_device()
-    _WS.ws = world_size
-    _WS.rank = dist.get_rank(group)
 
     import torch.distributed._symmetric_memory as symm_mem
 
@@ -1705,7 +1755,6 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
                 "TP MoE finalize is unavailable because another rank could not "
                 "allocate its workspace."
             )
-        _WS.initialized = True
         return False
     assert lam is not None and generation is not None and scratch is not None
     lam[:a_i32].fill_(SENT_A_I32)
@@ -1732,7 +1781,6 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
                 "TP MoE finalize is unavailable because another rank has no "
                 "NVLink multicast mapping."
             )
-        _WS.initialized = True
         return False
     _WS.use_mc = True
     try:
@@ -1766,8 +1814,6 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     }
     torch.accelerator.synchronize(device)
     dist.barrier(group=group)
-    _WS.available = True
-    _WS.initialized = True
     return True
 
 
@@ -2025,10 +2071,20 @@ def supports_tp_moe_finalize_rmsnorm(
     expanded_idx_to_permuted_idx: torch.Tensor,
     norm_weight: torch.Tensor,
     output: torch.Tensor,
+    backend: str = "auto",
 ) -> bool:
-    """Return whether tensors satisfy the TP SM100/SM103/SM107 kernel contract."""
+    """Return whether tensors satisfy the TP SM100/SM103/SM107 kernel contract
+    and ``backend`` (``"auto"``, ``"cake"`` or ``"cute"``) is prepared for the
+    group (:func:`init_tp_moe_finalize_rmsnorm`)."""
+    _check_backend(backend)
+    if backend == "cute":
+        available = _WS.available
+    elif backend == "cake":
+        available = _WS.cake is not None
+    else:
+        available = _WS.available or _WS.cake is not None
     if (
-        not _WS.available
+        not available
         or gemm2_permuted.ndim != 2
         or expert_weights.ndim != 2
         or expanded_idx_to_permuted_idx.ndim != 2
@@ -2087,15 +2143,49 @@ def _tp_moe_finalize_impl(
     eps: float,
     gain_center: float,
     weight_before_norm: bool,
+    backend: str = "auto",
 ) -> None:
+    _check_backend(backend)
+    if backend == "cake" and _WS.cake is None:
+        raise RuntimeError(
+            "the Cake TP MoE finalize backend is not prepared for this group: "
+            "init_tp_moe_finalize_rmsnorm(group, backend=...) found no Cake "
+            "program for this architecture and world size"
+        )
     if not supports_tp_moe_finalize_rmsnorm(
         gemm2_permuted,
         expert_weights,
         expanded_idx_to_permuted_idx,
         norm_weight,
         output,
+        backend=backend,
     ):
         raise ValueError("tensors do not satisfy the TP MoE finalize contract")
+    if backend != "cute" and _WS.cake is not None:
+        n_tok = expanded_idx_to_permuted_idx.shape[0]
+        if n_tok == 0:
+            return
+        try:
+            name, grid = _WS.cake.route_for(n_tok)
+        except LookupError as reason:
+            if backend == "cake" or not _WS.available:
+                raise RuntimeError(
+                    f"no Cake TP MoE finalize program serves {n_tok} tokens: {reason}"
+                ) from None
+        else:
+            _WS.cake.run(
+                name,
+                grid,
+                gemm2_permuted,
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                norm_weight,
+                output,
+                eps=eps,
+                gain_center=gain_center,
+                weight_before_norm=weight_before_norm,
+            )
+            return
     _run(
         gemm2_permuted,
         expert_weights,
@@ -2117,6 +2207,7 @@ def _tp_moe_finalize_fake(
     eps: float,
     gain_center: float,
     weight_before_norm: bool,
+    backend: str = "auto",
 ) -> None:
     return None
 
@@ -2140,6 +2231,7 @@ def tp_moe_finalize_rmsnorm(
     eps: float,
     gain_center: float,
     weight_before_norm: bool,
+    backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> None:
     """TP MoE finalize plus per-expert RMSNorm, for hidden size 4096 and top-k 8.
 
@@ -2182,6 +2274,14 @@ def tp_moe_finalize_rmsnorm(
     weight_before_norm : bool
         Whether ``norm_weight`` scales the activations before the RMS reduction
         instead of after normalization.
+    backend : str
+        ``"auto"`` (default) runs the Cake kernels of
+        :mod:`flashinfer.cake_tp_moe_finalize_rmsnorm_backend` where a Cake
+        program serves the token count on this architecture and world size and
+        the CuTe DSL kernels otherwise; ``"cake"`` requires a Cake program and
+        raises ``RuntimeError`` when none serves the call; ``"cute"`` runs the
+        CuTe DSL kernels.  The group must have been initialized with a
+        compatible ``backend`` (``"auto"`` prepares both).
 
     All tensors must be contiguous (except the padded ``gemm2_permuted``),
     16-byte aligned, and on the device the workspace was initialized on.
@@ -2195,4 +2295,5 @@ def tp_moe_finalize_rmsnorm(
         eps,
         gain_center,
         weight_before_norm,
+        backend,
     )

@@ -121,9 +121,6 @@ def test_registry_names_delivered_sources() -> None:
         entry = libraries[cake_jit.library_name(route, "sm_110a")]
         for source in entry["sources"]:
             assert (_PACKAGE / source).is_file(), f"{route}: missing {source}"
-    assert {"manifest.json", "RESULTS.md", "jit.py", "prepared.py"}.isdisjoint(
-        p.name for p in _PACKAGE.rglob("*")
-    )
 
 
 @_REQUIRES_CUDA

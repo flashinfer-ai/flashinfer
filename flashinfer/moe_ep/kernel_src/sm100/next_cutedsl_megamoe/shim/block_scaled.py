@@ -14,6 +14,8 @@ from typing import Any, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 from . import comm
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
@@ -86,6 +88,7 @@ def _max_active_clusters(cluster_size: int) -> int:
     return cached
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class BlockScaledMoeConfig:
     """Validated construction parameters for block-scaled inference and GenPhase."""
@@ -116,7 +119,7 @@ class BlockScaledMoeConfig:
     gate_up_clamp: Optional[float] = None
     reduce_topk_in_kernel: bool = False
     token_back_mode: BlockScaledTokenBackMode = "epi_warps"
-    apply_topk_at_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     max_sm_count: Optional[int] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
@@ -170,7 +173,11 @@ class BlockScaledMoeConfig:
                 raise ValueError(f"{name} must be a positive Python integer.")
         if type(self.rank) is not int or not (0 <= self.rank < self.world_size):
             raise ValueError(f"invalid rank/world_size {self.rank}/{self.world_size}.")
-        for name in ("fc2_use_bulk", "reduce_topk_in_kernel", "apply_topk_at_fc1"):
+        for name in (
+            "fc2_use_bulk",
+            "reduce_topk_in_kernel",
+            "apply_routing_weights_before_fc2",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a Python bool.")
         if self.num_total_experts > 16384:
@@ -332,10 +339,11 @@ class BlockScaledMoeConfig:
                 f"fc2_tma_stages must be in [1, {tiler[1] // 64}] for tiler N "
                 f"{tiler[1]}."
             )
-        if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
+        if self.reduce_topk_in_kernel and not self.apply_routing_weights_before_fc2:
             raise ValueError(
-                "reduce_topk_in_kernel requires apply_topk_at_fc1=True (the "
-                "in-kernel reduce red-adds already-weighted terms)."
+                "reduce_topk_in_kernel requires "
+                "apply_routing_weights_before_fc2=True (the in-kernel reduce "
+                "red-adds already-weighted terms)."
             )
 
         if self.kernel_variant == "genphase":
@@ -566,11 +574,10 @@ class BlockScaledSymmBuffer:
     @classmethod
     def _build_kernel(cls, cfg: BlockScaledMoeConfig):
         import cutlass
-        from cutlass.cute.nvgpu import OperandMajorMode
-
         from blackwell_genphase_sources import BlackwellInferenceGenphaseMegaMoE
         from blackwell_genphase_sources.api import ImplDesc, ProblemDesc
         from blackwell_genphase_sources.quant_def import CombineFormat
+        from cutlass.cute.nvgpu import OperandMajorMode
 
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
@@ -634,7 +641,7 @@ class BlockScaledSymmBuffer:
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
                 "max_tokens_per_rank": cfg.padded_tokens_per_rank,
-                "apply_topk_at_fc1": cfg.apply_topk_at_fc1,
+                "apply_topk_at_fc1": cfg.apply_routing_weights_before_fc2,
             }
         )
         impl_fields = {
