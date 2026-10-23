@@ -131,6 +131,20 @@ context-parallel window):
   flashinfer's public wrapper `flashinfer.dsa_sparse_attention` maps
   `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` onto the keyword when the caller leaves
   it at `None`.
+* Through the autograd entries `dkv_acc` may also be a zero-argument callable
+  that returns the accumulator, or an `(accumulator, dkv_dst_map)` pair; the
+  backward calls it, so the buffer need not exist at forward time (a callable's
+  result is validated in the backward, where `check_dst_map` then
+  synchronizes).  The autograd `Function`s save every tensor their forward
+  produces for the backward -- `out`, `lse`, `o_lo`, the index rows, the
+  lengths -- through `ctx.save_for_backward` (a fixed list with a zero-size
+  placeholder for an absent `topk_length`, so non-reentrant
+  `torch.utils.checkpoint` can match the recomputed tensors by position) and
+  keep nothing else of size on `ctx`: after a checkpointed forward the entries
+  retain ~0 MiB (flashinfer-ai/flashinfer#7039).  A tensor `dkv_acc` (and
+  `dkv_dst_map`) is caller-owned and stays on the autograd node as before,
+  outside the saved list: zeroing or otherwise touching it in place between
+  the forward and the backward is fine.
 * With `dkv_acc` the backward returns `(dq_latent, dq_rope, None, None)`, the
   autograd wrapper returns `None` gradients for `kv_latent` / `k_rope`, and
   `dkv_fp32=True` is rejected.  The kernels' permuted FP32 accumulators remain
@@ -346,7 +360,14 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   paths and `None` for `dkv`; chunked backward passes of one long row sum into
   one buffer without intermediate rounding.  Through autograd without
   `dkv_acc`, the FP32 `dkv` becomes the `kv` gradient and the autograd engine
-  casts it to the leaf's dtype (BF16 for a BF16 leaf).
+  casts it to the leaf's dtype (BF16 for a BF16 leaf); `dkv_acc` may be the
+  tensor or a zero-argument callable producing it (or an `(accumulator,
+  dkv_dst_map)` pair) at backward time, as for the rope entries.  Both NoPE
+  autograd `Function`s save every produced backward operand -- the saved
+  outputs, `o_lo`, the global index rows, the lengths -- through
+  `ctx.save_for_backward` (seven tensors in a fixed order) and keep only
+  options, geometry keys and the caller-owned accumulator on `ctx`, so a
+  checkpointed forward retains nothing (flashinfer-ai/flashinfer#7039).
 * `dout` may be a head-major view (strides `[512, T * 512, 1]`) or any strided
   `[T, 64, 512]` view under the layout rules of `q` (unit channel stride, token
   and head strides multiples of 8 elements, 16-byte base): it is read in place

@@ -63,7 +63,7 @@ import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, TypeVar, overload
+from typing import Any, Callable, Optional, TypeVar, Union, overload
 
 import torch
 import tvm_ffi
@@ -831,10 +831,63 @@ def _check_dkv_acc(
                 f"dkv_dst_map values must lie in [0, {num_rows}) (the rows of dkv_acc); "
                 f"got min {int(dkv_dst_map.min())}, max {int(dkv_dst_map.max())}"
             )
+    return _dkv_acc_operand(dkv_acc), row_stride
+
+
+def _dkv_acc_operand(dkv_acc: torch.Tensor) -> torch.Tensor:
+    """The raw-pointer operand of a validated accumulator (:func:`_check_dkv_acc`): the tensor itself when
+    contiguous, else the flat stride-1 alias over the rows it spans."""
     if dkv_acc.is_contiguous():
-        return dkv_acc, row_stride
+        return dkv_acc
+    row_stride = int(dkv_acc.stride(0))
     span = (int(dkv_acc.shape[0]) - 1) * row_stride + int(dkv_acc.shape[1])
-    return dkv_acc.as_strided((span,), (1,), dkv_acc.storage_offset()), row_stride
+    return dkv_acc.as_strided((span,), (1,), dkv_acc.storage_offset())
+
+
+# The autograd entries take ``dkv_acc`` as a tensor or as a zero-argument callable that produces it at backward
+# time (``DkvAccSource``): under activation checkpointing a tensor passed at forward time exists for every layer
+# at once, a deferred accumulator only while its backward runs.
+DkvAccSource = Union[
+    torch.Tensor,
+    Callable[[], Union[torch.Tensor, tuple[torch.Tensor, Optional[torch.Tensor]]]],
+]
+
+
+def _resolve_dkv_acc(
+    dkv_acc: Optional[DkvAccSource], dkv_dst_map: Optional[torch.Tensor]
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(dkv_acc, dkv_dst_map)`` as tensors: a tensor ``dkv_acc`` passes through; a callable is called now (at
+    backward time) and returns the accumulator or an ``(accumulator, dkv_dst_map)`` pair -- a pair's map must not be
+    given twice.  Validation (:func:`_check_dkv_acc`) is the caller's."""
+    if dkv_acc is None or isinstance(dkv_acc, torch.Tensor):
+        return dkv_acc, dkv_dst_map
+    if not callable(dkv_acc):
+        raise TypeError(
+            "dkv_acc must be a float32 tensor or a zero-argument callable returning it"
+        )
+    produced = dkv_acc()
+    if isinstance(produced, tuple):
+        if len(produced) != 2:
+            raise ValueError(
+                "a dkv_acc callable returns the accumulator or an (accumulator, dkv_dst_map) pair"
+            )
+        produced, companion = produced
+        if companion is not None:
+            if dkv_dst_map is not None:
+                raise ValueError(
+                    "dkv_dst_map was given both as an argument and by the dkv_acc callable"
+                )
+            dkv_dst_map = companion
+    if not isinstance(produced, torch.Tensor):
+        raise ValueError("the dkv_acc callable must return a float32 tensor")
+    return produced, dkv_dst_map
+
+
+def _saved_optional(t: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+    """``t`` for ``ctx.save_for_backward``, or a zero-size placeholder on ``like``'s device when absent: the saved
+    list keeps one fixed length and order (non-reentrant checkpointing matches recomputed saved tensors by
+    position), and the presence flags travel separately."""
+    return t if t is not None else like.new_empty(0)
 
 
 # ---------------------------------------------------------------------------
@@ -2731,10 +2784,17 @@ def backward(
 class DSASparseAttentionFunction(torch.autograd.Function):
     """Autograd wrapper: saves ``out``, ``o_lo``, ``lse`` and the inputs for the backward.
 
-    ``dkv_acc`` / ``dkv_dst_map`` (see :func:`backward`): the backward accumulates the dK/dV gradients into the
-    caller's packed FP32 buffer and returns no gradient for ``kv_latent`` / ``k_rope``.  ``dkv_direct`` (default
-    ``None``: the record's size rule; ``True`` / ``False`` force / disable the direct path) and ``check_dst_map``
-    (default ``False``; ``True`` validates the map's values in the backward) are handed to :func:`backward`.
+    Every tensor the forward produces or consumes for the backward goes through ``ctx.save_for_backward`` (nine
+    tensors in a fixed order, a zero-size placeholder for an absent ``topk_length``): under non-reentrant
+    activation checkpointing they are released after the forward and recomputed, and nothing else of size is kept
+    on ``ctx``.  ``dkv_acc`` / ``dkv_dst_map`` (see :func:`backward`): the backward accumulates the dK/dV gradients
+    into the caller's packed FP32 buffer and returns no gradient for ``kv_latent`` / ``k_rope``; ``dkv_acc`` is a
+    tensor (caller-owned: validated here and kept on ``ctx`` as before, free to be zeroed in place between the
+    forward and the backward) or a zero-argument callable producing it (or an ``(accumulator, dkv_dst_map)`` pair)
+    at backward time, so the accumulator need not exist at forward time (:data:`DkvAccSource`; a callable's result
+    is validated in the backward).  ``dkv_direct`` (default ``None``: the record's size rule; ``True`` /
+    ``False`` force / disable the direct path) and ``check_dst_map`` (default ``False``; ``True`` validates the
+    map's values in the backward) are handed to :func:`backward`.
     """
 
     @staticmethod
@@ -2772,15 +2832,35 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         ctx.key_passes = key_passes
         ctx.num_segments = int(num_segments)
         ctx.has_topk_length = topk_length is not None
-        # The packed accumulator is mutated in place by the backward (+=), so it is kept on ctx rather than saved: a
-        # saved tensor's version check would reject that mutation when the graph is retained for another backward.
-        ctx.dkv_acc = dkv_acc
-        ctx.dkv_dst_map = dkv_dst_map
         ctx.dkv_direct = dkv_direct
         ctx.check_dst_map = check_dst_map
-        saved = [q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo]
-        saved.append(topk_length if topk_length is not None else indices.new_empty(0))
-        ctx.save_for_backward(*saved)
+        if dkv_dst_map is not None and dkv_acc is None:
+            raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
+        # A tensor accumulator is validated now and kept on ``ctx`` as before (caller-owned, outside the saved list:
+        # the checkpoint frame holds the Function's inputs anyway, and no version counter is involved).  A callable
+        # (no tensor yet) is kept as the zero-size state it is and resolved in the backward; ``check_dst_map`` then
+        # synchronizes there.
+        acc_tensor = dkv_acc if isinstance(dkv_acc, torch.Tensor) else None
+        if acc_tensor is not None:
+            _check_dkv_acc(acc_tensor, dkv_dst_map, int(kv_latent.shape[0]))
+        elif dkv_acc is not None and not callable(dkv_acc):
+            raise TypeError(
+                "dkv_acc must be a float32 tensor or a zero-argument callable returning it"
+            )
+        ctx.dkv_acc = acc_tensor
+        ctx.dkv_dst_map = dkv_dst_map
+        ctx.dkv_acc_source = None if acc_tensor is not None else dkv_acc
+        ctx.save_for_backward(
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            out,
+            lse,
+            o_lo,
+            _saved_optional(topk_length, indices),
+        )
         return out, lse
 
     @staticmethod
@@ -2791,8 +2871,20 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             )
         if dout is None:  # out unused downstream
             return (None,) * 14
-        q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = (
-            ctx.saved_tensors
+        (
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            out,
+            lse,
+            o_lo,
+            topk_length,
+        ) = ctx.saved_tensors
+        dkv_acc, dkv_dst_map = _resolve_dkv_acc(
+            ctx.dkv_acc if ctx.dkv_acc is not None else ctx.dkv_acc_source,
+            ctx.dkv_dst_map,
         )
         dq_latent, dq_rope, dkv_latent, dk_rope = backward(
             q_latent,
@@ -2807,8 +2899,8 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             topk_length=topk_length if ctx.has_topk_length else None,
             softmax_scale=ctx.softmax_scale,
             key_passes=ctx.key_passes,
-            dkv_acc=ctx.dkv_acc,
-            dkv_dst_map=ctx.dkv_dst_map,
+            dkv_acc=dkv_acc,
+            dkv_dst_map=dkv_dst_map,
             num_segments=ctx.num_segments,
             dkv_direct=ctx.dkv_direct,
             check_dst_map=ctx.check_dst_map,
@@ -2828,7 +2920,7 @@ def dsa_sparse_attention(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
     dkv_direct: Optional[bool] = None,
@@ -2843,7 +2935,15 @@ def dsa_sparse_attention(
     FP32 ``[S_dst, >= 576]`` accumulated in place: latent columns ``0:512``,
     rope ``512:576``) and ``dkv_dst_map`` (int32 ``[S]`` destination row per
     key row, default identity) are handed to the backward; with ``dkv_acc``
-    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``dkv_direct``
+    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``dkv_acc`` may
+    also be a zero-argument callable that the backward calls for the
+    accumulator -- or for an ``(accumulator, dkv_dst_map)`` pair -- so that it
+    need not exist at forward time (:data:`DkvAccSource`; under activation
+    checkpointing a tensor passed at forward time is alive for every layer at
+    once, a deferred one only during its backward).  Every tensor this call
+    produces for the backward is saved through ``ctx.save_for_backward``; a
+    tensor ``dkv_acc`` stays caller-owned on the node: a checkpointed forward
+    retains nothing of this call.  ``dkv_direct``
     (default ``None``: the record's size rule; ``True`` / ``False`` force /
     disable the direct accumulation of a ``dkv_acc`` binding) and
     ``check_dst_map`` (default ``False``; ``True`` validates the values of
@@ -2902,7 +3002,7 @@ def dsa_sparse_attention_varlen(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
@@ -3987,17 +4087,21 @@ def backward_nope(
 
 
 class DSASparseAttentionNopeFunction(torch.autograd.Function):
-    """Autograd wrapper of the NoPE program: saves ``q_latent``, ``kv_latent``, ``out`` and ``lse`` for the backward
-    and settles the rest of it at forward time (:class:`_NopeBackwardPrep`).
+    """Autograd wrapper of the NoPE program: saves every tensor the backward reads and settles the rest of it at
+    forward time (:class:`_NopeBackwardPrep`).
 
     Twelve forward inputs ``(q_latent, kv_latent, indices, topk_length, softmax_scale, key_passes, dkv_acc,
     dkv_dst_map, num_segments, derive_topk_length, dkv_direct, check_dst_map)``; returns ``(out, lse)``.  The
     backward returns ``(dq, dkv)`` for ``q_latent`` / ``kv_latent`` (``dkv`` is ``None`` when it went into
     ``dkv_acc``) and no gradient for the ten other inputs.  The FP32 ``dkv`` of :func:`backward_nope` reaches a
     BF16 ``kv_latent`` leaf as BF16: the autograd engine casts a gradient to the leaf's dtype.  The FP32 contract
-    therefore holds through ``dkv_acc`` (kept on ctx and validated when the forward binds it -- ``check_dst_map=True``
-    synchronizes there -- not saved: the backward mutates it in place), the eager
-    :func:`backward_nope` and the prepared runner.
+    therefore holds through ``dkv_acc`` -- a tensor (validated when the forward binds it; ``check_dst_map=True``
+    synchronizes there) or a zero-argument callable producing the accumulator, or an ``(accumulator,
+    dkv_dst_map)`` pair, at backward time (:data:`DkvAccSource`; validated then) -- the eager :func:`backward_nope`
+    and the prepared runner.  Seven tensors are saved in a fixed order (``q_latent, kv_latent, out, lse, o_lo,
+    indices, topk_length`` -- a zero-size placeholder when the lengths are absent): under non-reentrant
+    activation checkpointing they are released after the forward and recomputed, and the ``ctx`` keeps nothing
+    else of size; a tensor ``dkv_acc`` / ``dkv_dst_map`` is caller-owned and stays on the node (the prep).
     """
 
     @staticmethod
@@ -4026,6 +4130,7 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
         )
         ctx.set_materialize_grads(False)
         ctx.nope_prep = _NopeBackwardPrep(
+            ctx,
             q_latent,
             kv_latent,
             indices,
@@ -4041,7 +4146,6 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
             dkv_direct,
             check_dst_map,
         )
-        ctx.save_for_backward(q_latent, kv_latent, out, lse)
         return out, lse
 
     @staticmethod
@@ -4058,28 +4162,33 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
 class _NopeBackwardPrep:
     """What the NoPE autograd wrappers settle at forward time for their backward, so that the backward's host work
     before its first launch is the completion of the binding key with ``dout``'s geometry, the cache lookup, the
-    two fresh allocations and the binding of the launch values: the key without ``dout``, the backward's operands
-    that autograd does not save (the index rows, ``o_lo``, the lengths, the cast's placeholders), the caller's
-    accumulator (validated once here, :func:`_check_dkv_acc`; ``check_dst_map`` synchronizes here) and the options.
-    The autograd-saved ``q_latent`` / ``kv_latent`` / ``out`` / ``lse`` join at backward time."""
+    two fresh allocations and the binding of the launch values: the options, the geometry key without ``dout`` and
+    without the accumulator, and the presence flag of the lengths.  It holds no produced tensor: the saved outputs,
+    the index rows, ``o_lo`` and the lengths go through ``ctx.save_for_backward`` in one fixed order (seven
+    tensors), so that under activation checkpointing nothing of size outlives the forward.  The caller-owned
+    accumulator stays here as before -- a tensor ``dkv_acc`` (validated here, :func:`_check_dkv_acc`;
+    ``check_dst_map`` synchronizes here) with its pointer operand and ``dkv_dst_map`` in ``operands`` -- or as the
+    zero-argument callable a deferred accumulator comes from, resolved and validated in the backward
+    (:data:`DkvAccSource`)."""
 
     __slots__ = (
-        "indices",
-        "o_lo",
-        "topk_length",
         "softmax_scale",
         "key_passes",
         "num_segments",
+        "dkv_direct",
+        "check_dst_map",
+        "has_topk_length",
         "dkv_acc",
         "dkv_dst_map",
-        "dkv_direct",
+        "dkv_acc_source",
         "operands",
         "key_head",
-        "key_tail",
+        "key_mid",
     )
 
     def __init__(
         self,
+        ctx,
         q_latent,
         kv_latent,
         indices,
@@ -4097,32 +4206,31 @@ class _NopeBackwardPrep:
     ):
         if dkv_dst_map is not None and dkv_acc is None:
             raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
-        self.indices, self.o_lo, self.topk_length = indices, o_lo, topk_length
         self.softmax_scale = float(softmax_scale)
         self.key_passes, self.num_segments = key_passes, int(num_segments)
-        self.dkv_acc, self.dkv_dst_map, self.dkv_direct = (
-            dkv_acc,
-            dkv_dst_map,
-            dkv_direct,
-        )
-        inert_f32, inert_bf16 = _inert_placeholders(q_latent.device)
-        operands = dict(
-            indices=indices, o_lo=o_lo, inert_f32=inert_f32, inert_bf16=inert_bf16
-        )
-        if topk_length is not None:
-            operands["topk_length"] = topk_length
-        if dkv_acc is not None:
-            operands["dkv_acc"], _row_stride = _check_dkv_acc(
-                dkv_acc,
+        self.dkv_direct, self.check_dst_map = dkv_direct, bool(check_dst_map)
+        acc_tensor = dkv_acc if isinstance(dkv_acc, torch.Tensor) else None
+        self.operands = {}
+        if acc_tensor is not None:
+            # caller-owned: validated (and its map's values checked) now, the pointer operand bound now
+            self.operands["dkv_acc"], _row_stride = _check_dkv_acc(
+                acc_tensor,
                 dkv_dst_map,
                 int(kv_latent.shape[0]),
                 check_dst_map=check_dst_map,
                 min_cols=D_LATENT,
             )
             if dkv_dst_map is not None:
-                operands["dkv_dst_map"] = dkv_dst_map
-        self.operands = operands
-        # the backward key with dout's slot (index 7) left open: completed per backward call
+                self.operands["dkv_dst_map"] = dkv_dst_map
+        elif dkv_acc is not None and not callable(dkv_acc):
+            raise TypeError(
+                "dkv_acc must be a float32 tensor or a zero-argument callable returning it"
+            )
+        self.dkv_acc, self.dkv_dst_map = acc_tensor, dkv_dst_map
+        self.dkv_acc_source = None if acc_tensor is not None else dkv_acc
+        self.has_topk_length = topk_length is not None
+        # the backward key with dout's slot (index 7) and the accumulator's geometry (indices 12, 13) left open:
+        # completed per backward call
         key = backward_binding_key_nope(
             q_latent,
             kv_latent,
@@ -4135,65 +4243,103 @@ class _NopeBackwardPrep:
             self.softmax_scale,
             key_passes,
             self.num_segments,
-            dkv_acc,
-            dkv_dst_map,
+            None,
+            None,
             dkv_direct,
         )
-        self.key_head, self.key_tail = key[:7], key[8:]
+        self.key_head, self.key_mid = key[:7], key[8:12]
+        ctx.save_for_backward(
+            q_latent,
+            kv_latent,
+            out,
+            lse,
+            o_lo,
+            indices,
+            _saved_optional(topk_length, indices),
+        )
 
-    def backward(
-        self, q_latent, kv_latent, out, lse, dout
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def backward(self, saved, dout) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        q_latent, kv_latent, out, lse, o_lo, indices, topk_length = saved
+        topk_length = topk_length if self.has_topk_length else None
+        dkv_acc, dst_map = _resolve_dkv_acc(
+            self.dkv_acc if self.dkv_acc is not None else self.dkv_acc_source,
+            self.dkv_dst_map,
+        )
         if _no_query_rows(q_latent):
             return backward_nope(
                 q_latent,
                 kv_latent,
-                self.indices,
+                indices,
                 out,
-                self.o_lo,
+                o_lo,
                 lse,
                 dout,
-                topk_length=self.topk_length,
+                topk_length=topk_length,
                 softmax_scale=self.softmax_scale,
                 key_passes=self.key_passes,
-                dkv_acc=self.dkv_acc,
-                dkv_dst_map=self.dkv_dst_map,
+                dkv_acc=dkv_acc,
+                dkv_dst_map=dst_map,
                 num_segments=self.num_segments,
                 dkv_direct=self.dkv_direct,
             )
-        key = self.key_head + (_geometry(dout),) + self.key_tail
+        key = (
+            self.key_head
+            + (_geometry(dout),)
+            + self.key_mid
+            + (_geometry(dkv_acc), _geometry(dst_map), self.dkv_direct)
+        )
         binding = _binding(
             key,
             lambda: _plan_nope(
                 q_latent,
                 kv_latent,
-                self.indices,
-                topk_length=self.topk_length,
+                indices,
+                topk_length=topk_length,
                 dout=dout,
                 softmax_scale=self.softmax_scale,
-                outputs=dict(out=out, lse=lse, o_lo=self.o_lo),
+                outputs=dict(out=out, lse=lse, o_lo=o_lo),
                 backward=True,
                 key_passes=self.key_passes,
-                dkv_acc=self.dkv_acc,
-                dkv_dst_map=self.dkv_dst_map,
+                dkv_acc=dkv_acc,
+                dkv_dst_map=dst_map,
                 num_segments=self.num_segments,
                 dkv_direct=self.dkv_direct,
             ),
             _NopeBinding,
         )
+        inert_f32, inert_bf16 = _inert_placeholders(q_latent.device)
         operands = dict(
-            self.operands, q_latent=q_latent, kv_latent=kv_latent, out=out, lse=lse
+            q_latent=q_latent,
+            kv_latent=kv_latent,
+            indices=indices,
+            out=out,
+            lse=lse,
+            o_lo=o_lo,
+            topk_length=topk_length if topk_length is not None else binding.topk_length,
+            inert_f32=inert_f32,
+            inert_bf16=inert_bf16,
         )
-        if self.topk_length is None:
-            operands["topk_length"] = binding.topk_length
+        if self.dkv_acc is not None:
+            # the tensor accumulator: validated and bound at forward time
+            operands.update(self.operands)
+        elif dkv_acc is not None:
+            # a callable's result is validated here, including the map's values when asked for
+            operands["dkv_acc"], _row_stride = _check_dkv_acc(
+                dkv_acc,
+                dst_map,
+                int(kv_latent.shape[0]),
+                check_dst_map=self.check_dst_map,
+                min_cols=D_LATENT,
+            )
+            if dst_map is not None:
+                operands["dkv_dst_map"] = dst_map
         return binding.launch_backward(operands, dout)
 
 
 def _nope_backward_from_ctx(ctx, dout) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """``(dq, dkv)`` of the NoPE autograd wrappers: the backward the forward settled (:class:`_NopeBackwardPrep`)
-    over the autograd-saved tensors."""
-    q_latent, kv_latent, out, lse = ctx.saved_tensors
-    return ctx.nope_prep.backward(q_latent, kv_latent, out, lse, dout)
+    over the saved tensors."""
+    return ctx.nope_prep.backward(ctx.saved_tensors, dout)
 
 
 def dsa_sparse_attention_nope(
@@ -4205,7 +4351,7 @@ def dsa_sparse_attention_nope(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
     dkv_direct: Optional[bool] = None,
@@ -4217,7 +4363,11 @@ def dsa_sparse_attention_nope(
     leaf through the view).  ``softmax_scale`` defaults to 1/16.  Without ``dkv_acc`` the ``kv_latent`` gradient
     of the autograd call is the FP32 ``dkv`` of :func:`backward_nope` cast by the autograd engine to the leaf's
     dtype (BF16 for a BF16 leaf); with ``dkv_acc`` the FP32 ``dK + dV`` is accumulated into it and the
-    ``kv_latent`` gradient is ``None``.  ``key_passes``, ``dkv_dst_map``, ``num_segments``, ``dkv_direct``,
+    ``kv_latent`` gradient is ``None``.  ``dkv_acc`` is a tensor or a zero-argument callable producing it (or an
+    ``(accumulator, dkv_dst_map)`` pair) at backward time (:data:`DkvAccSource`), so the accumulator need not exist
+    at forward time; every tensor this call produces for the backward is saved through ``ctx.save_for_backward``
+    (a tensor ``dkv_acc`` stays caller-owned on the node) and a checkpointed forward retains nothing of this call.
+    ``key_passes``, ``dkv_dst_map``, ``num_segments``, ``dkv_direct``,
     ``check_dst_map`` and the row-length handling as in :func:`dsa_sparse_attention`.
     """
     kv_latent = _kv_latent_rows(kv_latent)
@@ -4636,7 +4786,10 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
     rows to ``indices_out`` itself -- and the forward kernel follows with no host work in between: the plan
     lookup, the output allocation and the forward's launch values are prepared before the first launch, and
     nothing on the path synchronizes with the device.  The backward is that of
-    :class:`DSASparseAttentionNopeFunction` over the saved global rows and lengths.
+    :class:`DSASparseAttentionNopeFunction` over the saved global rows and lengths: every produced operand of the
+    backward goes through ``ctx.save_for_backward`` and a tensor ``dkv_acc`` stays caller-owned on the node, so a
+    checkpointed forward retains nothing; ``dkv_acc`` may be a callable resolved at backward time
+    (:data:`DkvAccSource`).
     """
 
     @staticmethod
@@ -4672,6 +4825,7 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
         scale = float(softmax_scale)
         ctx.set_materialize_grads(False)
         ctx.nope_prep = _NopeBackwardPrep(
+            ctx,
             q_latent,
             kv_latent,
             indices,
@@ -4687,7 +4841,6 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
             dkv_direct,
             check_dst_map,
         )
-        ctx.save_for_backward(q_latent, kv_latent, out, lse)
         return out, lse
 
     @staticmethod
@@ -4715,7 +4868,7 @@ def dsa_sparse_attention_nope_varlen(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
