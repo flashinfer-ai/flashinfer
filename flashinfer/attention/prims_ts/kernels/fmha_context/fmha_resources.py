@@ -2089,6 +2089,9 @@ class SmemPageOffsetsKvResource(MemoryResource):
 # SmemSageKScalesResource -- SMEM ring of one K tile's Sage sfK words per stage
 # ---------------------------------------------------------------------------
 
+# Import after FmhaConfig is defined because helpers_paged imports it back.
+from .helpers_paged import _resolve_kv_tile_idx_context  # noqa: E402
+
 
 @dataclass(kw_only=True)
 class SmemSageKScalesResource(MemoryResource):
@@ -2159,8 +2162,6 @@ class SmemSageKScalesResource(MemoryResource):
         whole tiles, so the copy never runs past the sequence. Lane ``l``
         copies float4 ``l``, ``l + 32``, ... of the tile.
         """
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         cfg = self.cfg
         layout = cfg.sage_scale_layout
         tile_idx = _resolve_kv_tile_idx_context(stage_info, kv_tile_start)
