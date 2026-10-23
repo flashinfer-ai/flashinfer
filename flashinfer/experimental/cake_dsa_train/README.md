@@ -40,8 +40,19 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
   backward, so both skip the trailing invalid key blocks of short rows; the
   results are those of the full row.
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
-  to `cu_seqlens_k[d]`) and offsets them on device before the flat kernels
-  run (one glue pass that also yields the per-row lengths).  `cu_seqlens_q`
+  to `cu_seqlens_k[d]`) and turns them into global key rows on device in one
+  launch of the NoPE record's index-preparation stage right before the forward
+  kernel (`index_prep`, `compact = 1`, the forward launched behind it with the
+  programmatic-dependent-launch attribute, see below; the torch twin
+  `offset_gather_kv_indices(..., compact=True)` where the stage is not
+  available -- host tensors, an unserved device, a non-contiguous prefix sum --
+  with bitwise the same result).  Every row is compacted stably: its valid keys
+  come first in ascending slot order, then `-1`, and the row's length is its
+  valid count, so rows with `-1` holes cost their valid slots in the forward
+  and the backward; rows whose valid slots already come first are unchanged
+  bytes with the same length.  A caller `topk_length` is a position cut
+  applied before compaction (slots at positions `>= topk_length[t]` are
+  invalid regardless of content).  `cu_seqlens_q`
   and `cu_seqlens_k` are independent: a query segment may be shorter than its
   key segment, in which case it is the tail of that key prefix -- query
   `local_q` of document `d` sits at key position
@@ -93,9 +104,15 @@ trainer's packed layouts (flashinfer-ai/flashinfer#5675) are consumed in place
   row stride at least the slice width and a multiple of 8 elements; base
   16-byte aligned (the TMA gather descriptors and the 16-byte rope loads).
 * `indices` rows stay contiguous int32 (any row stride; a column slice of a
-  wider index buffer is accepted); `dout` is made contiguous by the eager
-  backward and the autograd wrapper (`bwd_delta` addresses it as flat
-  `[T * 64, 512]` rows).
+  wider index buffer is accepted); `dout` follows the layout rules of
+  `q_latent` and is read in place -- the head-major `[512, T * 512, 1]` view an
+  output projection hands back included -- by the main stage (stride-carrying
+  tensor map) and by `bwd_delta` (the strided delta kernel shared with the
+  NoPE record: `dout_offset + token * dout_token_stride + head *
+  dout_head_stride + channel`).  The eager `backward` copies a `dout` only when
+  the descriptor cannot address it (base not 16-byte aligned, strides not
+  multiples of 8 elements, channel stride != 1); `prepare_dsa_train` rejects
+  such a view.
 * A strided view yields bitwise the same `out`, `lse` and `dq` as the
   contiguous copy (only descriptor fields and pointer offsets change); dK/dV
   agree within the FP32 `red.global` reduction spread.
@@ -338,12 +355,32 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   place); `kv [S, 512]` BF16 or its one-head form `[S, 1, 512]` (squeezed on the
   host; the gradient reaches that leaf through the view); `indices [T, K_slots]`
   int32 global key rows, `topk_length` and the validity rules as above.
-  `softmax_scale` defaults to `1 / 16`.
+  `softmax_scale` defaults to `1 / 16`.  Without `topk_length` the flat entry
+  compacts the rows on device in one launch of the index-preparation stage's
+  flat mode right before the forward (valid keys `0 <= idx < S` first in
+  ascending slot order, then `-1`; the valid count as the row's length) into a
+  fresh `[T, K_slots]` buffer and a `[T]` vector the backward reads, so rows
+  with `-1` holes cost their valid slots; the caller's tensor is untouched.
+  With `topk_length` the rows and lengths reach the kernels as given.
+* Rows with holes and the kernel-level entries: `forward_nope`,
+  `backward_nope` and the prepared runner read rows as given (work up to the
+  last valid slot, or `topk_length`).  `nope_compact_indices(indices, S,
+  topk_length=None)` returns `(rows, counts)` -- one flat stage launch, any
+  row stride, optional `out=` / `counts=` buffers for a capturing caller -- to
+  pass as `indices` / `topk_length` to those entries and to the flat autograd
+  entry with caller lengths.  (A backward over raw hole rows could instead run
+  the key-range-pass form at one pass -- `nope_bwd_compact` writes each row's
+  valid keys compacted, `nope_bwd_main_pass*` consumes them with `dq_mode 0` --
+  which is not wired up in this round.)
 * Backend entries (`cake_backend`): `forward_nope`, `backward_nope`,
   `forward_nope_varlen` (the packed forward without autograd: the public
-  entry's index route by table size; returns `(out, lse, o_lo, indices,
-  topk_length)`, the global rows and lengths `backward_nope` takes with
+  entry's index route; returns `(out, lse, o_lo, indices, topk_length)`, the
+  compacted global rows and their valid counts `backward_nope` takes with
   `num_segments = cu_seqlens_k.numel() - 1` and a caller-zeroed `dkv_acc`),
+  `nope_compact_indices`, `nope_globalize_indices(..., compact=False)` (one
+  stage launch over per-document rows: the position-preserving rows and last
+  valid slot + 1 by default, bitwise `offset_gather_kv_indices`; `compact=True`
+  the compacted rows and counts, with an optional `topk_length` cut),
   `prepare_dsa_nope_train` / `DSANopeTrainRunner`, `dsa_nope_train_workspace_size`,
   `validate_dsa_nope_inputs`, `DSASparseAttentionNopeFunction` (12 forward inputs,
   gradients for `q` and `kv` only).  The binding cache is shared; the NoPE keys are
@@ -375,24 +412,33 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   main stage through a stride-carrying tensor map, the delta stage through the
   token / head strides (elements) and the element offset the launcher passes
   (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
-* Varlen: per-document indices become global key rows on device, by table
-  size (`nope_varlen_index_mode`).  Below `NOPE_CONVERT_SLOT_LIMIT` (2^20)
-  index slots (`T * K_slots`) the forward program converts them itself
-  (`cu_seqlens_q`, `cu_seqlens_k`, `indices_out`, `num_docs`, `search_iters`,
-  `causal`, `convert` at the end of its launch arguments; `convert = 1` reads
-  the per-document rows at any row stride, writes the global rows the backward
-  consumes and derives the per-row lengths): the packed forward is one launch
-  -- seventeen with the torch glue `offset_gather_kv_indices`, which the rope
-  varlen entry keeps; the results are bitwise equal.  At or above the limit,
-  and always with a caller-given `topk_length`, the record's index-preparation
-  stage runs first (`index_prep`: one warp per index row, four rows per
-  128-thread CTA, any index row stride read in place; on large tables it
-  converts faster than the forward's own producer path) and the forward takes
-  its rows -- the host prepares the forward's plan, outputs and launch
-  arguments and converts its operands before the first launch, then issues
-  the forward from those pre-bound values inside the same stream context, so
-  only the forward's binding call sits between the two launches (it hides
-  behind the stage's kernel).
+* Varlen: per-document indices become global key rows on device in one launch
+  of the record's index-preparation stage right before the forward
+  (`nope_varlen_index_mode`: `"index_prep"` at every table size, since
+  `NOPE_CONVERT_SLOT_LIMIT` is 0).  `index_prep` (one warp per index row, four
+  rows per 128-thread CTA, any index row stride read in place) runs with
+  `compact = 1`: every row stably compacted -- valid keys first in ascending
+  slot order, then `-1` -- and its valid count as the length, after the position
+  cut of a caller `topk_length` passed as `length_in`; the forward and the
+  saved backward read the stage's rows and counts in both cases (bitwise the
+  torch twin `offset_gather_kv_indices(..., compact=True)`).  Both forward
+  stages (`fwd`, `nope_fwd`) launch with the programmatic-dependent-launch
+  attribute (`use_pdl` in their launch records, a fixed attribute of their
+  bindings): `index_prep` signals `launch_dependents` at entry and the forward
+  kernels execute `griddepcontrol.wait` after their barrier / TMEM prologue,
+  before any global read, so behind the stage the forward's prologue overlaps
+  the stage; behind any other kernel the attribute changes nothing.  The host prepares
+  the forward's plan, outputs and launch arguments and converts its operands
+  before the first launch, then issues the forward from those pre-bound values
+  inside the same stream context, so only the forward's binding call sits
+  between the two launches (it hides behind the stage's kernel).  The forward
+  program still carries its own conversion (`cu_seqlens_q`, `cu_seqlens_k`,
+  `indices_out`, `num_docs`, `search_iters`, `causal`, `convert` at the end of
+  its launch arguments; `convert = 1` globalizes the rows and, since flour
+  ae939ee44, writes the same stable compaction and valid counts as the stage,
+  bitwise): the `"kernel"` route below a limit above zero (a performance
+  crossover still to be measured; the limit is 0) and the fallback of a
+  registry without the stage, which takes no caller `topk_length`.
   `causal=True` drops keys after the query's own position, query segments are
   tails of their key prefix.  The NoPE entries have no torch fallback.
 * Backward host order: the autograd wrappers settle their backward at forward
@@ -409,13 +455,17 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   non-decreasing, `cu_seqlens_q[-1] == T`, `cu_seqlens_k[-1] == S` (a shorter
   or longer key window is rejected, not truncated), `seqlen_q <= seqlen_k` per
   document -- at the cost of one blocking device-to-host copy before any launch
-  (skipped during CUDA-graph capture).  The rope varlen entry is unchanged.
+  (skipped during CUDA-graph capture).  The rope varlen entry launches the same
+  stage (compacting, caller lengths as the cut) and keeps the torch twin as its
+  fallback; its structural checks are unchanged.
 
 Stages of the record, in launch order and with the kernels they share with the
 rope program: `nope_fwd` (own kernel, 320 threads), `nope_bwd_delta` (the
-strided sibling of the rope `bwd_delta` kernel, 256 threads: the `[T * 64, 512]`
-rows of `dout` addressed as `dout_offset + token * dout_token_stride + head *
-dout_head_stride + channel`, strides and offset multiples of 8 elements),
+strided delta kernel, shared with the rope program's `bwd_delta`, 256 threads:
+the `[T * 64, 512]` rows of `dout` addressed as `dout_offset + token *
+dout_token_stride + head * dout_head_stride + channel`, strides and offset
+multiples of 8 elements; with contiguous strides it is bitwise the dense form
+it replaced),
 `nope_bwd_main` /
 `nope_bwd_main_natural` (own kernels, 640 threads: no rope operands, one
 accumulator `dkv_f32` with `dkv_stride >= 512`, a multiple of 4, and the
@@ -428,9 +478,12 @@ the SM count is read once per device), `nope_bwd_compact` (the rope compaction k
 `nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
 and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
 `ceil(num_kv * 16 / 256)`).  `index_prep` (own kernel, 128 threads, grid
-`ceil(T / 4)`) is the packed entry's index preparation at or above
-`NOPE_CONVERT_SLOT_LIMIT` slots or when the caller gives `topk_length`; it is
-launched before `nope_fwd` and is not part of the flat step.  The key-range-pass policy of the record plans one
+`ceil(T / 4)`; arguments `compact`, `length_in`, `has_length_in` after
+`write_out`) is the index preparation of both varlen entries (document mode,
+`compact = 1`), of the flat NoPE entry without caller lengths and of
+`nope_compact_indices` (flat mode: `has_docs = 0`, `flat_bound = S - 1`, the
+prefix-sum operands never read); it is launched right before the forward and
+is not part of a prepared runner's step.  The key-range-pass policy of the record plans one
 pass on every row (`max_passes` 1, no per-architecture rules: one pass measured
 fastest on every row, build and GPU of this form), so the single-pass main stage
 is the default and `dq_partial` is not allocated; `key_passes=n` on the entry
@@ -461,7 +514,7 @@ reports that gap).
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`, written by the export): one entry per `<library>_<arch>`
-  (eight stages x three architectures) with its translation units, digests,
+  (fourteen libraries x three architectures) with its translation units, digests,
   nvcc flags (`--use_fast_math` per stage), closure digest and `aot/<name>.so`
   path.  `cake_build.load_library(name)` loads the prebuilt library when
   `aot/` holds it (next to the builder's `aot/build_info.json` sidecar, which
@@ -478,8 +531,9 @@ reports that gap).
   (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
-  eight pairs, one per stage (the main stage and its key-range-pass form each
-  with a natural-layout variant), shared by `sm_100a`, `sm_103a` and `sm_107a` and
+  one pair per library (the main stage and its key-range-pass form each with a
+  natural-layout variant; the delta, compaction and cast pairs serve both
+  programs), shared by `sm_100a`, `sm_103a` and `sm_107a` and
   compiled once per architecture (`.clang-format` disables formatting: the sources are
   identity-checked by the digests in `build.json`).
 
@@ -490,8 +544,9 @@ backward preprocess, backward main (single-pass and key-range-pass form with
 its compaction, each with its natural-layout direct-accumulation variant) and
 cast stages plus the key-range-pass and direct-accumulation policies, exported
 from the kernel snapshot named in the pull request, and the NoPE program's
-record with its eight stages (three shared with the rope program) and its own
-key-range-pass and direct-accumulation policies (see "NoPE (zero-rope) program").
+record with its nine stages (the delta, compaction and cast kernels shared with
+the rope program) and its own key-range-pass and direct-accumulation policies
+(see "NoPE (zero-rope) program").
 
 Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
 only this package; skips without a registered program or a compute capability

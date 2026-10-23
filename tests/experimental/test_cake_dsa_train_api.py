@@ -40,7 +40,12 @@ from flashinfer.dsa_sparse_attention import (
     dsa_sparse_attention_nope_varlen,
     dsa_sparse_attention_varlen,
 )
-from flashinfer.experimental.cake_dsa_train import cake_backend, cake_build, cake_jit
+from flashinfer.experimental.cake_dsa_train import (
+    cake_backend,
+    cake_build,
+    cake_jit,
+    cake_launch,
+)
 from flashinfer.experimental.cake_dsa_train.cake_backend import (
     D_LATENT,
     D_QK,
@@ -60,6 +65,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
 )
 from tests.test_helpers import cake_dsa_train_reference as nope_ref
 from tests.test_helpers.cake_dsa_train_reference import (
+    compact_rows,
     globalize_gather_indices_loop,
     make_inputs,
     reference_fp64,
@@ -243,13 +249,58 @@ def _kv_as_packed_row(kv_latent, k_rope, row_stride):
     return kv, lat, rope
 
 
-def _forward_backward(q_latent, q_rope, kv_latent, k_rope, indices, dout):
-    out, lse, o_lo = cake_backend.forward(q_latent, q_rope, kv_latent, k_rope, indices)
+def _forward_backward(
+    q_latent, q_rope, kv_latent, k_rope, indices, dout, *, topk_length=None
+):
+    out, lse, o_lo = cake_backend.forward(
+        q_latent, q_rope, kv_latent, k_rope, indices, topk_length=topk_length
+    )
     grads = cake_backend.backward(
-        q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout
+        q_latent,
+        q_rope,
+        kv_latent,
+        k_rope,
+        indices,
+        out,
+        o_lo,
+        lse,
+        dout,
+        topk_length=topk_length,
     )
     torch.cuda.synchronize()
     return (out, lse, o_lo), grads
+
+
+def _require_compacting_stage():
+    """The NoPE record's index-preparation stage of this checkout compacts (the K2 interface in its launch
+    arguments); the varlen entries route hole rows through it.  Skips until the render lands."""
+    stage = getattr(cake_jit, "NOPE_INDEX_PREP_STAGE", "index_prep")
+    if not cake_backend.nope_index_prep_available(torch.device("cuda")):
+        pytest.skip(
+            "the NoPE record does not register the index-preparation stage on this checkout"
+        )
+    if "compact" not in cake_launch.STAGE_ARGS.get(stage, ()) or not hasattr(
+        cake_backend, "nope_compact_indices"
+    ):
+        pytest.skip(
+            "the index-preparation stage of this checkout does not compact (the K2 render has not landed)"
+        )
+    probe = torch.tensor([[-1, 5, -1, 7]], dtype=torch.int32, device="cuda")
+    try:  # a launch table may be edited ahead of the kernel: one probe launch must actually compact
+        rows, counts = cake_backend.nope_compact_indices(probe, 16)
+        torch.cuda.synchronize()
+        ok = (
+            torch.equal(rows, probe.new_tensor([[5, 7, -1, -1]]))
+            and int(counts[0]) == 2
+        )
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(
+            f"the index-preparation kernel of this checkout does not compact: {exc}"
+        )
+    if not ok:
+        pytest.skip(
+            "the index-preparation kernel of this checkout does not compact (the K2 render has not landed)"
+        )
 
 
 def _assert_same_step(got, ref):
@@ -957,11 +1008,14 @@ def test_kv_row_stride_704_bitwise():
 
 def test_varlen_causal_tail_of_prefix_matches_reference():
     """Query segments that are the tail of their key prefix (seqlen_q < seqlen_k) with gather indices that
-    deliberately select keys beyond the causal bound ``(seqlen_k - seqlen_q) + local_q``: the varlen entry masks
-    exactly those slots (loop reference of the rule; the FP64 reference sees the same set), a zero-query segment
-    contributes no rows, and a segment whose every slot is ``-1`` gives ``out = 0``, ``lse = -inf``, ``dq = 0`` and
-    exact zeros in dK / dV for its keys."""
+    deliberately select keys beyond the causal bound ``(seqlen_k - seqlen_q) + local_q`` and 10 % ``-1`` slots
+    anywhere: the varlen entry masks exactly those slots (loop reference of the rule; the FP64 reference sees the
+    same set) and compacts every row (the index-preparation stage: valid keys first, the valid count as the
+    length), so it is bitwise the flat entry on the stable compaction of the masked rows with the counts as
+    caller lengths; a zero-query segment contributes no rows, and a segment whose every slot is ``-1`` gives
+    ``out = 0``, ``lse = -inf``, ``dq = 0`` and exact zeros in dK / dV for its keys."""
     _require_program(backward=True)
+    _require_compacting_stage()
     seq_q, seq_k = (
         [40, 48, 0, 56, 32],
         [40, 200, 64, 320, 96],
@@ -981,8 +1035,16 @@ def test_varlen_causal_tail_of_prefix_matches_reference():
     assert ((expected == -1) & (loose != -1)).any(), (
         "the case must select keys beyond the causal bound"
     )
+    rows, counts = compact_rows(expected, inp.total_k)
+    twin = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=True, compact=True, return_topk_length=True
+    )
+    assert torch.equal(twin[0], rows) and torch.equal(twin[1], counts)
+    assert not torch.equal(rows, expected), (
+        "the case must carry holes before valid slots"
+    )
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    (out, lse, _), grads = _forward_backward(*args, expected, inp.dout)
+    (out, lse, _), grads = _forward_backward(*args, rows, inp.dout, topk_length=counts)
     leaves = [t.detach().clone().requires_grad_() for t in args]
     with _quiet_experimental():
         out_v, lse_v = dsa_sparse_attention_varlen(
@@ -1496,8 +1558,12 @@ def test_nope_varlen_multi_document_matches_flat_and_reference():
 
 def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
     """``causal=True`` on a query segment that is the tail of its key prefix: a selected key after the query's own
-    position is invalid; the result equals the flat call over the explicitly masked global indices."""
+    position is invalid; the varlen entry compacts the masked rows, so it is bitwise the flat call over the
+    explicitly masked global indices (which compacts them the same way through the stage's flat mode) and the flat
+    call over their stable compaction with the counts as caller lengths; the floor of the FP64 gate is evaluated
+    on the compacted order."""
     _require_nope_program()
+    _require_compacting_stage()
     inp = _nope_inputs([256, 128], [512, 512], seed=NOPE_SEED + 3, topk=96)
     gen = torch.Generator(device="cuda").manual_seed(NOPE_SEED + 3)
     local = torch.full_like(inp.idx_local, -1)
@@ -1523,11 +1589,17 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
         local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
     )
     assert torch.equal(offset, masked)
+    rows, counts = compact_rows(masked, inp.total_k)
+    assert not torch.equal(rows, masked), "the case must carry holes before valid slots"
     with _quiet_experimental():
         out_f, lse_f = dsa_sparse_attention_nope(inp.q, inp.kv, masked, return_lse=True)
+        out_s, lse_s = dsa_sparse_attention_nope(
+            inp.q, inp.kv, rows, topk_length=counts, return_lse=True
+        )
     torch.cuda.synchronize()
     assert torch.equal(out_c, out_f) and torch.equal(lse_c, lse_f)
-    ref = nope_ref.reference_fp64_nope(inp.q, inp.kv, masked)
+    assert torch.equal(out_c, out_s) and torch.equal(lse_c, lse_s)
+    ref = nope_ref.reference_fp64_nope(inp.q, inp.kv, masked, compact=True)
     assert rel_l2(out_c, ref["out"]) <= _nope_floor_gate(ref)
 
 
@@ -1599,17 +1671,14 @@ def _cuda_kernel_names(fn) -> list[str]:
     ]
 
 
-def test_nope_public_packed_forward_launch_count_follows_the_table_size():
-    """The public packed entry's forward is one launch (the forward kernel converts the per-document rows itself)
-    below ``NOPE_CONVERT_SLOT_LIMIT`` index slots and two (the index-preparation stage, then the forward kernel) at
-    or above it -- the expectation derived from the same rule, ``nope_varlen_index_mode``; the torch glue it replaces
-    is sixteen launches; the flat entry launches the forward kernel alone (the row lengths are derived in-kernel, no
-    separate derivation runs)."""
+def test_nope_public_packed_forward_launch_count_follows_the_table_size(monkeypatch):
+    """The public packed entry's forward is two launches at every table size -- the index-preparation stage
+    (compacting), then the forward kernel -- while ``NOPE_CONVERT_SLOT_LIMIT`` is 0, also with caller lengths; the
+    torch glue it replaces is at least ten launches.  The flat entry without lengths is the same two launches (the
+    stage's flat mode compacts the caller's rows); with caller lengths it launches the forward kernel alone.  A
+    monkeypatched limit above zero (the measurement route) re-enables the converting forward below it: one launch."""
     _require_nope_program()
-    if not cake_backend.nope_index_prep_available(torch.device("cuda")):
-        pytest.skip(
-            "the NoPE record does not register the index-preparation stage on this checkout"
-        )
+    _require_compacting_stage()
     if not _cuda_kernel_names(lambda: torch.ones(8, device="cuda").add_(1)):
         pytest.skip("the torch profiler records no CUDA kernels in this environment")
     cases = [
@@ -1620,31 +1689,33 @@ def test_nope_public_packed_forward_launch_count_follows_the_table_size():
             [640, 512], [1024, 1024], seed=NOPE_SEED + 8, topk=1024
         ),  # 1152 x 1024 slots
     ]
-    seen = set()
     for inp in cases:
         T, K = (int(d) for d in inp.idx_local.shape)
-        mode = cake_backend.nope_varlen_index_mode(T, K)
-        assert mode == cake_backend.varlen_index_mode(inp.idx_local)
-        seen.add(mode)
+        assert cake_backend.nope_varlen_index_mode(T, K) == "index_prep"
+        assert cake_backend.varlen_index_mode(inp.idx_local) == "index_prep"
+        lengths = inp.topk_length
 
-        def packed(inp=inp):
+        def packed(inp=inp, **kw):
             return dsa_sparse_attention_nope_varlen(
-                inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
+                inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k, **kw
             )
 
         with _quiet_experimental():
             packed()  # plan and module load
             names = _cuda_kernel_names(packed)
+            with_cut = _cuda_kernel_names(lambda: packed(topk_length=lengths))
             flat = _cuda_kernel_names(
                 lambda inp=inp: dsa_sparse_attention_nope(inp.q, inp.kv, inp.idx_global)
             )
-        expected = {"kernel": 1, "index_prep": 2}[mode]
-        assert len(names) == expected and len(flat) == 1 and names[-1] == flat[0], (
-            mode,
-            names,
-            flat,
-        )
-    assert seen == {"kernel", "index_prep"}
+            flat_cut = _cuda_kernel_names(
+                lambda inp=inp: dsa_sparse_attention_nope(
+                    inp.q, inp.kv, inp.idx_global, topk_length=lengths
+                )
+            )
+        assert len(names) == 2 and len(with_cut) == 2, (names, with_cut)
+        assert names == flat, (names, flat)
+        assert len(flat_cut) == 1 and flat_cut[0] == names[-1], (flat_cut, names)
+        assert names[0] != names[1]
     inp = cases[0]
     glue = _cuda_kernel_names(
         lambda: offset_gather_kv_indices(
@@ -1652,3 +1723,130 @@ def test_nope_public_packed_forward_launch_count_follows_the_table_size():
         )
     )
     assert len(glue) >= 10
+    # the measurement route: the converting forward alone below a limit above zero
+    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
+    assert cake_backend.varlen_index_mode(inp.idx_local) == "kernel"
+    with _quiet_experimental():
+        dsa_sparse_attention_nope_varlen(
+            inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
+        )
+        kernel = _cuda_kernel_names(
+            lambda: dsa_sparse_attention_nope_varlen(
+                inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
+            )
+        )
+    assert len(kernel) == 1
+
+
+def test_rope_varlen_launch_count_is_the_stage_and_the_forward():
+    """The rope varlen entry's forward is two launches at every table size -- the NoPE record's index-preparation
+    stage (compacting), then the rope forward kernel -- also with caller lengths; the flat rope entry without
+    lengths launches the forward kernel alone."""
+    _require_program()
+    _require_compacting_stage()
+    if not _cuda_kernel_names(lambda: torch.ones(8, device="cuda").add_(1)):
+        pytest.skip("the torch profiler records no CUDA kernels in this environment")
+    for seq_q, seq_k, topk in (
+        ([64, 200, 120], [128, 200, 384], 128),
+        ([640, 512], [1024, 1024], 1024),
+    ):
+        inp = make_inputs(seq_q, seq_k, seed=SEED + 90 + topk, topk=topk)
+        args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+        T = inp.total_q
+        lengths = torch.full((T,), topk, dtype=torch.int32, device="cuda")
+
+        def packed(**kw):
+            return dsa_sparse_attention_varlen(
+                *args,
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                causal=True,
+                **kw,
+            )
+
+        with _quiet_experimental():
+            packed()
+            names = _cuda_kernel_names(packed)
+            with_cut = _cuda_kernel_names(lambda: packed(topk_length=lengths))
+            flat = _cuda_kernel_names(
+                lambda: dsa_sparse_attention(*args, inp.idx_global)
+            )
+        assert len(names) == 2 and len(with_cut) == 2, (names, with_cut)
+        assert len(flat) == 1 and names[-1] == flat[0], (names, flat)
+
+
+def test_public_rope_head_major_dout_autograd_matches_the_dense_gradients():
+    """A head-major ``dout`` (``[512, T * 512, 1]`` strides, the layout an output projection hands back) through the
+    public rope entry's autograd gives the dense path's ``q_latent`` / ``q_rope`` gradients bitwise and the key
+    gradients within the atomics spread; the public varlen entry likewise."""
+    _require_program(backward=True)
+    inp = make_inputs(
+        [256, 128], [512, 512], seed=SEED + 95, topk=96, dout_layout="head_major"
+    )
+    assert inp.dout.stride() == (D_LATENT, inp.total_q * D_LATENT, 1)
+    dense = inp.dout.contiguous()
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+
+    def grads_of(dout, varlen):
+        leaves = [t.detach().clone().requires_grad_() for t in args]
+        with _quiet_experimental():
+            if varlen:
+                out = dsa_sparse_attention_varlen(
+                    *leaves,
+                    inp.idx_local,
+                    inp.cu_seqlens_q,
+                    inp.cu_seqlens_k,
+                    causal=True,
+                )
+            else:
+                out = dsa_sparse_attention(*leaves, inp.idx_global)
+        out.backward(dout)
+        torch.cuda.synchronize()
+        return out, [t.grad for t in leaves]
+
+    for varlen in (False, True):
+        out_h, g_h = grads_of(inp.dout, varlen)
+        out_d, g_d = grads_of(dense, varlen)
+        assert torch.equal(out_h, out_d)
+        assert torch.equal(g_h[0], g_d[0]) and torch.equal(g_h[1], g_d[1])
+        assert rel_l2(g_h[2], g_d[2]) < 1e-3 and rel_l2(g_h[3], g_d[3]) < 1e-3
+
+
+def test_rope_varlen_entry_captures_into_a_cuda_graph():
+    """Forward + backward of the public rope varlen entry (the stage route on hole rows) capture into a CUDA graph
+    and replay to the eager results bitwise (``out``, ``dq_latent``, ``dq_rope``)."""
+    _require_program(backward=True)
+    _require_compacting_stage()
+    inp = make_inputs([64, 200, 120], [128, 200, 384], seed=SEED + 96, topk=128)
+    gen = torch.Generator(device="cuda").manual_seed(SEED + 97)
+    local = _non_causal_local_indices(inp, gen)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves = [t.detach().clone().requires_grad_() for t in args[:2]] + list(args[2:])
+
+    def step():
+        with _quiet_experimental():
+            out = dsa_sparse_attention_varlen(
+                *leaves, local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
+            )
+        dq_latent, dq_rope = torch.autograd.grad(out, leaves[:2], inp.dout)
+        return out, dq_latent, dq_rope
+
+    # eager reference, warm-ups and capture on one side stream: the leaves' ``AccumulateGrad`` nodes record the
+    # stream of their first use, and a node created on the default stream is a stale reference under capture
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        eager = tuple(t.detach().clone() for t in step())
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = step()
+    for _ in range(2):
+        graph.replay()
+    torch.cuda.synchronize()
+    for a, b in zip(eager, captured, strict=True):
+        assert torch.equal(a, b)
