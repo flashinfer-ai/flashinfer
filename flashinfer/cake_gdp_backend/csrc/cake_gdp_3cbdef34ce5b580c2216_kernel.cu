@@ -92,14 +92,6 @@ __device__ __forceinline__ float approx_rcp(float x) {
 #if __CUDA_ARCH__ == 900
 #else
 
-__device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
-  float2 r;
-  asm("add.rn.ftz.f32x2 %0, %1, %2;"
-      : "=l"(*(unsigned long long*)&r)
-      : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-  return r;
-}
-
 __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
   float2 r;
   asm("mul.rn.ftz.f32x2 %0, %1, %2;"
@@ -174,7 +166,7 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
   int* sSsm = reinterpret_cast<int*>(smem_raw + 22656);
   const int sSsm_addr = smem + 22656;
 
-  // === Task calls (dependency order) ===
+  // === Task calls (declaration order) ===
   uint32_t _fast_div_q_0 =
       (heads.divisor != 1)
           ? (__umulhi((uint32_t)((unsigned int)blockIdx.x), heads.multiplier) >> heads.shift_right)
@@ -699,7 +691,7 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         float _exp_23 = __expf(x);
         float _log2_22;
         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_22) : "f"(1.0f + _exp_23));
-        softplus_x = _log2_22 * 0.6931471805599453f;
+        softplus_x = _log2_22 * 0.6931472f;
 #else
     for (int tt = 0; tt < 1; tt++) {
       int t = tt * 8 + warp_local;
@@ -755,7 +747,7 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
             float _exp_20 = __expf(x);
             float _log2_19;
             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_19) : "f"(1.0f + _exp_20));
-            softplus_x = _log2_19 * 0.6931471805599453f;
+            softplus_x = _log2_19 * 0.6931472f;
           }
           float _exp_21 = __expf(A_log[h]);
           float g_log = (-_exp_21) * softplus_x;
@@ -837,7 +829,7 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
               float _exp_27 = __expf(x_1);
               float _log2_26;
               asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_26) : "f"(1.0f + _exp_27));
-              softplus_x_1 = _log2_26 * 0.6931471805599453f;
+              softplus_x_1 = _log2_26 * 0.6931472f;
             }
             float _exp_28 = __expf(A_log[h]);
             float g_log_1 = (-_exp_28) * softplus_x_1;
@@ -1139,17 +1131,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, dots0_0, 4);
 #else
         float2 accs0_0_0 = make_float2(0.0f, 0.0f);
-        float2 accs0_0_1 = make_float2(0.0f, 0.0f);
         accs0_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accs0_0_0);
-        accs0_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accs0_0_1);
+        accs0_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accs0_0_0);
         accs0_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accs0_0_0);
-        accs0_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accs0_0_1);
+        accs0_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accs0_0_0);
         accs0_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accs0_0_0);
-        accs0_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accs0_0_1);
+        accs0_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accs0_0_0);
         accs0_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accs0_0_0);
-        accs0_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accs0_0_1);
-        float2 _add_0 = add_f32x2(accs0_0_0, accs0_0_1);
-        float dots0_0 = _add_0.x + _add_0.y;
+        accs0_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accs0_0_0);
+        float dots0_0 = accs0_0_0.x + accs0_0_0.y;
         float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, dots0_0, 1);
 #endif
         dots0_0 = dots0_0 + _shfl_xor_sync_30;
@@ -1344,17 +1334,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         S2[6] = fma_f32x2_rn_ftz(k2[6], vn2s0_0, S2[6]);
         S2[7] = fma_f32x2_rn_ftz(k2[7], vn2s0_0, S2[7]);
         float2 accs0_1_0 = make_float2(0.0f, 0.0f);
-        float2 accs0_1_1 = make_float2(0.0f, 0.0f);
         accs0_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accs0_1_0);
-        accs0_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accs0_1_1);
+        accs0_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accs0_1_0);
         accs0_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accs0_1_0);
-        accs0_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accs0_1_1);
+        accs0_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accs0_1_0);
         accs0_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accs0_1_0);
-        accs0_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accs0_1_1);
+        accs0_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accs0_1_0);
         accs0_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accs0_1_0);
-        accs0_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accs0_1_1);
-        float2 _add_1 = add_f32x2(accs0_1_0, accs0_1_1);
-        float dots0_1 = _add_1.x + _add_1.y;
+        accs0_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accs0_1_0);
+        float dots0_1 = accs0_1_0.x + accs0_1_0.y;
 #endif
         float _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, dots0_1, 1);
         dots0_1 = dots0_1 + _shfl_xor_sync_33;
@@ -1593,17 +1581,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         float _shfl_xor_sync_38 = __shfl_xor_sync(0xFFFFFFFF, dots1_0, 1);
 #else
         float2 accs1_0_0 = make_float2(0.0f, 0.0f);
-        float2 accs1_0_1 = make_float2(0.0f, 0.0f);
         accs1_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accs1_0_0);
-        accs1_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accs1_0_1);
+        accs1_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accs1_0_0);
         accs1_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accs1_0_0);
-        accs1_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accs1_0_1);
+        accs1_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accs1_0_0);
         accs1_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accs1_0_0);
-        accs1_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accs1_0_1);
+        accs1_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accs1_0_0);
         accs1_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accs1_0_0);
-        accs1_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accs1_0_1);
-        float2 _add_2 = add_f32x2(accs1_0_0, accs1_0_1);
-        float dots1_0 = _add_2.x + _add_2.y;
+        accs1_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accs1_0_0);
+        float dots1_0 = accs1_0_0.x + accs1_0_0.y;
         float _shfl_xor_sync_36 = __shfl_xor_sync(0xFFFFFFFF, dots1_0, 1);
         dots1_0 = dots1_0 + _shfl_xor_sync_36;
         float _shfl_xor_sync_37 = __shfl_xor_sync(0xFFFFFFFF, dots1_0, 2);
@@ -1807,17 +1793,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         S2[6] = fma_f32x2_rn_ftz(k2[6], vn2s1_0, S2[6]);
         S2[7] = fma_f32x2_rn_ftz(k2[7], vn2s1_0, S2[7]);
         float2 accs1_1_0 = make_float2(0.0f, 0.0f);
-        float2 accs1_1_1 = make_float2(0.0f, 0.0f);
         accs1_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accs1_1_0);
-        accs1_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accs1_1_1);
+        accs1_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accs1_1_0);
         accs1_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accs1_1_0);
-        accs1_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accs1_1_1);
+        accs1_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accs1_1_0);
         accs1_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accs1_1_0);
-        accs1_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accs1_1_1);
+        accs1_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accs1_1_0);
         accs1_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accs1_1_0);
-        accs1_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accs1_1_1);
-        float2 _add_3 = add_f32x2(accs1_1_0, accs1_1_1);
-        float dots1_1 = _add_3.x + _add_3.y;
+        accs1_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accs1_1_0);
+        float dots1_1 = accs1_1_0.x + accs1_1_0.y;
         float _shfl_xor_sync_39 = __shfl_xor_sync(0xFFFFFFFF, dots1_1, 1);
         dots1_1 = dots1_1 + _shfl_xor_sync_39;
         float _shfl_xor_sync_40 = __shfl_xor_sync(0xFFFFFFFF, dots1_1, 2);
@@ -2061,17 +2045,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         dots2_0 = dots2_0 + _shfl_xor_sync_50;
 #else
         float2 accs2_0_0 = make_float2(0.0f, 0.0f);
-        float2 accs2_0_1 = make_float2(0.0f, 0.0f);
         accs2_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accs2_0_0);
-        accs2_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accs2_0_1);
+        accs2_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accs2_0_0);
         accs2_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accs2_0_0);
-        accs2_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accs2_0_1);
+        accs2_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accs2_0_0);
         accs2_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accs2_0_0);
-        accs2_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accs2_0_1);
+        accs2_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accs2_0_0);
         accs2_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accs2_0_0);
-        accs2_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accs2_0_1);
-        float2 _add_4 = add_f32x2(accs2_0_0, accs2_0_1);
-        float dots2_0 = _add_4.x + _add_4.y;
+        accs2_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accs2_0_0);
+        float dots2_0 = accs2_0_0.x + accs2_0_0.y;
         float _shfl_xor_sync_42 = __shfl_xor_sync(0xFFFFFFFF, dots2_0, 1);
         dots2_0 = dots2_0 + _shfl_xor_sync_42;
         float _shfl_xor_sync_43 = __shfl_xor_sync(0xFFFFFFFF, dots2_0, 2);
@@ -2269,17 +2251,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         S2[6] = fma_f32x2_rn_ftz(k2[6], vn2s2_0, S2[6]);
         S2[7] = fma_f32x2_rn_ftz(k2[7], vn2s2_0, S2[7]);
         float2 accs2_1_0 = make_float2(0.0f, 0.0f);
-        float2 accs2_1_1 = make_float2(0.0f, 0.0f);
         accs2_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accs2_1_0);
-        accs2_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accs2_1_1);
+        accs2_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accs2_1_0);
         accs2_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accs2_1_0);
-        accs2_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accs2_1_1);
+        accs2_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accs2_1_0);
         accs2_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accs2_1_0);
-        accs2_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accs2_1_1);
+        accs2_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accs2_1_0);
         accs2_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accs2_1_0);
-        accs2_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accs2_1_1);
-        float2 _add_5 = add_f32x2(accs2_1_0, accs2_1_1);
-        float dots2_1 = _add_5.x + _add_5.y;
+        accs2_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accs2_1_0);
+        float dots2_1 = accs2_1_0.x + accs2_1_0.y;
         float _shfl_xor_sync_45 = __shfl_xor_sync(0xFFFFFFFF, dots2_1, 1);
         dots2_1 = dots2_1 + _shfl_xor_sync_45;
         float _shfl_xor_sync_46 = __shfl_xor_sync(0xFFFFFFFF, dots2_1, 2);
@@ -2514,17 +2494,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         k2[6] = make_float2(k_regs[12], k_regs[13]);
         k2[7] = make_float2(k_regs[14], k_regs[15]);
         float2 accsq_0_0 = make_float2(0.0f, 0.0f);
-        float2 accsq_0_1 = make_float2(0.0f, 0.0f);
         accsq_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accsq_0_0);
-        accsq_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accsq_0_1);
+        accsq_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accsq_0_0);
         accsq_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accsq_0_0);
-        accsq_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accsq_0_1);
+        accsq_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accsq_0_0);
         accsq_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accsq_0_0);
-        accsq_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accsq_0_1);
+        accsq_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accsq_0_0);
         accsq_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accsq_0_0);
-        accsq_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accsq_0_1);
-        float2 _add_6 = add_f32x2(accsq_0_0, accsq_0_1);
-        float dotsq_0 = _add_6.x + _add_6.y;
+        accsq_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accsq_0_0);
+        float dotsq_0 = accsq_0_0.x + accsq_0_0.y;
         float _shfl_xor_sync_48 = __shfl_xor_sync(0xFFFFFFFF, dotsq_0, 1);
         dotsq_0 = dotsq_0 + _shfl_xor_sync_48;
         float _shfl_xor_sync_49 = __shfl_xor_sync(0xFFFFFFFF, dotsq_0, 2);
@@ -2631,17 +2609,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         dotsq_1 = dotsq_1 + _shfl_xor_sync_65;
 #else
         float2 accsq_1_0 = make_float2(0.0f, 0.0f);
-        float2 accsq_1_1 = make_float2(0.0f, 0.0f);
         accsq_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accsq_1_0);
-        accsq_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accsq_1_1);
+        accsq_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accsq_1_0);
         accsq_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accsq_1_0);
-        accsq_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accsq_1_1);
+        accsq_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accsq_1_0);
         accsq_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accsq_1_0);
-        accsq_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accsq_1_1);
+        accsq_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accsq_1_0);
         accsq_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accsq_1_0);
-        accsq_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accsq_1_1);
-        float2 _add_7 = add_f32x2(accsq_1_0, accsq_1_1);
-        float dotsq_1 = _add_7.x + _add_7.y;
+        accsq_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accsq_1_0);
+        float dotsq_1 = accsq_1_0.x + accsq_1_0.y;
         float _shfl_xor_sync_51 = __shfl_xor_sync(0xFFFFFFFF, dotsq_1, 1);
         dotsq_1 = dotsq_1 + _shfl_xor_sync_51;
         float _shfl_xor_sync_52 = __shfl_xor_sync(0xFFFFFFFF, dotsq_1, 2);
@@ -3200,17 +3176,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         dotp0_0 = dotp0_0 + _shfl_xor_sync_70;
 #else
         float2 accp0_0_0 = make_float2(0.0f, 0.0f);
-        float2 accp0_0_1 = make_float2(0.0f, 0.0f);
         accp0_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accp0_0_0);
-        accp0_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accp0_0_1);
+        accp0_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accp0_0_0);
         accp0_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accp0_0_0);
-        accp0_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accp0_0_1);
+        accp0_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accp0_0_0);
         accp0_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accp0_0_0);
-        accp0_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accp0_0_1);
+        accp0_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accp0_0_0);
         accp0_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accp0_0_0);
-        accp0_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accp0_0_1);
-        float2 _add_8 = add_f32x2(accp0_0_0, accp0_0_1);
-        float dotp0_0 = _add_8.x + _add_8.y;
+        accp0_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accp0_0_0);
+        float dotp0_0 = accp0_0_0.x + accp0_0_0.y;
         float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, dotp0_0, 1);
         dotp0_0 = dotp0_0 + _shfl_xor_sync_54;
         float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, dotp0_0, 2);
@@ -3408,17 +3382,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         S2[6] = fma_f32x2_rn_ftz(k2[6], vn2p0_0, S2[6]);
         S2[7] = fma_f32x2_rn_ftz(k2[7], vn2p0_0, S2[7]);
         float2 accp0_1_0 = make_float2(0.0f, 0.0f);
-        float2 accp0_1_1 = make_float2(0.0f, 0.0f);
         accp0_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accp0_1_0);
-        accp0_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accp0_1_1);
+        accp0_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accp0_1_0);
         accp0_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accp0_1_0);
-        accp0_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accp0_1_1);
+        accp0_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accp0_1_0);
         accp0_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accp0_1_0);
-        accp0_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accp0_1_1);
+        accp0_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accp0_1_0);
         accp0_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accp0_1_0);
-        accp0_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accp0_1_1);
-        float2 _add_9 = add_f32x2(accp0_1_0, accp0_1_1);
-        float dotp0_1 = _add_9.x + _add_9.y;
+        accp0_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accp0_1_0);
+        float dotp0_1 = accp0_1_0.x + accp0_1_0.y;
         float _shfl_xor_sync_57 = __shfl_xor_sync(0xFFFFFFFF, dotp0_1, 1);
         dotp0_1 = dotp0_1 + _shfl_xor_sync_57;
         float _shfl_xor_sync_58 = __shfl_xor_sync(0xFFFFFFFF, dotp0_1, 2);
@@ -3662,17 +3634,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         dotp1_0 = dotp1_0 + _shfl_xor_sync_80;
 #else
         float2 accp1_0_0 = make_float2(0.0f, 0.0f);
-        float2 accp1_0_1 = make_float2(0.0f, 0.0f);
         accp1_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accp1_0_0);
-        accp1_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accp1_0_1);
+        accp1_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accp1_0_0);
         accp1_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accp1_0_0);
-        accp1_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accp1_0_1);
+        accp1_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accp1_0_0);
         accp1_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accp1_0_0);
-        accp1_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accp1_0_1);
+        accp1_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accp1_0_0);
         accp1_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accp1_0_0);
-        accp1_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accp1_0_1);
-        float2 _add_10 = add_f32x2(accp1_0_0, accp1_0_1);
-        float dotp1_0 = _add_10.x + _add_10.y;
+        accp1_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accp1_0_0);
+        float dotp1_0 = accp1_0_0.x + accp1_0_0.y;
         float _shfl_xor_sync_60 = __shfl_xor_sync(0xFFFFFFFF, dotp1_0, 1);
         dotp1_0 = dotp1_0 + _shfl_xor_sync_60;
         float _shfl_xor_sync_61 = __shfl_xor_sync(0xFFFFFFFF, dotp1_0, 2);
@@ -3870,17 +3840,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         S2[6] = fma_f32x2_rn_ftz(k2[6], vn2p1_0, S2[6]);
         S2[7] = fma_f32x2_rn_ftz(k2[7], vn2p1_0, S2[7]);
         float2 accp1_1_0 = make_float2(0.0f, 0.0f);
-        float2 accp1_1_1 = make_float2(0.0f, 0.0f);
         accp1_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accp1_1_0);
-        accp1_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accp1_1_1);
+        accp1_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accp1_1_0);
         accp1_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accp1_1_0);
-        accp1_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accp1_1_1);
+        accp1_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accp1_1_0);
         accp1_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accp1_1_0);
-        accp1_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accp1_1_1);
+        accp1_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accp1_1_0);
         accp1_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accp1_1_0);
-        accp1_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accp1_1_1);
-        float2 _add_11 = add_f32x2(accp1_1_0, accp1_1_1);
-        float dotp1_1 = _add_11.x + _add_11.y;
+        accp1_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accp1_1_0);
+        float dotp1_1 = accp1_1_0.x + accp1_1_0.y;
         float _shfl_xor_sync_63 = __shfl_xor_sync(0xFFFFFFFF, dotp1_1, 1);
         dotp1_1 = dotp1_1 + _shfl_xor_sync_63;
         float _shfl_xor_sync_64 = __shfl_xor_sync(0xFFFFFFFF, dotp1_1, 2);
@@ -4124,17 +4092,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         dotp2_0 = dotp2_0 + _shfl_xor_sync_90;
 #else
         float2 accp2_0_0 = make_float2(0.0f, 0.0f);
-        float2 accp2_0_1 = make_float2(0.0f, 0.0f);
         accp2_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accp2_0_0);
-        accp2_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accp2_0_1);
+        accp2_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accp2_0_0);
         accp2_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accp2_0_0);
-        accp2_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accp2_0_1);
+        accp2_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accp2_0_0);
         accp2_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accp2_0_0);
-        accp2_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accp2_0_1);
+        accp2_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accp2_0_0);
         accp2_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accp2_0_0);
-        accp2_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accp2_0_1);
-        float2 _add_12 = add_f32x2(accp2_0_0, accp2_0_1);
-        float dotp2_0 = _add_12.x + _add_12.y;
+        accp2_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accp2_0_0);
+        float dotp2_0 = accp2_0_0.x + accp2_0_0.y;
         float _shfl_xor_sync_66 = __shfl_xor_sync(0xFFFFFFFF, dotp2_0, 1);
         dotp2_0 = dotp2_0 + _shfl_xor_sync_66;
         float _shfl_xor_sync_67 = __shfl_xor_sync(0xFFFFFFFF, dotp2_0, 2);
@@ -4332,17 +4298,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         S2[6] = fma_f32x2_rn_ftz(k2[6], vn2p2_0, S2[6]);
         S2[7] = fma_f32x2_rn_ftz(k2[7], vn2p2_0, S2[7]);
         float2 accp2_1_0 = make_float2(0.0f, 0.0f);
-        float2 accp2_1_1 = make_float2(0.0f, 0.0f);
         accp2_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accp2_1_0);
-        accp2_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accp2_1_1);
+        accp2_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accp2_1_0);
         accp2_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accp2_1_0);
-        accp2_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accp2_1_1);
+        accp2_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accp2_1_0);
         accp2_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accp2_1_0);
-        accp2_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accp2_1_1);
+        accp2_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accp2_1_0);
         accp2_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accp2_1_0);
-        accp2_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accp2_1_1);
-        float2 _add_13 = add_f32x2(accp2_1_0, accp2_1_1);
-        float dotp2_1 = _add_13.x + _add_13.y;
+        accp2_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accp2_1_0);
+        float dotp2_1 = accp2_1_0.x + accp2_1_0.y;
         float _shfl_xor_sync_69 = __shfl_xor_sync(0xFFFFFFFF, dotp2_1, 1);
         dotp2_1 = dotp2_1 + _shfl_xor_sync_69;
         float _shfl_xor_sync_70 = __shfl_xor_sync(0xFFFFFFFF, dotp2_1, 2);
@@ -4577,17 +4541,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         k2[6] = make_float2(k_regs[12], k_regs[13]);
         k2[7] = make_float2(k_regs[14], k_regs[15]);
         float2 accpq_0_0 = make_float2(0.0f, 0.0f);
-        float2 accpq_0_1 = make_float2(0.0f, 0.0f);
         accpq_0_0 = fma_f32x2_rn_ftz(S2[0], k2[0], accpq_0_0);
-        accpq_0_1 = fma_f32x2_rn_ftz(S2[1], k2[1], accpq_0_1);
+        accpq_0_0 = fma_f32x2_rn_ftz(S2[1], k2[1], accpq_0_0);
         accpq_0_0 = fma_f32x2_rn_ftz(S2[2], k2[2], accpq_0_0);
-        accpq_0_1 = fma_f32x2_rn_ftz(S2[3], k2[3], accpq_0_1);
+        accpq_0_0 = fma_f32x2_rn_ftz(S2[3], k2[3], accpq_0_0);
         accpq_0_0 = fma_f32x2_rn_ftz(S2[4], k2[4], accpq_0_0);
-        accpq_0_1 = fma_f32x2_rn_ftz(S2[5], k2[5], accpq_0_1);
+        accpq_0_0 = fma_f32x2_rn_ftz(S2[5], k2[5], accpq_0_0);
         accpq_0_0 = fma_f32x2_rn_ftz(S2[6], k2[6], accpq_0_0);
-        accpq_0_1 = fma_f32x2_rn_ftz(S2[7], k2[7], accpq_0_1);
-        float2 _add_14 = add_f32x2(accpq_0_0, accpq_0_1);
-        float dotpq_0 = _add_14.x + _add_14.y;
+        accpq_0_0 = fma_f32x2_rn_ftz(S2[7], k2[7], accpq_0_0);
+        float dotpq_0 = accpq_0_0.x + accpq_0_0.y;
         float _shfl_xor_sync_72 = __shfl_xor_sync(0xFFFFFFFF, dotpq_0, 1);
         dotpq_0 = dotpq_0 + _shfl_xor_sync_72;
         float _shfl_xor_sync_73 = __shfl_xor_sync(0xFFFFFFFF, dotpq_0, 2);
@@ -4694,17 +4656,15 @@ __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_3cbdef
         dotpq_1 = dotpq_1 + _shfl_xor_sync_105;
 #else
         float2 accpq_1_0 = make_float2(0.0f, 0.0f);
-        float2 accpq_1_1 = make_float2(0.0f, 0.0f);
         accpq_1_0 = fma_f32x2_rn_ftz(S2[8], k2[0], accpq_1_0);
-        accpq_1_1 = fma_f32x2_rn_ftz(S2[9], k2[1], accpq_1_1);
+        accpq_1_0 = fma_f32x2_rn_ftz(S2[9], k2[1], accpq_1_0);
         accpq_1_0 = fma_f32x2_rn_ftz(S2[10], k2[2], accpq_1_0);
-        accpq_1_1 = fma_f32x2_rn_ftz(S2[11], k2[3], accpq_1_1);
+        accpq_1_0 = fma_f32x2_rn_ftz(S2[11], k2[3], accpq_1_0);
         accpq_1_0 = fma_f32x2_rn_ftz(S2[12], k2[4], accpq_1_0);
-        accpq_1_1 = fma_f32x2_rn_ftz(S2[13], k2[5], accpq_1_1);
+        accpq_1_0 = fma_f32x2_rn_ftz(S2[13], k2[5], accpq_1_0);
         accpq_1_0 = fma_f32x2_rn_ftz(S2[14], k2[6], accpq_1_0);
-        accpq_1_1 = fma_f32x2_rn_ftz(S2[15], k2[7], accpq_1_1);
-        float2 _add_15 = add_f32x2(accpq_1_0, accpq_1_1);
-        float dotpq_1 = _add_15.x + _add_15.y;
+        accpq_1_0 = fma_f32x2_rn_ftz(S2[15], k2[7], accpq_1_0);
+        float dotpq_1 = accpq_1_0.x + accpq_1_0.y;
         float _shfl_xor_sync_75 = __shfl_xor_sync(0xFFFFFFFF, dotpq_1, 1);
         dotpq_1 = dotpq_1 + _shfl_xor_sync_75;
         float _shfl_xor_sync_76 = __shfl_xor_sync(0xFFFFFFFF, dotpq_1, 2);

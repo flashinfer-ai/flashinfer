@@ -1145,16 +1145,18 @@ def _static_pick(
 @pytest.mark.parametrize("sm", (148, 152))
 def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
     """T = 1, three Householder steps, on `sm` SMs: the row-partition program up to 160
-    state heads and l8r4 above it; on SM100 / SM103 the one-wave-of-5 program l8r4w5
-    takes (4 x sm, 5 x sm] and l8r4 resumes above it, while SM90 ships no l8r4w5 program
-    and keeps l8r4 there.  The choice depends on (arch, T, B x HV, sm_count) only."""
+    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], the
+    one-wave-of-5 program l8r4w5 takes (4 x sm, 5 x sm] and l8r4 resumes above it, while
+    SM90 ships neither program and keeps l8r4 above 160.  The choice depends on
+    (arch, T, B x HV, sm_count) only."""
     assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a"}
     for arch in loader.ROUTES:
+        one_wave = "l8r4" if arch == "sm_90a" else "l8r4p"
         tail_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
         expected = {
             160: ("splitv", "splitv8_tile8"),
-            161: ("lanerow", "l8r4"),
-            4 * sm: ("lanerow", "l8r4"),
+            161: ("lanerow", one_wave),
+            4 * sm: ("lanerow", one_wave),
             4 * sm + 1: ("lanerow", tail_wave),
             5 * sm: ("lanerow", tail_wave),
             5 * sm + 1: ("lanerow", "l8r4"),
@@ -1178,7 +1180,7 @@ def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
 def test_t4_band_follows_the_architecture(sm: int) -> None:
     """T = 4, three Householder steps: SM90 runs the one-CTA-per-SM program l4r2 up to
     `sm` state heads and l8r4 above it; SM100 / SM103 run l8r4 on every state-head count
-    and ship no l4r2 program (and SM90 no l8r4w5 program)."""
+    and ship no l4r2 program (and SM90 no l8r4p / l8r4w5 program)."""
     for arch in loader.ROUTES:
         for state_heads in (1, 24, sm, sm + 1, 4 * sm, 20480):
             one_cta_wave = arch == "sm_90a" and state_heads <= sm
@@ -1197,6 +1199,7 @@ def test_t4_band_follows_the_architecture(sm: int) -> None:
         }
         assert ("l4r2" in variants) == (arch == "sm_90a"), (arch, sorted(variants))
         assert ("l8r4w5" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
+        assert ("l8r4p" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
 
 
 def test_t1_static_programs_partition_every_sm_count() -> None:
