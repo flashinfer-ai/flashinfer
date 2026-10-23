@@ -6527,6 +6527,152 @@ def test_measured_shape_rules_plan_their_programs(arch):
     )
 
 
+def _owner_rows():
+    """Every row the package owns, as planner views with their planner keywords: the GLM-5.2 projection and MLA
+    rows at the contract's two T and the measured rows of the shapes tranche at their T."""
+    for row in PROJECTION_ROWS:
+        for op in ("fwd", "dgrad", "wgrad"):
+            for out_dtype in ("bf16",) if op == "fwd" else ("bf16", "f32"):
+                for T in (16172, 16231):
+                    v = _views("proj", row, op, out_dtype, T)
+                    yield (
+                        (row, op, out_dtype, T),
+                        v,
+                        dict(transposed_out=v.get("transposed", False)),
+                    )
+    for row in MLA_ROWS:
+        for op in ("fwd", "dgrad", "wgrad"):
+            for T in (16172, 16231):
+                yield (row, op, "bf16", T), _views("mla", row, op, "bf16", T), {}
+    seen = set()
+    for key, T, _sm, _template in MEASURED_SHAPE_ROWS:
+        if (key[1:], T) in seen:
+            continue
+        seen.add((key[1:], T))
+        yield ("shape", *key[1:], T), _key_views(key, T), dict(transposed_out=key[4])
+
+
+def _plan_signature(plan):
+    """Every planned field but the per-architecture shared-memory limit: the instance (template) and the plan."""
+    fields = dataclasses.asdict(plan)
+    fields.pop("smem_limit", None)
+    fields.pop("arch", None)
+    return fields
+
+
+def _own_measured_rule(arch, plan):
+    """The ``ROW_RULES`` entry ``arch`` itself holds for the planned row (the three ragged lookups, no parent)."""
+    ident = (
+        arch,
+        plan.a_mn,
+        plan.b_mn,
+        plan.out_f32,
+        plan.transposed_out,
+        plan.L > 1,
+    )
+    for tail in (
+        (plan.N, plan.K, plan.M),
+        (plan.N, plan.K, None),
+        (plan.N, None, plan.M),
+    ):
+        if ident + tail in ROW_RULES:
+            return ROW_RULES[ident + tail]
+    return None
+
+
+def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
+    """sm_103a registers every sm_100a program, but its lanes measured only the shapes tranche: a row without an
+    sm_103a rule plans with the sm_100a rule (the same instance-key knobs, the same program, the same weight-gradient
+    orientation) and runs that program where the sm_103a registry has it - the registry decides, no template is
+    named here; a row the GB300 lanes measured keeps its own rule."""
+    assert cake_backend.RULE_PARENT == {"sm_103a": "sm_100a"}
+    keys = lambda arch: {k[1:] for k in ROW_RULES if k[0] == arch}  # noqa: E731
+    own, inherited = keys("sm_103a"), keys("sm_100a") - keys("sm_103a")
+    assert inherited and not (own & inherited)
+    for arch_of, table in (("sm_100a", inherited), ("sm_103a", own)):
+        for key in table:
+            a_mn, b_mn, out_f32, out_t, batched, N, K, M = key
+            dims = (N, 16231 if K is None else K, 16231 if M is None else M)
+            assert (
+                cake_backend._measured_row_rule(
+                    "sm_103a", a_mn, b_mn, out_f32, out_t, batched, *dims
+                )
+                == ROW_RULES[(arch_of,) + key]
+            ), key
+    sm = SM_COUNT_OF_ARCH["sm_103a"]
+    registered = _registered("sm_103a")
+    direct = fallen = own_rows = 0
+    for label, v, extra in _owner_rows():
+        kw = dict(sm_count=sm, l2_bytes=L2_BYTES, **extra)
+        mirror, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], arch="sm_103a", _fallback=False, **kw
+        )
+        if _own_measured_rule("sm_103a", mirror) is not None:
+            own_rows += 1  # a GB300-measured row: its own rule, checked by the measured-rows test
+            continue
+        parent, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], arch="sm_100a", _fallback=False, **kw
+        )
+        assert _plan_signature(mirror) == _plan_signature(parent), label
+        plan, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], arch="sm_103a", **kw
+        )
+        if parent.template in registered:
+            assert plan.template == parent.template, (label, plan.template)
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), label
+            direct += 1
+        else:
+            assert plan.template in registered, (label, plan.template)
+            fallen += 1
+    assert own_rows and direct, (own_rows, direct, fallen)
+
+
+def test_rule_inheritance_leaves_the_other_architectures_unchanged(monkeypatch):
+    """Byte for byte: planned with the inheritance map emptied (the planner before it), every owner row plans the
+    same instance and the same plan on sm_100a and sm_107a at their devices' SM counts; on sm_103a only rows
+    without an own rule change, each to a program the sm_103a registry has."""
+
+    def plans(arch):
+        out = {}
+        for label, v, extra in _owner_rows():
+            try:
+                plan, *_ = plan_dense_projection_gemm(
+                    v["A"],
+                    v["B"],
+                    v["out"],
+                    arch=arch,
+                    sm_count=SM_COUNT_OF_ARCH[arch],
+                    l2_bytes=L2_BYTES,
+                    **extra,
+                )
+            except ValueError as e:
+                out[label] = ("raises", str(e))
+                continue
+            out[label] = _plan_signature(plan)
+        return out
+
+    archs = ("sm_100a", "sm_103a", "sm_107a")
+    after = {arch: plans(arch) for arch in archs}
+    with monkeypatch.context() as m:
+        m.setattr(cake_backend, "RULE_PARENT", {})
+        before = {arch: plans(arch) for arch in archs}
+    assert after["sm_100a"] == before["sm_100a"]
+    assert after["sm_107a"] == before["sm_107a"]
+    changed = [
+        k for k in after["sm_103a"] if after["sm_103a"][k] != before["sm_103a"][k]
+    ]
+    assert (
+        changed
+    )  # the GLM-5.2 rows the GB300 benchmark found slower on the generic programs
+    registered = _registered("sm_103a")
+    for label in changed:
+        sig = after["sm_103a"][label]
+        assert isinstance(sig, dict) and sig["template"] in registered, label
+        assert label[0] != "shape", label  # the GB300-measured rows do not move
+
+
 def test_wgrad_swap_follows_the_measured_rule():
     """The weight-gradient orientation: a measured rule keyed in exactly one orientation (the swapped ``_t`` key
     ``(arch, nn, out_f32, True, False, N, None, K)`` or the direct key ``(arch, nn, out_f32, False, False, K, None, N)``)

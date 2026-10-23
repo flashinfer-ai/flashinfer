@@ -1388,6 +1388,15 @@ ARCH_RULE_DEFAULTS: dict[str, dict] = {
 }
 
 
+# Rule inheritance: an architecture whose own rule table covers only the rows its lanes measured plans every other
+# row with the parent's rule - the same instance-key knobs, so the same program, which the registry fallback keeps
+# only where the architecture registers it.  sm_103a (GB300) registers every sm_100a program and its lanes measured
+# the shapes tranche alone; its Cake rows ran the architecture defaults (the generic programs) before, slower than
+# the sm_100a programs the GB300 benchmark planned through the sm_100a table.  A rule the architecture measured itself
+# always wins (either weight-gradient orientation); sm_100a and sm_107a inherit nothing.
+RULE_PARENT: dict[str, str] = {"sm_103a": "sm_100a"}
+
+
 def _measured_row_rule(
     arch: str,
     a_mn: bool,
@@ -1400,8 +1409,9 @@ def _measured_row_rule(
     M: int,
 ) -> dict:
     """The row's own ``ROW_RULES`` entry without the architecture defaults: the exact (N, K, M) rule, else the
-    ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else empty (the lookup of Cake ``row_rule``;
-    FlashInfer-only split so the registry fallback can drop the MEASURED rule alone, see
+    ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else the parent architecture's entry
+    (``RULE_PARENT``: sm_103a reads the sm_100a table for the rows its lanes did not measure), else empty (the lookup
+    of Cake ``row_rule``; FlashInfer-only split so the registry fallback can drop the MEASURED rule alone, see
     ``plan_dense_projection_gemm``)."""
     ident = (arch, bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t), bool(batched))
     for tail in (
@@ -1412,6 +1422,9 @@ def _measured_row_rule(
         rule = ROW_RULES.get(ident + tail)
         if rule is not None:
             return dict(rule)
+    parent = RULE_PARENT.get(arch)
+    if parent is not None:
+        return _measured_row_rule(parent, a_mn, b_mn, out_f32, out_t, batched, N, K, M)
     return {}
 
 
@@ -1427,9 +1440,9 @@ def row_rule(
     M: int,
 ) -> dict:
     """The measured knob overrides of one row identity: the exact (N, K, M) rule, else the
-    ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else empty (the class defaults apply) - each
-    merged over the architecture's ``ARCH_RULE_DEFAULTS`` (round 33: a row rule overrides an architecture default).
-    [Cake ``row_rule``]"""
+    ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else the parent architecture's rule
+    (``RULE_PARENT``), else empty (the class defaults apply) - each merged over the architecture's
+    ``ARCH_RULE_DEFAULTS`` (round 33: a row rule overrides an architecture default).  [Cake ``row_rule``]"""
     merged = dict(ARCH_RULE_DEFAULTS.get(arch, {}))
     merged.update(
         _measured_row_rule(arch, a_mn, b_mn, out_f32, out_t, batched, N, K, M)
@@ -3845,6 +3858,19 @@ def wgrad_views(
     return G.t(), X, False
 
 
+def _orientation_rules(arch: str, N: int, K: int, out_f32: bool) -> tuple[bool, bool]:
+    """Whether ``ROW_RULES`` keys the weight gradient ``[N, K]`` of ``arch`` in the swapped and in the direct
+    orientation; an architecture keyed in neither reads its parent's keys (``RULE_PARENT``)."""
+    a: Optional[str] = arch
+    while a is not None:
+        swapped = (a, True, True, bool(out_f32), True, False, N, None, K) in ROW_RULES
+        direct = (a, True, True, bool(out_f32), False, False, K, None, N) in ROW_RULES
+        if swapped or direct:
+            return swapped, direct
+        a = RULE_PARENT.get(a)
+    return False, False
+
+
 def wgrad_swapped(
     N: int, K: int, *, arch: Optional[str] = None, out_f32: bool = False
 ) -> bool:
@@ -3858,29 +3884,9 @@ def wgrad_swapped(
     from N move less than 256-row tiles padded from N rows and ``default_block_n`` column tiles over K
     (N < 256 and N = 576 swap; a tie keeps the direct route).  [Cake ``wgrad_swapped`` L1496-L1504]"""
     if arch is not None:
-        # the weight-gradient rules are keyed ragged in K (= T): the exact orientation keys, not ``_measured_row_rule``
-        swapped_rule = (
-            arch,
-            True,
-            True,
-            bool(out_f32),
-            True,
-            False,
-            N,
-            None,
-            K,
-        ) in ROW_RULES
-        direct_rule = (
-            arch,
-            True,
-            True,
-            bool(out_f32),
-            False,
-            False,
-            K,
-            None,
-            N,
-        ) in ROW_RULES
+        # the weight-gradient rules are keyed ragged in K (= T): the exact orientation keys, not ``_measured_row_rule``;
+        # an architecture without a rule in either orientation reads its parent's keys (``RULE_PARENT``)
+        swapped_rule, direct_rule = _orientation_rules(arch, N, K, out_f32)
         if swapped_rule != direct_rule:
             return swapped_rule
     bk, bn = default_block_n(K, True), default_block_n(N, True)
