@@ -171,9 +171,24 @@ and writes nothing, no ring row either (the table ceiling of the dense form); ``
 argument of the dense form holds unchanged: a completing row of this step reads ring positions ``pos0 - POOL + 1 ..
 pos0 - 1`` while the step writes positions ``pos0 .. pos0 + S_q - 1``, disjoint rows whenever ``cap >= S_q + POOL - 1``
 (``min_ring_rows``; a cap of 4 serves ``S_q = 1``, 8 serves ``S_q <= 5``), so within a launch no row is read after another
-row writes it.  The e4m3 compressed-key STORE (an e4m3 indexer cache at decode) is a follow-up and is declined by name: the
-paged arms store the activation dtype; the raw-key ring is a bit copy of the step's raw keys and is never quantized (an e4m3
-ring is a form error naming that rule, not the decline).
+row writes it.
+
+The e4m3 STORE arm (the e4m3 compressed-key cache at decode, ``QsaSpec.index_cache_dtype=torch.float8_e4m3fn``; 2026-10-21): the
+compressed-key output of EITHER form (the prefill kernel's ``out`` through ``compile_qsa_compress(out_dtype=)`` -- the unfused decode
+step's pool-1 query path --, the step form's dense ``[B, NB, D]`` and paged ``[num_pages, P / POOL, 1, D]`` caches through
+``compile_qsa_compress_step(index_cache_dtype=)``) may be ``float8_e4m3fn`` on bf16 io.  The chain is the bf16 form's TO THE LAST BIT
+and then ONE more rounding::
+
+    kbar_b = e4m3_rn_satfinite(f32(bf16_rn(y)))        # == bf16_row.to(torch.float8_e4m3fn): the e4m3 cast OF THE bf16 ROW
+
+i.e. the e4m3 cache is exactly the e4m3 cast of the bf16 cache the bf16 form writes (``tile_dsl.pointwise.bf16_words_to_e4m3_words``:
+the four packed bf16 words widened exactly and rounded by ``cvt.rn.satfinite.e4m3x2.f32`` -- round-to-nearest-even, saturating at
++-448, never a NaN; one ``st.global.v2.b32`` of 8 B per lane in place of the ``v4`` of 16).  No scale (plain e4m3 at unit scale: the
+serving stacks' indexer-cache recipe), the same convention as the prefill form's per-tensor cast of its bf16 rows, so a paged cache
+primed from the prefill form's rows and appended by the step form is ONE chain, bitwise.  The raw-key RING stays the io dtype (a bit copy
+of the step's raw keys, never quantized -- an e4m3 ring is a form error naming that rule), so the bf16 value pooled for a block is bitwise
+the bf16 form's before the cast.  f16 io has no e4m3 arm (the helper widens bf16 words; ``check_index_cache_dtype`` refuses the pair by
+name).  The fp8 ``cvt`` is an sm_89+ instruction: an older part is declined BY NAME at compile time (Rule 7), never through ptxas.
 
 Still no shared memory, no mbarrier, no TMA, no tcgen05 in either form: the barrier table and the SMEM table of this kernel
 stay EMPTY by construction.
@@ -189,19 +204,23 @@ from cutlass.cute.runtime import make_fake_stream
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.datatypes import _convert_to_cutlass_data_type
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_requirement_error
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.device import current_device
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.device import compute_capability, current_device
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import bf16_words_to_e4m3_words, f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v2, st_global_v4
 
+from ..cache_write_contract import DEFAULT_POOL  # tokens per compressed block (the QSA compress ratio): defined DSL-free, re-exported here
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, lanes_per_row, validate_shape, vec_chunks
 
-DEFAULT_POOL = 4
-"""Tokens per compressed block -- the QSA compress ratio (``indexer_compress_ratio``)."""
+# ``DEFAULT_POOL`` -- tokens per compressed block, the QSA compress ratio (``indexer_compress_ratio``) -- is imported above from the DSL-free
+# contract module (the block's declaration reads it through ``QsaPrepareIndexArms``; Rule 7) and keeps its name here for this kernel's callers.
 DEFAULT_THREADS_PER_CTA = 128
 
 _IO_DTYPES = (torch.bfloat16, torch.float16)
 _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
+_E4M3 = torch.float8_e4m3fn
+_FP8_CVT_MIN_CC = (8, 9)  # cvt.rn.satfinite.e4m3x2.f32 (the e4m3 store arm): Ada / Hopper / Blackwell / Rubin
+E4M3_LANE_BYTES = 8  # the e4m3 store arm's bytes per lane per chunk: the 8 elements of one 16-B bf16 access as e4m3, one st.global.v2.b32
 
 
 def validate_compress_shape(d: int, rope_dim: int, pool: int, threads_per_cta: int) -> None:
@@ -215,6 +234,18 @@ def validate_compress_shape(d: int, rope_dim: int, pool: int, threads_per_cta: i
     validate_shape(d, rope_dim, threads_per_cta)
     if pool < 1 or (pool & (pool - 1)) != 0:
         raise ValueError(f"pool must be a power of two >= 1 so the fp32 mean is an exact reciprocal multiply, got {pool}")
+
+
+@cute.jit
+def _store_row_chunk_e4m3(out_base: cutlass.Int64, c: cutlass.Constexpr[int], lanes: cutlass.Constexpr[int], lane: cutlass.Int32, y, io_dtype):
+    """The e4m3 store arm of one 16-B chunk of a compressed row: the io-dtype (bf16) rounding of the eight fp32 values -- the bf16 form's
+    words, bit for bit -- then :func:`bf16_words_to_e4m3_words` (``cvt.rn.satfinite.e4m3x2.f32`` on the exactly widened bf16: the e4m3
+    cast of the bf16 row) and ONE ``st.global.v2.b32`` of 8 B at ``out_base + (c x lanes + lane) x 8``: the e4m3 row is 128 B = 16 lanes x
+    8 B.  Called by the prefill kernel, the step form and the fused prepare launch (one convention, four store sites)."""
+    packed = [fp32_to_fp16(y[i], y[i + 1], dtype=io_dtype) for i in range(0, ELEMS_PER_ACCESS, 2)]
+    u0, u1 = bf16_words_to_e4m3_words(packed[0], packed[1], packed[2], packed[3])
+    off8 = cutlass.Int64((c * lanes) * E4M3_LANE_BYTES) + lane.to(cutlass.Int64) * cutlass.Int64(E4M3_LANE_BYTES)
+    st_global_v2(out_base + off8, (u0, u1), cutlass.Int32)
 
 
 @cute.kernel
@@ -337,14 +368,19 @@ def frost_qsa_compress(
             rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
             ys[0][i] = rotated if in_rope else ys[0][i]
 
-    # --- the ONE rounding, 256 B per block row ---------------------------------
+    # --- the ONE rounding, 256 B per block row (the e4m3 store arm: the bf16 words rounded once more, 128 B per row) ------
+    out_fp8 = cutlass.const_expr(mOut.element_type == cutlass.Float8E4M3FN)
+    out_bpe = cutlass.Int64(1) if cutlass.const_expr(out_fp8) else bpe
     if valid:
-        out_base = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * bpe
+        out_base = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * out_bpe
         for c in cutlass.range_constexpr(chunks):
-            off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
             y = ys[c]
-            packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mOut.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
-            st_global_v4(out_base + off, packed, cutlass.Int32)
+            if cutlass.const_expr(out_fp8):
+                _store_row_chunk_e4m3(out_base, c, lanes, lane, y, mK.element_type)
+            else:
+                off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+                packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mOut.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
+                st_global_v4(out_base + off, packed, cutlass.Int32)
 
     if cutlass.const_expr(use_pdl):
         launch_dependent_grids()
@@ -398,6 +434,7 @@ class QsaCompressRecipe(NamedTuple):
     has_seq_lens: bool
     dtype: object
     table_dtype: object
+    out_dtype: object = None  # appended: ``out``'s dtype -- the io dtype, or float8_e4m3fn (the e4m3 store arm)
 
 
 def _fake_strided(dtype, shape, stride):
@@ -418,14 +455,16 @@ def compile_qsa_compress(
     table_dtype=None,
     threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
     use_pdl: bool = False,
+    out_dtype=None,
 ) -> QsaCompressRecipe:
     """Build the artifact from SHAPES ALONE -- no device allocation, no launch.
 
-    ``dtype`` is the io dtype of ``k_raw`` / ``out`` / ``w`` (bf16 or f16);
-    ``table_dtype`` that of ``cos`` / ``sin`` (defaults to ``dtype``).  The
-    batch stride and the token stride of ``k_raw`` are SYMBOLIC, so a column
-    slice of the fused projection slab (token stride = the slab width) and a
-    compact ``[B, S, D]`` buffer share one artifact with no repack.
+    ``dtype`` is the io dtype of ``k_raw`` / ``w`` (bf16 or f16) and of ``out`` unless ``out_dtype`` (appended) names the e4m3 store
+    arm: ``None`` = the io dtype, ``torch.float8_e4m3fn`` = the e4m3 cast of the bf16 row (module docstring; bf16 io only; sm_89+ --
+    an older part is a typed ``NotImplementedError`` naming the instruction); any other value a ``ValueError``.  ``table_dtype`` is
+    that of ``cos`` / ``sin`` (defaults to ``dtype``).  The batch stride and the token stride of ``k_raw`` are SYMBOLIC, so a column
+    slice of the fused projection slab (token stride = the slab width) and a compact ``[B, S, D]`` buffer share one artifact with no
+    repack.  ``out_dtype`` is in the cache key (an e4m3 artifact is a different trace).
     """
     too_old = cutedsl_requirement_error("qsa_compress")
     if too_old is not None:
@@ -436,12 +475,17 @@ def compile_qsa_compress(
     table_dtype = dtype if table_dtype is None else table_dtype
     if table_dtype not in _IO_DTYPES:
         raise ValueError(f"qsa_compress takes 16-bit cos / sin tables (bf16/f16), got table_dtype={table_dtype}")
+    check_index_cache_dtype(out_dtype, dtype)
+    out_dtype = dtype if out_dtype is None else out_dtype
+    check_e4m3_store_target("qsa_compress", out_dtype)
 
-    key = (str(dtype), str(table_dtype), int(d), int(rope_dim), int(pool), int(threads_per_cta), bool(has_seq_lens), bool(use_pdl), current_device())
+    key = (str(dtype), str(table_dtype), int(d), int(rope_dim), int(pool), int(threads_per_cta), bool(has_seq_lens), bool(use_pdl), current_device()) + (
+        () if out_dtype == dtype else (str(out_dtype),)
+    )
     if key not in compiled_cache:
         batch = cute.sym_int()
         k = _fake_strided(dtype, (batch, cute.sym_int(), d), (cute.sym_int(), cute.sym_int(), 1))
-        out = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
+        out = _fake_compact(out_dtype, (batch, cute.sym_int(), d), (2, 1, 0))
         w = _fake_compact(dtype, (d,), (0,))
         table_dim = rope_dim if rope_dim else 1
         tables = [_fake_strided(table_dtype, (cute.sym_int(), cute.sym_int(), table_dim), (cute.sym_int(), cute.sym_int(), 1)) for _ in range(2)]
@@ -474,23 +518,24 @@ def compile_qsa_compress(
         has_seq_lens=bool(has_seq_lens),
         dtype=dtype,
         table_dtype=table_dtype,
+        out_dtype=out_dtype,
     )
 
 
 def _check_row_tensor(name: str, x: torch.Tensor, *, dtype, last_dim: int) -> None:
-    """A ``[..., last_dim]`` 16-bit tensor whose rows the kernel moves in 16-B
-    vectors: unit last stride, every other stride a multiple of 8 elements,
-    base 16-B aligned."""
+    """A ``[..., last_dim]`` tensor of ``dtype`` whose rows the kernel moves in 16-B vectors: unit last stride, every other stride a
+    multiple of one 16-B vector of elements (8 at 16 bits, 16 at e4m3), base 16-B aligned."""
     if x.dtype != dtype:
         raise ValueError(f"{name} must have dtype {dtype} (the recipe's), got {x.dtype}")
     if x.shape[-1] != last_dim:
         raise ValueError(f"{name} must have {last_dim} elements per row, got shape {tuple(x.shape)}")
     if x.stride(-1) != 1:
         raise ValueError(f"{name} must be contiguous along its last dim, got strides {tuple(x.stride())}")
+    per_access = ACCESS_BYTES // max(1, x.element_size())  # elements per 16-B vector (8 at 16 bits, 16 at e4m3)
     for dim in range(x.ndim - 1):
-        if x.stride(dim) % ELEMS_PER_ACCESS != 0:
+        if x.stride(dim) % per_access != 0:
             raise ValueError(
-                f"{name} stride {x.stride(dim)} (dim {dim}) must be a multiple of {ELEMS_PER_ACCESS} elements so every row starts 16-B aligned; got strides {tuple(x.stride())}"
+                f"{name} stride {x.stride(dim)} (dim {dim}) must be a multiple of {per_access} elements so every row starts 16-B aligned; got strides {tuple(x.stride())}"
             )
     if x.data_ptr() % ACCESS_BYTES != 0:
         raise ValueError(f"{name} must be {ACCESS_BYTES}-B aligned for 128-bit accesses")
@@ -534,7 +579,7 @@ def run_qsa_compress(
         raise ValueError(f"out holds {int(out.shape[1])} blocks per batch entry but S={s_tok} has {n_full} complete blocks of {r.pool}")
     if not out.is_contiguous():
         raise ValueError("out must be a compact [B, NB, D] tensor")
-    _check_row_tensor("out", out, dtype=r.dtype, last_dim=r.d)
+    _check_row_tensor("out", out, dtype=r.out_dtype if r.out_dtype is not None else r.dtype, last_dim=r.d)  # the recipe's cache dtype, both ways
     if w.ndim != 1 or int(w.shape[0]) != r.d or not w.is_contiguous():
         raise ValueError(f"w must be a contiguous [{r.d}] norm weight, got shape {tuple(w.shape)}")
     _check_row_tensor("w", w, dtype=r.dtype, last_dim=r.d)
@@ -606,6 +651,7 @@ def build_qsa_compress(
         table_dtype=cos.dtype,
         threads_per_cta=threads_per_cta,
         use_pdl=use_pdl,
+        out_dtype=out.dtype,
     )
     run_qsa_compress(r, k_raw, out, w, cos, sin, seq_lens, eps=eps, norm_weight_offset=norm_weight_offset, stream=stream)
     return r
@@ -633,10 +679,19 @@ hold, or (paged form) a block that needs ring rows the sequence does not own or 
 the committed row's raw key still enters the ring, since the position itself is served)."""
 
 _RING_SLOT_DTYPES = (torch.int32, torch.int64)
-E4M3_STORE_DECLINE = (
-    "the e4m3 compressed-key cache store (an e4m3 indexer cache at decode) is a follow-up: the paged compress arms store the activation dtype (bf16 / f16)"
-)
-"""The typed decline of the e4m3 compressed-key cache on the paged arms (compile and execute, both directions)."""
+
+
+def check_e4m3_store_target(who: str, cache_dtype) -> None:
+    """The e4m3 store arm's instruction (``cvt.rn.satfinite.e4m3x2.f32``) needs sm_89+: an older part is declined BY NAME at compile time
+    (Rule 7), never through the ptxas error the trace would die with.  A no-op for a 16-bit cache."""
+    if cache_dtype != _E4M3:
+        return
+    cc = tuple(compute_capability(current_device()))
+    if cc < _FP8_CVT_MIN_CC:
+        raise NotImplementedError(
+            f"{who}: the e4m3 compressed-key store arm (cvt.rn.satfinite.e4m3x2.f32) needs sm_{_FP8_CVT_MIN_CC[0]}{_FP8_CVT_MIN_CC[1]} or later "
+            f"(Ada / Hopper / Blackwell / Rubin); the current device is sm_{cc[0]}{cc[1]} -- declare a bf16 compressed-key cache there"
+        )
 
 
 def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL) -> int:
@@ -810,9 +865,11 @@ def frost_qsa_compress_step(
     blk = p // cutlass.Int32(pool)
     tok0 = blk * cutlass.Int32(pool)
     # the ring entry (the sequence, or its state block) and the block's cache row -- the one place the two forms differ
+    out_fp8 = cutlass.const_expr(mOut.element_type == cutlass.Float8E4M3FN)  # the e4m3 store arm (module docstring): 1 B per element
+    out_bpe = cutlass.Int64(1) if cutlass.const_expr(out_fp8) else bpe
     if cutlass.const_expr(paged):
         entry, owns_ring = ring_entry(mStateTable, b, mRing)
-        out_row, fits = paged_block_row(mOut, mBlockTable, b, blk, bpe)
+        out_row, fits = paged_block_row(mOut, mBlockTable, b, blk, out_bpe)
         # a block that needs ring rows (it starts below pos0) from a sequence that owns no ring: -2, never the null block's rows
         fits = fits & (owns_ring | (tok0 >= pos0))
     else:
@@ -821,7 +878,7 @@ def frost_qsa_compress_step(
         n_cap = cutlass.Int32(mOut.shape[1])
         fits = blk < n_cap
         blk_r = blk if fits else n_cap - cutlass.Int32(1)
-        out_row = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk_r.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * bpe
+        out_row = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk_r.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * out_bpe
     # The RoPE table is the CEILING on positions: a committed row at p >= S_pos has no table row (the fused launch's RoPE-table arm
     # would rotate it with a clamped row), so it writes nothing -- no ring row, no block -- and reports -2.  A block's rows all lie at
     # or below its completing row's position, so no block ever pools a ring row at or past the table, and the block start's table row
@@ -910,13 +967,16 @@ def frost_qsa_compress_step(
             rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
             ys[0][i] = rotated if in_rope else ys[0][i]
 
-    # --- the ONE rounding, into the block's own cache row ---------------------------
+    # --- the ONE rounding, into the block's own cache row (the e4m3 store arm: the bf16 words rounded once more) ----------
     if write_blk:
         for c in cutlass.range_constexpr(chunks):
-            off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
             y = ys[c]
-            packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mOut.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
-            st_global_v4(out_row + off, packed, cutlass.Int32)
+            if cutlass.const_expr(out_fp8):
+                _store_row_chunk_e4m3(out_row, c, lanes, lane, y, mKnew.element_type)
+            else:
+                off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+                packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mOut.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
+                st_global_v4(out_row + off, packed, cutlass.Int32)
 
     # --- the per-row report: the block id written, -1 (no block / draft), -2 (capacity: a block the cache cannot hold, or a row at or
     # past the table) ----
@@ -1002,6 +1062,7 @@ class QsaCompressStepRecipe(NamedTuple):
     paged: bool = False
     ring_slots: bool = False
     ring_slot_dtype: object = torch.int64
+    index_cache_dtype: object = None  # appended: the compressed-key cache's dtype -- None = the io dtype, float8_e4m3fn = the e4m3 store arm
 
 
 def _fake_i32_table(shape, stride):
@@ -1023,13 +1084,20 @@ def _fake_paged_state(dtype, d):
 
 
 def check_index_cache_dtype(index_cache_dtype, dtype) -> None:
-    """The compressed-key cache's dtype against the paged arms' contract: ``None`` or the activation dtype is served; the e4m3
-    store is the typed decline :data:`E4M3_STORE_DECLINE` (a follow-up); any other dtype is a ``ValueError``."""
+    """The compressed-key cache's dtype against the compress arms' contract: ``None`` or the io dtype is served; ``float8_e4m3fn`` is
+    the e4m3 store arm (the e4m3 cast of the bf16 row -- bf16 io only: f16 io has no e4m3 arm); any other dtype is a ``ValueError``
+    naming the three."""
     if index_cache_dtype is None or index_cache_dtype == dtype:
         return
-    if index_cache_dtype == torch.float8_e4m3fn:
-        raise NotImplementedError(E4M3_STORE_DECLINE)
-    raise ValueError(f"the compressed-key cache must hold the activation dtype {dtype} on the paged arms, got {index_cache_dtype}")
+    if index_cache_dtype == _E4M3:
+        if dtype != torch.bfloat16:
+            raise ValueError(
+                f"the e4m3 compressed-key cache is the e4m3 cast of the bf16 row (the serving stacks' indexer-cache convention); it needs bf16 io, got {dtype}"
+            )
+        return
+    raise ValueError(
+        f"the compressed-key cache must hold the io dtype {dtype} or torch.float8_e4m3fn (the e4m3 store arm) on the compress arms, got {index_cache_dtype}"
+    )
 
 
 def compile_qsa_compress_step(
@@ -1053,8 +1121,9 @@ def compile_qsa_compress_step(
     ``paged=True`` traces the PAGED form (module docstring): the ring ``[blocks, cap, 1, D]`` behind ``index_state_block_table``,
     the compressed-key cache ``[num_pages, P / pool, 1, D]`` behind the main ``block_table``, positions from ``kv_lens``;
     ``ring_slots=True`` (paged only) takes the ring WRITE rows from ``index_state_slot_mapping`` of ``ring_slot_dtype``
-    instead of deriving them; ``index_cache_dtype`` names the cache's dtype (``None`` = the activation dtype; e4m3 is the
-    typed decline of a follow-up).  Every flag is in the cache key.
+    instead of deriving them; ``index_cache_dtype`` names the cache's dtype -- ``None`` = the io dtype, ``torch.float8_e4m3fn`` =
+    the e4m3 store arm (module docstring; the dense AND the paged form, bf16 io only, sm_89+ -- an older part is a typed
+    ``NotImplementedError`` naming the instruction).  Every flag is in the cache key.
     """
     too_old = cutedsl_requirement_error("qsa_compress_step")
     if too_old is not None:
@@ -1070,6 +1139,8 @@ def compile_qsa_compress_step(
     if ring_slot_dtype not in _RING_SLOT_DTYPES:
         raise ValueError(f"ring_slot_dtype must be int32 or int64, got {ring_slot_dtype}")
     check_index_cache_dtype(index_cache_dtype, dtype)
+    cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
+    check_e4m3_store_target("qsa_compress_step", cache_dtype)
 
     key = (
         str(dtype),
@@ -1084,6 +1155,7 @@ def compile_qsa_compress_step(
         bool(paged),
         bool(ring_slots),
         str(ring_slot_dtype) if ring_slots else None,
+        str(cache_dtype) if cache_dtype != dtype else None,  # appended: the e4m3 store arm is its own artifact
     )
     if key not in step_compiled_cache:
         batch = cute.sym_int()
@@ -1096,7 +1168,7 @@ def compile_qsa_compress_step(
         slot = _fake_compact(torch.int32, (batch, rows), (1, 0))
         if paged:
             ring = _fake_paged_state(dtype, d)
-            out = _fake_paged_state(dtype, d)
+            out = _fake_paged_state(cache_dtype, d)
             pos0 = None
             kv_lens = _fake_compact(torch.int32, (batch,), (0,))
             block_table = _fake_i32_table((batch, cute.sym_int()), (cute.sym_int(), 1))
@@ -1104,7 +1176,7 @@ def compile_qsa_compress_step(
             slots = _fake_ring_slots(ring_slot_dtype) if ring_slots else None
         else:
             ring = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
-            out = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
+            out = _fake_compact(cache_dtype, (batch, cute.sym_int(), d), (2, 1, 0))
             pos0 = _fake_compact(torch.int32, (batch,), (0,))
             kv_lens = block_table = state_table = slots = None
         step_compiled_cache[key] = cute.compile(
@@ -1146,6 +1218,7 @@ def compile_qsa_compress_step(
         paged=bool(paged),
         ring_slots=bool(ring_slots),
         ring_slot_dtype=ring_slot_dtype,
+        index_cache_dtype=cache_dtype,
     )
 
 
@@ -1156,19 +1229,22 @@ def _check_int32_vector(name: str, x: torch.Tensor, shape: tuple) -> None:
 
 
 def check_paged_state(name: str, x: torch.Tensor, *, dtype, d: int, min_rows: int, what: str, cache: bool = False) -> None:
-    """A paged state tensor ``[blocks >= 1, rows >= min_rows, 1, D]`` of the activation dtype whose rows the kernels move in 16-B
-    vectors (the stack's ring ``[num_ring_blocks, cap, 1, D]`` or compressed-key cache ``[num_pages, P / pool, 1, D]``).  The e4m3
-    form of the compressed-key CACHE (``cache=True``) is the typed decline of a follow-up, :data:`E4M3_STORE_DECLINE`; an e4m3
-    ring is a ``ValueError`` naming the ring's rule (a bit copy of the step's raw keys, never quantized), as is every other dtype
-    mismatch; typed and naming the operand."""
+    """A paged state tensor ``[blocks >= 1, rows >= min_rows, 1, D]`` of ``dtype`` whose rows the kernels move in 16-B vectors (the
+    stack's ring ``[num_ring_blocks, cap, 1, D]`` in the io dtype, or the compressed-key cache ``[num_pages, P / pool, 1, D]`` in the
+    RECIPE's cache dtype -- ``cache=True``: an e4m3 cache under a 16-bit recipe and a 16-bit cache under an e4m3 recipe are both
+    refused, each naming the recipe's dtype).  An e4m3 ring is a ``ValueError`` naming the ring's rule (a bit copy of the step's raw
+    keys, never quantized), as is every other dtype mismatch; typed and naming the operand."""
     if not isinstance(x, torch.Tensor):
         raise ValueError(f"{name} must be a 4-D [blocks, rows, 1, D={d}] {what}, got {type(x).__name__}")
-    if x.dtype == torch.float8_e4m3fn and dtype != torch.float8_e4m3fn:
+    if x.dtype == _E4M3 and dtype != _E4M3:
         if cache:
-            raise NotImplementedError(E4M3_STORE_DECLINE)
+            raise ValueError(
+                f"{name} is float8_e4m3fn but this artifact stores the compressed-key cache in {dtype} (the recipe's index_cache_dtype): compile the "
+                "e4m3 store arm (index_cache_dtype=torch.float8_e4m3fn) for an e4m3 cache -- no silent cast"
+            )
         raise ValueError(
             f"{name} must hold the activation dtype {dtype}: the raw-key ring is a bit copy of this step's raw keys and is never quantized "
-            f"(the e4m3 form of the paged arms is the compressed-key cache's, a follow-up), got {x.dtype}"
+            f"(the e4m3 form of the paged arms is the compressed-key cache's: index_cache_dtype), got {x.dtype}"
         )
     if x.dim() != 4 or int(x.shape[2]) != 1 or int(x.shape[3]) != d or int(x.shape[0]) < 1:
         raise ValueError(f"{name} must be a 4-D [blocks >= 1, rows, 1, D={d}] {what}, got shape {tuple(x.shape)}")
@@ -1283,7 +1359,8 @@ def run_qsa_compress_step(
 
     ``k_new`` ``[B, S_q, D]`` this step's raw keys (any batch / token stride with 16-B aligned rows), ``ring``
     ``[B, RING, D]`` compact with ``RING >= S_q + pool - 1``, ``out`` ``[B, NB, D]`` compact (the compressed-key
-    cache; a block past ``NB`` is reported ``-2`` and not written), ``w`` ``[D]``, ``cos`` / ``sin`` ``[1 or B, S_pos,
+    cache in the recipe's ``index_cache_dtype`` -- the io dtype or e4m3, refused both ways; a block past ``NB`` is reported ``-2`` and
+    not written), ``w`` ``[D]``, ``cos`` / ``sin`` ``[1 or B, S_pos,
     rope_dim]`` (the table is the ceiling on positions: a committed row at a position at or past ``S_pos`` is reported ``-2`` and
     writes nothing -- size the table for the context), ``pos0`` ``[B]`` int32 (the position of row 0), ``slot_out`` ``[B, S_q]``
     int32 (written for every row), ``n_commit`` ``[B]`` int32 iff the
@@ -1313,7 +1390,15 @@ def run_qsa_compress_step(
             min_rows=need,
             what=f"raw-key ring: a step of {rows} rows needs rows + pool - 1 = {rows} + {r.pool} - 1 so this launch's ring writes never alias its ring reads",
         )
-        check_paged_state("out", out, dtype=r.dtype, d=r.d, min_rows=1, what="compressed-key cache, P / pool rows per attention page", cache=True)
+        check_paged_state(
+            "out",
+            out,
+            dtype=r.index_cache_dtype if r.index_cache_dtype is not None else r.dtype,
+            d=r.d,
+            min_rows=1,
+            what="compressed-key cache, P / pool rows per attention page",
+            cache=True,
+        )
     else:
         if ring.ndim != 3 or int(ring.shape[0]) != batch or int(ring.shape[2]) != r.d or not ring.is_contiguous():
             raise ValueError(f"ring must be a compact [B={batch}, RING, D={r.d}] tensor, got shape {tuple(ring.shape)}")
@@ -1325,7 +1410,7 @@ def run_qsa_compress_step(
         _check_row_tensor("ring", ring, dtype=r.dtype, last_dim=r.d)
         if out.ndim != 3 or int(out.shape[0]) != batch or int(out.shape[2]) != r.d or int(out.shape[1]) < 1 or not out.is_contiguous():
             raise ValueError(f"out must be a compact [B={batch}, NB >= 1, D={r.d}] tensor, got shape {tuple(out.shape)}")
-        _check_row_tensor("out", out, dtype=r.dtype, last_dim=r.d)
+        _check_row_tensor("out", out, dtype=r.index_cache_dtype if r.index_cache_dtype is not None else r.dtype, last_dim=r.d)  # the recipe's cache dtype
     if w.ndim != 1 or int(w.shape[0]) != r.d or not w.is_contiguous():
         raise ValueError(f"w must be a contiguous [{r.d}] norm weight, got shape {tuple(w.shape)}")
     _check_row_tensor("w", w, dtype=r.dtype, last_dim=r.d)
@@ -1426,7 +1511,7 @@ def build_qsa_compress_step(
         paged=paged,
         ring_slots=paged and index_state_slot_mapping is not None,
         ring_slot_dtype=index_state_slot_mapping.dtype if (paged and index_state_slot_mapping is not None) else torch.int64,
-        index_cache_dtype=out.dtype if paged else None,
+        index_cache_dtype=out.dtype,  # both forms: the dense arm is the e4m3 paged arm's oracle twin
     )
     run_qsa_compress_step(
         r,

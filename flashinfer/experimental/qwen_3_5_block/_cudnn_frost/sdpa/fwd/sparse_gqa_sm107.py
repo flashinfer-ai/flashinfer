@@ -62,10 +62,15 @@ past the bound, which is the module's own forms there by construction); off cc 1
 before.  A PERFORMANCE pin only (the same function): the output is BITWISE the former entry's up to 16 splits -- the forms share one
 arithmetic there, the combine module's order statement -- and within fp32 rounding past 16 (the decode-grid kernel merges its eight
 chain partials with ``exp(m_c - m)`` factors; the final O rounds once either way).  :meth:`SparseGqaFwdDslSm107.combine_form` reads the
-pinned value back.  ``use_pdl`` (appended, default False) names the programmatic-dependent-launch form of the chain's two launches; the
-record declines ``True`` by name on this tree (:meth:`SparseGqaFwdDslSm107.check_support`: the sparse core carries no
-``griddepcontrol`` site yet), while the flag already reaches the combine's entry (``compile_ptr(use_pdl=)``) so the commit that lands
-the sites lifts the decline alone.
+pinned value back.  ``use_pdl`` (appended, default False) is the programmatic-dependent-launch form of the chain's two launches -- a
+PERFORMANCE knob, the same function bitwise: the sparse core launches with the programmatic-stream-serialization attribute and carries
+its ``griddepcontrol`` sites (every role's wait before its first dependent global read; no explicit release -- the CTA exit triggers the
+dependent grid at the core's completion, the measured placement of the kernel header's PDL SITES paragraph), and the combine's entry
+takes the switch too (``compile_ptr(use_pdl=)``: every form's pair).  THD x
+``use_pdl`` is a typed decline by name (:meth:`SparseGqaFwdDslSm107.check_support`; the text is :func:`pdl_decline_reason`'s, the ONE
+statement of the fact that the gated attention block's declaration-time decline carries too): the packed form reads the setup launch's
+metadata above every role wait (the pre-dispatch dead-CTA exit, the claim-counter scheduler), so a dependent launch of it would read
+what the setup launch has not written yet; the switch's scope is the dense BSHD and paged decode chain.
 
 The device does the work (Rule 3): lengths, counts, dead items and the tail block(s) are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
@@ -323,6 +328,24 @@ def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_c
 SOFTMAX_GROUPS_DEFAULT = int(os.environ.get("CUDNN_FROST_QSA_SOFTMAX_GROUPS", "0") or 0)
 
 
+def pdl_decline_reason(*, thd: bool) -> Optional[str]:
+    """The ONE statement of the kernel fact behind the ``thd`` x ``use_pdl`` decline (``None`` = the composition is served).  The packed form's
+    pre-dispatch dead-CTA exit reads the live-unit total ``meta[4B + 2]`` and its claim-counter scheduler ``meta[4B + 3]`` -- the SETUP launch's
+    device values, written by the kernel launched right before the main one on the same stream -- above every role's dependent-grid wait (the
+    kernel header's PDL SITES paragraph), so a dependent launch of the THD rendering would read what the setup launch has not written yet, and
+    a wait above the exit would serialize every CTA behind the predecessor anyway.  :meth:`SparseGqaFwdDslSm107.check_support` raises this
+    text; the gated attention block raises the same text at declaration (``thd=True`` on a ``QsaSpec`` geometry with ``use_pdl=True``) -- one
+    source, pinned equal by both suites, so neither site drifts alone when the kernel's PDL scope moves."""
+    if not thd:
+        return None
+    return (
+        "thd=True with use_pdl=True is not served -- the packed form reads the setup launch's metadata (the live-unit total and the claim "
+        "counter) in its pre-dispatch dead-CTA exit and in its scheduler, above every role's dependent-grid wait, so a dependent launch of it "
+        "would read what the setup launch has not written yet; the programmatic-dependent-launch scope is the dense BSHD and paged decode "
+        "chain -- declare use_pdl=False"
+    )
+
+
 class SparseGqaFwdDslSm107:
     """``O, LSE = sparse_sdpa(Q, K, V, block_ids[, block_lens][, seq_kv_lens][, block_table][, epilogue_gate])`` on cc 10.7 -- the standalone adapter.
 
@@ -368,9 +391,10 @@ class SparseGqaFwdDslSm107:
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         # Programmatic dependent launch (appended 2026-10-21; a PERFORMANCE knob of the chain's two launches -- the same function, bitwise):
-        # the launch attribute plus the griddepcontrol pair in every kernel it reaches.  The flag is threaded to the split combine's entry
-        # (compile_ptr(use_pdl=), whose every form carries the pair); the sparse core itself carries no site on this tree, so check_support
-        # declines True by name (knob honoured or ineligible, never a kernel launched with the attribute and no wait).
+        # the launch attribute plus the griddepcontrol sites in both kernels it reaches -- the sparse core (compile(use_pdl=): every role's
+        # wait before its first dependent global read; no explicit release, the CTA exit triggers the dependent at the core's completion)
+        # and the split combine's entry
+        # (compile_ptr(use_pdl=), every form's pair).  THD x use_pdl is check_support's typed decline (knob honoured or ineligible).
         self.use_pdl = bool(use_pdl)
         # The softmax SPLIT (appended; a PERFORMANCE knob of the kernel's softmax role, the same function bitwise): 0 = the module
         # default SOFTMAX_GROUPS_DEFAULT (itself 0 = the kernel's two 4-warp column groups), 1 / 2 explicit -- compiled in as
@@ -487,19 +511,14 @@ class SparseGqaFwdDslSm107:
                 f"sparse d256 forward (sm107): softmax_groups must be 0 (the kernel default), 1 (one 4-warp column group) or 2 (the softmax split: two "
                 f"4-warp groups of 8 columns); got {self.softmax_groups}"
             )
-        if self.use_pdl:
-            # The kernel body carries no griddepcontrol site on this tree: a kernel launched with the programmatic-stream-serialization
-            # attribute but without the wait starts while its predecessor still writes the slab, the pools, the block list and the
-            # lengths and reads them stale -- the gated attention block's PDL suite shows exactly that corruption on a tile whose wait
-            # is removed (its detector cells), so the switch is a typed decline here until the sites land (the combine's entry already
-            # takes it: compile_ptr(use_pdl=)).
-            raise NotImplementedError(
-                "sparse d256 forward (sm107): use_pdl=True is not served by the kernel body yet -- the sparse core carries no griddepcontrol site, and a "
-                "kernel launched with the programmatic-stream-serialization attribute but without the dependent-grid wait reads the slab, the pools, "
-                "the block list and the lengths before its predecessor's writes have landed (the gated attention block's PDL suite shows that corruption "
-                "on a tile whose wait is removed); the split combine's entry already takes the switch, so the commit that lands the sites in "
-                "kernels/sm107/sparse_d256_f16.py lifts this decline alone -- declare use_pdl=False"
-            )
+        if self.use_pdl and self.thd:
+            # The packed form's ONE global read above every role's dependent-grid wait: the pre-dispatch dead-CTA exit reads the live-unit
+            # total meta[4B + 2] (and the claim-counter scheduler meta[4B + 3]) -- the SETUP launch's device values, written by the kernel
+            # launched right before the main one on the same stream.  A dependent launch of the THD rendering would read them before that
+            # launch wrote them (the kernel header's PDL SITES paragraph), and a wait above the exit would serialize every CTA behind the
+            # predecessor anyway -- so the composition is declined by name; the dense BSHD and paged chains carry the sites.  The text is
+            # `pdl_decline_reason`'s: ONE statement for this site and for the gated attention block's declaration-time decline.
+            raise NotImplementedError(f"sparse d256 forward (sm107): {pdl_decline_reason(thd=True)}")
         if self.thd:
             for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence), ("bottom_right", self.bottom_right)):
                 if requested:
@@ -863,7 +882,8 @@ class SparseGqaFwdDslSm107:
         # Their outer functools.lru_cache keys only on arguments. Bypass it so compiled_cache's device/context-aware memo
         # owns reuse: the same specialization compiled by another plan on another GPU is a different launchable.
         compile_kernel = getattr(self._module.compile, "__wrapped__", self._module.compile)
-        fn = compile_kernel(has_lse=(self.lse is not None) or self.split_kv > 1, has_block_lens=has_block_lens)
+        # use_pdl: the programmatic-dependent-launch rendering of the core (its launch attribute + griddepcontrol sites; in the compile key)
+        fn = compile_kernel(has_lse=(self.lse is not None) or self.split_kv > 1, has_block_lens=has_block_lens, use_pdl=self.use_pdl)
         self._fns[has_block_lens] = fn
         if has_block_lens == (self.block_lens is not None):
             self._fn = fn

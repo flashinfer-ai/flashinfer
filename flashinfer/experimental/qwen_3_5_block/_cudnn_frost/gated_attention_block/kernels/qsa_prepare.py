@@ -83,8 +83,14 @@ form"): a row at a negative position (``kv_lens[b] < S_q``; a padding sequence h
 block, slot ``-1`` -- so the null ring block and page 0 are never written for it; a sequence whose state-table entry is ``<= 0``
 or past the ring's blocks owns no ring: it writes no ring row and a block of its that needs ring rows (one starting below
 ``pos0``) reports ``-2`` -- the null block's rows are never pooled into a live sequence's block; a completing block past the
-table's width, on a negative page or on a page past the cache reports ``-2``; the e4m3 compressed-key store is declined by name
-(a follow-up; an e4m3 ring is a form error -- the ring is never quantized).
+table's width, on a negative page or on a page past the cache reports ``-2``.
+
+The e4m3 STORE arm (``compile_qsa_prepare(index_cache_dtype=torch.float8_e4m3fn)``; the e4m3 compressed-key cache at decode, bf16 io
+only): the indexer-query arm's ``index_q_out`` and the compress arm's ``index_k_compressed`` (dense or paged) are e4m3 -- each row the
+bf16 form's packed words rounded ONCE more by ``cvt.rn.satfinite.e4m3x2.f32`` (``qsa_compress._store_row_chunk_e4m3``: the e4m3 cast OF
+THE bf16 ROW, one ``st.global.v2.b32`` of 8 B per lane), the SAME helper and convention as the step form and the pool-1 compress, so the
+fused launch stays bitwise the unfused chain under the attribute too.  The ring stays the io dtype (a bit copy, never quantized -- an e4m3
+ring is a form error naming that rule); the fp8 ``cvt`` needs sm_89+ (an older part is declined by name at compile time, Rule 7).
 
 Bytes per launch (the roofline term is HBM bytes; no perf claim is made here until one is measured on an exclusive GPU):
 Q and K read once and written once, V read once and written once (the pool), the raw key read up to three times (pool,
@@ -106,7 +112,7 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
 
-from ..cache_write_contract import check_pool, check_slot_mapping
+from ..cache_write_contract import QsaPrepareIndexArms, check_pool, check_slot_mapping  # the arms record: re-exported for this kernel's callers
 from .cache_write import _fake_pool, _fake_slot
 from .qk_norm_rope import (
     ACCESS_BYTES,
@@ -128,6 +134,8 @@ from .qsa_compress import (
     _fake_i32_table,
     _fake_paged_state,
     _fake_strided,
+    _store_row_chunk_e4m3,
+    check_e4m3_store_target,
     check_index_cache_dtype,
     check_paged_state,
     check_paged_step_operands,
@@ -504,12 +512,17 @@ def frost_qsa_prepare(
                     rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
                     ys[0][i] = rotated if in_rope else ys[0][i]
             if store_qi:
-                out_base = mIQout.iterator.toint() + (token64 * cutlass.Int64(mIQout.stride[0]) + head64 * cutlass.Int64(mIQout.stride[1])) * bpe
+                iq_fp8 = cutlass.const_expr(mIQout.element_type == cutlass.Float8E4M3FN)  # the e4m3 store arm: 1 B per element
+                iq_bpe = cutlass.Int64(1) if cutlass.const_expr(iq_fp8) else bpe
+                out_base = mIQout.iterator.toint() + (token64 * cutlass.Int64(mIQout.stride[0]) + head64 * cutlass.Int64(mIQout.stride[1])) * iq_bpe
                 for c in cutlass.range_constexpr(chunks_i):
-                    coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
                     y = ys[c]
-                    packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mIQout.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
-                    st_global_v4(out_base + coff, packed, cutlass.Int32)
+                    if cutlass.const_expr(iq_fp8):
+                        _store_row_chunk_e4m3(out_base, c, lanes_i, lane, y, mIQsrc.element_type)
+                    else:
+                        coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
+                        packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mIQout.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
+                        st_global_v4(out_base + coff, packed, cutlass.Int32)
     else:
         # ---------------- the raw-key arm: the key's pool, the ring and the block it completes (qsa_compress_step) ----------
         if cutlass.const_expr(has_raw):
@@ -561,9 +574,11 @@ def frost_qsa_prepare(
                 blk = p // cutlass.Int32(pool)
                 tok0 = blk * cutlass.Int32(pool)
                 # the ring entry (the sequence, or its state block) and the block's cache row -- the one place the two forms differ
+                comp_fp8 = cutlass.const_expr(mComp.element_type == cutlass.Float8E4M3FN)  # the e4m3 store arm: 1 B per element
+                comp_bpe = cutlass.Int64(1) if cutlass.const_expr(comp_fp8) else bpe
                 if cutlass.const_expr(paged):
                     entry, owns_ring = ring_entry(mStateTable, b, mRing)
-                    out_row, fits = paged_block_row(mComp, mBlockTable, b, blk, bpe)
+                    out_row, fits = paged_block_row(mComp, mBlockTable, b, blk, comp_bpe)
                     # a block that needs ring rows (it starts below pos0) from a sequence that owns no ring: -2, never the null block's rows
                     fits = fits & (owns_ring | (tok0 >= pos0))
                 else:
@@ -572,7 +587,9 @@ def frost_qsa_prepare(
                     n_cap = cutlass.Int32(mComp.shape[1])
                     fits = blk < n_cap
                     blk_r = blk if fits else n_cap - cutlass.Int32(1)
-                    out_row = mComp.iterator.toint() + (b64 * cutlass.Int64(mComp.stride[0]) + blk_r.to(cutlass.Int64) * cutlass.Int64(mComp.stride[1])) * bpe
+                    out_row = (
+                        mComp.iterator.toint() + (b64 * cutlass.Int64(mComp.stride[0]) + blk_r.to(cutlass.Int64) * cutlass.Int64(mComp.stride[1])) * comp_bpe
+                    )
                 # the RoPE table is the CEILING on positions (qsa_compress_step's rule): a committed row at p >= S_pos writes nothing -- no ring
                 # row, no block (and no Q / K / indexer-query row under the RoPE-table arm) -- and reports -2; a block's rows all lie at or
                 # below its completing row's position, so no block ever pools a ring row at or past the table
@@ -655,10 +672,13 @@ def frost_qsa_prepare(
                         ys[0][i] = rotated if in_rope else ys[0][i]
                 if write_blk:
                     for c in cutlass.range_constexpr(chunks_i):
-                        coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
                         y = ys[c]
-                        packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mComp.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
-                        st_global_v4(out_row + coff, packed, cutlass.Int32)
+                        if cutlass.const_expr(comp_fp8):
+                            _store_row_chunk_e4m3(out_row, c, lanes_i, lane, y, mIKsrc.element_type)
+                        else:
+                            coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
+                            packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mComp.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
+                            st_global_v4(out_row + coff, packed, cutlass.Int32)
                 slot_val = cutlass.Int32(SLOT_CAPACITY) if (committed & (completes | past_table)) else cutlass.Int32(SLOT_NO_BLOCK)
                 slot_val = blk if write_blk else slot_val
                 if in_row & (lane == cutlass.Int32(0)):
@@ -785,39 +805,8 @@ def qsa_prepare_launch(
 compiled_cache = {}
 
 
-class QsaPrepareIndexArms(NamedTuple):
-    """Which indexer arms an artifact traces (every one a compile key), and the band geometry they address.
-
-    ``raw_pool``: the raw indexer key's write-through pool (the cache-write kernel's second launch); ``query``: the
-    indexer queries' norm + RoPE into a compact ``[T, H_i, D_i]`` buffer (the compress kernel at pool 1); ``compress``:
-    the ring + the compressed-key cache (the compress kernel's step form; ``n_commit`` traces its accepted-prefix load).
-    ``heads`` / ``head_dim`` are the band's ``index_heads`` / ``index_head_dim``; ``pool`` the compress ratio.
-
-    Appended (the serving step's forms, each a compile key): ``paged`` -- the compress arm over the stack's PAGED ring and
-    compressed-key cache through their block tables with the positions from ``kv_lens`` (needs ``compress``);
-    ``ring_slots`` -- the ring WRITE rows from the stack's own slot mapping (needs ``paged``; the slots share the
-    artifact's slot dtype); ``rope_table`` -- the Q / K and indexer-query rotations read from the position-indexed
-    ``cos_pos`` / ``sin_pos`` at ``pos0 + j`` instead of per-token rows (needs ``compress`` and a rotation)."""
-
-    heads: int
-    head_dim: int
-    raw_pool: bool = True
-    query: bool = False
-    compress: bool = False
-    n_commit: bool = False
-    pool: int = DEFAULT_POOL
-    paged: bool = False
-    ring_slots: bool = False
-    rope_table: bool = False
-
-    @property
-    def raw(self) -> bool:
-        """Whether the raw-key arm exists at all (any of its three jobs)."""
-        return bool(self.raw_pool or self.compress)
-
-    @property
-    def any(self) -> bool:
-        return bool(self.raw or self.query)
+# ``QsaPrepareIndexArms`` -- which indexer arms an artifact traces (every one a compile key) -- lives in ``cache_write_contract.py``: the
+# block builds the record at DECLARATION, which must not import this module (the DSL at module scope; Rule 7).  Re-exported above.
 
 
 class QsaPrepareRecipe(NamedTuple):
@@ -838,6 +827,7 @@ class QsaPrepareRecipe(NamedTuple):
     slot_dtype: object
     index: Optional[QsaPrepareIndexArms]
     threads_per_cta: int
+    index_cache_dtype: object = None  # appended: the indexer queries' / compressed-key cache's dtype -- None = the io dtype, float8_e4m3fn = the e4m3 store arm
 
 
 def compile_qsa_prepare(
@@ -861,8 +851,9 @@ def compile_qsa_prepare(
 
     ``apply_norm=False`` traces the RoPE-only Q / K artifact (both weight slots ``None`` -- the ``qk_norm_rope`` presence
     switch); ``index`` names the indexer arms to trace (``None`` = no indexer band: the attention rows and the K / V pools
-    only); ``index_cache_dtype`` (appended) names the compressed-key cache's dtype -- ``None`` = the activation dtype, the
-    e4m3 store is the typed decline of a follow-up (``qsa_compress.E4M3_STORE_DECLINE``).  Every flag is in the cache key.
+    only); ``index_cache_dtype`` (appended) names the indexer queries' and the compressed-key cache's dtype -- ``None`` = the io
+    dtype, ``torch.float8_e4m3fn`` = the e4m3 store arm of the query and the compress arms (module docstring; bf16 io only; sm_89+ --
+    an older part is a typed ``NotImplementedError`` naming the instruction).  Every flag is in the cache key.
     """
     too_old = cutedsl_requirement_error("qsa_prepare")
     if too_old is not None:
@@ -892,6 +883,9 @@ def compile_qsa_prepare(
     if ix is not None and ix.rope_table and rope_dim == 0:
         raise ValueError("index.rope_table with rope_dim=0: there is no rotation to read from a table")
     check_index_cache_dtype(index_cache_dtype, dtype)
+    cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
+    if ix is not None and (ix.query or ix.compress):
+        check_e4m3_store_target("qsa_prepare", cache_dtype)
     key = (
         str(dtype),
         int(h_q),
@@ -906,6 +900,7 @@ def compile_qsa_prepare(
         bool(const_head_counts),
         bool(use_pdl),
         current_device(),
+        str(cache_dtype) if cache_dtype != dtype else None,  # appended: the e4m3 store arm is its own artifact
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -928,20 +923,20 @@ def compile_qsa_prepare(
                 ik_pool = _fake_pool(dtype, 1, page_size, d_i)
             if ix.query:
                 iq_src = fake_rowmajor_dynamic_token_stride(dtype, tok, h_i, d_i)
-                iq_out = _fake(dtype, (tok, h_i, d_i), (2, 1, 0))
+                iq_out = _fake(cache_dtype, (tok, h_i, d_i), (2, 1, 0))
                 w_iq = _fake(dtype, (d_i,), (0,))
             if ix.compress:
                 batch = cute.sym_int()
                 if ix.paged:
                     ring = _fake_paged_state(dtype, d_i)
-                    comp = _fake_paged_state(dtype, d_i)
+                    comp = _fake_paged_state(cache_dtype, d_i)
                     kv_lens = _fake_compact(torch.int32, (batch,), (0,))
                     block_table = _fake_i32_table((batch, cute.sym_int()), (cute.sym_int(), 1))
                     state_table = _fake_i32_table((batch, 1), (cute.sym_int(), 1))
                     ring_slots = _fake_slot(slot_dtype) if ix.ring_slots else None
                 else:
                     ring = _fake_compact(dtype, (batch, cute.sym_int(), d_i), (2, 1, 0))
-                    comp = _fake_compact(dtype, (batch, cute.sym_int(), d_i), (2, 1, 0))
+                    comp = _fake_compact(cache_dtype, (batch, cute.sym_int(), d_i), (2, 1, 0))
                     pos0 = _fake_compact(torch.int32, (batch,), (0,))
                 w_ik = _fake(dtype, (d_i,), (0,))
                 cos_pos, sin_pos = [_fake_strided(dtype, (cute.sym_int(), cute.sym_int(), table_dim), (cute.sym_int(), cute.sym_int(), 1)) for _ in range(2)]
@@ -1010,6 +1005,7 @@ def compile_qsa_prepare(
         slot_dtype=slot_dtype,
         index=ix,
         threads_per_cta=int(threads_per_cta),
+        index_cache_dtype=cache_dtype,
     )
 
 
@@ -1073,6 +1069,8 @@ def run_qsa_prepare(
     ``index_q_out`` ``[T, H_i, D_i]`` + ``w_iq_norm`` with the query arm, ``ring`` ``[B, RING, D_i]`` / ``index_k_compressed``
     ``[B, NB, D_i]`` / ``w_ik_norm`` / ``cos_pos`` / ``sin_pos`` ``[1 or B, S_pos, rope_dim]`` / ``pos0`` ``[B]`` /
     ``compressed_slot`` ``[B, S_q]`` + ``seq_q`` (= S_q, so B = T / S_q) with the compress arm, ``n_commit`` ``[B]`` iff traced.
+    ``index_q_out`` and ``index_k_compressed`` are in the recipe's ``index_cache_dtype`` (the io dtype, or e4m3 under the e4m3 store
+    arm -- refused both ways); the ring is always the io dtype.
 
     The PAGED compress arm (``index.paged``) binds the stack's state in the SAME slots -- ``ring`` is ``[blocks >= 1, cap >= S_q + pool - 1,
     1, D_i]``, ``index_k_compressed`` ``[num_pages >= 1, P / pool, 1, D_i]`` -- plus the appended ``kv_lens`` ``[B]`` int32 (the KV length
@@ -1180,6 +1178,7 @@ def run_qsa_prepare(
     s_q = 1
     if ix is not None:
         d_i = ix.head_dim
+        cache_dtype = r.index_cache_dtype if r.index_cache_dtype is not None else r.dtype  # the recipe's: the io dtype or the e4m3 store arm, both ways
         if ix.raw:
             _check_band("index_k_raw_src", index_k_raw_src, t=t, h=1, d=d_i, dtype=r.dtype)
         if ix.raw_pool:
@@ -1189,7 +1188,7 @@ def run_qsa_prepare(
             n_islots = int(index_k_raw_pool.shape[0]) * r.page_size
         if ix.query:
             _check_band("index_q_src", index_q_src, t=t, h=ix.heads, d=d_i, dtype=r.dtype)
-            _check_band("index_q_out", index_q_out, t=t, h=ix.heads, d=d_i, dtype=r.dtype)
+            _check_band("index_q_out", index_q_out, t=t, h=ix.heads, d=d_i, dtype=cache_dtype)
             if not index_q_out.is_contiguous():
                 raise ValueError(f"index_q_out must be a compact [T, {ix.heads}, {d_i}] buffer, got strides {tuple(index_q_out.stride())}")
             if w_iq_norm.dim() != 1 or int(w_iq_norm.shape[0]) != d_i or not w_iq_norm.is_contiguous():
@@ -1213,7 +1212,7 @@ def run_qsa_prepare(
                 check_paged_state(
                     "index_k_compressed",
                     index_k_compressed,
-                    dtype=r.dtype,
+                    dtype=cache_dtype,
                     d=d_i,
                     min_rows=1,
                     what="compressed-key cache, P / pool rows per attention page",
@@ -1231,7 +1230,7 @@ def run_qsa_prepare(
                 c = index_k_compressed
                 if c.dim() != 3 or int(c.shape[0]) != batch or int(c.shape[2]) != d_i or int(c.shape[1]) < 1 or not c.is_contiguous():
                     raise ValueError(f"index_k_compressed must be a compact [B={batch}, NB >= 1, D_i={d_i}] cache, got shape {tuple(c.shape)}")
-                _check_row_tensor("index_k_compressed", c, dtype=r.dtype, last_dim=d_i)
+                _check_row_tensor("index_k_compressed", c, dtype=cache_dtype, last_dim=d_i)
             if w_ik_norm.dim() != 1 or int(w_ik_norm.shape[0]) != d_i or not w_ik_norm.is_contiguous():
                 raise ValueError(f"w_ik_norm must be a contiguous [{d_i}] norm weight, got shape {tuple(w_ik_norm.shape)}")
             _check_row_tensor("w_ik_norm", w_ik_norm, dtype=r.dtype, last_dim=d_i)
@@ -1344,21 +1343,24 @@ def moved_bytes(
     slot_bytes: int = 4,
     index: Optional[QsaPrepareIndexArms] = None,
     pool: int = DEFAULT_POOL,
+    index_cache_bytes: Optional[int] = None,
 ) -> int:
     """HBM traffic of one launch -- the denominator for an SOL number.  Q read + written; K read + written twice (the slab
     and the pool); V read + written (the pool); the slot per token; with the band: the raw key read once per job (pool,
     ring, its own block -- ``pool`` rows per completing row, counted as one row per token on average) and written to the
     pool and the ring, the indexer queries read + written.  The tables and the norm weights are L2-resident and excluded,
-    as in the sibling kernels' counts."""
+    as in the sibling kernels' counts.  ``index_cache_bytes`` (appended; ``None`` = ``elem_bytes``) is the element size of the
+    indexer queries' output and the compressed-key cache (1 under the e4m3 store arm): the rows the launch WRITES there."""
+    cache_bytes = elem_bytes if index_cache_bytes is None else int(index_cache_bytes)
     total = (2 * t * h_q + 3 * t * h_kv + 2 * t * h_kv) * d * elem_bytes + t * slot_bytes
     if index is not None and index.any:
         d_i = index.head_dim
         if index.raw_pool:
             total += 2 * t * d_i * elem_bytes
         if index.compress:
-            total += (2 + 1) * t * d_i * elem_bytes  # the ring write (read + write) and one pooled row per token on average
+            total += 2 * t * d_i * elem_bytes + t * d_i * cache_bytes  # the ring write (read + write) and one pooled row per token on average
         if index.query:
-            total += 2 * t * index.heads * d_i * elem_bytes
+            total += t * index.heads * d_i * (elem_bytes + cache_bytes)  # read in the io dtype, written in the cache dtype
     return total
 
 

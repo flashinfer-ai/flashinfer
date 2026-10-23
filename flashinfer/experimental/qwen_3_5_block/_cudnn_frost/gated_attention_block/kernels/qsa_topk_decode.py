@@ -122,7 +122,7 @@ states the per-lane stride that keeps the banks spread):
 |---|---|---|---|
 | ``s_hist`` i32 x ``2 x 4096`` | ``red.shared.add`` at the digit of each candidate (data-dependent); the zeroing ``s_hist[b][j x THREADS + t]`` | the scan: thread ``t`` reads bins ``4095 - BPT x t - j`` (``4 x BPT`` B between lanes: 4 wavefronts per load, BPT loads per pass -- immaterial) | the zeroing is conflict-free; the histogram side is bin-addressed by nature |
 | ``s_cand`` u32 x ``CAND_CAP``, ``s_cand_id`` i32 x ``CAND_CAP`` (the fallback's candidate list; views of ``s_pool``) | the appending lanes of a warp at ``base + popc(ballot & lt_mask)`` (consecutive slots: 4 B between lanes) | the later passes (round-strided; the all-pairs rank of a kernel without the fast path: entry ``t`` and every entry) | conflict-free |
-| ``s_pool`` i32 x ``max(nwarps x STAGE_CAP + 1, FALLBACK_POOL_WORDS)`` (the fast path's staging regions, ``STAGE_CAP = top_k + RANK_CAP``, 0 words when they would exceed ``STAGE_POOL_MAX_BYTES`` = 96 KB; the fallback's ``s_cand`` / ``s_cand_id`` / ``s_bal`` are VIEWS of the same words -- a row runs one path or the other) | the staging sweep: the selected lanes of a round store CONSECUTIVE words of their warp's region (4 B between them); every other lane stores the last word (one same-address broadcast store) | the two walks: warp ``w`` reads words ``base + lane`` of its region (consecutive) | conflict-free |
+| ``s_pool`` i32 x ``max(nwarps x STAGE_CAP + 1, fallback_pool_words(cols_cap) = 2 x CAND_CAP + cols_cap / 32)`` (the fast path's staging regions, ``STAGE_CAP = top_k + RANK_CAP``, 0 words when they would exceed ``STAGE_POOL_MAX_BYTES`` = 96 KB; the fallback's ``s_cand`` / ``s_cand_id`` / ``s_bal`` are VIEWS of the same words -- a row runs one path or the other) | the staging sweep: the selected lanes of a round store CONSECUTIVE words of their warp's region (4 B between them); every other lane stores the last word (one same-address broadcast store) | the two walks: warp ``w`` reads words ``base + lane`` of its region (consecutive) | conflict-free |
 | ``s_rank_key`` u32 x ``RANK_CAP``, ``s_rank_id`` i32 x ``RANK_CAP`` | the appending lanes (consecutive slots) | the spread rank: ``THREADS / RANK_CAP`` consecutive lanes read one slot (a broadcast), then slots ``part + j x parts`` (distinct words across the group); the walks: a flagged word's slot (<= 2 words per lane) | conflict-free / broadcast |
 | ``s_bal`` u32 x ``cols_cap / 32`` (one word per round per warp; the fallback; a view of ``s_pool`` past the list) | lane 0 of warp ``w`` at word ``w x EPT + i`` in sweep A | sweep B: every lane of warp ``w`` reads word ``w x EPT + i`` (a broadcast) | consecutive words per warp, one lane writes, broadcast reads: conflict-free |
 | ``s_wsum`` i32 x 32 | lane 31 (the scans) or lane 0 (sweep A) of each warp | every thread reads slot ``lane`` | 4 B between lanes: conflict-free |
@@ -181,8 +181,10 @@ the regions would exceed ``STAGE_POOL_MAX_BYTES`` and the kernel is compiled as 
 <= ``MAX_EPT x cluster_ctas x threads_per_cta``) sizes the register tile; one artifact serves every ``n_blocks_max`` up to it.
 Requirements: a CuTe DSL at or above the FROST floor with the device's target (Rule 7, gated before anything else), a cc 9.0+ device
 for ``cluster_ctas > 1`` (thread-block clusters, DSMEM) and for ``use_pdl`` (``griddepcontrol``; both exist from Hopper; the single-CTA
-form runs on any CuTe DSL target), and the per-CTA dynamic shared memory within the device's opt-in limit (named in the decline
-otherwise).  No performance number is claimed here; an internal record carries the ranking and the measurement of record.
+form runs on any CuTe DSL target), the public CuTe DSL wheel at or above ``CLUSTER_FORM_MIN_DSL`` = 4.8.0 for ``cluster_ctas > 1`` (its
+vector ``st.async`` exchanges: the released 4.7.0 fails that compile -- a typed decline naming the version, the single-CTA form serving
+and the default knob chooser picking it there), and the per-CTA dynamic shared memory within the device's opt-in limit (named in the
+decline otherwise).  No performance number is claimed here; an internal record carries the ranking and the measurement of record.
 
 Importing THIS module already needs the floor: it imports the CuTe DSL and ``cudnn.frost.tile_dsl`` at module scope, so on a DSL
 below the floor the import fails inside the DSL before any gate here can name the version.  The entry a caller hits is the
@@ -198,17 +200,17 @@ from typing import NamedTuple, Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.experimental import primitives as nvvm
 import torch
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost._cutlass_compat import SmemAllocator
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.compiled_cache import compile_cached, template_key
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.device import compute_capability, current_device, shared_memory_per_block_optin
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global, st_global
 
 __all__ = [
+    "FROST_SOURCE_DIGEST",
     "QSA_TOPK_DECODE_MAX_K",
     "MAX_ROWS",
     "MAX_EPT",
@@ -253,12 +255,13 @@ MAX_EPT = 64
 """Keys per thread kept in registers: the register budget of a 512-thread CTA (128 per thread) carries 64; 1024 threads carry 32."""
 MAX_ROWS = 65535
 """The widest row block one launch serves: one CTA per row along ``grid.y``, whose extent the launch grid caps at 65535."""
-_FULL_MASK = 0xFFFFFFFF
 _FAKE_STREAM = None
 compiled_cache = {}
 # Imported normally (not through the template loader), so the module names its own source identity: ``template_key`` joins
 # it with the compile site's key to name the persistent object (``compiled_cache``); the cache's environment manifest covers
 # every other ``.py`` the kernel is traced from.
+# read through the module globals by the persistent compiled-plan cache (``template_key(globals(), ...)``: the digest keys every
+# artifact of this file) and by the test attestation; exported so the reference is explicit
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
@@ -266,12 +269,50 @@ def _is_pow2(x: int) -> bool:
     return x >= 1 and (x & (x - 1)) == 0
 
 
+CLUSTER_FORM_MIN_DSL = (4, 8, 0)
+"""The cluster form's exchanges store four words per thread with one tuple-valued ``store_async_dsmem`` (the vector ``st.async``); the
+released CuTe DSL 4.7.0 -- admitted by the FROST floor -- evaluates ``Int32(value)`` on that tuple and fails the cluster form's compile
+(the single-CTA form compiles there).  The public wheel at or above this version compiles it; an internal build is not judged (the
+floor's own rule), and a version that does not parse is not refused."""
+
+
+def cluster_form_requirement_error(cluster_ctas: int) -> Optional[str]:
+    """Message naming the installed DSL version when ``cluster_ctas > 1`` and the public wheel is below ``CLUSTER_FORM_MIN_DSL``, else
+    None -- a device-free gate, read before any compile (the single-CTA form is the way out it names)."""
+    if int(cluster_ctas) <= 1:
+        return None
+    installed, version = cutedsl_state()
+    if not installed or not version or version[0] != "nvidia-cutlass-dsl":
+        return None
+    parts = []
+    for piece in str(version[1]).split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    if not parts or tuple(parts) >= CLUSTER_FORM_MIN_DSL:
+        return None
+    need = ".".join(str(x) for x in CLUSTER_FORM_MIN_DSL)
+    return (
+        f"qsa_topk_decode with cluster_ctas = {int(cluster_ctas)} (the row-split cluster form) needs nvidia-cutlass-dsl >= {need} for its vector "
+        f"st.async exchanges; found {version[1]} -- use cluster_ctas = 1 (the single-CTA form) there, or upgrade with: pip install -U 'nvidia-cutlass-dsl>={need}'"
+    )
+
+
+def cluster_form_available() -> bool:
+    """Whether the installed DSL compiles the cluster form: the default knob chooser's capability read."""
+    return cluster_form_requirement_error(CLUSTER_SIZES[1]) is None
+
+
 def default_knobs_for(rows: int, n_blocks_max: int, cc=None) -> tuple:
     """The knob pair ``(cluster_ctas, threads_per_cta)`` the convenience entry picks for a row block: the row-split cluster form only
     where it earned its exchanges on the ranking -- rows of more than 8192 blocks (128K tokens and beyond) at up to 32 rows (8 CTAs
     per row up to 16 rows, 4 at 17 .. 32: 32 x 8 CTAs would outnumber the SMs and run in waves); every other block runs one 1024-thread
-    CTA per row.  Below cc 9.0 (no clusters) always ``(1, 1024)``.  A caller with its own measurement passes the knobs explicitly."""
+    CTA per row.  Below cc 9.0 (no clusters) and on a public CuTe DSL wheel below ``CLUSTER_FORM_MIN_DSL`` (the cluster form does not
+    compile there) always ``(1, 1024)``.  A caller with its own measurement passes the knobs explicitly."""
     if cc is not None and tuple(cc) < (9, 0):
+        return (1, DEFAULT_THREADS_PER_CTA)
+    if not cluster_form_available():
         return (1, DEFAULT_THREADS_PER_CTA)
     if n_blocks_max > 8192:
         if rows <= 16:
@@ -324,9 +365,6 @@ def fallback_pool_words(cols_cap: int) -> int:
     """The words the fallback's views need of the pool: the candidate list (``CAND_CAP`` keys + ``CAND_CAP`` ids) and the ballot words
     (one per round per warp = ``cols_cap / 32``)."""
     return 2 * CAND_CAP + cols_cap // 32
-
-
-FALLBACK_POOL_WORDS = fallback_pool_words  # the name the SMEM table cites
 
 
 def stage_words_for(top_k: int, threads_per_cta: int) -> int:
@@ -743,7 +781,6 @@ def frost_qsa_topk_decode(
                     idstar = s_found[3]
                 else:
                     # the narrowing passes over the list (or, a bin wider than the list, over the row's keys): 12-bit digits of [lo, hi]
-                    sh = cutlass.Uint32(0)
                     done = cutlass.Boolean(False)
                     take = zero
                     for p0_ in cutlass.range_constexpr(MAX_PASSES - 1):
@@ -1139,7 +1176,6 @@ def frost_qsa_topk_decode_cluster(
                     idstar = s_found[1]
                 else:
                     # the narrowing passes over the union list, local to every CTA (identical data -> identical verdict)
-                    sh = cutlass.Uint32(0)
                     done = cutlass.Boolean(False)
                     take = zero
                     for p0 in cutlass.range_constexpr(MAX_PASSES - 1):
@@ -1174,11 +1210,14 @@ def frost_qsa_topk_decode_cluster(
                     kstar = (lo - cutlass.Uint32(1)) if lo > cutlass.Uint32(0) else cutlass.Uint32(0)
                     idstar = n - one
                     if (lo == hi) & (take < cnt_b):
-                        # the take-th smallest id among the union's entries with the exact key: an all-pairs rank over ids (<= CAND_CAP)
+                        # the take-th smallest id among the union's entries with the exact key: an all-pairs rank over ids (<= CAND_CAP).
+                        # The union holds up to C x UNION_CAP = 2032 entries at 16 CTAs -- more than the CTA's threads -- so the owner
+                        # loop STRIDES over the whole list: an entry past slot 1023 owned by no thread left the fourth word unwritten and
+                        # the compaction read a stale cutoff (every output slot kept its sentinel; the 2026-10-22 review's finding)
                         kstar = lo
-                        if tidx < ncand:
-                            key_c = s_cand[tidx]
-                            id_c = s_cand_id[tidx]
+                        for c in range(tidx, ncand, threads_per_cta):
+                            key_c = s_cand[c]
+                            id_c = s_cand_id[c]
                             if key_c == kstar:
                                 rnk = zero
                                 for j in range(ncand):
@@ -1193,7 +1232,6 @@ def frost_qsa_topk_decode_cluster(
             else:
                 # a CTA holds more candidates than the union carries: the merged passes over the row's keys (every CTA, every pass),
                 # then -- for an exact key with a partial take -- the merged 2 x 12-bit select over the ids of the keys equal to it
-                sh = cutlass.Uint32(0)
                 done = cutlass.Boolean(False)
                 take = zero
                 for p0 in cutlass.range_constexpr(MAX_PASSES - 1):
@@ -1359,8 +1397,9 @@ class QsaTopkDecodeRecipe(NamedTuple):
 
 
 def _fake_rows(dtype):
-    """``[rows, cols]`` with a symbolic row stride and a unit column stride, 16-B aligned base."""
-    return cute.runtime.make_fake_tensor(dtype=dtype, shape=(cute.sym_int(), cute.sym_int()), stride=(cute.sym_int(), 1), assumed_align=16)
+    """``[rows, cols]`` with a 64-BIT symbolic row stride (the contract takes any row stride and both kernels widen the row arithmetic to
+    64 bits; a default-width symbolic stride made the binder refuse one past the int32 range) and a unit column stride, 16-B aligned base."""
+    return cute.runtime.make_fake_tensor(dtype=dtype, shape=(cute.sym_int(), cute.sym_int()), stride=(cute.sym_int64(), 1), assumed_align=16)
 
 
 def compile_qsa_topk_decode(
@@ -1374,8 +1413,9 @@ def compile_qsa_topk_decode(
     """Build the artifact from the geometry ALONE -- no device allocation, no launch.
 
     Order of the gates (Rule 7 first): the CuTe DSL floor, the geometry, the DSL's target for the current device, the device's
-    PDL support (cc 9.0+), the dynamic shared memory against the device's opt-in limit.  ``NotImplementedError`` names the
-    version, the target or the limit; ``ValueError`` names the malformed geometry.
+    cluster / DSMEM and PDL support (cc 9.0+), the cluster form's own DSL floor (``CLUSTER_FORM_MIN_DSL``: a device gate before a
+    form's DSL gate, so a part below cc 9.0 is named whatever wheel it runs), the dynamic shared memory against the device's
+    opt-in limit.  ``NotImplementedError`` names the version, the target or the limit; ``ValueError`` names the malformed geometry.
     """
     global _FAKE_STREAM
     too_old = cutedsl_requirement_error("qsa_topk_decode")
@@ -1394,6 +1434,9 @@ def compile_qsa_topk_decode(
         )
     if use_pdl and cc < (9, 0):
         raise NotImplementedError(f"qsa_topk_decode with use_pdl=True needs griddepcontrol (cc 9.0+); found cc {cc[0]}.{cc[1]}")
+    cluster_problem = cluster_form_requirement_error(cluster_ctas)  # after the device gates: an older part is named whatever wheel it runs
+    if cluster_problem is not None:
+        raise NotImplementedError(cluster_problem)
     smem_bytes = smem_bytes_for(cols_cap, cluster_ctas, threads_per_cta, top_k)
     limit = shared_memory_per_block_optin(device)
     if smem_bytes > limit:
@@ -1406,26 +1449,40 @@ def compile_qsa_topk_decode(
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
     key = (cols_cap, top_k, cluster_ctas, threads_per_cta, bool(use_pdl), device)
     if key not in compiled_cache:
-        # the in-process memo; behind it the persistent compiled-plan cache keyed by this file's digest + the key's plain values
+        # the in-process memo; behind it the persistent compiled-plan cache keyed by this file's digest + the key's plain values;
+        # the compile runs with the plan device current (its context), so the DSL's compile-target auto-detect sees the device the
+        # constants above were taken from -- a build_device() scope or the tensors' device of the convenience entry, not whichever
+        # GPU the caller left current
         cache_key = template_key(globals(), {"key": key}, "compile_qsa_topk_decode")
-        compiled_cache[key] = compile_cached(
-            qsa_topk_decode_launch,
-            _fake_rows(cutlass.Int32),  # the fp32 logits enter as their int32 bits (a view at the launch boundary)
-            cute.runtime.make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
-            _fake_rows(cutlass.Int32),
-            cutlass.Int32(1),  # rows: runtime, the literal pins the type
-            cols_cap,
-            top_k,
-            cluster_ctas,
-            threads_per_cta,
-            bool(use_pdl),
-            smem_bytes,
-            _FAKE_STREAM,
-            options="--enable-tvm-ffi",
-            cache_key=cache_key,
-            symbol="cudnn_qsa_topk_decode",
-        )
+        with torch.cuda.device(device):
+            compiled_cache[key] = _compile_for(cache_key, cols_cap, top_k, cluster_ctas, threads_per_cta, bool(use_pdl), smem_bytes)
     return QsaTopkDecodeRecipe(compiled_cache[key], cols_cap, top_k, cluster_ctas, threads_per_cta, bool(use_pdl), smem_bytes, device)
+
+
+def _compile_for(cache_key, cols_cap, top_k, cluster_ctas, threads_per_cta, use_pdl, smem_bytes):
+    """The one ``compile_cached`` call of :func:`compile_qsa_topk_decode` (split out so the device scope around it reads as one line)."""
+    return compile_cached(
+        qsa_topk_decode_launch,
+        _fake_rows(cutlass.Int32),  # the fp32 logits enter as their int32 bits (a view at the launch boundary)
+        cute.runtime.make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
+        _fake_rows(cutlass.Int32),
+        cutlass.Int32(1),  # rows: runtime, the literal pins the type
+        cols_cap,
+        top_k,
+        cluster_ctas,
+        threads_per_cta,
+        use_pdl,
+        smem_bytes,
+        _FAKE_STREAM,
+        options="--enable-tvm-ffi",
+        cache_key=cache_key,
+        symbol="cudnn_qsa_topk_decode",
+    )
+
+
+def _tensor_device_index(x: torch.Tensor) -> int:
+    """The CUDA ordinal a tensor lives on (a device without an index = the current one)."""
+    return x.device.index if x.device.index is not None else torch.cuda.current_device()
 
 
 def _check_rows(name: str, x: torch.Tensor, *, dtype, rows: int, device) -> None:
@@ -1452,24 +1509,30 @@ def run_qsa_topk_decode(r: QsaTopkDecodeRecipe, logits: torch.Tensor, counts: to
     """
     if not isinstance(counts, torch.Tensor) or counts.ndim != 1 or counts.dtype != torch.int32 or not counts.is_cuda or not counts.is_contiguous():
         raise ValueError("counts must be a contiguous 1-D int32 CUDA tensor")
-    rows = int(counts.shape[0])
-    if rows > MAX_ROWS:
-        raise ValueError(f"counts holds {rows} rows; the launch grid caps the row count at {MAX_ROWS} (one CTA per row along grid.y) -- split the row block")
-    device = counts.device
-    _check_rows("logits", logits, dtype=torch.float32, rows=rows, device=device)
-    _check_rows("block_ids", block_ids, dtype=torch.int32, rows=rows, device=device)
-    n_blocks_max = int(logits.shape[1])
-    if n_blocks_max < 1 or n_blocks_max > r.cols_cap:
-        raise ValueError(f"logits holds {n_blocks_max} columns; this artifact was compiled for cols_cap = {r.cols_cap} (1 <= n_blocks_max <= cols_cap)")
-    if int(block_ids.shape[1]) != r.top_k:
-        raise ValueError(f"block_ids must be [T, top_k = {r.top_k}] for this artifact, got shape {tuple(block_ids.shape)}")
-    dev_index = device.index if device.index is not None else torch.cuda.current_device()
-    if dev_index != r.device:
-        raise ValueError(f"the tensors live on device {dev_index} but the artifact was compiled for device {r.device} (compile per device)")
-    if rows == 0:
-        return
-    handle = int(stream) if stream is not None else torch.cuda.current_stream(device).cuda_stream
-    r.compiled(logits.view(torch.int32), counts, block_ids, cutlass.Int32(rows), cuda.CUstream(handle))
+    # the recipe's device is the plan device: current for the form checks (a refusal restores the caller's device the same way),
+    # the stream selection (``None`` = THAT device's current stream, whose raw handle may be the default-stream sentinel) and the
+    # launch (the prepared host enters with the plan device's context, whichever GPU the caller left current)
+    with torch.cuda.device(r.device):
+        rows = int(counts.shape[0])
+        if rows > MAX_ROWS:
+            raise ValueError(
+                f"counts holds {rows} rows; the launch grid caps the row count at {MAX_ROWS} (one CTA per row along grid.y) -- split the row block"
+            )
+        device = counts.device
+        _check_rows("logits", logits, dtype=torch.float32, rows=rows, device=device)
+        _check_rows("block_ids", block_ids, dtype=torch.int32, rows=rows, device=device)
+        n_blocks_max = int(logits.shape[1])
+        if n_blocks_max < 1 or n_blocks_max > r.cols_cap:
+            raise ValueError(f"logits holds {n_blocks_max} columns; this artifact was compiled for cols_cap = {r.cols_cap} (1 <= n_blocks_max <= cols_cap)")
+        if int(block_ids.shape[1]) != r.top_k:
+            raise ValueError(f"block_ids must be [T, top_k = {r.top_k}] for this artifact, got shape {tuple(block_ids.shape)}")
+        dev_index = _tensor_device_index(counts)
+        if dev_index != r.device:
+            raise ValueError(f"the tensors live on device {dev_index} but the artifact was compiled for device {r.device} (compile per device)")
+        if rows == 0:
+            return
+        handle = int(stream) if stream is not None else torch.cuda.current_stream(r.device).cuda_stream
+        r.compiled(logits.view(torch.int32), counts, block_ids, cutlass.Int32(rows), cuda.CUstream(handle))
 
 
 def qsa_topk_decode(
@@ -1493,23 +1556,27 @@ def qsa_topk_decode(
         raise NotImplementedError(too_old)
     if not isinstance(block_ids, torch.Tensor) or block_ids.ndim != 2:
         raise ValueError("block_ids must be a [T, top_k] int32 CUDA tensor")
-    if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or not logits.is_cuda:
         raise ValueError("logits must be a [T, n_blocks_max] fp32 CUDA tensor")
-    if cluster_ctas is None:
-        rows = int(counts.shape[0]) if isinstance(counts, torch.Tensor) and counts.ndim == 1 else 0
-        auto_c, auto_t = default_knobs_for(rows, int(logits.shape[1]), compute_capability(current_device()))
-        # an explicit thread count other than the cluster form's keeps the single-CTA form (the knobs are a pair)
-        cluster_ctas = auto_c if (threads_per_cta is None or int(threads_per_cta) == CLUSTER_THREADS) else 1
-        threads_per_cta = auto_t if threads_per_cta is None else int(threads_per_cta)
-    else:
-        cluster_ctas = int(cluster_ctas)
-        threads_per_cta = (CLUSTER_THREADS if cluster_ctas > 1 else DEFAULT_THREADS_PER_CTA) if threads_per_cta is None else int(threads_per_cta)
-    r = compile_qsa_topk_decode(
-        cols_cap=cols_cap_for(int(logits.shape[1]), cluster_ctas, threads_per_cta),
-        top_k=int(block_ids.shape[1]),
-        cluster_ctas=cluster_ctas,
-        threads_per_cta=threads_per_cta,
-        use_pdl=use_pdl,
-    )
-    run_qsa_topk_decode(r, logits, counts, block_ids, stream=stream)
+    # the plan device is the TENSORS' device (``logits``; the lowered launch checks the other two against it), not whichever GPU
+    # is current: the knob pick's capability, the compile and the launch all run with it current, the caller's device restored
+    # after -- also when a form check refuses
+    with torch.cuda.device(_tensor_device_index(logits)):
+        if cluster_ctas is None:
+            rows = int(counts.shape[0]) if isinstance(counts, torch.Tensor) and counts.ndim == 1 else 0
+            auto_c, auto_t = default_knobs_for(rows, int(logits.shape[1]), compute_capability(current_device()))
+            # an explicit thread count other than the cluster form's keeps the single-CTA form (the knobs are a pair)
+            cluster_ctas = auto_c if (threads_per_cta is None or int(threads_per_cta) == CLUSTER_THREADS) else 1
+            threads_per_cta = auto_t if threads_per_cta is None else int(threads_per_cta)
+        else:
+            cluster_ctas = int(cluster_ctas)
+            threads_per_cta = (CLUSTER_THREADS if cluster_ctas > 1 else DEFAULT_THREADS_PER_CTA) if threads_per_cta is None else int(threads_per_cta)
+        r = compile_qsa_topk_decode(
+            cols_cap=cols_cap_for(int(logits.shape[1]), cluster_ctas, threads_per_cta),
+            top_k=int(block_ids.shape[1]),
+            cluster_ctas=cluster_ctas,
+            threads_per_cta=threads_per_cta,
+            use_pdl=use_pdl,
+        )
+        run_qsa_topk_decode(r, logits, counts, block_ids, stream=stream)
     return block_ids

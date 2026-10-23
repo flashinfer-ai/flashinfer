@@ -66,6 +66,16 @@ DECODE_CAPTURE_ROWS_MAX = 128
 #: the FlashInfer-side decline (not an envelope row): a tensor-parallel shard whose dense projection is off the capture-safe
 #: small-M route of the vendored projection GEMM on the device (the probe lists it under this key; ``prepare`` raises it typed)
 PROJ_SLAB_ROUTE_KEY = "proj_slab_route"
+#: the second FlashInfer-side decline row: the e4m3 compressed-key cache.  The vendored tree SERVES it at decode (the paged scorer's e4m3
+#: read arm; ``decode.index_cache_dtypes`` reads ``(bf16, e4m3)`` and the tree's own ``indexer_e4m3_cache`` decline row is retired), but
+#: this entry's e4m3 cache surface (the cache dtype on the probe, the plan key, the stack's cast at prefill) is a follow-up, so the entry
+#: declines it by name and ``index_cache_dtypes`` lists what THIS entry serves.
+INDEX_CACHE_E4M3_KEY = "indexer_e4m3_cache"
+INDEX_CACHE_DTYPES_SERVED: Tuple[torch.dtype, ...] = (torch.bfloat16,)
+INDEX_CACHE_E4M3_REASON = (
+    "index_cache_dtype=torch.float8_e4m3fn: this entry serves the paged compressed-key cache in bf16; the vendored tree serves the e4m3 cache at "
+    "decode (the paged scorer's e4m3 read arm), and this entry's e4m3 cache surface is a follow-up -- declare index_cache_dtype=None"
+)
 #: the decline keys of the README's Errors table every re-vendor must keep publishing under ``decode.declines``
 DECLINE_KEYS: Tuple[str, ...] = (
     "indexer_f16",
@@ -73,7 +83,6 @@ DECLINE_KEYS: Tuple[str, ...] = (
     "indexer_thd",
     "indexer_query_rows",
     "indexer_page_size",
-    "indexer_e4m3_cache",
     "indexer_e4m3_pool",
     "indexer_shared_list",
     "shared_list_rows",
@@ -325,9 +334,11 @@ class Qwen38BlockGeometry:
             self.index_cache_dtype is not None
             and self.index_cache_dtype != torch.bfloat16
         ):
+            if self.index_cache_dtype == torch.float8_e4m3fn:
+                return INDEX_CACHE_E4M3_REASON
             return (
-                f"index_cache_dtype={self.index_cache_dtype}: the paged compressed-key cache is served in the activation dtype (bf16) at decode; "
-                "the e4m3 indexer cache is a follow-up (the paged scorer's e4m3 read arm) -- declare index_cache_dtype=None"
+                f"index_cache_dtype={self.index_cache_dtype}: the paged compressed-key cache is served in bf16 by this entry (the vendored tree "
+                "serves bf16 and e4m3) -- declare index_cache_dtype=None"
             )
         if self.index_list_form == "shared":
             return (
@@ -461,6 +472,8 @@ def _frost_decode_table(
             f"kv_cache_dtype={kv_cache_dtype} is not served under the in-block indexer (served: {d.kv_cache_dtypes})",
         )
     declines = dict(d.declines)
+    # the FlashInfer-side e4m3 cache row (the tree serves that dtype; this entry does not yet): present on every device
+    declines[INDEX_CACHE_E4M3_KEY] = INDEX_CACHE_E4M3_REASON
     route = proj_route_reason(geometry, device, dtype)
     if (
         route is not None
@@ -476,7 +489,9 @@ def _frost_decode_table(
         index_sources=tuple(d.index_sources),
         index_list_forms=tuple(d.index_list_forms),
         index_list_form_default=str(d.index_list_form_default),
-        index_cache_dtypes=tuple(d.index_cache_dtypes),
+        index_cache_dtypes=tuple(
+            t for t in d.index_cache_dtypes if t in INDEX_CACHE_DTYPES_SERVED
+        ),  # what THIS entry serves (the tree also serves e4m3: INDEX_CACHE_E4M3_KEY)
         index_head_dims=tuple(int(x) for x in d.index_head_dims),
         index_kv_heads=tuple(int(x) for x in d.index_kv_heads),
         index_block_sizes=tuple(int(x) for x in d.index_block_sizes),
@@ -580,7 +595,9 @@ def check_vendored_rules() -> Dict[str, Any]:
     ``api.prepare``); returns the tree's constants.  Raises ``RuntimeError`` naming every drifted fact."""
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
         GatedAttentionBlockFwd,
-        qsa_select_paged,
+    )
+    from ..qwen_3_5_block._cudnn_frost.QSA import (  # the paged scorer's DSL-free host (``gated_attention_block/qsa_select_paged.py`` before the pinned commit)
+        selection_paged as qsa_select_paged,
     )
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block.kernels import (
         proj_gemm,

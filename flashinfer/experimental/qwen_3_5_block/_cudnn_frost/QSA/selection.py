@@ -17,7 +17,7 @@ This is exactly the ratio-causal, ReLU-summed, head-reduced score the DSA indexe
 compact-logits + fused top-k path (``cudnn.DSA.indexer_forward_top_k_wrapper``): the compression ratio is
 the block size, the per-head weights are the constant scale, and the dense ``[T, n_blocks]`` score tensor is
 never materialized -- the kernel writes only the ratio-causal candidates compactly and a radix pass selects
-the top-k per token. :func:`qsa_select` is the thin host wrapper that spells the QSA geometry in that
+the top-k per token. :func:`qsa_select_forward` is the thin host wrapper that spells the QSA geometry in that
 vocabulary.
 
 Contract (prefill, THD-packed queries):
@@ -52,7 +52,7 @@ Inside a stream capture neither the record nor the wait is issued (an event reco
 one), so a captured call's constants are warmed up on the capture stream first -- one call outside the capture at the same
 ``(B, n_blocks_max)``, head count and cache dtype -- the rule every capture of the gated attention block already follows.
 
-The DECODE form is :func:`qsa_select_decode` (one to a few query rows per sequence, the verify rows sharing the
+The DECODE form is :func:`qsa_select_decode_forward` (one to a few query rows per sequence, the verify rows sharing the
 step-0 list): the dense DSA scorer at the smallest MMA tile plus the radix top-k kernel with one length per row.
 """
 
@@ -65,14 +65,14 @@ from typing import Optional, Sequence, Union
 import torch
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost._torch_stream import _raw_current_stream, stream_context
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.api_base import TupleDict
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost._tupledict import TupleDict  # the DSL-free home of the result type (Rule 7: this module's import must not execute the DSL)
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 __all__ = [
-    "qsa_select",
+    "qsa_select_forward",
     "QSA_BLOCK_SIZE",
     "QSA_TOP_K",
-    "qsa_select_decode",
+    "qsa_select_decode_forward",
     "decode_row_positions_and_counts",
     "TOP_K_KERNEL_MAX",
     "INDEXER_SCORER_HEAD_DIM",
@@ -206,7 +206,7 @@ def _fp8_q_scale_prefix(cu_seqlens_q: torch.Tensor, n_heads: int) -> torch.Tenso
     """The e4m3 arm's ``cu_seqlens_q_scale_padded`` for ``cu_seqlens_q`` (int32 ``[B + 1]``, any device -- a host tensor gives a host
     result): every sequence's length rounded up to the scale span of ``n_heads`` heads, ``128 // gcd(128, n_heads)`` tokens (32 at 4
     heads).  A caller whose ``cu_seqlens_q`` is a plan constant builds it once (the block's indexer stage, at ``compile``) and hands it
-    to :func:`qsa_select` instead of paying the five device ops of :func:`_padded_prefix` per call (Rule 1)."""
+    to :func:`qsa_select_forward` instead of paying the five device ops of :func:`_padded_prefix` per call (Rule 1)."""
     return _padded_prefix(cu_seqlens_q, _SF_ATOM_ROWS // math.gcd(_SF_ATOM_ROWS, int(n_heads)))
 
 
@@ -235,7 +235,7 @@ def _as_host_ints(values, name: str) -> list:
     return [int(v) for v in values]
 
 
-def qsa_select(
+def qsa_select_forward(
     qi: torch.Tensor,
     kbar: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -302,7 +302,7 @@ def qsa_select(
     total_q, n_heads, head_dim = qi.shape
     batch, n_blocks_max, head_dim_k = kbar.shape
     if head_dim != 128 or head_dim_k != 128:
-        raise ValueError(f"qsa_select scores head_dim 128 indexer heads, got qi head_dim {head_dim} and kbar head_dim {head_dim_k}")
+        raise ValueError(f"qsa_select_forward scores head_dim 128 indexer heads, got qi head_dim {head_dim} and kbar head_dim {head_dim_k}")
     fp8 = _fp8_cache_arm(qi, kbar)
     if not qi.is_cuda or kbar.device != qi.device:
         raise ValueError("qi and kbar must be CUDA tensors on one device")
@@ -362,21 +362,21 @@ def qsa_select(
 
     # Rule 7 first: the CuTe DSL floor (device-free) BEFORE the head-group read -- the module that spells the scorer's packed head
     # groups imports the DSA indexer package, whose __init__ imports its kernel modules, so a sub-floor DSL gets the typed version
-    # decline here and never an error from inside the DSL (qsa_select_decode orders it the same way); then the head count (a property
+    # decline here and never an error from inside the DSL (qsa_select_decode_forward orders it the same way); then the head count (a property
     # of the request, ahead of any device query), then the target and the device family, then the wrapper import.
-    dsl_problem = cutedsl_requirement_error("qsa_select")
+    dsl_problem = cutedsl_requirement_error("qsa_select_forward")
     if dsl_problem is not None:
         raise NotImplementedError(dsl_problem)
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
 
     if n_heads not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16:
-        raise NotImplementedError(f"qsa_select packs n_heads in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16} indexer heads per token, got {n_heads}")
+        raise NotImplementedError(f"qsa_select_forward packs n_heads in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16} indexer heads per token, got {n_heads}")
     device_cc = tuple(torch.cuda.get_device_capability(qi.device))
     arch_problem = cutedsl_arch_requirement_error(device_cc)
     if arch_problem is not None:
         raise NotImplementedError(arch_problem)
     if device_cc[0] != 10:
-        raise NotImplementedError(f"qsa_select runs the SM100-family indexer scorer (cc 10.x); found cc {device_cc[0]}.{device_cc[1]}")
+        raise NotImplementedError(f"qsa_select_forward runs the SM100-family indexer scorer (cc 10.x); found cc {device_cc[0]}.{device_cc[1]}")
 
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward import indexer_forward_top_k_wrapper
 
@@ -474,7 +474,7 @@ def decode_row_positions_and_counts(
     return positions, counts
 
 
-def qsa_select_decode(
+def qsa_select_decode_forward(
     qi: torch.Tensor,
     kbar: torch.Tensor,
     kv_lens: torch.Tensor,
@@ -491,7 +491,7 @@ def qsa_select_decode(
     """Block selection for a DECODE step (one to a few query tokens per sequence; the speculative-verify rows share
     the step-0 list).
 
-    The prefill selector (:func:`qsa_select`) runs the compact-logits + fused top-k path, sized for thousands of
+    The prefill selector (:func:`qsa_select_forward`) runs the compact-logits + fused top-k path, sized for thousands of
     query rows.  A decode step has ``rows_per_seq`` (1, or ``1 + drafts``) rows per sequence, so the dense
     ``[rows, n_blocks_max]`` score matrix is small (``B x 4 x n_blocks_max x 4 B``: 2 MiB at 128K tokens, ``B = 4``)
     and the two-launch form -- the DSA unified scorer writing dense ratio-causal scores, then the radix top-k
@@ -543,7 +543,7 @@ def qsa_select_decode(
     if rows_per_seq < 1:
         raise ValueError("qi must hold at least one query row per sequence")
     if head_dim != 128 or head_dim_k != 128:
-        raise ValueError(f"qsa_select_decode scores head_dim 128 indexer heads, got qi head_dim {head_dim} and kbar head_dim {head_dim_k}")
+        raise ValueError(f"qsa_select_decode_forward scores head_dim 128 indexer heads, got qi head_dim {head_dim} and kbar head_dim {head_dim_k}")
     fp8 = _fp8_cache_arm(qi, kbar)
     if not qi.is_cuda or kbar.device != qi.device:
         raise ValueError("qi and kbar must be CUDA tensors on one device")
@@ -595,7 +595,7 @@ def qsa_select_decode(
 
     # Rule 7 first: the DSL floor and target, then the device family -- before any kernel module is imported, so a
     # sub-floor DSL gets the typed message and never a DSL-internal import error.
-    dsl_problem = cutedsl_requirement_error("qsa_select_decode")
+    dsl_problem = cutedsl_requirement_error("qsa_select_decode_forward")
     if dsl_problem is not None:
         raise NotImplementedError(dsl_problem)
     device_cc = tuple(torch.cuda.get_device_capability(qi.device))
@@ -603,12 +603,12 @@ def qsa_select_decode(
     if arch_problem is not None:
         raise NotImplementedError(arch_problem)
     if device_cc[0] != 10:
-        raise NotImplementedError(f"qsa_select_decode runs the SM100-family indexer scorer (cc 10.x); found cc {device_cc[0]}.{device_cc[1]}")
+        raise NotImplementedError(f"qsa_select_decode_forward runs the SM100-family indexer scorer (cc 10.x); found cc {device_cc[0]}.{device_cc[1]}")
 
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
 
     if n_heads not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16:
-        raise NotImplementedError(f"qsa_select_decode packs n_heads in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16} indexer heads per token, got {n_heads}")
+        raise NotImplementedError(f"qsa_select_decode_forward packs n_heads in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16} indexer heads per token, got {n_heads}")
     if fp8:
         m_eff = _MXFP8_TILE_ROWS
     else:

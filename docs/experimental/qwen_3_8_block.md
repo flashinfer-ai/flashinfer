@@ -166,7 +166,7 @@ through the vendored compress kernel (one convention).
 | condition | exception |
 |---|---|
 | a tensor-parallel shard whose fused slab or out projection is off the capture-safe small-M projection route on the device (the TP 2 / TP 4 slabs, N 7296 / 4224: 256 does not divide N and its 64-row weight tiles fit one wave; the vendored route's own arithmetic decides, at the part's SM count); the probe lists it as `proj_slab_route` -- a FlashInfer-side row, not an envelope row | `NotImplementedError` naming the projection, N, K and the SM count |
-| not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 activations on the bf16 entry; `head_dim != 256`, `d_model % 256`, `rope_dim` not 64 / 128; the indexer geometry off `index_head_dim 128` / `index_kv_heads 1` / `block_size 4` / `top_k` a multiple of 4 in [4, 512]; `index_list_form="shared"`; `index_cache_dtype=torch.float8_e4m3fn`; `kv_cache_dtype=torch.float8_e4m3fn`; `q_len_per_req x next_pow2(index_heads) > 64` (16 rows at four heads); a `page_size` the paged scorer does not address (not 16 / 32 / 64 / 128); `use_pdl=True` on the sparse chain; `fuse_prepare=False` with `rope_position_tables_only=True`; `"prefill"` / `"extend"` on this entry | `NotImplementedError` naming the fact (the vendored decline text where one exists; `qwen_3_8_block_support` reports it without raising, and its `decode.declines` table carries every vendored row by key: `indexer_f16`, `indexer_head_dim`, `indexer_thd`, `indexer_query_rows`, `indexer_page_size`, `indexer_e4m3_cache`, `indexer_e4m3_pool`, `indexer_shared_list`, `shared_list_rows`, `fuse_prepare_rope_tables_unfused`) |
+| not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 activations on the bf16 entry; `head_dim != 256`, `d_model % 256`, `rope_dim` not 64 / 128; the indexer geometry off `index_head_dim 128` / `index_kv_heads 1` / `block_size 4` / `top_k` a multiple of 4 in [4, 512]; `index_list_form="shared"`; `index_cache_dtype=torch.float8_e4m3fn`; `kv_cache_dtype=torch.float8_e4m3fn`; `q_len_per_req x next_pow2(index_heads) > 64` (16 rows at four heads); a `page_size` the paged scorer does not address (not 16 / 32 / 64 / 128); `use_pdl=True` on the sparse chain; `fuse_prepare=False` with `rope_position_tables_only=True`; `"prefill"` / `"extend"` on this entry | `NotImplementedError` naming the fact (the vendored decline text where one exists; `qwen_3_8_block_support` reports it without raising, and its `decode.declines` table carries every vendored row by key: `indexer_f16`, `indexer_head_dim`, `indexer_thd`, `indexer_query_rows`, `indexer_page_size`, `indexer_e4m3_pool`, `indexer_shared_list`, `shared_list_rows`, `fuse_prepare_rope_tables_unfused`, plus the two FlashInfer-side rows `indexer_e4m3_cache` (the tree serves the e4m3 compressed-key cache; this entry's surface for it is a follow-up) and `proj_slab_route`) |
 | a malformed operand (dtype, rank, shape, strides, alignment, device); a ring with `cap < q_len + 3` (the bound named); position tables shorter than `max_pages x page_size`; `index_state_slot_mapping` given / missing against the plan's `ring_slots`, or of another dtype than `slot_mapping`; `rope_cos` / `rope_sin` given under the table arm or missing under the per-token arm; `query_start_loc` / `num_actual_tokens` on the decode form; `k_scale` / `v_scale` on bf16 pools; `max_pages` narrower than the table; the CSR triple | `ValueError` naming the operand and the expected form |
 | `prepare` / `plan` under capture; a cold functional bucket under capture; `clear_plan_cache()` under capture | `RuntimeError` naming the remedy |
 
@@ -212,16 +212,17 @@ environment", for the full table.
 
 ## Where the kernels come from
 
-The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 112 files at the pinned commit
-`b4664a2d4` -- the block's forward with the in-block indexer's decode step, the block-sparse d256 core and its paged indexer kernels
-(the fused prepare, the compress step, the paged scorer, the decode top-k) and their DSL-free hosts, beside the dense forms' launches
---, every file with its NVIDIA SPDX header, MIT or Apache-2.0; the import roots rewritten and the declared patches of
-`../qwen_3_5_block/_cudnn_frost/VENDOR.md`; per-file digests in `VENDOR_MANIFEST.json`). The pinned commit is the cuDNN Frontend PR of
-the in-block indexer's decode step (`QsaSpec(index_source="indexer")` over the pools: the paged compressed-key cache on the main block
-table, the raw-key ring, the paged scorer, the decode top-k, the measured `fuse_prepare` default); until it merges, the drop is
-reproducible from the author's fork named in `VENDOR.md` / `VENDOR_MANIFEST.json`, and this package stays a DRAFT -- it is re-vendored at
-the `develop` commit before review. `qwen_3_8_block_support(...).source` reports the pin at runtime (the same record as the Qwen 3.5
-package's). The deployed process never imports the `cudnn` package nor the cuDNN library. Re-vendoring: `../qwen_3_5_block/_vendoring/`
+The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 114 files at the pinned commit
+`f2aa360e5` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode step, the block-sparse d256
+core and its paged indexer kernels (the fused prepare, the compress step, the paged scorer, the decode top-k) and their DSL-free hosts
+(the `QSA` selection package), beside the dense forms' launches --, every file with its NVIDIA SPDX header, MIT or Apache-2.0; the import
+roots rewritten and the declared patches of `../qwen_3_5_block/_cudnn_frost/VENDOR.md`; per-file digests in `VENDOR_MANIFEST.json`). The
+pinned commit carries the in-block indexer's decode step (`QsaSpec(index_source="indexer")` over the pools: the paged compressed-key
+cache on the main block table, the raw-key ring, the paged scorer, the decode top-k, the measured `fuse_prepare` default), the
+block-sparse decode schedule's split rule, the chain's programmatic-dependent-launch sites (served on the caller-list form; under the
+in-block indexer `use_pdl=True` stays a typed decline) and the e4m3 compressed-key cache arms (served by the tree; this entry declines
+`index_cache_dtype=torch.float8_e4m3fn` by name until its own e4m3 cache surface lands). `qwen_3_8_block_support(...).source` reports the
+pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the cuDNN library. Re-vendoring: `../qwen_3_5_block/_vendoring/`
 (its README is the recipe; the tracer's `decode_qsa` form declares this route).
 
 ## Validation

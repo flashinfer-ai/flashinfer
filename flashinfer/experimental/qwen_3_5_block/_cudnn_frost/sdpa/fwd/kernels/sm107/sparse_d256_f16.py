@@ -201,6 +201,55 @@ mb_q_empty(i) -> gate(i) -> mb_gate_full -> epilogue(i) reads -> mb_gate_empty -
 queuing Q(i + 1) / ids(i + 1) (their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's
 LAST BMM1) and before its next credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
 
+PDL SITES (``use_pdl``, a compile-time kernel argument and the launch attribute, appended 2026-10-21; NO barrier row, ring depth,
+SMEM buffer or TMEM column changes -- the table above is the ``use_pdl=False`` rendering's and the ``use_pdl=True`` rendering's alike,
+and the two compute the same function bitwise).  Under the programmatic-stream-serialization attribute this grid may START while
+its predecessor on the stream (the norm + RoPE / prepare launch that writes the slab, the write-through that fills the pools, the
+selector that writes the block list, the stack's kernels that write the lengths and the table) still runs, so EVERY global read of a
+predecessor's output sits below a ``griddepcontrol.wait`` (``wait_on_dependent_grids()``) of the reading role, and no global WRITE
+sits above one.  Per role, every global read, and where its wait is:
+
+    TMA warp      reads: block_ids (the ids bulk copy, barrier row 3), the Q^T box (the slab; row 1), the gate tile (the slab's GATE
+                  columns; row 11, gated arm).  Wait: at the top of ``_tmaldg_warp_group``, before the prologue's ``_decode_item`` and
+                  ``_tma_issue_item`` (the tensor-map prefetches above it read kernel PARAMETERS, not a predecessor's output).
+    gather warps  reads: ``_item_bounds``' inputs -- seq_kv_lens (the stack's lengths) and block_lens (the selector's counts) --, the
+                  block table (``_gather_block_pages``, paged arm) and the K / V rows (``tma_gather4`` of the pools or the dense
+                  operands).  Wait: at the top of ``_gather_warp_group``, before the prologue's ``_decode_item`` and the first
+                  ``_item_bounds``.  (Dense BSHD: ``_decode_item`` reads nothing global -- the grid position; the THD arm's metadata
+                  read is below the wait too, but see the prologue note.)
+    MMA warp      reads: ``_item_bounds``' inputs (seq_kv_lens, block_lens) only -- its operands arrive through SMEM.  Wait: after the
+                  TMEM allocation, the named-barrier hand-off and the descriptor builds (its prologue), before ``_decode_item``.
+    softmax warps reads: ``_item_bounds``' inputs (seq_kv_lens, block_lens); WRITES: O / the partial slabs and the LSE (the epilogue).
+                  Wait: after the TMEM hand-off (``barrier_cta_sync`` on named barrier 1 + the SMEM read of the TMEM base), before
+                  ``_decode_item`` -- every global write of the role is below it.
+    scheduler     reads nothing global on the BSHD / CLC form (the CLC responses are hardware; the payload ring is SMEM): no wait.
+    spare warp    exits after the init sync: no wait.
+    the release   NONE explicit: no CTA executes ``griddepcontrol.launch_dependents``, so each CTA counts as released when it EXITS (the
+                  PTX rule) and the dependent grid (the split combine, or the out projection at split 1) launches at this grid's
+                  completion through the programmatic edge.  Its own wait blocks on this grid's completion and memory flush wherever a
+                  trigger would sit, so the placement is a performance choice, never a correctness one -- and it is a MEASURED one
+                  (2026-10-21, the cc 10.7 class: a 212-SM gate of the switched block chain and a per-kernel timeline of one replay on
+                  a 204-SM part under two instruments).  The first form of this paragraph released right after ``fence_mbarrier_init +
+                  barrier_cta_sync``, before the role dispatch: the combine's CTAs then sat resident on the idle SMs from this grid's
+                  first microsecond, spinning in their wait through the whole mainloop, and after this grid completed they needed
+                  7.4-7.9 us for 2.75 us of work (+4.6-5.1 us at that one link) while this kernel ran 0.4-0.7 us slower with them
+                  resident -- the whole 3.2-4.4 us per-step loss the switched chain showed at B <= 4 (the graph's launch overhead did
+                  not move with the number of programmatic nodes).  The SAME edge triggered at this grid's completion cost nothing
+                  (2.85 vs 2.75 us), and the dependents the norm + RoPE, cache-write and combine kernels launch early (short, non-CLC
+                  primaries) gain 0.2-0.8 us each.  Rule for a long CLC-scheduled primary: no release above its mainloop (trigger at
+                  completion, or after the CTA's last item); a prologue release is a measured exception.  The TMEM-footprint argument
+                  the prologue release needed (no dependent CTA could co-reside with this one -- 226,688 B of the 227 KiB carveout, one
+                  CTA per SM -- so a dependent allocating TMEM before its own wait could never hold columns this CTA's later allocation
+                  needs) is moot: nothing is released above the MMA warp's allocation, or at all.
+
+The PRE-DISPATCH prologue holds ONE global read ABOVE every role wait: ``exit_if_dead_thd_cluster(seq_kv_lens_tensor, ...)`` under
+``CFG.THD_VARLEN == 1`` reads the live-unit total ``meta[4B + 2]`` -- the SETUP LAUNCH's device value, written by the kernel launched
+right before this one on the same stream -- before any mbarrier init, and the THD scheduler's claim counter reads ``meta[4B + 3]`` the
+same way.  A dependent launch of the THD rendering would therefore read the metadata the setup launch has not written yet, so THD x
+``use_pdl`` is a typed decline of the adapter (``SparseGqaFwdDslSm107.check_support``: ``thd=True`` with ``use_pdl=True``), never a wait
+placed above the exit (which would serialize every CTA of the grid behind the predecessor anyway).  The early-exit CTAs of the THD form
+count as released by completing, like every CTA of this kernel.  The PDL scope is the dense BSHD and paged decode chain.
+
 THE ONE HELPER ``_item_bounds``: n_tiles, count, the tail block id(s), dead and the split chunk are computed by ONE pure
 helper at the item-start site of EVERY role that loops over tiles (softmax, MMA, the 8 gather warps, the TMA warp) over the
 same inputs (the item ``_decode_item`` decoded from the payload -- ONE decode for every role and every item, the CTA's
@@ -420,7 +469,7 @@ from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, wait
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, wait, wait_on_dependent_grids
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.mma import mma_ss
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import TMA_L2_EVICT_LAST, bulk_copy, opaque_i64, tma_gather4, tma_load_tile
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
@@ -858,7 +907,20 @@ def _tma_issue_gate(tma_gate, sQ, bars, out_tok, head, out_batch, qg_idx, qg_pha
 
 @cute.jit
 def _tmaldg_warp_group(
-    tma_q_desc, tma_gate_desc, sQ, sIds_raw, bars, sched, block_ids_tensor, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv, t0_init, t1_init
+    tma_q_desc,
+    tma_gate_desc,
+    sQ,
+    sIds_raw,
+    bars,
+    sched,
+    block_ids_tensor,
+    seq_kv_lens_tensor,
+    n_batch,
+    seqlen_q,
+    seqlen_kv,
+    t0_init,
+    t1_init,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     tma_q = GmemTileTma(tma_q_desc)
     tma_gate = GmemTileTma(tma_gate_desc) if cutlass.const_expr(CFG.EPILOGUE_GATE) else None
@@ -875,6 +937,11 @@ def _tmaldg_warp_group(
     qg_state = PipelineState.start(phase=0)
     ge_state = PipelineState.start(phase=1)
 
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): this role's first global reads are the prologue's ids bulk copy (block_ids: the selector's / the
+        # caller's list) and the Q^T box (the slab a projection / norm + RoPE launch wrote); the tensor-map prefetches above are kernel
+        # parameters.  Nothing of the role is read or written above this wait.
+        wait_on_dependent_grids()
     # Prologue: the first item's loads (its coordinates are this CTA's grid position, decoded like every later payload).
     _tok, head, _batch, item_row, _kvb, _sq, out_tok, out_batch, _split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     qi, qp, qei, qep, ii, ip, iei, iep, gei, gep = _tma_issue_item(
@@ -1097,7 +1164,12 @@ def _gather_warp_group(
     k_rows_per_head=None,
     v_rows_per_page=None,
     v_rows_per_head=None,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): this role's first global reads are _item_bounds' lengths / counts, then the block table (paged arm)
+        # and the K / V rows of the gathers -- all a predecessor's output; nothing is read above this wait.
+        wait_on_dependent_grids()
     hint = opaque_i64(TMA_L2_EVICT_LAST)
     # kv_state: the stage to fill next (producer of mb_kv_full) == the mb_kv_empty wait (pre-armed: the first STAGES_KV
     # fills pass fresh barriers); advanced per LOAD in the K(0), K(1), V(0), K(2), V(1), ... order the MMA warp consumes,
@@ -1214,7 +1286,23 @@ def _gather_warp_group(
 
 
 @cute.jit
-def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tensor, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv, t0_init, t1_init):
+def _mma_warp_group(
+    sQ,
+    sK,
+    sVt,
+    sP,
+    tmem_ptr_i32,
+    bars,
+    sched,
+    block_lens_tensor,
+    seq_kv_lens_tensor,
+    n_batch,
+    seqlen_q,
+    seqlen_kv,
+    t0_init,
+    t1_init,
+    use_pdl: cutlass.Constexpr[bool] = False,
+):
     tmem_alloc(tmem_ptr_i32, TMEM_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(_BAR_TMEM, BAR_TMEM_THREADS)
 
@@ -1279,6 +1367,10 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
     p_state = PipelineState.start(phase=0)
     bmm2_state = PipelineState.start(phase=0)
 
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): the TMEM allocation, the named-barrier hand-off and the descriptor builds above are this role's
+        # prologue; its only global reads are _item_bounds' lengths / counts, below (the operands arrive through SMEM).
+        wait_on_dependent_grids()
     tok, head, batch, item_row, _kvb, eff_seqlen_q, _ot, _ob, split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1401,6 +1493,7 @@ def _softmax_warp_group(
     t1_init,
     scale_log2: cutlass.Float32,
     sQ_raw=None,  # the gated arm reads the item's gate out of its freed Q^T slot (appended; unused ungated)
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=BAR_TMEM_THREADS)
     tidx = cute.arch.thread_idx()[0]
@@ -1433,6 +1526,10 @@ def _softmax_warp_group(
     gf_state = PipelineState.start(phase=0)
     qslot_state = PipelineState.start(phase=0)
 
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): the TMEM hand-off above is this role's prologue; its global reads (_item_bounds' lengths / counts)
+        # and every global WRITE of the role (O / the partial slabs, the LSE) are below this wait.
+        wait_on_dependent_grids()
     tok, head, batch, item_row, _kvb, eff_seqlen_q, out_tok, out_batch, split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1751,6 +1848,11 @@ def _kernel(
     # rendering's parameter offsets are untouched; ungated it aliases tma_q_desc (a GridConstant tensor map is always a valid
     # one) and is never read -- CFG.EPILOGUE_GATE stays the single fold flag.
     tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,
+    # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag; header, PDL SITES): every role
+    # waits on the dependent grid before its first global read of a predecessor's output; no explicit release -- the CTA exit triggers
+    # the dependent grid at this grid's completion (the measured placement).  Appended LAST; the False rendering traces the program
+    # above unchanged.
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1884,6 +1986,9 @@ def _kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     # No CTA-wide barrier-0 sync may follow this one: the spare warp exits here.
+    # PDL (header, PDL SITES): NO release here, or anywhere -- the CTA exit is the trigger of the dependent grid (a release at this
+    # point made the split combine's CTAs resident through the core's whole run and cost 3.2-4.4 us per step at B <= 4 on the cc 10.7
+    # class, the measured placement); each role's own wait follows in its body.
 
     if warp_idx < SOFTMAX_WARPS:
         _softmax_warp_group(
@@ -1904,6 +2009,7 @@ def _kernel(
             t1_init=t1_init,
             scale_log2=scale_softmax_log2,
             sQ_raw=sQ_raw,
+            use_pdl=use_pdl,
         )
     elif warp_idx < GATHER_WARP_BASE + GATHER_WARPS:
         _gather_warp_group(
@@ -1929,6 +2035,7 @@ def _kernel(
             k_rows_per_head=k_rows_per_head,
             v_rows_per_page=v_rows_per_page,
             v_rows_per_head=v_rows_per_head,
+            use_pdl=use_pdl,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1946,6 +2053,7 @@ def _kernel(
             seqlen_kv=seqlen_kv,
             t0_init=t0_init,
             t1_init=t1_init,
+            use_pdl=use_pdl,
         )
     elif warp_idx == TMALDG_WARP_ID:
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
@@ -1967,6 +2075,7 @@ def _kernel(
             seqlen_kv=seqlen_kv,
             t0_init=t0_init,
             t1_init=t1_init,
+            use_pdl=use_pdl,
         )
     elif warp_idx == SCHED_WARP_ID:
         cta_id_x = cutlass.Int32(0)
@@ -2012,6 +2121,7 @@ def _host(
     n_ctas: Optional[cutlass.Int32] = None,
     gate_ptr: Optional[cute.Pointer] = None,
     gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
+    use_pdl: cutlass.Constexpr[bool] = False,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the explicit pointer ABI and launch the sparse core.
@@ -2039,6 +2149,11 @@ def _host(
     (``o_strides`` / ``lse_strides`` are the SLABS' strides -- the adapter passes the compact ones -- and ``lse_ptr`` is REQUIRED:
     the per-split LSE drives the combine); the grid is (SQ x S, KH, B) and ``sm100/split_combine.py`` reduces the slabs into the
     caller's O / LSE afterwards (the adapter's second launch; the gate, when given, rides it).
+
+    PDL (``use_pdl``, a compile-time constant of this entry -- the adapter's ``compile(use_pdl=)`` key): the main kernel launches with
+    the programmatic-stream-serialization attribute and carries the griddepcontrol sites (header, PDL SITES); the THD setup launch never
+    takes the attribute (THD x ``use_pdl`` is the adapter's typed decline: the main kernel reads the setup launch's metadata above every
+    role wait).  The same math, bitwise.
 
     THD (CFG.THD_VARLEN): ``B`` is the number of SEQUENCES and ``SQ`` / ``SKV`` the packed CAPACITIES of the ``[1, T, H, D]``
     operands (batch extent 1; the live totals are device values); ``seq_kv_lens_ptr`` -> the int32 metadata workspace of
@@ -2173,11 +2288,13 @@ def _host(
         cutlass.Int32(v_rows_per_head),
         cutlass.Int32(B),
         tma_gate_desc,
+        use_pdl,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(1, 1, 1),
         stream=stream,
+        use_pdl=use_pdl,  # the programmatic-stream-serialization attribute, paired with the kernel's griddepcontrol sites
     )
 
 
@@ -2188,11 +2305,16 @@ EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument l
 def compile(  # noqa: A001
     has_lse: bool = True,
     has_block_lens: bool = False,
+    use_pdl: bool = False,
 ) -> Callable:
     """Compile the pointer ABI: ``has_lse`` folds the LSE store in / out, ``has_block_lens`` the per-row count read; the
     paged arm's block table is present exactly when the config is paged (CFG.PAGED_KV, part of the template's identity).
     Head dims are the config's (d_qk = d_v = 256, exact); shapes and strides are runtime arguments.  SPLIT_KV > 1 (the
-    config's): the O pointer is the fp32 PARTIAL slab and ``has_lse`` must be True (the per-split LSE drives the combine)."""
+    config's): the O pointer is the fp32 PARTIAL slab and ``has_lse`` must be True (the per-split LSE drives the combine).
+    ``use_pdl`` (appended; in the key) traces the programmatic-dependent-launch form: the launch attribute plus the per-role
+    ``griddepcontrol`` wait before the first dependent global read, and NO explicit release -- the CTA exit triggers the dependent
+    grid at this grid's completion (header, PDL SITES: the measured placement) -- the same math, bitwise; the False rendering is the
+    program as before."""
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("sparse_d256_f16: split_kv > 1 requires has_lse=True (the per-split LSE partial drives the combine)")
     _cache_key = _template_key(globals(), locals(), "compile")
@@ -2230,6 +2352,7 @@ def compile(  # noqa: A001
         # the gated rendering only, its strides are runtime host arguments, so nothing of it is in the compile key.
         P(STORAGE_DTYPE) if CFG.EPILOGUE_GATE else None,
         i64_3,
+        bool(use_pdl),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

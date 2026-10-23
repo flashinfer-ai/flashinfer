@@ -16,15 +16,22 @@ page); the scorer kernel reads them there and the deterministic radix top-k foll
     block_lens[t] = min(top_k, n_vis_t)
     block_ids[t]  = the top_k of logits[t, :counts[t]], ASCENDING, -1 past block_lens[t]
 
-**Placement (Rule 7).**  This module imports no CuTe DSL -- torch, the stream helpers and the version gates only -- so the
-documented import path resolves on every installed DSL, the public 4.6.2 wheel (the floor vLLM and SGLang pin) included.
-:func:`qsa_select_decode_paged` checks every operand's FORM first, then gates the DSL floor, the ``sm_107a`` target on cc 10.7
+**Placement (Rule 7).**  This module imports no CuTe DSL -- torch, the stream helpers, the version gates and the DSL-free
+``TupleDict`` (``cudnn._tupledict``; never ``cudnn.api_base``, whose import executes the DSL) only -- so the documented import path
+resolves on every installed DSL, the public 4.6.2 wheel (the floor vLLM and SGLang pin) included.
+:func:`qsa_select_decode_paged_forward` checks every operand's FORM first, then gates the DSL floor, the ``sm_107a`` target on cc 10.7
 and the radix top-k's cc 9.0 -- each a typed ``NotImplementedError`` naming the version or the device -- and only THEN imports
 the kernel module (whose import executes the DSL, like its neighbours) inside the function body.  The kernel's host-side
 facts a declaration may need before any kernel is reached -- the MMA row map of the query rows, the compile-key validator, the
 knob defaults, the byte model -- live here for the same reason, and the kernel module imports them from here (never the other way
 round at module scope).  The kernel's SMEM table, barrier table, PDL sites and degenerate-input matrix are in the kernel
-module's docstring; :func:`qsa_select_decode_paged` documents the selection's contract.
+module's docstring; :func:`qsa_select_decode_paged_forward` documents the selection's contract.
+
+**The e4m3 read arm (2026-10-21).**  The pair ``(qi, kbar)`` may be ``float8_e4m3fn`` (the serving stacks' fp8 indexer cache:
+plain e4m3 compressed keys and queries at unit scale, written by the compress kernels' e4m3 store arm as the e4m3 cast of the bf16
+row): the kernel keeps its shape and swaps the element size -- 128-B rows, 4 k-steps of ``mma.sync.m16n8k32 .e4m3`` (fp32
+accumulation; every e4m3 x e4m3 product exact), half the shared-memory ring -- an sm_89+ instruction, a typed decline below it.  A
+different selection function from the bf16 arm (3 mantissa bits), chosen by the caller's dtype; a mixed pair is a form error.
 
 **Streams (Rule 5).**  The call resolves ONE torch stream from ``stream`` first (:func:`cudnn._torch_stream.launch_stream`: a
 ``torch.cuda.Stream``, a raw handle or a ``cuda.CUstream``; ``None`` = torch's current stream on the operands' device) and
@@ -39,11 +46,11 @@ from typing import NamedTuple, Optional
 import torch
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost._torch_stream import launch_stream, stream_context
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.api_base import TupleDict
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost._tupledict import TupleDict
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 __all__ = [
-    "qsa_select_decode_paged",
+    "qsa_select_decode_paged_forward",
     "INDEX_HEAD_DIM",
     "BLOCK_SIZE",
     "QSA_TOP_K",
@@ -51,6 +58,8 @@ __all__ = [
     "MAX_QUERY_ROWS",
     "UNITS_PER_WARP_CHOICES",
     "RING_DEPTH_CHOICES",
+    "K_STEPS",  # the MMA geometry the kernel module imports from here (Rule 7 placement: the facts live in the DSL-free module)
+    "CHUNKS_PER_LANE",
     "QueryRowMap",
     "padded_heads",
     "query_row_map",
@@ -59,6 +68,13 @@ __all__ = [
     "default_units_per_warp",
     "validate_params",
     "moved_bytes",
+    "CACHE_DTYPES",
+    "K_STEP_BYTES",
+    "cache_elem_bytes",
+    "row_bytes",
+    "k_steps",
+    "chunks_per_lane",
+    "mma_k",
 ]
 
 INDEX_HEAD_DIM = 128  # the head dim the indexer scorer packs (qi and kbar rows): the one geometry the paged scorer addresses
@@ -82,8 +98,45 @@ UNITS_PER_WARP_CHOICES = (1, 2, 4, 8)  # 32 / 64 / 128 / 256 rows per warp = blo
 MAX_QUERY_ROWS = 64  # S_q x next_pow2(H_i) padded (s, h) MMA rows resident in registers per warp: 4 m-tiles of 16 (32 registers each)
 MIN_PAGE_SIZE = 2 * BLOCK_SIZE  # at least two compressed rows per page (a power-of-two row count)
 CHUNK_ELEMS = 8  # bf16 elements per 16-byte chunk
-CHUNKS_PER_ROW = INDEX_HEAD_DIM // CHUNK_ELEMS  # 16
-CHUNKS_PER_LANE = CHUNKS_PER_ROW // 4  # the 4 chunks `q + 4 j` lane (g, q) loads of a row: one 16-byte load each
+CHUNK_BYTES = 16  # one granule of a row: one cp.async / ld.shared.v4 (8 bf16 or 16 e4m3)
+CHUNKS_PER_ROW = INDEX_HEAD_DIM // CHUNK_ELEMS  # 16 (the bf16 arm; the e4m3 arm's 8 = chunks_per_lane(1) x 4)
+CHUNKS_PER_LANE = CHUNKS_PER_ROW // 4  # the 4 chunks `q + 4 j` lane (g, q) loads of a bf16 row: one 16-byte load each
+# The (qi, kbar) pair's dtypes the scorer serves: the bf16 arm (mma.sync.m16n8k16, any CuTe DSL device from sm_80) and the e4m3 READ arm
+# (mma.sync.m16n8k32 .e4m3 over the e4m3 indexer cache and e4m3 queries, sm_89+; 2026-10-21) -- a mixed pair is a form error.  Every
+# geometry fact of the arm is a function of the ELEMENT SIZE, never a second literal: a k-step consumes K_STEP_BYTES = 32 B of a row in
+# BOTH forms (16 bf16 of m16n8k16, 32 e4m3 of m16n8k32), so the K permutation is dtype-free and the kernel's shape is unchanged.
+CACHE_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
+K_STEP_BYTES = 32
+_CACHE_ELEM_BYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}
+
+
+def cache_elem_bytes(dtype) -> int:
+    """Bytes per element of a served cache dtype (2 bf16, 1 e4m3); ``ValueError`` for any other."""
+    if dtype not in _CACHE_ELEM_BYTES:
+        raise ValueError(f"the paged scorer serves the cache dtypes {CACHE_DTYPES} (the bf16 arm / the e4m3 read arm), got {dtype}")
+    return _CACHE_ELEM_BYTES[dtype]
+
+
+def row_bytes(elem_bytes: int) -> int:
+    """Bytes of one compressed row (= one query row): 256 at bf16, 128 at e4m3."""
+    return INDEX_HEAD_DIM * int(elem_bytes)
+
+
+def k_steps(elem_bytes: int) -> int:
+    """MMA k-steps per row: ``row_bytes / 32`` -- 8 at bf16 (m16n8k16), 4 at e4m3 (m16n8k32)."""
+    return row_bytes(elem_bytes) // K_STEP_BYTES
+
+
+def chunks_per_lane(elem_bytes: int) -> int:
+    """16-byte granules lane ``(g, q)`` loads of a row (``q + 4 j``): 4 at bf16, 2 at e4m3."""
+    return row_bytes(elem_bytes) // CHUNK_BYTES // 4
+
+
+def mma_k(elem_bytes: int) -> int:
+    """The MMA's K per step: 16 at bf16, 32 at e4m3 (both = 32 B of a row)."""
+    return K_STEP_BYTES // int(elem_bytes)
+
+
 # The radix top-k's input contract, by value (``deepseek_sparse_attention.indexer_top_k``: ``INPUT_ALIGN`` = 32 bytes, fp32 rows read in
 # 256-bit vectors): spelled here because the preallocated-output checks run BEFORE the gate that makes that kernel module importable.
 _SCORE_ROW_ALIGN = 8  # n_blocks_max must be a multiple of 8 fp32 (one 256-bit vector)
@@ -171,10 +224,11 @@ def default_units_per_warp(n_blocks_max: int, batch: int = 1, num_sms: Optional[
     return UNITS_DEFAULT
 
 
-def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int, ring_depth: int = NTILES_IN_FLIGHT) -> None:
+def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int, ring_depth: int = NTILES_IN_FLIGHT, l2_hint: Optional[bool] = None) -> None:
     """The compile-key facts, typed (never an assert): the head count and the rows per sequence (their PADDED product is the
     register envelope of the resident query fragments), the page size (a power of two of at least two compressed rows: the
-    in-kernel page / row split is a shift), the units knob."""
+    in-kernel page / row split is a shift), the units knob, the ring depth, and the VALUE of the ``l2_hint`` arm (``None`` / ``True`` /
+    ``False``; which arm ``None`` resolves to is the kernel module's reading of the DSL's compiler, not a host fact)."""
     if int(h_i) < 1:
         raise ValueError(f"h_i must be >= 1, got {h_i}")
     if int(s_q) < 1:
@@ -194,6 +248,8 @@ def validate_params(*, h_i: int, s_q: int, page_size: int, units_per_warp: int, 
         raise ValueError(f"units_per_warp must be one of {UNITS_PER_WARP_CHOICES}, got {units_per_warp}")
     if int(ring_depth) not in RING_DEPTH_CHOICES:
         raise ValueError(f"ring_depth must be one of {RING_DEPTH_CHOICES}, got {ring_depth}")
+    if l2_hint is not None and not isinstance(l2_hint, bool):
+        raise ValueError(f"l2_hint must be None (the DSL's compiler decides), True or False, got {l2_hint!r}")
 
 
 def _check_i32_1d(t, name: str, n: int, device) -> None:
@@ -205,12 +261,16 @@ def _check_i32_1d(t, name: str, n: int, device) -> None:
         raise ValueError(f"{name} must live on {device}, got {t.device}")
 
 
-def _kbar_rows_view(kbar: torch.Tensor, rows_per_page: int, device) -> torch.Tensor:
+def _kbar_rows_view(kbar: torch.Tensor, rows_per_page: int, device, dtype=torch.bfloat16) -> torch.Tensor:
     """The compressed-key cache as the kernel's ``[num_pages, R, D]`` view (a view, never a copy): ``[num_pages, R, 1, D]``
-    (the serving layout, one compressed row per 4 tokens) or ``[num_pages, R, D]``; bf16 (an e4m3 cache is refused by the
-    entry, a mixed pair is a form error there); ``D`` contiguous, 16-byte-aligned page / row strides and base."""
+    (the serving layout, one compressed row per 4 tokens) or ``[num_pages, R, D]``; of ``dtype`` (appended; the artifact's cache
+    dtype -- bf16, or e4m3 for the e4m3 read arm; a mixed pair is the entry's form error); ``D`` contiguous, 16-byte-aligned page /
+    row strides and base (in BYTES: the element size is 2 or 1)."""
     if not isinstance(kbar, torch.Tensor):
-        raise ValueError(f"kbar must be a [num_pages, {rows_per_page}, 1, {INDEX_HEAD_DIM}] bf16 tensor, got {type(kbar).__name__}")
+        raise ValueError(f"kbar must be a [num_pages, {rows_per_page}, 1, {INDEX_HEAD_DIM}] {dtype} tensor, got {type(kbar).__name__}")
+    if kbar.dtype != dtype:
+        raise ValueError(f"kbar must be {dtype} for this artifact (its cache dtype: the bf16 arm, or float8_e4m3fn for the e4m3 read arm), got {kbar.dtype}")
+    esz = cache_elem_bytes(dtype)
     if kbar.dim() == 4:
         if int(kbar.shape[2]) != 1:
             raise ValueError(
@@ -229,19 +289,19 @@ def _kbar_rows_view(kbar: torch.Tensor, rows_per_page: int, device) -> torch.Ten
             f"kbar must hold >= 1 pages of {rows_per_page} compressed rows (page_size {rows_per_page * BLOCK_SIZE} / {BLOCK_SIZE}) x {INDEX_HEAD_DIM}, got {tuple(kbar.shape)}"
         )
     s0, s1, s2 = (int(x) for x in view.stride())
-    if s2 != 1 or s1 != INDEX_HEAD_DIM or (s0 * 2) % 16 or kbar.data_ptr() % 16:
+    if s2 != 1 or s1 != INDEX_HEAD_DIM or (s0 * esz) % 16 or kbar.data_ptr() % 16:
         raise ValueError(
             f"kbar must hold a page's compressed rows contiguously (row stride {INDEX_HEAD_DIM}, D contiguous) with a 16-byte-aligned page stride and "
             f"base, got strides {tuple(kbar.stride())}, data_ptr {kbar.data_ptr():#x}"
         )
-    if s0 * 2 >= 2**31:
-        raise ValueError(f"kbar's page stride must be below 2 GiB (the kernel's 32-bit page stride), got {s0 * 2} bytes")
+    if s0 * esz >= 2**31:
+        raise ValueError(f"kbar's page stride must be below 2 GiB (the kernel's 32-bit page stride), got {s0 * esz} bytes")
     if kbar.device != device:
         raise ValueError(f"kbar must live on {device}, got {kbar.device}")
     return view
 
 
-def qsa_select_decode_paged(
+def qsa_select_decode_paged_forward(
     qi: torch.Tensor,
     kbar: torch.Tensor,
     block_table: torch.Tensor,
@@ -264,11 +324,12 @@ def qsa_select_decode_paged(
 
     Contract:
 
-    * ``qi``: ``[T, H_i, 128]`` bf16, ``T = B x seq_q`` (row ``t = b x seq_q + s`` is row ``s`` of sequence ``b``, at position
-      ``kv_lens[b] - seq_q + s``); a unit last stride and 16-byte-aligned token / head strides (a column slice of a wider slab
-      reads in place).  ``float8_e4m3fn`` (the fp8 indexer cache) is refused BY NAME: that read arm is a follow-up of the
-      kernel.
-    * ``kbar``: ``[num_pages, page_size / 4, 1, 128]`` bf16, the paged compressed-key cache on the MAIN block table: block
+    * ``qi``: ``[T, H_i, 128]`` bf16 or ``float8_e4m3fn``, ``T = B x seq_q`` (row ``t = b x seq_q + s`` is row ``s`` of sequence ``b``,
+      at position ``kv_lens[b] - seq_q + s``); a unit last stride and 16-byte-aligned token / head strides (a column slice of a wider
+      slab reads in place).  ``qi`` and ``kbar`` share ONE dtype (``CACHE_DTYPES``): the bf16 arm, or the e4m3 READ arm (the fp8
+      indexer cache: plain e4m3 queries and keys at unit scale -- ``mma.sync.m16n8k32 .e4m3`` with fp32 accumulation, every
+      product exact; sm_89+, a typed decline below it); a mixed pair is a ``ValueError``.
+    * ``kbar``: ``[num_pages, page_size / 4, 1, 128]`` in ``qi``'s dtype, the paged compressed-key cache on the MAIN block table: block
       ``j`` of sequence ``b`` is row ``j % (page_size / 4)`` of page ``block_table[b, j // (page_size / 4)]``; ``page_size`` a
       power of two >= 8 (16 / 32 / 64 in serving).  A ``-1`` (or out-of-range) page under a visible block reads as a zero key
       (logit 0); a page past the visible range is never consulted.
@@ -292,26 +353,26 @@ def qsa_select_decode_paged(
     * ``stream``: the LAUNCH stream -- a ``torch.cuda.Stream`` (on ``qi``'s device), a raw CUDA stream handle (an ``int`` or a
       ``cuda.CUstream``), or ``None`` = torch's current stream on ``qi``'s device.  It is resolved to one torch stream before any
       torch operation of the call, and every one of them (the output allocations here, the top-k wrapper's allocations and
-      launch) runs on it (Rule 5); the two kernels receive its raw handle.
+      launch) runs on it (Rule 5); the two kernels receive its raw handle.  ``qi``'s device is selected for the compile and the
+      launch setup whichever device is current at the call, and the caller's device is restored on return.
 
     Raises:
         NotImplementedError: a CuTe DSL below the floor / without the target, a device below cc 9.0 (the radix top-k's bound;
-            the scorer alone runs anywhere -- ``kernels.qsa_score_paged.run_qsa_score_paged``), ``use_pdl`` below cc 9.0, or
-            the e4m3 pair -- the message names the version, the device or the arm; raised BEFORE the kernel module is imported.
-        ValueError: a malformed input (shape, dtype, device, alignment, the table's reach, ``top_k``, ``scale``, a stream on
-            another device).
+            the scorer alone runs anywhere -- ``kernels.qsa_score_paged.run_qsa_score_paged``), ``use_pdl`` below cc 9.0 (the
+            e4m3 pair's own sm_89 bound lies below the top-k's, so the compile entry alone can meet it) -- the message names the
+            version, the device or the arm; raised BEFORE the kernel module is imported.
+        ValueError: a malformed input (shape, dtype -- a mixed or an unserved pair --, device, alignment, the table's reach,
+            ``top_k``, ``scale``, a stream on another device).
     """
     if not isinstance(qi, torch.Tensor) or qi.dim() != 3:
         raise ValueError(f"qi must be a [T, H_i, {INDEX_HEAD_DIM}] tensor, got {getattr(qi, 'shape', type(qi).__name__)}")
     if not isinstance(kbar, torch.Tensor) or kbar.dim() not in (3, 4):
         raise ValueError(f"kbar must be a [num_pages, page_size / {BLOCK_SIZE}, 1, {INDEX_HEAD_DIM}] tensor, got {getattr(kbar, 'shape', type(kbar).__name__)}")
-    if qi.dtype == _E4M3 and kbar.dtype == _E4M3:
-        raise NotImplementedError(
-            "qsa_select_decode_paged scores the bf16 indexer cache; the e4m3 pair (qi and kbar float8_e4m3fn, the fp8 indexer cache) is the "
-            "paged scorer's e4m3 read arm, a follow-up -- pass the bf16 pair, or select over a dense e4m3 cache with the dense decode selector"
+    if qi.dtype != kbar.dtype or qi.dtype not in CACHE_DTYPES:
+        raise ValueError(
+            f"qi and kbar must both be bfloat16 or both float8_e4m3fn (the bf16 arm / the e4m3 read arm of the paged scorer; a mixed pair is a form "
+            f"error); got {qi.dtype} and {kbar.dtype}"
         )
-    if qi.dtype != torch.bfloat16 or kbar.dtype != torch.bfloat16:
-        raise ValueError(f"qi and kbar must both be bfloat16 (the e4m3 pair is a typed decline of its own); got {qi.dtype} and {kbar.dtype}")
     if not qi.is_cuda or kbar.device != qi.device:
         raise ValueError("qi and kbar must be CUDA tensors on one device")
     if int(seq_q) < 1:
@@ -322,8 +383,16 @@ def qsa_select_decode_paged(
         )
     t, h_i, d = (int(x) for x in qi.shape)
     batch, max_pages = (int(x) for x in block_table.shape)
+    # the table's device and column stride and the lengths' form HERE, ahead of the gates below and the compile: a malformed operand is the
+    # operand-form ValueError, never a NotImplementedError from a gate it reached first, and never a kernel import / compile before the error
+    # (the kernel runner re-checks the same facts at the launch)
+    if int(block_table.stride(1)) != 1 or block_table.device != qi.device:
+        raise ValueError(f"block_table needs a unit column stride on {qi.device}, got strides {tuple(block_table.stride())} on {block_table.device}")
+    _check_i32_1d(kv_lens, "kv_lens", batch, qi.device)
     if d != INDEX_HEAD_DIM or (kbar.dim() == 4 and int(kbar.shape[3]) != INDEX_HEAD_DIM) or (kbar.dim() == 3 and int(kbar.shape[2]) != INDEX_HEAD_DIM):
-        raise ValueError(f"qsa_select_decode_paged scores head_dim {INDEX_HEAD_DIM} indexer heads, got qi {tuple(qi.shape)} and kbar {tuple(kbar.shape)}")
+        raise ValueError(
+            f"qsa_select_decode_paged_forward scores head_dim {INDEX_HEAD_DIM} indexer heads, got qi {tuple(qi.shape)} and kbar {tuple(kbar.shape)}"
+        )
     rows_per_page = int(kbar.shape[1])
     page_size = rows_per_page * BLOCK_SIZE
     if t != batch * int(seq_q):
@@ -347,7 +416,7 @@ def qsa_select_decode_paged(
     if units_per_warp is None:
         units_per_warp = default_units_per_warp(n_blocks_max, batch, torch.cuda.get_device_properties(qi.device).multi_processor_count, int(seq_q))
     validate_params(h_i=h_i, s_q=int(seq_q), page_size=page_size, units_per_warp=int(units_per_warp))
-    _kbar_rows_view(kbar, rows_per_page, qi.device)  # the cache's form (its singleton row axis, D contiguous, the alignment) ahead of the gates
+    _kbar_rows_view(kbar, rows_per_page, qi.device, dtype=qi.dtype)  # the cache's form (its singleton row axis, D contiguous, the alignment) ahead of the gates
     for name, out, shape in (("logits_out", logits_out, (t, n_blocks_max)), ("counts_out", counts_out, (t,)), ("block_lens_out", block_lens_out, (t,))):
         if out is None:
             continue
@@ -368,7 +437,7 @@ def qsa_select_decode_paged(
     # Rule 7 first: the DSL floor (device-free), then the target, then the device family of the radix top-k -- BEFORE the kernel
     # module (whose import executes the DSL) or any kernel module of the DSA package is imported, so a sub-floor DSL gets the typed
     # message and never a DSL-internal import error.
-    why = cutedsl_requirement_error("qsa_select_decode_paged")
+    why = cutedsl_requirement_error("qsa_select_decode_paged_forward")
     if why is not None:
         raise NotImplementedError(why)
     device_cc = tuple(torch.cuda.get_device_capability(qi.device))
@@ -377,52 +446,65 @@ def qsa_select_decode_paged(
         raise NotImplementedError(why)
     if device_cc < (9, 0):
         raise NotImplementedError(
-            f"qsa_select_decode_paged pairs the paged scorer with the radix top-k kernel, which requires cc 9.0 or later; found cc {device_cc[0]}.{device_cc[1]} "
+            f"qsa_select_decode_paged_forward pairs the paged scorer with the radix top-k kernel, which requires cc 9.0 or later; found cc {device_cc[0]}.{device_cc[1]} "
             "(the scorer alone, kernels.qsa_score_paged.run_qsa_score_paged, runs on this device)"
         )
 
-    # only now the two kernel modules: the paged scorer (this package) and the radix top-k (the DSA package)
+    # only now the two kernel modules: the paged scorer (the integrated block package) and the radix top-k (the DSA package)
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k import indexer_top_k_wrapper
 
-    from .kernels.qsa_score_paged import compile_qsa_score_paged, run_qsa_score_paged
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_score_paged import compile_qsa_score_paged, run_qsa_score_paged
 
     dev = qi.device.index if qi.device.index is not None else torch.cuda.current_device()
-    recipe = compile_qsa_score_paged(
-        h_i=h_i, s_q=int(seq_q), page_size=page_size, units_per_warp=int(units_per_warp), has_block_lens=True, use_pdl=bool(use_pdl), device=dev
-    )
+    # The operand device is SELECTED for the compile and the whole launch setup -- the house rule for a direct standalone entry:
+    # nothing of the call depends on which device is current (`stream_context`'s fast path does not switch devices; the DSL's
+    # compile and its load of the launchable run under the current device); the caller's device is restored on exit.
+    with torch.cuda.device(dev):
+        recipe = compile_qsa_score_paged(
+            h_i=h_i,
+            s_q=int(seq_q),
+            page_size=page_size,
+            units_per_warp=int(units_per_warp),
+            has_block_lens=True,
+            use_pdl=bool(use_pdl),
+            device=dev,
+            cache_dtype=qi.dtype,
+        )
 
-    # Rule 5: ONE torch stream resolved from `stream` FIRST (a torch.cuda.Stream / a raw handle / a cuda.CUstream; None = torch's current
-    # stream on qi's device); every torch operation below -- the scorer's output allocations, the top-k wrapper's own allocations and
-    # launch -- runs inside its context, and both kernels receive its raw handle.
-    launch = launch_stream(stream, qi.device)
-    raw_stream = int(launch.cuda_stream)
-    with stream_context(launch, qi.device):
-        logits = torch.empty((t, n_blocks_max), dtype=torch.float32, device=qi.device) if logits_out is None else logits_out
-        counts = torch.empty((t,), dtype=torch.int32, device=qi.device) if counts_out is None else counts_out
-        block_lens = torch.empty((t,), dtype=torch.int32, device=qi.device) if block_lens_out is None else block_lens_out
-        run_qsa_score_paged(recipe, qi, kbar, block_table, kv_lens, logits, counts, block_lens, top_k=int(top_k), scale=float(scale), stream=raw_stream)
-        selected = indexer_top_k_wrapper(logits, counts, int(top_k), next_n=1, return_val=True, stream=raw_stream, tie_break=0, deterministic=True)
+        # Rule 5: ONE torch stream resolved from `stream` FIRST (a torch.cuda.Stream / a raw handle / a cuda.CUstream; None = torch's
+        # current stream on qi's device); every torch operation below -- the scorer's output allocations, the top-k wrapper's own
+        # allocations and launch -- runs inside its context, and both kernels receive its raw handle.
+        launch = launch_stream(stream, qi.device)
+        raw_stream = int(launch.cuda_stream)
+        with stream_context(launch, qi.device):
+            logits = torch.empty((t, n_blocks_max), dtype=torch.float32, device=qi.device) if logits_out is None else logits_out
+            counts = torch.empty((t,), dtype=torch.int32, device=qi.device) if counts_out is None else counts_out
+            block_lens = torch.empty((t,), dtype=torch.int32, device=qi.device) if block_lens_out is None else block_lens_out
+            run_qsa_score_paged(recipe, qi, kbar, block_table, kv_lens, logits, counts, block_lens, top_k=int(top_k), scale=float(scale), stream=raw_stream)
+            selected = indexer_top_k_wrapper(logits, counts, int(top_k), next_n=1, return_val=True, stream=raw_stream, tie_break=0, deterministic=True)
     return TupleDict(block_ids=selected["indices"], block_lens=block_lens, scores=selected["values"], logits=logits, counts=counts)
 
 
-def moved_bytes(n_vis_rows, *, s_q: int, h_i: int, n_blocks_max: int, page_size: int, units_per_warp: int = 1) -> int:
+def moved_bytes(n_vis_rows, *, s_q: int, h_i: int, n_blocks_max: int, page_size: int, units_per_warp: int = 1, elem_bytes: int = 2) -> int:
     """The HBM-side byte model of one scorer launch for a SOL number: ``n_vis_rows`` = every row's visible count (host arithmetic
     from the caller's own ``kv_lens``, ``[T]`` in row order, ``T = B x s_q``): the compressed rows a sequence streams once
-    (its last row's count x 256 B), the fp32 logits written (every row's count x 4 B), the padded query tile every LIVE CTA stages
-    (``16 x 256 B`` per m-tile, L2-resident in practice, counted) and the table words (one per page, read by the warp that owns it)."""
+    (its last row's count x the row's bytes -- 256 at bf16, 128 under the e4m3 arm: ``elem_bytes``, appended), the fp32 logits written
+    (every row's count x 4 B), the padded query tile every LIVE CTA stages (``16 x row bytes`` per m-tile, L2-resident in practice,
+    counted) and the table words (one per page, read by the warp that owns it)."""
     rows = [int(v) for v in n_vis_rows]
     s_q = int(s_q)
     if s_q < 1 or len(rows) % s_q:
         raise ValueError(f"n_vis_rows holds {len(rows)} rows, not a multiple of s_q = {s_q}")
+    rb = row_bytes(elem_bytes)
     rows_per_page = int(page_size) // BLOCK_SIZE
     per_cta = blocks_per_cta(units_per_warp)
     n_ctas = _ceil_div(int(n_blocks_max), per_cta)
-    tile_bytes = query_row_map(s_q, h_i).m_tiles * MMA_M * INDEX_HEAD_DIM * 2
+    tile_bytes = query_row_map(s_q, h_i).m_tiles * MMA_M * rb
     total = 0
     for b in range(len(rows) // s_q):
         seq = rows[b * s_q : (b + 1) * s_q]
         n_max = max(seq)
-        total += n_max * INDEX_HEAD_DIM * 2  # the compressed rows read once
+        total += n_max * rb  # the compressed rows read once
         total += sum(seq) * 4  # the logits written
         total += min(n_ctas, _ceil_div(n_max, per_cta)) * tile_bytes  # the query tile per LIVE CTA (none for a padding sequence)
         total += _ceil_div(n_max, rows_per_page) * 4  # the table words, one per page

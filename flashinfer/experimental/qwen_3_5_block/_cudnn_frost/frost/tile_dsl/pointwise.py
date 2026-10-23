@@ -154,6 +154,31 @@ def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
 
 
+@cute.jit
+def bf16_words_to_e4m3_words(w0: cutlass.Int32, w1: cutlass.Int32, w2: cutlass.Int32, w3: cutlass.Int32):
+    """The e4m3 rounding OF A PACKED bf16 ROW: four ``bf16x2`` words (8 elements, element ``2w`` in the low half of word ``w``) into two
+    ``e4m3x4`` words ``(u0, u1)`` -- ``u0`` holds elements 0..3 in byte order, ``u1`` elements 4..7.  Each bf16 is widened to fp32 EXACTLY
+    (a bit move: bf16 is the top half of an fp32) and rounded ONCE by ``cvt.rn.satfinite.e4m3x2.f32`` (round-to-nearest-even, saturating
+    at +-448, never a NaN from a finite value), so the result is bitwise ``bf16_row.to(torch.float8_e4m3fn)`` on the torch pinned here --
+    the convention of the indexer's e4m3 compressed-key cache (the serving stacks' ``x.to(bf16).to(e4m3)`` chain and the prefill form's
+    per-tensor cast of the bf16 rows): one rounding convention across every writer, so a cache primed by one writer and appended by
+    another is bitwise.  ``cvt...e4m3x2 d, a, b`` puts ``a`` in the UPPER byte, so the operands are ``(hi, lo)`` -- the order
+    :func:`fp32_to_fp8_pack` spells.  Needs sm_89+ (the fp8 ``cvt``); the callers decline older parts by name at compile time."""
+    return inline_ptx(
+        "{ .reg .b16 lo0, hi0, lo1, hi1, e0, e1; .reg .f32 f0, f1, f2, f3;\n"
+        "mov.b32 {lo0, hi0}, $2; mov.b32 f0, {0, lo0}; mov.b32 f1, {0, hi0};\n"
+        "mov.b32 {lo1, hi1}, $3; mov.b32 f2, {0, lo1}; mov.b32 f3, {0, hi1};\n"
+        "cvt.rn.satfinite.e4m3x2.f32 e0, f1, f0; cvt.rn.satfinite.e4m3x2.f32 e1, f3, f2;\n"
+        "mov.b32 $0, {e0, e1};\n"
+        "mov.b32 {lo0, hi0}, $4; mov.b32 f0, {0, lo0}; mov.b32 f1, {0, hi0};\n"
+        "mov.b32 {lo1, hi1}, $5; mov.b32 f2, {0, lo1}; mov.b32 f3, {0, hi1};\n"
+        "cvt.rn.satfinite.e4m3x2.f32 e0, f1, f0; cvt.rn.satfinite.e4m3x2.f32 e1, f3, f2;\n"
+        "mov.b32 $1, {e0, e1}; }",
+        write_only_types=[cutlass.Int32, cutlass.Int32],
+        read_only_args=[w0, w1, w2, w3],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rubin's FUSED descale-and-pack: cvt.rn.satfinite.scaled::n1::ue8m0.{e4m3,e5m2}x2.f32
 # (sm_107a only) -- the block-scale quantizers' FMUL-free pack.  Semantics MEASURED on

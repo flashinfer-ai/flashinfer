@@ -391,8 +391,13 @@ def make_classic_bars(
     bias_resident: bool = False,
     bias_ring_stages: int = 0,
     bias_ring_empty_arrivers: Optional[int] = None,
+    stages_k: Optional[int] = None,
+    stages_v: Optional[int] = None,
 ) -> Bars:
     """The classic pipeline's barrier set.
+
+    ``stages_k`` / ``stages_v``: the K and V ring depths when a kernel runs them at different depths (the d192
+    half-input cga1 tile: one K stage, two V stages); None (every other caller) = ``CFG.STAGES_KV`` for both.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
     handshakes run over: one stage per Q sub-tile on the classic pipeline
@@ -444,6 +449,8 @@ def make_classic_bars(
     KV_EMPTY_ARRIVERS = (CFG.CGA_M // CFG.CTA_MMA) + CFG.CGA_N - 1
     N_BMM2_CHUNKS = CFG.N_BMM2_CHUNKS
     N_S = CFG.TILES_Q if s_stages is None else int(s_stages)
+    STAGES_K = CFG.STAGES_KV if stages_k is None else int(stages_k)
+    STAGES_V = CFG.STAGES_KV if stages_v is None else int(stages_v)
 
     def _alloc(n):
         return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
@@ -452,11 +459,11 @@ def make_classic_bars(
         # q_full_arrivers > 1: besides the leader's expect_tx arrive, each peer CTA's TMA-LDG warp arrives once
         # after filling its own SF_Q tile by hand (the MXFP8 PackGQA gather, sm100/prefill_d128_mxfp8.py).
         mb_q_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE + q_full_arrivers - 1, producer=Producer.TMA_LOAD),
-        mb_k_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_v_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_k_full=MBarrier(_alloc(STAGES_K), stages=STAGES_K, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_v_full=MBarrier(_alloc(STAGES_V), stages=STAGES_V, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_q_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_k_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_v_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_k_empty=MBarrier(_alloc(STAGES_K), stages=STAGES_K, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_v_empty=MBarrier(_alloc(STAGES_V), stages=STAGES_V, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_bmm1_done=MBarrier(_alloc(N_S), stages=N_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_done=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_ready=MBarrier(
