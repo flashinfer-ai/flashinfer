@@ -136,14 +136,33 @@ class NonClcMixedCgaSchedulerWorker:
     fallback_registration_counter_region = "non_clc_mixed_cga.fallback_registration_counter"
     fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"
 
-    def __init__(self, *, config: NonClcMixedCgaConfig, work_id_mode: WorkIdAcquisitionMode, stream_count: int) -> None:
+    def __init__(
+        self,
+        *,
+        config: NonClcMixedCgaConfig,
+        work_id_mode: WorkIdAcquisitionMode,
+        stream_count: int,
+        work_id_stride: Optional[int] = None,
+    ) -> None:
         if work_id_mode not in ("grid_stride", "atomic_counter"):
             raise ValueError("Non-CLC mixed-CGA scheduling supports grid_stride or atomic_counter work IDs.")
         if isinstance(stream_count, bool) or not isinstance(stream_count, int) or stream_count <= 0:
             raise ValueError("stream_count must be a positive Python int.")
+        if work_id_stride is None:
+            work_id_stride = config.launch_cluster_cnt_merge_as_preferred
+        if isinstance(work_id_stride, bool) or not isinstance(work_id_stride, int) or work_id_stride <= 0:
+            raise ValueError("work_id_stride must be a positive Python int.")
         self.config = config
         self.work_id_mode = work_id_mode
         self.stream_count = stream_count
+        # The work stream can have fewer participants than the physical launch
+        # when some clusters only communicate. Atomic claims do not use this.
+        self.work_id_stride = work_id_stride
+
+    @property
+    def max_fallback_cluster_count(self) -> int:
+        """Upper bound on physical fallback clusters: every preferred-cluster slot of the launch split."""
+        return self.config.launch_cluster_cnt_merge_as_preferred * self.config.split_factor
 
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Register the cluster-local claim broadcast channel."""
@@ -169,10 +188,12 @@ class NonClcMixedCgaSchedulerWorker:
                     buffer_space="local",
                     reset="tail_reset",
                 )
+                # Under PDL more slots can split into fallback clusters than the host plan assumed: size the group
+                # table for every slot splitting.
                 device_workspace.register(
                     self.fallback_group_token_region,
                     cutlass.Int64,
-                    (self.config.fallback_cluster_count,),
+                    (self.max_fallback_cluster_count,),
                     buffer_space="local",
                     reset="tail_reset",
                 )
@@ -248,7 +269,7 @@ class NonClcMixedCgaSchedulerWorker:
                     registration_counter_pointer=device_workspace.ptr(self.fallback_registration_counter_region),
                     group_token_pointer=device_workspace.ptr(self.fallback_group_token_region),
                     split_factor=self.config.split_factor,
-                    fallback_cluster_count=self.config.fallback_cluster_count,
+                    fallback_cluster_count=self.max_fallback_cluster_count,
                     is_fallback_cluster=is_fallback_cluster,
                     fallback_group_idx=Int32(0),
                     in_group_idx=Int32(0),
@@ -261,7 +282,7 @@ class NonClcMixedCgaSchedulerWorker:
         else:
             self._work_id_state = GridStrideWorkIdState(
                 next_work_id=Int32(block_idx[2]),
-                work_id_stride=Int32(self.config.launch_cluster_cnt_merge_as_preferred),
+                work_id_stride=Int32(self.work_id_stride),
             )
         self.claimed_stream_index = Int32(0)
 
@@ -398,7 +419,12 @@ class NonClcMixedCgaSchedulerWorker:
             value_index += field_value_count
             return result
 
-        result = type(self)(config=self.config, work_id_mode=self.work_id_mode, stream_count=self.stream_count)
+        result = type(self)(
+            config=self.config,
+            work_id_mode=self.work_id_mode,
+            stream_count=self.stream_count,
+            work_id_stride=self.work_id_stride,
+        )
         result._work_id_state = rebuild(self._work_id_state)
         result.cta_coord_in_preferred_cluster = rebuild(self.cta_coord_in_preferred_cluster)
         result.claimed_stream_index = rebuild(self.claimed_stream_index)
