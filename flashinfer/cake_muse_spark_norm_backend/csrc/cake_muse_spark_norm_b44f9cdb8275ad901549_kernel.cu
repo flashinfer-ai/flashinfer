@@ -68,6 +68,11 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    const unsigned int w = *reinterpret_cast<const unsigned int*>(&v);
+    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
@@ -227,56 +232,56 @@ kernel_cake_muse_spark_norm_b44f9cdb8275ad901549(__nv_bfloat16* __restrict__ bra
             }
         }
         float acc = 0.0f;
-        float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(cur[0]));
+        float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[0]));
         float x0_0 = _cvt_f32_0.x * wf[0];
         float x1_0 = _cvt_f32_0.y * wf[1];
         x[0] = x0_0;
         x[1] = x1_0;
         acc = __fmaf_rn(x0_0, x0_0, acc);
         acc = __fmaf_rn(x1_0, x1_0, acc);
-        float2 _cvt_f32_1 = __bfloat1622float2(__as_bf16x2(cur[1]));
+        float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[1]));
         float x0_2 = _cvt_f32_1.x * wf[2];
         float x1_2 = _cvt_f32_1.y * wf[3];
         x[2] = x0_2;
         x[3] = x1_2;
         acc = __fmaf_rn(x0_2, x0_2, acc);
         acc = __fmaf_rn(x1_2, x1_2, acc);
-        float2 _cvt_f32_2 = __bfloat1622float2(__as_bf16x2(cur[2]));
+        float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[2]));
         float x0_4 = _cvt_f32_2.x * wf[4];
         float x1_4 = _cvt_f32_2.y * wf[5];
         x[4] = x0_4;
         x[5] = x1_4;
         acc = __fmaf_rn(x0_4, x0_4, acc);
         acc = __fmaf_rn(x1_4, x1_4, acc);
-        float2 _cvt_f32_3 = __bfloat1622float2(__as_bf16x2(cur[3]));
+        float2 _cvt_f32_3 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[3]));
         float x0_6 = _cvt_f32_3.x * wf[6];
         float x1_6 = _cvt_f32_3.y * wf[7];
         x[6] = x0_6;
         x[7] = x1_6;
         acc = __fmaf_rn(x0_6, x0_6, acc);
         acc = __fmaf_rn(x1_6, x1_6, acc);
-        float2 _cvt_f32_4 = __bfloat1622float2(__as_bf16x2(cur[4]));
+        float2 _cvt_f32_4 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[4]));
         float x0_8 = _cvt_f32_4.x * wf[8];
         float x1_8 = _cvt_f32_4.y * wf[9];
         x[8] = x0_8;
         x[9] = x1_8;
         acc = __fmaf_rn(x0_8, x0_8, acc);
         acc = __fmaf_rn(x1_8, x1_8, acc);
-        float2 _cvt_f32_5 = __bfloat1622float2(__as_bf16x2(cur[5]));
+        float2 _cvt_f32_5 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[5]));
         float x0_10 = _cvt_f32_5.x * wf[10];
         float x1_10 = _cvt_f32_5.y * wf[11];
         x[10] = x0_10;
         x[11] = x1_10;
         acc = __fmaf_rn(x0_10, x0_10, acc);
         acc = __fmaf_rn(x1_10, x1_10, acc);
-        float2 _cvt_f32_6 = __bfloat1622float2(__as_bf16x2(cur[6]));
+        float2 _cvt_f32_6 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[6]));
         float x0_12 = _cvt_f32_6.x * wf[12];
         float x1_12 = _cvt_f32_6.y * wf[13];
         x[12] = x0_12;
         x[13] = x1_12;
         acc = __fmaf_rn(x0_12, x0_12, acc);
         acc = __fmaf_rn(x1_12, x1_12, acc);
-        float2 _cvt_f32_7 = __bfloat1622float2(__as_bf16x2(cur[7]));
+        float2 _cvt_f32_7 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[7]));
         float x0_14 = _cvt_f32_7.x * wf[14];
         float x1_14 = _cvt_f32_7.y * wf[15];
         x[14] = x0_14;

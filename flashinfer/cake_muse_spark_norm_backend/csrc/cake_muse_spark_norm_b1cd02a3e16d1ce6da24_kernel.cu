@@ -113,6 +113,11 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    const unsigned int w = *reinterpret_cast<const unsigned int*>(&v);
+    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) __cluster_dims__(16,1,1) void
@@ -294,8 +299,8 @@ kernel_cake_muse_spark_norm_b1cd02a3e16d1ce6da24(const __nv_bfloat16* branch, co
         float bb[8];
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(cur_b[k]));
-            float2 _cvt_f32_1 = __bfloat1622float2(__as_bf16x2(pw[k]));
+            float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(cur_b[k]));
+            float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(pw[k]));
             bb[2 * k] = _cvt_f32_0.x * (_cvt_f32_1.x + post_gain_center);
             bb[2 * k + 1] = _cvt_f32_0.y * (_cvt_f32_1.y + post_gain_center);
         }
@@ -402,7 +407,7 @@ kernel_cake_muse_spark_norm_b1cd02a3e16d1ce6da24(const __nv_bfloat16* branch, co
         }
         #pragma unroll
         for (int k_1 = 0; k_1 < 4; k_1++) {
-            float2 _cvt_f32_2 = __bfloat1622float2(__as_bf16x2(nw[k_1]));
+            float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(nw[k_1]));
             bb[2 * k_1] = _cvt_f32_2.x + next_gain_center;
             bb[2 * k_1 + 1] = _cvt_f32_2.y + next_gain_center;
         }
@@ -421,14 +426,28 @@ kernel_cake_muse_spark_norm_b1cd02a3e16d1ce6da24(const __nv_bfloat16* branch, co
         for (int j_3 = 0; j_3 < 8; j_3++) {
             bb[j_3] = cur_r[j_3] * r2 * bb[j_3];
         }
-        {
-            __nv_bfloat162 _pk[4];
-            _pk[0] = __floats2bfloat162_rn(bb[0 + 0], bb[0 + 1]);
-            _pk[1] = __floats2bfloat162_rn(bb[0 + 2], bb[0 + 3]);
-            _pk[2] = __floats2bfloat162_rn(bb[0 + 4], bb[0 + 5]);
-            _pk[3] = __floats2bfloat162_rn(bb[0 + 6], bb[0 + 7]);
-            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(ffn_input + rbase))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+        unsigned int _packed_0[4];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(bb[_lp*2 + 0], bb[_lp*2+1 + 0]));
+            _packed_0[_lp] = *(uint32_t*)&_bf2;
         }
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(bb[_lp*2 + 2], bb[_lp*2+1 + 2]));
+            _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(bb[_lp*2 + 4], bb[_lp*2+1 + 4]));
+            _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(bb[_lp*2 + 6], bb[_lp*2+1 + 6]));
+            _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+        }
+        reinterpret_cast<int4*>(ffn_input + rbase)[0] = reinterpret_cast<int4*>(_packed_0)[0];
         #pragma unroll
         for (int k_2 = 0; k_2 < 4; k_2++) {
             cur_b[k_2] = nxt_b[k_2];

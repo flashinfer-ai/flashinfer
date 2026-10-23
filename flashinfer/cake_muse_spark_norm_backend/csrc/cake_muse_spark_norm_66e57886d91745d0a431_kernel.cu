@@ -92,6 +92,11 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    const unsigned int w = *reinterpret_cast<const unsigned int*>(&v);
+    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) __cluster_dims__(4,1,1) void
@@ -212,35 +217,35 @@ kernel_cake_muse_spark_norm_66e57886d91745d0a431(__nv_bfloat16* __restrict__ bra
         float acc = 0.0f;
         if (M > 0) {
             float2 acc2_0 = make_float2(0.0f, 0.0f);
-            float2 x2_0 = __bfloat1622float2(__as_bf16x2(cur[0]));
+            float2 x2_0 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[0]));
             x[0] = x2_0.x;
             x[1] = x2_0.y;
             float2 acc2_1 = fma_f32x2_rn_noftz(x2_0, x2_0, acc2_0);
-            float2 x2_2 = __bfloat1622float2(__as_bf16x2(cur[1]));
+            float2 x2_2 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[1]));
             x[2] = x2_2.x;
             x[3] = x2_2.y;
             float2 acc2_2 = fma_f32x2_rn_noftz(x2_2, x2_2, acc2_1);
-            float2 x2_4 = __bfloat1622float2(__as_bf16x2(cur[2]));
+            float2 x2_4 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[2]));
             x[4] = x2_4.x;
             x[5] = x2_4.y;
             float2 acc2_3 = fma_f32x2_rn_noftz(x2_4, x2_4, acc2_2);
-            float2 x2_6 = __bfloat1622float2(__as_bf16x2(cur[3]));
+            float2 x2_6 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[3]));
             x[6] = x2_6.x;
             x[7] = x2_6.y;
             float2 acc2_4 = fma_f32x2_rn_noftz(x2_6, x2_6, acc2_3);
-            float2 x2_8 = __bfloat1622float2(__as_bf16x2(cur[4]));
+            float2 x2_8 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[4]));
             x[8] = x2_8.x;
             x[9] = x2_8.y;
             float2 acc2_5 = fma_f32x2_rn_noftz(x2_8, x2_8, acc2_4);
-            float2 x2_10 = __bfloat1622float2(__as_bf16x2(cur[5]));
+            float2 x2_10 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[5]));
             x[10] = x2_10.x;
             x[11] = x2_10.y;
             float2 acc2_6 = fma_f32x2_rn_noftz(x2_10, x2_10, acc2_5);
-            float2 x2_12 = __bfloat1622float2(__as_bf16x2(cur[6]));
+            float2 x2_12 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[6]));
             x[12] = x2_12.x;
             x[13] = x2_12.y;
             float2 acc2_7 = fma_f32x2_rn_noftz(x2_12, x2_12, acc2_6);
-            float2 x2_14 = __bfloat1622float2(__as_bf16x2(cur[7]));
+            float2 x2_14 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[7]));
             x[14] = x2_14.x;
             x[15] = x2_14.y;
             float2 acc2_8 = fma_f32x2_rn_noftz(x2_14, x2_14, acc2_7);
