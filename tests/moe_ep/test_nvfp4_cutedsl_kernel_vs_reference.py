@@ -192,7 +192,8 @@ def test_blackwell_standard_global_scales(kind, scalar, monkeypatch):
 
 
 @pytest.mark.arch_blackwell
-def test_blackwell_standard_nvfp4_padded_aot(monkeypatch):
+@pytest.mark.parametrize("persistent", [False, True])
+def test_blackwell_standard_nvfp4_padded_aot(monkeypatch, persistent):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
@@ -210,10 +211,26 @@ def test_blackwell_standard_nvfp4_padded_aot(monkeypatch):
         rank=0,
         world_size=1,
         quant_kind="nvfp4",
+        use_persistent_finalize_kernel=persistent,
+        enable_fc1_activation_per_token_scale=persistent,
     )
-    ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    ws = pkg.Sm100BlockScaledSymmBuffer(
+        cfg,
+        num_valid_tokens_tensor=torch.ones(1, dtype=torch.int32, device="cuda")
+        if persistent
+        else None,
+    )
     try:
-        assert callable(ws.kernel.aot_compile())
+        loaded = ws.kernel.aot_compile()
+        weights = pkg.preprocess_block_scaled_weights(
+            torch.zeros(8, 192, 384, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(8, 384, 96, device="cuda", dtype=torch.bfloat16),
+            quant_kind="nvfp4",
+            intermediate_size=96,
+        )
+        loaded(**ws._runtime_kwargs(*weights))
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(ws.output_activation[:1]) == 0
     finally:
         ws.destroy()
 

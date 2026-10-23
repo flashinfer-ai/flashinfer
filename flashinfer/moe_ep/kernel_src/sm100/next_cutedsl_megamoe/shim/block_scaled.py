@@ -152,6 +152,8 @@ class BlockScaledMoeConfig:
         if self.activation == "situ":
             for name in ("situ_beta", "situ_linear_beta"):
                 value = getattr(self, name)
+                if name == "situ_linear_beta" and value is None:
+                    continue
                 if value is None or not math.isfinite(value) or value <= 0:
                     raise ValueError(f"SiTU requires positive, finite {name}.")
             if self.gate_up_clamp is not None:
@@ -692,7 +694,13 @@ class BlockScaledSymmBuffer:
             fields["fc1_activation_per_token_scale"] = getattr(
                 cfg, "enable_fc1_activation_per_token_scale", False
             )
+            fields["swiglu_alpha"] = getattr(cfg, "swiglu_alpha", None)
+            fields["swiglu_beta"] = getattr(cfg, "swiglu_beta", None)
             problem_desc = ProblemDesc(fields)
+            impl_fields["skip_topk_reduce"] = getattr(cfg, "use_custom_finalize", False)
+            impl_fields["topk_reduce_persistent"] = getattr(
+                cfg, "use_persistent_finalize_kernel", False
+            )
         kernel_cls = (
             BlackwellInferenceGenphaseMegaMoE
             if cfg.kernel_variant == "genphase"
@@ -906,6 +914,10 @@ def block_scaled_mega_moe(
             stacklevel=2,
         )
     cfg = symm_buffer.config
+    if getattr(cfg, "use_custom_finalize", False):
+        raise ValueError(
+            "Custom finalization requires the launch thunk and borrowed partial outputs."
+        )
     if y is not None and (
         y.ndim != 2
         or y.shape[1] != cfg.hidden

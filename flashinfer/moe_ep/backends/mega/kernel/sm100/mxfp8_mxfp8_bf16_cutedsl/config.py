@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional
 
@@ -32,7 +33,8 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
 
     ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"`` selects the standard
     provider export for E4M3 or E5M2. Keep ``kernel_variant="inference"`` and
-    use default or fixed ``knobs`` with this backend.
+    use default or fixed ``knobs`` with this backend. Activation controls and
+    late routing weights are available through this selector.
     """
 
     intermediate_size: int
@@ -74,7 +76,40 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # ("grouped", positive_int) overrides it for offline tuning.
     schedule_policy: tuple[str, int | None] | None = None
 
+    activation: Literal["swiglu", "situ"] = field(default="swiglu", kw_only=True)
+    situ_beta: float | None = field(default=None, kw_only=True)
+    situ_linear_beta: float | None = field(default=None, kw_only=True)
+    swiglu_alpha: float | None = field(default=None, kw_only=True)
+    swiglu_beta: float | None = field(default=None, kw_only=True)
+    apply_routing_weights_before_fc2: bool = field(default=True, kw_only=True)
+
     def __post_init__(self) -> None:
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
+        if self.swiglu_alpha is not None and self.swiglu_beta is not None:
+            if not all(math.isfinite(x) for x in (self.swiglu_alpha, self.swiglu_beta)):
+                raise ValueError("SwiGLU constants must be finite.")
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError("activation must be 'swiglu' or 'situ'.")
+        if self.activation == "situ":
+            if self.swiglu_alpha is not None:
+                raise ValueError("SwiGLU constants are not supported with SiTU.")
+            if (
+                self.situ_beta is None
+                or not math.isfinite(self.situ_beta)
+                or self.situ_beta <= 0
+            ):
+                raise ValueError("SiTU requires a positive, finite situ_beta.")
+            if self.situ_linear_beta is not None and (
+                not math.isfinite(self.situ_linear_beta) or self.situ_linear_beta <= 0
+            ):
+                raise ValueError(
+                    "situ_linear_beta must be positive and finite when set."
+                )
+            if self.gate_up_clamp is not None or self.activation_clamp is not None:
+                raise ValueError("Activation clamps are not supported with SiTU.")
+        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU parameters require activation='situ'.")
         validate_finalize_mode(
             self.finalize_mode,
             (

@@ -28,9 +28,8 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     These are scalar activation constants, distinct from ``fc1_alpha``.
 
     ``kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next"`` selects the standard
-    provider export. It accepts default or fixed ``knobs``; parameterized
-    SwiGLU, deferred finalization and online autotuning are unavailable there.
-    SiTU on this backend requires both ``situ_beta`` and ``situ_linear_beta``.
+    provider export. It accepts default or fixed ``knobs``, activation controls
+    and the finalization modes below. Online autotuning remains unavailable.
     """
 
     intermediate_size: int

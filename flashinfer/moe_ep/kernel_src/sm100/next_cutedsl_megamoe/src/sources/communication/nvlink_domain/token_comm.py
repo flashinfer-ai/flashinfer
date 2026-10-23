@@ -1378,7 +1378,8 @@ class TokenCommNonDeterministic(KernelComponent):
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("In-kernel top-k reduction requires BF16 combine data.")
         if self.activation_is_quantized:
-            element_block = self.activation_sf_vector_size * 4
+            # Scale storage is padded for vector copies; the logical row needs 64-element alignment.
+            element_block = max(64, self.activation_sf_vector_size)
             if self.hidden_size % element_block != 0:
                 raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {element_block}.")
         else:

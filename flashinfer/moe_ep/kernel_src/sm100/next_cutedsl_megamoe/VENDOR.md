@@ -8,11 +8,11 @@ registering a global `sources` package or loading Rubin kernels.
 ## Source
 
 - Provider base: `228a02d`.
-- Source revision: `a4344fb82313149b853ad7a696b98738d50ceead`.
+- Source revision: `f9a52924e16ea4b9107086d1445b0d1b292aae3a`.
 - Exporter revision: `f2d13b3cb8277398ff281fc80ae5f725cf1b2f10`.
 - Exporter SHA-256: `0e578237d416970d099750606a2489c0bfe2c0fd39bc86fa7c83bc7343d87814`.
 - Entry points: `BlackwellInferenceMegaMoE` and `BlackwellInferenceGenphaseMegaMoE`.
-- Exported Python files: 45.
+- Exported Python files: 46.
 
 The changes pending upstream bring the Blackwell GenPhase implementation from
 [FlashInfer #6565](https://github.com/flashinfer-ai/flashinfer/pull/6565) into
@@ -23,6 +23,8 @@ by GenPhase while preserving the provider's current accumulation arithmetic.
 The exporter registers both entry points and generates lazy imports. The
 counted CTA barrier helper is retained for GenPhase.
 
+The shared reducer masks invalid routes in BF16 and quantized combine, in
+both static and persistent execution. Deferred and quantized combine reset unwritten slots before reuse.
 The standard router checks the packed rank and top-k bounds, and NVFP4 calls
 require all three global scales. FC1 scale views match AOT padding. Grid-stride
 scheduling requires one compute cluster per launched cluster.
@@ -49,14 +51,24 @@ by `sm100/cutedsl_megamoe`, including Rubin's existing staging consumer. This
 export contains no second `inputs_process.py`. BF16/BF16 and BF16/MXFP8 remain
 in the legacy package.
 
-The standard adapter accepts `knobs=None` or a dictionary. It supports early
-and late routing weights, BF16 or quantized combine, in-kernel BF16 reduction,
-and NVFP4 per-token FC1 activation scales. SiTU requires both bounds.
-Finalization supports `FinalizeMode.DEFAULT` and `AUTO` without a live-token
-count. Persistent, deferred and CAKE finalization, parameterized SwiGLU, online
-autotuning and IKET capture are unavailable through these selectors. Legacy
-scheduler controls without an equivalent in the standard kernel are rejected
-before allocation.
+The standard adapter accepts `knobs=None` or a dictionary. Both dtypes support
+parameterized SwiGLU, bounded or unbounded SiTU, early and late routing weights,
+and in-kernel BF16 reduction. NVFP4 also exposes per-token FC1 activation scales
+and quantized combine. MXFP8 supports 64-aligned hidden rows with padded scales.
+
+`FinalizeMode.DEFAULT` uses the static reducer. `PERSISTENT` borrows the caller's
+CUDA int32 `(1,)` live-token count; update its contents before each forward.
+`NONE` returns borrowed BF16 rows, remaining routing weights and a route map
+through `forward_unfinalized()`. Consume them on the launch stream before
+workspace reuse. Persistent and deferred finalization cannot be combined.
+`CAKE` retains the existing NVFP4 device and shape restrictions. `AUTO` selects
+CAKE when supported, then persistent reduction when a live count is supplied,
+otherwise static reduction. In-kernel reduction needs no separate finalizer.
+
+Online autotuning and IKET capture are unavailable through the standard
+selectors. Legacy scheduler controls without a standard-kernel equivalent are
+rejected before allocation. GenPhase retains its existing SwiGLU and separate
+BF16 finalization restrictions.
 
 The GenPhase autotuner keeps its existing interface. Its cache revision changes
 with this export, and the shim preserves its previous default FC2 staging depth.

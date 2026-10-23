@@ -35,32 +35,27 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             )
         if config.knobs is not None and not isinstance(config.knobs, dict):
             raise MoEEpConfigError("knobs must be a dictionary or None.")
-        if getattr(config, "swiglu_alpha", None) is not None:
-            raise MoEEpConfigError(
-                "Parameterized SwiGLU is not in this provider snapshot."
-            )
-        mode = config.finalize_mode
-        if mode is FinalizeMode.AUTO:
-            mode = (
-                FinalizeMode.DEFAULT
-                if config.num_valid_tokens_tensor is None
-                else FinalizeMode.PERSISTENT
-            )
-        if mode is not FinalizeMode.DEFAULT:
-            raise MoEEpConfigError(
-                f"The standard backend does not support finalize_mode={mode.name}; "
-                "use DEFAULT or AUTO without num_valid_tokens_tensor."
-            )
-        if (
-            getattr(config, "activation", "swiglu") == "situ"
-            and config.situ_linear_beta is None
-        ):
-            raise MoEEpConfigError("This provider snapshot requires both SiTU bounds.")
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         if any(
             getattr(config, name, None) is not None
             for name in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
         ):
             raise MoEEpConfigError("Use knobs for standard inference geometry.")
+
+    def _finalize_mode(self, fleet):
+        mode = self._config.finalize_mode
+        if mode is not FinalizeMode.AUTO:
+            return mode
+        if self._cake_reducer_supported(fleet):
+            return FinalizeMode.CAKE
+        if self._config.num_valid_tokens_tensor is not None:
+            return FinalizeMode.PERSISTENT
+        return FinalizeMode.DEFAULT
+
+    def _cake_reducer_supported(self, fleet):
+        from .nvfp4_nvfp4_bf16_cutedsl.backend import _cake_reducer_supported
+
+        return self._kind() == "nvfp4" and _cake_reducer_supported(self._config, fleet)
 
     def _kind(self):
         return self.quant_kind or self._config.kind
@@ -90,6 +85,11 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         from .....kernel_src.sm100.next_cutedsl_megamoe import Sm100BlockScaledMoeConfig
 
         k = self._config
+        mode = self._finalize_mode(fleet)
+        if mode is FinalizeMode.CAKE and not self._cake_reducer_supported(fleet):
+            raise MoEEpConfigError(
+                "CAKE finalization is unsupported for this workspace."
+            )
         kind = self._kind()
         wire = getattr(k, "combine_dtype", "bf16")
         knobs = default_knobs(
@@ -164,6 +164,11 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             activation=getattr(k, "activation", "swiglu"),
             situ_beta=getattr(k, "situ_beta", None),
             situ_linear_beta=getattr(k, "situ_linear_beta", None),
+            swiglu_alpha=getattr(k, "swiglu_alpha", None),
+            swiglu_beta=getattr(k, "swiglu_beta", None),
+            use_custom_finalize=mode in (FinalizeMode.NONE, FinalizeMode.CAKE),
+            use_persistent_finalize_kernel=mode is FinalizeMode.PERSISTENT
+            and not reduce,
             apply_routing_weights_before_fc2=getattr(
                 k, "apply_routing_weights_before_fc2", True
             ),
@@ -217,7 +222,20 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             Sm100BlockScaledSymmBuffer,
         )
 
-        workspace = Sm100BlockScaledSymmBuffer(self._workspace_config(fleet_params))
+        cfg = self._workspace_config(fleet_params)
+        workspace = Sm100BlockScaledSymmBuffer(
+            cfg,
+            num_valid_tokens_tensor=self._config.num_valid_tokens_tensor
+            if cfg.use_persistent_finalize_kernel
+            else None,
+        )
+        if self.supports_unfinalized_output:
+            workspace._unfinalized_route_map = torch.arange(
+                cfg.max_tokens_per_rank * cfg.num_topk,
+                dtype=torch.int32,
+                device=workspace.device,
+            ).view(cfg.max_tokens_per_rank, cfg.num_topk)
+            workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
         if self._kind() == "nvfp4":
             for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
                 value = getattr(self._config, name)
@@ -236,6 +254,10 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             self.ep_rank,
             id(self._ep_comm_group),
             self._workspace_config(fleet_params),
+            self._finalize_mode(fleet_params),
+            epilogue_pool_key(self._config.num_valid_tokens_tensor)
+            if self._workspace_config(fleet_params).use_persistent_finalize_kernel
+            else None,
             tuple(
                 epilogue_pool_key(getattr(self._config, name, None))
                 for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
@@ -307,12 +329,14 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 if self._kind() == "nvfp4"
                 else dict(kind=self._kind())
             )
+            # The shared stager rounds scale columns to four; the native
+            # workspace keeps a wider row stride for its TMA alignment.
             self._legacy_backend().staging.stage_mega_moe_inputs(
                 t.hidden_states,
                 t.topk_weights,
                 t.topk_ids,
                 workspace.x,
-                workspace.x_sf[:, : cfg.hidden // cfg.sf_vec_size],
+                workspace.x_sf[:, : ((cfg.hidden // cfg.sf_vec_size + 3) // 4) * 4],
                 workspace.topk_idx,
                 workspace.topk_weights,
                 **kwargs,
@@ -331,6 +355,17 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
 
             note_staged_tokens(workspace.topk_idx, n)
         workspace.note_staged_tokens(n)
+        if (
+            self.supports_unfinalized_output
+            and not cfg.apply_routing_weights_before_fc2
+        ):
+            weights = workspace._unfinalized_weights[:n]
+            weights.copy_(workspace.topk_weights[:n])
+            weights.masked_fill_(
+                (workspace.topk_idx[:n] < 0)
+                | (workspace.topk_idx[:n] >= cfg.num_total_experts),
+                0,
+            )
         if cfg.enable_fc1_activation_per_token_scale:
             workspace.fc1_activation_per_token_scale[:n].copy_(
                 t.fc1_activation_per_token_scale
@@ -350,18 +385,67 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
     def validate_capture_ready(self, workspace, transformed_weights):
         if workspace._compiled is None:
             raise RuntimeError("Warm up the standard workspace before graph capture.")
+        if (
+            workspace.config.use_custom_finalize
+            and not self.supports_unfinalized_output
+        ):
+            from flashinfer.jit.cake_megamoe_topk_reduce import (
+                is_cake_megamoe_topk_reduce_module_loaded,
+            )
+
+            if not is_cake_megamoe_topk_reduce_module_loaded():
+                raise RuntimeError("Warm up the terminal reducer before graph capture.")
 
     def compute(self, workspace, transformed_weights, *, output):
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
+            sm100_block_scaled_mega_launch_thunk,
             sm100_block_scaled_mega_moe,
         )
 
-        return sm100_block_scaled_mega_moe(
-            output,
-            *transformed_weights,
-            workspace,
-            fast_math=self._config.fast_math,
+        if self.supports_unfinalized_output:
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
+        if not workspace.config.use_custom_finalize:
+            return sm100_block_scaled_mega_moe(
+                output,
+                *transformed_weights,
+                workspace,
+                fast_math=self._config.fast_math,
+            )
+        from flashinfer.jit.cake_megamoe_topk_reduce import (
+            get_cake_megamoe_topk_reduce_module,
         )
+
+        n = workspace.staged_tokens()
+        if n is None:
+            raise ValueError("compute() requires stage_inputs() first")
+        partials = workspace.custom_finalize_workspace()
+        thunk = sm100_block_scaled_mega_launch_thunk(*transformed_weights, workspace)
+        reducer = get_cake_megamoe_topk_reduce_module(workspace.device)
+        stream = torch.cuda.current_stream().cuda_stream
+        thunk()
+        reducer.run(partials, workspace.output_activation, n, stream)
+        if output is None:
+            return workspace.output_activation[:n]
+        output.copy_(workspace.output_activation[:n])
+        return output
+
+    def compute_unfinalized(self, workspace, transformed_weights):
+        from .....kernel_src.sm100.next_cutedsl_megamoe import (
+            sm100_block_scaled_mega_launch_thunk,
+        )
+
+        if not self.supports_unfinalized_output:
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        n = workspace.staged_tokens()
+        if n is None:
+            raise ValueError("compute_unfinalized() requires stage_inputs() first")
+        partials = workspace.custom_finalize_workspace()
+        rows = partials[:n].view(n * workspace.config.num_topk, workspace.config.hidden)
+        weights = workspace._unfinalized_weights[:n]
+        route_map = workspace._unfinalized_route_map[:n]
+        thunk = sm100_block_scaled_mega_launch_thunk(*transformed_weights, workspace)
+        thunk()
+        return rows, weights, route_map
 
 
 @register_mega_kernel("sm100_nvfp4_nvfp4_bf16_cutedsl_next")

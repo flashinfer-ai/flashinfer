@@ -658,8 +658,6 @@ def test_blackwell_standard_and_genphase_share_epilogue(kind, monkeypatch):
     "kwargs",
     [
         {"knobs": "auto"},
-        {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
-        {"activation": "situ", "situ_beta": 7.0},
     ],
 )
 def test_blackwell_standard_rejects_missing_provider_features(kwargs):
@@ -682,11 +680,11 @@ def test_blackwell_standard_rejects_missing_provider_features(kwargs):
     "mode,live_count,supported",
     [
         ("AUTO", False, True),
-        ("AUTO", True, False),
+        ("AUTO", True, True),
         ("DEFAULT", False, True),
         ("DEFAULT", True, True),
-        ("PERSISTENT", True, False),
-        ("NONE", False, False),
+        ("PERSISTENT", True, True),
+        ("NONE", False, True),
     ],
 )
 def test_blackwell_standard_finalize_modes(kind, mode, live_count, supported):
@@ -736,8 +734,21 @@ def test_blackwell_standard_nvfp4_finalize_compat(kwargs):
             kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
             **kwargs,
         )
-    with pytest.raises(MoEEpConfigError, match="finalize_mode"):
-        create_mega_kernel(config)
+    backend = create_mega_kernel(config)
+    if config.finalize_mode is FinalizeMode.NONE:
+        assert backend.supports_unfinalized_output
+    else:
+        backend.bind_ep_bootstrap(
+            moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+        )
+        with pytest.raises(MoEEpConfigError, match="CAKE"):
+            backend._workspace_config(
+                moe_ep.FleetParams(
+                    num_experts=8,
+                    max_tokens_per_rank=129,
+                    token_hidden_size=384,
+                )
+            )
 
 
 @pytest.mark.parametrize("early", [True, False])
@@ -1311,3 +1322,130 @@ def test_blackwell_genphase_tuning_cache_hit_before_dsl_arch_configuration(
     assert identity["compiler_options"] == "preserve-options"
     monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "different-options")
     assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16)[1] == "heuristic"
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "activation",
+    [
+        {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
+        {"activation": "situ", "situ_beta": 7.0},
+        {"activation": "situ", "situ_beta": 7.0, "situ_linear_beta": 5.0},
+    ],
+)
+def test_standard_activation_forwarding(kind, activation, monkeypatch):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled._max_active_clusters",
+        lambda size: 32,
+    )
+    cls = (
+        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        if kind == "nvfp4"
+        else moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    )
+    backend = create_mega_kernel(
+        cls(
+            intermediate_size=192,
+            top_k=3,
+            kernel_name=f"sm100_{kind}_{kind}_bf16_cutedsl_next",
+            **activation,
+        )
+    )
+    backend.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    cfg = backend._workspace_config(
+        moe_ep.FleetParams(
+            num_experts=8,
+            max_tokens_per_rank=129,
+            token_hidden_size=384,
+        )
+    )
+    kernel = pkg.Sm100BlockScaledSymmBuffer._build_kernel(cfg)
+    for field, value in activation.items():
+        assert getattr(cfg, field) == value
+        if field != "activation":
+            assert getattr(kernel.epilogue, field) == value
+
+
+def test_standard_persistent_pool_tracks_storage(monkeypatch):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.config import FinalizeMode
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    count = torch.tensor([7], dtype=torch.int32)
+    config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=192,
+        top_k=3,
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+        finalize_mode=FinalizeMode.PERSISTENT,
+        num_valid_tokens_tensor=count,
+    )
+    backend = create_mega_kernel(config)
+    backend.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    fleet = moe_ep.FleetParams(
+        num_experts=8, max_tokens_per_rank=129, token_hidden_size=384
+    )
+    first = backend._workspace_pool_key(fleet)
+    count.fill_(1)
+    assert first == backend._workspace_pool_key(fleet)
+    config.num_valid_tokens_tensor = count.clone()
+    assert first != backend._workspace_pool_key(fleet)
+    assert backend._workspace_config(fleet).use_persistent_finalize_kernel
+
+
+def test_standard_auto_cake_matches_legacy(monkeypatch):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.config import FinalizeMode
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(
+        "flashinfer.jit.cake_megamoe_topk_reduce.supports_device", lambda: True
+    )
+    config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=6,
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+    )
+    backend = create_mega_kernel(config)
+    backend.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    fleet = moe_ep.FleetParams(
+        num_experts=8, max_tokens_per_rank=256, token_hidden_size=4096
+    )
+    assert backend._finalize_mode(fleet) is FinalizeMode.CAKE
+    assert backend._workspace_config(fleet).use_custom_finalize
+
+
+def test_standard_cake_requires_reducer_warmup(monkeypatch):
+    from types import SimpleNamespace
+    from flashinfer.jit import cake_megamoe_topk_reduce as cake
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    backend = create_mega_kernel(
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=192,
+            top_k=3,
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+        )
+    )
+    workspace = SimpleNamespace(
+        _compiled=object(),
+        config=SimpleNamespace(use_custom_finalize=True),
+    )
+    monkeypatch.setattr(
+        cake, "is_cake_megamoe_topk_reduce_module_loaded", lambda: False
+    )
+    with pytest.raises(RuntimeError, match="terminal reducer"):
+        backend.validate_capture_ready(workspace, None)
+    monkeypatch.setattr(cake, "is_cake_megamoe_topk_reduce_module_loaded", lambda: True)
+    backend.validate_capture_ready(workspace, None)

@@ -979,6 +979,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             # Whether run() will receive the per-token FC1 activation scale. Absent means False:
             # the SMEM scratch it needs is reserved only for descriptors that enable it.
             "fc1_activation_per_token_scale": OptionalRequirement(bool),
+            "swiglu_alpha": OptionalRequirement(Optional[float]),
+            "swiglu_beta": OptionalRequirement(Optional[float]),
         }
 
     _supported_gate_activations: ClassVar[Tuple[str, ...]] = ("swiglu", "quick_geglu")
@@ -1002,24 +1004,20 @@ class SwapABGatedActEpilogue(KernelComponent):
 
     @staticmethod
     def _resolve_situ_betas(problem_desc: ProblemDesc) -> Tuple[Optional[float], Optional[float]]:
-        """Resolve the SiTU (Kimi K3) betas from the ProblemDesc; ``(None, None)`` means SwiGLU.
-
-        Both betas must be given together, and SiTU excludes ``gate_up_clamp`` -- matching DeepGEMM's
-        ``DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value())``. They are baked in at
-        codegen time exactly like ``gate_up_clamp``, so the enclosing KernelClass must also fold them
-        into its ``name()`` cache key.
-        """
+        """Resolve SiTU constants; an absent linear beta leaves the up branch unbounded."""
         beta = problem_desc.get("situ_beta")
         linear_beta = problem_desc.get("situ_linear_beta")
-        if (beta is None) != (linear_beta is None):
-            raise ValueError(f"situ_beta and situ_linear_beta must be set together, got {beta} and {linear_beta}.")
         if beta is None:
+            if linear_beta is not None:
+                raise ValueError("situ_linear_beta requires situ_beta.")
             return None, None
-        if beta <= 0 or linear_beta <= 0:
-            raise ValueError(f"SiTU beta parameters must be positive, got {beta} and {linear_beta}.")
+        if not math.isfinite(beta) or beta <= 0 or (
+            linear_beta is not None and (not math.isfinite(linear_beta) or linear_beta <= 0)
+        ):
+            raise ValueError("SiTU beta parameters must be positive and finite.")
         if problem_desc["gate_up_clamp"] is not None:
             raise ValueError("SiTU does not support gate_up_clamp; the two activation variants are exclusive.")
-        return float(beta), float(linear_beta)
+        return float(beta), None if linear_beta is None else float(linear_beta)
 
     @classmethod
     def _resolve_gate_activation(cls, problem_desc: ProblemDesc) -> str:
@@ -1054,6 +1052,17 @@ class SwapABGatedActEpilogue(KernelComponent):
         # The scratch costs mainloop SMEM budget, so only a descriptor that enables the scale
         # reserves it; passing the tensor without the flag is rejected in run().
         self.act_scale_scratch_enabled = bool(problem_desc.get("fc1_activation_per_token_scale", False))
+        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
+        self.swiglu_beta = problem_desc.get("swiglu_beta")
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
+        if self.swiglu_alpha is not None:
+            if not math.isfinite(self.swiglu_alpha) or not math.isfinite(self.swiglu_beta):
+                raise ValueError("SwiGLU constants must be finite.")
+            if self.situ_beta is not None:
+                raise ValueError("SiTU excludes SwiGLU alpha/beta constants.")
+            if self.gate_activation != "swiglu":
+                raise ValueError("QuickGeGLU excludes SwiGLU alpha/beta constants.")
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -2034,11 +2043,20 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         out = cute.make_rmem_tensor((n,), cutlass.Float32)
         log2_e = 1.4426950408889634
 
-        # quick_geglu: out = up * gate * sigmoid(1.702 * gate). The 1.702 folds into the exp2 constant
-        # (one Python-side double product, rounded once to fp32), so the SwiGLU instruction sequence
-        # is reused unchanged. SiTU never reaches here with quick_geglu (_resolve_gate_activation).
-        sigmoid_scale = self._quick_geglu_sigmoid_scale if self.gate_activation == "quick_geglu" else 1.0
-        neg_log2e_pair = (cutlass.Float32(-sigmoid_scale * log2_e), cutlass.Float32(-sigmoid_scale * log2_e))
+        sigmoid_scale = (
+            self._quick_geglu_sigmoid_scale
+            if self.gate_activation == "quick_geglu"
+            else 1.0
+        )
+        activation_alpha = (
+            sigmoid_scale if self.swiglu_alpha is None else self.swiglu_alpha
+        )
+        neg_log2e_pair = (
+            cutlass.Float32(-activation_alpha * log2_e),
+            cutlass.Float32(-activation_alpha * log2_e),
+        )
+        if cutlass.const_expr(self.swiglu_beta is not None):
+            beta_pair = (cutlass.Float32(self.swiglu_beta), cutlass.Float32(self.swiglu_beta))
         one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
         if cutlass.const_expr(self.gate_up_clamp is not None):
             limit = cutlass.Float32(self.gate_up_clamp)
@@ -2132,7 +2150,9 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             sigmoid_pair = _sigmoid(g0, g1)
 
             if cutlass.const_expr(self.situ_beta is None):
-                # SwiGLU: out = up * gate * sigmoid(gate)
+                # Add beta after clamping; alpha scales only the sigmoid argument.
+                if cutlass.const_expr(self.swiglu_beta is not None):
+                    u0, u1 = cute.arch.add_packed_f32x2((u0, u1), beta_pair)
                 ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
                 out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
             else:
@@ -2149,19 +2169,22 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 inv_2beta = cutlass.Float32(2.0 / self.situ_beta)
                 two_beta = cutlass.Float32(2.0 * self.situ_beta)
                 neg_beta = cutlass.Float32(-self.situ_beta)
-                inv_2lbeta = cutlass.Float32(2.0 / self.situ_linear_beta)
-                two_lbeta = cutlass.Float32(2.0 * self.situ_linear_beta)
-                neg_lbeta = cutlass.Float32(-self.situ_linear_beta)
 
                 gs = _sigmoid(*cute.arch.mul_packed_f32x2((g0, g1), (inv_2beta, inv_2beta)))
                 tanh_g = cute.arch.add_packed_f32x2(
                     cute.arch.mul_packed_f32x2(gs, (two_beta, two_beta)), (neg_beta, neg_beta)
                 )
 
-                us = _sigmoid(*cute.arch.mul_packed_f32x2((u0, u1), (inv_2lbeta, inv_2lbeta)))
-                tanh_u = cute.arch.add_packed_f32x2(
-                    cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)), (neg_lbeta, neg_lbeta)
-                )
+                if cutlass.const_expr(self.situ_linear_beta is not None):
+                    inv_2lbeta = cutlass.Float32(2.0 / self.situ_linear_beta)
+                    two_lbeta = cutlass.Float32(2.0 * self.situ_linear_beta)
+                    neg_lbeta = cutlass.Float32(-self.situ_linear_beta)
+                    us = _sigmoid(*cute.arch.mul_packed_f32x2((u0, u1), (inv_2lbeta, inv_2lbeta)))
+                    tanh_u = cute.arch.add_packed_f32x2(
+                        cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)), (neg_lbeta, neg_lbeta)
+                    )
+                else:
+                    tanh_u = (u0, u1)
 
                 situ_gate = cute.arch.mul_packed_f32x2(tanh_g, sigmoid_pair)
                 out_pair = cute.arch.mul_packed_f32x2(situ_gate, tanh_u)

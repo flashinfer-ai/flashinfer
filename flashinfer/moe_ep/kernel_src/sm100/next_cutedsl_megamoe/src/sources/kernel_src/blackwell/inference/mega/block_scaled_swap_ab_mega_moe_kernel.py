@@ -21,6 +21,7 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.iket_compat import iket
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
+from .....helpers.route_reset import ClearInvalidRoutes
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.topk_reduce import TopkReduce
 from .....helpers.utils import ceil_div, round_up
@@ -51,6 +52,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     fc1_output_region: ClassVar[str] = "blackwell.mega_moe.fc1_output"
     fc1_output_sf_region: ClassVar[str] = "blackwell.mega_moe.fc1_output_sf"
     fc1_done_counter_region: ClassVar[str] = "blackwell.mega_moe.fc1_done_counter"
+    topk_reduce_counter_region: ClassVar[str] = "blackwell.mega_moe.topk_reduce_counters"
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
     tma_a_warp_id: ClassVar[int] = 5
@@ -77,6 +79,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "situ_linear_beta": OptionalRequirement(Optional[float]),
             # "swiglu" (default) or "quick_geglu"; validated by the epilogue, keyed in name().
             "gate_activation": OptionalRequirement(str),
+            "swiglu_alpha": OptionalRequirement(Optional[float]),
+            "swiglu_beta": OptionalRequirement(Optional[float]),
             "world_size": int,
             "topk": int,
             "topk_index_dtype": type,
@@ -108,8 +112,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
+            "skip_topk_reduce": OptionalRequirement(bool),
             "helper_expert_count": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
+            "topk_reduce_persistent": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -137,6 +143,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.situ_beta = problem_desc.get("situ_beta")
         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
         self.gate_activation = problem_desc.get("gate_activation") or "swiglu"
+        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
+        self.swiglu_beta = problem_desc.get("swiglu_beta")
         self.world_size = problem_desc["world_size"]
         self.topk = problem_desc["topk"]
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
@@ -160,9 +168,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        self.skip_topk_reduce = impl_desc.get("skip_topk_reduce", False)
         self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
+        # Opt-in persistent scheduler for the separate top-k reduce.
+        self.topk_reduce_persistent = bool(
+            impl_desc.get("topk_reduce_persistent") and not self.reduce_topk_in_kernel
+        )
+
         self.occupancy = 1
         self.architecture = "sm_100"
         self.local_expert_count = self.expert_count // self.world_size
@@ -268,14 +282,25 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("Epilogue and Mainloop scale vector sizes must match.")
         self._device_workspace = self._build_device_workspace()
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
-        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
+        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(
-                self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count
+            None if self.reduce_topk_in_kernel or self.skip_topk_reduce else TopkReduce(
+                self.hidden_size, self.topk, self.combine_format,
+                num_experts=self.expert_count, persistent=self.topk_reduce_persistent,
             )
+        )
+        self._route_reset = ClearInvalidRoutes(
+            self.max_tokens_per_rank, self.topk, self.expert_count,
+            self.hidden_size * self.combine_format.act_dtype.width // 8,
+            self.token_comm.combine_sf_hidden_padded * self.combine_format.scale_dtype.width // 8
+            if self.combine_format.is_quantized else 0,
         )
 
     def _validate_geometry(self) -> None:
+        if self.skip_topk_reduce and self.topk_reduce_persistent:
+            raise ValueError("skip_topk_reduce and topk_reduce_persistent are mutually exclusive.")
+        if self.skip_topk_reduce and (self.reduce_topk_in_kernel or self.combine_format.is_quantized):
+            raise ValueError("skip_topk_reduce requires BF16 combine and reduce_topk_in_kernel=False.")
         static_expert_dimensions = (
             isinstance(self.expert_count, int),
             isinstance(self.intermediate_gateup_size, int),
@@ -417,6 +442,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             byte_alignment=16,
             reset="tail_reset",
         )
+        if self.topk_reduce_persistent:
+            # Work cursor of the persistent top-k reduce: tail-reset like the
+            # other per-launch counters, so it is zero before every reduce.
+            device_workspace.register(
+                self.topk_reduce_counter_region,
+                cutlass.Int32,
+                (1,),
+                buffer_space="local",
+                byte_alignment=16,
+                reset="tail_reset",
+            )
         self.scheduler.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         device_workspace.finalize()
@@ -429,6 +465,30 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     @property
     def require_zero_workspace_leading_bytes(self) -> Tuple[int, int]:
         return self._device_workspace.require_zero_workspace_leading_bytes
+
+    def topk_reduce_input_region(self) -> dict:
+        """Describe borrowed BF16 partials in the shared workspace.
+
+        If apply_routing_weights is true, multiply by top-k scores before
+        summing. Otherwise the scores were already applied in FC1.
+        Consume on the launch stream before reusing or releasing the workspace.
+        """
+        if not self.skip_topk_reduce:
+            raise RuntimeError("skip_topk_reduce mode is not enabled")
+        region = self.token_comm.pre_reduced_activation_region
+        return {
+            "name": region,
+            "byte_offset": self._device_workspace.offset(region),
+            "nbytes": self._device_workspace.nbytes(region),
+            "shape": (self.max_tokens_per_rank, self.topk, self.hidden_size),
+            "stride": (self.topk * self.hidden_size, self.hidden_size, 1),
+            "dtype": "bfloat16",
+            "alignment": self._device_workspace.byte_alignment(region),
+            "apply_routing_weights": not self.apply_topk_at_fc1,
+        }
+
+    def skip_topk_reduce_region(self) -> dict:
+        return self.topk_reduce_input_region()
 
     def name(self) -> str:
         """Canonical encoding of every constexpr: the compiled-kernel cache key.
@@ -468,6 +528,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
+            f"swiglu{self.swiglu_alpha}x{self.swiglu_beta}_skipreduce{self.skip_topk_reduce}_"
+            f"persistent{self.topk_reduce_persistent}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
             "_dlb_v1"
@@ -552,6 +614,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 ),
                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
             )
+        if self.topk_reduce_persistent:
+            # The persistent reduce reads its token count from device memory, so
+            # the AOT ABI carries the int32[1] operand; static-reduce entries omit it.
+            fake_arguments.update(num_valid_tokens=fake_tensor(cutlass.Int32, (1,), (0,), set(), 4))
         if self.quant_kind.uses_global_scale:
             # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
             # all, and declaring them here would put three tensors in the ABI that the caller has
@@ -629,11 +695,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
         hot_expert_weight_ready_flags: Optional[cute.Pointer] = None,  # uint64[EP]
         hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
-        # (tokens,) fp32, this rank's own tokens, plain local memory (the router reads it here and
-        # pushes it to the pool). Required iff the descriptor enables fc1_activation_per_token_scale.
-        # Last on purpose: the AOT kwargs wrapper right-aligns its None defaults, so appending keeps
-        # every existing positional caller valid.
+        # Local FP32 scales, one per source token when enabled by the descriptor.
         fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
+        # Caller-owned int32[1] live-token count for persistent finalization.
+        num_valid_tokens: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
@@ -725,10 +790,23 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        if cutlass.const_expr(not self.reduce_topk_in_kernel and (self.skip_topk_reduce or self.combine_format.is_quantized)):
+            self._route_reset(
+                topk_indices,
+                self.token_comm.pre_reduced_activation_tensor(self._device_workspace),
+                self.token_comm.pre_reduced_activation_sf_tensor(self._device_workspace),
+                stream,
+            )
         activation_pool = self.token_comm.fc1_activation_tensor(self._device_workspace)
         activation_sf_pool = self.token_comm.fc1_activation_sf_tensor(self._device_workspace)
         fc1_output = self._device_workspace.tensor(self.fc1_output_region)
         fc1_output_sf = self._device_workspace.tensor(self.fc1_output_sf_region)
+
+        topk_reduce_counters = (
+            self._device_workspace.tensor(self.topk_reduce_counter_region)
+            if cutlass.const_expr(self.topk_reduce_persistent)
+            else None
+        )
 
         experts = self.local_expert_count
         hidden = self.hidden_size
@@ -929,11 +1007,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 min_blocks_per_mp=self.occupancy,
                 use_pdl=True,
             )
-        if cutlass.const_expr(not self.reduce_topk_in_kernel):
+        if cutlass.const_expr(not self.reduce_topk_in_kernel and not self.skip_topk_reduce):
+            if cutlass.const_expr(self.topk_reduce_persistent != (num_valid_tokens is not None)):
+                raise ValueError("num_valid_tokens is required exactly when topk_reduce_persistent=True.")
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
             self._topk_reduce(
                 pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream,
-                topk_indices=topk_indices if cutlass.const_expr(not self.combine_format.is_quantized) else None,
+                counters=topk_reduce_counters, num_tokens_dev=num_valid_tokens,
+                topk_indices=topk_indices,
             )
 
     @cute.kernel
