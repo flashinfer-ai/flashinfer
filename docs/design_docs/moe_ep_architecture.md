@@ -34,6 +34,11 @@ Selected via `MegaConfig(megakernel=<config>)`. One symmetric-memory kernel
 owns dispatch, expert compute, and combine; output is always BF16
 `[num_tokens, hidden]`.
 
+For the SM100/SM103 NVFP4-weight, BF16-activation MegaMoE design, see
+[Faster-than-light NVFP4 decode—with precision](https://humansand.ai/blog/faster-than-light-nvfp4-decode)
+by Ziang Li and friends at humans&. The article covers weight-dequantization
+run-ahead, overlap with token arrival, and fused deterministic combine.
+
 | Backend (alias) | Activation | Weight | Output | Arch | Tuning |
 |---|---|---|---|---|---|
 | `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16) | BF16 | SM100/SM103 | same `knobs` surface as the NVFP4 backend |
