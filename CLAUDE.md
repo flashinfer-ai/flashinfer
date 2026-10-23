@@ -634,7 +634,10 @@ import, including literal `importlib.import_module` calls. Package initializers
 are resolved name by name: a name looked up in a package follows the binding
 that defines it (a re-export to its source, a function into its body, a module
 through the attributes read from it) plus the submodule of that name. The code
-an initializer runs at import is followed for every keyed file in its package.
+an initializer runs at import, including evaluated function annotations, is
+followed for every keyed file in its package. Star imports remain covered when
+they can replace an earlier binding; lazy fallbacks are followed when a binding
+may be absent.
 Each initializer is keyed by that code and the import lines of used names, so a
 new re-export or `__all__` entry invalidates nothing. Not keyed: import-time
 side effects of modules that keyed code neither imports nor uses, nonliteral

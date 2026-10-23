@@ -144,6 +144,12 @@ class _Source:
     def __init__(self, path: Path, data: bytes):
         self.path = path
         self.tree = ast.parse(data, filename=str(path))
+        self.future_annotations = any(
+            isinstance(stmt, ast.ImportFrom)
+            and stmt.module == "__future__"
+            and any(alias.name == "annotations" for alias in stmt.names)
+            for stmt in self.tree.body
+        )
         rel = path.relative_to(_PACKAGE_DIR.parent).with_suffix("")
         self.package = list(rel.parts[:-1])  # same for ``__init__`` and plain modules
         self.is_initializer = path.name == "__init__.py"
@@ -155,6 +161,18 @@ class _Source:
         # function bodies (which run only when called).
         self.executed: list = []
         self._scan(self.tree.body)
+        top_level = set(self.tree.body)
+        self.definite_bindings = {
+            name
+            for name, bindings in self.bindings.items()
+            if any(
+                statement in top_level
+                and not (
+                    isinstance(statement, ast.AnnAssign) and statement.value is None
+                )
+                for statement, _ in bindings
+            )
+        }
         self._uses: dict = {}
         self.importlib_names = {"importlib"}
         self.import_module_names: set = set()
@@ -192,6 +210,21 @@ class _Source:
                 self._bind(stmt.name, stmt)
                 self.executed += stmt.decorator_list + stmt.args.defaults
                 self.executed += [d for d in stmt.args.kw_defaults if d is not None]
+                if not self.future_annotations:
+                    # Annotations can call setup code even for unused functions.
+                    self.executed += [
+                        arg.annotation
+                        for arg in [
+                            *stmt.args.posonlyargs,
+                            *stmt.args.args,
+                            *stmt.args.kwonlyargs,
+                            stmt.args.vararg,
+                            stmt.args.kwarg,
+                        ]
+                        if arg is not None and arg.annotation is not None
+                    ]
+                    if stmt.returns is not None:
+                        self.executed.append(stmt.returns)
             elif isinstance(stmt, ast.ClassDef):
                 self._bind(stmt.name, stmt)
                 self.executed.append(stmt)  # the class body runs at import
@@ -442,9 +475,9 @@ class _ImportClosure:
                 path, chain[0], frozenset({chain[1:]}) if len(chain) > 1 else None
             )
 
-    def add_symbol(self, path: Path, name: str, uses) -> None:
+    def add_symbol(self, path: Path, name: str, uses, *, attribute_lookup=True) -> None:
         """``name`` looked up in the package initializer ``path``."""
-        if not self._once("symbol", path, name, uses):
+        if not self._once("symbol", path, name, uses, attribute_lookup):
             return
         self.add_initializer(path)
         self.initializers[path].add(name)
@@ -459,15 +492,19 @@ class _ImportClosure:
             elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self._add_code(source, [statement])
             # Other bindings take their value from code already run at import.
-        if bindings:
-            return
+        # A later star import can replace even an unconditional binding.
         for statement in source.star_imports:
             target = source.import_target(statement)
             if target is not None and self._source(target).is_initializer:
                 self.add_symbol(target, name, uses)
             elif target is not None:
                 self.add_file(target)
-        if "__getattr__" in source.bindings:
+        # A conditional or annotation-only binding may leave the name absent.
+        if (
+            attribute_lookup
+            and name not in source.definite_bindings
+            and "__getattr__" in source.bindings
+        ):
             self.add_symbol(path, "__getattr__", None)
 
     def _add_alias(self, source: _Source, statement, alias: ast.alias, uses) -> None:
@@ -483,7 +520,16 @@ class _ImportClosure:
         if target is None:
             return
         if self._source(target).is_initializer:
-            self.add_symbol(target, alias.name, uses)
+            # A self re-export resolves its own binding, rather than looking
+            # up an unrelated lazy export in the same initializer.
+            self.add_symbol(
+                target,
+                alias.name,
+                uses,
+                attribute_lookup=(
+                    target != source.path or _bound_name(statement, alias) != alias.name
+                ),
+            )
         else:
             self.add_file(target)
 
@@ -504,7 +550,13 @@ class _ImportClosure:
         for node in nodes:
             self._add_imports(source, node)
             for name in source.scope_imports(node)[1]:
-                self.add_symbol(source.path, name, source.uses(node, name))
+                # Global-name reads do not invoke a module's __getattr__.
+                self.add_symbol(
+                    source.path,
+                    name,
+                    source.uses(node, name),
+                    attribute_lookup=False,
+                )
 
 
 @functools.lru_cache(maxsize=None)

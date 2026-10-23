@@ -236,29 +236,83 @@ def test_module_attribute_access_is_keyed(fake_package, kernel_source):
     )
 
 
-def test_star_import_and_lazy_getattr_are_keyed(fake_package):
-    _write(fake_package / "starred/impl.py", "def op():\n    return 1\n")
-    _write(fake_package / "starred/__init__.py", "from .impl import *\n")
-    _write(fake_package / "kernels/uses_star.py", "from ..starred import op\n")
-    assert _edit_changes_key(
-        fake_package,
-        "kernels/uses_star.py",
-        "starred/impl.py",
-        "def op():\n    return 2\n",
-    )
-    _write(fake_package / "lazy/impl.py", "def op():\n    return 1\n")
-    _write(
-        fake_package / "lazy/__init__.py",
+@pytest.mark.parametrize(
+    "initializer",
+    [
+        "op = None\nfrom .impl import *\n",
+        "if False:\n    op = None\n"
         "def __getattr__(name):\n"
         "    from . import impl\n"
         "    return getattr(impl, name)\n",
-    )
-    _write(fake_package / "kernels/uses_lazy.py", "from ..lazy import op\n")
+        "op: object\n"
+        "def __getattr__(name):\n"
+        "    from . import impl\n"
+        "    return getattr(impl, name)\n",
+    ],
+    ids=[
+        "star-overwrites-binding",
+        "conditional-lazy-fallback",
+        "annotation-lazy-fallback",
+    ],
+)
+def test_star_import_and_lazy_getattr_are_keyed(fake_package, initializer):
+    _write(fake_package / "exports/impl.py", "def op():\n    return 1\n")
+    _write(fake_package / "exports/__init__.py", initializer)
+    _write(fake_package / "kernels/uses_export.py", "from ..exports import op\n")
     assert _edit_changes_key(
         fake_package,
-        "kernels/uses_lazy.py",
-        "lazy/impl.py",
+        "kernels/uses_export.py",
+        "exports/impl.py",
         "def op():\n    return 2\n",
+    )
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "unused(arg: configure(), /)",
+        "unused(arg: configure())",
+        "unused(*, arg: configure())",
+        "unused(*args: configure())",
+        "unused(**kwargs: configure())",
+        "unused() -> configure()",
+    ],
+    ids=[
+        "positional-only",
+        "positional",
+        "keyword-only",
+        "varargs",
+        "kwargs",
+        "return",
+    ],
+)
+def test_initializer_evaluated_annotations_are_keyed(fake_package, signature):
+    _write(fake_package / "setup.py", "def configure():\n    return int\n")
+    _write(
+        fake_package / "__init__.py",
+        f"from .setup import configure\ndef {signature}:\n    pass\n",
+    )
+    assert _edit_changes_key(
+        fake_package,
+        "kernels/standalone.py",
+        "setup.py",
+        "def configure():\n    return str\n",
+    )
+
+
+def test_initializer_postponed_annotations_do_not_run_at_import(fake_package):
+    _write(fake_package / "setup.py", "def configure():\n    return int\n")
+    _write(
+        fake_package / "__init__.py",
+        "from __future__ import annotations\n"
+        "from .setup import configure\n"
+        "def unused(arg: configure()) -> configure():\n    pass\n",
+    )
+    assert not _edit_changes_key(
+        fake_package,
+        "kernels/standalone.py",
+        "setup.py",
+        "def configure():\n    return str\n",
     )
 
 

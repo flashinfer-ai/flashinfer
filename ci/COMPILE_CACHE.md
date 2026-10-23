@@ -52,8 +52,10 @@ dependencies are not captured by wheel metadata.
 Strict source hashing follows static imports and resolvable literal dynamic
 imports. Package initializers are resolved per name a kernel looks up, so a
 re-export leads to its source rather than to everything the package exports;
-their import-time code is keyed, while an added re-export or `__all__` entry
-is not. Import-time side effects of modules no keyed code imports or uses,
+their import-time code, including evaluated function annotations, is keyed,
+while an added re-export or `__all__` entry is not. Star imports and lazy
+fallbacks remain covered when an explicit binding can be overwritten or absent.
+Import-time side effects of modules no keyed code imports or uses,
 nonliteral imports, and runtime file reads are not covered: list the latter
 through `extra_key_files`. This is not a general Python dependency analyzer.
 
