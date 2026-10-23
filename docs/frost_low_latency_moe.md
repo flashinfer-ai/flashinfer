@@ -104,15 +104,14 @@ dependencies are unchanged. Legacy `cudnn_frost` adapters retain their existing
 entry points. Existing Frost callers use the new entry automatically, with no
 API changes. Raw output still creates its identity-index tensor per call.
 
-### B300 host qualification (preliminary)
+### B300 host qualification
 
-These results compare the #7053 head `df7511ec` with the host implementation
-whose production-source hashes are recorded in the
-[machine-readable results](frost_low_latency_host_b300.json).
-Final qualification against main after #7053 merges is still pending.
+These results compare main `3f398977d` (after #7053 merged) with the host
+implementation measured at `91ae8a699`. Full revisions and production-source
+hashes are recorded in the [machine-readable results](frost_low_latency_host_b300.json).
 
-Across 81 primary cases, two opposite-order processes give **2.96–4.89×**
-faster warm public API submission and **5.62–10.58×** for the prepacked runner.
+Across 81 primary cases, two opposite-order processes give **2.85–4.65×**
+faster warm public API submission and **5.35–9.77×** for the prepacked runner.
 The cases cover BF16, MXFP4/MXFP8, MXFP8/MXFP8 and NVFP4, T=1/2/4, and
 SwiGLU/SiTU/SiLU. H=2048, physical I=1408, E=64, top-k=6. The same tactic,
 tensor contents and GPU workspace addresses are used on both sides.
@@ -123,21 +122,29 @@ while the last column measures GPU time per MoE call.
 
 | Path | Public API before → after | Host speedup | Prepacked runner before → after | GPU before → after |
 |---|---:|---:|---:|---:|
-| BF16 FMA | 130.86 → 42.33 | 3.09× | 105.94 → 18.52 | 26.44 → 26.43 |
-| MXFP4 TC128 | 304.82 → 67.12 | 4.54× | 277.01 → 30.77 | 10.52 → 10.51 |
-| MXFP4 FMA | 184.32 → 54.93 | 3.36× | 147.12 → 17.45 | 17.27 → 17.27 |
-| MXFP8 TC128 | 305.23 → 68.12 | 4.48× | 263.49 → 29.91 | 10.72 → 10.72 |
-| MXFP8 FMA | 183.11 → 54.72 | 3.35× | 147.04 → 18.39 | 24.53 → 24.53 |
-| NVFP4 FMA | 198.73 → 56.35 | 3.53× | 158.49 → 19.31 | 13.23 → 13.23 |
+| BF16 FMA | 106.04 → 35.81 | 2.96× | 83.25 → 14.64 | 26.63 → 26.65 |
+| MXFP4 TC128 | 260.85 → 61.85 | 4.22× | 217.82 → 24.90 | 10.33 → 10.33 |
+| MXFP4 FMA | 154.30 → 47.30 | 3.26× | 117.98 → 14.33 | 17.25 → 17.25 |
+| MXFP8 TC128 | 256.21 → 60.98 | 4.20× | 213.17 → 25.74 | 10.50 → 10.50 |
+| MXFP8 FMA | 152.79 → 47.38 | 3.23× | 116.25 → 15.13 | 24.52 → 24.52 |
+| NVFP4 FMA | 162.43 → 48.37 | 3.36× | 125.88 → 16.02 | 13.23 → 13.23 |
 
-B300/SM103, PyTorch 2.14.1+cu130, CuTe DSL 4.8.0, Xeon Platinum 8570.
-The CPU is shared. A/A public timing ratios range from 0.994 to 1.012;
-GPU changes are within -0.22% to +0.24% across both process orders, compared
-with -0.20% to +0.36% for A/A. Plain graph-replay CPU time is about 3 µs
-per replay of a 50-call graph on both sides; it is not divided by 50.
+B300/SM103, Python 3.12.15, PyTorch 2.14.1+cu130, CuTe DSL 4.8.0,
+apache-tvm-ffi 0.1.11, Xeon Platinum 8570. The CPU is shared. A/A public timing
+ratios range from 0.989 to 1.011; GPU changes are within
+-0.32% to +0.26% across both process orders, compared with
+-0.28% to +0.27% for A/A. Plain graph-replay CPU time
+has a median of 2.94 µs per replay of a 50-call graph; it is not divided by 50.
+GPU timing uses repeated fixed-input graph replay without an L2 flush.
 These results do not establish a GPU-time or model-throughput improvement.
 A smaller H=512/I=128/E=8/top-k=2 control covers 27 SwiGLU cases and gives
-2.99–4.50× public API and 5.53–8.68× prepacked-runner improvement.
+2.93–4.22× public API and 5.57–8.43× prepacked-runner improvement.
+
+Current-main B300 qualification passed 166 tests. Two noncurrent-device cases
+were skipped because this allocation exposes one GPU.
+The same production sources previously passed 149 tests on SM107 before the
+main rebase. Tests cover fresh tensor bindings, concurrent threads/streams,
+changed-input graphs, storage ownership and independent numerical references.
 
 Use `benchmarks/bench_frost_host_overhead.py` with the recorded baseline and
 candidate revisions. The following commands reproduce the primary protocol
