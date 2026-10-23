@@ -296,7 +296,13 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
         == shipped["package"]
         == "flashinfer.experimental.cake_kda_train"
     )
-    assert document["generator"] == shipped["generator"]
+    # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
+    # programs change: the two generator records share their form, not their stamp
+    assert (
+        set(document["generator"])
+        == set(shipped["generator"])
+        == {"cake_revision", "cuda", "rendered_at"}
+    )
     names = {entry["name"] for entry in document["libraries"]}
     assert names == {
         f"{record['library']}_{arch}"
