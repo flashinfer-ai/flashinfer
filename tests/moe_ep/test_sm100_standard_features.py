@@ -253,7 +253,8 @@ def test_standard_padded_mxfp8_staging(kind, fused, monkeypatch):
                 hidden_states=x,
                 topk_ids=torch.zeros(65, 2, dtype=torch.int64, device="cuda"),
                 topk_weights=torch.full((65, 2), 0.5, device="cuda"),
-            )
+            ),
+            return_workspace_view=True,
         )
         indices, expected = pkg.sampled_reference(
             layer._ensure_workspace(), *layer._transformed, 65
