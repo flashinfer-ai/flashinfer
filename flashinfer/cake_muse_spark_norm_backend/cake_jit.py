@@ -17,7 +17,9 @@ Host plan and loader glue of the Cake single-GPU norm kernels of the Muse
 Spark family: the gated residual with the next RMSNorm fused
 (``flashinfer.norm.gated_residual_next_rmsnorm``) and the gated residual
 RMSNorm (``flashinfer.norm.gated_residual_rmsnorm``), hidden size 8192, BF16
-branch and FP32 residual stream; SM100 / SM103.
+branch and FP32 residual stream, and the per-head RMSNorm times the sigmoid
+gate (``flashinfer.norm.rmsnorm_sigmoid_gate``, head dimension 64, in place);
+SM100 / SM103.
 
 Every record of ``MODULES`` is one mechanically exported production build: a
 CUDA device translation unit, a tvm-ffi binding and an occupancy query
@@ -45,8 +47,14 @@ count, so ``selected_module`` always answers.  The grid follows the record's
 clusters of ``cluster``), or a persistent cluster loop of ``min(rows,
 co-resident clusters)`` clusters, the co-residency read once per (record,
 architecture, device) from the record's occupancy query (``occupancy_entry``).  No program owns a workspace (``workspace_rule`` is
-``None`` on every record).  Batch size is a runtime scalar, so a changed row
-count never recompiles anything.
+``None`` on every record).  ``rmsnorm_sigmoid_gate`` routes on the head count and
+the token count together (``select_rule`` ``tokens_heads_between``: ``[heads,
+above, at_most]`` windows, a partition of the token counts per head count) and
+launches the kernel's two-dimensional grid (``grid_rule`` ``tokens_heads``:
+``rows_per_cta`` rows of the (tokens x heads) row space per CTA, the cluster
+over one token's head blocks, the token-axis cluster, the CTA order and the
+token interleave; :func:`tokens_heads_grid`).  Batch size is a runtime scalar,
+so a changed row count never recompiles anything.
 """
 
 from __future__ import annotations
@@ -4985,7 +4993,7 @@ HIDDEN_SIZE = 8192
 #: The operators of the package and the variants of each (the route suffixes a
 #: public call maps onto: which optional inputs the programs take, or the mode
 #: and the PDL form).
-OPS = ("gated_residual_next_rmsnorm", "gated_residual_rmsnorm")
+OPS = ("gated_residual_next_rmsnorm", "gated_residual_rmsnorm", "rmsnorm_sigmoid_gate")
 VARIANTS: dict[str, tuple[str, ...]] = {
     "gated_residual_next_rmsnorm": (
         "alpha_tensor_pw",
@@ -4994,9 +5002,11 @@ VARIANTS: dict[str, tuple[str, ...]] = {
         "alpha_tensor_nopw",
     ),
     "gated_residual_rmsnorm": ("mode0", "mode0_pdl", "mode1", "mode1_pdl"),
+    "rmsnorm_sigmoid_gate": ("bf16",),
 }
 SELECT_KIND = "rows_between"
-GRID_KINDS = ("rows", "persistent_rows")
+SELECT_KINDS = (SELECT_KIND, "tokens_heads_between")
+GRID_KINDS = ("rows", "persistent_rows", "tokens_heads")
 
 #: The logical argument vocabulary of ``run_module`` ``values``.
 LOGICAL_TENSORS = (
@@ -5010,6 +5020,8 @@ LOGICAL_TENSORS = (
     "ffn_input",
     "weight",
     "out",
+    "input",
+    "gate",
 )
 LOGICAL_SCALARS = (
     "rows",
@@ -5020,6 +5032,10 @@ LOGICAL_SCALARS = (
     "alpha_value",
     "eps",
     "gain_center",
+    "tokens",
+    "heads",
+    "input_stride",
+    "gate_stride",
 )
 
 
@@ -5072,29 +5088,45 @@ def route_modules(arch: str, route: str) -> tuple[str, ...]:
     return tuple(ROUTES.get(arch, {}).get(route, ()))
 
 
-def admits(rule: dict[str, Any] | None, rows: int, arch: str) -> bool:
+def admits(
+    rule: dict[str, Any] | None, rows: int, arch: str, heads: int | None = None
+) -> bool:
     """The record's selection rule: ``None`` admits every call; ``rows_between`` admits ``rows`` on ``arch``
-    when one of the architecture's windows holds ``above < rows <= at_most`` (``at_most`` ``None`` = unbounded)."""
+    when one of the architecture's windows holds ``above < rows <= at_most`` (``at_most`` ``None`` = unbounded);
+    ``tokens_heads_between`` admits ``rows`` tokens of ``heads`` heads when one of the architecture's windows
+    ``[heads, above, at_most]`` names the head count and holds the token count."""
     if rule is None:
         return True
-    if rule.get("kind") != SELECT_KIND:
-        raise ValueError(f"unknown Cake norm select rule {rule.get('kind')!r}")
+    kind = rule.get("kind")
+    if kind not in SELECT_KINDS:
+        raise ValueError(f"unknown Cake norm select rule {kind!r}")
     windows = rule["windows"].get(arch, ())
+    if kind == SELECT_KIND:
+        return any(
+            rows > int(above) and (at_most is None or rows <= int(at_most))
+            for above, at_most in windows
+        )
+    if heads is None:
+        raise ValueError(f"a {kind} select rule needs the head count of the call")
     return any(
-        rows > int(above) and (at_most is None or rows <= int(at_most))
-        for above, at_most in windows
+        int(count) == int(heads)
+        and rows > int(above)
+        and (at_most is None or rows <= int(at_most))
+        for count, above, at_most in windows
     )
 
 
-def selected_module(arch: str, route: str, rows: int) -> str:
-    """The record of ``route`` whose window admits ``rows`` on ``arch``."""
+def selected_module(arch: str, route: str, rows: int, heads: int | None = None) -> str:
+    """The record of ``route`` whose window admits ``rows`` on ``arch`` (``heads`` the head count of a route
+    selecting on it)."""
     if rows <= 0:
         raise ValueError(f"Cake norm launches need a positive row count, got {rows}")
     for name in route_modules(arch, route):
-        if admits(MODULES[name].get("select_rule"), rows, arch):
+        if admits(MODULES[name].get("select_rule"), rows, arch, heads):
             return name
+    heads_text = "" if heads is None else f" of {heads} heads"
     raise NotImplementedError(
-        f"no exported program of route {route!r} on {arch} admits {rows} rows"
+        f"no exported program of route {route!r} on {arch} admits {rows} rows{heads_text}"
     )
 
 
@@ -5145,12 +5177,36 @@ def cluster_capacity(name: str, arch: str, device_index: int) -> int:
     )
 
 
+def tokens_heads_grid(
+    rule: dict[str, Any], tokens: int, heads: int
+) -> tuple[int, int, int]:
+    """The grid of a ``tokens_heads`` rule for ``tokens`` tokens of ``heads`` heads (the kernel's own
+    arithmetic): ``(ceil(heads / rows_per_cta), tokens rounded up to tcluster, 1)`` for a cluster over the head
+    blocks or the head-major order, else ``(tokens rounded up to max(tcluster, interleave), ceil(heads /
+    rows_per_cta), 1)``."""
+    if tokens <= 0 or heads <= 0:
+        raise ValueError(
+            f"Cake norm tokens_heads launches need positive counts, got tokens={tokens}, heads={heads}"
+        )
+    blocks = -(-int(heads) // int(rule["rows_per_cta"]))
+    tcluster, interleave = int(rule.get("tcluster", 1)), int(rule.get("interleave", 1))
+    if int(rule["cluster"]) > 1 or rule.get("order") == "heads":
+        return (blocks, -(-int(tokens) // tcluster) * tcluster, 1)
+    step = max(tcluster, interleave)
+    return (-(-int(tokens) // step) * step, blocks, 1)
+
+
 def launch_grid(
-    record: dict[str, Any], rows: int, *, device_index: int
+    record: dict[str, Any],
+    rows: int,
+    *,
+    device_index: int,
+    values: dict[str, Any] | None = None,
 ) -> tuple[int, int, int]:
     """Launch grid of one record under its recorded grid rule: ``rows x row_ctas`` CTAs (``row_ctas`` the
-    rule's CTAs per row, the cluster when it names none), or ``min(rows, co-resident clusters) x cluster``
-    CTAs for the persistent row loop."""
+    rule's CTAs per row, the cluster when it names none), ``min(rows, co-resident clusters) x cluster``
+    CTAs for the persistent row loop, or the two-dimensional ``tokens_heads`` grid of ``rows`` tokens and the
+    ``heads`` of ``values`` (:func:`tokens_heads_grid`)."""
     if rows <= 0:
         raise ValueError(f"Cake norm launches need a positive row count, got {rows}")
     rule = record["grid_rule"]
@@ -5163,6 +5219,12 @@ def launch_grid(
             record["library"], device_arch(device_index), device_index
         )
         return (min(rows, max(1, capacity)) * cluster, 1, 1)
+    if kind == "tokens_heads":
+        if values is None or "heads" not in values:
+            raise ValueError(
+                f"module {record['library']} launches a tokens_heads grid; its values must carry 'heads'"
+            )
+        return tokens_heads_grid(rule, rows, int(values["heads"]))
     raise ValueError(f"unknown Cake norm grid rule {kind!r}")
 
 
@@ -5193,7 +5255,7 @@ def run_module(
     """Launch one exported module with logical argument ``values`` (``LOGICAL_TENSORS`` / ``LOGICAL_SCALARS``)
     over ``rows`` rows on the current torch stream of device ``device_index``."""
     record = MODULES[name]
-    grid = launch_grid(record, rows, device_index=device_index)
+    grid = launch_grid(record, rows, device_index=device_index, values=values)
     args = launch_args(record, values, grid)
     module = load(name, device_arch(device_index))
     with tvm_ffi.use_torch_stream():
@@ -5211,6 +5273,7 @@ __all__ = [
     "OPS",
     "ROUTES",
     "SELECT_KIND",
+    "SELECT_KINDS",
     "VARIANTS",
     "admits",
     "arch_for_capability",
@@ -5227,4 +5290,5 @@ __all__ = [
     "selected_module",
     "sm_count",
     "specs_for_arch",
+    "tokens_heads_grid",
 ]
