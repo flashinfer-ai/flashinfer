@@ -38,6 +38,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -519,6 +520,88 @@ def test_cuda_graph_replay_with_caller_workspace():
         torch.testing.assert_close(out, _run(q, cache, selection, gate), rtol=0, atol=0)
 
 
+def test_graph_capture_leaves_the_stream_caches_untouched():
+    """A captured call without a workspace takes its partials and counters from the graph's
+    private pool: the per-stream scratch and counter tables gain no entry during the capture,
+    and the replay is bit for bit the eager result."""
+    device = _device_or_skip()
+    rows = 8
+    if _splits(rows, 2, device) == 1:
+        pytest.skip("one split keeps no partials")
+    q, cache, selection, gate = _inputs(rows, 24, 2, "NHD", 17)
+    out = torch.empty_like(q)
+    _run(q, cache, selection, gate, out)
+    torch.cuda.synchronize()
+    partials_before = {
+        key: (id(scratch), frozenset(scratch.views))
+        for key, scratch in cake_backend._stream_partials.items()
+    }
+    counters_before = {
+        key: id(buffer) for key, buffer in cake_backend._stream_counters.items()
+    }
+    views_before = set(cake_backend._stream_counter_views)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(q, cache, selection, gate, out)
+    assert {
+        key: (id(scratch), frozenset(scratch.views))
+        for key, scratch in cake_backend._stream_partials.items()
+    } == partials_before
+    assert {
+        key: id(buffer) for key, buffer in cake_backend._stream_counters.items()
+    } == counters_before
+    assert set(cake_backend._stream_counter_views) == views_before
+    q.copy_(torch.randn_like(q))
+    graph.replay()
+    torch.testing.assert_close(out, _run(q, cache, selection, gate), rtol=0, atol=0)
+
+
+def test_concurrent_streams_keep_their_scratch():
+    """Without a workspace the partials (and the fused form's counters) come from one scratch
+    per (device, stream): two streams whose calls interleave on the host without a
+    synchronization each get their eager bits, and so do two Python threads enqueuing on
+    one stream (the lock orders each call's carve and launches)."""
+    device = _device_or_skip()
+    rows = 8
+    if _splits(rows, 2, device) == 1:
+        pytest.skip("one split keeps no partials")
+    inputs = [_inputs(rows, 24, 2, "NHD", 40 + i) for i in range(2)]
+    expected = [_run(*args) for args in inputs]
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(device) for _ in range(2)]
+    outs = [None, None]
+    for _ in range(3):
+        for i, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                outs[i] = _run(*inputs[i])
+    torch.cuda.synchronize()
+    for i, stream in enumerate(streams):
+        assert torch.equal(outs[i], expected[i])
+        assert (device.index, stream.cuda_stream) in cake_backend._stream_partials
+    results = [None, None]
+    errors = []
+    barrier = threading.Barrier(2)
+
+    def worker(i):
+        try:
+            torch.cuda.set_device(device)
+            barrier.wait(timeout=60)
+            for _ in range(20):
+                results[i] = _run(*inputs[i])
+        except Exception as error:  # reported by the test thread
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    torch.cuda.synchronize()
+    assert not errors, errors
+    for i in range(2):
+        assert torch.equal(results[i], expected[i])
+
+
 def test_zero_rows_return_the_output_untouched():
     _device_or_skip()
     q, cache, selection, gate = _inputs(4, 24, 2, "NHD", 0)
@@ -528,7 +611,13 @@ def test_zero_rows_return_the_output_untouched():
     assert result is out
 
 
-def test_rejects_invalid_inputs():
+def _no_launch(*args, **kwargs):
+    raise AssertionError("a launch was reached with invalid inputs")
+
+
+def test_rejects_invalid_inputs(monkeypatch):
+    """Every argument defect raises ``ValueError`` before the host reaches a launch (the
+    environment-stream context every launch runs under is replaced by a tripwire)."""
     _device_or_skip()
     q, cache, selection, gate = _inputs(4, 24, 2, "NHD", 0)
     (k_data, v_data), (k_sf, v_sf), (k_scale, v_scale), _ = cache
@@ -551,6 +640,7 @@ def test_rejects_invalid_inputs():
         q.shape
     )
     wide_group = torch.zeros(4, 48, HEAD_DIM, dtype=q.dtype, device="cuda")
+    monkeypatch.setattr(cake_jit, "ffi_stream_context", _no_launch)
     for change in (
         {"q": q.half()},
         {"q": q[..., :128]},
@@ -583,6 +673,18 @@ def test_rejects_invalid_inputs():
             cake_backend.qsa_sparse_paged_attention(
                 **{**args, "logical_indices": one_tile, "workspace_buffer": buffer}
             )
+    # The tripwire is live: a valid call reaches a launch and trips it.
+    with pytest.raises(AssertionError, match="a launch was reached"):
+        cake_backend.qsa_sparse_paged_attention(
+            **{
+                **args,
+                "logical_indices": one_tile,
+                "workspace_buffer": torch.zeros(
+                    nbytes, dtype=torch.uint8, device="cuda"
+                ),
+            }
+        )
+    monkeypatch.undo()
     cake_backend.qsa_sparse_paged_attention(
         **{
             **args,
@@ -724,6 +826,19 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
             elif key == "page_div":
                 assert kinds[key] == "parameter", name  # the page size as a divisor
         assert record["logical"] == {key: key for key in parameters}, name
+
+
+def test_logical_index_orders_the_flat_argument_sequence():
+    """The host's fast path binds ``LOGICAL_TENSORS`` then ``LOGICAL_SCALARS`` in one flat
+    sequence (``LOGICAL_INDEX``); every record's plan names its kernel arguments from that
+    vocabulary and ends with the three grid arguments."""
+    names = cake_jit.LOGICAL_TENSORS + cake_jit.LOGICAL_SCALARS
+    assert list(cake_jit.LOGICAL_INDEX) == list(names)
+    assert [cake_jit.LOGICAL_INDEX[name] for name in names] == list(range(len(names)))
+    for name, record in cake_jit.MODULES.items():
+        plan = record["arg_plan"]
+        assert [kind for kind, _ in plan[-3:]] == ["grid"] * 3, name
+        assert all(key in cake_jit.LOGICAL_INDEX for _, key in plan[:-3]), name
 
 
 def test_manifest_holds_one_entry_per_program_and_architecture():

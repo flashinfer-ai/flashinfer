@@ -100,15 +100,23 @@ capturable with a replay-stable layout. The counters are zeroed once, the
 first time a buffer's storage is seen for a `rows * num_kv_heads` (a new
 buffer at a freed buffer's address is a new storage and is zeroed again), and
 reset themselves after every launch; `reset_workspace(buffer)` forgets a
-buffer whose bytes another use overwrote. Without a workspace the partials are
-allocated per call, as the default implementation does, and the fused form's
-counters come from a module buffer per (device, stream): zeroed when it is
-allocated, left idle by every launch, grown on demand; a capturing stream
-allocates its counters per call instead (the graph's private pool). That path
-is outside the zero-allocation guarantee.
+buffer whose bytes another use overwrote. Without a workspace the partials
+come from a module scratch per (device, stream) -- one float32 buffer, grown
+when a call needs more, its views kept per call shape -- and the fused form's
+counters from a module buffer per (device, stream): zeroed when it is
+allocated, left idle by every launch, grown on demand. Calls on one stream are
+ordered, so no two launches share live partials or counters; a module lock
+orders two Python threads enqueuing on one stream from the carve through the
+call's last launch. A capturing stream allocates its partials and counters per
+call instead (the graph's private pool) and leaves both caches untouched. That
+path is outside the zero-allocation guarantee.
 
 Nothing on the host reads tensor contents; every dispatch is on host scalars
-and tensor metadata.
+and tensor metadata. The launch plan of a call shape -- split count, form,
+program, loaded FFI entries, argument order and grids -- is resolved once per
+shape and device (`cake_jit.resolved_launches`); a call checks its arguments,
+binds them in one flat sequence and issues its launches under one
+environment-stream context.
 
 ## Kernel structure of one call
 
@@ -140,7 +148,7 @@ Every kernel is compiled with `--use_fast_math` (recorded on every
 
 | File | Role |
 | --- | --- |
-| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves; a record lists the architectures it ships for), the rules as data (`select_records`, `launch_grid`), `run_module` |
+| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves; a record lists the architectures it ships for), the rules as data (`select_records`, `launch_grid`), the launch plan resolved once per shape (`resolved_launches`), `run_module` |
 | `cake_backend.py` | the host plan: checks, split rule, form rule, program rule, workspace rule, launch sequence |
 | `build.json` | the manifest: one library per (program, architecture), sources with digests, nvcc flags |
 | `cake_build.py` | the loader: `aot/` prebuilt libraries first, else FlashInfer's JIT from `build.json` |
