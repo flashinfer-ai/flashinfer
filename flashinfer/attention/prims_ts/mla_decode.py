@@ -1609,7 +1609,8 @@ class BatchMLADecodePagedTSWrapper:
             )
             _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
         # Range-check the threshold even when validate is False: it selects a
-        # compiled kernel, and a value past the per-dtype bound saturates FP8 P.
+        # compiled kernel, and past the per-dtype bound FP8 P (scaled by
+        # 448 * 2**-T) would lose most of the row to E4M3 subnormals.
         softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
             softmax_rescale_threshold_log2, q_dtype=q_data_type
         )
