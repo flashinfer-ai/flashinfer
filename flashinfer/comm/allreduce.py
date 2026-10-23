@@ -1138,10 +1138,6 @@ def allreduce_fusion(
                 weight_bias=weight_bias,
             )
 
-            # Return quant_out as documented (and as the MNNVL path does), even
-            # though this pattern also writes norm_out.
-            if pattern == AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant:
-                return quant_out
             if norm_out is not None:
                 return norm_out
             elif quant_out is not None:
@@ -1362,7 +1358,11 @@ def allreduce_fusion(
             block_quant_group_size=block_quant_group_size,
         )
 
-        # Return the most downstream output (already in 2D shape from input views)
+        # Return the most downstream output (already in 2D shape from input views).
+        # This MXFP8 pattern also writes norm_out but returns quant_out as documented
+        # (and as the MNNVL path does).
+        if pattern == AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant:
+            return quant_out
         if norm_out is not None:
             return norm_out
         elif quant_out is not None:
