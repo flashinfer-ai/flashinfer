@@ -3176,7 +3176,7 @@ class KcpOptions:
             )
         if int(self.head_groups) != 1:
             raise NotImplementedError(
-                "head_groups > 1 (lever L3) is not part of Phase 1"
+                "head_groups > 1 is not supported on the KCP route"
             )
         if (
             self.save_transfer is None
@@ -4485,7 +4485,7 @@ def _prepare(
         raise ValueError(f"save_mode must be one of {SAVE_MODES}, got {save_mode!r}")
     if save_mode != "light":
         raise NotImplementedError(
-            "save_mode='tape' is not part of Phase 1 of the KCP route (light only)"
+            "save_mode='tape' is not supported on the KCP route (light only)"
         )
     q, k, v, g, beta, T, H, batched = _operands(
         q, k, v, g, beta, ctx, dtypes=backend.dtypes
