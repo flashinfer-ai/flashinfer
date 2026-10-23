@@ -29,7 +29,7 @@ def numpy_packbits_ref(x_cpu: torch.Tensor, bitorder: Literal["big", "little"]):
     return torch.tensor(x_packed)
 
 
-@pytest.mark.parametrize("num_elements", [1, 10, 99, 128, 999, 5000, 131072, 999999])
+@pytest.mark.parametrize("num_elements", [0, 1, 10, 99, 128, 999, 5000, 131072, 999999])
 @pytest.mark.parametrize("bitorder", ["big", "little"])
 def test_packbits(num_elements, bitorder):
     torch.manual_seed(42)

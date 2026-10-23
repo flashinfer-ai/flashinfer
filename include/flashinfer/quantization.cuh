@@ -90,6 +90,9 @@ __global__ void SegmentPackBitsKernel(bool* input, uint8_t* output, IdType* inpu
 
 cudaError_t PackBits(bool* input, uint8_t* output, int64_t num_elements, BitOrder bitorder,
                      cudaStream_t stream) {
+  if (num_elements == 0) {
+    return cudaSuccess;
+  }
   DISPATCH_BITORDER(bitorder, BITORDER, {
     auto kernel = PackBitsKernel<BITORDER>;
     const dim3 nthrs(256);
