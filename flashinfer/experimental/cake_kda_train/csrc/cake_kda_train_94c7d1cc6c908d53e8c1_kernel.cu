@@ -78,6 +78,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_AII_S_OFF 71680
 #define SMEM_AII_S_STAGE_BYTES 1024
 #define SMEM_AII_S_STRIDE 1024
+#define SMEM_XCH_S_OFF 71680
+#define SMEM_XCH_S_STAGE_BYTES 4096
+#define SMEM_XCH_S_STRIDE 4096
 #define SMEM_BETA_S_OFF 75776
 #define SMEM_BETA_S_STAGE_BYTES 256
 #define SMEM_BETA_S_STRIDE 256
@@ -298,6 +301,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
     const int l3_s_addr = smem + 68608;
     float* aii_s = reinterpret_cast<float*>(smem_raw + 71680);
     const int aii_s_addr = smem + 71680;
+    float* xch_s = reinterpret_cast<float*>(smem_raw + 71680);
+    const int xch_s_addr = smem + 71680;
     float* beta_s = reinterpret_cast<float*>(smem_raw + 75776);
     const int beta_s_addr = smem + 75776;
     int* warp_tot = reinterpret_cast<int*>(smem_raw + 0);
@@ -786,22 +791,50 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 int prow = gi / 8;
                 int pcol = (gi - prow * 8) * 8;
                 long long pidx = pbase + (long long)(prow * prs) + (long long)pcol;
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(zero8[0 + 0], zero8[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(zero8[0 + 2], zero8[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(zero8[0 + 4], zero8[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(zero8[0 + 6], zero8[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_int + pidx))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_0[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 0], zero8[_lp*2+1 + 0]));
+                    _packed_0[_lp] = *(uint32_t*)&_bf2;
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(zero8[0 + 0], zero8[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(zero8[0 + 2], zero8[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(zero8[0 + 4], zero8[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(zero8[0 + 6], zero8[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_int + pidx))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 2], zero8[_lp*2+1 + 2]));
+                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 4], zero8[_lp*2+1 + 4]));
+                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 6], zero8[_lp*2+1 + 6]));
+                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(aqk_int + pidx)[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                unsigned int _packed_1[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 0], zero8[_lp*2+1 + 0]));
+                    _packed_1[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 2], zero8[_lp*2+1 + 2]));
+                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 4], zero8[_lp*2+1 + 4]));
+                    _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8[_lp*2 + 6], zero8[_lp*2+1 + 6]));
+                    _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(akk_int + pidx)[0] = reinterpret_cast<int4*>(_packed_1)[0];
             }
         }
         if (write_prep != 0) {
@@ -824,38 +857,94 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 int prow_p = gi_p / 16;
                 int pcol_p = (gi_p - prow_p * 16) * 8;
                 long long pidx_p = pbase_p + (long long)(prow_p * prs_p) + (long long)pcol_p;
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(pz8[0 + 0], pz8[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(pz8[0 + 2], pz8[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(pz8[0 + 4], pz8[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(pz8[0 + 6], pz8[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(kb_out + pidx_p))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_2[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 0], pz8[_lp*2+1 + 0]));
+                    _packed_2[_lp] = *(uint32_t*)&_bf2;
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(pz8[0 + 0], pz8[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(pz8[0 + 2], pz8[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(pz8[0 + 4], pz8[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(pz8[0 + 6], pz8[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(kg_out + pidx_p))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 2], pz8[_lp*2+1 + 2]));
+                    _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(pz8[0 + 0], pz8[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(pz8[0 + 2], pz8[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(pz8[0 + 4], pz8[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(pz8[0 + 6], pz8[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(qg_out + pidx_p))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 4], pz8[_lp*2+1 + 4]));
+                    _packed_2[_lp + 2] = *(uint32_t*)&_bf2;
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(pz8[0 + 0], pz8[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(pz8[0 + 2], pz8[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(pz8[0 + 4], pz8[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(pz8[0 + 6], pz8[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(v_new + pidx_p))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 6], pz8[_lp*2+1 + 6]));
+                    _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
                 }
+                reinterpret_cast<int4*>(kb_out + pidx_p)[0] = reinterpret_cast<int4*>(_packed_2)[0];
+                unsigned int _packed_3[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 0], pz8[_lp*2+1 + 0]));
+                    _packed_3[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 2], pz8[_lp*2+1 + 2]));
+                    _packed_3[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 4], pz8[_lp*2+1 + 4]));
+                    _packed_3[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 6], pz8[_lp*2+1 + 6]));
+                    _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(kg_out + pidx_p)[0] = reinterpret_cast<int4*>(_packed_3)[0];
+                unsigned int _packed_4[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 0], pz8[_lp*2+1 + 0]));
+                    _packed_4[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 2], pz8[_lp*2+1 + 2]));
+                    _packed_4[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 4], pz8[_lp*2+1 + 4]));
+                    _packed_4[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 6], pz8[_lp*2+1 + 6]));
+                    _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(qg_out + pidx_p)[0] = reinterpret_cast<int4*>(_packed_4)[0];
+                unsigned int _packed_5[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 0], pz8[_lp*2+1 + 0]));
+                    _packed_5[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 2], pz8[_lp*2+1 + 2]));
+                    _packed_5[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 4], pz8[_lp*2+1 + 4]));
+                    _packed_5[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pz8[_lp*2 + 6], pz8[_lp*2+1 + 6]));
+                    _packed_5[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(v_new + pidx_p)[0] = reinterpret_cast<int4*>(_packed_5)[0];
             }
             if (tid_p < 32) {
                 float pz4[4];
@@ -928,7 +1017,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
     // Kernel post-init ops
     const int tmem_acc = taddr;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int chunk = blockIdx.x;
     int head = blockIdx.y;
     int qk_head = head / group;
@@ -1015,7 +1104,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
     int rb = smem0 + (lane_1 >> 3) * 8192 + w * 1024;
     int c8v = lane_1 & 7;
     int gwv = w;
-    int xc = smem0 + 71680 + lane_1 * 16;
+    int xc = (int)xch_s_addr + lane_1 * 16;
     int t_0 = gwv * 8;
     float gq[32];
     #pragma unroll
@@ -1065,7 +1154,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             off1 = add_f32x2(off1, make_float2(tg[2], tg[3]));
         }
     }
-    float2 _f2_0 = make_float2(1.4426950408889634f, 1.4426950408889634f);
+    float2 _f2_0 = make_float2(1.442695f, 1.442695f);
     #pragma unroll
     for (int p_3 = 0; p_3 < 8; p_3++) {
         float gkr[4];
@@ -1126,7 +1215,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
         int p8f = f_row & 7;
         int t_f = i * 16 + f_row;
         float bt_r[1];
-        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&bt_r[0])) : "r"(smem0 + 75776 + t_f * 4));
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&bt_r[0])) : "r"((int)beta_s_addr + t_f * 4));
         float bt_f = bt_r[0];
         int v_f = 0;
         if (t_f < clen) {
@@ -1137,7 +1226,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
         int c4 = (f_c ^ fq << 2) << 4;
         int gk_i = smem0 + rowb + (c4 ^ p8f << 4);
         int t_i = smem0 + 75264 + (fq * 16 + f_c * 4 << 2);
-        float rcp_f = 1.4426950408889634f;
+        float rcp_f = 1.442695f;
         int cq = (f_c >> 1 ^ fq << 1) << 4;
         int h8 = (f_c & 1) * 8;
         int k_i = smem0 + 32768 + rowb + (cq ^ p8f << 4) + h8;
@@ -1248,26 +1337,53 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_9) : "l"(*(const unsigned long long*)&_f32x2_mul_a_11), "l"(*(const unsigned long long*)&_f2_7));
             qg[2] = qg2_9.x;
             qg[3] = qg2_9.y;
-            {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kb[0 + 0], kb[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kb[0 + 2], kb[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kb_p + 0))[0]) = _pk2;
+            unsigned int _packed_6[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb[_lp*2 + 0], kb[_lp*2+1 + 0]));
+                _packed_6[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb[_lp*2 + 2], kb[_lp*2+1 + 2]));
+                _packed_6[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kg[0 + 0], kg[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kg[0 + 2], kg[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kg_p + 0))[0]) = _pk2;
+                auto _gst_12 = kb_p + 0;
+                __builtin_assume(__isGlobal(_gst_12));
+                reinterpret_cast<int2*>(_gst_12)[0] = reinterpret_cast<int2*>(_packed_6)[0];
+            }
+            unsigned int _packed_7[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg[_lp*2 + 0], kg[_lp*2+1 + 0]));
+                _packed_7[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg[_lp*2 + 2], kg[_lp*2+1 + 2]));
+                _packed_7[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(qg[0 + 0], qg[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(qg[0 + 2], qg[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(qg_p + 0))[0]) = _pk2;
+                auto _gst_13 = kg_p + 0;
+                __builtin_assume(__isGlobal(_gst_13));
+                reinterpret_cast<int2*>(_gst_13)[0] = reinterpret_cast<int2*>(_packed_7)[0];
+            }
+            unsigned int _packed_8[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg[_lp*2 + 0], qg[_lp*2+1 + 0]));
+                _packed_8[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg[_lp*2 + 2], qg[_lp*2+1 + 2]));
+                _packed_8[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            {
+                auto _gst_14 = qg_p + 0;
+                __builtin_assume(__isGlobal(_gst_14));
+                reinterpret_cast<int2*>(_gst_14)[0] = reinterpret_cast<int2*>(_packed_8)[0];
             }
         }
         mbarrier_wait(ring_empty_addr, _phase_ring_empty_0);
@@ -1314,7 +1430,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             }
             float shift = 0.0f;
             if (use_gc != 0) {
-                shift = 21.64042561333445f;
+                shift = 21.640425f;
             }
             float2 _f2_8 = make_float2(shift, shift);
             float v[8];
@@ -1323,10 +1439,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 float2 d2 = sub_f32x2(sub_f32x2(make_float2(an[e_2], an[e_2 + 1]), _f2_8), make_float2(g_0[e_2], g_0[e_2 + 1]));
                 float x0_1 = approx_exp2(d2.x);
                 float x1_1 = approx_exp2(d2.y);
-                float2 _f32x2_mul_a_12 = make_float2(x0_1, x1_1);
-                float2 _f32x2_mul_b_13 = make_float2(_unpack_bf16_2[e_2], _unpack_bf16_2[e_2 + 1]);
+                float2 _f32x2_mul_a_15 = make_float2(x0_1, x1_1);
+                float2 _f32x2_mul_b_16 = make_float2(_unpack_bf16_2[e_2], _unpack_bf16_2[e_2 + 1]);
                 float2 v2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_12), "l"(*(const unsigned long long*)&_f32x2_mul_b_13));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_15), "l"(*(const unsigned long long*)&_f32x2_mul_b_16));
                 v[e_2] = v2.x;
                 v[e_2 + 1] = v2.y;
             }
@@ -1364,16 +1480,16 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 : "r"(ka_1));
             float shift_1 = 0.0f;
             if (bq != 0) {
-                shift_1 = 21.64042561333445f;
+                shift_1 = 21.640425f;
             }
             float2 _f2_9 = make_float2(shift_1, shift_1);
             #pragma unroll
             for (int e_4 = 0; e_4 < 8; e_4 += 2) {
                 float2 d2_1 = sub_f32x2(make_float2(g_0_1[e_4], g_0_1[e_4 + 1]), sub_f32x2(make_float2(an[e_4], an[e_4 + 1]), _f2_9));
-                float _exp2_14 = approx_exp2(d2_1.x);
-                g_0_1[e_4] = _exp2_14;
-                float _exp2_15 = approx_exp2(d2_1.y);
-                g_0_1[e_4 + 1] = _exp2_15;
+                float _exp2_17 = approx_exp2(d2_1.x);
+                g_0_1[e_4] = _exp2_17;
+                float _exp2_18 = approx_exp2(d2_1.y);
+                g_0_1[e_4 + 1] = _exp2_18;
             }
             if (clen <= i * 16 + sl) {
                 #pragma unroll
@@ -1390,10 +1506,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vq[8];
             #pragma unroll
             for (int e_6 = 0; e_6 < 8; e_6 += 2) {
-                float2 _f32x2_mul_a_16 = make_float2(_unpack_bf16_3[e_6], _unpack_bf16_3[e_6 + 1]);
-                float2 _f32x2_mul_b_17 = make_float2(g_0_1[e_6], g_0_1[e_6 + 1]);
+                float2 _f32x2_mul_a_19 = make_float2(_unpack_bf16_3[e_6], _unpack_bf16_3[e_6 + 1]);
+                float2 _f32x2_mul_b_20 = make_float2(g_0_1[e_6], g_0_1[e_6 + 1]);
                 float2 q2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_16), "l"(*(const unsigned long long*)&_f32x2_mul_b_17));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_19), "l"(*(const unsigned long long*)&_f32x2_mul_b_20));
                 vq[e_6] = q2.x;
                 vq[e_6 + 1] = q2.y;
             }
@@ -1408,10 +1524,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vk[8];
             #pragma unroll
             for (int e_7 = 0; e_7 < 8; e_7 += 2) {
-                float2 _f32x2_mul_a_18 = make_float2(_unpack_bf16_4[e_7], _unpack_bf16_4[e_7 + 1]);
-                float2 _f32x2_mul_b_19 = make_float2(g_0_1[e_7], g_0_1[e_7 + 1]);
+                float2 _f32x2_mul_a_21 = make_float2(_unpack_bf16_4[e_7], _unpack_bf16_4[e_7 + 1]);
+                float2 _f32x2_mul_b_22 = make_float2(g_0_1[e_7], g_0_1[e_7 + 1]);
                 float2 k2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_18), "l"(*(const unsigned long long*)&_f32x2_mul_b_19));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_21), "l"(*(const unsigned long long*)&_f32x2_mul_b_22));
                 vk[e_7] = k2.x;
                 vk[e_7 + 1] = k2.y;
             }
@@ -1454,8 +1570,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                     #pragma unroll
                     for (int j_3 = 0; j_3 < 8; j_3++) {
                         {
-                            uint32_t _addr_20 = static_cast<uint32_t>(smem0 + 57344 + w * 1152 + ((th_1 + j_3) * 18 + sl_0) * 4);
-                            asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_20), "f"(_tmem_load_0[j_3]) : "memory");
+                            uint32_t _addr_23 = static_cast<uint32_t>(smem0 + 57344 + w * 1152 + ((th_1 + j_3) * 18 + sl_0) * 4);
+                            asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_23), "f"(_tmem_load_0[j_3]) : "memory");
                         }
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1481,14 +1597,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                     int col_3 = scol + hh_2;
                     if (write_ext != 0) {
                         if (t_d < clen) {
-                            {
-                                __nv_bfloat162 _pk[4];
-                                _pk[0] = __floats2bfloat162_rn(vals[0 + 0], vals[0 + 1]);
-                                _pk[1] = __floats2bfloat162_rn(vals[0 + 2], vals[0 + 3]);
-                                _pk[2] = __floats2bfloat162_rn(vals[0 + 4], vals[0 + 5]);
-                                _pk[3] = __floats2bfloat162_rn(vals[0 + 6], vals[0 + 7]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_ext + (abase + (long long)(t_d * ars) + (long long)col_3)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            unsigned int _packed_9[4];
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 0], vals[_lp*2+1 + 0]));
+                                _packed_9[_lp] = *(uint32_t*)&_bf2;
                             }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 2], vals[_lp*2+1 + 2]));
+                                _packed_9[_lp + 1] = *(uint32_t*)&_bf2;
+                            }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 4], vals[_lp*2+1 + 4]));
+                                _packed_9[_lp + 2] = *(uint32_t*)&_bf2;
+                            }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 6], vals[_lp*2+1 + 6]));
+                                _packed_9[_lp + 3] = *(uint32_t*)&_bf2;
+                            }
+                            reinterpret_cast<int4*>(aqk_ext + (abase + (long long)(t_d * ars) + (long long)col_3))[0] = reinterpret_cast<int4*>(_packed_9)[0];
                         }
                     }
                     if (write_int != 0) {
@@ -1498,14 +1628,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                                 vals[e_8] = 0.0f;
                             }
                         }
-                        {
-                            __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(vals[0 + 0], vals[0 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(vals[0 + 2], vals[0 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(vals[0 + 4], vals[0 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(vals[0 + 6], vals[0 + 7]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_int + (ibase + (long long)(t_d * ars) + (long long)col_3)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                        unsigned int _packed_10[4];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 0], vals[_lp*2+1 + 0]));
+                            _packed_10[_lp] = *(uint32_t*)&_bf2;
                         }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 2], vals[_lp*2+1 + 2]));
+                            _packed_10[_lp + 1] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 4], vals[_lp*2+1 + 4]));
+                            _packed_10[_lp + 2] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 6], vals[_lp*2+1 + 6]));
+                            _packed_10[_lp + 3] = *(uint32_t*)&_bf2;
+                        }
+                        reinterpret_cast<int4*>(aqk_int + (ibase + (long long)(t_d * ars) + (long long)col_3))[0] = reinterpret_cast<int4*>(_packed_10)[0];
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     __syncwarp();
@@ -1540,8 +1684,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         #pragma unroll
                         for (int j_7 = 0; j_7 < 8; j_7++) {
                             {
-                                uint32_t _addr_21 = static_cast<uint32_t>(base_t + j_7 * 64 + ((c4_0 ^ j_7 >> 1) << 4));
-                                asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_21), "f"(_tmem_load_0[j_7]) : "memory");
+                                uint32_t _addr_24 = static_cast<uint32_t>(base_t + j_7 * 64 + ((c4_0 ^ j_7 >> 1) << 4));
+                                asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_24), "f"(_tmem_load_0[j_7]) : "memory");
                             }
                         }
                     } else if (i - 1 == 2) {
@@ -1550,8 +1694,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         #pragma unroll
                         for (int j_8 = 0; j_8 < 8; j_8++) {
                             {
-                                uint32_t _addr_22 = static_cast<uint32_t>(base_t_1 + j_8 * 128 + ((c8 ^ j_8) << 4));
-                                asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_22), "f"(_tmem_load_0[j_8]) : "memory");
+                                uint32_t _addr_25 = static_cast<uint32_t>(base_t_1 + j_8 * 128 + ((c8 ^ j_8) << 4));
+                                asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_25), "f"(_tmem_load_0[j_8]) : "memory");
                             }
                         }
                     } else {
@@ -1563,8 +1707,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         #pragma unroll
                         for (int j_9 = 0; j_9 < 8; j_9++) {
                             {
-                                uint32_t _addr_23 = static_cast<uint32_t>(base_t_2 + j_9 * 64 + ((c4_0 ^ j_9 >> 1) << 4));
-                                asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_23), "f"(_tmem_load_0[j_9]) : "memory");
+                                uint32_t _addr_26 = static_cast<uint32_t>(base_t_2 + j_9 * 64 + ((c4_0 ^ j_9 >> 1) << 4));
+                                asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_26), "f"(_tmem_load_0[j_9]) : "memory");
                             }
                         }
                     }
@@ -1583,25 +1727,53 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 int col_1 = scol + lane_1 % 2 * 8;
                 if (write_ext != 0) {
                     if (t_d_1 < clen) {
-                        {
-                            __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(zero8_1[0 + 0], zero8_1[0 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(zero8_1[0 + 2], zero8_1[0 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(zero8_1[0 + 4], zero8_1[0 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(zero8_1[0 + 6], zero8_1[0 + 7]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_ext + (abase + (long long)(t_d_1 * ars) + (long long)col_1)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                        unsigned int _packed_11[4];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 0], zero8_1[_lp*2+1 + 0]));
+                            _packed_11[_lp] = *(uint32_t*)&_bf2;
                         }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 2], zero8_1[_lp*2+1 + 2]));
+                            _packed_11[_lp + 1] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 4], zero8_1[_lp*2+1 + 4]));
+                            _packed_11[_lp + 2] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 6], zero8_1[_lp*2+1 + 6]));
+                            _packed_11[_lp + 3] = *(uint32_t*)&_bf2;
+                        }
+                        reinterpret_cast<int4*>(aqk_ext + (abase + (long long)(t_d_1 * ars) + (long long)col_1))[0] = reinterpret_cast<int4*>(_packed_11)[0];
                     }
                 }
                 if (write_int != 0) {
-                    {
-                        __nv_bfloat162 _pk[4];
-                        _pk[0] = __floats2bfloat162_rn(zero8_1[0 + 0], zero8_1[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(zero8_1[0 + 2], zero8_1[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(zero8_1[0 + 4], zero8_1[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(zero8_1[0 + 6], zero8_1[0 + 7]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_int + (ibase + (long long)(t_d_1 * ars) + (long long)col_1)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    unsigned int _packed_12[4];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 0], zero8_1[_lp*2+1 + 0]));
+                        _packed_12[_lp] = *(uint32_t*)&_bf2;
                     }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 2], zero8_1[_lp*2+1 + 2]));
+                        _packed_12[_lp + 1] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 4], zero8_1[_lp*2+1 + 4]));
+                        _packed_12[_lp + 2] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_1[_lp*2 + 6], zero8_1[_lp*2+1 + 6]));
+                        _packed_12[_lp + 3] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<int4*>(aqk_int + (ibase + (long long)(t_d_1 * ars) + (long long)col_1))[0] = reinterpret_cast<int4*>(_packed_12)[0];
                 }
             } else {
                 float zero8_2[8];
@@ -1617,25 +1789,53 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 int col_2 = scol + lane_1 % 2 * 8;
                 if (write_ext != 0) {
                     if (t_d_2 < clen) {
-                        {
-                            __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(zero8_2[0 + 0], zero8_2[0 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(zero8_2[0 + 2], zero8_2[0 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(zero8_2[0 + 4], zero8_2[0 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(zero8_2[0 + 6], zero8_2[0 + 7]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_ext + (abase + (long long)(t_d_2 * ars) + (long long)col_2)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                        unsigned int _packed_13[4];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 0], zero8_2[_lp*2+1 + 0]));
+                            _packed_13[_lp] = *(uint32_t*)&_bf2;
                         }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 2], zero8_2[_lp*2+1 + 2]));
+                            _packed_13[_lp + 1] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 4], zero8_2[_lp*2+1 + 4]));
+                            _packed_13[_lp + 2] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 6], zero8_2[_lp*2+1 + 6]));
+                            _packed_13[_lp + 3] = *(uint32_t*)&_bf2;
+                        }
+                        reinterpret_cast<int4*>(akk_ext + (abase + (long long)(t_d_2 * ars) + (long long)col_2))[0] = reinterpret_cast<int4*>(_packed_13)[0];
                     }
                 }
                 if (write_int != 0) {
-                    {
-                        __nv_bfloat162 _pk[4];
-                        _pk[0] = __floats2bfloat162_rn(zero8_2[0 + 0], zero8_2[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(zero8_2[0 + 2], zero8_2[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(zero8_2[0 + 4], zero8_2[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(zero8_2[0 + 6], zero8_2[0 + 7]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_int + (ibase + (long long)(t_d_2 * ars) + (long long)col_2)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    unsigned int _packed_14[4];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 0], zero8_2[_lp*2+1 + 0]));
+                        _packed_14[_lp] = *(uint32_t*)&_bf2;
                     }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 2], zero8_2[_lp*2+1 + 2]));
+                        _packed_14[_lp + 1] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 4], zero8_2[_lp*2+1 + 4]));
+                        _packed_14[_lp + 2] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_2[_lp*2 + 6], zero8_2[_lp*2+1 + 6]));
+                        _packed_14[_lp + 3] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<int4*>(akk_int + (ibase + (long long)(t_d_2 * ars) + (long long)col_2))[0] = reinterpret_cast<int4*>(_packed_14)[0];
                 }
             }
         }
@@ -1647,9 +1847,9 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                int _smem_desc_lo_24 = (((b_ring_addr) >> 4) & 0x7FFF) + (0) * 512;
+                int _smem_desc_lo_27 = (((b_ring_addr) >> 4) & 0x7FFF) + (0) * 512;
 #else
-                int _smem_desc_lo_24 = (((b_ring_addr) >> 4) & 0x3FFF) + (0) * 512;
+                int _smem_desc_lo_27 = (((b_ring_addr) >> 4) & 0x3FFF) + (0) * 512;
 #endif
                 asm volatile(
             "{\n\t"
@@ -1679,7 +1879,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"(tmem_acc), "r"(_smem_desc_lo_24), "r"(tmem_acc + 64), "r"(0) : "memory");
+            :: "r"(tmem_acc), "r"(_smem_desc_lo_27), "r"(tmem_acc + 64), "r"(0) : "memory");
                 tcgen05_commit(ring_empty_addr);
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 int i_n = i;
@@ -1735,14 +1935,14 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float e0_1 = approx_exp2(gk_1[0]);
             float e1_2 = approx_exp2(gk_1[1]);
             float2 _f2_11 = make_float2(e0_1, e1_2);
-            float2 _f32x2_mul_a_25 = make_float2(_unpack_bf16_5[0], _unpack_bf16_5[1]);
+            float2 _f32x2_mul_a_28 = make_float2(_unpack_bf16_5[0], _unpack_bf16_5[1]);
             float2 kbt_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_25), "l"(*(const unsigned long long*)&_f2_10));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_28), "l"(*(const unsigned long long*)&_f2_10));
             float kb0_1 = (float)(__nv_bfloat16)kbt_1.x;
             float kb1_1 = (float)(__nv_bfloat16)kbt_1.y;
-            float2 _f32x2_mul_a_26 = make_float2(kb0_1, kb1_1);
+            float2 _f32x2_mul_a_29 = make_float2(kb0_1, kb1_1);
             float2 kb2_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_26), "l"(*(const unsigned long long*)&_f2_11));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_29), "l"(*(const unsigned long long*)&_f2_11));
             kb_1[0] = kb2_1.x;
             kb_1[1] = kb2_1.y;
             float _fma_4;
@@ -1751,28 +1951,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(tot_1[1]), "f"(rcp_f), "f"(-gk_1[1]));
             float x0_2 = approx_exp2(_fma_4);
             float x1_2 = approx_exp2(_fma_5);
-            float2 _f32x2_mul_a_27 = make_float2(_unpack_bf16_5[0], _unpack_bf16_5[1]);
-            float2 _f32x2_mul_b_28 = make_float2(x0_2, x1_2);
+            float2 _f32x2_mul_a_30 = make_float2(_unpack_bf16_5[0], _unpack_bf16_5[1]);
+            float2 _f32x2_mul_b_31 = make_float2(x0_2, x1_2);
             float2 kg2_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_27), "l"(*(const unsigned long long*)&_f32x2_mul_b_28));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_30), "l"(*(const unsigned long long*)&_f32x2_mul_b_31));
             kg_1[0] = kg2_1.x;
             kg_1[1] = kg2_1.y;
-            float2 _f32x2_mul_a_29 = make_float2(_unpack_bf16_6[0], _unpack_bf16_6[1]);
+            float2 _f32x2_mul_a_32 = make_float2(_unpack_bf16_6[0], _unpack_bf16_6[1]);
             float2 qg2_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_29), "l"(*(const unsigned long long*)&_f2_11));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_32), "l"(*(const unsigned long long*)&_f2_11));
             qg_1[0] = qg2_1.x;
             qg_1[1] = qg2_1.y;
             float e0_0_1 = approx_exp2(gk_1[2]);
             float e1_1_1 = approx_exp2(gk_1[3]);
             float2 _f2_12 = make_float2(e0_0_1, e1_1_1);
-            float2 _f32x2_mul_a_30 = make_float2(_unpack_bf16_5[2], _unpack_bf16_5[3]);
+            float2 _f32x2_mul_a_33 = make_float2(_unpack_bf16_5[2], _unpack_bf16_5[3]);
             float2 kbt_2_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_30), "l"(*(const unsigned long long*)&_f2_10));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_33), "l"(*(const unsigned long long*)&_f2_10));
             float kb0_3_1 = (float)(__nv_bfloat16)kbt_2_1.x;
             float kb1_4_1 = (float)(__nv_bfloat16)kbt_2_1.y;
-            float2 _f32x2_mul_a_31 = make_float2(kb0_3_1, kb1_4_1);
+            float2 _f32x2_mul_a_34 = make_float2(kb0_3_1, kb1_4_1);
             float2 kb2_5_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_5_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_31), "l"(*(const unsigned long long*)&_f2_12));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_5_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_34), "l"(*(const unsigned long long*)&_f2_12));
             kb_1[2] = kb2_5_1.x;
             kb_1[3] = kb2_5_1.y;
             float _fma_6;
@@ -1781,37 +1981,64 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_7) : "f"(tot_1[3]), "f"(rcp_f), "f"(-gk_1[3]));
             float x0_6_1 = approx_exp2(_fma_6);
             float x1_7_1 = approx_exp2(_fma_7);
-            float2 _f32x2_mul_a_32 = make_float2(_unpack_bf16_5[2], _unpack_bf16_5[3]);
-            float2 _f32x2_mul_b_33 = make_float2(x0_6_1, x1_7_1);
+            float2 _f32x2_mul_a_35 = make_float2(_unpack_bf16_5[2], _unpack_bf16_5[3]);
+            float2 _f32x2_mul_b_36 = make_float2(x0_6_1, x1_7_1);
             float2 kg2_8_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_8_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_32), "l"(*(const unsigned long long*)&_f32x2_mul_b_33));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_8_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_35), "l"(*(const unsigned long long*)&_f32x2_mul_b_36));
             kg_1[2] = kg2_8_1.x;
             kg_1[3] = kg2_8_1.y;
-            float2 _f32x2_mul_a_34 = make_float2(_unpack_bf16_6[2], _unpack_bf16_6[3]);
+            float2 _f32x2_mul_a_37 = make_float2(_unpack_bf16_6[2], _unpack_bf16_6[3]);
             float2 qg2_9_1;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_9_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_34), "l"(*(const unsigned long long*)&_f2_12));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_9_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_37), "l"(*(const unsigned long long*)&_f2_12));
             qg_1[2] = qg2_9_1.x;
             qg_1[3] = qg2_9_1.y;
-            {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kb_1[0 + 0], kb_1[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kb_1[0 + 2], kb_1[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kb_p + 32))[0]) = _pk2;
+            unsigned int _packed_15[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb_1[_lp*2 + 0], kb_1[_lp*2+1 + 0]));
+                _packed_15[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb_1[_lp*2 + 2], kb_1[_lp*2+1 + 2]));
+                _packed_15[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kg_1[0 + 0], kg_1[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kg_1[0 + 2], kg_1[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kg_p + 32))[0]) = _pk2;
+                auto _gst_38 = kb_p + 32;
+                __builtin_assume(__isGlobal(_gst_38));
+                reinterpret_cast<int2*>(_gst_38)[0] = reinterpret_cast<int2*>(_packed_15)[0];
+            }
+            unsigned int _packed_16[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg_1[_lp*2 + 0], kg_1[_lp*2+1 + 0]));
+                _packed_16[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg_1[_lp*2 + 2], kg_1[_lp*2+1 + 2]));
+                _packed_16[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(qg_1[0 + 0], qg_1[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(qg_1[0 + 2], qg_1[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(qg_p + 32))[0]) = _pk2;
+                auto _gst_39 = kg_p + 32;
+                __builtin_assume(__isGlobal(_gst_39));
+                reinterpret_cast<int2*>(_gst_39)[0] = reinterpret_cast<int2*>(_packed_16)[0];
+            }
+            unsigned int _packed_17[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg_1[_lp*2 + 0], qg_1[_lp*2+1 + 0]));
+                _packed_17[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg_1[_lp*2 + 2], qg_1[_lp*2+1 + 2]));
+                _packed_17[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            {
+                auto _gst_40 = qg_p + 32;
+                __builtin_assume(__isGlobal(_gst_40));
+                reinterpret_cast<int2*>(_gst_40)[0] = reinterpret_cast<int2*>(_packed_17)[0];
             }
         }
         mbarrier_wait(ring_empty_addr + 8, _phase_ring_empty_1);
@@ -1858,7 +2085,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             }
             float shift_2 = 0.0f;
             if (use_gc_1 != 0) {
-                shift_2 = 21.64042561333445f;
+                shift_2 = 21.640425f;
             }
             float2 _f2_13 = make_float2(shift_2, shift_2);
             float v_1[8];
@@ -1867,10 +2094,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 float2 d2_2 = sub_f32x2(sub_f32x2(make_float2(an_3[e_9], an_3[e_9 + 1]), _f2_13), make_float2(g_0_2[e_9], g_0_2[e_9 + 1]));
                 float x0_3 = approx_exp2(d2_2.x);
                 float x1_3 = approx_exp2(d2_2.y);
-                float2 _f32x2_mul_a_35 = make_float2(x0_3, x1_3);
-                float2 _f32x2_mul_b_36 = make_float2(_unpack_bf16_7[e_9], _unpack_bf16_7[e_9 + 1]);
+                float2 _f32x2_mul_a_41 = make_float2(x0_3, x1_3);
+                float2 _f32x2_mul_b_42 = make_float2(_unpack_bf16_7[e_9], _unpack_bf16_7[e_9 + 1]);
                 float2 v2_1;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_35), "l"(*(const unsigned long long*)&_f32x2_mul_b_36));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_41), "l"(*(const unsigned long long*)&_f32x2_mul_b_42));
                 v_1[e_9] = v2_1.x;
                 v_1[e_9 + 1] = v2_1.y;
             }
@@ -1908,16 +2135,16 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 : "r"(ka_3));
             float shift_3 = 0.0f;
             if (bq_0 != 0) {
-                shift_3 = 21.64042561333445f;
+                shift_3 = 21.640425f;
             }
             float2 _f2_14 = make_float2(shift_3, shift_3);
             #pragma unroll
             for (int e_11 = 0; e_11 < 8; e_11 += 2) {
                 float2 d2_3 = sub_f32x2(make_float2(g_0_3[e_11], g_0_3[e_11 + 1]), sub_f32x2(make_float2(an_3[e_11], an_3[e_11 + 1]), _f2_14));
-                float _exp2_37 = approx_exp2(d2_3.x);
-                g_0_3[e_11] = _exp2_37;
-                float _exp2_38 = approx_exp2(d2_3.y);
-                g_0_3[e_11 + 1] = _exp2_38;
+                float _exp2_43 = approx_exp2(d2_3.x);
+                g_0_3[e_11] = _exp2_43;
+                float _exp2_44 = approx_exp2(d2_3.y);
+                g_0_3[e_11 + 1] = _exp2_44;
             }
             if (clen <= i * 16 + sl) {
                 #pragma unroll
@@ -1934,10 +2161,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vq_1[8];
             #pragma unroll
             for (int e_13 = 0; e_13 < 8; e_13 += 2) {
-                float2 _f32x2_mul_a_39 = make_float2(_unpack_bf16_8[e_13], _unpack_bf16_8[e_13 + 1]);
-                float2 _f32x2_mul_b_40 = make_float2(g_0_3[e_13], g_0_3[e_13 + 1]);
+                float2 _f32x2_mul_a_45 = make_float2(_unpack_bf16_8[e_13], _unpack_bf16_8[e_13 + 1]);
+                float2 _f32x2_mul_b_46 = make_float2(g_0_3[e_13], g_0_3[e_13 + 1]);
                 float2 q2_1;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_39), "l"(*(const unsigned long long*)&_f32x2_mul_b_40));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_45), "l"(*(const unsigned long long*)&_f32x2_mul_b_46));
                 vq_1[e_13] = q2_1.x;
                 vq_1[e_13 + 1] = q2_1.y;
             }
@@ -1952,10 +2179,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vk_1[8];
             #pragma unroll
             for (int e_14 = 0; e_14 < 8; e_14 += 2) {
-                float2 _f32x2_mul_a_41 = make_float2(_unpack_bf16_9[e_14], _unpack_bf16_9[e_14 + 1]);
-                float2 _f32x2_mul_b_42 = make_float2(g_0_3[e_14], g_0_3[e_14 + 1]);
+                float2 _f32x2_mul_a_47 = make_float2(_unpack_bf16_9[e_14], _unpack_bf16_9[e_14 + 1]);
+                float2 _f32x2_mul_b_48 = make_float2(g_0_3[e_14], g_0_3[e_14 + 1]);
                 float2 k2_1;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_41), "l"(*(const unsigned long long*)&_f32x2_mul_b_42));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_47), "l"(*(const unsigned long long*)&_f32x2_mul_b_48));
                 vk_1[e_14] = k2_1.x;
                 vk_1[e_14 + 1] = k2_1.y;
             }
@@ -1971,9 +2198,9 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                int _smem_desc_lo_43 = (((b_ring_addr) >> 4) & 0x7FFF) + (1) * 512;
+                int _smem_desc_lo_49 = (((b_ring_addr) >> 4) & 0x7FFF) + (1) * 512;
 #else
-                int _smem_desc_lo_43 = (((b_ring_addr) >> 4) & 0x3FFF) + (1) * 512;
+                int _smem_desc_lo_49 = (((b_ring_addr) >> 4) & 0x3FFF) + (1) * 512;
 #endif
                 asm volatile(
             "{\n\t"
@@ -2003,7 +2230,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"(tmem_acc), "r"(_smem_desc_lo_43), "r"(tmem_acc + 96), "r"(1) : "memory");
+            :: "r"(tmem_acc), "r"(_smem_desc_lo_49), "r"(tmem_acc + 96), "r"(1) : "memory");
                 tcgen05_commit(ring_empty_addr + 8);
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 int i_n_1 = i + 1;
@@ -2059,14 +2286,14 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float e0_2 = approx_exp2(gk_2[0]);
             float e1_3 = approx_exp2(gk_2[1]);
             float2 _f2_16 = make_float2(e0_2, e1_3);
-            float2 _f32x2_mul_a_44 = make_float2(_unpack_bf16_10[0], _unpack_bf16_10[1]);
+            float2 _f32x2_mul_a_50 = make_float2(_unpack_bf16_10[0], _unpack_bf16_10[1]);
             float2 kbt_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_44), "l"(*(const unsigned long long*)&_f2_15));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_50), "l"(*(const unsigned long long*)&_f2_15));
             float kb0_2 = (float)(__nv_bfloat16)kbt_3.x;
             float kb1_2 = (float)(__nv_bfloat16)kbt_3.y;
-            float2 _f32x2_mul_a_45 = make_float2(kb0_2, kb1_2);
+            float2 _f32x2_mul_a_51 = make_float2(kb0_2, kb1_2);
             float2 kb2_2;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_45), "l"(*(const unsigned long long*)&_f2_16));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_51), "l"(*(const unsigned long long*)&_f2_16));
             kb_2[0] = kb2_2.x;
             kb_2[1] = kb2_2.y;
             float _fma_8;
@@ -2075,28 +2302,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_9) : "f"(tot_2[1]), "f"(rcp_f), "f"(-gk_2[1]));
             float x0_4 = approx_exp2(_fma_8);
             float x1_4 = approx_exp2(_fma_9);
-            float2 _f32x2_mul_a_46 = make_float2(_unpack_bf16_10[0], _unpack_bf16_10[1]);
-            float2 _f32x2_mul_b_47 = make_float2(x0_4, x1_4);
+            float2 _f32x2_mul_a_52 = make_float2(_unpack_bf16_10[0], _unpack_bf16_10[1]);
+            float2 _f32x2_mul_b_53 = make_float2(x0_4, x1_4);
             float2 kg2_2;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_46), "l"(*(const unsigned long long*)&_f32x2_mul_b_47));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_52), "l"(*(const unsigned long long*)&_f32x2_mul_b_53));
             kg_2[0] = kg2_2.x;
             kg_2[1] = kg2_2.y;
-            float2 _f32x2_mul_a_48 = make_float2(_unpack_bf16_11[0], _unpack_bf16_11[1]);
+            float2 _f32x2_mul_a_54 = make_float2(_unpack_bf16_11[0], _unpack_bf16_11[1]);
             float2 qg2_2;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_48), "l"(*(const unsigned long long*)&_f2_16));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_54), "l"(*(const unsigned long long*)&_f2_16));
             qg_2[0] = qg2_2.x;
             qg_2[1] = qg2_2.y;
             float e0_0_2 = approx_exp2(gk_2[2]);
             float e1_1_2 = approx_exp2(gk_2[3]);
             float2 _f2_17 = make_float2(e0_0_2, e1_1_2);
-            float2 _f32x2_mul_a_49 = make_float2(_unpack_bf16_10[2], _unpack_bf16_10[3]);
+            float2 _f32x2_mul_a_55 = make_float2(_unpack_bf16_10[2], _unpack_bf16_10[3]);
             float2 kbt_2_2;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_49), "l"(*(const unsigned long long*)&_f2_15));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_55), "l"(*(const unsigned long long*)&_f2_15));
             float kb0_3_2 = (float)(__nv_bfloat16)kbt_2_2.x;
             float kb1_4_2 = (float)(__nv_bfloat16)kbt_2_2.y;
-            float2 _f32x2_mul_a_50 = make_float2(kb0_3_2, kb1_4_2);
+            float2 _f32x2_mul_a_56 = make_float2(kb0_3_2, kb1_4_2);
             float2 kb2_5_2;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_5_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_50), "l"(*(const unsigned long long*)&_f2_17));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_5_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_56), "l"(*(const unsigned long long*)&_f2_17));
             kb_2[2] = kb2_5_2.x;
             kb_2[3] = kb2_5_2.y;
             float _fma_10;
@@ -2105,37 +2332,64 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_11) : "f"(tot_2[3]), "f"(rcp_f), "f"(-gk_2[3]));
             float x0_6_2 = approx_exp2(_fma_10);
             float x1_7_2 = approx_exp2(_fma_11);
-            float2 _f32x2_mul_a_51 = make_float2(_unpack_bf16_10[2], _unpack_bf16_10[3]);
-            float2 _f32x2_mul_b_52 = make_float2(x0_6_2, x1_7_2);
+            float2 _f32x2_mul_a_57 = make_float2(_unpack_bf16_10[2], _unpack_bf16_10[3]);
+            float2 _f32x2_mul_b_58 = make_float2(x0_6_2, x1_7_2);
             float2 kg2_8_2;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_8_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_51), "l"(*(const unsigned long long*)&_f32x2_mul_b_52));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_8_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_57), "l"(*(const unsigned long long*)&_f32x2_mul_b_58));
             kg_2[2] = kg2_8_2.x;
             kg_2[3] = kg2_8_2.y;
-            float2 _f32x2_mul_a_53 = make_float2(_unpack_bf16_11[2], _unpack_bf16_11[3]);
+            float2 _f32x2_mul_a_59 = make_float2(_unpack_bf16_11[2], _unpack_bf16_11[3]);
             float2 qg2_9_2;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_9_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_53), "l"(*(const unsigned long long*)&_f2_17));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_9_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_59), "l"(*(const unsigned long long*)&_f2_17));
             qg_2[2] = qg2_9_2.x;
             qg_2[3] = qg2_9_2.y;
-            {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kb_2[0 + 0], kb_2[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kb_2[0 + 2], kb_2[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kb_p + 64))[0]) = _pk2;
+            unsigned int _packed_18[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb_2[_lp*2 + 0], kb_2[_lp*2+1 + 0]));
+                _packed_18[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb_2[_lp*2 + 2], kb_2[_lp*2+1 + 2]));
+                _packed_18[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kg_2[0 + 0], kg_2[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kg_2[0 + 2], kg_2[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kg_p + 64))[0]) = _pk2;
+                auto _gst_60 = kb_p + 64;
+                __builtin_assume(__isGlobal(_gst_60));
+                reinterpret_cast<int2*>(_gst_60)[0] = reinterpret_cast<int2*>(_packed_18)[0];
+            }
+            unsigned int _packed_19[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg_2[_lp*2 + 0], kg_2[_lp*2+1 + 0]));
+                _packed_19[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg_2[_lp*2 + 2], kg_2[_lp*2+1 + 2]));
+                _packed_19[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(qg_2[0 + 0], qg_2[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(qg_2[0 + 2], qg_2[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(qg_p + 64))[0]) = _pk2;
+                auto _gst_61 = kg_p + 64;
+                __builtin_assume(__isGlobal(_gst_61));
+                reinterpret_cast<int2*>(_gst_61)[0] = reinterpret_cast<int2*>(_packed_19)[0];
+            }
+            unsigned int _packed_20[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg_2[_lp*2 + 0], qg_2[_lp*2+1 + 0]));
+                _packed_20[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg_2[_lp*2 + 2], qg_2[_lp*2+1 + 2]));
+                _packed_20[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            {
+                auto _gst_62 = qg_p + 64;
+                __builtin_assume(__isGlobal(_gst_62));
+                reinterpret_cast<int2*>(_gst_62)[0] = reinterpret_cast<int2*>(_packed_20)[0];
             }
         }
         mbarrier_wait(ring_empty_addr, _phase_ring_empty_0);
@@ -2182,7 +2436,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             }
             float shift_4 = 0.0f;
             if (use_gc_2 != 0) {
-                shift_4 = 21.64042561333445f;
+                shift_4 = 21.640425f;
             }
             float2 _f2_18 = make_float2(shift_4, shift_4);
             float v_2[8];
@@ -2191,10 +2445,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 float2 d2_4 = sub_f32x2(sub_f32x2(make_float2(an_8[e_15], an_8[e_15 + 1]), _f2_18), make_float2(g_0_4[e_15], g_0_4[e_15 + 1]));
                 float x0_5 = approx_exp2(d2_4.x);
                 float x1_5 = approx_exp2(d2_4.y);
-                float2 _f32x2_mul_a_54 = make_float2(x0_5, x1_5);
-                float2 _f32x2_mul_b_55 = make_float2(_unpack_bf16_12[e_15], _unpack_bf16_12[e_15 + 1]);
+                float2 _f32x2_mul_a_63 = make_float2(x0_5, x1_5);
+                float2 _f32x2_mul_b_64 = make_float2(_unpack_bf16_12[e_15], _unpack_bf16_12[e_15 + 1]);
                 float2 v2_2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_54), "l"(*(const unsigned long long*)&_f32x2_mul_b_55));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_63), "l"(*(const unsigned long long*)&_f32x2_mul_b_64));
                 v_2[e_15] = v2_2.x;
                 v_2[e_15 + 1] = v2_2.y;
             }
@@ -2232,16 +2486,16 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 : "r"(ka_5));
             float shift_5 = 0.0f;
             if (bq_5 != 0) {
-                shift_5 = 21.64042561333445f;
+                shift_5 = 21.640425f;
             }
             float2 _f2_19 = make_float2(shift_5, shift_5);
             #pragma unroll
             for (int e_17 = 0; e_17 < 8; e_17 += 2) {
                 float2 d2_5 = sub_f32x2(make_float2(g_0_5[e_17], g_0_5[e_17 + 1]), sub_f32x2(make_float2(an_8[e_17], an_8[e_17 + 1]), _f2_19));
-                float _exp2_56 = approx_exp2(d2_5.x);
-                g_0_5[e_17] = _exp2_56;
-                float _exp2_57 = approx_exp2(d2_5.y);
-                g_0_5[e_17 + 1] = _exp2_57;
+                float _exp2_65 = approx_exp2(d2_5.x);
+                g_0_5[e_17] = _exp2_65;
+                float _exp2_66 = approx_exp2(d2_5.y);
+                g_0_5[e_17 + 1] = _exp2_66;
             }
             if (clen <= i * 16 + sl) {
                 #pragma unroll
@@ -2258,10 +2512,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vq_2[8];
             #pragma unroll
             for (int e_19 = 0; e_19 < 8; e_19 += 2) {
-                float2 _f32x2_mul_a_58 = make_float2(_unpack_bf16_13[e_19], _unpack_bf16_13[e_19 + 1]);
-                float2 _f32x2_mul_b_59 = make_float2(g_0_5[e_19], g_0_5[e_19 + 1]);
+                float2 _f32x2_mul_a_67 = make_float2(_unpack_bf16_13[e_19], _unpack_bf16_13[e_19 + 1]);
+                float2 _f32x2_mul_b_68 = make_float2(g_0_5[e_19], g_0_5[e_19 + 1]);
                 float2 q2_2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_58), "l"(*(const unsigned long long*)&_f32x2_mul_b_59));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_67), "l"(*(const unsigned long long*)&_f32x2_mul_b_68));
                 vq_2[e_19] = q2_2.x;
                 vq_2[e_19 + 1] = q2_2.y;
             }
@@ -2276,10 +2530,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vk_2[8];
             #pragma unroll
             for (int e_20 = 0; e_20 < 8; e_20 += 2) {
-                float2 _f32x2_mul_a_60 = make_float2(_unpack_bf16_14[e_20], _unpack_bf16_14[e_20 + 1]);
-                float2 _f32x2_mul_b_61 = make_float2(g_0_5[e_20], g_0_5[e_20 + 1]);
+                float2 _f32x2_mul_a_69 = make_float2(_unpack_bf16_14[e_20], _unpack_bf16_14[e_20 + 1]);
+                float2 _f32x2_mul_b_70 = make_float2(g_0_5[e_20], g_0_5[e_20 + 1]);
                 float2 k2_2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_60), "l"(*(const unsigned long long*)&_f32x2_mul_b_61));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_69), "l"(*(const unsigned long long*)&_f32x2_mul_b_70));
                 vk_2[e_20] = k2_2.x;
                 vk_2[e_20 + 1] = k2_2.y;
             }
@@ -2295,9 +2549,9 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                int _smem_desc_lo_62 = (((b_ring_addr) >> 4) & 0x7FFF) + (0) * 512;
+                int _smem_desc_lo_71 = (((b_ring_addr) >> 4) & 0x7FFF) + (0) * 512;
 #else
-                int _smem_desc_lo_62 = (((b_ring_addr) >> 4) & 0x3FFF) + (0) * 512;
+                int _smem_desc_lo_71 = (((b_ring_addr) >> 4) & 0x3FFF) + (0) * 512;
 #endif
                 asm volatile(
             "{\n\t"
@@ -2327,7 +2581,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"(tmem_acc), "r"(_smem_desc_lo_62), "r"(tmem_acc + 64), "r"(1) : "memory");
+            :: "r"(tmem_acc), "r"(_smem_desc_lo_71), "r"(tmem_acc + 64), "r"(1) : "memory");
                 tcgen05_commit(ring_empty_addr);
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 int i_n_2 = i + 1;
@@ -2383,14 +2637,14 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float e0_3 = approx_exp2(gk_3[0]);
             float e1_4 = approx_exp2(gk_3[1]);
             float2 _f2_21 = make_float2(e0_3, e1_4);
-            float2 _f32x2_mul_a_63 = make_float2(_unpack_bf16_15[0], _unpack_bf16_15[1]);
+            float2 _f32x2_mul_a_72 = make_float2(_unpack_bf16_15[0], _unpack_bf16_15[1]);
             float2 kbt_4;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_4) : "l"(*(const unsigned long long*)&_f32x2_mul_a_63), "l"(*(const unsigned long long*)&_f2_20));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_4) : "l"(*(const unsigned long long*)&_f32x2_mul_a_72), "l"(*(const unsigned long long*)&_f2_20));
             float kb0_4 = (float)(__nv_bfloat16)kbt_4.x;
             float kb1_3 = (float)(__nv_bfloat16)kbt_4.y;
-            float2 _f32x2_mul_a_64 = make_float2(kb0_4, kb1_3);
+            float2 _f32x2_mul_a_73 = make_float2(kb0_4, kb1_3);
             float2 kb2_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_64), "l"(*(const unsigned long long*)&_f2_21));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_73), "l"(*(const unsigned long long*)&_f2_21));
             kb_3[0] = kb2_3.x;
             kb_3[1] = kb2_3.y;
             float _fma_12;
@@ -2399,28 +2653,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_13) : "f"(tot_3[1]), "f"(rcp_f), "f"(-gk_3[1]));
             float x0_7 = approx_exp2(_fma_12);
             float x1_6 = approx_exp2(_fma_13);
-            float2 _f32x2_mul_a_65 = make_float2(_unpack_bf16_15[0], _unpack_bf16_15[1]);
-            float2 _f32x2_mul_b_66 = make_float2(x0_7, x1_6);
+            float2 _f32x2_mul_a_74 = make_float2(_unpack_bf16_15[0], _unpack_bf16_15[1]);
+            float2 _f32x2_mul_b_75 = make_float2(x0_7, x1_6);
             float2 kg2_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_65), "l"(*(const unsigned long long*)&_f32x2_mul_b_66));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_74), "l"(*(const unsigned long long*)&_f32x2_mul_b_75));
             kg_3[0] = kg2_3.x;
             kg_3[1] = kg2_3.y;
-            float2 _f32x2_mul_a_67 = make_float2(_unpack_bf16_16[0], _unpack_bf16_16[1]);
+            float2 _f32x2_mul_a_76 = make_float2(_unpack_bf16_16[0], _unpack_bf16_16[1]);
             float2 qg2_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_67), "l"(*(const unsigned long long*)&_f2_21));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_76), "l"(*(const unsigned long long*)&_f2_21));
             qg_3[0] = qg2_3.x;
             qg_3[1] = qg2_3.y;
             float e0_0_3 = approx_exp2(gk_3[2]);
             float e1_1_3 = approx_exp2(gk_3[3]);
             float2 _f2_22 = make_float2(e0_0_3, e1_1_3);
-            float2 _f32x2_mul_a_68 = make_float2(_unpack_bf16_15[2], _unpack_bf16_15[3]);
+            float2 _f32x2_mul_a_77 = make_float2(_unpack_bf16_15[2], _unpack_bf16_15[3]);
             float2 kbt_2_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_68), "l"(*(const unsigned long long*)&_f2_20));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kbt_2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_77), "l"(*(const unsigned long long*)&_f2_20));
             float kb0_3_3 = (float)(__nv_bfloat16)kbt_2_3.x;
             float kb1_4_3 = (float)(__nv_bfloat16)kbt_2_3.y;
-            float2 _f32x2_mul_a_69 = make_float2(kb0_3_3, kb1_4_3);
+            float2 _f32x2_mul_a_78 = make_float2(kb0_3_3, kb1_4_3);
             float2 kb2_5_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_5_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_69), "l"(*(const unsigned long long*)&_f2_22));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kb2_5_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_78), "l"(*(const unsigned long long*)&_f2_22));
             kb_3[2] = kb2_5_3.x;
             kb_3[3] = kb2_5_3.y;
             float _fma_14;
@@ -2429,37 +2683,64 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_15) : "f"(tot_3[3]), "f"(rcp_f), "f"(-gk_3[3]));
             float x0_6_3 = approx_exp2(_fma_14);
             float x1_7_3 = approx_exp2(_fma_15);
-            float2 _f32x2_mul_a_70 = make_float2(_unpack_bf16_15[2], _unpack_bf16_15[3]);
-            float2 _f32x2_mul_b_71 = make_float2(x0_6_3, x1_7_3);
+            float2 _f32x2_mul_a_79 = make_float2(_unpack_bf16_15[2], _unpack_bf16_15[3]);
+            float2 _f32x2_mul_b_80 = make_float2(x0_6_3, x1_7_3);
             float2 kg2_8_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_8_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_70), "l"(*(const unsigned long long*)&_f32x2_mul_b_71));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&kg2_8_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_79), "l"(*(const unsigned long long*)&_f32x2_mul_b_80));
             kg_3[2] = kg2_8_3.x;
             kg_3[3] = kg2_8_3.y;
-            float2 _f32x2_mul_a_72 = make_float2(_unpack_bf16_16[2], _unpack_bf16_16[3]);
+            float2 _f32x2_mul_a_81 = make_float2(_unpack_bf16_16[2], _unpack_bf16_16[3]);
             float2 qg2_9_3;
-            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_9_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_72), "l"(*(const unsigned long long*)&_f2_22));
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&qg2_9_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_81), "l"(*(const unsigned long long*)&_f2_22));
             qg_3[2] = qg2_9_3.x;
             qg_3[3] = qg2_9_3.y;
-            {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kb_3[0 + 0], kb_3[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kb_3[0 + 2], kb_3[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kb_p + 96))[0]) = _pk2;
+            unsigned int _packed_21[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb_3[_lp*2 + 0], kb_3[_lp*2+1 + 0]));
+                _packed_21[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb_3[_lp*2 + 2], kb_3[_lp*2+1 + 2]));
+                _packed_21[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(kg_3[0 + 0], kg_3[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(kg_3[0 + 2], kg_3[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kg_p + 96))[0]) = _pk2;
+                auto _gst_82 = kb_p + 96;
+                __builtin_assume(__isGlobal(_gst_82));
+                reinterpret_cast<int2*>(_gst_82)[0] = reinterpret_cast<int2*>(_packed_21)[0];
+            }
+            unsigned int _packed_22[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg_3[_lp*2 + 0], kg_3[_lp*2+1 + 0]));
+                _packed_22[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg_3[_lp*2 + 2], kg_3[_lp*2+1 + 2]));
+                _packed_22[_lp + 1] = *(uint32_t*)&_bf2;
             }
             {
-                uint2 _pk2;
-                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                _pk[0] = __floats2bfloat162_rn(qg_3[0 + 0], qg_3[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(qg_3[0 + 2], qg_3[0 + 3]);
-                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(qg_p + 96))[0]) = _pk2;
+                auto _gst_83 = kg_p + 96;
+                __builtin_assume(__isGlobal(_gst_83));
+                reinterpret_cast<int2*>(_gst_83)[0] = reinterpret_cast<int2*>(_packed_22)[0];
+            }
+            unsigned int _packed_23[2];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg_3[_lp*2 + 0], qg_3[_lp*2+1 + 0]));
+                _packed_23[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(qg_3[_lp*2 + 2], qg_3[_lp*2+1 + 2]));
+                _packed_23[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            {
+                auto _gst_84 = qg_p + 96;
+                __builtin_assume(__isGlobal(_gst_84));
+                reinterpret_cast<int2*>(_gst_84)[0] = reinterpret_cast<int2*>(_packed_23)[0];
             }
         }
         mbarrier_wait(ring_empty_addr + 8, _phase_ring_empty_1);
@@ -2506,7 +2787,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             }
             float shift_6 = 0.0f;
             if (use_gc_3 != 0) {
-                shift_6 = 21.64042561333445f;
+                shift_6 = 21.640425f;
             }
             float2 _f2_23 = make_float2(shift_6, shift_6);
             float v_3[8];
@@ -2515,10 +2796,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 float2 d2_6 = sub_f32x2(sub_f32x2(make_float2(an_13[e_21], an_13[e_21 + 1]), _f2_23), make_float2(g_0_6[e_21], g_0_6[e_21 + 1]));
                 float x0_8 = approx_exp2(d2_6.x);
                 float x1_8 = approx_exp2(d2_6.y);
-                float2 _f32x2_mul_a_73 = make_float2(x0_8, x1_8);
-                float2 _f32x2_mul_b_74 = make_float2(_unpack_bf16_17[e_21], _unpack_bf16_17[e_21 + 1]);
+                float2 _f32x2_mul_a_85 = make_float2(x0_8, x1_8);
+                float2 _f32x2_mul_b_86 = make_float2(_unpack_bf16_17[e_21], _unpack_bf16_17[e_21 + 1]);
                 float2 v2_3;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_73), "l"(*(const unsigned long long*)&_f32x2_mul_b_74));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&v2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_85), "l"(*(const unsigned long long*)&_f32x2_mul_b_86));
                 v_3[e_21] = v2_3.x;
                 v_3[e_21 + 1] = v2_3.y;
             }
@@ -2556,16 +2837,16 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 : "r"(ka_7));
             float shift_7 = 0.0f;
             if (bq_10 != 0) {
-                shift_7 = 21.64042561333445f;
+                shift_7 = 21.640425f;
             }
             float2 _f2_24 = make_float2(shift_7, shift_7);
             #pragma unroll
             for (int e_23 = 0; e_23 < 8; e_23 += 2) {
                 float2 d2_7 = sub_f32x2(make_float2(g_0_7[e_23], g_0_7[e_23 + 1]), sub_f32x2(make_float2(an_13[e_23], an_13[e_23 + 1]), _f2_24));
-                float _exp2_75 = approx_exp2(d2_7.x);
-                g_0_7[e_23] = _exp2_75;
-                float _exp2_76 = approx_exp2(d2_7.y);
-                g_0_7[e_23 + 1] = _exp2_76;
+                float _exp2_87 = approx_exp2(d2_7.x);
+                g_0_7[e_23] = _exp2_87;
+                float _exp2_88 = approx_exp2(d2_7.y);
+                g_0_7[e_23 + 1] = _exp2_88;
             }
             if (clen <= i * 16 + sl) {
                 #pragma unroll
@@ -2582,10 +2863,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vq_3[8];
             #pragma unroll
             for (int e_25 = 0; e_25 < 8; e_25 += 2) {
-                float2 _f32x2_mul_a_77 = make_float2(_unpack_bf16_18[e_25], _unpack_bf16_18[e_25 + 1]);
-                float2 _f32x2_mul_b_78 = make_float2(g_0_7[e_25], g_0_7[e_25 + 1]);
+                float2 _f32x2_mul_a_89 = make_float2(_unpack_bf16_18[e_25], _unpack_bf16_18[e_25 + 1]);
+                float2 _f32x2_mul_b_90 = make_float2(g_0_7[e_25], g_0_7[e_25 + 1]);
                 float2 q2_3;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_77), "l"(*(const unsigned long long*)&_f32x2_mul_b_78));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&q2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_89), "l"(*(const unsigned long long*)&_f32x2_mul_b_90));
                 vq_3[e_25] = q2_3.x;
                 vq_3[e_25 + 1] = q2_3.y;
             }
@@ -2600,10 +2881,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             float vk_3[8];
             #pragma unroll
             for (int e_26 = 0; e_26 < 8; e_26 += 2) {
-                float2 _f32x2_mul_a_79 = make_float2(_unpack_bf16_19[e_26], _unpack_bf16_19[e_26 + 1]);
-                float2 _f32x2_mul_b_80 = make_float2(g_0_7[e_26], g_0_7[e_26 + 1]);
+                float2 _f32x2_mul_a_91 = make_float2(_unpack_bf16_19[e_26], _unpack_bf16_19[e_26 + 1]);
+                float2 _f32x2_mul_b_92 = make_float2(g_0_7[e_26], g_0_7[e_26 + 1]);
                 float2 k2_3;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_79), "l"(*(const unsigned long long*)&_f32x2_mul_b_80));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&k2_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_91), "l"(*(const unsigned long long*)&_f32x2_mul_b_92));
                 vk_3[e_26] = k2_3.x;
                 vk_3[e_26 + 1] = k2_3.y;
             }
@@ -2619,9 +2900,9 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                int _smem_desc_lo_81 = (((b_ring_addr) >> 4) & 0x7FFF) + (1) * 512;
+                int _smem_desc_lo_93 = (((b_ring_addr) >> 4) & 0x7FFF) + (1) * 512;
 #else
-                int _smem_desc_lo_81 = (((b_ring_addr) >> 4) & 0x3FFF) + (1) * 512;
+                int _smem_desc_lo_93 = (((b_ring_addr) >> 4) & 0x3FFF) + (1) * 512;
 #endif
                 asm volatile(
             "{\n\t"
@@ -2651,7 +2932,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"(tmem_acc), "r"(_smem_desc_lo_81), "r"(tmem_acc + 96), "r"(1) : "memory");
+            :: "r"(tmem_acc), "r"(_smem_desc_lo_93), "r"(tmem_acc + 96), "r"(1) : "memory");
                 tcgen05_commit(ring_empty_addr + 8);
                 tcgen05_commit(acc_done_addr);
                 asm volatile("tcgen05.fence::before_thread_sync;");
@@ -2699,8 +2980,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             #pragma unroll
             for (int j_12 = 0; j_12 < 8; j_12++) {
                 {
-                    uint32_t _addr_82 = static_cast<uint32_t>(smem0 + w * 1152 + ((th_1_1 + j_12) * 18 + sl_0_1) * 4);
-                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_82), "f"(_tmem_load_1[j_12]) : "memory");
+                    uint32_t _addr_94 = static_cast<uint32_t>(smem0 + w * 1152 + ((th_1_1 + j_12) * 18 + sl_0_1) * 4);
+                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_94), "f"(_tmem_load_1[j_12]) : "memory");
                 }
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -2726,14 +3007,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             int col_3_1 = scol + hh_2_1;
             if (write_ext != 0) {
                 if (t_d_3 < clen) {
-                    {
-                        __nv_bfloat162 _pk[4];
-                        _pk[0] = __floats2bfloat162_rn(vals_1[0 + 0], vals_1[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(vals_1[0 + 2], vals_1[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(vals_1[0 + 4], vals_1[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(vals_1[0 + 6], vals_1[0 + 7]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_ext + (abase + (long long)(t_d_3 * ars) + (long long)col_3_1)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    unsigned int _packed_24[4];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 0], vals_1[_lp*2+1 + 0]));
+                        _packed_24[_lp] = *(uint32_t*)&_bf2;
                     }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 2], vals_1[_lp*2+1 + 2]));
+                        _packed_24[_lp + 1] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 4], vals_1[_lp*2+1 + 4]));
+                        _packed_24[_lp + 2] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 6], vals_1[_lp*2+1 + 6]));
+                        _packed_24[_lp + 3] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<int4*>(aqk_ext + (abase + (long long)(t_d_3 * ars) + (long long)col_3_1))[0] = reinterpret_cast<int4*>(_packed_24)[0];
                 }
             }
             if (write_int != 0) {
@@ -2743,14 +3038,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         vals_1[e_27] = 0.0f;
                     }
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(vals_1[0 + 0], vals_1[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(vals_1[0 + 2], vals_1[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(vals_1[0 + 4], vals_1[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(vals_1[0 + 6], vals_1[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_int + (ibase + (long long)(t_d_3 * ars) + (long long)col_3_1)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_25[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 0], vals_1[_lp*2+1 + 0]));
+                    _packed_25[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 2], vals_1[_lp*2+1 + 2]));
+                    _packed_25[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 4], vals_1[_lp*2+1 + 4]));
+                    _packed_25[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 6], vals_1[_lp*2+1 + 6]));
+                    _packed_25[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(aqk_int + (ibase + (long long)(t_d_3 * ars) + (long long)col_3_1))[0] = reinterpret_cast<int4*>(_packed_25)[0];
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
             __syncwarp();
@@ -2785,8 +3094,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 #pragma unroll
                 for (int j_16 = 0; j_16 < 8; j_16++) {
                     {
-                        uint32_t _addr_83 = static_cast<uint32_t>(base_t_3 + j_16 * 64 + ((c4_1 ^ j_16 >> 1) << 4));
-                        asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_83), "f"(_tmem_load_1[j_16]) : "memory");
+                        uint32_t _addr_95 = static_cast<uint32_t>(base_t_3 + j_16 * 64 + ((c4_1 ^ j_16 >> 1) << 4));
+                        asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_95), "f"(_tmem_load_1[j_16]) : "memory");
                     }
                 }
             } else {
@@ -2796,8 +3105,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                 #pragma unroll
                 for (int j_17 = 0; j_17 < 8; j_17++) {
                     {
-                        uint32_t _addr_84 = static_cast<uint32_t>(base_t_4 + j_17 * 64 + ((c4_1 ^ j_17 >> 1) << 4));
-                        asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_84), "f"(_tmem_load_1[j_17]) : "memory");
+                        uint32_t _addr_96 = static_cast<uint32_t>(base_t_4 + j_17 * 64 + ((c4_1 ^ j_17 >> 1) << 4));
+                        asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_96), "f"(_tmem_load_1[j_17]) : "memory");
                     }
                 }
             }
@@ -2816,25 +3125,53 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
         int col_5 = scol + lane_1 % 2 * 8;
         if (write_ext != 0) {
             if (t_d_4 < clen) {
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(zero8_3[0 + 0], zero8_3[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(zero8_3[0 + 2], zero8_3[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(zero8_3[0 + 4], zero8_3[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(zero8_3[0 + 6], zero8_3[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_ext + (abase + (long long)(t_d_4 * ars) + (long long)col_5)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_26[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 0], zero8_3[_lp*2+1 + 0]));
+                    _packed_26[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 2], zero8_3[_lp*2+1 + 2]));
+                    _packed_26[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 4], zero8_3[_lp*2+1 + 4]));
+                    _packed_26[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 6], zero8_3[_lp*2+1 + 6]));
+                    _packed_26[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(aqk_ext + (abase + (long long)(t_d_4 * ars) + (long long)col_5))[0] = reinterpret_cast<int4*>(_packed_26)[0];
             }
         }
         if (write_int != 0) {
-            {
-                __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(zero8_3[0 + 0], zero8_3[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(zero8_3[0 + 2], zero8_3[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(zero8_3[0 + 4], zero8_3[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(zero8_3[0 + 6], zero8_3[0 + 7]);
-                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(aqk_int + (ibase + (long long)(t_d_4 * ars) + (long long)col_5)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            unsigned int _packed_27[4];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 0], zero8_3[_lp*2+1 + 0]));
+                _packed_27[_lp] = *(uint32_t*)&_bf2;
             }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 2], zero8_3[_lp*2+1 + 2]));
+                _packed_27[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 4], zero8_3[_lp*2+1 + 4]));
+                _packed_27[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_3[_lp*2 + 6], zero8_3[_lp*2+1 + 6]));
+                _packed_27[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            reinterpret_cast<int4*>(aqk_int + (ibase + (long long)(t_d_4 * ars) + (long long)col_5))[0] = reinterpret_cast<int4*>(_packed_27)[0];
         }
     } else {
         float zero8_4[8];
@@ -2850,25 +3187,53 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
         int col_6 = scol + lane_1 % 2 * 8;
         if (write_ext != 0) {
             if (t_d_5 < clen) {
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(zero8_4[0 + 0], zero8_4[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(zero8_4[0 + 2], zero8_4[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(zero8_4[0 + 4], zero8_4[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(zero8_4[0 + 6], zero8_4[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_ext + (abase + (long long)(t_d_5 * ars) + (long long)col_6)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_28[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 0], zero8_4[_lp*2+1 + 0]));
+                    _packed_28[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 2], zero8_4[_lp*2+1 + 2]));
+                    _packed_28[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 4], zero8_4[_lp*2+1 + 4]));
+                    _packed_28[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 6], zero8_4[_lp*2+1 + 6]));
+                    _packed_28[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(akk_ext + (abase + (long long)(t_d_5 * ars) + (long long)col_6))[0] = reinterpret_cast<int4*>(_packed_28)[0];
             }
         }
         if (write_int != 0) {
-            {
-                __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(zero8_4[0 + 0], zero8_4[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(zero8_4[0 + 2], zero8_4[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(zero8_4[0 + 4], zero8_4[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(zero8_4[0 + 6], zero8_4[0 + 7]);
-                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_int + (ibase + (long long)(t_d_5 * ars) + (long long)col_6)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            unsigned int _packed_29[4];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 0], zero8_4[_lp*2+1 + 0]));
+                _packed_29[_lp] = *(uint32_t*)&_bf2;
             }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 2], zero8_4[_lp*2+1 + 2]));
+                _packed_29[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 4], zero8_4[_lp*2+1 + 4]));
+                _packed_29[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero8_4[_lp*2 + 6], zero8_4[_lp*2+1 + 6]));
+                _packed_29[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            reinterpret_cast<int4*>(akk_int + (ibase + (long long)(t_d_5 * ars) + (long long)col_6))[0] = reinterpret_cast<int4*>(_packed_29)[0];
         }
     }
     if (h4 == 0) {
@@ -3161,8 +3526,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             #pragma unroll
             for (int r_5 = 0; r_5 < 16; r_5++) {
                 {
-                    uint32_t _addr_85 = static_cast<uint32_t>(cbase + r_5 * 64 + ((c4_2 ^ r_5 >> 1 & 3) << 4));
-                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_85), "f"(Ai[r_5]) : "memory");
+                    uint32_t _addr_97 = static_cast<uint32_t>(cbase + r_5 * 64 + ((c4_2 ^ r_5 >> 1 & 3) << 4));
+                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_97), "f"(Ai[r_5]) : "memory");
                 }
             }
         }
@@ -3200,9 +3565,9 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-            int _smem_desc_lo_86 = (((l1_s_addr) >> 4) & 0x7FFF) + (0) * 64;
+            int _smem_desc_lo_98 = (((l1_s_addr) >> 4) & 0x7FFF) + (0) * 64;
 #else
-            int _smem_desc_lo_86 = (((l1_s_addr) >> 4) & 0x3FFF) + (0) * 64;
+            int _smem_desc_lo_98 = (((l1_s_addr) >> 4) & 0x3FFF) + (0) * 64;
 #endif
             asm volatile(
             "{\n\t"
@@ -3224,15 +3589,15 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (64))), "r"(_smem_desc_lo_86), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (64))), "r"(_smem_desc_lo_98), "r"(tmem_acc), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-            int _smem_desc_lo_87 = (((aii_s_addr) >> 4) & 0x7FFF) + (1) * 64;
+            int _smem_desc_lo_99 = (((aii_s_addr) >> 4) & 0x7FFF) + (1) * 64;
 #else
-            int _smem_desc_lo_87 = (((aii_s_addr) >> 4) & 0x3FFF) + (1) * 64;
+            int _smem_desc_lo_99 = (((aii_s_addr) >> 4) & 0x3FFF) + (1) * 64;
 #endif
             asm volatile(
             "{\n\t"
@@ -3254,16 +3619,16 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (16))), "r"(_smem_desc_lo_87), "r"(tmem_acc + 64), "r"(1), "r"(((uint32_t)(67373328) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
+            :: "r"((tmem_acc + (16))), "r"(_smem_desc_lo_99), "r"(tmem_acc + 64), "r"(1), "r"(((uint32_t)(67373328) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
             tcgen05_commit(hop_addr);
             tcgen05_commit(lvl1_done_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-            int _smem_desc_lo_88 = (((l2_s_addr) >> 4) & 0x7FFF) + (0) * 128;
+            int _smem_desc_lo_100 = (((l2_s_addr) >> 4) & 0x7FFF) + (0) * 128;
 #else
-            int _smem_desc_lo_88 = (((l2_s_addr) >> 4) & 0x3FFF) + (0) * 128;
+            int _smem_desc_lo_100 = (((l2_s_addr) >> 4) & 0x3FFF) + (0) * 128;
 #endif
             asm volatile(
             "{\n\t"
@@ -3293,15 +3658,15 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (80))), "r"(_smem_desc_lo_88), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (80))), "r"(_smem_desc_lo_100), "r"(tmem_acc), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-            int _smem_desc_lo_89 = (((aii_s_addr) >> 4) & 0x7FFF) + (2) * 64;
+            int _smem_desc_lo_101 = (((aii_s_addr) >> 4) & 0x7FFF) + (2) * 64;
 #else
-            int _smem_desc_lo_89 = (((aii_s_addr) >> 4) & 0x3FFF) + (2) * 64;
+            int _smem_desc_lo_101 = (((aii_s_addr) >> 4) & 0x3FFF) + (2) * 64;
 #endif
             asm volatile(
             "{\n\t"
@@ -3323,16 +3688,16 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (32))), "r"(_smem_desc_lo_89), "r"(tmem_acc + 80), "r"(1), "r"(((uint32_t)(67373328) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
+            :: "r"((tmem_acc + (32))), "r"(_smem_desc_lo_101), "r"(tmem_acc + 80), "r"(1), "r"(((uint32_t)(67373328) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
             tcgen05_commit(hop_addr);
             tcgen05_commit(lvl2_done_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-            int _smem_desc_lo_90 = (((l3_s_addr) >> 4) & 0x7FFF) + (0) * 192;
+            int _smem_desc_lo_102 = (((l3_s_addr) >> 4) & 0x7FFF) + (0) * 192;
 #else
-            int _smem_desc_lo_90 = (((l3_s_addr) >> 4) & 0x3FFF) + (0) * 192;
+            int _smem_desc_lo_102 = (((l3_s_addr) >> 4) & 0x3FFF) + (0) * 192;
 #endif
             asm volatile(
             "{\n\t"
@@ -3370,15 +3735,15 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (96))), "r"(_smem_desc_lo_90), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (96))), "r"(_smem_desc_lo_102), "r"(tmem_acc), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-            int _smem_desc_lo_91 = (((aii_s_addr) >> 4) & 0x7FFF) + (3) * 64;
+            int _smem_desc_lo_103 = (((aii_s_addr) >> 4) & 0x7FFF) + (3) * 64;
 #else
-            int _smem_desc_lo_91 = (((aii_s_addr) >> 4) & 0x3FFF) + (3) * 64;
+            int _smem_desc_lo_103 = (((aii_s_addr) >> 4) & 0x3FFF) + (3) * 64;
 #endif
             asm volatile(
             "{\n\t"
@@ -3400,7 +3765,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (48))), "r"(_smem_desc_lo_91), "r"(tmem_acc + 96), "r"(1), "r"(((uint32_t)(67373328) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
+            :: "r"((tmem_acc + (48))), "r"(_smem_desc_lo_103), "r"(tmem_acc + 96), "r"(1), "r"(((uint32_t)(67373328) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
             tcgen05_commit(chain_done_addr);
         }
     }
@@ -3421,8 +3786,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             #pragma unroll
             for (int j_18 = 0; j_18 < 8; j_18++) {
                 {
-                    uint32_t _addr_92 = static_cast<uint32_t>(tr_base + ((th_1_2 + j_18) * 18 + sl_0_2) * 4);
-                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_92), "f"(_tmem_load_2[j_18]) : "memory");
+                    uint32_t _addr_104 = static_cast<uint32_t>(tr_base + ((th_1_2 + j_18) * 18 + sl_0_2) * 4);
+                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_104), "f"(_tmem_load_2[j_18]) : "memory");
                 }
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -3448,14 +3813,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             int col_7 = scol + hh_2_2;
             if (write_ext != 0) {
                 if (t_d_6 < clen) {
-                    {
-                        __nv_bfloat162 _pk[4];
-                        _pk[0] = __floats2bfloat162_rn(vals_2[0 + 0], vals_2[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(vals_2[0 + 2], vals_2[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(vals_2[0 + 4], vals_2[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(vals_2[0 + 6], vals_2[0 + 7]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_ext + (abase + (long long)(t_d_6 * ars) + (long long)col_7)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    unsigned int _packed_30[4];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 0], vals_2[_lp*2+1 + 0]));
+                        _packed_30[_lp] = *(uint32_t*)&_bf2;
                     }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 2], vals_2[_lp*2+1 + 2]));
+                        _packed_30[_lp + 1] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 4], vals_2[_lp*2+1 + 4]));
+                        _packed_30[_lp + 2] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 6], vals_2[_lp*2+1 + 6]));
+                        _packed_30[_lp + 3] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<int4*>(akk_ext + (abase + (long long)(t_d_6 * ars) + (long long)col_7))[0] = reinterpret_cast<int4*>(_packed_30)[0];
                 }
             }
             if (write_int != 0) {
@@ -3465,14 +3844,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         vals_2[e_28] = 0.0f;
                     }
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(vals_2[0 + 0], vals_2[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(vals_2[0 + 2], vals_2[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(vals_2[0 + 4], vals_2[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(vals_2[0 + 6], vals_2[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_int + (ibase + (long long)(t_d_6 * ars) + (long long)col_7)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_31[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 0], vals_2[_lp*2+1 + 0]));
+                    _packed_31[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 2], vals_2[_lp*2+1 + 2]));
+                    _packed_31[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 4], vals_2[_lp*2+1 + 4]));
+                    _packed_31[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 6], vals_2[_lp*2+1 + 6]));
+                    _packed_31[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(akk_int + (ibase + (long long)(t_d_6 * ars) + (long long)col_7))[0] = reinterpret_cast<int4*>(_packed_31)[0];
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
             __syncwarp();
@@ -3494,8 +3887,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             #pragma unroll
             for (int j_19 = 0; j_19 < 8; j_19++) {
                 {
-                    uint32_t _addr_93 = static_cast<uint32_t>(tr_base + ((th_1_3 + j_19) * 18 + sl_0_3) * 4);
-                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_93), "f"(_tmem_load_3[j_19]) : "memory");
+                    uint32_t _addr_105 = static_cast<uint32_t>(tr_base + ((th_1_3 + j_19) * 18 + sl_0_3) * 4);
+                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_105), "f"(_tmem_load_3[j_19]) : "memory");
                 }
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -3521,14 +3914,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             int col_8 = scol + hh_2_3;
             if (write_ext != 0) {
                 if (t_d_7 < clen) {
-                    {
-                        __nv_bfloat162 _pk[4];
-                        _pk[0] = __floats2bfloat162_rn(vals_3[0 + 0], vals_3[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(vals_3[0 + 2], vals_3[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(vals_3[0 + 4], vals_3[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(vals_3[0 + 6], vals_3[0 + 7]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_ext + (abase + (long long)(t_d_7 * ars) + (long long)col_8)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    unsigned int _packed_32[4];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 0], vals_3[_lp*2+1 + 0]));
+                        _packed_32[_lp] = *(uint32_t*)&_bf2;
                     }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 2], vals_3[_lp*2+1 + 2]));
+                        _packed_32[_lp + 1] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 4], vals_3[_lp*2+1 + 4]));
+                        _packed_32[_lp + 2] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 6], vals_3[_lp*2+1 + 6]));
+                        _packed_32[_lp + 3] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<int4*>(akk_ext + (abase + (long long)(t_d_7 * ars) + (long long)col_8))[0] = reinterpret_cast<int4*>(_packed_32)[0];
                 }
             }
             if (write_int != 0) {
@@ -3538,14 +3945,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         vals_3[e_29] = 0.0f;
                     }
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(vals_3[0 + 0], vals_3[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(vals_3[0 + 2], vals_3[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(vals_3[0 + 4], vals_3[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(vals_3[0 + 6], vals_3[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_int + (ibase + (long long)(t_d_7 * ars) + (long long)col_8)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_33[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 0], vals_3[_lp*2+1 + 0]));
+                    _packed_33[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 2], vals_3[_lp*2+1 + 2]));
+                    _packed_33[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 4], vals_3[_lp*2+1 + 4]));
+                    _packed_33[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_3[_lp*2 + 6], vals_3[_lp*2+1 + 6]));
+                    _packed_33[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(akk_int + (ibase + (long long)(t_d_7 * ars) + (long long)col_8))[0] = reinterpret_cast<int4*>(_packed_33)[0];
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
             __syncwarp();
@@ -3571,8 +3992,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             #pragma unroll
             for (int j_20 = 0; j_20 < 8; j_20++) {
                 {
-                    uint32_t _addr_94 = static_cast<uint32_t>(tr_base + ((th_1_4 + j_20) * 18 + sl_0_4) * 4);
-                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_94), "f"(_tmem_load_4[j_20]) : "memory");
+                    uint32_t _addr_106 = static_cast<uint32_t>(tr_base + ((th_1_4 + j_20) * 18 + sl_0_4) * 4);
+                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_106), "f"(_tmem_load_4[j_20]) : "memory");
                 }
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -3598,14 +4019,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             int col_9 = scol + hh_2_4;
             if (write_ext != 0) {
                 if (t_d_8 < clen) {
-                    {
-                        __nv_bfloat162 _pk[4];
-                        _pk[0] = __floats2bfloat162_rn(vals_4[0 + 0], vals_4[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(vals_4[0 + 2], vals_4[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(vals_4[0 + 4], vals_4[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(vals_4[0 + 6], vals_4[0 + 7]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_ext + (abase + (long long)(t_d_8 * ars) + (long long)col_9)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    unsigned int _packed_34[4];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 0], vals_4[_lp*2+1 + 0]));
+                        _packed_34[_lp] = *(uint32_t*)&_bf2;
                     }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 2], vals_4[_lp*2+1 + 2]));
+                        _packed_34[_lp + 1] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 4], vals_4[_lp*2+1 + 4]));
+                        _packed_34[_lp + 2] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 6], vals_4[_lp*2+1 + 6]));
+                        _packed_34[_lp + 3] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<int4*>(akk_ext + (abase + (long long)(t_d_8 * ars) + (long long)col_9))[0] = reinterpret_cast<int4*>(_packed_34)[0];
                 }
             }
             if (write_int != 0) {
@@ -3615,14 +4050,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         vals_4[e_30] = 0.0f;
                     }
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(vals_4[0 + 0], vals_4[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(vals_4[0 + 2], vals_4[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(vals_4[0 + 4], vals_4[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(vals_4[0 + 6], vals_4[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_int + (ibase + (long long)(t_d_8 * ars) + (long long)col_9)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_35[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 0], vals_4[_lp*2+1 + 0]));
+                    _packed_35[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 2], vals_4[_lp*2+1 + 2]));
+                    _packed_35[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 4], vals_4[_lp*2+1 + 4]));
+                    _packed_35[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_4[_lp*2 + 6], vals_4[_lp*2+1 + 6]));
+                    _packed_35[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(akk_int + (ibase + (long long)(t_d_8 * ars) + (long long)col_9))[0] = reinterpret_cast<int4*>(_packed_35)[0];
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
             __syncwarp();
@@ -3644,8 +4093,8 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             #pragma unroll
             for (int j_21 = 0; j_21 < 8; j_21++) {
                 {
-                    uint32_t _addr_95 = static_cast<uint32_t>(tr_base + ((th_1_5 + j_21) * 18 + sl_0_5) * 4);
-                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_95), "f"(_tmem_load_5[j_21]) : "memory");
+                    uint32_t _addr_107 = static_cast<uint32_t>(tr_base + ((th_1_5 + j_21) * 18 + sl_0_5) * 4);
+                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_107), "f"(_tmem_load_5[j_21]) : "memory");
                 }
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -3671,14 +4120,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             int col_10 = scol + hh_2_5;
             if (write_ext != 0) {
                 if (t_d_9 < clen) {
-                    {
-                        __nv_bfloat162 _pk[4];
-                        _pk[0] = __floats2bfloat162_rn(vals_5[0 + 0], vals_5[0 + 1]);
-                        _pk[1] = __floats2bfloat162_rn(vals_5[0 + 2], vals_5[0 + 3]);
-                        _pk[2] = __floats2bfloat162_rn(vals_5[0 + 4], vals_5[0 + 5]);
-                        _pk[3] = __floats2bfloat162_rn(vals_5[0 + 6], vals_5[0 + 7]);
-                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_ext + (abase + (long long)(t_d_9 * ars) + (long long)col_10)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    unsigned int _packed_36[4];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 0], vals_5[_lp*2+1 + 0]));
+                        _packed_36[_lp] = *(uint32_t*)&_bf2;
                     }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 2], vals_5[_lp*2+1 + 2]));
+                        _packed_36[_lp + 1] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 4], vals_5[_lp*2+1 + 4]));
+                        _packed_36[_lp + 2] = *(uint32_t*)&_bf2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 6], vals_5[_lp*2+1 + 6]));
+                        _packed_36[_lp + 3] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<int4*>(akk_ext + (abase + (long long)(t_d_9 * ars) + (long long)col_10))[0] = reinterpret_cast<int4*>(_packed_36)[0];
                 }
             }
             if (write_int != 0) {
@@ -3688,14 +4151,28 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                         vals_5[e_31] = 0.0f;
                     }
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(vals_5[0 + 0], vals_5[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(vals_5[0 + 2], vals_5[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(vals_5[0 + 4], vals_5[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(vals_5[0 + 6], vals_5[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(akk_int + (ibase + (long long)(t_d_9 * ars) + (long long)col_10)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_37[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 0], vals_5[_lp*2+1 + 0]));
+                    _packed_37[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 2], vals_5[_lp*2+1 + 2]));
+                    _packed_37[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 4], vals_5[_lp*2+1 + 4]));
+                    _packed_37[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_5[_lp*2 + 6], vals_5[_lp*2+1 + 6]));
+                    _packed_37[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(akk_int + (ibase + (long long)(t_d_9 * ars) + (long long)col_10))[0] = reinterpret_cast<int4*>(_packed_37)[0];
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
             __syncwarp();
@@ -3706,8 +4183,7 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
     asm volatile("barrier.sync 1, 256;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;");
     if (w == 0) {
-        int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(128));
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(128));
     }
 
     // Cleanup
