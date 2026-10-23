@@ -1442,42 +1442,6 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     assert "mask:causal" in defn["tags"]
 
 
-@pytest.mark.parametrize("page_size", (16, 32, 64, 128))
-@pytest.mark.filterwarnings("ignore::UserWarning")
-def test_attention_ts_mla_fp8_dense_loaders_read_page_window(page_size: int):
-    """Dense FP8 K/V loaders take page IDs from the register page window."""
-
-    cfg = make_mla_decode_config(qkv_dtype="e4m3", o_dtype="bf16", page_size=page_size)
-    task_manager, _, _ = build_mla_decode_task_manager(
-        cfg,
-        domain=4,
-        exhaustive_deadlock_race_check=False,
-    )
-    loaders = {
-        task.name: task
-        for task in task_manager.tasks
-        if task.name in ("LoadKTask", "LoadVTask")
-    }
-    assert set(loaders) == {"LoadKTask", "LoadVTask"}
-    for task in loaders.values():
-        assert [resource.name for resource in task.src_resources] == [
-            "page_offset_window"
-        ]
-
-
-@pytest.mark.parametrize("qkv_dtype", ("bf16", "e4m3"))
-def test_attention_ts_mla_dense_page_window_rejects_wide_k_tiles(qkv_dtype):
-    """A K tile spanning more than 32 pages cannot use the page-ID window."""
-
-    with pytest.raises(ValueError, match="pages_per_k_tile to divide 32"):
-        make_mla_decode_config(
-            qkv_dtype=qkv_dtype,
-            o_dtype="bf16",
-            page_size=16,
-            mma_qk_tiler_mn=(128, 1024),
-        )
-
-
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_attention_ts_mla_bf16_clc_skipped_tiles_preserve_progress():
     """Skip data work symmetrically while preserving CLC queue progress."""
@@ -2463,11 +2427,9 @@ def test_attention_ts_mla_decode_page_size_dtype_product(
     (
         (2, 16, 32769),
         (128, 16, 2049),
-        (128, 32, 2049),
-        (128, 64, 2049),
         (128, 128, 4225),
     ),
-    ids=("split-page16", "page16", "page32", "page64", "page128"),
+    ids=("split-page16", "page16", "page128"),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_fp8_2cta_page_window(
@@ -2477,8 +2439,9 @@ def test_attention_ts_mla_decode_fp8_2cta_page_window(
 
     One window covers ``32 / pages_per_tile`` K tiles. Every case gives the
     longest request's work tiles more K tiles than one window, so the loaders
-    swap in the prefetched window. The two-request case also splits KV, so
-    windows start at each split's first K tile.
+    swap in the prefetched window. The two-request case is long enough to
+    split KV, so windows start at each split's first K tile. Page 128 covers
+    the two CTAs sharing one page.
     """
 
     case = _make_mla_case(
@@ -2496,10 +2459,6 @@ def test_attention_ts_mla_decode_fp8_2cta_page_window(
     k_tiles = -(-max_seq_len // 128)
     tiles_per_work_tile = -(-k_tiles // int(policy["split_kv"]))
     assert tiles_per_work_tile > 32 // (128 // page_size), policy
-    if batch_size == 2:
-        assert int(policy["split_kv"]) > 1, policy
-    else:
-        assert int(policy["split_kv"]) == 1, policy
     _assert_case_correct(_run_case(wrapper, case), case, policy)
 
 

@@ -1032,7 +1032,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         return cached_k, cached_v, cached_next_v, cached_window_page
 
     @cute.jit
-    def _refresh_dense_window(
+    def advance_dense_page_window(
         self, stage_info: StageInfo, cached_window_page, cached_next_window_page
     ):
         """Advance the FP8 dense loader's prefetched page-ID window.
@@ -1041,11 +1041,11 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         of the current window and of the next. The next window's load is
         issued at the start of the current window (``32 / pages_per_k_tile`` K
         tiles before it is used); ptxas copies the loop-carried register at the
-        next K tile, so the load has at least one K tile to land. Either way
-        the page-table read no longer sits between a freed K/V slot and its
-        TMA. Only the first window of a work tile is loaded synchronously.
-        Indices clamp to the last table column; fragments past the sequence
-        are masked by the runtime length as before.
+        next K tile, so the load has at least one K tile to land. Only the
+        first window of a work tile is loaded synchronously, so no page-table
+        read sits between a freed K/V slot and its TMA. Indices clamp to the
+        last table column; fragments past the sequence are masked by the
+        runtime length.
         """
         cfg = self.cfg
         pages_per_tile = cutlass.const_expr(cfg.pages_per_k_tile)
@@ -1114,7 +1114,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         """Return this CTA's K page IDs for the current tile from the window."""
         cfg = self.cfg
         cached_window_page, cached_next_window_page, window_pos = (
-            self._refresh_dense_window(
+            self.advance_dense_page_window(
                 stage_info, cached_window_page, cached_next_window_page
             )
         )
@@ -1168,7 +1168,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         """Return the V page IDs of the current tile from the window."""
         cfg = self.cfg
         cached_window_page, cached_next_window_page, window_pos = (
-            self._refresh_dense_window(
+            self.advance_dense_page_window(
                 stage_info, cached_window_page, cached_next_window_page
             )
         )
