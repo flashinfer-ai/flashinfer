@@ -257,6 +257,15 @@ class MlaConfig:
         return self.num_tokens_per_page == 1 and not self.is_dynamic_token_sparse
 
     @property
+    def keeps_ilp_softmax(self) -> bool:
+        """Keeps-MMA-AB softmax with a 4-way row max, FFMA2 exp arguments and four
+        packed sum accumulators (short dependency chains): the native sparse path
+        and the E4M3 token-sparse path."""
+        return self.native_sparse_pages or (
+            self.is_dynamic_token_sparse and not self.is_dynamic_token_sparse_nvfp4
+        )
+
+    @property
     def one_insts_kv_swap(self) -> bool:
         """One KV stream with swapped MMA operands (P remains in SMEM)."""
         return self.num_insts_kv == 1 and self.kernel_variant == "swaps_mma_ab"

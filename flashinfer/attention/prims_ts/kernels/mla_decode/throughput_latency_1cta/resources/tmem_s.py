@@ -1020,7 +1020,7 @@ class TmemSResource(MlaResource):
             local_max = old_max_vals[0]
             if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
                 local_max = neg_max_f32()
-            if cutlass.const_expr(cfg.native_sparse_pages):
+            if cutlass.const_expr(cfg.keeps_ilp_softmax):
                 max0 = local_max
                 max1 = neg_max_f32()
                 max2 = neg_max_f32()
