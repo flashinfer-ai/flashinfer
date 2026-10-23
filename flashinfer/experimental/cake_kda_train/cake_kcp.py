@@ -204,7 +204,7 @@ TRANSFER_WALKS = (
     "bf16x3",
     "bf16x3_hw64",
 )  # K3 program family (non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
-KCP_SAVED_VERSION = 1  # saved set {Aqk, Akk, tables, S_in [, c1 receive tensor, M_seg]}
+KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg]}; version 1 also held the token-row Aqk / Akk
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 # Host / plan levers (test knob class: reachable only through _kcp_test_knobs):
 SCHEDULES = (
@@ -553,21 +553,21 @@ class KernelBackend(Backend):
     provider launching the source builds directly can be passed (``path="direct"``; never a gated row).
 
     Local stages (:data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`): a forward call runs the existing backend's
-    intra program (``write_prep = 1``: the GLM prep's rows, the internal ``Aqk`` / ``Akk`` rows and, with a saved set,
-    the token rows), its forward WY program and the KCP's output program ``kcp_fwd_o`` (the output from the K1 ``h``
-    / ``v_new`` tapes) on the arena's ``fwd`` layout, with the records the plan selects on the forward path without a
-    saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout with the records of the replay
-    path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows and the internal ``dout`` copy
-    ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk`` rows), the replay's WY program,
-    then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk`` and the intra-chunk ``dv1`` K2 reads) and after K2
-    the fused gradient, GLM intra and the gate epilogue.  Where the plan fuses the WY representation into a state
-    recurrence the KCP does not run, the WY program is launched directly (:data:`WY_DIRECT_RECORDS`) on its grid
-    rule.  The intra record that computes the chunk layout from ``cu_seqlens`` writes its tables into a scratch set
-    on the arena (:data:`SCRATCH_TABLES_ATTR`); every other program reads the context's CPU-built tables.  The saved
-    set's token-row ``Aqk`` / ``Akk`` are kept (the saved-set contract) and read by no local program: the backward
-    recomputes the internal rows in both modes, so the two modes run the same programs on the same operands.  The
-    K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and write
-    its ``h`` / ``v_new`` (``dh`` / ``dv2``) tapes.
+    intra program (``write_prep = 1``: the GLM prep's rows and the internal ``Aqk`` / ``Akk`` rows; the token-row
+    copies are never written, ``write_ext = 0``), its forward WY program and the KCP's output program ``kcp_fwd_o``
+    (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's ``fwd`` layout, with the records the plan selects
+    on the forward path without a saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout
+    with the records of the replay path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows
+    and the internal ``dout`` copy ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk``
+    rows), the replay's WY program, then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk`` and the intra-chunk
+    ``dv1`` K2 reads) and after K2 the fused gradient, GLM intra and the gate epilogue.  Where the plan fuses the WY
+    representation into a state recurrence the KCP does not run, the WY program is launched directly
+    (:data:`WY_DIRECT_RECORDS`) on its grid rule.  The intra record that computes the chunk layout from ``cu_seqlens``
+    writes its tables into a scratch set on the arena (:data:`SCRATCH_TABLES_ATTR`); every other program reads the
+    context's CPU-built tables.  The saved set carries no token-row ``Aqk`` / ``Akk`` (:class:`KcpSaved`): the
+    backward recomputes the internal rows in both modes, so the two modes run the same programs on the same operands.
+    The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and
+    write its ``h`` / ``v_new`` (``dh`` / ``dv2``) tapes.
 
     SPEC-3 (debug probe, once per process on the first saved-mode backward): before that backward's prep the
     forward's intra program and WY program run on the ``fwd`` layout and their five rows (``gk`` / ``kg`` / ``qg`` /
@@ -704,42 +704,15 @@ class KernelBackend(Backend):
             values.update(call.grads)
         if name == "bwd_prep":
             # both backward modes run the replay prep (the GLM prep's rows, the internal dout copy K2 and dav read);
-            # the saved rows are checked here and read by no local program (the intra program recomputes the rows)
-            saved = extra.pop("saved", None)
-            if saved is not None:
-                if saved.Aqk is None or saved.Akk is None:
-                    raise ValueError(
-                        "saved: the saved set has no Aqk / Akk rows (forward without save_for_backward?)"
-                    )
-                _check(
-                    saved.Aqk,
-                    "saved.Aqk",
-                    (call.T_r, call.H, BT),
-                    torch.bfloat16,
-                    call.device,
-                )
-                _check(
-                    saved.Akk,
-                    "saved.Akk",
-                    (call.T_r, call.H, BT),
-                    torch.bfloat16,
-                    call.device,
-                )
-                if self._spec3_pending:
-                    self._spec3_forward_rows(
-                        call
-                    )  # before the backward's prep: the layouts share the arena
+            # the saved set carries no token rows: the intra program recomputes the internal rows in both modes
+            if extra.pop("saved", None) is not None and self._spec3_pending:
+                self._spec3_forward_rows(
+                    call
+                )  # before the backward's prep: the layouts share the arena
         elif name == "fwd_intra":
-            if int(extra.get("write_ext", 0)):
-                aqk = call.scratch["Aqk"] = _alloc(
-                    (call.T_r, call.H, BT), torch.bfloat16, call.device
-                )
-                akk = call.scratch["Akk"] = _alloc(
-                    (call.T_r, call.H, BT), torch.bfloat16, call.device
-                )
-                extra.update(aqk_ext=aqk, akk_ext=akk)
-            else:  # not written: any BF16 tensor serves as the unused pointer (as cake_backend does)
-                extra.update(aqk_ext=views.akk_int, akk_ext=views.akk_int)
+            # the token-row Aqk / Akk are never written on this route (the saved set carries none); any BF16 tensor
+            # serves as the unused pointer (as cake_backend does)
+            extra.update(write_ext=0, aqk_ext=views.akk_int, akk_ext=views.akk_int)
             # the internal rows every KCP consumer reads; the GLM prep's rows on the forward, the backward's prep
             # program wrote them already
             extra.setdefault("write_int", 1)
@@ -3069,17 +3042,14 @@ class KcpWorkspace:
 @dataclasses.dataclass(frozen=True)
 class KcpSaved:
     """The saved context of one forward (``boundary_mode="saved"``, the design note §16): ``S_in`` (the fresh c2
-    output), the owner's c1 receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the
-    forward's token-row ``Aqk`` / ``Akk`` (kernel path; kept for the saved-set contract, the backward recomputes the
-    internal rows it reads), and the scalars of the call.  The int32 tables are rebuilt from ``ctx`` (droppable, §16
-    item 3)."""
+    output), the owner's c1 receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``) and the
+    scalars of the call.  The int32 tables are rebuilt from ``ctx`` (droppable, §16 item 3).  No token-row ``Aqk`` /
+    ``Akk``: the backward recomputes the internal rows it reads in both modes (version 2; version 1 held them)."""
 
     version: int
     S_in: torch.Tensor
     c1_recv: torch.Tensor | None
     M_seg: torch.Tensor | None
-    Aqk: torch.Tensor | None
-    Akk: torch.Tensor | None
     T_r: int
     H: int
     n_frag: int
@@ -3094,11 +3064,11 @@ class KcpSaved:
     ctx: Any
     transfer_walk: str = "tf32_hilo"
 
-    _OPTIONAL = ("c1_recv", "M_seg", "Aqk", "Akk")
+    _OPTIONAL = ("c1_recv", "M_seg")
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         return (self.S_in,) + tuple(
-            t for t in (self.c1_recv, self.M_seg, self.Aqk, self.Akk) if t is not None
+            t for t in (self.c1_recv, self.M_seg) if t is not None
         )
 
     def flags(self) -> tuple[bool, ...]:
@@ -4082,10 +4052,10 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
             call.fresh("stage_m")  # M_seg^T of the segmented fragments (§16 item 5b)
     if replay:  # the replay's prep (the GLM prep's rows, the internal dout copy), then the internal Aqk / Akk rows
         call.stage("bwd_prep", saved=None)
-        call.stage("fwd_intra", write_ext=0)
+        call.stage("fwd_intra")
         call.stage("wy")
-    else:  # the intra program writes the GLM prep's rows itself (write_prep = 1)
-        call.stage("fwd_intra", write_ext=1 if save else 0)
+    else:  # the intra program writes the GLM prep's rows itself (write_prep = 1); no token-row copies are saved
+        call.stage("fwd_intra")
         call.stage("wy_fwd")
     _summaries(call)
     carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
@@ -4147,7 +4117,7 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
             call.bufs["stage_m"] = saved.M_seg
         call.stage("bwd_prep", saved=saved)
         call.stage(
-            "fwd_intra", write_ext=0
+            "fwd_intra"
         )  # the internal Aqk / Akk rows the WY, dav and gradient programs read
         call.stage("wy")
         if (
@@ -4654,8 +4624,6 @@ def _fwd_body(
             M_seg=call.bufs.get("stage_m")
             if (opts.save_transfer and tb.P > 1)
             else None,
-            Aqk=call.scratch.get("Aqk"),
-            Akk=call.scratch.get("Akk"),
             T_r=call.T_r,
             H=call.H,
             n_frag=tb.n_frag,
@@ -4745,11 +4713,7 @@ def chunk_kda_kcp_bwd(
     opts = _options(options)
     entry = None
     if opts.graph != "off":
-        kept = (
-            ()
-            if saved is None
-            else (saved.S_in, saved.c1_recv, saved.M_seg, saved.Aqk, saved.Akk)
-        )
+        kept = () if saved is None else (saved.S_in, saved.c1_recv, saved.M_seg)
         entry = _graph_entry(
             "bwd",
             ctx,

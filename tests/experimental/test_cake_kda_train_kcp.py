@@ -455,8 +455,7 @@ def test_head_ownership_rows(H, W) -> None:
         )
         assert (
             kp.kcp_saved_bytes(ctx, H=H, with_conv=False, save_transfer=False)
-            == 256 * ctx.T_r * H
-            + kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+            == kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
             + ctx.n_in * n_owners * Hg * kp.STATE_TILE_BYTES
         )
         if (
@@ -2212,11 +2211,14 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     )  # literal form: H = 64, light, no transfer, conv, C = 8192
     assert (
         base
-        == 256 * ctx.T_r * 64
-        + kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+        == kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
         + ctx.n_in * s
         + ctx.halo.n_hist_rows * 8192 * 2
-    )
+    )  # no token-row Aqk / Akk term: the saved set carries none
+    assert cake_kcp.KCP_SAVED_VERSION == 2
+    fields = cake_kcp.KcpSaved.__dataclass_fields__
+    assert "Aqk" not in fields and "Akk" not in fields
+    assert cake_kcp.KcpSaved._OPTIONAL == ("c1_recv", "M_seg")
     assert (
         kp.kcp_saved_bytes(ctx, save_transfer=False, with_conv=False)
         == base - ctx.halo.n_hist_rows * 8192 * 2
@@ -4410,7 +4412,8 @@ LOCAL_RECORD_CASES = [
 )
 def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
     """The local stages against the existing backend's registry on the CPU: the kernel backend's value dict of a
-    forward (with a saved set), a saved-mode backward and a replay backward binds every logical name of every
+    forward (no token-row copies: the saved set carries none), a saved-mode backward and a replay backward binds
+    every logical name of every
     record it launches -- the plan's records on the forward path without a saved set and on the replay path, the
     direct WY record where the plan fuses the WY representation into a recurrence the KCP does not run, and the
     KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids; the two backward modes launch the same records on the same
@@ -4484,16 +4487,13 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
         return done
 
     ops = {n: torch.zeros(1) for n in ("q", "k", "v", "g", "beta")}
-    fwd = run(
-        call_for(False, ops=ops, out=torch.zeros(1)),
-        (("fwd_intra", {"write_ext": 1}), ("wy_fwd", {}), ("fwd_o", {})),
-    )
+    fwd_call = call_for(False, ops=ops, out=torch.zeros(1))
+    fwd = run(fwd_call, (("fwd_intra", {}), ("wy_fwd", {}), ("fwd_o", {})))
     bwd_ops = {**ops, "dout": torch.zeros(1)}
     grads = {n: torch.zeros(1) for n in ("dq", "dk", "dv", "dg", "dbeta")}
-    rows = torch.zeros(ctx.T_r, H, cake_kcp.BT, dtype=torch.bfloat16)
-    saved = types.SimpleNamespace(Aqk=rows, Akk=rows)
+    saved = types.SimpleNamespace(S_in=torch.zeros(1), c1_recv=None, M_seg=None)
     bwd_stages = (
-        ("fwd_intra", {"write_ext": 0}),
+        ("fwd_intra", {}),
         ("wy", {}),
         ("dav", {}),
         ("dqkg", {}),
@@ -4544,14 +4544,22 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
             not plan.dispatched("wy_fwd", f)
             and [r for _, r, _, _ in fwd][1] == "wy_fwd"
         )
-    # the write switches, the scratch tables and the grids
+    # the write switches (no token-row copies on this route: the saved set carries none), the scratch tables and
+    # the grids
     intra, bintra = fwd[0][3], bwd[1][3]
-    assert (intra["write_ext"], intra["write_int"], intra["write_prep"]) == (1, 1, 1)
+    assert (intra["write_ext"], intra["write_int"], intra["write_prep"]) == (0, 1, 1)
     assert (bintra["write_ext"], bintra["write_int"], bintra["write_prep"]) == (0, 1, 0)
     assert (
-        intra["aqk_ext"] is not intra["akk_ext"]
-        and bintra["aqk_ext"] is bintra["akk_ext"]
+        intra["aqk_ext"]
+        is intra["akk_ext"]
+        is arena.views(cake_kcp.LOCAL_LAYOUT_FWD).akk_int
     )
+    assert (
+        bintra["aqk_ext"]
+        is bintra["akk_ext"]
+        is arena.views(cake_kcp.LOCAL_LAYOUT_BWD).akk_int
+    )
+    assert "Aqk" not in fwd_call.scratch and "Akk" not in fwd_call.scratch
     if kp.intra_writes_tables(plan):
         scratch = getattr(arena, cake_kcp.SCRATCH_TABLES_ATTR)
         assert intra["seg_table"] is scratch["seg_table"]

@@ -374,6 +374,15 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
 
+Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
+(the initial states of its fragments), with `save_transfer` the owner's c1
+receive tensor and `M_seg`, and the call's scalars; the int32 tables are
+rebuilt from the context.  The token-row `Aqk` / `Akk` of the single-rank
+saved set are not part of it: the backward recomputes the internal rows in
+both modes (saved set and checkpoint replay run the same local programs), so
+`kcp_saved_bytes` counts the tables, `S_in` and the `save_transfer` tensors
+(and the convolution's history rows with `with_conv`).
+
 Walk-launch geometry: the walk kernels' CTA lists are issued
 longest-segment-first and the two tape programs (`fwdh_tape`, `dhu_tape`) run
 at one CTA per SM. Because the JIT binding exposes no per-function carveout

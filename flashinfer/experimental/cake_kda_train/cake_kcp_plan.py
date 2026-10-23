@@ -2015,7 +2015,7 @@ def kcp_saved_bytes(
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
-    256 * T_r * H + tables_bytes(NC_pad, n_frag, NSEG)        # Aqk / Akk on the token rows + the int32 tables
+    tables_bytes(NC_pad, n_frag, NSEG)                         # the int32 tables
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
     + [save_transfer] * N_out * 2 * s * Hg_r / H               # the owner's whole c1 receive tensor
     + [save_transfer] * [P > 1] * NSEG * s                     # M_seg of the segmented fragments (home rank)
@@ -2024,6 +2024,9 @@ def kcp_saved_bytes(
 
     ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since an earlier revision);
     the two ``[save_transfer]`` terms are the delta against the earlier recompute form (``save_transfer=False``).
+
+    The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
+    recomputes the internal rows in both modes.
 
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
@@ -2034,7 +2037,7 @@ def kcp_saved_bytes(
     hp = ctx.heads(H)
     s = H * STATE_TILE_BYTES
     s_pad = hp.n_owners * hp.Hg * STATE_TILE_BYTES  # = s without padding
-    total = 256 * ctx.T_r * H + tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+    total = tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
     total += ctx.n_in * s_pad
     if save_transfer:
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
