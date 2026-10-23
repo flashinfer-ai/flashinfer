@@ -93,6 +93,14 @@ try:
 except (ImportError, AttributeError):
     _HAS_CUTE_DSL_FUSED_NORM = False
 
+    def supports_rmsnorm_sigmoid_gate(
+        dtype: torch.dtype,
+        head_dim: int,
+        device: torch.device | str | None = None,
+    ) -> bool:
+        return False
+
+
 try:
     from ..cake_muse_spark_norm_backend import (
         cake_gated_residual_next_rmsnorm as _cake_gated_residual_next_rmsnorm,
@@ -104,13 +112,6 @@ try:
     _HAS_CAKE_FUSED_NORM = True
 except (ImportError, AttributeError):
     _HAS_CAKE_FUSED_NORM = False
-
-    def supports_rmsnorm_sigmoid_gate(
-        dtype: torch.dtype,
-        head_dim: int,
-        device: torch.device | str | None = None,
-    ) -> bool:
-        return False
 
 
 @functools.cache
