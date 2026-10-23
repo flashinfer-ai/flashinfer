@@ -4782,7 +4782,11 @@ def chunk_kda_kcp_bwd(
     opts = _options(options)
     entry = None
     if opts.graph != "off":
-        kept = () if saved is None else (saved.S_in, saved.c1_recv, saved.M_seg)
+        kept = (
+            ()
+            if saved is None
+            else (saved.S_in, saved.c1_recv, saved.M_seg, saved.carry)
+        )  # the validity key sees every saved tensor (the carry plane of saved_carry=1 included)
         entry = _graph_entry(
             "bwd",
             ctx,
