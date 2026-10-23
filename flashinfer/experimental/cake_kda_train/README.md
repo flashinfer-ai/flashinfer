@@ -412,7 +412,7 @@ then `dav_serial` (`dA_qk` alone; persistent grid over the chunk pairs) on
 the serial rows below 16 heads, and no `dav` launch elsewhere: the fused
 gradient hosts `dA_qk` (`dqkg_davq`) on the serial rows from 16 heads and on
 every segmented row, whose adjoint recurrence accumulates `dv` (on `sm_107a`
-above 16 heads the fused gradient is its `_nohint` build: the same kernel with
+from 16 heads the fused gradient is its `_nohint` build: the same kernel with
 the L2 prefetch and evict-first hints off); the adjoint recurrence
 `dhu` (the state gradient `dh` and `dv2`: `dhu_v1` / `dhu_v1_wt` or `dhu_v2t`
 on the serial forms; on the segmented route two launches around a reverse
@@ -470,7 +470,7 @@ the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 | `bwd_prep` | `bwd_prep_g8`, `bwd_prep_g8_replay` | backward; one CTA per chunk and head; the replay form keeps the internal `dout` copy |
 | `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
 | `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3p_f`, `dhu_v3p_f_wt`, `dhu_v3p_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` `dhu_v3p_f*` (the form prefetching the next chunk's tiles) below `4 * sm_count` and `dhu_v3_f*` at the boundary alone -- else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
-| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` above 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
+| `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` from 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
 | `glm_intra` | `glm_intra` | backward; reads `k` / `q` on the token rows |
 | `gate_epilogue` | `gate_epilogue` | backward |
 

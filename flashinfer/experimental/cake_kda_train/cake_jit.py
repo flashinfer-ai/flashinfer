@@ -77,7 +77,7 @@ the matching ``dhu_v1_wt*`` reads it).  The serial adjoint recurrence
 accumulates ``dv`` itself from the attention rows (``dhu_v2t*`` / ``dhu_v1*``),
 so the serial ``dav`` program computes ``dAqk`` alone (``dav_serial*``) and from
 16 heads the fused gradient hosts even that (``dqkg_davq`` / ``dqkg_int_davq``:
-no ``dav`` launch; on ``sm_107a`` above 16 heads their ``_nohint`` twins, the
+no ``dav`` launch; on ``sm_107a`` from 16 heads their ``_nohint`` twins, the
 same kernel built with its L2 prefetch and evict-first hints off).  With at
 most ``max_heads`` heads the segmented route runs:
 every document is cut into ``segments`` chunk-aligned segments
@@ -4570,7 +4570,7 @@ MODULES: dict[str, dict[str, Any]] = {
                                             "kind": "arch_in",
                                             "arches": ["sm_100a", "sm_103a"],
                                         },
-                                        {"kind": "heads_at_most", "max": 16},
+                                        {"kind": "heads_below", "max": 16},
                                     ],
                                 },
                             ],
@@ -4670,7 +4670,7 @@ MODULES: dict[str, dict[str, Any]] = {
                                             "kind": "arch_in",
                                             "arches": ["sm_100a", "sm_103a"],
                                         },
-                                        {"kind": "heads_at_most", "max": 16},
+                                        {"kind": "heads_below", "max": 16},
                                     ],
                                 },
                             ],
@@ -4756,7 +4756,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rules": [
                 {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
                 {"kind": "arch_in", "arches": ["sm_107a"]},
-                {"kind": "heads_above", "min": 16},
+                {"kind": "heads_at_least", "min": 16},
             ],
         },
         "stage": "dqkg",
@@ -4835,7 +4835,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rules": [
                 {"kind": "path_in", "paths": ["replay"]},
                 {"kind": "arch_in", "arches": ["sm_107a"]},
-                {"kind": "heads_above", "min": 16},
+                {"kind": "heads_at_least", "min": 16},
             ],
         },
         "stage": "dqkg",

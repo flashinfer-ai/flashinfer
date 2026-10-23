@@ -94,9 +94,9 @@ INTERNAL_ROW_TWIN = {
     "fwdh_o_v2_rows": "fwdh_o_v2",
 }
 DAVQ_MIN_H = 16  # the fused gradient hosts dAqk on the serial route from 16 heads
-# above this many heads the fused gradient runs with its L2 prefetch / evict-first hints off (the `_nohint` records:
+# from this many heads the fused gradient runs with its L2 prefetch / evict-first hints off (the `_nohint` records:
 # the same kernel built with the hint thresholds beyond any head count); the other architectures keep the hints
-DQKG_HINTS_MAX_H_BY_ARCH = {"sm_107a": 16}
+DQKG_NOHINT_MIN_H_BY_ARCH = {"sm_107a": 16}
 FEW_CHAINS = 4  # at most four (document, head) chains: the few-chain segmented rows
 # the saved-state pass 2 forms the WY representation itself (no WY launch) up to 32 (document, head) chains; on
 # every segmented row the adjoint recurrence accumulates dv and the fused gradient hosts dAqk (no dav launch)
@@ -620,7 +620,7 @@ def _expected_records(
         out["dhu"] = "dhu_v1_wt_replay" if replay else "dhu_v1_wt"
     else:
         out["dhu"] = "dhu_v1_replay" if replay else "dhu_v1"
-    nohint = davq and not seg and h > DQKG_HINTS_MAX_H_BY_ARCH.get(arch, h)
+    nohint = davq and not seg and h >= DQKG_NOHINT_MIN_H_BY_ARCH.get(arch, h + 1)
     out["dqkg"] = (
         ("dqkg_int" if replay else "dqkg")
         + ("_davq" if davq else "")
@@ -944,10 +944,10 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
 
 
 def test_the_fused_gradient_turns_its_l2_hints_off_on_the_large_sm107a_rows() -> None:
-    # The fused gradient's L2 prefetch and evict-first hints cost about 6 % on the sm_107a rows above 16 heads, so
+    # The fused gradient's L2 prefetch and evict-first hints cost about 6 % on the sm_107a rows from 16 heads, so
     # its dAqk-hosting forms ship a second build there with the hints off (the `_nohint` records: the same kernel,
     # launch and operands; the hint thresholds beyond any head count).  The registry dispatches them on sm_107a
-    # above 16 heads alone; the segmented rows, 16 heads and the other architectures keep the hinted builds.
+    # from 16 heads alone; the segmented rows and the other architectures keep the hinted builds.
     for name in ("dqkg_davq_nohint", "dqkg_int_davq_nohint"):
         record = cake_jit.MODULES[name]
         hinted = cake_jit.MODULES[name[: -len("_nohint")]]
@@ -968,7 +968,9 @@ def test_the_fused_gradient_turns_its_l2_hints_off_on_the_large_sm107a_rows() ->
             for h in (1, 4, 8, 12, 16, 24, 32, 64, 128):
                 seg = h <= SEG_MAX_H
                 davq = seg or h >= DAVQ_MIN_H
-                nohint = davq and not seg and h > DQKG_HINTS_MAX_H_BY_ARCH.get(arch, h)
+                nohint = (
+                    davq and not seg and h >= DQKG_NOHINT_MIN_H_BY_ARCH.get(arch, h + 1)
+                )
                 want = base + ("_davq" if davq else "") + ("_nohint" if nohint else "")
                 got = cake_jit.select_record(
                     "dqkg",
