@@ -40,7 +40,6 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
 _MXFP4_DTYPE_PREFIX = "sm90_w_mxfp4_"
 _MXFP4_HARDWARE_KEY_FIELDS = ("compute_capability", "sm_count")
 _MXFP4_PROVENANCE_KEY_FIELD = "tuning_provenance_sha256"
@@ -133,6 +132,8 @@ def _is_valid_tuning_provenance_sha256(value: Any) -> bool:
 
 
 def _load_entries(path: str) -> List[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
     try:
         with open(path) as f:
             data = json.load(f)
@@ -146,7 +147,7 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
             stacklevel=3,
         )
         return []
-    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+    if not isinstance(data, dict) or data.get("version") != KNOB_CACHE_VERSION:
         warnings.warn(
             f"[moe_ep-knob-cache] {path!r} has unsupported version "
             f"{data.get('version') if isinstance(data, dict) else '?'}; ignoring.",
@@ -419,10 +420,14 @@ def record_knobs(
                 ]
                 entries.append(entry)
                 fd, tmp = tempfile.mkstemp(dir=directory, prefix=".moe_ep_knob_cache.")
+                from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
                 try:
                     with os.fdopen(fd, "w") as f:
                         json.dump(
-                            {"version": _CACHE_VERSION, "entries": entries}, f, indent=1
+                            {"version": KNOB_CACHE_VERSION, "entries": entries},
+                            f,
+                            indent=1,
                         )
                         f.flush()
                         os.fsync(f.fileno())

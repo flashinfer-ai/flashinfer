@@ -290,7 +290,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 |------|------|
 | `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store`, optional `process_group` (EP comm; defaults to WORLD), `auto_bootstrap=True` |
 | `FleetParams` | EP sizing only (no weights); split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
-| `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `recv_count`, `num_tokens_per_expert` |
+| `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `fc1_activation_per_token_scale`, `recv_count`, `num_tokens_per_expert` |
 | `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
 | `MoEEpMegaWorkspace` | Public, layer-bound capacity-profile handle returned by `MoEEpMegaLayer.create_workspace()`; do not construct directly |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
@@ -411,8 +411,9 @@ classDiagram
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
 BF16×NVFP4 stages BF16 inputs and defaults to ordered FP32 combine inside MegaMoE.
-Routing weights apply after FC2 by default; `apply_topk_in_fc1=True` applies them
-before the BF16 FC1 handoff, with a different rounding contract.
+Routing weights apply after FC2 by default;
+`apply_routing_weights_before_fc2=True` applies them before the BF16 FC1
+handoff, with a different rounding contract.
 
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
 BF16-activation backends ignore `quantize_input` and copy BF16 inputs.
@@ -579,7 +580,7 @@ unless noted):
 | mega deep_gemm (fp8_fp4) | 2026-07-31 | same run + variant job (multirank oracle) |
 | mega sm100_nvfp4_nvfp4_bf16_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
 | mega sm100_mxfp8_mxfp8_bf16_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
-| mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
+| mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper; not runnable on SM100 |
 | mega sm90_bf16_bf16_bf16_pull_cutedsl | 2026-10-08 | Hopper 4x H200, this branch |
 
 ## Forward flow
@@ -724,8 +725,10 @@ profile tag is required. This applies to SM90, SM100, and SM107 tuners.
 
 Lookup first matches capacity exactly, then selects the smallest recorded live
 bucket at least as large as the workload, or the largest bucket if none is
-large enough. Legacy entries without `live_tokens` retain capacity-based
-fallback. Default callers without a live count select for full capacity.
+large enough. Legacy entries without `live_tokens` count as full-capacity
+buckets. If the requested capacity has no buckets, lookup retains the
+capacity-based fallback. Default callers without a live count select for full
+capacity.
 
 Before CUDA graph capture, enumerate `layer.live_token_buckets(capacity)`, create
 `layer.create_workspace(capacity, live_tokens=bucket)`, and warm each handle.

@@ -43,9 +43,12 @@ mapping arithmetic is FP32-quality throughout (exact three-way BF16 split of
 FP32 forward sigmoid rounds to one.
 
 Retained between forward and backward: the inputs and ``stats`` (256 bytes
-per token); with ``cake_mhc_train_prepare(..., save_stats=False)`` the
-statistics are recomputed from ``X`` in the backward with bitwise the same
-gradients (checkpoint replay).  Workspaces are caller-held
+per token), all through the autograd saved tensors, so an activation
+checkpoint (``torch.utils.checkpoint``) frees them after the forward and
+recomputes them in the backward; with
+``cake_mhc_train_prepare(..., save_stats=False)`` the statistics are instead
+recomputed from ``X`` in the backward with bitwise the same gradients
+(checkpoint replay).  Workspaces are caller-held
 (``*_workspace_bytes`` / ``*_workspace``) and the submit path allocates
 nothing.  All tensors are contiguous: ``X``, ``Y``, ``dY``, ``dX`` BF16
 ``[T, 4, 4096]``; ``U``, ``B``, ``dU``, ``dB`` BF16 ``[T, 4096]``; ``fn`` FP32

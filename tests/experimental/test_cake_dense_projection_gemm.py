@@ -15,8 +15,10 @@ limitations under the License.
 """
 
 import ast
+import contextlib
 import dataclasses
 import re
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -5084,6 +5086,341 @@ def test_convenience_cache_hit_evicted_before_its_refresh_is_a_miss():
     assert cake_backend._cache_get(OrderedDict(), ("k", 0)) is None
 
 
+def test_convenience_cache_put_reports_every_entry_that_leaves_the_cache():
+    """``on_evict`` sees the entries the bound evicts and an earlier entry a key replaces (the arena
+    reference count of the convenience caches hangs on it), each exactly once."""
+    gone = []
+    cache: OrderedDict = OrderedDict()
+    for i in range(3):
+        cake_backend._cache_put(cache, ("k", i), i, bound=2, on_evict=gone.append)
+    assert gone == [0] and list(cache) == [("k", 1), ("k", 2)]
+    cake_backend._cache_put(cache, ("k", 2), 20, bound=2, on_evict=gone.append)
+    assert gone == [0, 2] and cache[("k", 2)] == 20 and list(cache)[-1] == ("k", 2)
+    cake_backend._cache_put(cache, ("k", 2), 20, bound=2, on_evict=gone.append)
+    assert gone == [0, 2]  # re-inserting the same entry is not a replacement
+    cake_backend._cache_put(cache, ("k", 3), 3, bound=1, on_evict=gone.append)
+    assert gone == [0, 2, 1, 20] and list(cache) == [("k", 3)]
+
+
+def _cpu_router_entry(arena, op, T, splits=None):
+    """A planned K2 convenience entry on CPU views (no module: a no-op entry callable)."""
+    v = _router_inputs(op, T, seed=SEED + 8, device="cpu")
+    plan, A_eff, B_eff = plan_router_fp32_gemm(v["A"], v["B"], v["out"], splits=splits)
+    _, split_src = cake_backend._k2_views(v["A"], v["B"], plan)
+    split_shape = tuple(int(s) for s in split_src.shape)
+    partials = None
+    if plan.splits > 1:
+        rows, cols = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
+        partials = (plan.splits, rows, cols)
+    arena.require("k2_parts", 3 * split_src.numel())
+    arena.require("k2_resid", split_src.numel())
+    if partials is not None:
+        arena.require("k2_partials", partials[0] * partials[1] * partials[2])
+    arena.refs += 1
+    return cake_backend._CachedRouter(
+        "router_fp32_gemm_kk",
+        "sm_100a",
+        plan,
+        lambda *args: None,
+        (
+            cake_backend._Slot("A"),
+            cake_backend._Slot("parts"),
+            cake_backend._Slot("out32"),
+        ),
+        arena,
+        split_shape,
+        partials,
+    ), v
+
+
+def test_convenience_arena_grows_to_the_largest_requirement_and_carves_views(
+    monkeypatch,
+):
+    """The arena of one (device, stream) holds one buffer per workspace kind, grown to the largest requirement
+    its entries asked for (never shrunk; the counters zero-initialised); an entry carves its workspace out of
+    the buffers at launch time and memoises the views until the arena grows -- CPU tensors, no module."""
+    monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_ARENAS", {})
+    arena = cake_backend._Arena(torch.device("cpu"), (0, 7))
+    assert arena.nbytes() == 0 and arena.version == 0 and arena.refs == 0
+    small = arena.require("k1_counters", 5)
+    assert (
+        small.dtype == torch.uint32 and small.numel() == cake_backend._ARENA_MIN_ELEMS
+    )
+    assert (
+        int(torch.count_nonzero(small.view(torch.int32))) == 0
+    )  # bitcast: no u32 CPU kernel
+    assert arena.version == 1
+    ws = arena.require("k1_ws", 1000)
+    assert ws.dtype == torch.float32 and ws.numel() == 1000 and arena.version == 2
+    assert (
+        arena.require("k1_ws", 400) is ws and arena.version == 2
+    )  # a smaller requirement reuses
+    assert arena.require("k1_ws", 1000) is ws
+    grown = arena.require("k1_ws", 1001)
+    assert grown is not ws and grown.numel() == 1001 and arena.version == 3
+    assert arena.nbytes() == 1001 * 4 + cake_backend._ARENA_MIN_ELEMS * 4
+    carved = cake_backend._carve(torch.arange(24.0), (2, 3, 4))
+    assert carved.is_contiguous() and carved.storage_offset() == 0
+    assert torch.equal(carved, torch.arange(24.0).view(2, 3, 4))
+    assert set(cake_backend._ARENA_KINDS) == {
+        "k1_ws",
+        "k1_counters",
+        "k2_parts",
+        "k2_resid",
+        "k2_partials",
+    }
+    # K2 entries of two geometries share the buffers; each carves its own exact shapes at offset 0
+    fwd, _ = _cpu_router_entry(arena, "fwd", 257)
+    wgrad, _ = _cpu_router_entry(arena, "wgrad", 1001)
+    assert fwd.arena is arena and wgrad.arena is arena and arena.refs == 2
+    for entry in (fwd, wgrad):
+        views = cake_backend._entry_views(entry)
+        assert views is cake_backend._entry_views(entry)  # memoised
+        assert tuple(views["parts"].shape) == (3, *entry.split_shape)
+        assert tuple(views["resid"].shape) == entry.split_shape
+        assert views["parts"].data_ptr() == arena.buffers["k2_parts"].data_ptr()
+        assert views["resid"].data_ptr() == arena.buffers["k2_resid"].data_ptr()
+        assert tuple(views["workspace"].shape) == entry.partials_shape
+        assert views["workspace"].data_ptr() == arena.buffers["k2_partials"].data_ptr()
+        assert views["parts"].is_contiguous() and views["workspace"].is_contiguous()
+    # parts of W [3, 256, 6144] (forward) and of G [3, 1001, 256] (weight gradient): one buffer, the larger
+    assert (fwd.split_shape, wgrad.split_shape) == ((256, 6144), (1001, 256))
+    assert (
+        arena.buffers["k2_parts"].numel()
+        == 3 * 256 * 6144
+        == max(3 * 256 * 6144, 3 * 1001 * 256)
+    )
+    assert (fwd.partials_shape, wgrad.partials_shape) == (
+        (4, 257, 256),
+        (11, 256, 6144),
+    )
+    assert arena.buffers["k2_partials"].numel() == 11 * 256 * 6144
+    # a growth forgets every memo of the arena's cached entries and the next launch carves again
+    cake_backend._K2_CACHE[("fwd",)] = fwd
+    cake_backend._K2_CACHE[("wgrad",)] = wgrad
+    old_parts = cake_backend._entry_views(fwd)["parts"]
+    version = arena.version
+    arena.require("k2_parts", arena.buffers["k2_parts"].numel() + 1)
+    assert arena.version == version + 1 and fwd.views is None and wgrad.views is None
+    new_parts = cake_backend._entry_views(fwd)["parts"]
+    assert new_parts.data_ptr() != old_parts.data_ptr() and tuple(
+        new_parts.shape
+    ) == tuple(old_parts.shape)
+    assert fwd.views_version == arena.version
+    # a K1 entry carves the buffers themselves (pointer parameters)
+    v = _views("proj", "kv_a", "fwd", "bf16", 257)
+    plan, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a"
+    )
+    arena.require("k1_ws", plan.ws_f32_elems)
+    arena.require("k1_counters", plan.counters_alloc_u32)
+    gemm_entry = cake_backend._CachedGemm(
+        "m", "sm_100a", plan, False, lambda *args: None, (), arena
+    )
+    k1 = cake_backend._entry_views(gemm_entry)
+    assert (
+        k1["ws"] is arena.buffers["k1_ws"]
+        and k1["counters"] is arena.buffers["k1_counters"]
+    )
+    assert k1["counters"].numel() >= plan.counters_alloc_u32 >= SK_DUMMY_BASE + 16 * 32
+
+
+def test_convenience_arena_is_released_with_its_last_entry(monkeypatch):
+    """``_release_entry`` (the caches' ``on_evict``) drops an arena from the registry once its last cached
+    entry is evicted; ``clear_convenience_caches`` drops them all."""
+    monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_ARENAS", {})
+    device = torch.device("cpu")
+    a7 = cake_backend._arena_for(0, 7, device)
+    assert cake_backend._arena_for(0, 7, device) is a7 and a7.key == (0, 7)
+    a8 = cake_backend._arena_for(0, 8, device)
+    assert a8 is not a7 and len(cake_backend._ARENAS) == 2
+    e1, _ = _cpu_router_entry(a7, "fwd", 257)
+    e2, _ = _cpu_router_entry(a7, "dgrad", 257)
+    e3, _ = _cpu_router_entry(a8, "fwd", 129)
+    assert (a7.refs, a8.refs) == (2, 1)
+    cache = cake_backend._K2_CACHE
+    put = cake_backend._cache_put
+    put(cache, ("e1",), e1, bound=2, on_evict=cake_backend._release_entry)
+    put(cache, ("e2",), e2, bound=2, on_evict=cake_backend._release_entry)
+    put(cache, ("e3",), e3, bound=2, on_evict=cake_backend._release_entry)  # evicts e1
+    assert list(cache) == [("e2",), ("e3",)] and a7.refs == 1
+    assert cake_backend._ARENAS[(0, 7)] is a7
+    put(
+        cache, ("e3",), e3, bound=1, on_evict=cake_backend._release_entry
+    )  # evicts e2: a7 is released
+    assert (
+        list(cache) == [("e3",)] and a7.refs == 0 and (0, 7) not in cake_backend._ARENAS
+    )
+    assert {(0, 8): a8} == cake_backend._ARENAS and a8.refs == 1
+    # a stale release never drops a successor arena of the same key
+    a7b = cake_backend._arena_for(0, 7, device)
+    cake_backend._release_entry(e1)
+    assert cake_backend._ARENAS[(0, 7)] is a7b
+    cake_backend.clear_convenience_caches()
+    assert cake_backend._ARENAS == {} and cache == OrderedDict()
+
+
+def test_convenience_arena_require_keeps_the_larger_buffer(monkeypatch):
+    """``require`` is monotone: when a larger buffer of the kind was stored between its size check and its own
+    allocation (another planning thread), the larger one is kept and returned, never the smaller."""
+    monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
+    arena = cake_backend._Arena(torch.device("cpu"), (0, 7))
+    larger = torch.empty(2000, dtype=torch.float32)
+
+    class _StoredMeanwhile(dict):
+        reads = 0
+
+        def get(self, key, default=None):
+            self.reads += 1
+            if (
+                self.reads == 2
+            ):  # the re-read after allocating: the other thread's buffer landed
+                dict.__setitem__(self, key, larger)
+            return dict.get(self, key, default)
+
+    arena.buffers = _StoredMeanwhile()
+    got = arena.require("k1_ws", 1000)
+    assert got is larger and arena.buffers["k1_ws"] is larger and got.numel() == 2000
+    assert arena.version == 1 and arena.buffers.reads == 2
+    # the plain case still grows to the requirement and keeps its own allocation
+    assert arena.require("k1_ws", 3000).numel() == 3000 and arena.version == 2
+    assert isinstance(arena.lock, type(threading.Lock())) and not arena.lock.locked()
+
+
+def test_convenience_entry_views_memo_is_stamped_before_carving():
+    """``_entry_views`` reads the arena version before carving: a growth that interleaves with the carve leaves
+    the memo stale (re-carved on the next use) instead of pinning the replaced buffer as current."""
+    arena = cake_backend._Arena(torch.device("cpu"), (0, 7))
+    entry, _ = _cpu_router_entry(arena, "fwd", 257)
+    carve = entry.carve
+    before = arena.version
+    grown = []
+
+    def carve_with_interleaved_growth(a):
+        views = carve(a)
+        a.require(
+            "k2_parts", a.buffers["k2_parts"].numel() + 1
+        )  # another thread grows meanwhile
+        grown.append(a.version)
+        return views
+
+    entry.carve = carve_with_interleaved_growth
+    first = cake_backend._entry_views(entry)
+    assert grown == [before + 1] and arena.version == before + 1
+    assert (
+        entry.views_version == before
+    )  # stamped with the version read before the carve
+    assert first["parts"].data_ptr() != arena.buffers["k2_parts"].data_ptr()
+    entry.carve = carve
+    second = cake_backend._entry_views(entry)
+    assert second is not first and entry.views_version == arena.version
+    assert second["parts"].data_ptr() == arena.buffers["k2_parts"].data_ptr()
+    assert cake_backend._entry_views(entry) is second
+
+
+def test_convenience_plan_entry_rolls_back_a_failed_plan_and_rechecks_the_cache(
+    monkeypatch,
+):
+    """A plan that fails after growing a *shared* arena (bind / JIT / grid error) restores the arena's earlier
+    buffers (and forgets memos carved against the dropped growth); a fresh arena it created is removed; a key
+    another thread planned meanwhile is returned without planning again."""
+    monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_ARENAS", {})
+    device = torch.device("cpu")
+    cache = cake_backend._K2_CACHE
+    shared = cake_backend._arena_for(0, 7, device)
+    entry, _ = _cpu_router_entry(
+        shared, "fwd", 257
+    )  # refs 1, buffers grown for the forward
+    cache[("fwd",)] = entry
+    memo = cake_backend._entry_views(entry)
+    saved, version = dict(shared.buffers), shared.version
+    calls = []
+
+    def grows_then_fails(arena):
+        calls.append(arena)
+        have = (
+            arena.buffers["k2_parts"].numel() if "k2_parts" in arena.buffers else 1000
+        )
+        arena.require("k2_parts", 4 * have)
+        raise RuntimeError("bind failed")
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        cake_backend._plan_entry(cache, ("huge",), 0, 7, device, grows_then_fails)
+    assert calls == [shared] and ("huge",) not in cache and list(cache) == [("fwd",)]
+    assert {(0, 7): shared} == cake_backend._ARENAS and shared.refs == 1
+    assert shared.buffers.keys() == saved.keys() and all(
+        shared.buffers[k] is saved[k] for k in saved
+    )  # the same tensors as before the failed plan
+    assert (
+        shared.version == version + 2 and entry.views is None
+    )  # grown, then rolled back: memos forgotten
+    assert (
+        cake_backend._entry_views(entry)["parts"].data_ptr() == memo["parts"].data_ptr()
+    )
+    assert not cake_backend._PLAN_LOCK.locked()
+    # a fresh arena a failed plan created is removed
+    with pytest.raises(RuntimeError):
+        cake_backend._plan_entry(cache, ("other",), 0, 8, device, grows_then_fails)
+    assert (0, 8) not in cake_backend._ARENAS and len(calls) == 2
+    # the cache is re-checked under the lock: a key planned meanwhile is returned with ``views = None``
+    got, views = cake_backend._plan_entry(
+        cache, ("fwd",), 0, 7, device, grows_then_fails
+    )
+    assert got is entry and views is None and len(calls) == 2
+    assert list(cache)[-1] == ("fwd",)
+
+
+def test_convenience_router_launch_holds_the_arena_lock(monkeypatch):
+    """The K2 hit path holds its arena's lock from the carve of the workspace views through the launch and the
+    split-K reduction (CPU stand-ins for the device, the stream and the FFI entry)."""
+    monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_ARENAS", {})
+    device = torch.device("cpu")
+    arena = cake_backend._arena_for(0, 7, device)
+    cached, v = _cpu_router_entry(arena, "fwd", 257, splits=4)
+    seen = []
+
+    def entry_call(*arguments):
+        assert arena.lock.locked()
+        seen.append(("kernel", len(arguments)))
+
+    cached.entry = entry_call
+    key = convenience_key(0, 7, (4,), v["A"], v["B"], v["out"])
+    cake_backend._K2_CACHE[key] = cached
+    monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
+    monkeypatch.setattr(cake_backend, "_cuda_index", lambda d: 0)
+    monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: 7)
+    monkeypatch.setattr(
+        cake_backend,
+        "_ffi_stream_context",
+        lambda index, raw=None: contextlib.nullcontext(),
+    )
+    split = cake_backend.split_fp32_to_bf16x3_
+
+    def locked_split(src, parts, resid):
+        assert arena.lock.locked()
+        seen.append(("split", tuple(parts.shape)))
+        return split(src, parts, resid)
+
+    monkeypatch.setattr(cake_backend, "split_fp32_to_bf16x3_", locked_split)
+    out = cake_backend._launch_cached_router(v["A"], v["B"], v["out"], splits=4)
+    assert out is v["out"] and not arena.lock.locked()
+    assert seen == [("split", (3, 256, 6144)), ("kernel", 3)]
+    assert cached.views is not None and cached.views_version == arena.version
+    # the memoised workspace views are the arena's buffers, carved under the lock
+    assert (
+        cached.views["workspace"].data_ptr() == arena.buffers["k2_partials"].data_ptr()
+    )
+
+
 @pytest.mark.parametrize("sm_count", SM_COUNTS)
 def test_convenience_views_match_the_planner_views(sm_count):
     """The per-call view rebuild of the convenience path (``_k1_views`` under ``_k1_swapped``) returns the
@@ -5421,11 +5758,19 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
     assert len(cake_backend._K1_CACHE) == 1
     _check(out2, torch.matmul(X2.double(), W.double().t()))
     assert torch.equal(cake_backend.projection_forward(X, W, out), first)
-    # another stream never shares an entry (nor its workspace)
+    assert len(cake_backend._ARENAS) == 1
+    # another stream never shares an entry (nor its workspace arena)
     with torch.cuda.stream(torch.cuda.Stream(device=device)):
         cake_backend.projection_forward(X, W, out2)
     torch.cuda.synchronize()
     assert len(cake_backend._K1_CACHE) == 2 and torch.equal(out2, first)
+    first_entry, second_entry = cake_backend._K1_CACHE.values()
+    assert (
+        first_entry.arena is not second_entry.arena and len(cake_backend._ARENAS) == 2
+    )
+    assert {e.arena.key for e in (first_entry, second_entry)} == set(
+        cake_backend._ARENAS
+    )
     # the prepared path of the same binding gives the same bits
     prepared = prepare_dense_projection_gemm(X, W.t(), out2)
     assert (
@@ -5435,9 +5780,9 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
 
 
 def test_convenience_path_replays_a_stream_k_row_bit_exact():
-    """The cached entry owns the stream-K workspace and the slice counters: the second call of the same
-    geometry reuses them without a memset (the kernel resets every counter it uses), stays allocation-free
-    and reproduces the first result bit for bit."""
+    """The cached entry carves the stream-K workspace and the slice counters out of the arena of its device
+    and stream: the second call of the same geometry reuses them without a memset (the kernel resets every
+    counter it uses), stays allocation-free and reproduces the first result bit for bit."""
     if not _device_supported():
         pytest.skip(
             "requires a device with a registered generated instance "
@@ -5475,18 +5820,90 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
     assert len(cake_backend._K1_CACHE) == 1 and torch.equal(out1, out2)
+    counters = entry.arena.buffers["k1_counters"]
+    assert counters.numel() >= entry.plan.counters_alloc_u32
+    assert entry.arena.buffers["k1_ws"].numel() >= max(entry.plan.ws_f32_elems, 1)
     if entry.plan.sk_units:
-        # the counters the launch used are back at zero when it completes
-        used = entry.counters[: entry.plan.counters_u32].view(
-            torch.int32
-        )  # bitcast: int32 reductions
-        assert int(torch.count_nonzero(used)) == 0
+        # the whole shared counter buffer is back at zero when the launch completes (the zero contract every
+        # entry of the arena relies on), not only the slice counters this launch used
+        assert int(torch.count_nonzero(counters.view(torch.int32))) == 0
     # a different knob set is a different entry (``_registered_knobs`` picked the registered family)
     assert cake_backend.convenience_key(
         0, 0, (True, ("cta_rows", 64), ("sk", "auto")), G, X, out1
     ) != cake_backend.convenience_key(
         0, 0, (True, ("cta_rows", 128), ("sk", "auto")), G, X, out1
     )
+
+
+def test_convenience_path_memory_is_bounded_across_token_counts():
+    """A ragged token count (a new T every step) must not grow the memory the convenience path holds: the
+    router entries of 23 distinct T share one arena per (device, stream), so the memory held after the loop is
+    about the single-T high-water mark (each entry used to own ~200 MiB of workspace: 4.16 GiB after 23 T),
+    and a cached replay still matches the prepared path bit for bit."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
+    for a_mn, b_mn, out_t in (
+        (False, False, False),
+        (False, True, False),
+        (True, True, True),
+    ):
+        _require_program(
+            cake_backend.router_symbol(a_mn, b_mn, out_t)
+        )  # kk / kn / nn_t
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(SEED + 12)
+    W = torch.randn(256, 6144, device=device, generator=g)
+
+    def held_after(T_values):
+        cake_backend.clear_convenience_caches()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        base = torch.cuda.memory_allocated()
+        for T in T_values:
+            X = torch.randn(T, 6144, device=device, generator=g)
+            G = torch.randn(T, 256, device=device, generator=g)
+            cake_backend.router_forward(X, W)
+            cake_backend.router_dgrad(G, W)
+            cake_backend.router_wgrad(G, X)
+        del X, G
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return torch.cuda.memory_allocated() - base
+
+    single = held_after([16022])
+    assert len(cake_backend._K2_CACHE) == 3 and len(cake_backend._ARENAS) == 1
+    (arena,) = cake_backend._ARENAS.values()
+    assert arena.refs == 3 and single >= arena.nbytes() > 0
+    loop = held_after(range(16000, 16023))
+    assert len(cake_backend._K2_CACHE) == min(3 * 23, CONVENIENCE_CACHE_SIZE)
+    assert loop <= 1.5 * single, (loop, single)
+    assert loop < 2**30, loop  # far below the 4.16 GiB the per-entry workspaces held
+    (arena,) = cake_backend._ARENAS.values()
+    assert arena.refs == len(cake_backend._K2_CACHE)
+    # the cached replay of the last T is allocation-free (``out`` given) and matches the prepared path
+    T = 16022
+    X = torch.randn(T, 6144, device=device, generator=g)
+    G = torch.randn(T, 256, device=device, generator=g)
+    outs = [torch.empty(T, 256, device=device) for _ in range(3)]
+    cake_backend.router_forward(X, W, outs[0])
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()
+    cake_backend.router_forward(X, W, outs[1])
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    prepared = prepare_router_fp32_gemm(X, W.t(), outs[2], splits=4)
+    prepared.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+    dw = cake_backend.router_wgrad(G, X)
+    prepared_w = prepare_router_fp32_gemm(G.t(), X, torch.empty_like(dw), splits=11)
+    assert torch.equal(dw, prepared_w.launch())
+    cake_backend.clear_convenience_caches()
+    assert cake_backend._ARENAS == {}
 
 
 # longer than a cold-cache JIT build; the hang this test guards against never returns

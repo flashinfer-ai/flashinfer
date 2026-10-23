@@ -24,9 +24,8 @@ from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Explicit target-owned registration of the generated programs: one record per
-# program (its translation units, FFI entry and argument plan) and the
-# architectures that compile it.  Written by the generated-program export; do
-# not edit by hand.
+# program (its translation units and argument plan) and the architectures that
+# compile it.  Written by the generated-program export; do not edit by hand.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_balanced_gqa_decode_36ecd3362289b95340d6": {
         "kind": "mtp32",
@@ -34,8 +33,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "cake_balanced_gqa_decode/cake_balanced_gqa_decode_36ecd3362289b95340d6_kernel.cu",
             "cake_balanced_gqa_decode/cake_balanced_gqa_decode_36ecd3362289b95340d6_binding.cu",
         ],
-        "compile_flags": [],
-        "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
             ["tma_buffer", "K"],
@@ -66,8 +63,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "cake_balanced_gqa_decode/cake_balanced_gqa_decode_41e174c38744ae345da2_kernel.cu",
             "cake_balanced_gqa_decode/cake_balanced_gqa_decode_41e174c38744ae345da2_binding.cu",
         ],
-        "compile_flags": [],
-        "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Qt"],
             ["tma_buffer", "K"],
@@ -99,8 +94,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "cake_balanced_gqa_decode/cake_balanced_gqa_decode_470794ded0549b0c6037_kernel.cu",
             "cake_balanced_gqa_decode/cake_balanced_gqa_decode_470794ded0549b0c6037_binding.cu",
         ],
-        "compile_flags": [],
-        "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
             ["tma_buffer", "K"],
@@ -181,7 +174,7 @@ def gen_cake_balanced_gqa_decode_module(name: str, arch: str):
     return gen_jit_spec(
         name=f"{name}_{arch}",
         sources=sources,
-        extra_cuda_cflags=[*ARCH_NVCC_FLAGS[arch], *record["compile_flags"]],
+        extra_cuda_cflags=[*ARCH_NVCC_FLAGS[arch]],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
         use_fast_math=False,

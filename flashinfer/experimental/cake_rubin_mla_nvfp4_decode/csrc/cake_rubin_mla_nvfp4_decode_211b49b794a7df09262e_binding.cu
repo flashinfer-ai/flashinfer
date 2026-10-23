@@ -389,7 +389,7 @@ void Run(TensorView a_QN, TensorView a_QS, TensorView a_QR, TensorView a_CKV, Te
          int64_t a_items, int64_t a_max_splits, int64_t a_ckv_stride_words,
          int64_t a_cks_stride_words, double a_logit_scale, double a_o_factor, TensorView a_O_T,
          TensorView a_PO_T, TensorView a_O_T16, TensorView a_PO_T16, int64_t a_n_full,
-         int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+         int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_QN.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_QN, "QN");
@@ -492,6 +492,8 @@ void Run(TensorView a_QN, TensorView a_QS, TensorView a_QR, TensorView a_CKV, Te
   check_same_device(a_PO_T, a_QN, "PO_T", "QN");
   check_same_device(a_O_T16, a_QN, "O_T16", "QN");
   check_same_device(a_PO_T16, a_QN, "PO_T16", "QN");
+  TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
+      << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z
       << ") must be positive";
@@ -586,7 +588,7 @@ void Run(TensorView a_QN, TensorView a_QS, TensorView a_QR, TensorView a_CKV, Te
   config.blockDim = dim3(512, 1, 1);
   config.dynamicSmemBytes = 323584;
   config.stream = stream;
-  cudaLaunchAttribute attrs[4] = {};
+  cudaLaunchAttribute attrs[5] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;
   attrs[0].val.clusterDim.x = 2;
   attrs[0].val.clusterDim.y = 1;
@@ -599,8 +601,14 @@ void Run(TensorView a_QN, TensorView a_QS, TensorView a_QR, TensorView a_CKV, Te
   attrs[3].val.preferredClusterDim.x = 4;
   attrs[3].val.preferredClusterDim.y = 1;
   attrs[3].val.preferredClusterDim.z = 1;
+  int n = 4;
+  if (a_enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   config.attrs = attrs;
-  config.numAttrs = 4;
+  config.numAttrs = n;
   CheckCuda(cudaLaunchKernelExC(&config,
                                 reinterpret_cast<const void*>(
                                     kernel_cake_rubin_mla_nvfp4_decode_211b49b794a7df09262e),

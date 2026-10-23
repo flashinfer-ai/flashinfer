@@ -221,10 +221,13 @@ class MoEEpMegaLayer(nn.Module):
         inherits the layer's configuration. A dictionary selects fixed knobs
         for this handle and is copied before allocation. The layer must use
         fixed knobs, and its default workspace must not already be allocated
-        when overriding that capacity.
+        when overriding its profile.
 
         ``live_tokens`` selects an offline workload profile without shrinking
         capacity. Explicit knobs take precedence over that profile's cache.
+        ``live_tokens=None`` selects full capacity, even when the layer has a
+        different default tuning profile. Handles retain their compiled tactics
+        and stable addresses.
         Call collectively with matching arguments on all EP ranks before
         capture. Only one live handle per (capacity, live_tokens) is allowed.
         """
@@ -254,9 +257,9 @@ class MoEEpMegaLayer(nn.Module):
                 "a MegaMoE workspace profile for max_tokens_per_rank="
                 f"{max_tokens_per_rank}, live_tokens={live_tokens} already exists on this layer"
             )
-        is_default_capacity = (
-            live_tokens is None
-            and max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+        is_default_profile = (
+            max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+            and live_tokens == self._fleet_params.tuning_live_tokens
         )
         kernel = self._kernel
         if knobs is not None:
@@ -268,7 +271,7 @@ class MoEEpMegaLayer(nn.Module):
                 or not hasattr(self._megakernel_config, "knobs")
             ):
                 raise MoEEpConfigError("this MegaMoE backend does not support knobs")
-            if is_default_capacity and self._workspace is not None:
+            if is_default_profile and self._workspace is not None:
                 raise MoEEpConfigError(
                     "cannot override knobs for an already allocated default workspace"
                 )
@@ -282,7 +285,7 @@ class MoEEpMegaLayer(nn.Module):
             tuning_live_tokens=live_tokens,
         )
         kernel.validate_init(self._bootstrap, fleet_params)
-        if is_default_capacity and self._workspace is not None:
+        if is_default_profile and self._workspace is not None:
             # Transfer the already-lazy-allocated default profile into the
             # explicit handle without acquiring a second pooled reference.
             backend_workspace = self._workspace
@@ -296,7 +299,7 @@ class MoEEpMegaLayer(nn.Module):
             self, fleet_params, backend_workspace, kernel=kernel
         )
         self._workspaces[profile_key] = handle
-        if is_default_capacity:
+        if is_default_profile:
             self._default_workspace_handle = handle
         return handle
 
@@ -669,7 +672,7 @@ class MoEEpMegaLayer(nn.Module):
         until the next launch reuses the pooled physical workspace.
         """
         if self._kernel.supports_unfinalized_output:
-            raise MoEEpConfigError("do_finalize=False requires forward_unfinalized()")
+            raise MoEEpConfigError("finalize_mode=NONE requires forward_unfinalized()")
         if return_workspace_view and t.output is not None:
             raise MoEEpConfigError(
                 "return_workspace_view=True cannot be combined with t.output"
@@ -726,10 +729,11 @@ class MoEEpMegaLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return GEMM2 rows, remaining routing weights, and a route-to-row map.
 
-        Requires ``do_finalize=False``. Results are contiguous BF16
+        Requires ``finalize_mode=FinalizeMode.NONE``. Results are contiguous BF16
         ``[T * top_k, hidden]`` rows, FP32 ``[T, top_k]`` weights, and an int32
         ``[T, top_k]`` identity map whose entries index the first result.
-        Weights are one when ``apply_topk_in_fc1=True`` already applied routing.
+        Weights are one when ``apply_routing_weights_before_fc2=True`` already
+        applied routing.
         These tensors match the unfinalized TRTLLM MoE output layout.
 
         All results borrow pooled workspace storage: consume them on the current
@@ -739,7 +743,7 @@ class MoEEpMegaLayer(nn.Module):
         """
         if not self._kernel.supports_unfinalized_output:
             raise MoEEpConfigError(
-                "forward_unfinalized() requires a backend with do_finalize=False"
+                "forward_unfinalized() requires finalize_mode=FinalizeMode.NONE"
             )
         _, backend_workspace, kernel, quantize_input, transformed_weights = (
             self._prepare_inputs(t, workspace=workspace)

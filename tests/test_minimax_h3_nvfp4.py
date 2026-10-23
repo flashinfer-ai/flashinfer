@@ -78,21 +78,112 @@ def test_prepared_api_preserves_caller_owned_outputs(monkeypatch) -> None:
         operation.run(**{**values, "x": object()})
 
 
+def test_prepared_api_e4m3_returns_no_scale_tile(monkeypatch) -> None:
+    names = [n for n in _RUN_TENSOR_NAMES if n not in ("out_global_scale", "out_sf")]
+    values = {name: object() for name in names}
+    values["qkv_scales"] = object()
+    calls = []
+
+    class _Prepared:
+        def __call__(self):
+            calls.append("run")
+            return values["out_q"], None
+
+    generated = ModuleType("flashinfer.diffusion_ops.cake_minimax_h3_nvfp4")
+
+    def _prepare(**kwargs):
+        calls.append(kwargs)
+        return _Prepared()
+
+    generated.prepare_minimax_h3_nvfp4_pre_attention = _prepare
+    monkeypatch.setitem(sys.modules, generated.__name__, generated)
+
+    operation = MiniMaxH3Nvfp4PreAttention(
+        **values,
+        activation_q=object(),
+        activation_sf=object(),
+        P=8,
+        out_format="e4m3",
+    )
+    actual = operation.run(**values)
+
+    assert calls[0]["out_format"] == "e4m3"
+    assert calls[0]["qkv_scales"] is values["qkv_scales"]
+    assert calls[0]["out_global_scale"] is None and calls[0]["out_sf"] is None
+    assert operation.out_format == "e4m3"
+    assert actual[0] is values["out_q"] and actual[1] is None
+
+    with pytest.raises(ValueError, match="qkv_scales"):
+        operation.run(**{**values, "qkv_scales": object()})
+
+
 @pytest.mark.parametrize(
     ("capability", "expected"),
-    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a")],
 )
 def test_exact_architecture_router(monkeypatch, capability, expected) -> None:
-    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
+
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
-    assert router.minimax_h3_nvfp4_target(torch.device("cuda")) == expected
+    assert ops.minimax_h3_nvfp4_target(torch.device("cuda")) == expected
+    norm, gemm = ops.minimax_h3_nvfp4_programs(torch.device("cuda"), "e4m3")
+    assert expected in norm.targets and gemm.targets == (expected,)
+    assert gemm is not ops.minimax_h3_nvfp4_programs(torch.device("cuda"), "nvfp4")[1]
 
 
-def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
-    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+@pytest.mark.parametrize("capability", [(9, 0), (10, 7), (12, 0)])
+def test_architecture_router_rejects_cross_routing(monkeypatch, capability) -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
     with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
-        router.minimax_h3_nvfp4_target(torch.device("cuda"))
+        ops.minimax_h3_nvfp4_target(torch.device("cuda"))
+
+
+@pytest.mark.parametrize(
+    ("out_format", "missing", "extra", "message"),
+    [
+        ("nvfp4", ("out_sf",), {}, "out_global_scale and out_sf are required"),
+        (
+            "nvfp4",
+            ("out_global_scale",),
+            {},
+            "out_global_scale and out_sf are required",
+        ),
+        ("nvfp4", (), {"qkv_scales": "qkv_scales"}, "qkv_scales must be None"),
+        ("e4m3", ("out_global_scale", "out_sf"), {}, "qkv_scales is required"),
+        (
+            "e4m3",
+            ("out_global_scale",),
+            {"qkv_scales": "qkv_scales"},
+            "out_global_scale and out_sf must be None",
+        ),
+        ("mxfp8", (), {}, "out_format must be one of"),
+    ],
+)
+def test_output_format_contract_is_checked_before_the_device(
+    out_format, missing, extra, message
+) -> None:
+    """The format's operand set is validated before any CUDA tensor is required (a CPU-only check)."""
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
+
+    x = torch.zeros((4, 5376), dtype=torch.bfloat16)
+    placeholder = torch.zeros((1,), dtype=torch.float32)
+    kwargs = {
+        name: placeholder
+        for name in _RUN_TENSOR_NAMES
+        if name != "x" and name not in missing
+    }
+    kwargs.update({name: placeholder for name in extra})
+    with pytest.raises(ValueError, match=message):
+        ops.prepare_minimax_h3_nvfp4_pre_attention(
+            x=x,
+            activation_q=placeholder,
+            activation_sf=placeholder,
+            P=8,
+            out_format=out_format,
+            **kwargs,
+        )
 
 
 def _prepare_zero_smoke(
@@ -100,6 +191,7 @@ def _prepare_zero_smoke(
     M: int = 1,
     P: int = 8,
     configure: Optional[Callable[[dict], None]] = None,
+    out_format: str = "nvfp4",
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
@@ -107,15 +199,12 @@ def _prepare_zero_smoke(
     ):
         pytest.skip("requires SM100a or SM103a")
 
-    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
 
     hidden, qkv_width, head_dim, fp4_block = 5376, 21504, 128, 16
     device = torch.device("cuda")
-    rows_per_destination = M * (56 // P) * 3
-    out_sf_stride = ((rows_per_destination + 127) // 128 * 128) * (
-        head_dim // fp4_block
-    )
     activation_sf_len = ((M + 127) // 128 * 128) * (hidden // fp4_block)
+    shapes = ops.minimax_h3_nvfp4_output_shapes(M, P, out_format)
     values = {
         "x": torch.zeros((M, hidden), dtype=torch.bfloat16, device=device),
         "x_norm_weight": torch.ones((hidden,), dtype=torch.bfloat16, device=device),
@@ -133,24 +222,29 @@ def _prepare_zero_smoke(
         "q_norm_weight": torch.ones((head_dim,), dtype=torch.bfloat16, device=device),
         "k_norm_weight": torch.ones((head_dim,), dtype=torch.bfloat16, device=device),
         "rope_cos_sin": torch.zeros((M, 96), dtype=torch.bfloat16, device=device),
-        "out_global_scale": torch.ones((1,), dtype=torch.float32, device=device),
-        "out_q": torch.ones(
-            (P, M, 56 // P, 3, head_dim // 2),
-            dtype=torch.uint8,
-            device=device,
-        ),
-        "out_sf": torch.full((P, out_sf_stride), 255, dtype=torch.uint8, device=device),
+        # Every output byte starts non-zero so a zero result is the kernel's.
+        "out_q": torch.full(
+            shapes["out_q"][0], 0x7F, dtype=torch.uint8, device=device
+        ).view(shapes["out_q"][1]),
     }
+    if out_format == "nvfp4":
+        assert shapes["out_sf"] is not None
+        values["out_global_scale"] = torch.ones(
+            (1,), dtype=torch.float32, device=device
+        )
+        values["out_sf"] = torch.full(
+            shapes["out_sf"][0], 255, dtype=torch.uint8, device=device
+        )
+    else:
+        values["qkv_scales"] = torch.ones((3,), dtype=torch.float32, device=device)
     if configure is not None:
         # The fused route derives alpha and the CTA-pair-ordered weight scales at
         # preparation, so operand values a test depends on are set before the
         # operation is prepared (the E2M1 weight bytes are still read in place).
         configure(values)
-    route = router.minimax_h3_nvfp4_route_record(device, P)
-    assert set(route["stages"]) == {
-        "norm_adaln_nvfp4_quantize",
-        "qkv_nvfp4_gemm_fused_pack",
-    }
+    norm, gemm = ops.minimax_h3_nvfp4_programs(device, out_format)
+    target = ops.minimax_h3_nvfp4_target(device)
+    assert target in norm.targets and gemm.targets == (target,)
     operation = MiniMaxH3Nvfp4PreAttention(
         **values,
         activation_q=torch.empty((M, hidden // 2), dtype=torch.uint8, device=device),
@@ -158,24 +252,35 @@ def _prepare_zero_smoke(
             (activation_sf_len,), dtype=torch.uint8, device=device
         ),
         P=P,
+        out_format=out_format,
     )
     return operation, values
 
 
+def _assert_zero_outputs(actual_q, actual_sf, values: dict) -> None:
+    assert actual_q is values["out_q"]
+    assert torch.count_nonzero(actual_q.view(torch.uint8)).item() == 0
+    if "out_sf" in values:
+        assert actual_sf is values["out_sf"]
+        assert torch.count_nonzero(actual_sf).item() == 0
+    else:
+        assert actual_sf is None
+
+
+@pytest.mark.parametrize("out_format", ["nvfp4", "e4m3"])
 @pytest.mark.parametrize("invalid_index", [-1, 9, -(2**31), 2**31 - 1])
-def test_invalid_adaln_row_writes_zero_to_caller_outputs(invalid_index) -> None:
-    operation, values = _prepare_zero_smoke(invalid_index)
+def test_invalid_adaln_row_writes_zero_to_caller_outputs(
+    invalid_index, out_format
+) -> None:
+    operation, values = _prepare_zero_smoke(invalid_index, out_format=out_format)
     actual_q, actual_sf = operation.run(**values)
     torch.cuda.synchronize()
-
-    assert actual_q is values["out_q"]
-    assert actual_sf is values["out_sf"]
-    assert torch.count_nonzero(actual_q).item() == 0
-    assert torch.count_nonzero(actual_sf).item() == 0
+    _assert_zero_outputs(actual_q, actual_sf, values)
 
 
-def test_prepared_api_cuda_graph_replay() -> None:
-    operation, values = _prepare_zero_smoke(-1)
+@pytest.mark.parametrize("out_format", ["nvfp4", "e4m3"])
+def test_prepared_api_cuda_graph_replay(out_format) -> None:
+    operation, values = _prepare_zero_smoke(-1, out_format=out_format)
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
@@ -185,15 +290,12 @@ def test_prepared_api_cuda_graph_replay() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_q, captured_sf = operation.run(**values)
-    values["out_q"].fill_(1)
-    values["out_sf"].fill_(255)
+    values["out_q"].view(torch.uint8).fill_(0x7F)
+    if "out_sf" in values:
+        values["out_sf"].fill_(255)
     graph.replay()
     torch.cuda.synchronize()
-
-    assert captured_q is values["out_q"]
-    assert captured_sf is values["out_sf"]
-    assert torch.count_nonzero(captured_q).item() == 0
-    assert torch.count_nonzero(captured_sf).item() == 0
+    _assert_zero_outputs(captured_q, captured_sf, values)
 
 
 def test_prepared_instances_run_on_independent_streams() -> None:
@@ -245,28 +347,21 @@ def test_stage_launch_grids_follow_the_runtime_token_count(
 ) -> None:
     from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
 
-    norm_record = {
-        "launch_grid_rule": {
-            "kind": "norm_rows",
-            "rows_per_cta": 2,
-            "row_alignment": 128,
-        }
+    assert ops.minimax_h3_nvfp4_launch_grid("norm", M) == expected_norm
+    assert ops.minimax_h3_nvfp4_launch_grid("gemm", M) == expected_gemm
+    assert ops._gemm_row_tiles(M) == expected_row_tiles
+    with pytest.raises(ValueError, match="unknown stage"):
+        ops.minimax_h3_nvfp4_launch_grid("other", M)
+    rows = M * (56 // P) * 3
+    assert ops.minimax_h3_nvfp4_rows_per_destination(M, P) == rows
+    assert ops.minimax_h3_nvfp4_output_shapes(M, P, "nvfp4") == {
+        "out_q": ((P, M, 56 // P, 3, 64), torch.uint8),
+        "out_sf": ((P, (rows + 127) // 128 * 128 * 8), torch.uint8),
     }
-    gemm_record = {
-        "launch_grid_rule": {
-            "kind": "gemm_cluster_tiles",
-            "block_m": 128,
-            "cta_group": 2,
-            "n_tiles": 84,
-        }
+    assert ops.minimax_h3_nvfp4_output_shapes(M, P, "e4m3") == {
+        "out_q": ((P, M, 56 // P, 3, 128), torch.float8_e4m3fn),
+        "out_sf": None,
     }
-    assert ops._stage_launch_grid(norm_record, M=M, P=P) == expected_norm
-    assert ops._stage_launch_grid(gemm_record, M=M, P=P) == expected_gemm
-    assert (
-        ops._gemm_row_tiles(gemm_record["launch_grid_rule"], M=M) == expected_row_tiles
-    )
-    with pytest.raises(RuntimeError, match="launch grid rule"):
-        ops._stage_launch_grid({"launch_grid_rule": {"kind": "other"}}, M=M, P=P)
 
 
 def test_fused_gemm_weight_scale_repack_orders_cta_pairs() -> None:
@@ -795,3 +890,172 @@ def test_numerical_reference(M: int, P: int) -> None:
     # BF16 inputs and only accumulation-order effects on V may differ.
     assert float((out_q != expected_q).float().mean()) <= 0.01
     assert float((logical_actual != logical_expected).float().mean()) <= 0.01
+
+
+# ---------------------------------------------------------------------------
+# E4M3 output mode
+# ---------------------------------------------------------------------------
+
+
+def _e4m3_cast(values: torch.Tensor, out_scale: torch.Tensor) -> torch.Tensor:
+    """``e4m3(value * out_scale)``: float32 multiply, round to nearest even, saturating at +-448."""
+    scaled = (values.float() * out_scale).clamp(-_E4M3_MAX, _E4M3_MAX)
+    return scaled.to(torch.float8_e4m3fn)
+
+
+def _e4m3_step(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """One E4M3 code step at the larger magnitude: 2^(e - 3) for normals, 2^-9 below 2^-6."""
+    magnitude = torch.maximum(a.abs(), b.abs()).clamp_min(2.0**-6)
+    return torch.exp2(torch.floor(torch.log2(magnitude)) - 3.0)
+
+
+def _make_e4m3_values(M: int, P: int, qkv_scales, device: torch.device) -> dict:
+    values = _make_numerical_values(M, P, device)
+    del values["out_global_scale"], values["out_sf"]
+    values["out_q"] = torch.full(
+        (P, M, _NUM_HEADS // P, 3, _HEAD_DIM), 0x7F, dtype=torch.uint8, device=device
+    ).view(torch.float8_e4m3fn)
+    values["qkv_scales"] = torch.tensor(qkv_scales, dtype=torch.float32, device=device)
+    return values
+
+
+def test_e4m3_rejects_wrong_operands() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100a or SM103a")
+    device = torch.device("cuda")
+    values = _make_e4m3_values(1, 8, (0.5, 2.0, 0.25), device)
+    common = {
+        "activation_q": torch.empty(
+            (1, _HIDDEN // 2), dtype=torch.uint8, device=device
+        ),
+        "activation_sf": torch.empty(
+            (128 * (_HIDDEN // _FP4_BLOCK),), dtype=torch.uint8, device=device
+        ),
+        "P": 8,
+        "out_format": "e4m3",
+    }
+    with pytest.raises(ValueError, match=r"qkv_scales must have shape \(3,\)"):
+        MiniMaxH3Nvfp4PreAttention(
+            **{**values, "qkv_scales": torch.ones((2,), device=device)}, **common
+        )
+    with pytest.raises(TypeError, match="out_q must have dtype torch.float8_e4m3fn"):
+        MiniMaxH3Nvfp4PreAttention(
+            **{**values, "out_q": values["out_q"].view(torch.uint8)}, **common
+        )
+    with pytest.raises(ValueError, match="out_q must have shape"):
+        MiniMaxH3Nvfp4PreAttention(
+            **{**values, "out_q": values["out_q"][..., : _HEAD_DIM // 2].contiguous()},
+            **common,
+        )
+
+
+@pytest.mark.parametrize(
+    ("M", "P", "qkv_scales"),
+    [
+        (1, 8, (0.5, 2.0, 2.0**-8)),
+        (129, 8, (4.0 / 448, 4.0 / 448, 8.0 / 448)),
+        (2048, 1, (0.3, 1.7, 0.9)),
+        (4097, 2, (4.0 / 448, 4.0 / 448, 8.0 / 448)),
+    ],
+)
+def test_e4m3_numerical_reference(M: int, P: int, qkv_scales) -> None:
+    """``out_format="e4m3"`` writes the same fused values, cast per kind.
+
+    The stage-1 and fused-epilogue checks are the NVFP4 route's (the e4m3
+    program shares the stage-1 program and the GEMM + Q/K RMSNorm + RoPE of
+    its NVFP4 sibling).  The Q and K bytes must equal the cast of the kernel's
+    own BF16 debug values exactly; the V bytes must equal the cast of the
+    oracle V within one E4M3 code step, with at most 1 % of the elements
+    differing (fp32 accumulation order); ``out_sf`` is ``None``; a second
+    launch reproduces the bytes.  The scales cover a saturating V (M = 1),
+    the fixture's magnitudes at ~448 full scale, and non-power-of-two scales
+    (M = 2048), which pin the multiply spelling and its ties.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100a or SM103a")
+
+    device = torch.device("cuda")
+    values = _make_e4m3_values(M, P, qkv_scales, device)
+    debug = {
+        "debug_adaln_bf16": torch.full(
+            (M, _HIDDEN), float("nan"), dtype=torch.bfloat16, device=device
+        ),
+        "debug_q_bf16": torch.full(
+            (M, _NUM_HEADS, _HEAD_DIM),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        "debug_k_bf16": torch.full(
+            (M, _NUM_HEADS, _HEAD_DIM),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+    }
+    activation_q = torch.empty((M, _HIDDEN // 2), dtype=torch.uint8, device=device)
+    activation_sf = torch.empty(
+        (_round_up(M, 128) * (_HIDDEN // _FP4_BLOCK),), dtype=torch.uint8, device=device
+    )
+    operation = MiniMaxH3Nvfp4PreAttention(
+        **values,
+        activation_q=activation_q,
+        activation_sf=activation_sf,
+        P=P,
+        out_format="e4m3",
+        **debug,
+    )
+    out_q, out_sf = operation.run(**values, **debug)
+    torch.cuda.synchronize()
+    assert out_q is values["out_q"] and out_sf is None
+    expected = _reference(values, activation_q, activation_sf)
+
+    torch.testing.assert_close(
+        debug["debug_adaln_bf16"], expected["adaln"], atol=1e-2, rtol=1e-2
+    )
+    _assert_activation_quantization(
+        debug["debug_adaln_bf16"],
+        activation_q,
+        activation_sf,
+        values["x_global_scale"],
+        M,
+    )
+    _assert_within(
+        debug["debug_q_bf16"], expected["q"], expected["q_bound"], "debug_q_bf16"
+    )
+    _assert_within(
+        debug["debug_k_bf16"], expected["k"], expected["k_bound"], "debug_k_bf16"
+    )
+
+    out_scale = (1.0 / values["qkv_scales"].double()).float()
+    fused = torch.stack(
+        (debug["debug_q_bf16"], debug["debug_k_bf16"], expected["v"]), dim=2
+    )
+    destination = fused.view(M, P, _NUM_HEADS // P, 3, _HEAD_DIM).permute(1, 0, 2, 3, 4)
+    oracle = _e4m3_cast(destination, out_scale.view(1, 1, 1, 3, 1)).contiguous()
+    actual_bytes = out_q.view(torch.uint8)
+    oracle_bytes = oracle.view(torch.uint8)
+    # Q and K: the kernel casts the BF16 values it also reports as debug outputs.
+    assert torch.equal(actual_bytes[:, :, :, :2], oracle_bytes[:, :, :, :2])
+    # V: the oracle's BF16 GEMM output may differ from the kernel's by a BF16
+    # rounding flip (accumulation order), which moves the cast by one code at most.
+    actual_v, oracle_v = out_q[:, :, :, 2].float(), oracle[:, :, :, 2].float()
+    assert torch.isfinite(actual_v).all()
+    error = (actual_v - oracle_v).abs()
+    assert bool((error <= _e4m3_step(actual_v, oracle_v) + 1e-7).all()), float(
+        error.max()
+    )
+    differing = actual_bytes[:, :, :, 2] != oracle_bytes[:, :, :, 2]
+    assert float(differing.float().mean()) <= 0.01
+
+    first = actual_bytes.clone()
+    out_q.view(torch.uint8).fill_(0x55)
+    operation.run(**values, **debug)
+    torch.cuda.synchronize()
+    assert torch.equal(out_q.view(torch.uint8), first)

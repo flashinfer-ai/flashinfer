@@ -68,6 +68,12 @@ __device__ __forceinline__ float mul_f32_rn_ftz(float a, float b) {
     return r;
 }
 
+__device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
+    float r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
@@ -195,9 +201,6 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
     const int tmem_accum = taddr;
     const int tmem_sfa = taddr + 448;
     const int tmem_sfb = taddr + 464;
-
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
     if (warp >= 4 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -282,18 +285,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         asm volatile("barrier.sync 7, 128;" ::: "memory");
                         int token = base_token;
                         float tok = smem_v4[token_block * 64 + token];
-                        float _mul_0;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(mul_f32_rn_ftz(frag[0], tok)), "f"(sc));
-                        converted[0] = _mul_0;
-                        float _mul_1;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(mul_f32_rn_ftz(frag[2], tok)), "f"(sc));
-                        converted[1] = _mul_1;
-                        float _mul_2;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(mul_f32_rn_ftz(frag[32], tok)), "f"(sc));
-                        converted[2] = _mul_2;
-                        float _mul_3;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(mul_f32_rn_ftz(frag[34], tok)), "f"(sc));
-                        converted[3] = _mul_3;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[0], tok), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[2], tok), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[32], tok), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[34], tok), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -308,18 +303,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_0 = base_token + 1;
                         float tok_1 = smem_v4[token_block * 64 + token_0];
-                        float _mul_4;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(mul_f32_rn_ftz(frag[1], tok_1)), "f"(sc));
-                        converted[0] = _mul_4;
-                        float _mul_5;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(mul_f32_rn_ftz(frag[3], tok_1)), "f"(sc));
-                        converted[1] = _mul_5;
-                        float _mul_6;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(mul_f32_rn_ftz(frag[33], tok_1)), "f"(sc));
-                        converted[2] = _mul_6;
-                        float _mul_7;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(mul_f32_rn_ftz(frag[35], tok_1)), "f"(sc));
-                        converted[3] = _mul_7;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[1], tok_1), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[3], tok_1), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[33], tok_1), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[35], tok_1), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -334,18 +321,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_3 = base_token + 8;
                         float tok_4 = smem_v4[token_block * 64 + token_3];
-                        float _mul_8;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_8) : "f"(mul_f32_rn_ftz(frag[4], tok_4)), "f"(sc));
-                        converted[0] = _mul_8;
-                        float _mul_9;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_9) : "f"(mul_f32_rn_ftz(frag[6], tok_4)), "f"(sc));
-                        converted[1] = _mul_9;
-                        float _mul_10;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_10) : "f"(mul_f32_rn_ftz(frag[36], tok_4)), "f"(sc));
-                        converted[2] = _mul_10;
-                        float _mul_11;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_11) : "f"(mul_f32_rn_ftz(frag[38], tok_4)), "f"(sc));
-                        converted[3] = _mul_11;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[4], tok_4), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[6], tok_4), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[36], tok_4), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[38], tok_4), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -360,18 +339,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_6 = base_token + 8 + 1;
                         float tok_7 = smem_v4[token_block * 64 + token_6];
-                        float _mul_12;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_12) : "f"(mul_f32_rn_ftz(frag[5], tok_7)), "f"(sc));
-                        converted[0] = _mul_12;
-                        float _mul_13;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_13) : "f"(mul_f32_rn_ftz(frag[7], tok_7)), "f"(sc));
-                        converted[1] = _mul_13;
-                        float _mul_14;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_14) : "f"(mul_f32_rn_ftz(frag[37], tok_7)), "f"(sc));
-                        converted[2] = _mul_14;
-                        float _mul_15;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_15) : "f"(mul_f32_rn_ftz(frag[39], tok_7)), "f"(sc));
-                        converted[3] = _mul_15;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[5], tok_7), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[7], tok_7), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[37], tok_7), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[39], tok_7), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -386,18 +357,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_9 = base_token + 16;
                         float tok_10 = smem_v4[token_block * 64 + token_9];
-                        float _mul_16;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_16) : "f"(mul_f32_rn_ftz(frag[8], tok_10)), "f"(sc));
-                        converted[0] = _mul_16;
-                        float _mul_17;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_17) : "f"(mul_f32_rn_ftz(frag[10], tok_10)), "f"(sc));
-                        converted[1] = _mul_17;
-                        float _mul_18;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_18) : "f"(mul_f32_rn_ftz(frag[40], tok_10)), "f"(sc));
-                        converted[2] = _mul_18;
-                        float _mul_19;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_19) : "f"(mul_f32_rn_ftz(frag[42], tok_10)), "f"(sc));
-                        converted[3] = _mul_19;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[8], tok_10), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[10], tok_10), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[40], tok_10), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[42], tok_10), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -412,18 +375,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_12 = base_token + 16 + 1;
                         float tok_13 = smem_v4[token_block * 64 + token_12];
-                        float _mul_20;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_20) : "f"(mul_f32_rn_ftz(frag[9], tok_13)), "f"(sc));
-                        converted[0] = _mul_20;
-                        float _mul_21;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_21) : "f"(mul_f32_rn_ftz(frag[11], tok_13)), "f"(sc));
-                        converted[1] = _mul_21;
-                        float _mul_22;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_22) : "f"(mul_f32_rn_ftz(frag[41], tok_13)), "f"(sc));
-                        converted[2] = _mul_22;
-                        float _mul_23;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_23) : "f"(mul_f32_rn_ftz(frag[43], tok_13)), "f"(sc));
-                        converted[3] = _mul_23;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[9], tok_13), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[11], tok_13), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[41], tok_13), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[43], tok_13), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -438,18 +393,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_15 = base_token + 24;
                         float tok_16 = smem_v4[token_block * 64 + token_15];
-                        float _mul_24;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_24) : "f"(mul_f32_rn_ftz(frag[12], tok_16)), "f"(sc));
-                        converted[0] = _mul_24;
-                        float _mul_25;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_25) : "f"(mul_f32_rn_ftz(frag[14], tok_16)), "f"(sc));
-                        converted[1] = _mul_25;
-                        float _mul_26;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_26) : "f"(mul_f32_rn_ftz(frag[44], tok_16)), "f"(sc));
-                        converted[2] = _mul_26;
-                        float _mul_27;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_27) : "f"(mul_f32_rn_ftz(frag[46], tok_16)), "f"(sc));
-                        converted[3] = _mul_27;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[12], tok_16), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[14], tok_16), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[44], tok_16), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[46], tok_16), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -464,18 +411,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_18 = base_token + 24 + 1;
                         float tok_19 = smem_v4[token_block * 64 + token_18];
-                        float _mul_28;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_28) : "f"(mul_f32_rn_ftz(frag[13], tok_19)), "f"(sc));
-                        converted[0] = _mul_28;
-                        float _mul_29;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_29) : "f"(mul_f32_rn_ftz(frag[15], tok_19)), "f"(sc));
-                        converted[1] = _mul_29;
-                        float _mul_30;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_30) : "f"(mul_f32_rn_ftz(frag[45], tok_19)), "f"(sc));
-                        converted[2] = _mul_30;
-                        float _mul_31;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_31) : "f"(mul_f32_rn_ftz(frag[47], tok_19)), "f"(sc));
-                        converted[3] = _mul_31;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[13], tok_19), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[15], tok_19), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[45], tok_19), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[47], tok_19), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -490,18 +429,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_21 = base_token + 32;
                         float tok_22 = smem_v4[token_block * 64 + token_21];
-                        float _mul_32;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_32) : "f"(mul_f32_rn_ftz(frag[16], tok_22)), "f"(sc));
-                        converted[0] = _mul_32;
-                        float _mul_33;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_33) : "f"(mul_f32_rn_ftz(frag[18], tok_22)), "f"(sc));
-                        converted[1] = _mul_33;
-                        float _mul_34;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_34) : "f"(mul_f32_rn_ftz(frag[48], tok_22)), "f"(sc));
-                        converted[2] = _mul_34;
-                        float _mul_35;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_35) : "f"(mul_f32_rn_ftz(frag[50], tok_22)), "f"(sc));
-                        converted[3] = _mul_35;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[16], tok_22), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[18], tok_22), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[48], tok_22), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[50], tok_22), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -516,18 +447,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_24 = base_token + 32 + 1;
                         float tok_25 = smem_v4[token_block * 64 + token_24];
-                        float _mul_36;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_36) : "f"(mul_f32_rn_ftz(frag[17], tok_25)), "f"(sc));
-                        converted[0] = _mul_36;
-                        float _mul_37;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_37) : "f"(mul_f32_rn_ftz(frag[19], tok_25)), "f"(sc));
-                        converted[1] = _mul_37;
-                        float _mul_38;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_38) : "f"(mul_f32_rn_ftz(frag[49], tok_25)), "f"(sc));
-                        converted[2] = _mul_38;
-                        float _mul_39;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_39) : "f"(mul_f32_rn_ftz(frag[51], tok_25)), "f"(sc));
-                        converted[3] = _mul_39;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[17], tok_25), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[19], tok_25), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[49], tok_25), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[51], tok_25), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -542,18 +465,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_27 = base_token + 40;
                         float tok_28 = smem_v4[token_block * 64 + token_27];
-                        float _mul_40;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_40) : "f"(mul_f32_rn_ftz(frag[20], tok_28)), "f"(sc));
-                        converted[0] = _mul_40;
-                        float _mul_41;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_41) : "f"(mul_f32_rn_ftz(frag[22], tok_28)), "f"(sc));
-                        converted[1] = _mul_41;
-                        float _mul_42;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_42) : "f"(mul_f32_rn_ftz(frag[52], tok_28)), "f"(sc));
-                        converted[2] = _mul_42;
-                        float _mul_43;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_43) : "f"(mul_f32_rn_ftz(frag[54], tok_28)), "f"(sc));
-                        converted[3] = _mul_43;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[20], tok_28), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[22], tok_28), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[52], tok_28), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[54], tok_28), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -568,18 +483,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_30 = base_token + 40 + 1;
                         float tok_31 = smem_v4[token_block * 64 + token_30];
-                        float _mul_44;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_44) : "f"(mul_f32_rn_ftz(frag[21], tok_31)), "f"(sc));
-                        converted[0] = _mul_44;
-                        float _mul_45;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_45) : "f"(mul_f32_rn_ftz(frag[23], tok_31)), "f"(sc));
-                        converted[1] = _mul_45;
-                        float _mul_46;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_46) : "f"(mul_f32_rn_ftz(frag[53], tok_31)), "f"(sc));
-                        converted[2] = _mul_46;
-                        float _mul_47;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_47) : "f"(mul_f32_rn_ftz(frag[55], tok_31)), "f"(sc));
-                        converted[3] = _mul_47;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[21], tok_31), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[23], tok_31), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[53], tok_31), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[55], tok_31), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -594,18 +501,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_33 = base_token + 48;
                         float tok_34 = smem_v4[token_block * 64 + token_33];
-                        float _mul_48;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_48) : "f"(mul_f32_rn_ftz(frag[24], tok_34)), "f"(sc));
-                        converted[0] = _mul_48;
-                        float _mul_49;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_49) : "f"(mul_f32_rn_ftz(frag[26], tok_34)), "f"(sc));
-                        converted[1] = _mul_49;
-                        float _mul_50;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_50) : "f"(mul_f32_rn_ftz(frag[56], tok_34)), "f"(sc));
-                        converted[2] = _mul_50;
-                        float _mul_51;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_51) : "f"(mul_f32_rn_ftz(frag[58], tok_34)), "f"(sc));
-                        converted[3] = _mul_51;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[24], tok_34), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[26], tok_34), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[56], tok_34), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[58], tok_34), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -620,18 +519,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_36 = base_token + 48 + 1;
                         float tok_37 = smem_v4[token_block * 64 + token_36];
-                        float _mul_52;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_52) : "f"(mul_f32_rn_ftz(frag[25], tok_37)), "f"(sc));
-                        converted[0] = _mul_52;
-                        float _mul_53;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_53) : "f"(mul_f32_rn_ftz(frag[27], tok_37)), "f"(sc));
-                        converted[1] = _mul_53;
-                        float _mul_54;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_54) : "f"(mul_f32_rn_ftz(frag[57], tok_37)), "f"(sc));
-                        converted[2] = _mul_54;
-                        float _mul_55;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_55) : "f"(mul_f32_rn_ftz(frag[59], tok_37)), "f"(sc));
-                        converted[3] = _mul_55;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[25], tok_37), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[27], tok_37), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[57], tok_37), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[59], tok_37), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -646,18 +537,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_39 = base_token + 56;
                         float tok_40 = smem_v4[token_block * 64 + token_39];
-                        float _mul_56;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_56) : "f"(mul_f32_rn_ftz(frag[28], tok_40)), "f"(sc));
-                        converted[0] = _mul_56;
-                        float _mul_57;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_57) : "f"(mul_f32_rn_ftz(frag[30], tok_40)), "f"(sc));
-                        converted[1] = _mul_57;
-                        float _mul_58;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_58) : "f"(mul_f32_rn_ftz(frag[60], tok_40)), "f"(sc));
-                        converted[2] = _mul_58;
-                        float _mul_59;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_59) : "f"(mul_f32_rn_ftz(frag[62], tok_40)), "f"(sc));
-                        converted[3] = _mul_59;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[28], tok_40), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[30], tok_40), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[60], tok_40), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[62], tok_40), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -672,18 +555,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_42 = base_token + 56 + 1;
                         float tok_43 = smem_v4[token_block * 64 + token_42];
-                        float _mul_60;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_60) : "f"(mul_f32_rn_ftz(frag[29], tok_43)), "f"(sc));
-                        converted[0] = _mul_60;
-                        float _mul_61;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_61) : "f"(mul_f32_rn_ftz(frag[31], tok_43)), "f"(sc));
-                        converted[1] = _mul_61;
-                        float _mul_62;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_62) : "f"(mul_f32_rn_ftz(frag[61], tok_43)), "f"(sc));
-                        converted[2] = _mul_62;
-                        float _mul_63;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_63) : "f"(mul_f32_rn_ftz(frag[63], tok_43)), "f"(sc));
-                        converted[3] = _mul_63;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[29], tok_43), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[31], tok_43), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[61], tok_43), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[63], tok_43), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -736,18 +611,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         asm volatile("barrier.sync 7, 128;" ::: "memory");
                         int token_47 = base_token;
                         float tok_48 = smem_v4[token_block_45 * 64 + token_47];
-                        float _mul_64;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_64) : "f"(mul_f32_rn_ftz(frag[0], tok_48)), "f"(sc));
-                        converted[0] = _mul_64;
-                        float _mul_65;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_65) : "f"(mul_f32_rn_ftz(frag[2], tok_48)), "f"(sc));
-                        converted[1] = _mul_65;
-                        float _mul_66;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_66) : "f"(mul_f32_rn_ftz(frag[32], tok_48)), "f"(sc));
-                        converted[2] = _mul_66;
-                        float _mul_67;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_67) : "f"(mul_f32_rn_ftz(frag[34], tok_48)), "f"(sc));
-                        converted[3] = _mul_67;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[0], tok_48), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[2], tok_48), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[32], tok_48), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[34], tok_48), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -762,18 +629,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_50 = base_token + 1;
                         float tok_51 = smem_v4[token_block_45 * 64 + token_50];
-                        float _mul_68;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_68) : "f"(mul_f32_rn_ftz(frag[1], tok_51)), "f"(sc));
-                        converted[0] = _mul_68;
-                        float _mul_69;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_69) : "f"(mul_f32_rn_ftz(frag[3], tok_51)), "f"(sc));
-                        converted[1] = _mul_69;
-                        float _mul_70;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_70) : "f"(mul_f32_rn_ftz(frag[33], tok_51)), "f"(sc));
-                        converted[2] = _mul_70;
-                        float _mul_71;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_71) : "f"(mul_f32_rn_ftz(frag[35], tok_51)), "f"(sc));
-                        converted[3] = _mul_71;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[1], tok_51), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[3], tok_51), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[33], tok_51), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[35], tok_51), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -788,18 +647,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_53 = base_token + 8;
                         float tok_54 = smem_v4[token_block_45 * 64 + token_53];
-                        float _mul_72;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_72) : "f"(mul_f32_rn_ftz(frag[4], tok_54)), "f"(sc));
-                        converted[0] = _mul_72;
-                        float _mul_73;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_73) : "f"(mul_f32_rn_ftz(frag[6], tok_54)), "f"(sc));
-                        converted[1] = _mul_73;
-                        float _mul_74;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_74) : "f"(mul_f32_rn_ftz(frag[36], tok_54)), "f"(sc));
-                        converted[2] = _mul_74;
-                        float _mul_75;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_75) : "f"(mul_f32_rn_ftz(frag[38], tok_54)), "f"(sc));
-                        converted[3] = _mul_75;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[4], tok_54), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[6], tok_54), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[36], tok_54), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[38], tok_54), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -814,18 +665,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_56 = base_token + 8 + 1;
                         float tok_57 = smem_v4[token_block_45 * 64 + token_56];
-                        float _mul_76;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_76) : "f"(mul_f32_rn_ftz(frag[5], tok_57)), "f"(sc));
-                        converted[0] = _mul_76;
-                        float _mul_77;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_77) : "f"(mul_f32_rn_ftz(frag[7], tok_57)), "f"(sc));
-                        converted[1] = _mul_77;
-                        float _mul_78;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_78) : "f"(mul_f32_rn_ftz(frag[37], tok_57)), "f"(sc));
-                        converted[2] = _mul_78;
-                        float _mul_79;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_79) : "f"(mul_f32_rn_ftz(frag[39], tok_57)), "f"(sc));
-                        converted[3] = _mul_79;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[5], tok_57), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[7], tok_57), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[37], tok_57), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[39], tok_57), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -840,18 +683,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_59 = base_token + 16;
                         float tok_60 = smem_v4[token_block_45 * 64 + token_59];
-                        float _mul_80;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_80) : "f"(mul_f32_rn_ftz(frag[8], tok_60)), "f"(sc));
-                        converted[0] = _mul_80;
-                        float _mul_81;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_81) : "f"(mul_f32_rn_ftz(frag[10], tok_60)), "f"(sc));
-                        converted[1] = _mul_81;
-                        float _mul_82;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_82) : "f"(mul_f32_rn_ftz(frag[40], tok_60)), "f"(sc));
-                        converted[2] = _mul_82;
-                        float _mul_83;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_83) : "f"(mul_f32_rn_ftz(frag[42], tok_60)), "f"(sc));
-                        converted[3] = _mul_83;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[8], tok_60), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[10], tok_60), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[40], tok_60), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[42], tok_60), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -866,18 +701,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_62 = base_token + 16 + 1;
                         float tok_63 = smem_v4[token_block_45 * 64 + token_62];
-                        float _mul_84;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_84) : "f"(mul_f32_rn_ftz(frag[9], tok_63)), "f"(sc));
-                        converted[0] = _mul_84;
-                        float _mul_85;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_85) : "f"(mul_f32_rn_ftz(frag[11], tok_63)), "f"(sc));
-                        converted[1] = _mul_85;
-                        float _mul_86;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_86) : "f"(mul_f32_rn_ftz(frag[41], tok_63)), "f"(sc));
-                        converted[2] = _mul_86;
-                        float _mul_87;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_87) : "f"(mul_f32_rn_ftz(frag[43], tok_63)), "f"(sc));
-                        converted[3] = _mul_87;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[9], tok_63), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[11], tok_63), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[41], tok_63), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[43], tok_63), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -892,18 +719,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_65 = base_token + 24;
                         float tok_66 = smem_v4[token_block_45 * 64 + token_65];
-                        float _mul_88;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_88) : "f"(mul_f32_rn_ftz(frag[12], tok_66)), "f"(sc));
-                        converted[0] = _mul_88;
-                        float _mul_89;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_89) : "f"(mul_f32_rn_ftz(frag[14], tok_66)), "f"(sc));
-                        converted[1] = _mul_89;
-                        float _mul_90;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_90) : "f"(mul_f32_rn_ftz(frag[44], tok_66)), "f"(sc));
-                        converted[2] = _mul_90;
-                        float _mul_91;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_91) : "f"(mul_f32_rn_ftz(frag[46], tok_66)), "f"(sc));
-                        converted[3] = _mul_91;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[12], tok_66), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[14], tok_66), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[44], tok_66), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[46], tok_66), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -918,18 +737,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_68 = base_token + 24 + 1;
                         float tok_69 = smem_v4[token_block_45 * 64 + token_68];
-                        float _mul_92;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_92) : "f"(mul_f32_rn_ftz(frag[13], tok_69)), "f"(sc));
-                        converted[0] = _mul_92;
-                        float _mul_93;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_93) : "f"(mul_f32_rn_ftz(frag[15], tok_69)), "f"(sc));
-                        converted[1] = _mul_93;
-                        float _mul_94;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_94) : "f"(mul_f32_rn_ftz(frag[45], tok_69)), "f"(sc));
-                        converted[2] = _mul_94;
-                        float _mul_95;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_95) : "f"(mul_f32_rn_ftz(frag[47], tok_69)), "f"(sc));
-                        converted[3] = _mul_95;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[13], tok_69), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[15], tok_69), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[45], tok_69), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[47], tok_69), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -944,18 +755,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_71 = base_token + 32;
                         float tok_72 = smem_v4[token_block_45 * 64 + token_71];
-                        float _mul_96;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_96) : "f"(mul_f32_rn_ftz(frag[16], tok_72)), "f"(sc));
-                        converted[0] = _mul_96;
-                        float _mul_97;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_97) : "f"(mul_f32_rn_ftz(frag[18], tok_72)), "f"(sc));
-                        converted[1] = _mul_97;
-                        float _mul_98;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_98) : "f"(mul_f32_rn_ftz(frag[48], tok_72)), "f"(sc));
-                        converted[2] = _mul_98;
-                        float _mul_99;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_99) : "f"(mul_f32_rn_ftz(frag[50], tok_72)), "f"(sc));
-                        converted[3] = _mul_99;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[16], tok_72), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[18], tok_72), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[48], tok_72), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[50], tok_72), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -970,18 +773,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_74 = base_token + 32 + 1;
                         float tok_75 = smem_v4[token_block_45 * 64 + token_74];
-                        float _mul_100;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_100) : "f"(mul_f32_rn_ftz(frag[17], tok_75)), "f"(sc));
-                        converted[0] = _mul_100;
-                        float _mul_101;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_101) : "f"(mul_f32_rn_ftz(frag[19], tok_75)), "f"(sc));
-                        converted[1] = _mul_101;
-                        float _mul_102;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_102) : "f"(mul_f32_rn_ftz(frag[49], tok_75)), "f"(sc));
-                        converted[2] = _mul_102;
-                        float _mul_103;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_103) : "f"(mul_f32_rn_ftz(frag[51], tok_75)), "f"(sc));
-                        converted[3] = _mul_103;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[17], tok_75), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[19], tok_75), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[49], tok_75), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[51], tok_75), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -996,18 +791,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_77 = base_token + 40;
                         float tok_78 = smem_v4[token_block_45 * 64 + token_77];
-                        float _mul_104;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_104) : "f"(mul_f32_rn_ftz(frag[20], tok_78)), "f"(sc));
-                        converted[0] = _mul_104;
-                        float _mul_105;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_105) : "f"(mul_f32_rn_ftz(frag[22], tok_78)), "f"(sc));
-                        converted[1] = _mul_105;
-                        float _mul_106;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_106) : "f"(mul_f32_rn_ftz(frag[52], tok_78)), "f"(sc));
-                        converted[2] = _mul_106;
-                        float _mul_107;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_107) : "f"(mul_f32_rn_ftz(frag[54], tok_78)), "f"(sc));
-                        converted[3] = _mul_107;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[20], tok_78), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[22], tok_78), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[52], tok_78), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[54], tok_78), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1022,18 +809,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_80 = base_token + 40 + 1;
                         float tok_81 = smem_v4[token_block_45 * 64 + token_80];
-                        float _mul_108;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_108) : "f"(mul_f32_rn_ftz(frag[21], tok_81)), "f"(sc));
-                        converted[0] = _mul_108;
-                        float _mul_109;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_109) : "f"(mul_f32_rn_ftz(frag[23], tok_81)), "f"(sc));
-                        converted[1] = _mul_109;
-                        float _mul_110;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_110) : "f"(mul_f32_rn_ftz(frag[53], tok_81)), "f"(sc));
-                        converted[2] = _mul_110;
-                        float _mul_111;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_111) : "f"(mul_f32_rn_ftz(frag[55], tok_81)), "f"(sc));
-                        converted[3] = _mul_111;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[21], tok_81), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[23], tok_81), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[53], tok_81), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[55], tok_81), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1048,18 +827,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_83 = base_token + 48;
                         float tok_84 = smem_v4[token_block_45 * 64 + token_83];
-                        float _mul_112;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_112) : "f"(mul_f32_rn_ftz(frag[24], tok_84)), "f"(sc));
-                        converted[0] = _mul_112;
-                        float _mul_113;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_113) : "f"(mul_f32_rn_ftz(frag[26], tok_84)), "f"(sc));
-                        converted[1] = _mul_113;
-                        float _mul_114;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_114) : "f"(mul_f32_rn_ftz(frag[56], tok_84)), "f"(sc));
-                        converted[2] = _mul_114;
-                        float _mul_115;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_115) : "f"(mul_f32_rn_ftz(frag[58], tok_84)), "f"(sc));
-                        converted[3] = _mul_115;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[24], tok_84), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[26], tok_84), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[56], tok_84), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[58], tok_84), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1074,18 +845,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_86 = base_token + 48 + 1;
                         float tok_87 = smem_v4[token_block_45 * 64 + token_86];
-                        float _mul_116;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_116) : "f"(mul_f32_rn_ftz(frag[25], tok_87)), "f"(sc));
-                        converted[0] = _mul_116;
-                        float _mul_117;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_117) : "f"(mul_f32_rn_ftz(frag[27], tok_87)), "f"(sc));
-                        converted[1] = _mul_117;
-                        float _mul_118;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_118) : "f"(mul_f32_rn_ftz(frag[57], tok_87)), "f"(sc));
-                        converted[2] = _mul_118;
-                        float _mul_119;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_119) : "f"(mul_f32_rn_ftz(frag[59], tok_87)), "f"(sc));
-                        converted[3] = _mul_119;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[25], tok_87), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[27], tok_87), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[57], tok_87), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[59], tok_87), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1100,18 +863,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_89 = base_token + 56;
                         float tok_90 = smem_v4[token_block_45 * 64 + token_89];
-                        float _mul_120;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_120) : "f"(mul_f32_rn_ftz(frag[28], tok_90)), "f"(sc));
-                        converted[0] = _mul_120;
-                        float _mul_121;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_121) : "f"(mul_f32_rn_ftz(frag[30], tok_90)), "f"(sc));
-                        converted[1] = _mul_121;
-                        float _mul_122;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_122) : "f"(mul_f32_rn_ftz(frag[60], tok_90)), "f"(sc));
-                        converted[2] = _mul_122;
-                        float _mul_123;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_123) : "f"(mul_f32_rn_ftz(frag[62], tok_90)), "f"(sc));
-                        converted[3] = _mul_123;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[28], tok_90), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[30], tok_90), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[60], tok_90), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[62], tok_90), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1126,18 +881,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_92 = base_token + 56 + 1;
                         float tok_93 = smem_v4[token_block_45 * 64 + token_92];
-                        float _mul_124;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_124) : "f"(mul_f32_rn_ftz(frag[29], tok_93)), "f"(sc));
-                        converted[0] = _mul_124;
-                        float _mul_125;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_125) : "f"(mul_f32_rn_ftz(frag[31], tok_93)), "f"(sc));
-                        converted[1] = _mul_125;
-                        float _mul_126;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_126) : "f"(mul_f32_rn_ftz(frag[61], tok_93)), "f"(sc));
-                        converted[2] = _mul_126;
-                        float _mul_127;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_127) : "f"(mul_f32_rn_ftz(frag[63], tok_93)), "f"(sc));
-                        converted[3] = _mul_127;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[29], tok_93), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[31], tok_93), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[61], tok_93), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[63], tok_93), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1190,18 +937,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         asm volatile("barrier.sync 7, 128;" ::: "memory");
                         int token_97 = base_token;
                         float tok_98 = smem_v4[token_block_95 * 64 + token_97];
-                        float _mul_128;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_128) : "f"(mul_f32_rn_ftz(frag[0], tok_98)), "f"(sc));
-                        converted[0] = _mul_128;
-                        float _mul_129;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_129) : "f"(mul_f32_rn_ftz(frag[2], tok_98)), "f"(sc));
-                        converted[1] = _mul_129;
-                        float _mul_130;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_130) : "f"(mul_f32_rn_ftz(frag[32], tok_98)), "f"(sc));
-                        converted[2] = _mul_130;
-                        float _mul_131;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_131) : "f"(mul_f32_rn_ftz(frag[34], tok_98)), "f"(sc));
-                        converted[3] = _mul_131;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[0], tok_98), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[2], tok_98), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[32], tok_98), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[34], tok_98), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1216,18 +955,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_100 = base_token + 1;
                         float tok_101 = smem_v4[token_block_95 * 64 + token_100];
-                        float _mul_132;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_132) : "f"(mul_f32_rn_ftz(frag[1], tok_101)), "f"(sc));
-                        converted[0] = _mul_132;
-                        float _mul_133;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_133) : "f"(mul_f32_rn_ftz(frag[3], tok_101)), "f"(sc));
-                        converted[1] = _mul_133;
-                        float _mul_134;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_134) : "f"(mul_f32_rn_ftz(frag[33], tok_101)), "f"(sc));
-                        converted[2] = _mul_134;
-                        float _mul_135;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_135) : "f"(mul_f32_rn_ftz(frag[35], tok_101)), "f"(sc));
-                        converted[3] = _mul_135;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[1], tok_101), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[3], tok_101), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[33], tok_101), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[35], tok_101), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1242,18 +973,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_103 = base_token + 8;
                         float tok_104 = smem_v4[token_block_95 * 64 + token_103];
-                        float _mul_136;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_136) : "f"(mul_f32_rn_ftz(frag[4], tok_104)), "f"(sc));
-                        converted[0] = _mul_136;
-                        float _mul_137;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_137) : "f"(mul_f32_rn_ftz(frag[6], tok_104)), "f"(sc));
-                        converted[1] = _mul_137;
-                        float _mul_138;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_138) : "f"(mul_f32_rn_ftz(frag[36], tok_104)), "f"(sc));
-                        converted[2] = _mul_138;
-                        float _mul_139;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_139) : "f"(mul_f32_rn_ftz(frag[38], tok_104)), "f"(sc));
-                        converted[3] = _mul_139;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[4], tok_104), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[6], tok_104), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[36], tok_104), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[38], tok_104), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1268,18 +991,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_106 = base_token + 8 + 1;
                         float tok_107 = smem_v4[token_block_95 * 64 + token_106];
-                        float _mul_140;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_140) : "f"(mul_f32_rn_ftz(frag[5], tok_107)), "f"(sc));
-                        converted[0] = _mul_140;
-                        float _mul_141;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_141) : "f"(mul_f32_rn_ftz(frag[7], tok_107)), "f"(sc));
-                        converted[1] = _mul_141;
-                        float _mul_142;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_142) : "f"(mul_f32_rn_ftz(frag[37], tok_107)), "f"(sc));
-                        converted[2] = _mul_142;
-                        float _mul_143;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_143) : "f"(mul_f32_rn_ftz(frag[39], tok_107)), "f"(sc));
-                        converted[3] = _mul_143;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[5], tok_107), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[7], tok_107), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[37], tok_107), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[39], tok_107), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1294,18 +1009,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_109 = base_token + 16;
                         float tok_110 = smem_v4[token_block_95 * 64 + token_109];
-                        float _mul_144;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_144) : "f"(mul_f32_rn_ftz(frag[8], tok_110)), "f"(sc));
-                        converted[0] = _mul_144;
-                        float _mul_145;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_145) : "f"(mul_f32_rn_ftz(frag[10], tok_110)), "f"(sc));
-                        converted[1] = _mul_145;
-                        float _mul_146;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_146) : "f"(mul_f32_rn_ftz(frag[40], tok_110)), "f"(sc));
-                        converted[2] = _mul_146;
-                        float _mul_147;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_147) : "f"(mul_f32_rn_ftz(frag[42], tok_110)), "f"(sc));
-                        converted[3] = _mul_147;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[8], tok_110), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[10], tok_110), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[40], tok_110), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[42], tok_110), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1320,18 +1027,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_112 = base_token + 16 + 1;
                         float tok_113 = smem_v4[token_block_95 * 64 + token_112];
-                        float _mul_148;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_148) : "f"(mul_f32_rn_ftz(frag[9], tok_113)), "f"(sc));
-                        converted[0] = _mul_148;
-                        float _mul_149;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_149) : "f"(mul_f32_rn_ftz(frag[11], tok_113)), "f"(sc));
-                        converted[1] = _mul_149;
-                        float _mul_150;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_150) : "f"(mul_f32_rn_ftz(frag[41], tok_113)), "f"(sc));
-                        converted[2] = _mul_150;
-                        float _mul_151;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_151) : "f"(mul_f32_rn_ftz(frag[43], tok_113)), "f"(sc));
-                        converted[3] = _mul_151;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[9], tok_113), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[11], tok_113), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[41], tok_113), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[43], tok_113), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1346,18 +1045,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_115 = base_token + 24;
                         float tok_116 = smem_v4[token_block_95 * 64 + token_115];
-                        float _mul_152;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_152) : "f"(mul_f32_rn_ftz(frag[12], tok_116)), "f"(sc));
-                        converted[0] = _mul_152;
-                        float _mul_153;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_153) : "f"(mul_f32_rn_ftz(frag[14], tok_116)), "f"(sc));
-                        converted[1] = _mul_153;
-                        float _mul_154;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_154) : "f"(mul_f32_rn_ftz(frag[44], tok_116)), "f"(sc));
-                        converted[2] = _mul_154;
-                        float _mul_155;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_155) : "f"(mul_f32_rn_ftz(frag[46], tok_116)), "f"(sc));
-                        converted[3] = _mul_155;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[12], tok_116), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[14], tok_116), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[44], tok_116), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[46], tok_116), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1372,18 +1063,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_118 = base_token + 24 + 1;
                         float tok_119 = smem_v4[token_block_95 * 64 + token_118];
-                        float _mul_156;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_156) : "f"(mul_f32_rn_ftz(frag[13], tok_119)), "f"(sc));
-                        converted[0] = _mul_156;
-                        float _mul_157;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_157) : "f"(mul_f32_rn_ftz(frag[15], tok_119)), "f"(sc));
-                        converted[1] = _mul_157;
-                        float _mul_158;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_158) : "f"(mul_f32_rn_ftz(frag[45], tok_119)), "f"(sc));
-                        converted[2] = _mul_158;
-                        float _mul_159;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_159) : "f"(mul_f32_rn_ftz(frag[47], tok_119)), "f"(sc));
-                        converted[3] = _mul_159;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[13], tok_119), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[15], tok_119), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[45], tok_119), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[47], tok_119), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1398,18 +1081,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_121 = base_token + 32;
                         float tok_122 = smem_v4[token_block_95 * 64 + token_121];
-                        float _mul_160;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_160) : "f"(mul_f32_rn_ftz(frag[16], tok_122)), "f"(sc));
-                        converted[0] = _mul_160;
-                        float _mul_161;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_161) : "f"(mul_f32_rn_ftz(frag[18], tok_122)), "f"(sc));
-                        converted[1] = _mul_161;
-                        float _mul_162;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_162) : "f"(mul_f32_rn_ftz(frag[48], tok_122)), "f"(sc));
-                        converted[2] = _mul_162;
-                        float _mul_163;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_163) : "f"(mul_f32_rn_ftz(frag[50], tok_122)), "f"(sc));
-                        converted[3] = _mul_163;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[16], tok_122), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[18], tok_122), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[48], tok_122), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[50], tok_122), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1424,18 +1099,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_124 = base_token + 32 + 1;
                         float tok_125 = smem_v4[token_block_95 * 64 + token_124];
-                        float _mul_164;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_164) : "f"(mul_f32_rn_ftz(frag[17], tok_125)), "f"(sc));
-                        converted[0] = _mul_164;
-                        float _mul_165;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_165) : "f"(mul_f32_rn_ftz(frag[19], tok_125)), "f"(sc));
-                        converted[1] = _mul_165;
-                        float _mul_166;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_166) : "f"(mul_f32_rn_ftz(frag[49], tok_125)), "f"(sc));
-                        converted[2] = _mul_166;
-                        float _mul_167;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_167) : "f"(mul_f32_rn_ftz(frag[51], tok_125)), "f"(sc));
-                        converted[3] = _mul_167;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[17], tok_125), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[19], tok_125), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[49], tok_125), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[51], tok_125), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1450,18 +1117,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_127 = base_token + 40;
                         float tok_128 = smem_v4[token_block_95 * 64 + token_127];
-                        float _mul_168;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_168) : "f"(mul_f32_rn_ftz(frag[20], tok_128)), "f"(sc));
-                        converted[0] = _mul_168;
-                        float _mul_169;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_169) : "f"(mul_f32_rn_ftz(frag[22], tok_128)), "f"(sc));
-                        converted[1] = _mul_169;
-                        float _mul_170;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_170) : "f"(mul_f32_rn_ftz(frag[52], tok_128)), "f"(sc));
-                        converted[2] = _mul_170;
-                        float _mul_171;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_171) : "f"(mul_f32_rn_ftz(frag[54], tok_128)), "f"(sc));
-                        converted[3] = _mul_171;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[20], tok_128), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[22], tok_128), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[52], tok_128), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[54], tok_128), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1476,18 +1135,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_130 = base_token + 40 + 1;
                         float tok_131 = smem_v4[token_block_95 * 64 + token_130];
-                        float _mul_172;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_172) : "f"(mul_f32_rn_ftz(frag[21], tok_131)), "f"(sc));
-                        converted[0] = _mul_172;
-                        float _mul_173;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_173) : "f"(mul_f32_rn_ftz(frag[23], tok_131)), "f"(sc));
-                        converted[1] = _mul_173;
-                        float _mul_174;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_174) : "f"(mul_f32_rn_ftz(frag[53], tok_131)), "f"(sc));
-                        converted[2] = _mul_174;
-                        float _mul_175;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_175) : "f"(mul_f32_rn_ftz(frag[55], tok_131)), "f"(sc));
-                        converted[3] = _mul_175;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[21], tok_131), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[23], tok_131), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[53], tok_131), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[55], tok_131), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1502,18 +1153,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_133 = base_token + 48;
                         float tok_134 = smem_v4[token_block_95 * 64 + token_133];
-                        float _mul_176;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_176) : "f"(mul_f32_rn_ftz(frag[24], tok_134)), "f"(sc));
-                        converted[0] = _mul_176;
-                        float _mul_177;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_177) : "f"(mul_f32_rn_ftz(frag[26], tok_134)), "f"(sc));
-                        converted[1] = _mul_177;
-                        float _mul_178;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_178) : "f"(mul_f32_rn_ftz(frag[56], tok_134)), "f"(sc));
-                        converted[2] = _mul_178;
-                        float _mul_179;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_179) : "f"(mul_f32_rn_ftz(frag[58], tok_134)), "f"(sc));
-                        converted[3] = _mul_179;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[24], tok_134), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[26], tok_134), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[56], tok_134), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[58], tok_134), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1528,18 +1171,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_136 = base_token + 48 + 1;
                         float tok_137 = smem_v4[token_block_95 * 64 + token_136];
-                        float _mul_180;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_180) : "f"(mul_f32_rn_ftz(frag[25], tok_137)), "f"(sc));
-                        converted[0] = _mul_180;
-                        float _mul_181;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_181) : "f"(mul_f32_rn_ftz(frag[27], tok_137)), "f"(sc));
-                        converted[1] = _mul_181;
-                        float _mul_182;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_182) : "f"(mul_f32_rn_ftz(frag[57], tok_137)), "f"(sc));
-                        converted[2] = _mul_182;
-                        float _mul_183;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_183) : "f"(mul_f32_rn_ftz(frag[59], tok_137)), "f"(sc));
-                        converted[3] = _mul_183;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[25], tok_137), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[27], tok_137), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[57], tok_137), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[59], tok_137), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1554,18 +1189,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_139 = base_token + 56;
                         float tok_140 = smem_v4[token_block_95 * 64 + token_139];
-                        float _mul_184;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_184) : "f"(mul_f32_rn_ftz(frag[28], tok_140)), "f"(sc));
-                        converted[0] = _mul_184;
-                        float _mul_185;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_185) : "f"(mul_f32_rn_ftz(frag[30], tok_140)), "f"(sc));
-                        converted[1] = _mul_185;
-                        float _mul_186;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_186) : "f"(mul_f32_rn_ftz(frag[60], tok_140)), "f"(sc));
-                        converted[2] = _mul_186;
-                        float _mul_187;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_187) : "f"(mul_f32_rn_ftz(frag[62], tok_140)), "f"(sc));
-                        converted[3] = _mul_187;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[28], tok_140), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[30], tok_140), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[60], tok_140), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[62], tok_140), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1580,18 +1207,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_142 = base_token + 56 + 1;
                         float tok_143 = smem_v4[token_block_95 * 64 + token_142];
-                        float _mul_188;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_188) : "f"(mul_f32_rn_ftz(frag[29], tok_143)), "f"(sc));
-                        converted[0] = _mul_188;
-                        float _mul_189;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_189) : "f"(mul_f32_rn_ftz(frag[31], tok_143)), "f"(sc));
-                        converted[1] = _mul_189;
-                        float _mul_190;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_190) : "f"(mul_f32_rn_ftz(frag[61], tok_143)), "f"(sc));
-                        converted[2] = _mul_190;
-                        float _mul_191;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_191) : "f"(mul_f32_rn_ftz(frag[63], tok_143)), "f"(sc));
-                        converted[3] = _mul_191;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[29], tok_143), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[31], tok_143), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[61], tok_143), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[63], tok_143), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1644,18 +1263,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         asm volatile("barrier.sync 7, 128;" ::: "memory");
                         int token_147 = base_token;
                         float tok_148 = smem_v4[token_block_145 * 64 + token_147];
-                        float _mul_192;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_192) : "f"(mul_f32_rn_ftz(frag[0], tok_148)), "f"(sc));
-                        converted[0] = _mul_192;
-                        float _mul_193;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_193) : "f"(mul_f32_rn_ftz(frag[2], tok_148)), "f"(sc));
-                        converted[1] = _mul_193;
-                        float _mul_194;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_194) : "f"(mul_f32_rn_ftz(frag[32], tok_148)), "f"(sc));
-                        converted[2] = _mul_194;
-                        float _mul_195;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_195) : "f"(mul_f32_rn_ftz(frag[34], tok_148)), "f"(sc));
-                        converted[3] = _mul_195;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[0], tok_148), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[2], tok_148), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[32], tok_148), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[34], tok_148), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1670,18 +1281,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_150 = base_token + 1;
                         float tok_151 = smem_v4[token_block_145 * 64 + token_150];
-                        float _mul_196;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_196) : "f"(mul_f32_rn_ftz(frag[1], tok_151)), "f"(sc));
-                        converted[0] = _mul_196;
-                        float _mul_197;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_197) : "f"(mul_f32_rn_ftz(frag[3], tok_151)), "f"(sc));
-                        converted[1] = _mul_197;
-                        float _mul_198;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_198) : "f"(mul_f32_rn_ftz(frag[33], tok_151)), "f"(sc));
-                        converted[2] = _mul_198;
-                        float _mul_199;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_199) : "f"(mul_f32_rn_ftz(frag[35], tok_151)), "f"(sc));
-                        converted[3] = _mul_199;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[1], tok_151), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[3], tok_151), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[33], tok_151), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[35], tok_151), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1696,18 +1299,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_153 = base_token + 8;
                         float tok_154 = smem_v4[token_block_145 * 64 + token_153];
-                        float _mul_200;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_200) : "f"(mul_f32_rn_ftz(frag[4], tok_154)), "f"(sc));
-                        converted[0] = _mul_200;
-                        float _mul_201;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_201) : "f"(mul_f32_rn_ftz(frag[6], tok_154)), "f"(sc));
-                        converted[1] = _mul_201;
-                        float _mul_202;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_202) : "f"(mul_f32_rn_ftz(frag[36], tok_154)), "f"(sc));
-                        converted[2] = _mul_202;
-                        float _mul_203;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_203) : "f"(mul_f32_rn_ftz(frag[38], tok_154)), "f"(sc));
-                        converted[3] = _mul_203;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[4], tok_154), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[6], tok_154), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[36], tok_154), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[38], tok_154), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1722,18 +1317,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_156 = base_token + 8 + 1;
                         float tok_157 = smem_v4[token_block_145 * 64 + token_156];
-                        float _mul_204;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_204) : "f"(mul_f32_rn_ftz(frag[5], tok_157)), "f"(sc));
-                        converted[0] = _mul_204;
-                        float _mul_205;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_205) : "f"(mul_f32_rn_ftz(frag[7], tok_157)), "f"(sc));
-                        converted[1] = _mul_205;
-                        float _mul_206;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_206) : "f"(mul_f32_rn_ftz(frag[37], tok_157)), "f"(sc));
-                        converted[2] = _mul_206;
-                        float _mul_207;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_207) : "f"(mul_f32_rn_ftz(frag[39], tok_157)), "f"(sc));
-                        converted[3] = _mul_207;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[5], tok_157), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[7], tok_157), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[37], tok_157), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[39], tok_157), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1748,18 +1335,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_159 = base_token + 16;
                         float tok_160 = smem_v4[token_block_145 * 64 + token_159];
-                        float _mul_208;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_208) : "f"(mul_f32_rn_ftz(frag[8], tok_160)), "f"(sc));
-                        converted[0] = _mul_208;
-                        float _mul_209;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_209) : "f"(mul_f32_rn_ftz(frag[10], tok_160)), "f"(sc));
-                        converted[1] = _mul_209;
-                        float _mul_210;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_210) : "f"(mul_f32_rn_ftz(frag[40], tok_160)), "f"(sc));
-                        converted[2] = _mul_210;
-                        float _mul_211;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_211) : "f"(mul_f32_rn_ftz(frag[42], tok_160)), "f"(sc));
-                        converted[3] = _mul_211;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[8], tok_160), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[10], tok_160), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[40], tok_160), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[42], tok_160), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1774,18 +1353,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_162 = base_token + 16 + 1;
                         float tok_163 = smem_v4[token_block_145 * 64 + token_162];
-                        float _mul_212;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_212) : "f"(mul_f32_rn_ftz(frag[9], tok_163)), "f"(sc));
-                        converted[0] = _mul_212;
-                        float _mul_213;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_213) : "f"(mul_f32_rn_ftz(frag[11], tok_163)), "f"(sc));
-                        converted[1] = _mul_213;
-                        float _mul_214;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_214) : "f"(mul_f32_rn_ftz(frag[41], tok_163)), "f"(sc));
-                        converted[2] = _mul_214;
-                        float _mul_215;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_215) : "f"(mul_f32_rn_ftz(frag[43], tok_163)), "f"(sc));
-                        converted[3] = _mul_215;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[9], tok_163), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[11], tok_163), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[41], tok_163), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[43], tok_163), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1800,18 +1371,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_165 = base_token + 24;
                         float tok_166 = smem_v4[token_block_145 * 64 + token_165];
-                        float _mul_216;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_216) : "f"(mul_f32_rn_ftz(frag[12], tok_166)), "f"(sc));
-                        converted[0] = _mul_216;
-                        float _mul_217;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_217) : "f"(mul_f32_rn_ftz(frag[14], tok_166)), "f"(sc));
-                        converted[1] = _mul_217;
-                        float _mul_218;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_218) : "f"(mul_f32_rn_ftz(frag[44], tok_166)), "f"(sc));
-                        converted[2] = _mul_218;
-                        float _mul_219;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_219) : "f"(mul_f32_rn_ftz(frag[46], tok_166)), "f"(sc));
-                        converted[3] = _mul_219;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[12], tok_166), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[14], tok_166), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[44], tok_166), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[46], tok_166), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1826,18 +1389,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_168 = base_token + 24 + 1;
                         float tok_169 = smem_v4[token_block_145 * 64 + token_168];
-                        float _mul_220;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_220) : "f"(mul_f32_rn_ftz(frag[13], tok_169)), "f"(sc));
-                        converted[0] = _mul_220;
-                        float _mul_221;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_221) : "f"(mul_f32_rn_ftz(frag[15], tok_169)), "f"(sc));
-                        converted[1] = _mul_221;
-                        float _mul_222;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_222) : "f"(mul_f32_rn_ftz(frag[45], tok_169)), "f"(sc));
-                        converted[2] = _mul_222;
-                        float _mul_223;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_223) : "f"(mul_f32_rn_ftz(frag[47], tok_169)), "f"(sc));
-                        converted[3] = _mul_223;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[13], tok_169), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[15], tok_169), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[45], tok_169), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[47], tok_169), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1852,18 +1407,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_171 = base_token + 32;
                         float tok_172 = smem_v4[token_block_145 * 64 + token_171];
-                        float _mul_224;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_224) : "f"(mul_f32_rn_ftz(frag[16], tok_172)), "f"(sc));
-                        converted[0] = _mul_224;
-                        float _mul_225;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_225) : "f"(mul_f32_rn_ftz(frag[18], tok_172)), "f"(sc));
-                        converted[1] = _mul_225;
-                        float _mul_226;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_226) : "f"(mul_f32_rn_ftz(frag[48], tok_172)), "f"(sc));
-                        converted[2] = _mul_226;
-                        float _mul_227;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_227) : "f"(mul_f32_rn_ftz(frag[50], tok_172)), "f"(sc));
-                        converted[3] = _mul_227;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[16], tok_172), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[18], tok_172), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[48], tok_172), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[50], tok_172), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1878,18 +1425,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_174 = base_token + 32 + 1;
                         float tok_175 = smem_v4[token_block_145 * 64 + token_174];
-                        float _mul_228;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_228) : "f"(mul_f32_rn_ftz(frag[17], tok_175)), "f"(sc));
-                        converted[0] = _mul_228;
-                        float _mul_229;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_229) : "f"(mul_f32_rn_ftz(frag[19], tok_175)), "f"(sc));
-                        converted[1] = _mul_229;
-                        float _mul_230;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_230) : "f"(mul_f32_rn_ftz(frag[49], tok_175)), "f"(sc));
-                        converted[2] = _mul_230;
-                        float _mul_231;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_231) : "f"(mul_f32_rn_ftz(frag[51], tok_175)), "f"(sc));
-                        converted[3] = _mul_231;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[17], tok_175), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[19], tok_175), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[49], tok_175), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[51], tok_175), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1904,18 +1443,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_177 = base_token + 40;
                         float tok_178 = smem_v4[token_block_145 * 64 + token_177];
-                        float _mul_232;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_232) : "f"(mul_f32_rn_ftz(frag[20], tok_178)), "f"(sc));
-                        converted[0] = _mul_232;
-                        float _mul_233;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_233) : "f"(mul_f32_rn_ftz(frag[22], tok_178)), "f"(sc));
-                        converted[1] = _mul_233;
-                        float _mul_234;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_234) : "f"(mul_f32_rn_ftz(frag[52], tok_178)), "f"(sc));
-                        converted[2] = _mul_234;
-                        float _mul_235;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_235) : "f"(mul_f32_rn_ftz(frag[54], tok_178)), "f"(sc));
-                        converted[3] = _mul_235;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[20], tok_178), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[22], tok_178), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[52], tok_178), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[54], tok_178), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1930,18 +1461,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_180 = base_token + 40 + 1;
                         float tok_181 = smem_v4[token_block_145 * 64 + token_180];
-                        float _mul_236;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_236) : "f"(mul_f32_rn_ftz(frag[21], tok_181)), "f"(sc));
-                        converted[0] = _mul_236;
-                        float _mul_237;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_237) : "f"(mul_f32_rn_ftz(frag[23], tok_181)), "f"(sc));
-                        converted[1] = _mul_237;
-                        float _mul_238;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_238) : "f"(mul_f32_rn_ftz(frag[53], tok_181)), "f"(sc));
-                        converted[2] = _mul_238;
-                        float _mul_239;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_239) : "f"(mul_f32_rn_ftz(frag[55], tok_181)), "f"(sc));
-                        converted[3] = _mul_239;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[21], tok_181), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[23], tok_181), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[53], tok_181), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[55], tok_181), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1956,18 +1479,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_183 = base_token + 48;
                         float tok_184 = smem_v4[token_block_145 * 64 + token_183];
-                        float _mul_240;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_240) : "f"(mul_f32_rn_ftz(frag[24], tok_184)), "f"(sc));
-                        converted[0] = _mul_240;
-                        float _mul_241;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_241) : "f"(mul_f32_rn_ftz(frag[26], tok_184)), "f"(sc));
-                        converted[1] = _mul_241;
-                        float _mul_242;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_242) : "f"(mul_f32_rn_ftz(frag[56], tok_184)), "f"(sc));
-                        converted[2] = _mul_242;
-                        float _mul_243;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_243) : "f"(mul_f32_rn_ftz(frag[58], tok_184)), "f"(sc));
-                        converted[3] = _mul_243;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[24], tok_184), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[26], tok_184), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[56], tok_184), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[58], tok_184), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -1982,18 +1497,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_186 = base_token + 48 + 1;
                         float tok_187 = smem_v4[token_block_145 * 64 + token_186];
-                        float _mul_244;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_244) : "f"(mul_f32_rn_ftz(frag[25], tok_187)), "f"(sc));
-                        converted[0] = _mul_244;
-                        float _mul_245;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_245) : "f"(mul_f32_rn_ftz(frag[27], tok_187)), "f"(sc));
-                        converted[1] = _mul_245;
-                        float _mul_246;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_246) : "f"(mul_f32_rn_ftz(frag[57], tok_187)), "f"(sc));
-                        converted[2] = _mul_246;
-                        float _mul_247;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_247) : "f"(mul_f32_rn_ftz(frag[59], tok_187)), "f"(sc));
-                        converted[3] = _mul_247;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[25], tok_187), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[27], tok_187), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[57], tok_187), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[59], tok_187), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -2008,18 +1515,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_189 = base_token + 56;
                         float tok_190 = smem_v4[token_block_145 * 64 + token_189];
-                        float _mul_248;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_248) : "f"(mul_f32_rn_ftz(frag[28], tok_190)), "f"(sc));
-                        converted[0] = _mul_248;
-                        float _mul_249;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_249) : "f"(mul_f32_rn_ftz(frag[30], tok_190)), "f"(sc));
-                        converted[1] = _mul_249;
-                        float _mul_250;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_250) : "f"(mul_f32_rn_ftz(frag[60], tok_190)), "f"(sc));
-                        converted[2] = _mul_250;
-                        float _mul_251;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_251) : "f"(mul_f32_rn_ftz(frag[62], tok_190)), "f"(sc));
-                        converted[3] = _mul_251;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[28], tok_190), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[30], tok_190), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[60], tok_190), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[62], tok_190), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -2034,18 +1533,10 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         }
                         int token_192 = base_token + 56 + 1;
                         float tok_193 = smem_v4[token_block_145 * 64 + token_192];
-                        float _mul_252;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_252) : "f"(mul_f32_rn_ftz(frag[29], tok_193)), "f"(sc));
-                        converted[0] = _mul_252;
-                        float _mul_253;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_253) : "f"(mul_f32_rn_ftz(frag[31], tok_193)), "f"(sc));
-                        converted[1] = _mul_253;
-                        float _mul_254;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_254) : "f"(mul_f32_rn_ftz(frag[61], tok_193)), "f"(sc));
-                        converted[2] = _mul_254;
-                        float _mul_255;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_255) : "f"(mul_f32_rn_ftz(frag[63], tok_193)), "f"(sc));
-                        converted[3] = _mul_255;
+                        converted[0] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[29], tok_193), sc);
+                        converted[1] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[31], tok_193), sc);
+                        converted[2] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[61], tok_193), sc);
+                        converted[3] = mul_f32_rn_noftz(mul_f32_rn_ftz(frag[63], tok_193), sc);
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -2153,8 +1644,7 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                         :: "r"(exit_bar_addr), "r"(0) : "memory");
                     mbarrier_wait(exit_bar_addr, 0);
                 }
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-                asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
+                asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
             }
         }
     }
@@ -2595,127 +2085,138 @@ kernel_cake_stepfun_moe_024867aa963132f48ac0(const __grid_constant__ CUtensorMap
                                 mbarrier_wait(sfa_full_addr + (stage_4) * 8, _phase_sfa_full);
                                 mbarrier_wait(sfb_full_addr + (stage_4) * 8, _phase_sfb_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
-                                if (elect_sync()) {
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfa)), "l"(_tcgen05_cp_desc_0)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfa + 4)), "l"(_tcgen05_cp_desc_1)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfa + 8)), "l"(_tcgen05_cp_desc_2)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfa + 12)), "l"(_tcgen05_cp_desc_3)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb)), "l"(_tcgen05_cp_desc_4)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb + 8)), "l"(_tcgen05_cp_desc_5)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb + 16)), "l"(_tcgen05_cp_desc_6)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb + 24)), "l"(_tcgen05_cp_desc_7)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb + 4)), "l"(_tcgen05_cp_desc_8)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2560)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb + 12)), "l"(_tcgen05_cp_desc_9)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3072)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb + 20)), "l"(_tcgen05_cp_desc_10)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3584)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)(tmem_sfb + 28)), "l"(_tcgen05_cp_desc_11)
-                                            : "memory");
-                                    }
+                                uint32_t _elected_0 = elect_sync();
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfa)), "l"(_tcgen05_cp_desc_1), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfa + 4)), "l"(_tcgen05_cp_desc_2), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfa + 8)), "l"(_tcgen05_cp_desc_3), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_sfa_addr + stage_4 * 2048 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfa + 12)), "l"(_tcgen05_cp_desc_4), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb)), "l"(_tcgen05_cp_desc_5), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb + 8)), "l"(_tcgen05_cp_desc_6), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb + 16)), "l"(_tcgen05_cp_desc_7), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb + 24)), "l"(_tcgen05_cp_desc_8), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb + 4)), "l"(_tcgen05_cp_desc_9), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 2560)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb + 12)), "l"(_tcgen05_cp_desc_10), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3072)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb + 20)), "l"(_tcgen05_cp_desc_11), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_12 = ((((uint64_t)(smem_sfb_addr + stage_4 * 4096 + 3584)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)(tmem_sfb + 28)), "l"(_tcgen05_cp_desc_12), "r"(_elected_0)
+                                        : "memory");
                                 }
                                 int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_4) * 1024;
                                 int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_4) * 1024;

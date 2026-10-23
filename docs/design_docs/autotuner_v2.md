@@ -143,6 +143,51 @@ maintaining a migration path for data that is, by construction, an optimization.
   neither the filesystem nor the JSON decoder, and v1/v2 state mixing is impossible by
   construction.
 
+### Custom tuning protocols
+
+`AutoTuner.choose_with_protocol()` supports operations that own candidate
+enumeration, measurement and result installation, on one device or across
+processes. It supplies the tuner's controls, lock, statistics and record storage.
+The protocol defines cache compatibility and handles any distributed coordination.
+The tuner always invokes it, even when tuning is disabled or the operation is
+skipped, so a protocol can coordinate its fallback or cache decision.
+
+`TuningContext.records()` reads the active store's protocol records.
+`context.publish()` keeps a record in memory and writes it to that store when
+ambient tuning is enabled and the operation is not in `skip_ops`.
+`force_tune` can request a fresh search but does not override these write
+controls. Returning a `TuningResult` does not publish it. Replay imports remain
+in memory. No JSON filename is required.
+
+Protocol results use the same `entries/` files, writer and preload as runner
+tactics. Their structural key is `("__protocol__", namespace, record_key)`;
+`runner` holds the stable protocol namespace and `tactic` holds the JSON result,
+including any metadata needed for selection. Neither field requires a runner
+instance. The protocol owns its record keys and payload schema. Changing
+aggregation or selection requires a distinct key or compatibility check when
+previous results are no longer reusable.
+
+Preload indexes these results by namespace for `context.records()`, preserving
+JSON lists and dictionaries. `context.lookup(key)` reads one result without
+copying the namespace. Both return copies. Ordinary runner tactics keep their
+existing decoding. Atomic writes preserve unrelated entries; writes to the same
+key can overwrite each other. `clear_cache()` and `autotune_v2_reload()` clear
+the namespace index along with other lookup memos. The protocol retains its
+own compatibility and capacity selection rules.
+
+Root and environment switches isolate protocol records. With persistence disabled,
+records use the in-memory measurement-policy partition, and the protocol must
+also disable any compatibility-file reads and writes. Measurement policies,
+inherited graph replay counts, `tuning_buckets` and `round_up` are passed to the
+protocol, which must implement or reject them. Protocol records are separate
+from v1 JSON import/export.
+Existing `autotune()` controls still compose with v2 as described above.
+`context.cache_identity` includes the store or policy identity, reload generation
+and skip state so protocols can invalidate prepared selections. Replay counts
+and bucket overrides are exposed separately; protocols must account for them
+when reusing prepared state or tuning results.
+Serving outside a context uses the attached store's measurement policy.
+
 ### 2.5 MeasurementPolicy — tune the way you deploy
 
 ```python
@@ -172,10 +217,20 @@ cache. A missing or different policy is a profiling miss, not deletion; replay, 
 and direct `search_cache` lookups still accept the winner, even inside a tuning context.
 Entries without provenance are retuned by `choose_one` even under the default policy, including
 after a same-version build upgrade that leaves the environment directory unchanged.
-Retuning updates the same entry and its decoded memo only when the winning runner's key is
-unchanged. If a different runner wins, it is published under that runner's key; the previous
-runner's entry remains, as before. This is an additive v2 field, not a new schema, manifest
-identity, or operation key. Legacy v1 file-policy gating is unchanged.
+Successful retuning retires the previous candidates before publishing the new winner, including
+when the winning runner changes. A single-process replacement keeps the entry being republished
+on disk until its atomic overwrite, avoiding a missing-file window for concurrent readers.
+Single-process retuning preserves the previous winner if no candidate succeeds.
+Coordinated tuning must retire rejected selections before profiling, so a
+failed retune cannot restore a selection that the group already rejected (§2.7).
+
+`rank_tactics` uses the same measurement overrides, store/policy partition, and winner publication
+as `choose_one`. Full shortlists remain memory-only and are rebuilt after reload; their first
+tactic is persisted as the serving winner. Loaded v1 or bundled entries remain compatibility
+fallbacks unless that key has been retired in the active identity. This exclusion is local to
+the process and identity, survives `autotune_v2_reload`, and resets with `clear_cache`; it does
+not delete global v1 entries used by another identity. This is an additive v2 field, not a new
+schema, manifest identity, or operation key. Legacy v1 file-policy gating is unchanged.
 
 `"auto"` currently preserves legacy behavior. Flipping the default to `"cuda_graph"` (the
 dominant serving mode) is gated on validating capture-safety across the op suite.
@@ -218,12 +273,14 @@ Persistence and orchestration stay separate responsibilities.
 - **Shared filesystem**: per-entry publication prevents torn entries. It does not provide a
   snapshot across ranks: concurrent publishers or an interrupted run can produce mixed hits.
 - **Profiling participation**: with `set_autotune_process_group`, each profile first reduces
-  its hit flag. Only an all-hit group skips profiling; any miss makes all ranks discard that
+  its hit flag and a digest of the cached runner/tactic. Only an all-hit group with matching
+  selections skips profiling; any miss or disagreement makes all ranks discard that
   profile's old runner entries and re-profile. Invalidation covers memory and persistence so
   a different runner can win without an older entry taking precedence after reload. These
   collectives run only during tuning, outside CUDA Graph capture. The framework must still
   ensure matching op/profile/candidate order and skip lists across the group.
-- **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
+- **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
+  tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
   winners and ephemeral tactic shortlists, bulk re-hydrates the attached store's final
   published state into memory, and thereby makes shared keys use the store's final tactics
@@ -349,5 +406,6 @@ single ambient policy matching the mode-sensitive path is sufficient.
   supported cleanup.
 - **Representative probe construction** for MoE (skewed routing / EP-deflated shapes) is a
   separate op-level track; balanced probes cannot exercise the regression class in #3622.
-- **Comm/collective op tuning** is out of scope: it needs lockstep candidate enumeration, a
-  MAX-reduction, one group-level decision, and topology fields in the manifest.
+- **Built-in collective orchestration** is not provided. A custom tuning protocol must
+  coordinate candidates and timing aggregation, agree on results, and include any required
+  topology information in its cache keys.

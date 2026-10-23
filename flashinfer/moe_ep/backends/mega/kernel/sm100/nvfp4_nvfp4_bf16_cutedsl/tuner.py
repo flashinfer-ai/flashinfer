@@ -40,8 +40,8 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             gate_up_clamp=args.gate_up_clamp,
             combine_dtype=args.combine_dtype,
             enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
-            apply_topk_in_fc1=args.apply_topk_in_fc1,
-            defer_topk_reduce=not args.do_finalize,
+            apply_routing_weights_before_fc2=args.apply_routing_weights_before_fc2,
+            use_custom_finalize=not args.do_finalize,
             seed=args.seed,
         )
         candidates = nvfp4_candidates(
@@ -69,8 +69,10 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     live_tokens=live_tokens,
                     combine_dtype=args.combine_dtype,
                     enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
-                    apply_topk_in_fc1=args.apply_topk_in_fc1,
-                    defer_topk_reduce=not args.do_finalize,
+                    apply_routing_weights_before_fc2=(
+                        args.apply_routing_weights_before_fc2
+                    ),
+                    use_custom_finalize=not args.do_finalize,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
