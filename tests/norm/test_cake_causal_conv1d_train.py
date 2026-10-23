@@ -32,6 +32,11 @@ suite checks that exactly one runs per call, that every program of the route
 runs for some channel count on both sides of its threshold (with a
 NaN-poisoned workspace), that the workspace is sized for the largest grid of
 the route, and that a routed row's ``dx`` equals the fallback program's bits.
+The backward is two launches on one stream -- the selected program, then its
+``reduce`` program with programmatic dependent launch -- and the suite holds
+the launch order, the registry's grid-rule kinds and FlashInfer issue
+#7038's recipe: a kernel resident on another stream does not stall the
+backward (``busy <= 2 x alone``) and leaves ``dweight`` bitwise unchanged.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
@@ -44,6 +49,7 @@ top-level exposure are covered by ``test_cake_causal_conv1d_train_api.py``.
 from __future__ import annotations
 
 import re
+import statistics
 from pathlib import Path
 
 import pytest
@@ -535,9 +541,11 @@ def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
         "dx": dx_fallback,
         "dw": dw_fallback,
         "partial": partial,
-        **{key: int(scalars[key]) for key in loader.LOGICAL_SCALARS},
+        **{key: int(scalars[key]) for key in loader.PLAN_SCALARS},
+        "main_ctas": grid_x,
     }
     loader.run_module(fallback, values, device_index=device.index)
+    loader.run_module(record["reduce"], values, device_index=device.index)
     torch.cuda.synchronize(device)
     assert torch.equal(dx, dx_fallback), (
         f"dx of {selected} differs from the fallback program {fallback} at S={S} C={C}"
@@ -624,6 +632,105 @@ def test_cuda_graph_replays_match_eager() -> None:
     assert replays == GRAPH_REPLAYS * len(GRAPH_CASES) == 20
 
 
+def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> None:
+    """A backward call is two launches: the program ``C`` selects, then that record's ``reduce`` program with
+    the main grid's CTA count as its ``main_ctas`` scalar, a partial view of that grid's rows and ``ceil(C / 4)``
+    CTAs; the forward launches its route in order."""
+
+    S, C, docs = 1000, 512, "perf"
+    device = _device()
+    x, w, cu, dy = _inputs(S, C, docs)
+    launched = []
+
+    def record_launch(name, values, *, device_index):
+        launched.append((name, dict(values), device_index))
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    cake_causal_conv1d_train_backward(x, w, cu, dy)
+    arch = _arch()
+    main = loader.selected_modules(arch, "bwd", C=C, S=S)[0]
+    record = loader.MODULES[main]
+    assert [name for name, _, _ in launched] == [main, record["reduce"]]
+    assert {index for _, _, index in launched} == {device.index}
+    values, reduce_values = launched[0][1], launched[1][1]
+    assert reduce_values == values, "both launches see one argument set"
+    grid_x = loader.launch_grid(record, device_index=device.index)[0]
+    _, _, n_ch_tiles = loader.channel_split(C, geometry=record["grid_rule"]["geometry"])
+    assert values["main_ctas"] == grid_x
+    assert tuple(values["partial"].shape) == (
+        loader.partial_rows(grid_x, n_ch_tiles),
+        C,
+        WIDTH,
+    )
+    assert {"dw", "partial", "C", "n_ch_tiles", "ct_vec"} <= set(values)
+    reduce = loader.MODULES[record["reduce"]]
+    assert loader.launch_grid(reduce, device_index=device.index, C=C) == (C // 4, 1, 1)
+    with pytest.raises(ValueError, match="needs the channel count"):
+        loader.launch_grid(reduce, device_index=device.index)
+    launched.clear()
+    cake_causal_conv1d_train_forward(x, w, cu)
+    assert [name for name, _, _ in launched] == list(loader.route_modules(arch, "fwd"))
+
+
+def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
+    record_property,
+) -> None:
+    """FlashInfer issue #7038's recipe: one 1-thread kernel resident on another stream must not stall the
+    backward.
+
+    The cooperative form waited for it (0.161 ms -> 17.85 ms on GB200, x28-x129 measured); the two ordinary
+    launches run beside it.  The residual is one second wave: when the resident kernel displaces one main CTA,
+    that CTA runs after the others and the backward takes up to twice its time alone (1.2-1.6x measured on
+    GB300 with the shipped grid).  Timed with CUDA events on the current stream, median of 7 after 3 warm-ups:
+    ``busy <= 2 x alone``, and ``dweight`` is bitwise equal with and without the side kernel.  Both medians
+    and their ratio go to the junit properties of the test.
+    """
+
+    device = _device()
+    S, C, docs = 261393, 512, "perf"
+    x, w, cu, dy = _inputs(S, C, docs)
+    workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
+    dx = torch.empty_like(x)
+    dw = torch.empty(C, WIDTH, dtype=torch.float32, device=device)
+    side = torch.cuda.Stream(device=device)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    def timed(with_side_kernel: bool) -> float:
+        torch.cuda.synchronize(device)
+        if with_side_kernel:
+            with torch.cuda.stream(side):
+                torch.cuda._sleep(
+                    10_000_000
+                )  # one 1-thread CTA, resident for milliseconds
+        torch.cuda._sleep(1_000_000)  # let it become resident before the backward
+        start.record()
+        cake_causal_conv1d_train_backward(
+            x, w, cu, dy, workspace=workspace, dx=dx, dweight=dw
+        )
+        end.record()
+        torch.cuda.synchronize(device)
+        return start.elapsed_time(end)
+
+    for _ in range(3):
+        timed(False)
+    alone = statistics.median(timed(False) for _ in range(7))
+    dw_alone = dw.clone()
+    busy = statistics.median(timed(True) for _ in range(7))
+    print(
+        f"backward alone {alone:.3f} ms, beside a resident 1-thread kernel on another "
+        f"stream {busy:.3f} ms ({busy / alone:.2f}x)"
+    )
+    record_property("backward_alone_ms", f"{alone:.4f}")
+    record_property("backward_beside_side_kernel_ms", f"{busy:.4f}")
+    record_property("busy_over_alone", f"{busy / alone:.3f}")
+    assert torch.equal(dw, dw_alone), "dweight changed beside the side kernel"
+    assert busy <= 2.0 * alone, (
+        f"the backward stalled behind a kernel resident on another stream: "
+        f"{busy:.3f} ms beside it vs {alone:.3f} ms alone"
+    )
+
+
 def test_zero_tokens_return_empty_outputs() -> None:
     C = 256
     x = torch.empty(0, C, dtype=torch.bfloat16, device=_device())
@@ -686,13 +793,20 @@ def test_workspace_bytes_and_layout() -> None:
         "the public workspace size is the fallback program's, unchanged by the"
         " programs a channel count selects"
     )
-    assert record["grid_rule"]["ctas_per_sm"] == max(
-        owner["grid_rule"]["ctas_per_sm"] for owner in owners
+    # The grid, hence the rows and bytes, is grid_mult[arch] x ctas_per_sm x SMs: the owner with the largest
+    # product bounds the route (grid_mult over-decomposes the token streams; the partial rows grow with it).
+    assert loader.grid_per_sm(record, arch) == max(
+        loader.grid_per_sm(owner, arch) for owner in owners
     )
     geometry = record["grid_rule"]["geometry"]
     assert all(owner["grid_rule"]["geometry"] == geometry for owner in owners)
     grid = loader.launch_grid(record, device_index=device.index)[0]
-    assert grid == record["grid_rule"]["ctas_per_sm"] * loader.sm_count(device.index)
+    assert grid == loader.grid_mult(record, arch) * record["grid_rule"][
+        "ctas_per_sm"
+    ] * loader.sm_count(device.index)
+    assert loader.grid_mult(record, arch) >= 1
+    fwd = loader.MODULES[loader.route_modules(arch, "fwd")[0]]
+    assert loader.grid_mult(fwd, arch) == 1, "co_resident grids never multiply"
     for C in (128, 136, 8192):
         small = cake_causal_conv1d_train_backward_workspace_bytes(1, C, device)
         large = cake_causal_conv1d_train_backward_workspace_bytes(262401, C, device)
@@ -816,12 +930,19 @@ def test_registry_records_reference_the_build_manifest() -> None:
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()
-    assert set(loader.MODULES) == {
+    routed = {
         name
         for route in loader.ROUTES.values()
         for names in route.values()
         for name in names
     }
+    # The routes list the programs a call selects; the reduce programs hang off the backward records.
+    reduces = {
+        loader.MODULES[name]["reduce"]
+        for name in routed
+        if loader.MODULES[name]["role"] == "bwd"
+    }
+    assert set(loader.MODULES) == routed | reduces and not routed & reduces
     for name, record in loader.MODULES.items():
         assert record["library"] == record["kernel"] == name
         assert record["kernel_symbol"] == f"kernel_{name}"
@@ -829,14 +950,55 @@ def test_registry_records_reference_the_build_manifest() -> None:
             record
         ), name
         assert set(record["arches"]) <= set(manifest["arch_flags"]), name
-        assert record["grid_rule"]["kind"] == "co_resident"
-        assert record["grid_rule"]["ctas_per_sm"] >= 1
-        assert record["grid_rule"]["cooperative"] == record["launch"]["cooperative"]
-        assert set(record["grid_rule"]["geometry"]) == {"threads", "vec"}
-        assert (
-            record["grid_rule"]["geometry"]["threads"] == record["launch"]["block"][0]
-        )
-        assert loader.CHANNEL_MULTIPLE % record["grid_rule"]["geometry"]["vec"] == 0
+        assert record["role"] in loader.ROLES, name
+        grid = record["grid_rule"]
+        assert grid["kind"] in loader.GRID_KINDS, name
+        # No launch is cooperative (FlashInfer #7038): a main program sizes its grid by occupancy, a reduce
+        # program by channels, and both are ordinary launches.
+        assert grid["cooperative"] is False, name
+        assert record["launch"]["cooperative"] is False, name
+        if record["role"] == "reduce":
+            assert grid["kind"] == "channels_per_cta", name
+            assert grid["channels_per_cta"] * 32 == record["launch"]["block"][0], (
+                name,
+                "one warp per channel",
+            )
+            assert record["launch"]["use_pdl"] is True, name
+            assert record["workspace_rule"] is None, name
+            assert not {"select_rule", "reduce"} & set(record), name
+            assert set(record["logical"].values()) == {
+                "partial",
+                "dw",
+                "C",
+                "main_ctas",
+                "n_ch_tiles",
+                "ct_vec",
+            }
+        else:
+            # The forward keeps the co-resident grid it always launched normally; the backward programs
+            # of the split are sized by occupancy, over-decomposed per architecture by grid_mult.
+            assert (
+                grid["kind"]
+                == {"fwd": "co_resident", "bwd": "occupancy"}[record["role"]]
+            ), name
+            assert grid["ctas_per_sm"] >= 1
+            if grid["kind"] == "occupancy":
+                assert set(grid["grid_mult"]) == set(record["arches"]), name
+                assert all(
+                    isinstance(k, int) and k >= 1 for k in grid["grid_mult"].values()
+                ), name
+            else:
+                assert "grid_mult" not in grid, name
+            assert set(grid["geometry"]) == {"threads", "vec"}
+            assert grid["geometry"]["threads"] == record["launch"]["block"][0]
+            assert loader.CHANNEL_MULTIPLE % grid["geometry"]["vec"] == 0
+            assert record["launch"]["use_pdl"] is False, name
+        if record["role"] == "bwd":
+            reduce = loader.MODULES[record["reduce"]]
+            assert reduce["role"] == "reduce", name
+            assert set(record["arches"]) <= set(reduce["arches"]), name
+        else:
+            assert "reduce" not in record, name
         plan = {key for kind, key in record["arg_plan"] if kind != "grid"}
         assert plan == set(record["logical"])
         assert set(record["logical"].values()) <= set(loader.LOGICAL_TENSORS) | set(
@@ -888,7 +1050,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
     backward = loader.workspace_record("sm_100a")
     assert backward["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
-    assert backward["launch"]["cooperative"] is True
+    assert backward["launch"]["cooperative"] is False
     # Every backward route: exactly one fallback record, every routed record's rule names the
     # architecture with its own threshold (distinct thresholds), one program selected per channel
     # count -- the highest threshold at most C, the fallback below the lowest -- and the forward route
@@ -932,5 +1094,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
         for owner in owners:
             assert owner["role"] == "bwd"
             assert owner["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
-            assert owner["launch"]["cooperative"] is True
+            assert owner["launch"]["cooperative"] is False
+            assert arch in loader.MODULES[owner["reduce"]]["arches"], (
+                arch,
+                owner["library"],
+            )
         assert loader.workspace_record(arch) in owners

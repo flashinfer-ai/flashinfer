@@ -213,7 +213,7 @@ def _output(
 
 
 def _scalars(scalars: dict[str, int]) -> dict[str, int]:
-    return {key: int(scalars[key]) for key in _loader.LOGICAL_SCALARS}
+    return {key: int(scalars[key]) for key in _loader.PLAN_SCALARS}
 
 
 def _launch(
@@ -242,14 +242,17 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
     """Bytes of the caller-owned backward workspace for ``C`` channels on ``device``.
 
     The workspace holds the FP32 ``[rows, C, 4]`` ``dweight`` partials of the
-    cooperative backward, one row per ``n_ch_tiles`` CTAs of a program's
-    launch grid (``rows = ceil(grid / n_ch_tiles)``), sized by the largest
-    grid of the architecture's backward programs: the channel count selects
-    the program a call runs, and every program writes and reduces the leading
-    rows of its own grid inside this buffer.  It depends on ``C`` and the
-    device only, so it is independent of ``S`` and one buffer serves every
-    token count; the kernel fully writes the rows it reduces, so the buffer
-    needs no zeroing between launches or CUDA Graph replays.
+    backward's main program, one row per ``n_ch_tiles`` CTAs of a program's
+    launch grid (``rows = ceil(grid / n_ch_tiles)``, ``grid = grid_mult x
+    ctas_per_sm x SM count``: the bytes grow with the program's over-
+    decomposition factor ``grid_mult``), sized by the largest grid of the
+    architecture's backward programs: the channel count selects the program
+    a call runs, every program writes the leading rows of its own grid inside
+    this buffer, and its reduce program sums exactly those.  It depends on
+    ``C`` and the device only, so it is independent of ``S`` and one buffer
+    serves every token count; the main program fully writes the rows the
+    reduce program sums, so the buffer needs no zeroing between launches or
+    CUDA Graph replays.
     """
 
     device = torch.device(device)
@@ -399,10 +402,20 @@ def cake_causal_conv1d_train_backward(
     so a given ``(S, C, device)`` always runs the same program.  The
     ``workspace`` is sized for every program of the route
     (:func:`cake_causal_conv1d_train_backward_workspace_bytes`); the selected
-    program uses the leading rows of its own grid.  Build every library of
-    the device's architecture (``cake_jit.specs_for_arch``) before capturing
-    a CUDA Graph: the capture holds the program selected for its shape, and
-    no JIT build may happen inside it.
+    program uses the leading rows of its own grid.
+
+    A call is two ordinary launches on the current stream: the selected
+    program writes ``dx`` and one FP32 partial row of ``dweight`` per CTA,
+    then the route's reduce program, launched programmatically dependent on
+    it (the launch latency overlaps the main kernel's tail; the dependency is
+    a stream-order edge, so the pair captures into a CUDA Graph), sums the
+    rows per channel in a fixed order.  Neither launch is cooperative, so the
+    backward keeps its speed while kernels of other streams (NCCL collectives)
+    are resident: a cooperative grid could not start until they finished.
+    Build every library of the device's architecture
+    (``cake_jit.specs_for_arch``) before capturing a CUDA Graph: the capture
+    holds the program selected for its shape, and no JIT build may happen
+    inside it.
     """
 
     x = _require_tensor(x, "x")
@@ -445,17 +458,22 @@ def cake_causal_conv1d_train_backward(
         "dw": dw_out,
         "partial": partial,
         **_scalars(scalars),
+        "main_ctas": grid_x,
     }
-    for name in names:
-        run_module(name, values, device_index=device_index)
+    # The main program (an ordinary launch) writes dx and the partial rows; the
+    # route's reduce program, programmatically dependent on it through its
+    # binding's launch attribute, sums into dweight on the same stream the rows
+    # of each channel tile that a grid of main_ctas CTAs wrote.
+    run_module(names[0], values, device_index=device_index)
+    run_module(record["reduce"], values, device_index=device_index)
     return dx_out, dw_out
 
 
 class CakeCausalConv1dFunction(torch.autograd.Function):
     """Autograd wrapper saving only ``(x, weight, cu_seqlens)`` for the backward.
 
-    ``forward(x, weight, cu_seqlens)`` returns ``y``; the backward launches the
-    fused ``dx`` + deterministic FP32 ``dweight`` kernel of
+    ``forward(x, weight, cu_seqlens)`` returns ``y``; the backward runs the
+    fused ``dx`` + deterministic FP32 ``dweight`` pair of launches of
     :func:`cake_causal_conv1d_train_backward` on the incoming gradient
     (materialized as a contiguous BF16 tensor when autograd hands over another
     layout or dtype).
