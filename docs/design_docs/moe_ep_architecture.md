@@ -36,7 +36,7 @@ owns dispatch, expert compute, and combine; output is always BF16
 
 For the SM100/SM103 NVFP4-weight, BF16-activation MegaMoE design, see
 [Faster-than-light NVFP4 decode—with precision](https://humansand.ai/blog/faster-than-light-nvfp4-decode)
-by Ziang Li and friends at humans&. The article covers weight-dequantization
+by Ziang Li at humans& ai. The article covers weight-dequantization
 run-ahead, overlap with token arrival, and fused deterministic combine.
 
 | Backend (alias) | Activation | Weight | Output | Arch | Tuning |

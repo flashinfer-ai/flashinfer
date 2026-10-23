@@ -771,8 +771,8 @@ The CuteDSL backends are conditionally available when the
 
 For the Blackwell NVFP4-weight, BF16-activation (W4A16) design, see
 `Faster-than-light NVFP4 decode—with precision
-<https://humansand.ai/blog/faster-than-light-nvfp4-decode>`_ by Ziang Li and
-friends at humans&. The article explains partial weight dequantization,
+<https://humansand.ai/blog/faster-than-light-nvfp4-decode>`_ by Ziang Li at humans& ai.
+The article explains partial weight dequantization,
 FP32 epilogue scaling, and overlap with BF16 Tensor Core computation.
 
 .. autosummary::
