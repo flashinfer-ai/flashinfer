@@ -9,7 +9,7 @@ import struct
 
 import torch
 
-from ._utils import _overlaps
+from .._utils import _overlaps
 
 
 _ALIGNMENT = 32

@@ -6,7 +6,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
 
-from ...attention.prims_ts.kernels.mla_decode.helpers.sparse_indices import (
+from ....attention.prims_ts.kernels.mla_decode.helpers.sparse_indices import (
     SparseKVIndices,
     SparseKVLengths,
     SparseSourceTile,
