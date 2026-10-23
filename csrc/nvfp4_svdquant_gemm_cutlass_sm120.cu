@@ -723,7 +723,8 @@ void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView g
   if (producer_family >= 0) {
     nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
         x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, producer_family, tiling0, tiling1,
-        tiling2, address_policy, (producer_family == 4 || producer_family == 1) && enable_pdl);
+        tiling2, address_policy,
+        (producer_family == 4 || producer_family == 1 || producer_family == 6) && enable_pdl);
     return;
   }
   nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
@@ -792,8 +793,8 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
   // Under address policy 1 the rank-128 small-M prefix signals PDL launch only
   // once its quantize CTAs have exited (XQ/SF fenced), so the GEMM may start its
   // FP4 mainloop at once and wait for the prefix grid only before LoRA-down.
-  bool const defer_lora_down_wait =
-      producer_family == 1 && address_policy == 1 && down.size(1) == 128 && enable_pdl;
+  bool const defer_lora_down_wait = (producer_family == 1 || producer_family == 6) &&
+                                    address_policy == 1 && down.size(1) == 128 && enable_pdl;
   nvfp4_svdquant_gemm_impl(xq, b, a_sf, b_sf, alpha, down, l1, bias, out, workspace_buffer, k3_row,
                            enable_pdl, nullptr, nullptr, defer_lora_down_wait);
   if (configure_case7_persisting_l2) {

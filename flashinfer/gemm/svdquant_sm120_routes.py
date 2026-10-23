@@ -26,7 +26,8 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
-SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 15
+# 16: the split-K small-M producer family joined the rank-128 candidates.
+SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 16
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -236,6 +237,18 @@ SM120_SMALL_M_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
     (1024, 16, 16),
 )
 
+# Rank-128 small-M producer with LoRA-down split over K across a cluster of CTAs:
+# (block threads, down tile columns, K splits). Mirrors
+# FI_SVDQ_SMALL_M_SPLIT_TILINGS in nvfp4_smooth_quantize_lora_down_sm120.cuh.
+SM120_SMALL_M_SPLIT_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (512, 16, 4),
+    (1024, 16, 2),
+    (1024, 16, 4),
+)
+# Splitting K only pays while the (M / 16) x (rank / tile columns) down tiles
+# leave SMs idle; above this M the unsplit families already fill the card.
+SM120_SMALL_M_SPLIT_MAX_M: Final = 512
+
 # LoRA ranks the native CUTLASS kernels can stage. Other multiples of 32 compile
 # but leave no tactic, so callers exclude them before loading a module.
 SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64, 128)
@@ -251,6 +264,10 @@ SM120_FAMILY_M537: Final = 2
 # whether it wins on a card nobody measured.
 SM120_FAMILY_CUBLASLT: Final = 3
 SM120_FAMILY_SMALL_M_PACKED: Final = 4
+# Rank-128 small-M producer whose LoRA-down CTAs split K over a thread-block
+# cluster and reduce through distributed shared memory; see
+# SM120_SMALL_M_SPLIT_TILING_LADDER.
+SM120_FAMILY_SMALL_M_SPLIT: Final = 6
 # Warp-specialized rank-128 large-M producer (persistent grid, producer warp +
 # mbarrier stage ring). Tiling = (tile M, tile K, stages * 100 + quantize
 # warps); the address-policy slot carries the grid mode.
@@ -349,6 +366,28 @@ def sm120_small_m_tiling_is_valid(
     return quant_blocks * rows_per_quant_block <= padded_m
 
 
+def sm120_small_m_split_tiling_is_valid(
+    m: int,
+    k: int,
+    block_threads: int,
+    down_tile_cols: int,
+    k_splits: int,
+    rank: int = 128,
+) -> bool:
+    """Python counterpart of the split-K small-M launcher guards."""
+    if rank != 128 or not 0 < m <= SM120_SMALL_M_SPLIT_MAX_M:
+        return False
+    if block_threads <= 0 or block_threads % 32 or k_splits <= 1:
+        return False
+    if k % 32 or k // 32 < k_splits * (block_threads // 32):
+        return False
+    if k % (4 * _GEOMETRY_SF_VEC):
+        return False
+    if down_tile_cols % _GEOMETRY_MMA_N or down_tile_cols // _GEOMETRY_MMA_N <= 0:
+        return False
+    return rank % down_tile_cols == 0
+
+
 @functools.cache
 def sm120_producer_variants(
     m: int, k: int, rank: int = 32
@@ -396,7 +435,14 @@ def sm120_producer_variants(
             for grid_mode in SM120_WS_GRID_MODES
         )
         deferred = tuple((family, tiling, 1) for family, tiling, _ in small)
-        return large + ws + small + deferred
+        # Appended last so every earlier index keeps its meaning.
+        split = tuple(
+            (SM120_FAMILY_SMALL_M_SPLIT, tiling, policy)
+            for policy in SM120_ADDRESS_POLICIES
+            for tiling in SM120_SMALL_M_SPLIT_TILING_LADDER
+            if sm120_small_m_split_tiling_is_valid(m, k, *tiling, rank)
+        )
+        return large + ws + small + deferred + split
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)
@@ -434,7 +480,13 @@ def sm120_variant_reads_kmajor_l2t(
     """
     family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
     return (
-        family in (SM120_FAMILY_LARGE_M, SM120_FAMILY_WS_RANK128, SM120_FAMILY_SMALL_M)
+        family
+        in (
+            SM120_FAMILY_LARGE_M,
+            SM120_FAMILY_WS_RANK128,
+            SM120_FAMILY_SMALL_M,
+            SM120_FAMILY_SMALL_M_SPLIT,
+        )
         and rank > 64
     )
 
