@@ -181,6 +181,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_0abe7d79ff8afb150cef(__nv_bfloat16* __restri
     sent4[2] = 2147516416;
     sent4[3] = 2147516416;
     asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(r_local + (r_old + dest64 * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    long long xf_old = (long long)d * 2;
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + xf_old * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (8 + xf_old) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (16 + xf_old) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (24 + xf_old) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (xf_old + 1) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (8 + (xf_old + 1)) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (16 + (xf_old + 1)) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
+    asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (24 + (xf_old + 1)) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
     unsigned int packets[32];
     packets[0] = 0;
     packets[1] = 0;
@@ -426,14 +435,6 @@ kernel_cake_tp_moe_finalize_rmsnorm_0abe7d79ff8afb150cef(__nv_bfloat16* __restri
     }
     if (tok_own < n_tok) {
         long long xf = (long long)d * 2;
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + xf * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (8 + xf) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (16 + xf) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (24 + xf) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (xf + 1) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (8 + (xf + 1)) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (16 + (xf + 1)) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
-        asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(a_local + (a_old + (24 + (xf + 1)) * 4096) + (0)), "r"(sent4[(0) + 0]), "r"(sent4[(0) + 1]), "r"(sent4[(0) + 2]), "r"(sent4[(0) + 3]) : "memory");
         float w8o[8];
         if (weights_fp32 != 0) {
             float _vec_load_1[4];

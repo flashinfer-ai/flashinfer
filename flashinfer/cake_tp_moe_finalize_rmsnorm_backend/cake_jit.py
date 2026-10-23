@@ -251,7 +251,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -451,7 +451,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 98304,
                     "fill": 2147516416,
@@ -459,7 +459,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 16,
                     "fill": 0,
@@ -467,7 +467,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 65536,
                     "fill": 0,
@@ -475,7 +475,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -488,7 +488,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -675,7 +675,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 196608,
                     "fill": 2147516416,
@@ -683,7 +683,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -691,7 +691,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 131072,
                     "fill": 0,
@@ -699,7 +699,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -712,7 +712,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -899,7 +899,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 196608,
                     "fill": 2147516416,
@@ -907,7 +907,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -915,7 +915,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 131072,
                     "fill": 0,
@@ -923,7 +923,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -936,7 +936,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -1123,7 +1123,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 98304,
                     "fill": 2147516416,
@@ -1131,7 +1131,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 16,
                     "fill": 0,
@@ -1139,7 +1139,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 65536,
                     "fill": 0,
@@ -1147,7 +1147,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -1160,7 +1160,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -1341,7 +1341,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -1520,7 +1520,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -1719,7 +1719,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 98304,
                     "fill": 2147516416,
@@ -1727,7 +1727,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 16,
                     "fill": 0,
@@ -1735,7 +1735,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 65536,
                     "fill": 0,
@@ -1743,7 +1743,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -1756,7 +1756,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -1922,7 +1922,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -2120,7 +2120,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -2315,7 +2315,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -2522,7 +2522,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 49152,
                     "fill": 2147516416,
@@ -2530,7 +2530,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 8,
                     "fill": 0,
@@ -2538,7 +2538,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 32768,
                     "fill": 0,
@@ -2546,7 +2546,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -2559,7 +2559,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -2736,7 +2736,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "ctl",
+                    "name": "ctl_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -2943,7 +2943,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 49152,
                     "fill": 2147516416,
@@ -2951,7 +2951,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 8,
                     "fill": 0,
@@ -2959,7 +2959,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 32768,
                     "fill": 0,
@@ -2967,7 +2967,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -2980,7 +2980,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -3167,7 +3167,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 49152,
                     "fill": 2147516416,
@@ -3175,7 +3175,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 8,
                     "fill": 0,
@@ -3183,7 +3183,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 32768,
                     "fill": 0,
@@ -3191,7 +3191,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -3204,7 +3204,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -3381,7 +3381,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "ctl",
+                    "name": "ctl_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -3578,7 +3578,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "ctl",
+                    "name": "ctl_words",
                     "placement": "local",
                     "bytes_per_slot": 4,
                     "fill": 0,
@@ -3785,7 +3785,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 49152,
                     "fill": 2147516416,
@@ -3793,7 +3793,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 8,
                     "fill": 0,
@@ -3801,7 +3801,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 32768,
                     "fill": 0,
@@ -3809,7 +3809,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -3822,7 +3822,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -4009,7 +4009,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 49152,
                     "fill": 2147516416,
@@ -4017,7 +4017,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 8,
                     "fill": 0,
@@ -4025,7 +4025,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 32768,
                     "fill": 0,
@@ -4033,7 +4033,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -4046,7 +4046,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
@@ -4233,7 +4233,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "rows",
+                    "name": "row_ring",
                     "placement": "symmetric",
                     "bytes_per_slot": 196608,
                     "fill": 2147516416,
@@ -4241,7 +4241,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": None,
                 },
                 {
-                    "name": "gen",
+                    "name": "gen_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -4249,7 +4249,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "gen",
                 },
                 {
-                    "name": "part",
+                    "name": "part_sums",
                     "placement": "local",
                     "bytes_per_slot": 131072,
                     "fill": 0,
@@ -4257,7 +4257,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "view": "part",
                 },
                 {
-                    "name": "ctr",
+                    "name": "ctr_words",
                     "placement": "local",
                     "bytes_per_slot": 32,
                     "fill": 0,
@@ -4270,7 +4270,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "parameter": "peer_table",
                     "entries": [
                         "scatter",
-                        "rows",
+                        "row_ring",
                     ],
                 },
             ],
