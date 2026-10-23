@@ -243,14 +243,16 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
 
     The workspace holds the FP32 ``[rows, C, 4]`` ``dweight`` partials of the
     backward's main program, one row per ``n_ch_tiles`` CTAs of a program's
-    launch grid (``rows = ceil(grid / n_ch_tiles)``), sized by the largest
-    grid of the architecture's backward programs: the channel count selects
-    the program a call runs, every program writes the leading rows of its own
-    grid inside this buffer, and its reduce program sums exactly those.  It
-    depends on ``C`` and the device only, so it is independent of ``S`` and
-    one buffer serves every token count; the main program fully writes the
-    rows the reduce program sums, so the buffer needs no zeroing between
-    launches or CUDA Graph replays.
+    launch grid (``rows = ceil(grid / n_ch_tiles)``, ``grid = grid_mult x
+    ctas_per_sm x SM count``: the bytes grow with the program's over-
+    decomposition factor ``grid_mult``), sized by the largest grid of the
+    architecture's backward programs: the channel count selects the program
+    a call runs, every program writes the leading rows of its own grid inside
+    this buffer, and its reduce program sums exactly those.  It depends on
+    ``C`` and the device only, so it is independent of ``S`` and one buffer
+    serves every token count; the main program fully writes the rows the
+    reduce program sums, so the buffer needs no zeroing between launches or
+    CUDA Graph replays.
     """
 
     device = torch.device(device)

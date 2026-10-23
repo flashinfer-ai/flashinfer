@@ -786,13 +786,20 @@ def test_workspace_bytes_and_layout() -> None:
         "the public workspace size is the fallback program's, unchanged by the"
         " programs a channel count selects"
     )
-    assert record["grid_rule"]["ctas_per_sm"] == max(
-        owner["grid_rule"]["ctas_per_sm"] for owner in owners
+    # The grid, hence the rows and bytes, is grid_mult[arch] x ctas_per_sm x SMs: the owner with the largest
+    # product bounds the route (grid_mult over-decomposes the token streams; the partial rows grow with it).
+    assert loader.grid_per_sm(record, arch) == max(
+        loader.grid_per_sm(owner, arch) for owner in owners
     )
     geometry = record["grid_rule"]["geometry"]
     assert all(owner["grid_rule"]["geometry"] == geometry for owner in owners)
     grid = loader.launch_grid(record, device_index=device.index)[0]
-    assert grid == record["grid_rule"]["ctas_per_sm"] * loader.sm_count(device.index)
+    assert grid == loader.grid_mult(record, arch) * record["grid_rule"][
+        "ctas_per_sm"
+    ] * loader.sm_count(device.index)
+    assert loader.grid_mult(record, arch) >= 1
+    fwd = loader.MODULES[loader.route_modules(arch, "fwd")[0]]
+    assert loader.grid_mult(fwd, arch) == 1, "co_resident grids never multiply"
     for C in (128, 136, 8192):
         small = cake_causal_conv1d_train_backward_workspace_bytes(1, C, device)
         large = cake_causal_conv1d_train_backward_workspace_bytes(262401, C, device)
@@ -955,12 +962,19 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert set(record["logical"].values()) == {"partial", "dw", "C", "rows"}
         else:
             # The forward keeps the co-resident grid it always launched normally; the backward programs
-            # of the split are sized by occupancy.
+            # of the split are sized by occupancy, over-decomposed per architecture by grid_mult.
             assert (
                 grid["kind"]
                 == {"fwd": "co_resident", "bwd": "occupancy"}[record["role"]]
             ), name
             assert grid["ctas_per_sm"] >= 1
+            if grid["kind"] == "occupancy":
+                assert set(grid["grid_mult"]) == set(record["arches"]), name
+                assert all(
+                    isinstance(k, int) and k >= 1 for k in grid["grid_mult"].values()
+                ), name
+            else:
+                assert "grid_mult" not in grid, name
             assert set(grid["geometry"]) == {"threads", "vec"}
             assert grid["geometry"]["threads"] == record["launch"]["block"][0]
             assert loader.CHANNEL_MULTIPLE % grid["geometry"]["vec"] == 0

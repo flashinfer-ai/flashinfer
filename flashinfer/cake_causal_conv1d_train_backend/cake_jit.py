@@ -39,8 +39,8 @@ applies that rule (a pure function of the architecture and ``C``; the host
 never reads the data).
 
 A backward call is two ordinary launches on one stream.  The selected program
-(persistent, ``ctas_per_sm x SM count`` CTAs) writes ``dx`` and one FP32
-partial row of ``dweight`` per CTA into the workspace and signals its
+(persistent, ``grid_mult x ctas_per_sm x SM count`` CTAs) writes ``dx`` and
+one FP32 partial row of ``dweight`` per CTA into the workspace and signals its
 dependents; then the route's reduce program (``record["reduce"]``), launched
 programmatically dependent on it (``launch.use_pdl``: its binding sets the
 programmatic-stream-serialization attribute, and the kernel waits for the
@@ -49,18 +49,21 @@ Until round 6 the backward was one cooperative launch whose grid-wide barrier
 preceded the same reduction in-kernel.  A cooperative grid cannot start while
 any kernel is resident on another stream -- NCCL collectives are, for most of
 a training backward (FlashInfer issue #7038) -- whereas an ordinary launch
-whose CTAs find no free slot runs them in a later wave.  The grid and the
-reduction order are unchanged, so ``dweight`` is bitwise what the cooperative
-form produced.
+whose CTAs find no free slot runs them in a later wave.  ``grid_mult``
+(``grid_rule["grid_mult"][arch]``) over-decomposes the token axis so that
+such a CTA trails by ``1 / grid_mult`` of a stream rather than a whole one;
+the partial rows grow with it.  The reduction order is unchanged, so
+``dweight`` is deterministic for a given ``(S, C, device)`` and, at
+``grid_mult`` 1, bitwise what the cooperative form produced.
 Token and channel counts are runtime scalars, so a changed problem size never
 recompiles anything; building every library of the architecture
 (:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
 capture.
 
 The host plan is the three functions :func:`plan` (the kernel scalars),
-:func:`launch_grid` (the grid: ``co_resident`` and ``occupancy`` records
-launch ``ctas_per_sm x SM count`` CTAs, ``channels_per_cta`` records ``ceil(C
-/ channels_per_cta)``)
+:func:`launch_grid` (the grid: ``co_resident`` records launch ``ctas_per_sm
+x SM count`` CTAs, ``occupancy`` records ``grid_mult x ctas_per_sm x SM
+count``, ``channels_per_cta`` records ``ceil(C / channels_per_cta)``)
 and :func:`partial_rows` (the backward workspace rows, the ``rows`` scalar of
 the reduce program); everything else derives from them.  The public workspace
 is sized by the largest grid of the architecture's backward programs
@@ -195,11 +198,12 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # An ordinary launch of ``ctas_per_sm x SM count`` CTAs, the measured
-        # co-residency (a CTA another stream's kernel displaces runs in a
-        # later wave; the grid, hence the partial rows and the dweight order,
-        # never changes).  Each CTA writes one partial row; ``reduce`` sums
-        # them.
+        # An ordinary launch of ``grid_mult x ctas_per_sm x SM count`` CTAs:
+        # ``ctas_per_sm`` is the measured co-residency, ``grid_mult`` (per
+        # architecture) splits the token streams that many times finer so a
+        # CTA another stream's kernel displaces trails by ``1 / grid_mult`` of
+        # a stream instead of a whole one.  Each CTA writes one partial row;
+        # ``reduce`` sums them.  The grid is a function of the device alone.
         # ``ctas_per_sm``: 3 CTAs per SM (168 registers at 128 threads, the
         # launch bound; ncu launch__occupancy_limit_registers), the occupancy
         # query's answer on B200 and GB300.
@@ -209,6 +213,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "geometry": {
                 "threads": 128,
                 "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
             },
             "kind": "occupancy",
         },
@@ -275,11 +283,12 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # An ordinary launch of ``ctas_per_sm x SM count`` CTAs, the measured
-        # co-residency (a CTA another stream's kernel displaces runs in a
-        # later wave; the grid, hence the partial rows and the dweight order,
-        # never changes).  Each CTA writes one partial row; ``reduce`` sums
-        # them.
+        # An ordinary launch of ``grid_mult x ctas_per_sm x SM count`` CTAs:
+        # ``ctas_per_sm`` is the measured co-residency, ``grid_mult`` (per
+        # architecture) splits the token streams that many times finer so a
+        # CTA another stream's kernel displaces trails by ``1 / grid_mult`` of
+        # a stream instead of a whole one.  Each CTA writes one partial row;
+        # ``reduce`` sums them.  The grid is a function of the device alone.
         # ``ctas_per_sm``: 2 CTAs per SM, the program's ``min_blocks`` 2 launch
         # bound (234 registers at 128 threads; ncu
         # launch__occupancy_limit_registers), the occupancy query's answer on
@@ -291,6 +300,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "geometry": {
                 "threads": 128,
                 "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
             },
             "kind": "occupancy",
         },
@@ -369,6 +381,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "geometry": {
                 "threads": 128,
                 "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+                "sm_107a": 1,
             },
             "kind": "occupancy",
         },
@@ -455,6 +472,10 @@ MODULES: dict[str, dict[str, Any]] = {
                 "threads": 128,
                 "vec": 8,
             },
+            "grid_mult": {
+                "sm_103a": 1,
+                "sm_107a": 1,
+            },
             "kind": "occupancy",
         },
         "kernel": "cake_causal_conv1d_train_be6f561d1572ef3c852a",
@@ -537,6 +558,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "geometry": {
                 "threads": 128,
                 "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
             },
             "kind": "occupancy",
         },
@@ -685,13 +709,13 @@ KINDS = ("fwd", "bwd")
 # names in ``record["reduce"]`` (the second launch).
 ROLES = ("fwd", "bwd", "reduce")
 # The grid-rule vocabulary (``record["grid_rule"]["kind"]``, see
-# :func:`launch_grid`): ``co_resident`` and ``occupancy`` launch ``ctas_per_sm
-# x SM count`` CTAs -- the former names a grid that must be exactly the
-# co-resident count (the forward's record and the cooperative KCP programs of
-# :mod:`.kcp_jit`, which share this host plan), the latter a grid sized by
-# occupancy and launched normally (the backward programs since the split);
-# ``channels_per_cta`` launches ``ceil(C / channels_per_cta)`` CTAs (the
-# reduce programs).
+# :func:`launch_grid`): ``co_resident`` launches exactly ``ctas_per_sm x SM
+# count`` CTAs, the co-resident count (the forward's record and the
+# cooperative KCP programs of :mod:`.kcp_jit`, which share this host plan);
+# ``occupancy`` launches ``grid_mult[arch] x ctas_per_sm x SM count`` CTAs
+# normally (the backward programs since the split; ``grid_mult`` names every
+# architecture of its record); ``channels_per_cta`` launches ``ceil(C /
+# channels_per_cta)`` CTAs (the reduce programs).
 GRID_KINDS = ("co_resident", "occupancy", "channels_per_cta")
 # The selection-rule vocabulary of a backward record (``record["select_rule"]
 # ["kind"]``); of the records whose rule admits a call the one of the highest
@@ -880,10 +904,11 @@ def workspace_record(arch: str) -> dict[str, Any]:
     The public workspace serves every backward program of the route
     (:func:`workspace_owners`), each of which writes the leading rows of its
     own grid.  The owners share one build geometry, so for every ``C`` their
-    rows, ``ceil(ctas_per_sm x SM count / n_ch_tiles)``, and bytes grow with
-    ``ctas_per_sm`` alone: the record with the largest ``ctas_per_sm`` (route
-    order breaks ties) bounds them all.  Owners of different geometries are a
-    registry error (``RuntimeError``).
+    rows, ``ceil(grid_mult x ctas_per_sm x SM count / n_ch_tiles)``, and bytes
+    grow with :func:`grid_per_sm` alone: the record with the largest
+    ``grid_mult[arch] x ctas_per_sm`` (route order breaks ties) bounds them
+    all.  Owners of different geometries are a registry error
+    (``RuntimeError``).
     """
 
     owners = workspace_owners(arch)
@@ -895,7 +920,34 @@ def workspace_record(arch: str) -> dict[str, Any]:
             f"the backward programs on {arch} declare {len(geometries)} build "
             "geometries; one workspace serves them only when they share one"
         )
-    return max(owners, key=lambda owner: int(owner["grid_rule"]["ctas_per_sm"]))
+    return max(owners, key=lambda owner: grid_per_sm(owner, arch))
+
+
+def grid_mult(record: dict[str, Any], arch: str) -> int:
+    """The over-decomposition factor of an ``occupancy`` record on ``arch`` (1 under every other grid rule).
+
+    ``grid_rule["grid_mult"]`` maps each architecture of the record to the
+    factor its grid multiplies the co-resident CTA count by; the factor per
+    architecture is the measured trade of tail latency behind a resident
+    side kernel against partial-row traffic.
+    """
+
+    rule = record["grid_rule"]
+    if rule["kind"] != "occupancy":
+        return 1
+    factor = int(rule["grid_mult"][arch])
+    if factor < 1:
+        raise ValueError(
+            f"module {record['kernel']}: grid_mult[{arch!r}] must be positive, got {factor}"
+        )
+    return factor
+
+
+def grid_per_sm(record: dict[str, Any], arch: str) -> int:
+    """CTAs per SM of a ``co_resident`` or ``occupancy`` record's grid on ``arch``:
+    ``grid_mult x ctas_per_sm`` (the grid is this times the SM count)."""
+
+    return grid_mult(record, arch) * int(record["grid_rule"]["ctas_per_sm"])
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -964,12 +1016,13 @@ def launch_grid(
 ) -> tuple[int, int, int]:
     """Launch grid of one module on ``device_index`` under its recorded grid rule.
 
-    ``co_resident`` and ``occupancy`` modules launch ``ctas_per_sm x SM
-    count`` CTAs, the measured co-residency of the program: exactly the
-    co-resident count for the former (a cooperative KCP backward never exceeds
-    it), a grid sized by occupancy for the latter (an ordinary launch: a CTA
-    that finds no free slot beside another stream's kernel runs in a later
-    wave).  That grid depends on the device only, so the deterministic
+    ``co_resident`` modules launch exactly ``ctas_per_sm x SM count`` CTAs,
+    the co-resident count (a cooperative KCP backward never exceeds it).
+    ``occupancy`` modules launch ``grid_mult[arch] x ctas_per_sm x SM count``
+    CTAs normally (:func:`grid_per_sm`): ``ctas_per_sm`` co-resident CTAs per
+    SM and ``grid_mult`` times finer token streams, so a CTA that finds no
+    free slot beside another stream's kernel trails by a short stream in a
+    later wave.  Either grid depends on the device only, so the deterministic
     ``dweight`` order is a pure function of ``(S, C, device)`` and one
     workspace serves every token count.  ``channels_per_cta`` modules (the
     reduce programs) launch ``ceil(C / channels_per_cta)`` CTAs for the call's
@@ -979,7 +1032,7 @@ def launch_grid(
     rule = record["grid_rule"]
     kind = rule["kind"]
     if kind in ("co_resident", "occupancy"):
-        grid_x = int(rule["ctas_per_sm"]) * sm_count(device_index)
+        grid_x = grid_per_sm(record, device_arch(device_index)) * sm_count(device_index)
     elif kind == "channels_per_cta":
         if C is None:
             raise ValueError(
@@ -1020,10 +1073,11 @@ def workspace_layout(
 
     The workspace is one CUDA ``uint8`` buffer holding the FP32 ``[rows, C, taps]``
     ``dweight`` partials, ``rows = partial_rows(grid, n_ch_tiles)`` for the
-    device's launch grid; it depends on ``C`` and the device only, so one
-    buffer serves every token count.  The kernel fully writes the rows its
-    reduce program sums, so nothing is zeroed between launches or CUDA Graph
-    replays.
+    device's launch grid (``grid_mult x ctas_per_sm x SM count``: the bytes
+    grow with the record's ``grid_mult``); it depends on ``C`` and the device
+    only, so one buffer serves every token count.  The kernel fully writes
+    the rows its reduce program sums, so nothing is zeroed between launches
+    or CUDA Graph replays.
     """
 
     grid_x = launch_grid(record, device_index=device_index)[0]
@@ -1133,6 +1187,8 @@ __all__ = [
     "arch_for_capability",
     "channel_split",
     "device_arch",
+    "grid_mult",
+    "grid_per_sm",
     "launch_grid",
     "library_name",
     "load",
