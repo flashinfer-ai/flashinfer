@@ -633,7 +633,7 @@ def test_kcp_plan_examples() -> None:
     )
 
 
-# Lever L-C.  Rule of record: on ranks with n_frag <= WAVE_N_FRAG_MAX = 3 the "wave"
+# The plan rule.  Rule of record: on ranks with n_frag <= WAVE_N_FRAG_MAX = 3 the "wave"
 # rule is argmin_P over P in [P_chain, min(64, NC_max)] (smallest P on ties) of
 #   ceil(n_frag P H / SM) x ceil(NC_max / P) x t_walk + (P - 1) x t_compose,  t_walk = 2.85 + 3.5 + 1.2 us, t_compose = 20.4 us
 # (10-ns integers); ranks with more fragments, and ranks whose longest fragment is <= 256 chunks (P_chain = 1), keep the occ P.  Information form (b) (superseded): the same
@@ -812,7 +812,7 @@ def test_lpt_makespan_matches_the_job_by_job_greedy() -> None:
 
 
 def test_kcp_plan_wave_rule_examples() -> None:
-    """Lever L-C at 152 SMs, H = 64: the rule of record equals the hand-derived argmin on ranks with <= 3 fragments,
+    """The plan rule at 152 SMs, H = 64: the rule of record equals the hand-derived argmin on ranks with <= 3 fragments,
     the occ P on guarded ranks; the information form (b) equals its hand values and the oracle; occ is untouched."""
     walk = sum(kp.WAVE_RULE_10NS[k] for k in ("tape", "xfer", "offset"))
     assert (walk, kp.WAVE_RULE_10NS["compose"], kp.WAVE_N_FRAG_MAX) == (
@@ -2343,14 +2343,14 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     assert set(ctx.describe(64)) >= {"rank", "T_r", "halo", "heads"}
 
 
-# --------------------------------------------------------------------------- the schedule / fused-walk / column-rule levers
+# --------------------------------------------------------------------------- the schedule / fused-walk / column-rule knobs
 
 cake_kcp = cake_package("cake_kda_train", "cake_kcp")
 LEVER_TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta")
 
 
 def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
-    """``schedule`` (L-A), ``fused_walks`` (L-B) and ``cols_rule`` (D1) are test knobs: refused
+    """``schedule``, ``fused_walks`` and ``cols_rule`` are test knobs: refused
     without ``CAKE_KCP_TEST_KNOBS=1``, never public keywords (``graph`` is the exception, public
     since this revision), validated against their admitted values; the
     shipped defaults since an earlier revision are the pair wait_first + fused_walks=1 (one tape launch per
@@ -2673,7 +2673,7 @@ def test_cols_rule_thresholds() -> None:
 
 
 def _check_fused_tables(ctx, H: int) -> dict:
-    """The L-B tables of one rank against the separate-walk tables (``fused_walks=0``) of ``cake_kcp``."""
+    """The fused-walk tables of one rank against the separate-walk tables (``fused_walks=0``) of ``cake_kcp``."""
     TILE = cake_kcp.TILE
     tb0 = cake_kcp._Tables(ctx, H, fused_walks=0)
     tb1 = cake_kcp._Tables(ctx, H, fused_walks=1)
@@ -2848,7 +2848,7 @@ FUSED_CASES = _fused_cases()
 @pytest.mark.parametrize("case", FUSED_CASES, ids=[c[0] for c in FUSED_CASES])
 @pytest.mark.parametrize("H", (4, 64))
 def test_fused_walk_tables(case, H) -> None:
-    """L-B: with ``fused_walks=1`` every live segment of every rank has a valid initial-state
+    """With ``fused_walks=1`` every live segment of every rank has a valid initial-state
     (final-adjoint) slot in one pool, the walk lists have one launch per phase, the carry plane grows by one slot per
     crossing fragment, and the only chain-table change is the publication of the ``S_in`` / ``dS_out`` copies."""
     name, part = case

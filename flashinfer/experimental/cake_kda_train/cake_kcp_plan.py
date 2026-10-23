@@ -731,7 +731,7 @@ def lpt_makespan(chains: "list[tuple[int, int]]", machines: int) -> int:
 def wave_rule_cost_10ns(
     n_frag: int, NC_max_frag: int, H: int, sm_count: int, P: int
 ) -> int:
-    """Lever L-C cost model of ``P`` segments per fragment (10 ns units, exact integers; the rule of
+    """Cost model of ``P`` segments per fragment (10 ns units, exact integers; the rule of
     record): the three walks (K1 offset, K3 transfer, K1 tape; one CTA per SM, equal segments) each take
     ``ceil(n_frag P H / SM)`` waves of ``ceil(NC_max_frag / P)`` CTA-steps, plus ``P - 1`` K4 compose steps."""
     waves = _ceil_div(n_frag * P * H, sm_count)
@@ -1195,7 +1195,7 @@ class KcpHeadPlan:
     crossing-out fragment -> ``dS_out`` slot; segments ``< P - 1`` -> adjoint carry slot), ``out_index`` (``P = 1``:
     the c1 send element of a crossing-out fragment, else ``-1``; ``P > 1``: the staging slot ``= segment``),
     ``walk_seg_offset`` (segments the offset walks visit) and ``walk_seg_tape`` (all).  ``h0_index_fused`` /
-    ``dht_index_fused`` are the one-pool form of the same tables for lever L-B (``fused_walks``; the shipped
+    ``dht_index_fused`` are the one-pool form of the same tables for the fused walks (``fused_walks``; the shipped
     form since an earlier revision; ``fused_walks=0`` through the test knob): at ``P > 1`` every segment's initial state (final adjoint) sits in the carry plane -- segment 0 of a
     crossing-in fragment in the extra slot ``n_frag (P - 1) + in_slot`` that the ``carry_in`` merge fills with its
     ``S_in`` tiles (``write_states``), the last segment of a crossing-out fragment in ``n_frag (P - 1) + out_slot``
@@ -1456,7 +1456,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
                 out_index.append(s)
                 walk_offset.append(s)
     walk_tape = list(range(NSEG))
-    # the one-pool tables of lever L-B (fused_walks; the shipped form since an earlier revision, fused_walks=0 via the knob)
+    # the one-pool tables of the fused walks (fused_walks; the shipped form since an earlier revision, fused_walks=0 via the knob)
     extra = ctx.n_frag * (P - 1)
     h0_fused, dht_fused = [], []
     for f in mine:
@@ -1560,7 +1560,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     numel["carry"] = (ctx.n_frag * (P - 1) * H * TILE) if P > 1 else 0
     numel["carry_fused"] = (
         ((extra + max(n_in, n_out)) * H * TILE) if P > 1 else 0
-    )  # lever L-B's carry plane
+    )  # the fused walks' carry plane
     dev = ctx.device
     i32, i64 = torch.int32, torch.int64
 

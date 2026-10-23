@@ -32,8 +32,8 @@ the forward's transfer was kept, ``M_f^T`` again go to the owners (``b1``), the
 owner walks each chain backwards (``X <- M_f^T X + d_f``) and returns every
 crossing-out fragment's ``dS_out`` (``b2``); the local adjoint recurrence runs
 from it.  One compute stream; the collectives are asynchronous on the caller's
-process group and waited at their first consumer.  Shipped schedule (an earlier
-adoption of levers L-A + L-B): ``wait_first`` -- no merge
+process group and waited at their first consumer.  Shipped schedule (adopted in an
+earlier revision): ``wait_first`` -- no merge
 or tape walk is issued while a collective is in flight, and the tape walks of a
 phase are one fused launch from the carry plane; the earlier ``overlap`` form
 (the document-start tape walk under ``c1``, the document-last adjoint tape walk
@@ -206,11 +206,11 @@ TRANSFER_WALKS = (
 )  # K3 program family (non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
 KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg]}; version 1 also held the token-row Aqk / Akk
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
-# Host / plan levers (test knob class: reachable only through _kcp_test_knobs):
+# Host / plan knobs (test knob class: reachable only through _kcp_test_knobs):
 SCHEDULES = (
     "overlap",
     "wait_first",
-)  # L-A: "wait_first" (shipped) = merges and tape walks after each wait; "overlap" = the earlier R7 overlaps of the design note §3.5 / §6.5 (test knob)
+)  # schedule: "wait_first" (shipped) = merges and tape walks after each wait; "overlap" = the earlier overlapped issue order of the design note §3.5 / §6.5 (test knob)
 COLS_RULES = (
     "fixed",
     "by_chains",
@@ -300,9 +300,9 @@ P2_KNOBS = {  # knob -> admitted values
     "host_trim": HOST_TRIMS,
     "merge_fuse": MERGE_FUSES,
 }
-# Shipped defaults of the schedule / fused-walk pair (adoption of levers L-A + L-B together, the keep
+# Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
-# selectable through the test knobs for the A/B record; cols_rule stays "fixed" (D1 in band everywhere: not adopted,
+# selectable through the test knobs for the A/B record; cols_rule stays "fixed" (the other column rule was in band everywhere: not adopted,
 # knob kept).  The schedule and the walk grouping never change a published bit (the merges read c1_recv / the staging
 # planes, the tapes read no collective buffer): G3 holds under every combination.
 SCHEDULE_DEFAULT = "wait_first"
@@ -2175,7 +2175,7 @@ class _Tables:
         self.H = H = int(H)
         self.fused_walks = int(
             fused_walks
-        )  # lever L-B: one base pointer per tape phase
+        )  # fused walks: one base pointer per tape phase
         if walk_geometry not in WALK_GEOMETRIES:
             raise ValueError(
                 f"walk_geometry must be one of {WALK_GEOMETRIES}, got {walk_geometry!r}"
@@ -2243,7 +2243,7 @@ class _Tables:
         self.walk_m_b1 = (
             segs([f for f in ins if f.crossing_out], [0]) if P == 1 else self.walk_all
         )  # K3 M-only (b1)
-        # fused_walks (L-B): one launch per tape phase -- every live segment after wait(c2) / wait(b2) (schedule
+        # fused_walks: one launch per tape phase -- every live segment after wait(c2) / wait(b2) (schedule
         # wait_first), or the crossing-in (crossing-out) fragments' segments when the document-start (document-last)
         # walk stays under the collective (schedule overlap)
         self.walk_live = segs(starts + ins, range(P))
@@ -2268,10 +2268,10 @@ class _Tables:
         self.dcarry_index = tuple(int(i) for i in hp.dcarry_index)
         self.h0_index_fused = tuple(
             int(i) for i in hp.h0_index_fused
-        )  # L-B: the carry plane (P > 1) / S_in (P = 1)
+        )  # fused walks: the carry plane (P > 1) / S_in (P = 1)
         self.dht_index_fused = tuple(
             int(i) for i in hp.dht_index_fused
-        )  # L-B: the carry plane (P > 1) / dS_out (P = 1)
+        )  # fused walks: the carry plane (P > 1) / dS_out (P = 1)
         self.out_index = tuple(int(i) for i in hp.out_index)
         self.in_index = tuple(
             in_slot[s // P] if (s % P == 0 and frags[s // P].crossing_in) else -1
@@ -2310,7 +2310,7 @@ class _Tables:
         n_carry = self.n_frag * (P - 1) if P > 1 else 0
         if (
             self.fused_walks and P > 1
-        ):  # L-B: + one slot per crossing fragment for the S_in / dS_out copies
+        ):  # fused walks: + one slot per crossing fragment for the S_in / dS_out copies
             n_carry += max(self.n_in, self.n_out)
         self.carry_tiles = tuple(
             tuple(c * H + h for h in range(H)) for c in range(n_carry)
@@ -2472,7 +2472,7 @@ class _Tables:
         bound("b1 d tiles (d form)", self.b1_d_tiles["d"], n["b1_send_d"])
         bound("b1 d tiles (dm form)", self.b1_d_tiles["dm"], n["b1_send_dm"])
         bound("b1 M tiles", self.b1_m_tiles, n["b1_send_dm"])
-        # the L-B tables address the fused carry plane (n_frag (P - 1) + max(n_in, n_out) slots; allocated only when
+        # the fused-walk tables address the fused carry plane (n_frag (P - 1) + max(n_in, n_out) slots; allocated only when
         # fused_walks is set, inert otherwise) at P > 1 and the S_in / dS_out pools at P = 1
         n_fused = self.n_frag * (self.P - 1) + max(self.n_in, self.n_out)
         fused_pool = (
@@ -2533,7 +2533,7 @@ class _Tables:
                     )
             extra = (
                 self.n_frag * (P - 1)
-            )  # L-B: the extra carry slots hold the S_in (dS_out) copies of the fused form
+            )  # fused walks: the extra carry slots hold the S_in (dS_out) copies of the fused form
 
             def copy_slot(
                 f, h: int, slot: int
@@ -3120,7 +3120,7 @@ class KcpSaved:
 
 @dataclasses.dataclass
 class KcpOptions:
-    """The extra keywords of the entry points (the design note §10.1): ``save_transfer`` (R6: keep the owner's c1
+    """The extra keywords of the entry points (the design note §10.1): ``save_transfer`` (keep the owner's c1
     receive tensor / ``M_seg`` for the backward; ``None`` = the default = resolve: :data:`cake_kcp_plan.SAVE_TRANSFER_DEFAULT`
     = ``True`` since an earlier revision for the a2a exchange, ``False`` for ``exchange="ring"``, whose
     path receives no c1 tensor; an explicit ``False`` = the earlier recompute form, which re-sends
@@ -3152,8 +3152,8 @@ class KcpOptions:
     p_rule: str | None = (
         None  # plan P rule named by _kcp_test_knobs (the wave rules); None = the context's (P_RULE_DEFAULT "wave_fill1_p1tie"); must equal ctx.p_rule
     )
-    schedule: str = SCHEDULE_DEFAULT  # L-A: "wait_first" (shipped) issues the merges and tape walks after each wait; "overlap" via _kcp_test_knobs
-    fused_walks: int = FUSED_WALKS_DEFAULT  # L-B (shipped 1): one tape launch per phase from the carry plane (+ the S_in / dS_out copies); 0 via _kcp_test_knobs
+    schedule: str = SCHEDULE_DEFAULT  # "wait_first" (shipped) issues the merges and tape walks after each wait; "overlap" via _kcp_test_knobs
+    fused_walks: int = FUSED_WALKS_DEFAULT  # shipped 1: one tape launch per phase from the carry plane (+ the S_in / dS_out copies); 0 via _kcp_test_knobs
     cols_rule: str = "fixed"  # D1: "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
     walk_geometry: str = WALK_GEOMETRY_DEFAULT  # walk geometry: shipped "lpt_tape_one_cta_per_sm"; "shipped" (the earlier geometry) and the other WALK_GEOMETRIES via _kcp_test_knobs only
     graph: str = GRAPH_DEFAULT  # graph replay: public keyword; "replay" captures a call once per validity key and replays it (eager on a key miss); also reachable through _kcp_test_knobs for the A/B record
@@ -3250,7 +3250,7 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
     p2: dict[str, Any] = {}
     if isinstance(raw, dict) and any(
         k in raw for k in P2_KNOBS
-    ):  # the earlier levers: the same gate
+    ):  # the earlier knobs: the same gate
         if os.environ.get(cake_kcp_plan.TEST_KNOBS_ENV) != "1":
             raise ValueError(
                 f"_kcp_test_knobs is a private test hook: it is accepted only with {cake_kcp_plan.TEST_KNOBS_ENV}=1 in the environment"
@@ -3274,7 +3274,7 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
     knobs = cake_kcp_plan.validate_test_knobs(raw)
     p_rule = (
         knobs["p_rule"] if isinstance(raw, dict) and "p_rule" in raw else None
-    )  # lever L-C: the context carries the rule
+    )  # plan rule: the context carries the rule
     unknown = sorted(set(kwargs) - set(_OPTION_KEYS))
     if unknown:
         raise TypeError(
@@ -3373,7 +3373,7 @@ class KcpCall:
             raise ValueError(
                 f"_kcp_test_knobs p_rule {opts.p_rule!r} differs from the context's plan rule {getattr(ctx, 'p_rule', cake_kcp_plan.P_RULE_DEFAULT)!r}: give the knob to build_kcp_context"
             )
-        self.schedule = str(opts.schedule)  # L-A
+        self.schedule = str(opts.schedule)
         self.cols_rule = str(opts.cols_rule)  # D1
         if int(tb.fused_walks) != int(opts.fused_walks):
             raise ValueError(
@@ -3614,8 +3614,8 @@ def _record(kind: str, call: KcpCall) -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Launch sequences (the design note §3.5 forward, §6.5 backward; one compute stream, waits at first consumption, R7;
-# shipped: schedule wait_first + fused tape walks, the R7 overlaps only under the overlap knob)
+# Launch sequences (the design note §3.5 forward, §6.5 backward; one compute stream, waits at first consumption;
+# shipped: schedule wait_first + fused tape walks, the overlapped issue order only under the overlap knob)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -3988,7 +3988,7 @@ def _summaries(call: KcpCall) -> None:
 def _fwd_tapes(
     call: KcpCall, *, out: torch.Tensor | None, carry: Indexed | None, wait_first: bool
 ) -> None:
-    """The forward tape walk(s) after ``S_in`` is complete.  ``fused_walks`` (L-B): one launch from one pool -- the
+    """The forward tape walk(s) after ``S_in`` is complete.  ``fused_walks``: one launch from one pool -- the
     carry plane at ``P > 1`` (``h0_index_fused``: carries, the ``S_in`` copies of ``carry_in``, ``-1`` zero states),
     ``S_in`` itself at ``P = 1`` -- over every live segment (``wait_first``) or the crossing-in fragments' segments
     (the document-start walk ran under c1); otherwise the three launches of the design note §3.5 (the document-start
@@ -4011,7 +4011,7 @@ def _fwd_tapes(
     if wait_first:
         call.walk(
             "kcp_fwdh_tape", tb.walk_start, h0=carry, out=out
-        )  # document starts: after wait(c2) (L-A)
+        )  # document starts: after wait(c2)
     call.walk("kcp_fwdh_tape", tb.walk_in_p0, h0=h0_in, out=out)
     if tb.P > 1:
         call.walk("kcp_fwdh_tape", tb.walk_in_p1, h0=carry, out=out)
@@ -4035,7 +4035,7 @@ def _adj_tapes(call: KcpCall, *, dcarry: Indexed | None, wait_first: bool) -> No
     if wait_first:
         call.walk(
             "kcp_dhu_tape", tb.walk_end, dht=dcarry
-        )  # document ends: after wait(b2) (L-A)
+        )  # document ends: after wait(b2)
     call.walk("kcp_dhu_tape", tb.walk_cross_last, dht=dht_cross)
     if tb.P > 1:
         call.walk("kcp_dhu_tape", tb.walk_cross_rest, dht=dcarry)
@@ -4044,7 +4044,7 @@ def _adj_tapes(call: KcpCall, *, dcarry: Indexed | None, wait_first: bool) -> No
 def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
     """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
     tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
-    ``schedule="wait_first"`` (L-A; the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
+    ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
     -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
     is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
     every published bit is the same."""
@@ -4105,7 +4105,7 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
     """The design note §6.5.  ``saved=None`` is the replay mode (the forward sequence without ``fwd_o`` recomputes
     ``S_in``, the tapes and the owner's c1 receive tensor); otherwise the tapes come from K1 ``_tape`` over the saved
     ``S_in`` and the owner's adjoint reads ``M_f`` from b1 (``save_transfer=False``) or ``M_f^T`` from the saved c1
-    receive tensor.  ``schedule="wait_first"`` (L-A; the shipped default since an earlier revision): ``b1 -> wait -> adjoint merge -> b2 -> wait -> dcarry merges ->
+    receive tensor.  ``schedule="wait_first"`` (the shipped default since an earlier revision): ``b1 -> wait -> adjoint merge -> b2 -> wait -> dcarry merges ->
     adjoint tape walk(s)`` (the R7 overlap of the document-last walk under b2 is dropped)."""
     tb = call.tb
     wait_first = call.schedule == "wait_first"
@@ -4151,7 +4151,7 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
                 call.merge("carry_in")
         if (
             tb.fused_walks and tb.P > 1
-        ):  # L-B: the whole tape replay from the carry plane in one launch
+        ):  # fused walks: the whole tape replay from the carry plane in one launch
             call.walk(
                 "kcp_fwdh_tape",
                 tb.walk_live,
