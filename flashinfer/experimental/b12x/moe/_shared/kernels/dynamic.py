@@ -3482,6 +3482,29 @@ class MoEDynamicKernelBackend:
                 scatter_output_u32[j // cols_u32, j % cols_u32] = Uint32(0)
                 j += flat_stride
 
+        # A masked route (topk_ids == -1) has no producer in the deterministic
+        # split: phase 2 writes only real (route, column) locations, while the
+        # fixed-order top-k reduction sums every routed row without consulting
+        # topk_ids.  When that split skips the full buffer clear, clear the rows
+        # of masked routes so a reused scratch cannot contribute the previous
+        # call's values to the reduction.  One warp owns a pair and reads its
+        # route id once, so a call without masked routes only pays the scan.
+        if cutlass.const_expr(
+            self.deterministic_output and self.external_materialized_fc2
+        ):
+            masked_lane = flat_tid & Int32(31)
+            masked_warp = flat_tid >> Int32(5)
+            masked_warps = flat_stride >> Int32(5)
+            masked_pair = masked_warp
+            while masked_pair < Int32(total_pairs):
+                masked_expert = topk_ids[masked_pair].to(Int32)
+                if masked_expert < Int32(0) or masked_expert >= num_experts:
+                    masked_col = masked_lane
+                    while masked_col < cols_u32:
+                        scatter_output_u32[masked_pair, masked_col] = Uint32(0)
+                        masked_col += Int32(32)
+                masked_pair += masked_warps
+
         # Materialized slots are overwritten before the second grid barrier;
         # only a true ready queue needs generation flags cleared up front.
         if cutlass.const_expr(self.work_is_streaming):
