@@ -136,14 +136,25 @@ def gate():
 
 
 def prims_ts_gate():
-    gate()
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip("Prims-TS DS4.1 decode validation targets SM100, SM103 or SM107")
+    pytest.importorskip("cutlass.experimental.primitives")
     import cutlass
     from packaging.version import Version
+    from flashinfer.cute_dsl.availability import require_cute_dsl_arch
 
     if Version(cutlass.__version__) < Version("4.8.0"):
         pytest.skip("Prims-TS requires CuTe-DSL >= 4.8.0")
     if cutlass.CUDA_VERSION.major < 13:
         pytest.skip("Prims-TS requires the bundled CUDA 13 compiler")
+    try:
+        require_cute_dsl_arch(torch.cuda.current_device())
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
 
 
 @pytest.fixture

@@ -158,13 +158,23 @@ def workspace_host(monkeypatch):
         monkeypatch,
         flashinfer_experimental_api=lambda function: function,
     )
-    state = SimpleNamespace(capturing=False, properties=0, allocations=[])
+    state = SimpleNamespace(
+        capturing=False,
+        properties=0,
+        allocations=[],
+        capability=(10, 0),
+        sm_count=148,
+    )
     cuda_device = torch.device("cuda:0")
 
     def properties(index):
         state.properties += 1
         assert index == 0
-        return SimpleNamespace(major=10, minor=0, multi_processor_count=148)
+        return SimpleNamespace(
+            major=state.capability[0],
+            minor=state.capability[1],
+            multi_processor_count=state.sm_count,
+        )
 
     def allocate(shape, *, device, dtype):
         assert device == cuda_device
@@ -366,10 +376,14 @@ def test_scalar_no_tensor_and_fp32_values(workspace_host):
     assert value == struct.unpack("f", struct.pack("f", 1.0000001))[0]
 
 
+@pytest.mark.parametrize("capability", ((10, 0), (10, 3), (10, 7)))
 @pytest.mark.parametrize("layout", ("HND", "NHD"))
 @pytest.mark.parametrize("k", (0, 64))
-def test_bind_normalizes_views_and_preserves_output_identity(workspace_host, layout, k):
+def test_bind_normalizes_views_and_preserves_output_identity(
+    workspace_host, capability, layout, k
+):
     host = workspace_host
+    host.state.capability = capability
     arguments = _arguments(host, k=k, layout=layout)
     snapshots = _snapshots(host, arguments)
     bound = host.module.bind_inputs(**arguments)
@@ -524,17 +538,55 @@ def test_bind_eager_output_and_capture_output_requirement(workspace_host):
     assert bound.out.dtype == host.torch.bfloat16
 
 
-def test_device_facts_cold_capture_rejected_warm_capture_cached(workspace_host):
+@pytest.mark.parametrize(
+    "capability,sm_count", (((10, 0), 148), ((10, 3), 73), ((10, 7), 117))
+)
+def test_device_facts_cold_capture_rejected_warm_capture_cached(
+    workspace_host, capability, sm_count
+):
     host = workspace_host
+    host.state.capability, host.state.sm_count = capability, sm_count
+    assert host.module.device_sm_count.cache_parameters() == {
+        "maxsize": None,
+        "typed": False,
+    }
     host.state.capturing = True
     with pytest.raises(ValueError, match="warm"):
         host.module.device_sm_count(0)
     assert host.state.properties == 0
     host.state.capturing = False
-    assert host.module.device_sm_count(0) == 148
+    assert host.module.device_sm_count(0) == sm_count
     host.state.capturing = True
-    assert host.module.device_sm_count(0) == 148
+    assert host.module.device_sm_count(0) == sm_count
     assert host.state.properties == 1
+    assert host.module.device_sm_count.cache_info().hits == 1
+
+
+@pytest.mark.parametrize("capability", ((9, 0), (10, 1), (11, 0), (12, 0)))
+def test_device_facts_reject_unsupported_architecture(workspace_host, capability):
+    host = workspace_host
+    host.state.capability = capability
+    with pytest.raises(ValueError):
+        host.module.device_sm_count(0)
+    assert host.state.properties == 1 and not host.state.allocations
+    assert host.module.device_sm_count.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize("capability", ((9, 0), (10, 1), (11, 0), (12, 0)))
+@pytest.mark.parametrize("caller_output", (False, True))
+def test_bind_rejects_unsupported_architecture_before_allocation_or_writes(
+    workspace_host, capability, caller_output
+):
+    host = workspace_host
+    host.state.capability = capability
+    arguments = _arguments(host)
+    if not caller_output:
+        arguments["out"] = None
+    snapshots = _snapshots(host, arguments)
+    with pytest.raises(ValueError):
+        host.module.bind_inputs(**arguments)
+    _assert_untouched(host, snapshots)
+    assert host.state.properties == 1 and not host.state.allocations
 
 
 def test_public_dispatcher_signature_and_backend_forwarding(workspace_host):

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
 
-"""Quantize-and-write helpers for the SM100 DS4.1 decode cache formats."""
+"""Quantize-and-write DS4.1 cache helpers for SM100, SM103 and SM107."""
 
 import torch
 import triton as tr
@@ -123,8 +123,14 @@ def quantize_cache(x, *, format, page_size=64, out=None, slots=None, kv_layout="
     """
     if kv_layout not in ("HND", "NHD"):
         raise ValueError("kv_layout must be HND or NHD")
-    if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) != (10, 0):
-        raise ValueError("DS4.1 decode cache preparation requires SM100")
+    if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        raise ValueError(
+            "DS4.1 decode cache preparation requires SM100, SM103 or SM107"
+        )
     if (
         x.ndim != 2
         or x.shape[1] != 512

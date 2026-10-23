@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
 
-"""Experimental DS4.1 decode backends and optional cache preparation on SM100."""
+"""Experimental DS4.1 decode backends and optional cache preparation."""
 
 from .api_logging import flashinfer_experimental_api
 
@@ -33,8 +33,8 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
     captured graph keeps fixed input addresses: update values in place, or
     recapture/update the graph when addresses change. Ordinary plan calls
     may use new addresses with matching declarations. The same plan must
-    not execute concurrently on different streams. Single
-    token decode only; MTP and SM103 are not part of this initial scope.
+    not execute concurrently on different streams. Frost supports SM100 and
+    single-token decode only; MTP and other GPU architectures are out of scope.
 
     Explicit ``backend="prims-ts"`` uses a separate caller-workspace API::
 
@@ -78,8 +78,9 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
     output normalization. Empty rows produce exact zero output. Effective
     Q/K/V must be finite; this is inference-only.
 
-    Prims-TS requires CuTe-DSL>=4.8 and its bundled CUDA13 compiler. Its
-    fixed Keep-AB/M64/BK128/retained-KV8/split1/nonpersistent schedule jointly
+    Prims-TS supports SM100, SM103 and SM107, with CuTe-DSL>=4.8 and its
+    bundled CUDA13 compiler supporting the device's compile target. Its fixed
+    Keep-AB/M64/BK128/retained-KV8/split1/nonpersistent schedule jointly
     attends SWA/main in one finalizing kernel with inline metadata and sinks.
     Workspace contains private LSE and a K0 dummy, not sanitized metadata.
     Capture requires caller out/workspace and eager warmup; keep addresses
@@ -88,8 +89,9 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
     synchronization. Workspace/out cannot overlap inputs or each other;
     read-only inputs may alias.
 
-    Both backends are explicit, JIT-only SM100/H64/Sq1/D512 paths, with no
-    automatic selector. No full-model equivalence or performance is claimed.
+    Both backends are explicit, JIT-only H64/Sq1/D512 paths, with no automatic
+    selector; Frost remains SM100-only. No full-model equivalence or performance
+    is claimed.
     See ``examples/deepseek_v41/README.md`` for limitations and usage.
     """
     if backend == "cute-dsl":
@@ -150,9 +152,11 @@ def deepseek_v41_quantize_cache(
     """Quantize/write DS4.1 cache bytes, preserving the original NHD default.
 
     Optional Triton helper for finite contiguous BF16/FP32 x[N,512], after
-    model-required RoPE. SM100 and page64 only. For native shared descales,
+    model-required RoPE. SM100/SM103/SM107 and page64 only. For native shared descales,
     normalize writer inputs to common cache units upstream; this writer
-    does not calculate a shared tensor descale.
+    does not calculate a shared tensor descale. Triton's selected PTX assembler
+    must support the device target (``sm_107a`` on SM107), independently of
+    CuTe's bundled compiler.
 
     ``main_kv_fp4`` uses E2M1 data and group16/E4M3 scales, width288;
     ``swa_mxfp8`` uses E4M3 data and group32/E8M0 scales, width528. Opaque
