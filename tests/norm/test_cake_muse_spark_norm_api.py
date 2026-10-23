@@ -469,23 +469,37 @@ def test_rmsnorm_sigmoid_gate_routes_window_the_token_count_per_head_count():
         loader.launch_grid(plain, 4096, device_index=0)
 
 
+# Op A's parked whole-row program (beta's plane parked in shared memory) owns the mid band of every route: above
+# these row counts and up to 2048 (384-2048 rows on sm_100a, 256-2048 on sm_103a); the prologue whole-row program
+# owns the rows on both sides of it.
+OP_A_PARKED_ABOVE = {"sm_100a": 383, "sm_103a": 255}
+
+
 def test_gated_residual_rmsnorm_routes_window_the_row_count():
-    """Op A's eight routes (two architectures x four variants) hold four programs each over the windows 1-16 /
-    17-64 / 65-128 / 129-: the 65-128 window is the whole-row (one CTA per row, 512 threads) program and the
-    programs of a variant differ only by their window."""
+    """Op A's eight routes (two architectures x four variants) hold five programs each over the windows 1-16 /
+    17-64 / 65-128 / 129-above / above+1-2048 / 2049-: the 65-128 window is the whole-row (one CTA per row, 512
+    threads) program, the prologue whole-row program owns 129-above and 2049- (two windows of one record), the
+    parked whole-row program owns above+1-2048 (above = 383 on sm_100a, 255 on sm_103a), and the programs of a
+    variant differ only by their windows."""
     for arch in BLACKWELL:
+        above = OP_A_PARKED_ABOVE[arch]
         for variant in SHIPPED_VARIANTS[OP_A]:
             route = loader.route_key(OP_A, variant)
             names = loader.route_modules(arch, route)
-            assert len(names) == 4, (arch, route)
-            edges = [
-                loader.MODULES[name]["select_rule"]["windows"][arch] for name in names
+            assert len(names) == 5, (arch, route)
+            windows = [
+                [
+                    tuple(window)
+                    for window in loader.MODULES[name]["select_rule"]["windows"][arch]
+                ]
+                for name in names
             ]
-            assert [tuple(window) for (window,) in edges] == [
-                (0, 16),
-                (16, 64),
-                (64, 128),
-                (128, None),
+            assert windows == [
+                [(0, 16)],
+                [(16, 64)],
+                [(64, 128)],
+                [(128, above), (2048, None)],
+                [(above, 2048)],
             ], (arch, route)
             for rows, position in (
                 (1, 0),
@@ -496,13 +510,28 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
                 (96, 2),
                 (128, 2),
                 (129, 3),
+                (above, 3),
+                (above + 1, 4),
+                (1024, 4),
+                (2048, 4),
+                (2049, 3),
                 (4096, 3),
             ):
                 assert loader.selected_module(arch, route, rows) == names[position]
-            window = loader.MODULES[names[2]]
-            assert window["grid_rule"] == {"cluster": 1, "kind": "rows", "row_ctas": 1}
-            assert window["build"]["threads"] == 512 and window["build"]["split"] == 1
-            assert tuple(window["launch"]["block"]) == (512, 1, 1)
+            for position in (2, 3, 4):
+                window = loader.MODULES[names[position]]
+                assert window["grid_rule"] == {
+                    "cluster": 1,
+                    "kind": "rows",
+                    "row_ctas": 1,
+                }
+                assert (
+                    window["build"]["threads"] == 512 and window["build"]["split"] == 1
+                )
+                assert tuple(window["launch"]["block"]) == (512, 1, 1)
+            parked = loader.MODULES[names[4]]["build"]
+            assert parked["planes_smem"] == "beta" and parked["planes_path"] == "sts"
+            assert loader.MODULES[names[3]]["build"]["planes_smem"] == "none"
             for name in names:
                 build = loader.MODULES[name]["build"]
                 assert build["mode"] == int(variant[4]) and build[
