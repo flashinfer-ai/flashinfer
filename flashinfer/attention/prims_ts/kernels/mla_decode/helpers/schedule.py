@@ -331,8 +331,14 @@ def staged_pv_mma_tmem_p(
     consumer_label,
     producer_label="pv_mma_loop_tmem_p",
     reuse_k=False,
+    qk_only_stages=0,
 ):
-    """Consume TMEM P and staged V descriptors to produce one PV output tile."""
+    """Consume TMEM P and staged V descriptors to produce one PV output tile.
+
+    With ``reuse_k`` V is read from the K stages QK acquired, and PV releases
+    them in acquisition order; ``qk_only_stages`` K stages that follow the V
+    stages in the tile (the 576-dim RoPE slice) are released after them.
+    """
     tmem_p.wait()
     p_stage_idx = tmem_p.p_stage()
     tmem_o.acquire()
@@ -347,6 +353,8 @@ def staged_pv_mma_tmem_p(
             v_subtile_idx=v_subtile_idx,
             is_tail=is_tail,
         )
+        smem_kv.release()
+    for _ in range(qk_only_stages):
         smem_kv.release()
     tmem_o.commit()
     tmem_p.release()
