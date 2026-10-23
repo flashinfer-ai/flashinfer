@@ -243,3 +243,19 @@ def test_xqa_mtp_q2_keeps_fast_planner(make_wrapper, monkeypatch):
         q_data_type=torch.float16,
     )
     assert not wrapper._use_xqa_mtp_decode
+
+
+def test_xqa_mtp_fallback_restores_shared_semaphore(make_wrapper):
+    wrapper, plan, _ = make_wrapper()
+    plan()
+    semaphore_bytes = 8 * 1024 * 1024
+    workspace = torch.zeros(semaphore_bytes + 64, dtype=torch.uint8)
+    wrapper._float_workspace_buffer = workspace
+    wrapper._workspace_size = workspace.numel()
+    # FA2 may use any part of caller-owned scratch, including XQA's semaphore.
+    wrapper._cached_module.paged_run = lambda *args: workspace.fill_(127)
+    q = torch.zeros(16 * 8, 32, 128, dtype=torch.float16)
+    kv = torch.zeros(16 * 64, 2, 16, 8, 128, dtype=torch.float16)
+    wrapper.run(q, kv, enable_pdl=False, return_lse=True)
+    assert bool(torch.all(workspace[:semaphore_bytes] == 0))
+    assert bool(torch.all(workspace[semaphore_bytes:] == 127))

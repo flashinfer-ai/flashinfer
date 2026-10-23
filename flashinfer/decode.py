@@ -3799,6 +3799,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     ]
 
             self._cached_module.paged_run(*run_args)
+            if self._use_xqa_mtp_decode:
+                # FA2 fallback shares scratch with XQA; restore its semaphore
+                # before a later XQA call or captured graph replay.
+                self._float_workspace_buffer.view(torch.uint8)[
+                    : 8 * 1024 * 1024
+                ].zero_()
         else:
             # trtllm-gen does not need plan info
             if self._backend == "trtllm-gen" and self._plan_info is None:
