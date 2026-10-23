@@ -315,73 +315,27 @@ def test_swa_fp8_all_finite_codes(dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_swa_fp8_halfway_even_saturation_and_signed_zero(dtype):
     gate()
-    values = [
-        0.0,
-        -0.0,
-        2**-10,
-        -(2**-10),
-        3 * 2**-10,
-        -3 * 2**-10,
-        5 * 2**-10,
-        -5 * 2**-10,
-        7 * 2**-10,
-        -7 * 2**-10,
-        2**-9,
-        -(2**-9),
-        7 * 2**-9,
-        -7 * 2**-9,
-        15 * 2**-10,
-        -15 * 2**-10,
-        1.0625,
-        -1.0625,
-        1.1875,
-        -1.1875,
-        400.0,
-        -400.0,
-        432.0,
-        -432.0,
-        448.0,
-        -448.0,
-        449.0,
-        -449.0,
-        1000.0,
-        -1000.0,
-        1e30,
-        -1e30,
+    positive_cases = [
+        (0.0, 0x00),
+        (2**-10, 0x00),
+        (3 * 2**-10, 0x02),
+        (5 * 2**-10, 0x02),
+        (7 * 2**-10, 0x04),
+        (2**-9, 0x01),
+        (7 * 2**-9, 0x07),
+        (15 * 2**-10, 0x08),
+        (1.0625, 0x38),
+        (1.1875, 0x3A),
+        (400.0, 0x7C),
+        (432.0, 0x7E),
+        (448.0, 0x7E),
+        (449.0, 0x7E),
+        (1000.0, 0x7E),
+        (1e30, 0x7E),
     ]
+    values = [signed for value, _ in positive_cases for signed in (value, -value)]
     expected_codes = [
-        0x00,
-        0x80,
-        0x00,
-        0x80,
-        0x02,
-        0x82,
-        0x02,
-        0x82,
-        0x04,
-        0x84,
-        0x01,
-        0x81,
-        0x07,
-        0x87,
-        0x08,
-        0x88,
-        0x38,
-        0xB8,
-        0x3A,
-        0xBA,
-        0x7C,
-        0xFC,
-        0x7E,
-        0xFE,
-        0x7E,
-        0xFE,
-        0x7E,
-        0xFE,
-        0x7E,
-        0xFE,
-        0x7E,
-        0xFE,
+        signed for _, code in positive_cases for signed in (code, code | 0x80)
     ]
     x = torch.tensor([values * 16], device="cuda", dtype=dtype)
     expected = torch.tensor([expected_codes * 16], device="cuda", dtype=torch.uint8)
@@ -577,8 +531,8 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
 
     def run(buffers=None):
         if compressed_k:
-            return decode_case(*args, buffers=buffers, backend="prims-ts")
-        return window_case(q, swa, wi, sink, buffers=buffers, backend="prims-ts")
+            return decode_case(*args, buffers=buffers)
+        return window_case(q, swa, wi, sink, buffers=buffers)
 
     def check():
         # Byte gates are separate from the represented-value FP64 decode gate.

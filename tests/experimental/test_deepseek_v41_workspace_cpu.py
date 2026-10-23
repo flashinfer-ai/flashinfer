@@ -563,16 +563,6 @@ def test_device_facts_cold_capture_rejected_warm_capture_cached(
 
 
 @pytest.mark.parametrize("capability", ((9, 0), (10, 1), (11, 0), (12, 0)))
-def test_device_facts_reject_unsupported_architecture(workspace_host, capability):
-    host = workspace_host
-    host.state.capability = capability
-    with pytest.raises(ValueError):
-        host.module.device_sm_count(0)
-    assert host.state.properties == 1 and not host.state.allocations
-    assert host.module.device_sm_count.cache_info().currsize == 0
-
-
-@pytest.mark.parametrize("capability", ((9, 0), (10, 1), (11, 0), (12, 0)))
 @pytest.mark.parametrize("caller_output", (False, True))
 def test_bind_rejects_unsupported_architecture_before_allocation_or_writes(
     workspace_host, capability, caller_output
@@ -587,6 +577,7 @@ def test_bind_rejects_unsupported_architecture_before_allocation_or_writes(
         host.module.bind_inputs(**arguments)
     _assert_untouched(host, snapshots)
     assert host.state.properties == 1 and not host.state.allocations
+    assert host.module.device_sm_count.cache_info().currsize == 0
 
 
 def test_public_dispatcher_signature_and_backend_forwarding(workspace_host):
@@ -619,23 +610,18 @@ def test_public_dispatcher_signature_and_backend_forwarding(workspace_host):
         target.assert_called_once_with(*args, **kwargs)
 
 
-def test_window_delegates_k0_output_only(workspace_host):
+def test_window_delegates_k0_output_only(workspace_host, monkeypatch):
     host = workspace_host
     result = object()
     target = Mock(return_value=result)
-    window = next(
-        node
-        for node in ast.parse((_PRIVATE / "prims_ts/__init__.py").read_text()).body
-        if isinstance(node, ast.FunctionDef) and node.name == "decode_window"
+    native = _load_host(
+        _PRIVATE / "prims_ts/__init__.py",
+        "_deepseek_v41_window_host",
+        monkeypatch,
+        functools=functools,
     )
-    namespace = {"decode_mixed": target}
-    exec(
-        compile(ast.Module(body=[window], type_ignores=[]), str(_PRIVATE), "exec"),
-        namespace,
-    )
-    host.imports["experimental.deepseek_v41.prims_ts"] = SimpleNamespace(
-        decode_window=namespace["decode_window"]
-    )
+    monkeypatch.setattr(native, "decode_mixed", target)
+    host.imports["experimental.deepseek_v41.prims_ts"] = native
     args = tuple(object() for _ in range(6))
     query, cache, workspace, indices, topk, seq = args
     assert host.public.deepseek_v41_window_decode(*args, backend="prims-ts") is result
