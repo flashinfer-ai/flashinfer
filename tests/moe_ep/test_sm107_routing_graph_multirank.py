@@ -88,7 +88,7 @@ def _check_sparse_to_dense_graph_multirank(
         kernel_variant=family,
         cluster_shape_mn=(cluster, 1),
         fc2_use_bulk=True,
-        apply_topk_at_fc1=early,
+        apply_routing_weights_before_fc2=early,
         reduce_topk_in_kernel=False,
     )
     if family == "genphase":

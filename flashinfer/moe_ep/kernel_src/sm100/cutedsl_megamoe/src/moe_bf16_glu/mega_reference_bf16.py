@@ -58,9 +58,7 @@ def reference_expert_fc12(
     fc1_fp32 = ref_mm(a=act, b=fc1_weight, n=intermediate, k=hidden)
 
     swiglu = swiglu_fold_interleave(
-        fc1_fp32,
-        gate_up_interleave,
-        gate_up_clamp=gate_up_clamp,
+        fc1_fp32, gate_up_interleave, gate_up_clamp=gate_up_clamp,
     )
     if ref_compute_graph == "deepgemm":
         swiglu = swiglu * topk_weights.unsqueeze(-1)
@@ -71,13 +69,12 @@ def reference_expert_fc12(
     fc2_fp32 = ref_mm(a=fc1_bf16, b=fc2_weight, n=hidden, k=intermediate_downproj)
     return fc2_fp32, fc1_bf16, fc1_fp32
 
-
 def compute_megamoe_reference(
-    input_activation: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden) BF16
-    input_topk_idx: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
-    fc1_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, intermediate) BF16, hidden stride-1
-    fc2_weight: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate//2, hidden) BF16, inter//2 stride-1
+    input_activation: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden) BF16
+    input_topk_idx: torch.Tensor,       # (num_ranks, num_tokens_per_rank, num_topk) int64
+    input_topk_weights: torch.Tensor,   # (num_ranks, num_tokens_per_rank, num_topk) fp32
+    fc1_weight: torch.Tensor,           # (num_ranks, num_experts_per_rank, hidden, intermediate) BF16, hidden stride-1
+    fc2_weight: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate//2, hidden) BF16, inter//2 stride-1
     ref_compute_graph: Literal["transformers", "deepgemm"],
     fc2_output_dtype: torch.dtype = torch.bfloat16,
     gate_up_clamp: Optional[float] = None,
@@ -211,6 +208,7 @@ def compute_megamoe_reference(
     if return_fc1_gateup:
         return combine_ref, fc1_gateup_per_expert
     return combine_ref
+
 
 
 import cuda.bindings.driver as cuda
@@ -1246,7 +1244,7 @@ class PersistentDenseGemmKernel:
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
 
-        :raises NotImplementedError: If the dtypes are invalid
+        :raises testing.CantImplementError: If the dtypes are invalid
         """
         valid_ab_dtypes = {
             cutlass.Float16,
@@ -1258,10 +1256,12 @@ class PersistentDenseGemmKernel:
             cutlass.Float8E5M2,
         }
         if a_dtype not in valid_ab_dtypes or b_dtype not in valid_ab_dtypes:
-            raise NotImplementedError(f"Unsupported AB dtype: {a_dtype} and {b_dtype}")
+            raise testing.CantImplementError(
+                f"Unsupported AB dtype: {a_dtype} and {b_dtype}"
+            )
 
         if self.acc_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.Int32}:
-            raise NotImplementedError(
+            raise testing.CantImplementError(
                 f"Unsupported accumulator dtype: {self.acc_dtype}"
             )
 
@@ -1286,7 +1286,7 @@ class PersistentDenseGemmKernel:
             a_dtype not in acc_ab_compatibility[self.acc_dtype]
             or b_dtype not in acc_ab_compatibility[self.acc_dtype]
         ):
-            raise NotImplementedError(
+            raise testing.CantImplementError(
                 f"Unsupported AB dtype: {a_dtype} and {b_dtype} for accumulator dtype: {self.acc_dtype}"
             )
 
@@ -1317,28 +1317,30 @@ class PersistentDenseGemmKernel:
         }
         # Check compatibility between accumulator type and C type
         if c_dtype not in acc_c_compatibility[self.acc_dtype]:
-            raise NotImplementedError(
+            raise testing.CantImplementError(
                 f"Unsupported C dtype: {c_dtype} for accumulator dtype: {self.acc_dtype}"
             )
 
     def check_mma_tiler_and_cluster_shape(self):
         """Check if the mma tiler and cluster shape are valid.
 
-        :raises NotImplementedError: If the mma tiler and cluster shape are invalid
+        :raises testing.CantImplementError: If the mma tiler and cluster shape are invalid
         """
         # Skip invalid mma tile shape
         if not (
             (not self.use_2cta_instrs and self.mma_tiler_mn[0] in [64, 128])
             or (self.use_2cta_instrs and self.mma_tiler_mn[0] in [128, 256])
         ):
-            raise NotImplementedError(
+            raise testing.CantImplementError(
                 f"Invalid mma tiler & use_2cta_instrs: {self.mma_tiler_mn}, {self.use_2cta_instrs}"
             )
         if self.mma_tiler_mn[1] not in range(32, 257, 32):
-            raise NotImplementedError(f"Invalid mma tiler N: {self.mma_tiler_mn[1]}")
+            raise testing.CantImplementError(
+                f"Invalid mma tiler N: {self.mma_tiler_mn[1]}"
+            )
         # Skip illegal cluster shape
         if self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0:
-            raise NotImplementedError(
+            raise testing.CantImplementError(
                 f"Invalid cluster shape M: {self.cluster_shape_mn[0]}"
             )
         # Skip invalid cluster shape
@@ -1350,7 +1352,9 @@ class PersistentDenseGemmKernel:
             or not is_power_of_2(self.cluster_shape_mn[0])
             or not is_power_of_2(self.cluster_shape_mn[1])
         ):
-            raise NotImplementedError(f"Invalid cluster shape: {self.cluster_shape_mn}")
+            raise testing.CantImplementError(
+                f"Invalid cluster shape: {self.cluster_shape_mn}"
+            )
 
     def check_tensor_alignment(
         self,
@@ -1389,7 +1393,7 @@ class PersistentDenseGemmKernel:
         :param c_major: The major axis of the C tensor
         :type c_major: str
 
-        :raises NotImplementedError: If the tensor alignment is invalid
+        :raises testing.CantImplementError: If the tensor alignment is invalid
         """
 
         # TODO: move to utils
@@ -1404,7 +1408,7 @@ class PersistentDenseGemmKernel:
             or not check_contiguous_16B_alignment(b_dtype, b_major == "n", (n, k, l))
             or not check_contiguous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
         ):
-            raise NotImplementedError(
+            raise testing.CantImplementError(
                 f"Invalid tensor alignment: {m}, {n}, {k}, {l}, {a_dtype}, {b_dtype}, {c_dtype}, {a_major}, {b_major}, {c_major}"
             )
 
@@ -1417,7 +1421,7 @@ class PersistentDenseGemmKernel:
         :param n: The number of columns in the B tensor
         :type n: int
 
-        :raises NotImplementedError: If the epilogue store option is invalid
+        :raises testing.CantImplementError: If the epilogue store option is invalid
         """
         # None TMA store version does not have predication, can not support OOB tiles
         cta_tile_shape_mn = (
@@ -1426,7 +1430,9 @@ class PersistentDenseGemmKernel:
         )
         if not self.use_tma_store:
             if not (m % cta_tile_shape_mn[0] == 0 and n % cta_tile_shape_mn[1] == 0):
-                raise NotImplementedError(f"Invalid epilog store option: {m}, {n}")
+                raise testing.CantImplementError(
+                    f"Invalid epilog store option: {m}, {n}"
+                )
 
     def can_implement(
         self,
@@ -1471,7 +1477,7 @@ class PersistentDenseGemmKernel:
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
             self.check_epilog_store_option(m, n)
-        except NotImplementedError:
+        except testing.CantImplementError:
             return False
         return True
 
@@ -1534,7 +1540,9 @@ class _DenseGemmReferenceLauncher:
         if b.shape != (n, k):
             raise ValueError(f"B must have shape {(n, k)}, got {tuple(b.shape)}.")
         if a.dtype != b.dtype:
-            raise ValueError(f"A/B dtypes must match, got {a.dtype} vs {b.dtype}.")
+            raise ValueError(
+                f"A/B dtypes must match, got {a.dtype} vs {b.dtype}."
+            )
 
         a_3d = a.unsqueeze(-1)
         b_3d = b.unsqueeze(-1)
@@ -1562,6 +1570,7 @@ class _DenseGemmReferenceLauncher:
         compiled(a_cute, b_cute, c_cute, stream)
         torch.cuda.current_stream().synchronize()
         return c_3d.squeeze(-1)
+
 
 
 __all__ = [

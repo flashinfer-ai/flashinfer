@@ -93,7 +93,7 @@ def _check_tuning_result(monkeypatch, config_name, package, dtype):
     monkeypatch.setattr(shim, f"autotune_{dtype}_mega_moe", tune)
     monkeypatch.setattr(shim, f"{dtype}_mega_moe", mock.Mock())
     workspace = mock.MagicMock()
-    workspace._frontend.config.defer_topk_reduce = False
+    workspace._frontend.config.use_custom_finalize = False
     output = torch.zeros(2, 128, dtype=torch.bfloat16)
     if hasattr(backend, "_prepared_thunk_state"):
         monkeypatch.setattr(
