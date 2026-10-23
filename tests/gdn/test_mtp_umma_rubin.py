@@ -24,8 +24,9 @@ Correctness tests for the Rubin (sm_107a) build of the UMMA MTP ReplaySSM kernel
    cache across streams and in-place updates, and the persistent kernel (sm_107a):
    bit-identity with the non-persistent launch at T = 1-8 on any row mix and grid, the automatic
    choice, the dispatch rule and ``flush_hint``, a caller-owned claim counter, and concurrent
-   replays of separately captured CUDA graphs; uGPU buffers (``ugpu_ucache_buffers``: one
-   launch per die) bit-identical to the 4-D buffers, eager and captured; the routing of
+   replays of separately captured CUDA graphs; every heads-per-CTA split bit-identical at
+   T = 1-8 in every rounding mode; uGPU buffers (``ugpu_ucache_buffers``: one launch per die)
+   bit-identical to the 4-D buffers, eager and captured; the routing of
    ``gated_delta_rule_mtp_ucache_flush`` to this build.
 
 Run:  pytest tests/gdn/test_mtp_umma_rubin.py -q
@@ -77,7 +78,7 @@ def _rubin_entry(monkeypatch):
     monkeypatch.setattr(_base, "_ENTRY", _RUBIN)
 
 
-@pytest.mark.parametrize("T", [1, 3, 4, 5, 8])
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("hpc", [1, 2, 4])
 def test_bit_identical_to_base_kernel(T, hpc):
     """Round to nearest: outputs, state pool and rings bit-identical to the base kernel on a mixed
@@ -680,15 +681,20 @@ def test_persistent_api():
 # domains (older drivers), and for small eager calls, the per-die launches run back to back on
 # the current stream; otherwise (Rubin, B200 on recent drivers) on the dies' green contexts.
 def _sr_kw(mode):
+    """Keyword arguments of a rounding mode of _SR_MODES (seeded, so the bits are reproducible)."""
     if mode == "none":
         return {}
     kw = dict(
-        stochastic_rounding=mode.rstrip("5"),
+        stochastic_rounding="lcg" if mode == "lcg" else "philox",
         rand_seed=torch.tensor([1234], dtype=torch.int64, device=DEV),
     )
-    if mode == "philox5":
-        kw["philox_rounds"] = 5
+    if mode != "lcg":
+        kw["philox_rounds"] = int(mode[len("philox") :])
     return kw
+
+
+# rounding modes of the bit-identity tests: round to nearest, seeded LCG, Philox 5 / 10 rounds
+_SR_MODES = ("none", "lcg", "philox5", "philox10")
 
 
 def _ugpu_split(x, n, layout):
@@ -751,25 +757,55 @@ def _ugpu_pattern(B, seed):
     return "".join(rng.choice("VVVVFFP") for _ in range(B))
 
 
-@pytest.mark.parametrize("T", [1, 4, 8])
-@pytest.mark.parametrize("mode", ["none", "philox5", "lcg"])
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("mode", _SR_MODES)
 @pytest.mark.parametrize("layout", ["view", "parts"])
 def test_ugpu_buffers_bit_identical(T, mode, layout):
-    """5-D uGPU buffers: same bits as the 4-D buffers (stochastic rounding included: its ids use
-    the global value head), for both kernels and every heads-per-CTA."""
+    """5-D uGPU buffers: same bits as the 4-D buffers with 4 heads per CTA (stochastic rounding
+    included: its ids use the global value head), for both kernels and every heads-per-CTA, with
+    and without a row order (flush rows first), at every T and rounding mode (the heads per CTA
+    pick different builds, e.g. the register split with 4 heads at T >= 5 and with Philox's 2
+    heads at T = 8, and auto_heads_per_cta changes them by batch size, T, flush hint and rounding
+    mode)."""
     from flashinfer.utils import get_compute_capability
 
     _skip_if_no_rubin_build()
     sr = _sr_kw(mode)
     case, fm = _pz_case(T, 700 + 7 * T, _PZ_PATTERNS[0])
     ref = _pz_call(case, fm, **sr)
+    ff = _rubin_mod().flush_first_row_order(case[11], fm)
     runs = [dict(heads_per_cta=h) for h in (1, 2, 4)]
     if get_compute_capability(torch.device("cuda")) == (10, 7):
         runs += [dict(persistent=True), dict(persistent=True, grid_override=3)]
     for kw in runs:
-        got = _ugpu_call(case, fm, layout=layout, **kw, **sr)
-        for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
-            assert torch.equal(x, y), (kw, name)
+        for ro in (None, ff):
+            got = _ugpu_call(case, fm, layout=layout, row_order=ro, **kw, **sr)
+            for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+                assert torch.equal(x, y), (kw, ro is not None, name)
+
+
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("mode", _SR_MODES)
+def test_heads_per_cta_bit_identical(T, mode):
+    """4-D buffers: 1, 2 and 4 heads per CTA (and on sm_107a the persistent kernel), with and
+    without a row order (flush rows first), give the same bits as 4 heads per CTA without one on a
+    mixed verify / flush / padded batch, at every T and rounding mode (the heads per CTA are a
+    performance choice only, see auto_heads_per_cta)."""
+    from flashinfer.utils import get_compute_capability
+
+    _skip_if_no_rubin_build()
+    sr = _sr_kw(mode)
+    case, fm = _pz_case(T, 760 + 7 * T, _PZ_PATTERNS[0])
+    ref = _pz_call(case, fm, **sr)  # 4 heads per CTA, no row order
+    ff = _rubin_mod().flush_first_row_order(case[11], fm)
+    runs = [dict(heads_per_cta=h) for h in (1, 2, 4)]
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        runs += [dict(persistent=True), dict(persistent=True, grid_override=3)]
+    for kw in runs:
+        for ro in (None, ff):
+            got = _pz_call(case, fm, row_order=ro, **kw, **sr)
+            for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+                assert torch.equal(x, y), (kw, ro is not None, name)
 
 
 def test_ugpu_buffers_graph():
