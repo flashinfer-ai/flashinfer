@@ -252,7 +252,7 @@ def make_layer(monkeypatch):
     cls = backend.Nvfp4CutedslMegaKernelBackend
     monkeypatch.setattr(backend, "validate_mega_arch", lambda: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(cls, "_uses_native_topk_reduce", lambda *args: False)
+    monkeypatch.setattr(cls, "_cake_reducer_supported", lambda *args: False)
     monkeypatch.setattr(cls, "validate_transformed_weights", mock.Mock())
     monkeypatch.setattr(workspace_pool, "_POOL", {})
     monkeypatch.setattr(workspace_pool, "_KEY_BY_ID", {})
