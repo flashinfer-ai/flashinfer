@@ -96,6 +96,7 @@ class UlyssesA2A {
   int rank_;
   int world_size_;
   int signal_slots_;
+  int max_blocks_;
   bool full_nvlink_;
 
   RankSignals sg_;
@@ -108,10 +109,11 @@ class UlyssesA2A {
   int safe_blocks_[3][2] = {};
 
   UlyssesA2A(Signal** signals, void** out_bufs, int rank, int world_size, bool full_nvlink,
-             int signal_slots)
+             int signal_slots, int max_blocks)
       : rank_(rank),
         world_size_(world_size),
         signal_slots_(signal_slots),
+        max_blocks_(max_blocks),
         full_nvlink_(full_nvlink),
         self_sg_(signals[rank]) {
     for (int i = 0; i < world_size_; i++) {

@@ -123,7 +123,9 @@ def main():
                         dtype=x.dtype,
                         device=rank,
                         backend=backend,
-                        nvlink_kernel=args.nvlink_kernel,
+                        nvlink_kernel=(
+                            args.nvlink_kernel if backend == "nvlink" else "auto"
+                        ),
                     )
                     try:
 

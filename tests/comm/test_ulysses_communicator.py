@@ -740,6 +740,35 @@ def _mixed_alignment_body(rank, world_size, group, _unused):
     return ("ok", "mixed alignment")
 
 
+def _mixed_capacity_body(rank, world_size, group, _unused):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    module = ulysses_mod.get_ulysses_a2a_module()
+    original_query = module.ulysses_a2a_safe_blocks
+    module.ulysses_a2a_safe_blocks = lambda *_args: 16 if rank == 0 else 32
+    shape = (1, 11, 24, 16)
+    try:
+        comm = UlyssesCommunicator(
+            group,
+            max_elems=math.prod(shape),
+            dtype=torch.bfloat16,
+            backend="nvlink",
+            nvlink_kernel="portable",
+        )
+        try:
+            assert comm._portable_max_blocks == 16
+            x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+            scattered = comm.scatter_heads(x)
+            assert torch.equal(
+                scattered, _ref_scatter_heads(x, world_size, rank, group)
+            )
+            assert torch.equal(comm.gather_heads(scattered), x)
+        finally:
+            comm.close()
+    finally:
+        module.ulysses_a2a_safe_blocks = original_query
+    return ("ok", "mixed capacity")
+
+
 def _head_chunk_body(rank, world_size, group, arg):
     if isinstance(arg, tuple):
         backend, dtype_name = arg
@@ -1607,6 +1636,10 @@ def test_forced_portable_nvlink_kernel():
 
 def test_portable_nvlink_mixed_rank_alignment():
     _run_multi_rank("_mixed_alignment_body", 2, None, allow_skip=True)
+
+
+def test_portable_nvlink_mixed_rank_capacity():
+    _run_multi_rank("_mixed_capacity_body", 2, None, allow_skip=True)
 
 
 @pytest.mark.parametrize("world_size", [2, 3])

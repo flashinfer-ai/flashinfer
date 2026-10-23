@@ -42,6 +42,7 @@ from .ulysses_topology import (
 _INT32_MAX = 2**31 - 1
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _ULYSSES_SIGNAL_SLOTS = 4
+_ULYSSES_MAX_BLOCKS = 144
 
 # communicator lifecycle states; CLOSED is only reached after a fully
 # successful teardown so a failed close() can be retried
@@ -340,6 +341,7 @@ class UlyssesCommunicator:
         # not armed) and the exported architecture it was bound for
         self._cake: Optional["cake_ulysses_backend.CakeUlyssesA2A"] = None
         self._cake_arch: Optional[str] = None
+        self._portable_max_blocks: Optional[int] = None
         self._out_ptrs: Optional[List[int]] = None
         self._sig_ptrs: Optional[List[int]] = None
         # rank-local resource tracking for staged init/teardown
@@ -596,8 +598,17 @@ class UlyssesCommunicator:
             from .vllm_ar import meta_size
 
             with torch.cuda.device(self.device):
-                get_ulysses_a2a_module()
+                module = get_ulysses_a2a_module()
                 sig_bytes = int(meta_size()) * _ULYSSES_SIGNAL_SLOTS
+                dtype_slot = {
+                    torch.float32: 0,
+                    torch.float16: 1,
+                    torch.bfloat16: 2,
+                }[self.dtype]
+                local_cap = min(
+                    _ULYSSES_MAX_BLOCKS,
+                    int(module.ulysses_a2a_safe_blocks(self.world_size, dtype_slot)),
+                )
                 cake_arch = (
                     None
                     if self._nvlink_kernel_policy == "portable"
@@ -612,7 +623,12 @@ class UlyssesCommunicator:
                 if cake_arch is not None:
                     _cake_nvlink_warm(cake_arch, self.dtype, self.world_size)
                     sig_bytes = max(sig_bytes, cake_ulysses_backend.SIGNAL_BYTES)
-            outcome: Tuple[str, ...] = ("ok", str(sig_bytes), cake_arch or "")
+            outcome: Tuple[str, ...] = (
+                "ok",
+                str(sig_bytes),
+                cake_arch or "",
+                str(local_cap),
+            )
         except Exception as e:  # noqa: BLE001
             outcome = ("err", f"rank {self.rank} JIT/meta: {type(e).__name__}: {e}")
         gathered_j = self._gather(outcome)
@@ -628,6 +644,9 @@ class UlyssesCommunicator:
                 f"(exported architectures per rank: {[o[2] or 'portable' for o in gathered_j]})"
             )
         self._cake_arch = cake_arch
+        # Every rank launches the same number of barrier-participating CTAs,
+        # including when the group contains GPUs with different capacities.
+        self._portable_max_blocks = min(int(o[3]) for o in gathered_j)
 
         # stage A: allocate this rank's export buffers and IPC handles
         out_bytes = self.max_elems * self.dtype.itemsize
@@ -691,6 +710,7 @@ class UlyssesCommunicator:
                     self.world_size,
                     True,
                     signal_slots=_ULYSSES_SIGNAL_SLOTS,
+                    max_blocks=self._portable_max_blocks,
                 )
                 if self._cake_arch is not None:
                     # the package route: the same staging and signal
@@ -886,6 +906,7 @@ class UlyssesCommunicator:
         self._out_ptrs = None
         self._sig_ptrs = None
         self._cake_arch = None
+        self._portable_max_blocks = None
         self._nvlink_armed = False
         self._state = _CLOSED
 
@@ -1690,9 +1711,16 @@ def get_ulysses_a2a_module():
         world_size: int,
         full_nvlink: bool,
         signal_slots: int,
+        max_blocks: int,
     ) -> int:
         return module.init_ulysses_a2a_with_signal_slots(
-            out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink, signal_slots
+            out_ipc_ptrs,
+            signal_ipc_ptrs,
+            rank,
+            world_size,
+            full_nvlink,
+            signal_slots,
+            max_blocks,
         )
 
     @register_custom_op("flashinfer::dispose_ulysses_a2a", mutates_args=[])
@@ -1715,6 +1743,7 @@ def get_ulysses_a2a_module():
     return SimpleNamespace(
         init_ulysses_a2a=init_ulysses_a2a,
         init_ulysses_a2a_with_signal_slots=init_ulysses_a2a_with_signal_slots,
+        ulysses_a2a_safe_blocks=module.ulysses_a2a_safe_blocks,
         dispose_ulysses_a2a=dispose_ulysses_a2a,
         ulysses_a2a=ulysses_a2a,
     )
@@ -1729,6 +1758,7 @@ def init_ulysses_a2a(
     full_nvlink: bool,
     *,
     signal_slots: int = 1,
+    max_blocks: Optional[int] = None,
 ) -> int:
     r"""Initialize the fused-transpose Ulysses NVLink-P2P all-to-all backend.
 
@@ -1769,6 +1799,12 @@ def init_ulysses_a2a(
         Number of vLLM-size signal slots allocated per rank. One preserves
         the raw API's original 36-CTA path; four enables the faster portable
         kernel and requires four times ``vllm_meta_size()`` bytes per rank.
+    max_blocks : Optional[int], default = None
+        Group-wide CTA cap for the four-slot path. All ranks must pass the
+        same value, no greater than their local occupancy capacity. The
+        default 36-CTA cap preserves the raw API's conservative behavior;
+        :class:`UlyssesCommunicator` exchanges capacities and uses their
+        minimum to enable a faster, rank-uniform launch.
 
     Returns
     -------
@@ -1799,6 +1835,8 @@ def init_ulysses_a2a(
         )
     if signal_slots not in (1, _ULYSSES_SIGNAL_SLOTS):
         raise ValueError("signal_slots must be 1 or 4")
+    if signal_slots == 1 and max_blocks is not None:
+        raise ValueError("max_blocks requires signal_slots=4")
     module = get_ulysses_a2a_module()
     if signal_slots == 1:
         fa = module.init_ulysses_a2a(
@@ -1806,7 +1844,13 @@ def init_ulysses_a2a(
         )
     else:
         fa = module.init_ulysses_a2a_with_signal_slots(
-            out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink, signal_slots
+            out_ipc_ptrs,
+            signal_ipc_ptrs,
+            rank,
+            world_size,
+            full_nvlink,
+            signal_slots,
+            36 if max_blocks is None else max_blocks,
         )
     # make the signal zeroing a real completion fence on this device
     try:

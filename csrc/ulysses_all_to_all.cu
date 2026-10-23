@@ -37,9 +37,59 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 
 namespace fi = flashinfer::comm::ulysses;
 
+template <typename T, int NG>
+int query_ulysses_safe_blocks(int device) {
+  int sms = 0;
+  int scatter_active = 0;
+  int gather_active = 0;
+  TVM_FFI_ICHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) ==
+                 cudaSuccess);
+  TVM_FFI_ICHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                     &scatter_active, fi::ulysses_a2a_kernel<T, NG, 0>, fi::kUlyssesThreads, 0) ==
+                 cudaSuccess);
+  TVM_FFI_ICHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                     &gather_active, fi::ulysses_a2a_kernel<T, NG, 1>, fi::kUlyssesThreads, 0) ==
+                 cudaSuccess);
+  const int cap = (std::min(scatter_active, gather_active) * sms / NG) * NG;
+  TVM_FFI_ICHECK_GE(cap, NG) << "insufficient CTA residency for Ulysses barrier";
+  return cap;
+}
+
+// Query the local device once during communicator initialization. The Python
+// communicator exchanges these values and gives every rank their minimum.
+int64_t ulysses_a2a_safe_blocks(int64_t world_size, int64_t dtype_slot) {
+  int device = 0;
+  TVM_FFI_ICHECK(cudaGetDevice(&device) == cudaSuccess);
+#define QUERY_WORLD(T)                                           \
+  switch (world_size) {                                          \
+    case 2:                                                      \
+      return query_ulysses_safe_blocks<T, 2>(device);            \
+    case 4:                                                      \
+      return query_ulysses_safe_blocks<T, 4>(device);            \
+    case 6:                                                      \
+      return query_ulysses_safe_blocks<T, 6>(device);            \
+    case 8:                                                      \
+      return query_ulysses_safe_blocks<T, 8>(device);            \
+    default:                                                     \
+      TVM_FFI_ICHECK(false) << "unsupported Ulysses world size"; \
+  }
+  switch (dtype_slot) {
+    case 0:
+      QUERY_WORLD(float);
+    case 1:
+      QUERY_WORLD(half);
+    case 2:
+      QUERY_WORLD(nv_bfloat16);
+    default:
+      TVM_FFI_ICHECK(false) << "unsupported Ulysses dtype slot";
+  }
+#undef QUERY_WORLD
+  return 0;
+}
+
 fptr_t init_ulysses_a2a_impl(Array<fptr_t> out_ipc_ptrs, Array<fptr_t> signal_ipc_ptrs,
                              int64_t rank, int64_t world_size, bool full_nvlink,
-                             int64_t signal_slots) {
+                             int64_t signal_slots, int64_t max_blocks) {
   TVM_FFI_ICHECK_LE(world_size, 8) << "ulysses a2a world size > 8 is not supported";
   TVM_FFI_ICHECK(world_size == 2 || world_size == 4 || world_size == 6 || world_size == 8)
       << "ulysses a2a only supports world size in (2, 4, 6, 8)";
@@ -50,6 +100,8 @@ fptr_t init_ulysses_a2a_impl(Array<fptr_t> out_ipc_ptrs, Array<fptr_t> signal_ip
       << "signal_ipc_ptrs size must equal world_size";
   TVM_FFI_ICHECK(signal_slots == 1 || signal_slots == fi::kUlyssesSignalSlots)
       << "unsupported Ulysses signal slot count";
+  TVM_FFI_ICHECK(max_blocks >= world_size && max_blocks <= signal_slots * vllm::kMaxBlocks)
+      << "invalid Ulysses CTA cap";
 
   fi::Signal* signals[8];
   void* out_bufs[8];
@@ -71,19 +123,20 @@ fptr_t init_ulysses_a2a_impl(Array<fptr_t> out_ipc_ptrs, Array<fptr_t> signal_ip
   TVM_FFI_ICHECK(st == cudaSuccess) << "failed to zero the ulysses a2a signal buffer";
   return (fptr_t) new fi::UlyssesA2A(signals, out_bufs, static_cast<int>(rank),
                                      static_cast<int>(world_size), full_nvlink,
-                                     static_cast<int>(signal_slots));
+                                     static_cast<int>(signal_slots), static_cast<int>(max_blocks));
 }
 
 fptr_t init_ulysses_a2a(Array<fptr_t> out_ipc_ptrs, Array<fptr_t> signal_ipc_ptrs, int64_t rank,
                         int64_t world_size, bool full_nvlink) {
-  return init_ulysses_a2a_impl(out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink, 1);
+  return init_ulysses_a2a_impl(out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink, 1,
+                               vllm::kMaxBlocks);
 }
 
 fptr_t init_ulysses_a2a_with_signal_slots(Array<fptr_t> out_ipc_ptrs, Array<fptr_t> signal_ipc_ptrs,
                                           int64_t rank, int64_t world_size, bool full_nvlink,
-                                          int64_t signal_slots) {
+                                          int64_t signal_slots, int64_t max_blocks) {
   return init_ulysses_a2a_impl(out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink,
-                               signal_slots);
+                               signal_slots, max_blocks);
 }
 
 void dispose_ulysses_a2a(fptr_t _fa) { delete reinterpret_cast<fi::UlyssesA2A*>(_fa); }
@@ -142,7 +195,7 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
                             row_bytes % 8 == 0 && row_elems > 0 && row_elems <= INT32_MAX / W &&
                             S_local <= INT32_MAX / (W * row_elems);
   const int blocks = static_cast<int>(std::max<int64_t>(
-      1, std::min<int64_t>(aligned_peer ? fi::kUlyssesMaxBlocks : vllm::kMaxBlocks, num_rows)));
+      1, std::min<int64_t>(aligned_peer ? fa->max_blocks_ : vllm::kMaxBlocks, num_rows)));
   const int threads = fi::kUlyssesThreads;
   const size_t out_bytes = out.numel() * get_element_size(out);
 
@@ -231,6 +284,7 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init_ulysses_a2a, init_ulysses_a2a);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_a2a_safe_blocks, ulysses_a2a_safe_blocks);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init_ulysses_a2a_with_signal_slots,
                               init_ulysses_a2a_with_signal_slots);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dispose_ulysses_a2a, dispose_ulysses_a2a);
