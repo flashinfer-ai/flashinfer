@@ -37,7 +37,7 @@ from __future__ import annotations
 import dataclasses
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, Protocol, Tuple
+from typing import Any, Callable, ClassVar, Dict, Literal, Optional, Protocol, Tuple
 
 import torch
 
@@ -186,6 +186,8 @@ class MegaMoEHopperNvfp4Inputs(MegaMoEHopperMxfp4Inputs):
     the composite kernel keeps the same thirteen-tensor runtime ABI.  Their
     dtypes/shapes have the NVFP4 meanings documented at module scope.
     """
+
+    _weight_format: ClassVar[str] = "NVFP4"
 
 
 class MegaMoEHopperNvfp4Frontend(MegaMoEHopperMxfp4Frontend):

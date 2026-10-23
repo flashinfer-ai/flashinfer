@@ -296,6 +296,8 @@ class MegaMoEHopperMxfp4Inputs(MegaMoEHopperFp8Inputs):
     dtypes/shapes have the MXFP4 meanings documented at module scope.
     """
 
+    _weight_format: ClassVar[str] = "MXFP4"
+
 
 class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
     """Lazy-compile frontend for ``Sm90MegaMoESwapABMxfp4Fp8Kernel`` only."""
@@ -377,7 +379,10 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
     @property
     def config(self) -> MegaMoEHopperMxfp4Config:
         config = super().config
-        if not isinstance(config, self._config_type):
+        if (
+            not isinstance(config, self._config_type)
+            or type(config)._weight_format != self._weight_format
+        ):
             raise RuntimeError(
                 f"{self._weight_format} frontend lost its format-specific config."
             )
@@ -466,7 +471,10 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         self._mega_key = key
 
     def _ensure_mega_compiled(self, inputs: MegaMoEHopperFp8Inputs) -> _CompiledMega:
-        if not isinstance(inputs, self._inputs_type):
+        if (
+            not isinstance(inputs, self._inputs_type)
+            or type(inputs)._weight_format != self._weight_format
+        ):
             raise TypeError(
                 f"{self._weight_format} frontend requires {self._inputs_type.__name__}."
             )
@@ -561,7 +569,10 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         inputs: MegaMoEHopperFp8Inputs,
         num_tokens: int,
     ) -> MegaMoEHopperMxfp4Inputs:
-        if not isinstance(inputs, cls._inputs_type):
+        if (
+            not isinstance(inputs, cls._inputs_type)
+            or type(inputs)._weight_format != cls._weight_format
+        ):
             raise TypeError(
                 f"{cls._weight_format} frontend requires {cls._inputs_type.__name__}."
             )
@@ -588,7 +599,10 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         *,
         num_tokens: int,
     ) -> None:
-        if not isinstance(inputs, self._inputs_type):
+        if (
+            not isinstance(inputs, self._inputs_type)
+            or type(inputs)._weight_format != self._weight_format
+        ):
             raise TypeError(
                 f"{self._weight_format} frontend requires {self._inputs_type.__name__}."
             )
