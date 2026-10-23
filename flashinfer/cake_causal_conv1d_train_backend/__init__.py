@@ -458,11 +458,12 @@ def cake_causal_conv1d_train_backward(
         "dw": dw_out,
         "partial": partial,
         **_scalars(scalars),
-        "rows": rows,
+        "main_ctas": grid_x,
     }
     # The main program (an ordinary launch) writes dx and the partial rows; the
     # route's reduce program, programmatically dependent on it through its
-    # binding's launch attribute, sums the rows into dweight on the same stream.
+    # binding's launch attribute, sums into dweight on the same stream the rows
+    # of each channel tile that a grid of main_ctas CTAs wrote.
     run_module(names[0], values, device_index=device_index)
     run_module(record["reduce"], values, device_index=device_index)
     return dx_out, dw_out

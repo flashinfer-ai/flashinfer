@@ -64,8 +64,8 @@ The host plan is the three functions :func:`plan` (the kernel scalars),
 :func:`launch_grid` (the grid: ``co_resident`` records launch ``ctas_per_sm
 x SM count`` CTAs, ``occupancy`` records ``grid_mult x ctas_per_sm x SM
 count``, ``channels_per_cta`` records ``ceil(C / channels_per_cta)``)
-and :func:`partial_rows` (the backward workspace rows, the ``rows`` scalar of
-the reduce program); everything else derives from them.  The public workspace
+and :func:`partial_rows` (the backward workspace rows); everything else
+derives from them.  The public workspace
 is sized by the largest grid of the architecture's backward programs
 (:func:`workspace_record`, the capacity owner); each program writes the
 leading rows of its own grid and its reduce program sums exactly those.
@@ -600,12 +600,14 @@ MODULES: dict[str, dict[str, Any]] = {
     # (``use_pdl``: the binding sets the programmatic-stream-serialization
     # launch attribute; the kernel's first statement waits for the main grid,
     # so the launch latency overlaps the main kernel's tail and an ordinary
-    # launch stays correct), it sums the ``rows`` FP32 ``[C, 4]`` partial rows
-    # of the workspace per channel in the order the cooperative backward used
-    # in-kernel -- one warp per channel, lane sums over rows ``lane, lane +
-    # 32, ...`` then the xor tree 16, 8, 4, 2, 1 -- so ``dweight`` is bitwise
-    # what one launch produced.  Built with its kernel file's default
-    # keywords, one program for the three architectures.
+    # launch stays correct), it sums the FP32 ``[C, 4]`` partial rows of the
+    # workspace per channel: channel ``c`` lies in tile ``t = c // (vec x
+    # ct_vec)``, whose ``ceil((main_ctas - t) / n_ch_tiles)`` rows the main
+    # grid wrote, in the order the cooperative backward used in-kernel -- one
+    # warp per channel, lane sums over rows ``lane, lane + 32, ...`` then the
+    # xor tree 16, 8, 4, 2, 1 -- so ``dweight`` is bitwise what one launch
+    # produced.  Built with its kernel file's default keywords, one program
+    # for the three architectures.
     "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5": {
         "arches": [
             "sm_100a",
@@ -747,10 +749,11 @@ PLAN_SCALARS = (
     "n_sub",
     "n_ch_tiles",
 )
-# ``rows``, the partial rows of the selected backward program's grid
-# (:func:`partial_rows`), is the reduce program's row count; the host sets it
-# from the grid, not from :func:`plan`.
-LOGICAL_SCALARS = (*PLAN_SCALARS, "rows")
+# ``main_ctas``, the CTA count of the selected backward program's launch
+# (``grid_x``), tells the reduce program how many partial rows each channel
+# tile holds (``ceil((main_ctas - tile) / n_ch_tiles)``); the host sets it from
+# the grid, not from :func:`plan`.
+LOGICAL_SCALARS = (*PLAN_SCALARS, "main_ctas")
 
 
 def arch_for_capability(device_capability: Sequence[int]) -> str | None:
@@ -1044,8 +1047,9 @@ def partial_rows(grid_x: int, n_ch_tiles: int) -> int:
     """Rows of the backward ``partial`` workspace for a grid: ``ceil(grid_x / n_ch_tiles)``.
 
     CTA ``b`` of the grid owns channel tile ``b % n_ch_tiles`` and partial row
-    ``b // n_ch_tiles``; the kernel writes every row, and the reduce program
-    sums exactly these ``rows`` (its ``rows`` scalar).
+    ``b // n_ch_tiles``, so tile ``t`` holds ``ceil((grid_x - t) / n_ch_tiles)``
+    written rows; the reduce program derives exactly those from ``main_ctas``
+    (= ``grid_x``) and ``n_ch_tiles`` and sums nothing else.
     """
 
     return _ceil_div(grid_x, n_ch_tiles)
