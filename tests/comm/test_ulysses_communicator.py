@@ -7,6 +7,7 @@
 # with timeout + terminate + natural-exit assertions.
 
 import importlib
+import math
 import multiprocessing as std_mp
 import queue as queue_mod
 import socket
@@ -690,6 +691,53 @@ def _portable_kernel_body(rank, world_size, group, _unused):
     finally:
         comm.close()
     return ("ok", "portable")
+
+
+def _mixed_alignment_body(rank, world_size, group, _unused):
+    shape = (1, 11, 24, 16)
+    dtype = torch.bfloat16
+
+    def tensor_with_offset(tensor_shape, offset):
+        count = math.prod(tensor_shape)
+        return (
+            torch.empty(count + offset, dtype=dtype, device="cuda")
+            .narrow(0, offset, count)
+            .view(tensor_shape)
+        )
+
+    comm = UlyssesCommunicator(
+        group,
+        max_elems=math.prod(shape),
+        dtype=dtype,
+        backend="nvlink",
+        nvlink_kernel="portable",
+    )
+    try:
+        assert comm.nvlink_kernel == "portable"
+        for iteration in range(4):
+            # Rank 0 has a two-byte offset for scatter input, while rank 1
+            # has one for gather output. Both still share the same protocol.
+            x = tensor_with_offset(shape, int(rank == 0))
+            torch.manual_seed(100 + rank + iteration)
+            x.copy_(torch.randn(shape, dtype=dtype, device="cuda"))
+            scattered = comm.scatter_heads(x)
+            scatter_ref = _ref_scatter_heads(x, world_size, rank, group)
+            assert torch.equal(scattered, scatter_ref)
+
+            y_shape = (
+                shape[0],
+                shape[1] * world_size,
+                shape[2] // world_size,
+                shape[3],
+            )
+            y = torch.randn(y_shape, dtype=dtype, device="cuda")
+            gathered = tensor_with_offset(shape, int(rank == 1))
+            comm.gather_heads(y, out=gathered)
+            gather_ref = _ref_gather_heads(y, world_size, rank, group)
+            assert torch.equal(gathered, gather_ref)
+    finally:
+        comm.close()
+    return ("ok", "mixed alignment")
 
 
 def _head_chunk_body(rank, world_size, group, arg):
@@ -1555,6 +1603,10 @@ def test_correctness_forced_nvlink(world_size):
 
 def test_forced_portable_nvlink_kernel():
     _run_multi_rank("_portable_kernel_body", 2, None, allow_skip=True)
+
+
+def test_portable_nvlink_mixed_rank_alignment():
+    _run_multi_rank("_mixed_alignment_body", 2, None, allow_skip=True)
 
 
 @pytest.mark.parametrize("world_size", [2, 3])

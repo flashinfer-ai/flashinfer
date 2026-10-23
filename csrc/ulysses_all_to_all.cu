@@ -133,12 +133,14 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
       << D << ")";
 
   const int64_t num_rows = B * static_cast<int64_t>(W) * S_local;
-  const int64_t row_bytes = static_cast<int64_t>(H_local) * D * get_element_size(inp);
-  const int64_t units = row_bytes / (row_bytes % 16 == 0 ? 16 : 8);
+  const int64_t row_elems = static_cast<int64_t>(H_local) * D;
+  const int64_t row_bytes = row_elems * get_element_size(inp);
+  // Every rank must choose the same protocol and launch size. Operand base
+  // alignment can differ by rank, so only the device movement body may use it
+  // to select vectorized loads/stores or the scalar fallback.
   const bool aligned_peer = fa->signal_slots_ == fi::kUlyssesSignalSlots && B == 1 &&
-                            row_bytes % 8 == 0 && S_local <= INT32_MAX / (W * units) &&
-                            reinterpret_cast<uintptr_t>(inp.data_ptr()) % 16 == 0 &&
-                            reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0;
+                            row_bytes % 8 == 0 && row_elems > 0 && row_elems <= INT32_MAX / W &&
+                            S_local <= INT32_MAX / (W * row_elems);
   const int blocks = static_cast<int>(std::max<int64_t>(
       1, std::min<int64_t>(aligned_peer ? fi::kUlyssesMaxBlocks : vllm::kMaxBlocks, num_rows)));
   const int threads = fi::kUlyssesThreads;

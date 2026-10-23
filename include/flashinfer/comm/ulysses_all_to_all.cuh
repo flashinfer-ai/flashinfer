@@ -246,7 +246,7 @@ __device__ __forceinline__ void ulysses_a2a_move(const T* __restrict__ local_in,
       } else {
         ulysses_a2a_aligned_peer<Vec, NGPUS, MODE>(local_in, out_ptrs, rank, S_local, units);
       }
-    } else {
+    } else if ((reinterpret_cast<uintptr_t>(local_in) % sizeof(int2)) == 0) {
       const int units = static_cast<int>(row_bytes / sizeof(int2));
       if constexpr (MODE == 0) {
         if (units == 129) {
@@ -259,6 +259,11 @@ __device__ __forceinline__ void ulysses_a2a_move(const T* __restrict__ local_in,
       } else {
         ulysses_a2a_aligned_peer<int2, NGPUS, MODE>(local_in, out_ptrs, rank, S_local, units);
       }
+    } else {
+      // A rank-local storage offset can make this operand unaligned even when
+      // all ranks use the same shape and fast-path synchronization protocol.
+      ulysses_a2a_aligned_peer<T, NGPUS, MODE>(local_in, out_ptrs, rank, S_local,
+                                               static_cast<int>(block_len));
     }
     return;
   }

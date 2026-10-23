@@ -31,6 +31,19 @@ def reference_scatter(x, world, rank):
     ).contiguous()
 
 
+def reference_gather(x, world, rank):
+    gathered = [torch.empty_like(x) for _ in range(world)]
+    dist.all_gather(gathered, x)
+    local_length = x.shape[1] // world
+    return torch.cat(
+        [
+            part[:, rank * local_length : (rank + 1) * local_length, :, :]
+            for part in gathered
+        ],
+        dim=2,
+    ).contiguous()
+
+
 def measure(call, warmup, trials, iters):
     for _ in range(warmup):
         call()
@@ -63,6 +76,7 @@ def main():
     parser.add_argument("--label", default="current")
     parser.add_argument("--lengths", default="4096,16384,65536")
     parser.add_argument("--head-dims", default="34,66")
+    parser.add_argument("--ops", default="scatter,gather")
     parser.add_argument(
         "--nvlink-kernel", choices=("auto", "portable", "cake"), default="auto"
     )
@@ -83,69 +97,86 @@ def main():
     world = dist.get_world_size()
     if world != 8:
         raise ValueError("This benchmark expects one 8-GPU NVLink node")
+    operations = tuple(args.ops.split(","))
+    if not operations or any(op not in ("scatter", "gather") for op in operations):
+        raise ValueError("--ops must list scatter and/or gather")
     rows = []
     for length in map(int, args.lengths.split(",")):
         for head_dim in map(int, args.head_dims.split(",")):
-            shape = (1, length, 48, head_dim)
-            torch.manual_seed(41 + rank)
-            x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
-            expected = reference_scatter(x, world, rank)
-            for backend in ("nccl", "nvlink"):
-                communicator = UlyssesCommunicator(
-                    group=dist.group.WORLD,
-                    max_elems=x.numel(),
-                    dtype=x.dtype,
-                    device=rank,
-                    backend=backend,
-                    nvlink_kernel=args.nvlink_kernel,
+            for op in operations:
+                shape = (
+                    (1, length, 48, head_dim)
+                    if op == "scatter"
+                    else (1, length * world, 48 // world, head_dim)
                 )
-                try:
-
-                    def call():
-                        return communicator.scatter_heads(x)
-
-                    actual = call()
-                    torch.cuda.synchronize()
-                    correct = torch.tensor(
-                        int(torch.equal(actual, expected)), device="cuda"
+                torch.manual_seed(41 + rank)
+                x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+                expected = (
+                    reference_scatter(x, world, rank)
+                    if op == "scatter"
+                    else reference_gather(x, world, rank)
+                )
+                for backend in ("nccl", "nvlink"):
+                    communicator = UlyssesCommunicator(
+                        group=dist.group.WORLD,
+                        max_elems=x.numel(),
+                        dtype=x.dtype,
+                        device=rank,
+                        backend=backend,
+                        nvlink_kernel=args.nvlink_kernel,
                     )
-                    dist.all_reduce(correct, op=dist.ReduceOp.MIN)
-                    if not correct.item():
-                        raise AssertionError(f"{backend} mismatch for {shape}")
-                    stats = measure(call, args.warmup, args.trials, args.iters)
-                    row = {
-                        "label": args.label,
-                        "shape": shape,
-                        "world_size": world,
-                        "backend": backend,
-                        "kernel": communicator.nvlink_kernel,
-                        "correct": True,
-                        **stats,
-                    }
-                    rows.append(row)
-                    if rank == 0:
-                        args.output.parent.mkdir(parents=True, exist_ok=True)
-                        args.output.write_text(
-                            json.dumps(
-                                {
-                                    "environment": {
-                                        "gpu": torch.cuda.get_device_name(),
-                                        "torch": torch.__version__,
-                                        "cuda": torch.version.cuda,
-                                        "world_size": world,
-                                        "args": {
-                                            key: str(value)
-                                            for key, value in vars(args).items()
-                                        },
-                                    },
-                                    "results": rows,
-                                },
-                                indent=2,
+                    try:
+
+                        def call():
+                            return (
+                                communicator.scatter_heads(x)
+                                if op == "scatter"
+                                else communicator.gather_heads(x)
                             )
+
+                        actual = call()
+                        torch.cuda.synchronize()
+                        correct = torch.tensor(
+                            int(torch.equal(actual, expected)), device="cuda"
                         )
-                        print(json.dumps(row), flush=True)
-                finally:
-                    communicator.close()
+                        dist.all_reduce(correct, op=dist.ReduceOp.MIN)
+                        if not correct.item():
+                            raise AssertionError(f"{backend} {op} mismatch for {shape}")
+                        stats = measure(call, args.warmup, args.trials, args.iters)
+                        row = {
+                            "label": args.label,
+                            "op": op,
+                            "shape": shape,
+                            "world_size": world,
+                            "backend": backend,
+                            "kernel": communicator.nvlink_kernel,
+                            "correct": True,
+                            **stats,
+                        }
+                        rows.append(row)
+                        if rank == 0:
+                            args.output.parent.mkdir(parents=True, exist_ok=True)
+                            args.output.write_text(
+                                json.dumps(
+                                    {
+                                        "environment": {
+                                            "gpu": torch.cuda.get_device_name(),
+                                            "torch": torch.__version__,
+                                            "cuda": torch.version.cuda,
+                                            "world_size": world,
+                                            "args": {
+                                                key: str(value)
+                                                for key, value in vars(args).items()
+                                            },
+                                        },
+                                        "results": rows,
+                                    },
+                                    indent=2,
+                                )
+                            )
+                            print(json.dumps(row), flush=True)
+                    finally:
+                        communicator.close()
     dist.destroy_process_group()
 
 

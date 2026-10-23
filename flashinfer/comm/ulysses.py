@@ -384,6 +384,10 @@ class UlyssesCommunicator:
         )
         self.decision: UlyssesBackendDecision = self.topology_decision
         self.backend = self.decision.backend
+        if nvlink_kernel == "cake" and self.backend != "nvlink":
+            raise ValueError(
+                "nvlink_kernel='cake' requires an available NVLink backend"
+            )
         self.fallback_reason = (
             self.decision.reason
             if self.backend == "nccl" and backend != "nccl"
@@ -395,7 +399,7 @@ class UlyssesCommunicator:
             if err is not None:
                 # all ranks cleaned up (verified group-wide by the staged
                 # cleanup) and hold the same joint error
-                if backend == "nvlink":
+                if backend == "nvlink" or nvlink_kernel == "cake":
                     raise RuntimeError(f"NVLink backend initialization failed: {err}")
                 self.backend = "nccl"
                 self.fallback_reason = f"nvlink init failed: {err}"
