@@ -165,7 +165,8 @@ WAVE_FILL_N_FRAG_MAX = {"wave_fill1": 1, "wave_fill": WAVE_N_FRAG_MAX}
 # keeps the occ P = ceil(152 / 128) = 2 (256 CTAs: two waves of ceil(NC / 2) steps) although the wave model scores P = 1
 # (128 CTAs, one wave of NC steps) at the same or fewer walk step-times (111 vs 2 x 56 = 112 on Q2 CP16 Z) and P = 2 adds the
 # segment-composition K4 launches (map before c1, carry_in / carry_start after c2, tmap / dcarry in the backward) plus the
-# backward's offset re-walk.  "wave_fill1_p1tie" = "wave_fill1", then P := 1 on a rank with 2 <= n_frag <= WAVE_N_FRAG_MAX,
+# backward's offset re-walk (replay mode; the saved-mode backward reads the kept carry plane).  "wave_fill1_p1tie" =
+# "wave_fill1", then P := 1 on a rank with 2 <= n_frag <= WAVE_N_FRAG_MAX,
 # 0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG, P > 1 and n_frag H <= SM (P = 1 runs one wave) when the LPT makespan of the walks
 # at P = 1 over the rank's actual fragment chunk counts is <= the makespan at the base rule's P (p1_tie_steps: the wave
 # model's waves x steps generalised to unequal fragments through lpt_makespan; equal fragments reproduce it exactly).  The
@@ -888,7 +889,8 @@ def kcp_plan(
     with ``nc_frags`` the rank's fragment chunk counts (``None`` = ``n_frag`` equal fragments of ``NC_max_frag`` chunks;
     :func:`_build_head_plan` passes the actual counts) and :func:`p1_tie_steps` the LPT makespan of one equal-segment
     walk at one CTA per SM -- the wave model's ``waves x steps`` for equal fragments.  The segment-composition K4
-    launches and the backward's offset re-walk exist only at ``P > 1``; the one-wave P = 1 walk of 128 CTAs runs at a
+    launches and the backward's offset re-walk (replay mode; the saved-mode backward reads the kept carry plane) exist
+    only at ``P > 1``; the one-wave P = 1 walk of 128 CTAs runs at a
     higher per-step cost than the two-wave 256-CTA walk, which the GPU A/B measures.
 
     A pure function of ``(fragment table, H, SM count)``.  A rank without fragments has ``P = 1``, ``NSEG = 0``;
@@ -2011,6 +2013,7 @@ def kcp_saved_bytes(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     with_conv: bool = True,
     C: int = 8192,
+    saved_carry: bool = True,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
@@ -2018,11 +2021,15 @@ def kcp_saved_bytes(
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
     + [save_transfer] * N_out * 2 * s * Hg_r / H               # the owner's whole c1 receive tensor
     + [save_transfer] * [P > 1] * NSEG * s                     # M_seg of the segmented fragments (home rank)
+    + [saved_carry] * [P > 1] * (n_frag * (P - 1) + max(n_in, n_out)) * s   # the forward's carry plane (shipped)
     + [with_conv] * sum_cont hist_valid * C * 2                # the hist row pool (BF16)
     save_mode="tape": + NC_pad * H * 32768 + R * H * 256       # the forward's h tape and v_new
 
     ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since an earlier revision);
     the two ``[save_transfer]`` terms are the delta against the earlier recompute form (``save_transfer=False``).
+    ``saved_carry`` (default ``True`` = the shipped default: the forward of a ``P > 1`` rank keeps its carry plane in
+    the saved set) counts the whole carry plane of a ``P > 1`` rank under the shipped fused tape walks (one extra slot
+    per crossing fragment); ``False`` = the re-walk form of the test knob ``saved_carry=0``.
 
     The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
     recomputes the internal rows in both modes.
@@ -2042,6 +2049,8 @@ def kcp_saved_bytes(
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
         if hp.P > 1:
             total += hp.NSEG * s
+    if saved_carry and hp.P > 1:
+        total += (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
     if with_conv:
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":

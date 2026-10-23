@@ -652,7 +652,9 @@ def _kcp_forward_trim(
             (name,) = route_modules(arch, KCP_FWD)
             device_index = _device_index(device)
             record = _loader.MODULES[name]
-            scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"])
+            scalars = plan(
+                S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+            )
             grid = launch_grid(record, device_index=device_index)
             if scalars["n_ch_tiles"] > grid[0]:
                 raise ValueError(
@@ -958,7 +960,9 @@ def _kcp_backward_trim(
             )
             names = selected_modules(arch, KCP_BWD, C=C, S=S)
             record = _loader.MODULES[names[0]]
-            scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"])
+            scalars = plan(
+                S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+            )
             grid_x = launch_grid(record, device_index=device_index)[0]
             if scalars["n_ch_tiles"] > grid_x:
                 raise ValueError(

@@ -150,7 +150,16 @@ trimmed segments are not part of the replayed call.
 A/B record; the D1 explicit-record merge form (``cols_rule="by_chains"`` beyond
 ``COLS_RULE_CHAINS`` state chains) needs the positional ABI and a diagnostics
 launcher on the arena keeps ``KdaWorkspace.run``: both keep the previous path
-under either value of the knob.
+under either value of ``host_trim``.
+
+Saved carry plane (``SAVED_CARRY_DEFAULT = 1``): the forward of a ``P > 1``
+rank keeps its whole carry plane in the saved set (``KcpSaved.carry``) and the
+saved-mode backward replays its tape from it instead of re-walking every
+segment (K1 ``_offset``) and re-merging the carries -- the same remaining
+launches, bitwise; ``kcp_saved_bytes`` counts the plane.
+``_kcp_test_knobs={"saved_carry": 0}`` selects the re-walk for the A/B record;
+the replay mode (checkpoint recompute) and ``P = 1`` ranks are the same under
+both values.
 
 The metadata (partition, context, head ownership, chain tables, split sizes,
 segment plan, compact-buffer addressing, byte queries) is
@@ -204,7 +213,7 @@ TRANSFER_WALKS = (
     "bf16x3",
     "bf16x3_hw64",
 )  # K3 program family (non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
-KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg]}; version 1 also held the token-row Aqk / Akk
+KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg, carry plane] -- the optional members travel as flags}; version 1 also held the token-row Aqk / Akk
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 # Host / plan knobs (test knob class: reachable only through _kcp_test_knobs):
 SCHEDULES = (
@@ -287,9 +296,18 @@ HOST_TRIM_DEFAULT = (
 # (zero state) beside the S_in (dS_out) tiles of the crossing chains; one launch saved per phase on ranks holding both a
 # document-start (document-last) and a crossing-in (crossing-out) fragment at P > 1.  Chain order inside a launch is the
 # CTA issue order only (every CTA walks its own chain / column block): bitwise.  Applies under schedule wait_first (the
-# overlap schedule issues carry_start / dcarry_end under the collective) and in the saved-mode backward's re-walk merges.
+# overlap schedule issues carry_start / dcarry_end under the collective) and in the saved-mode backward's re-walk merges (saved_carry=0).
 MERGE_FUSES = ("none", "carry")
 MERGE_FUSE_DEFAULT = "none"  # shipped: the separate launches; "carry" via _kcp_test_knobs (for the A/B record)
+# Saved carry plane: 1 (shipped) keeps the forward's whole carry plane (the "carry" pool's worth of a P > 1 rank:
+# n_carry x H tiles -- the carries, the S_in copies of the fused walks, the never-written slots) as a fresh tensor in the
+# saved set, and the saved-mode backward replays its tape from that plane instead of re-walking every segment with K1
+# ``_offset`` and re-merging carry_start + carry_in (those launches recompute the plane the forward produced from the same
+# inputs: bitwise).  The adjoint carries still go to the workspace pool (the saved plane is never written); replay mode
+# (checkpoint recompute) and P = 1 ranks are unchanged.  0 = the re-walk (the previous form), via _kcp_test_knobs only
+# (the A/B record).
+SAVED_CARRIES = (0, 1)
+SAVED_CARRY_DEFAULT = 1
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
@@ -299,6 +317,7 @@ P2_KNOBS = {  # knob -> admitted values
     "graph_cap": GRAPH_CAPS,
     "host_trim": HOST_TRIMS,
     "merge_fuse": MERGE_FUSES,
+    "saved_carry": SAVED_CARRIES,
 }
 # Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
@@ -3048,9 +3067,11 @@ class KcpWorkspace:
 @dataclasses.dataclass(frozen=True)
 class KcpSaved:
     """The saved context of one forward (``boundary_mode="saved"``, the design note §16): ``S_in`` (the fresh c2
-    output), the owner's c1 receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``) and the
-    scalars of the call.  The int32 tables are rebuilt from ``ctx`` (droppable, §16 item 3).  No token-row ``Aqk`` /
-    ``Akk``: the backward recomputes the internal rows it reads in both modes (version 2; version 1 held them)."""
+    output), the owner's c1 receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the
+    forward's carry plane ``carry`` (``P > 1``: the backward's tape replay reads it and skips the K1 offset re-walk +
+    carry merges; ``None`` at ``P = 1`` and under the test knob ``saved_carry=0``) and the scalars of the call.  The
+    int32 tables are rebuilt from ``ctx`` (droppable, §16 item 3).  No token-row ``Aqk`` / ``Akk``: the backward
+    recomputes the internal rows it reads in both modes (version 2; version 1 held them)."""
 
     version: int
     S_in: torch.Tensor
@@ -3069,12 +3090,15 @@ class KcpSaved:
     precision_mode: int
     ctx: Any
     transfer_walk: str = "tf32_hilo"
+    carry: torch.Tensor | None = (
+        None  # the forward's carry plane (P > 1; None at P = 1 or under saved_carry=0)
+    )
 
-    _OPTIONAL = ("c1_recv", "M_seg")
+    _OPTIONAL = ("c1_recv", "M_seg", "carry")
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         return (self.S_in,) + tuple(
-            t for t in (self.c1_recv, self.M_seg) if t is not None
+            t for t in (getattr(self, n) for n in self._OPTIONAL) if t is not None
         )
 
     def flags(self) -> tuple[bool, ...]:
@@ -3136,7 +3160,10 @@ class KcpOptions:
     = the previous form of record (no device preference), ``"capture_pref"`` (rejected) and ``"node_attr_post"`` stay selectable;
     ``_kcp_test_knobs`` only), ``host_trim`` (``1`` shipped: the
     trimmed host path of the eager call -- the same launches in the same order, bitwise; ``0`` = the previous host path;
-    ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through ``_kcp_test_knobs``)."""
+    ``_kcp_test_knobs`` only), ``saved_carry`` (``1`` shipped: the forward of a ``P > 1`` rank keeps its carry plane in
+    the saved set and the saved-mode backward reads it; ``0`` = that backward re-walks the forward carries -- the same
+    remaining launches, bitwise; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
+    ``_kcp_test_knobs``)."""
 
     save_transfer: bool | None = (
         None  # None = resolve: SAVE_TRANSFER_DEFAULT (True) for a2a / auto, False for the ring; explicit False = the recompute form
@@ -3160,6 +3187,7 @@ class KcpOptions:
     graph_cap: str = GRAPH_CAP_DEFAULT  # the cache-config form of a captured call ("node_attr" shipped | "none" the previous form of record | "capture_pref" rejected | "node_attr_post"); _kcp_test_knobs only
     host_trim: int = HOST_TRIM_DEFAULT  # shipped 1 = the trimmed host path of the eager call (same launches, bitwise); 0 = the previous path, _kcp_test_knobs only
     merge_fuse: str = MERGE_FUSE_DEFAULT  # "carry" = carry_start + carry_in (dcarry_end + dcarry_cross) in one K4 launch; _kcp_test_knobs only
+    saved_carry: int = SAVED_CARRY_DEFAULT  # shipped 1 = the forward's carry plane stays in the saved set and the saved-mode backward skips the P > 1 re-walk + carry merges; 0 = the re-walk, _kcp_test_knobs only
 
     def check(self) -> KcpOptions:
         if self.exchange not in EXCHANGES:
@@ -3260,7 +3288,7 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
             if key in raw:
                 p2[key] = (
                     int(raw.pop(key))
-                    if key in ("fused_walks", "host_trim")
+                    if key in ("fused_walks", "host_trim", "saved_carry")
                     else str(raw.pop(key))
                 )
     if (
@@ -3387,6 +3415,9 @@ class KcpCall:
         # 1 = the trimmed host path (shipped), 0 = the previous path (same launches, bitwise)
         self.host_trim = int(opts.host_trim)
         self.merge_fuse = str(opts.merge_fuse)  # fused carry merges
+        self.saved_carry = int(
+            opts.saved_carry
+        )  # 1 (shipped) = the saved carry plane; 0 = the re-walk (test knob)
 
     # -- buffers
     def buf(self, name: str) -> torch.Tensor:
@@ -3587,6 +3618,10 @@ def _record(kind: str, call: KcpCall) -> None:
         # the host path of this call (1 trimmed = shipped / 0 previous; same launches)
         "host_trim": call.host_trim,
         "merge_fuse": call.merge_fuse,  # the fused carry merges (test knob)
+        "saved_carry": call.saved_carry,  # 1 (shipped) = the saved carry plane; 0 = the re-walk (test knob)
+        "saved_carry_plane": call.scratch.get(
+            "saved_carry_plane"
+        ),  # bytes of the carry plane kept (forward) / read (backward) on a P > 1 rank under saved_carry=1, None otherwise
         "merges": list(
             call.merge_log
         ),  # D1 evidence: (family, ncols, n_chains, explicit cols_per_cta or None = registry)
@@ -4056,6 +4091,11 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
         call.fresh("c1_recv")
         if tb.P > 1:
             call.fresh("stage_m")  # M_seg^T of the segmented fragments (§16 item 5b)
+    if (
+        save and not replay and tb.P > 1 and call.saved_carry == 1
+    ):  # the carry plane as a fresh tensor: the carry merges below write it, the tape walk reads it, the saved set keeps it
+        plane = call.fresh("carry")
+        call.scratch["saved_carry_plane"] = plane.numel() * plane.element_size()
     if replay:  # the replay's prep (the GLM prep's rows, the internal dout copy), then the internal Aqk / Akk rows
         call.stage("bwd_prep", saved=None)
         call.stage("fwd_intra")
@@ -4126,16 +4166,24 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
             "fwd_intra"
         )  # the internal Aqk / Akk rows the WY, dav and gradient programs read
         call.stage("wy")
+        plane = (
+            saved.carry if tb.P > 1 else None
+        )  # the forward's carry plane (shipped; None under saved_carry=0): no K1 offset re-walk, no carry merges
+        if plane is not None:
+            call.scratch["saved_carry_plane"] = plane.numel() * plane.element_size()
         if (
             tb.P > 1
         ):  # the forward carries again: b_seg (and M_seg^T unless saved) -> K4 carries from 0 / S_in
-            call.walk(
-                "kcp_fwdh_offset",
-                tb.walk_all,
-                h0=None,
-                out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
-            )
-            if saved.M_seg is None:
+            if plane is None:
+                call.walk(
+                    "kcp_fwdh_offset",
+                    tb.walk_all,
+                    h0=None,
+                    out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+                )
+            if (
+                saved.M_seg is None
+            ):  # stage_m: the carry_in merge below and the owner's map merge (tmap_m) read it
                 call.walk(
                     "kcp_transfer_walk",
                     tb.walk_all,
@@ -4144,11 +4192,17 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
                     use_u=0,
                     write_transposed=0,
                 )
-            if call.merge_fuse == "carry":
+            if plane is not None:
+                pass  # the saved plane holds carry_start's and carry_in's results (and the S_in copies)
+            elif call.merge_fuse == "carry":
                 call.merge("carry_both")  # one launch for both carry families
             else:
                 call.merge("carry_start")
                 call.merge("carry_in")
+        if plane is not None:
+            call.bufs["carry"] = (
+                plane  # the tape replay below reads the saved plane; the adjoint carries go to the workspace pool
+            )
         if (
             tb.fused_walks and tb.P > 1
         ):  # fused walks: the whole tape replay from the carry plane in one launch
@@ -4181,6 +4235,10 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
                     h0=call.indexed("carry", tb.carry_index, tb.carry_tiles),
                     out=None,
                 )
+        if plane is not None:
+            del call.bufs[
+                "carry"
+            ]  # the saved plane is never written: dcarry_* publish into the workspace pool
     call.stage("dav")
     ring = call.exchange == "ring"
     form = (
@@ -4630,6 +4688,9 @@ def _fwd_body(
             M_seg=call.bufs.get("stage_m")
             if (opts.save_transfer and tb.P > 1)
             else None,
+            carry=call.bufs.get("carry")
+            if (tb.P > 1 and call.saved_carry == 1)
+            else None,
             T_r=call.T_r,
             H=call.H,
             n_frag=tb.n_frag,
@@ -4698,6 +4759,16 @@ def _check_saved(saved: KcpSaved, call: KcpCall) -> None:
                 call.state_dtype,
                 call.device,
             )
+    if saved.carry is not None:
+        if tb.P == 1:
+            raise ValueError("saved: a carry plane needs P > 1")
+        _check(
+            saved.carry,
+            "saved.carry",
+            (tb.sizes["carry"],),
+            call.state_dtype,
+            call.device,
+        )
 
 
 def chunk_kda_kcp_bwd(
@@ -4719,7 +4790,11 @@ def chunk_kda_kcp_bwd(
     opts = _options(options)
     entry = None
     if opts.graph != "off":
-        kept = () if saved is None else (saved.S_in, saved.c1_recv, saved.M_seg)
+        kept = (
+            ()
+            if saved is None
+            else (saved.S_in, saved.c1_recv, saved.M_seg, saved.carry)
+        )  # the validity key sees every saved tensor (the carry plane of saved_carry=1 included)
         entry = _graph_entry(
             "bwd",
             ctx,
