@@ -1,6 +1,7 @@
 """Operands and measurements for the SM120 SVDQuant backend comparison."""
 
 import math
+import os
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -24,13 +25,18 @@ from flashinfer.autotune_cache import MeasurementPolicy
 from flashinfer.autotuner import AutoTuner, _tactic_to_json
 
 
-Backend = Literal["cute-dsl", "cutlass-sm120", "auto"]
+Backend: TypeAlias = str
 Operation = Literal["gemm", "linear"]
 TuningL2 = Literal["operator", "warm", "cold"]
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-BACKENDS: Final[tuple[Backend, ...]] = ("cute-dsl", "cutlass-sm120", "auto")
+# SVDQ_BENCH_BACKENDS overrides the compared set (comma-separated), e.g. to add
+# the native-cutlass / native-cublaslt baselines; the first entry is the
+# accuracy reference and the speedup denominator.
+BACKENDS: Final[tuple[Backend, ...]] = tuple(
+    os.environ.get("SVDQ_BENCH_BACKENDS", "cute-dsl,cutlass-sm120,auto").split(",")
+)
 REDUCTION_ELEMENTS: Final = 1 << 20
 
 
