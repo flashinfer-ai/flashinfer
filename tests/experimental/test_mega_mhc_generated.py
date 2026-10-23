@@ -1,5 +1,7 @@
 """Independent fused mHC values, scale bytes, any token count, current stream and graph epochs."""
 
+import gc
+
 import pytest
 import torch
 from flashinfer.experimental.deepgemm_mega_mhc import mega_mhc as _runtime
@@ -702,3 +704,79 @@ def test_h4096_caller_held_fnp_and_deterministic_splits():
     plan.run()
     torch.cuda.synchronize()
     check_h4096(plan.outputs, dict(values, fn=replacement))
+
+
+def test_h4096_shared_launch_epochs_must_launch_the_same_grid():
+    """Plans over one caller-owned ``launch_epochs`` must launch the same grid
+    (one epoch slot per active CTA): a second plan with another grid is refused
+    naming both grids while the first is alive, the same grid shares, and a
+    collected plan releases the storage."""
+    _skip_unless_exported(4096, "bf16")
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    epochs = torch.zeros((sms,), dtype=torch.uint64, device="cuda")
+    small = prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16", launch_epochs=epochs)
+    grid = small.config["num_launch_sms"]
+    assert grid < sms
+    with pytest.raises(
+        ValueError, match=f"launching {grid} CTAs; this plan launches {sms}"
+    ):
+        prepare_mega_mhc(**inputs_h4096(4096), sf_layout="bf16", launch_epochs=epochs)
+    twin = prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16", launch_epochs=epochs)
+    assert twin.launch_epochs is epochs and small.launch_epochs is epochs
+    for plan in (small, twin, small):
+        plan.run()
+    torch.cuda.synchronize()
+    counts = epochs.cpu().tolist()
+    assert counts[:grid] == [3] * grid and counts[grid:] == [0] * (sms - grid)
+    other = prepare_mega_mhc(**inputs_h4096(4096), sf_layout="bf16")
+    assert other.launch_epochs is not epochs and other.config["num_launch_sms"] == sms
+    del small, twin, plan
+    gc.collect()
+    big = prepare_mega_mhc(**inputs_h4096(4096), sf_layout="bf16", launch_epochs=epochs)
+    assert big.launch_epochs is epochs
+
+
+def test_h4096_a_plans_own_launch_epochs_is_guarded_like_a_caller_owned_one():
+    """A plan's internally allocated ``launch_epochs`` handed to a second plan is
+    refused with another grid and shared with the same grid, exactly as a
+    caller-owned tensor: every plan registers its epoch storage."""
+    _skip_unless_exported(4096, "bf16")
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    first = prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16")
+    grid = first.config["num_launch_sms"]
+    assert grid < sms
+    with pytest.raises(
+        ValueError, match=f"launching {grid} CTAs; this plan launches {sms}"
+    ):
+        prepare_mega_mhc(
+            **inputs_h4096(4096), sf_layout="bf16", launch_epochs=first.launch_epochs
+        )
+    same = prepare_mega_mhc(
+        **inputs_h4096(64), sf_layout="bf16", launch_epochs=first.launch_epochs
+    )
+    assert same.launch_epochs is first.launch_epochs
+    for plan in (first, same):
+        plan.run()
+    torch.cuda.synchronize()
+    counts = first.launch_epochs.cpu().tolist()
+    assert counts[:grid] == [2] * grid and counts[grid:] == [0] * (sms - grid)
+
+
+def test_h4096_launch_epochs_must_own_its_whole_storage():
+    """A caller-owned ``launch_epochs`` that is a sliced or offset view of a larger
+    storage is refused (two views of overlapping memory would carry different
+    registry keys); a tensor owning its whole storage is accepted."""
+    _skip_unless_exported(4096, "bf16")
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    storage = torch.zeros((sms + 8,), dtype=torch.uint64, device="cuda")
+    for view in (storage[8:], storage[:sms]):
+        assert view.shape == (sms,)
+        with pytest.raises(ValueError, match="must own its whole storage"):
+            prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16", launch_epochs=view)
+    whole = torch.zeros((sms,), dtype=torch.uint64, device="cuda")
+    plan = prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16", launch_epochs=whole)
+    assert plan.launch_epochs is whole
+    plan.run()
+    torch.cuda.synchronize()
+    grid = plan.config["num_launch_sms"]
+    assert whole.cpu().tolist()[:grid] == [1] * grid

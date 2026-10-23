@@ -14,6 +14,8 @@ the launch grid are chosen here from the same rules the producer uses.
 from __future__ import annotations
 
 import functools
+import threading
+import weakref
 from typing import Any
 
 GENERATED_ROOT = "csrc/experimental/deepgemm_mega_mhc/generated"
@@ -765,6 +767,50 @@ def _new_outputs(
     return outputs
 
 
+#: The launch grid of every live plan's ``launch_epochs`` (caller-owned or the
+#: plan's own), by the storage's (data pointer, bytes, device): the kernel
+#: advances one epoch slot per active CTA, so plans sharing the storage must
+#: launch the same grid. Read and updated under ``_EPOCH_GRIDS_LOCK``.
+_EPOCH_GRIDS: dict = {}
+_EPOCH_GRIDS_LOCK = threading.Lock()
+
+
+def _claim_launch_epochs(plan, launch_epochs, grid):
+    """Record ``plan`` as a user of ``launch_epochs`` launching ``grid`` CTAs;
+    refuse the storage while another live plan launches a different grid. The
+    tensor must own its whole storage (offset 0, spanning the storage), so two
+    views of overlapping memory cannot carry different keys."""
+    storage = launch_epochs.untyped_storage()
+    nbytes = launch_epochs.numel() * launch_epochs.element_size()
+    if launch_epochs.storage_offset() != 0 or storage.nbytes() != nbytes:
+        raise ValueError(
+            "launch_epochs must own its whole storage (storage offset 0 and "
+            f"{launch_epochs.numel()} elements spanning the storage); a sliced or "
+            f"offset view (offset {launch_epochs.storage_offset()}, storage of "
+            f"{storage.nbytes()} bytes) is refused"
+        )
+    key = (storage.data_ptr(), nbytes, launch_epochs.device.index)
+    with _EPOCH_GRIDS_LOCK:
+        for stale in [
+            k for k, users in _EPOCH_GRIDS.items() if not any(ref() for ref, _ in users)
+        ]:
+            del _EPOCH_GRIDS[stale]
+        users = [
+            (ref, other)
+            for ref, other in _EPOCH_GRIDS.get(key, ())
+            if ref() is not None
+        ]
+        for _ref, other in users:
+            if other != grid:
+                raise ValueError(
+                    f"launch_epochs is in use by a plan launching {other} CTAs; this "
+                    f"plan launches {grid}: plans sharing launch_epochs must launch "
+                    "the same grid (one epoch slot per active CTA)"
+                )
+        users.append((weakref.ref(plan), grid))
+        _EPOCH_GRIDS[key] = users
+
+
 def _raw_storage(tensor):
     import torch
 
@@ -799,7 +845,12 @@ class MegaMHCPlan:
     ordinary calls and CUDA Graph replay. Epoch storage always has num_sms
     entries, including CTAs omitted by a selected launch grid. One plan must
     not execute concurrently on multiple streams. run() uses the current
-    PyTorch stream and performs no device allocation or workspace reset.
+    PyTorch stream and performs no device allocation or workspace reset. Plans
+    sharing a ``launch_epochs`` -- caller-owned or another plan's own -- must
+    launch the same grid: the kernel advances one epoch slot per active CTA, so
+    a plan refuses a ``launch_epochs`` another live plan uses with a different
+    grid. A caller-owned ``launch_epochs`` must own its whole storage (offset 0,
+    spanning the storage); a sliced or offset view is refused.
     """
 
     def __init__(
@@ -986,6 +1037,9 @@ class MegaMHCPlan:
         require("scratch", scratch, torch.float32, scratch_shape)
         require("split_barriers", split_barriers, torch.uint64, (SPLIT_BARRIER_WORDS,))
         require("launch_epochs", launch_epochs, torch.uint64, (sms,))
+        # every plan registers its epoch storage, caller-owned or its own, so a
+        # plan's own tensor handed to another plan is checked the same way
+        _claim_launch_epochs(self, launch_epochs, launch_sms)
         if store_fp8:
             if fnp is not None:
                 raise ValueError(
