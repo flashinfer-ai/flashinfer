@@ -14,6 +14,7 @@ the launch grid are chosen here from the same rules the producer uses.
 from __future__ import annotations
 
 import functools
+import weakref
 from typing import Any
 
 GENERATED_ROOT = "csrc/experimental/deepgemm_mega_mhc/generated"
@@ -765,6 +766,34 @@ def _new_outputs(
     return outputs
 
 
+#: The launch grid of every live plan over a caller-owned ``launch_epochs``, by
+#: the storage's (data pointer, length, device): the kernel advances one epoch
+#: slot per active CTA, so plans sharing the storage must launch the same grid.
+_EPOCH_GRIDS: dict = {}
+
+
+def _claim_launch_epochs(plan, launch_epochs, grid):
+    """Record ``plan`` as a user of ``launch_epochs`` launching ``grid`` CTAs;
+    refuse the storage while another live plan launches a different grid."""
+    key = (launch_epochs.data_ptr(), launch_epochs.numel(), launch_epochs.device.index)
+    for stale in [
+        k for k, users in _EPOCH_GRIDS.items() if not any(ref() for ref, _ in users)
+    ]:
+        del _EPOCH_GRIDS[stale]
+    users = [
+        (ref, other) for ref, other in _EPOCH_GRIDS.get(key, ()) if ref() is not None
+    ]
+    for _ref, other in users:
+        if other != grid:
+            raise ValueError(
+                f"launch_epochs is in use by a plan launching {other} CTAs; this plan "
+                f"launches {grid}: plans sharing launch_epochs must launch the same "
+                "grid (one epoch slot per active CTA)"
+            )
+    users.append((weakref.ref(plan), grid))
+    _EPOCH_GRIDS[key] = users
+
+
 def _raw_storage(tensor):
     import torch
 
@@ -799,7 +828,10 @@ class MegaMHCPlan:
     ordinary calls and CUDA Graph replay. Epoch storage always has num_sms
     entries, including CTAs omitted by a selected launch grid. One plan must
     not execute concurrently on multiple streams. run() uses the current
-    PyTorch stream and performs no device allocation or workspace reset.
+    PyTorch stream and performs no device allocation or workspace reset. Plans
+    sharing a caller-owned ``launch_epochs`` must launch the same grid: the
+    kernel advances one epoch slot per active CTA, so a plan refuses a
+    ``launch_epochs`` another live plan uses with a different grid.
     """
 
     def __init__(
@@ -981,11 +1013,14 @@ class MegaMHCPlan:
             split_barriers = torch.zeros(
                 (SPLIT_BARRIER_WORDS,), dtype=torch.uint64, device=x.device
             )
+        caller_epochs = launch_epochs is not None
         if launch_epochs is None:
             launch_epochs = torch.zeros((sms,), dtype=torch.uint64, device=x.device)
         require("scratch", scratch, torch.float32, scratch_shape)
         require("split_barriers", split_barriers, torch.uint64, (SPLIT_BARRIER_WORDS,))
         require("launch_epochs", launch_epochs, torch.uint64, (sms,))
+        if caller_epochs:
+            _claim_launch_epochs(self, launch_epochs, launch_sms)
         if store_fp8:
             if fnp is not None:
                 raise ValueError(

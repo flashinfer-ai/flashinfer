@@ -44,9 +44,10 @@ def prepare_mega_mhc(
     program reads fn through the BF16 pieces fnp[3,32,4H], built here from fn
     or taken from the caller's fnp, and plan.update_fn() re-splits a changed
     fn. The eps, scale and iteration keywords are the model's constants (the
-    defaults are DeepSeek V4's). Any token count in [1, 2**20] is accepted. See
-    MegaMHCPlan for caller-owned output/workspace layouts and invocation-state
-    ownership. The prepared plan follows the current PyTorch stream and CUDA
+    defaults are DeepSeek V4's). Any token count in [1, 2**20] is accepted. Plans
+    sharing a caller-owned launch_epochs must launch the same grid (one epoch
+    slot per active CTA); a reuse with another grid is refused. See MegaMHCPlan
+    for caller-owned output/workspace layouts and invocation-state ownership. The prepared plan follows the current PyTorch stream and CUDA
     Graph replay.
     """
     from .experimental.deepgemm_mega_mhc.mega_mhc import MegaMHCPlan
