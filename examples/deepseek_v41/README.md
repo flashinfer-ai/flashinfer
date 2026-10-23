@@ -211,7 +211,10 @@ Both caches must already use the same cache units. BMM1 is a positive finite
 FP32 Python scalar, BMM2 a finite FP32 Python scalar. For Q descale `q_s`, shared
 KV descale `s>0` and attention factor `alpha`, pass `bmm1_scale=alpha*q_s*s`
 and `bmm2_scale=s`. Defaults are1.0/1.0; the example above explicitly selects
-`512**-0.5` with unit descales. Main staging rounds/saturates exact
+`512**-0.5` with unit descales. Scaling uses ordinary FP32 arithmetic, including
+`bmm1_scale * log2(e)`. Extreme scales or scale/sink combinations have no
+overflow/underflow compensation, even when the supplied scalars are finite FP32;
+nonzero subnormal outputs are not guaranteed. Main staging rounds/saturates exact
 `E2M1 * original_group16_E4M3_scale` directly to E4M3, including intentional
 +/-448 saturation. There is no request amax, selected scale tensor, division
 by BMM2 or repeated scale restoration. Inconsistent cache units are not repaired;
@@ -239,11 +242,18 @@ FP8 output bound, LSE `rtol=0, atol=1e-5`, exact-empty/nonfinite checks and bitw
 layout/replay parity. Host contracts cover sparse views, workspace ownership,
 defaults and task control; static/CLC graph coverage remains in
 `tests/attention/test_attention_ts_sparse_mla.py`.
-The native finalizer retains ordinary-range arithmetic and uses two factors for
-extreme BMM2/sink combinations, avoiding premature underflow before PV scaling.
-Regression tests cover strong sinks with large signed BMM2, signed zero,
-BF16-subnormal output, and live metadata/layout/replay parity. The independent
-oracle and numerical gates above are unchanged; true BF16 overflow is not removed.
+Regression tests cover ordinary signed BMM2, signed zero, sinks, and live
+metadata/layout/replay parity without relaxing the oracle or numerical gates.
+
+After removing the extended-range scaling path, **B200 (SM100) passed 328 CPU
+contract and 171 decode/cache GPU cases** without failures or skips, using
+PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0, bundled CUDA 13.4 and Triton 3.6.0.
+Eight targeted generic sparse MLA GPU cases also passed, covering BF16/FP8,
+Keep-AB/Swap-AB, split-KV, static/CLC schedulers, device scalars, sinks and
+changed-metadata graph replay. These targeted runs do not requalify the full
+generic suite, SM103/SM107 or performance.
+
+The earlier validation records below predate that removal.
 Historical native-only frozen-source verification on **B200 (SM100) passed
 197 host-contract and 100 GPU cases** without failures or skips, using PyTorch
 2.11.0+cu128, CuTe-DSL 4.8.0 and bundled CUDA 13.4. Those counts predate the

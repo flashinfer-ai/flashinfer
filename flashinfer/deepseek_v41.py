@@ -72,6 +72,9 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
     scalars. For Q descale q_s, common KV descale s>0 and attention factor
     alpha, pass ``alpha*q_s*s`` and ``s``. Defaults are1.0/1.0; explicitly
     pass ``bmm1_scale=512**-0.5`` for that attention factor with unit descales.
+    Scaling uses ordinary FP32 arithmetic, including ``bmm1_scale * log2(e)``.
+    Extreme scales or scale/sink combinations have no overflow/underflow
+    compensation, even when the supplied scalars are finite FP32.
     Main staging directly rounds/saturates E2M1*group16_E4M3 to E4M3,
     including intentional +/-448 saturation, without request amax or division.
     Optional ``sinks`` is FP32[64], finite or -inf, and contributes once to
