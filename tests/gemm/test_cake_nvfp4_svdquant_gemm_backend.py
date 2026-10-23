@@ -149,10 +149,10 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
         (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
         (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
         (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
-        (6912, 3072, 3072, 96, True): _P + "96eddeb7b3a643b34a21",
+        (6912, 3072, 3072, 96, True): _P + "0f7f27a483c337265bf9",
         (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
         (9216, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
-        (16384, 3072, 3072, 32, True): _P + "c832b08a912e4c58112b",
+        (16384, 3072, 3072, 32, True): _P + "c80322ffcfa97a956474",
         (16384, 12288, 3072, 32, True): _P + "b4be925d9e1e6959b702",
     },
     "sm_103a": {
@@ -169,6 +169,10 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
     },
 }
 EXACT_BUILDS: dict[str, dict[str, object]] = {
+    _P + "0f7f27a483c337265bf9": {
+        "bias_path": "regs",
+        "rank": 96,
+    },
     _P + "1d78f2bd5722fb02b75a": {
         "clc_lead_kb": 8,
         "rank": 32,
@@ -202,10 +206,6 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "prologue": "overlap",
         "stages": 15,
     },
-    _P + "96eddeb7b3a643b34a21": {
-        "bias_path": "regs",
-        "rank": 96,
-    },
     _P + "aa5225a75028cbb32391": {
         "out_hint": "on",
         "out_store": "v8hint",
@@ -214,7 +214,7 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
     _P + "b4be925d9e1e6959b702": {
         "rank": 32,
     },
-    _P + "c832b08a912e4c58112b": {
+    _P + "c80322ffcfa97a956474": {
         "bias_path": "regs",
         "rank": 32,
     },
@@ -242,8 +242,8 @@ ARCH_ONLY: dict[str, set[str]] = {
         _P + "2270204930b79b8caef7",
         _P + "2ca0cf40f7bbfca9df92",
         _P + "8c21118cf9b080867cf1",
-        _P + "96eddeb7b3a643b34a21",
-        _P + "c832b08a912e4c58112b",
+        _P + "0f7f27a483c337265bf9",
+        _P + "c80322ffcfa97a956474",
     },
     "sm_103a": {
         _P + "44ec820136bf5bcde86e",
@@ -807,9 +807,10 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
         record = loader.MODULES[name]
         assert record["plan"]["grid_rule"] == "pair_persistent", (n, k)
         assert record["build"]["out_store"] == form, (n, k, record["build"])
-    # Every tail-split route is a hinted launch, so the program ships hinted only.
-    for record in loader.MODULES.values():
-        if record["plan"]["grid_rule"] == "pair_tailsplit":
+    # The tail-split rows by rank are hinted launches, so those builds ship hinted;
+    # the exact-dispatch rows pin their own tail-split builds (EXACT_BUILDS).
+    for name, record in loader.MODULES.items():
+        if record["plan"]["grid_rule"] == "pair_tailsplit" and name not in EXACT_BUILDS:
             assert record["build"]["out_store"] == "v8hint"
 
 

@@ -464,12 +464,12 @@ kernel_cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29(const __grid_constant__ CUt
                     tcgen05_cp_32x128b_warpx4((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo256((((smem_sfb_addr) >> 4) + (read_stage) * 896 + 8)));
                 }
                 int init_flag = ((k_tile_mma == 0) ? 1 : 0);
-                int _smem_desc_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (read_stage) * 896);
-                int _smem_desc_lo_1 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (read_stage) * 896);
+                int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (read_stage) * 896);
+                int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (read_stage) * 896);
                 if (elect_sync()) {
                     {
-                        uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_0) | ((uint64_t)0x80004020 << 32);
-                        uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x80004020 << 32);
+                        uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x80004020 << 32);
+                        uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x80004020 << 32);
 
                         tcgen05_mma_mxf4nvf4_bs(tmem_accum, a_desc + 0, b_desc + 0,
                             0x8100480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + mma_sfb_half * 2 + 0, ((init_flag) ? 0 : 1));
@@ -488,18 +488,18 @@ kernel_cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29(const __grid_constant__ CUt
                 mma_stage += 1;
                 if (mma_stage == 16) { mma_stage = 0; mma_phase ^= 1; }
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                int _smem_desc_lo_2 = make_warp_uniform((((smem_d_addr) >> 4) & 0x3FFF) + (read_stage_1) * 896);
-                int _smem_desc_lo_3 = make_warp_uniform((((smem_l1_addr) >> 4) & 0x3FFF) + (read_stage_1) * 896);
+                int _mma_a_lo_1 = make_warp_uniform((((smem_d_addr) >> 4) & 0x3FFF) + (read_stage_1) * 896);
+                int _mma_b_lo_1 = make_warp_uniform((((smem_l1_addr) >> 4) & 0x3FFF) + (read_stage_1) * 896);
                 {
-                    uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_smem_desc_lo_2);
-                    uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_smem_desc_lo_3);
+                    uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
+                    uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
+                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
+                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
                     }
                 }
                 elect_commit_cg1_multicast(tma_empty_addr + (read_stage_1) * 8, (uint16_t)(3));
@@ -509,8 +509,7 @@ kernel_cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29(const __grid_constant__ CUt
             mbarrier_wait(tmem_dealloc_addr, _phase_tmem_dealloc_0);
             _phase_tmem_dealloc_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
-            int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(128));
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(128));
         }
     }
     // ---- Role: scheduler ----
