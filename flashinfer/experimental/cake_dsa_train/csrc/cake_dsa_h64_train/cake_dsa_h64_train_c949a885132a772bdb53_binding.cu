@@ -300,6 +300,11 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_kv_latent, Ten
   config.blockDim = dim3(384, 1, 1);
   config.dynamicSmemBytes = 231680;
   config.stream = stream;
+  cudaLaunchAttribute attrs[1] = {};
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_dsa_h64_train_c949a885132a772bdb53), kernel_args),
             "cudaLaunchKernelExC");
 }

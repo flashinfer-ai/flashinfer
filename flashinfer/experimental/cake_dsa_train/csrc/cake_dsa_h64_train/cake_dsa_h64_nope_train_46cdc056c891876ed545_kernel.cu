@@ -383,6 +383,7 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
 
     // Kernel post-init ops
     const int tmem_tmem = taddr;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // ---- Role: softmax ----
     if (warp <= 3) {

@@ -563,6 +563,7 @@ kernel_cake_dsa_h64_nope_train_db791110b21a91be1388(int* __restrict__ indices, i
             }
         }
     }
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 } // extern "C"

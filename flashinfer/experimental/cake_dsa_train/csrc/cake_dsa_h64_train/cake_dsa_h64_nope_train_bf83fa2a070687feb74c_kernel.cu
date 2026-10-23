@@ -394,17 +394,17 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
             for (int tk = 0; tk < ntok; tk++) {
                 int tok = blockIdx.x + tk * gridDim.x;
                 int pw = warp;
-                int bslot = tk % 2;
-                int bphase = tk / 2 & 1;
-                mbarrier_wait(blocks_ready_addr + (bslot) * 8, bphase);
+                int bslot = (int)((unsigned int)tk % 2);
+                int _phase_bslot = (int)((unsigned int)tk / 2 % 2);
+                mbarrier_wait(blocks_ready_addr + (bslot) * 8, _phase_bslot);
                 int blocks = blocks_word[bslot];
                 mbarrier_arrive(blocks_free_addr + (bslot) * 8);
                 if (elect_sync()) {
                     #pragma unroll 1
                     for (int i = tord; i < tord + blocks; i++) {
-                        int slot = i % 2;
-                        int full_phase = i / 2 & 1;
-                        mbarrier_wait(idx_full_addr + (slot) * 8, full_phase);
+                        int slot = (int)((unsigned int)i % 2);
+                        int _phase_slot = (int)((unsigned int)i / 2 % 2);
+                        mbarrier_wait(idx_full_addr + (slot) * 8, _phase_slot);
                         int rows[16];
                         rows[0] = tile_idx[slot * 80 + pw * 4];
                         rows[1] = tile_idx[slot * 80 + pw * 4 + 1];
@@ -423,9 +423,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                         rows[14] = tile_idx[slot * 80 + 48 + pw * 4 + 2];
                         rows[15] = tile_idx[slot * 80 + 48 + pw * 4 + 3];
                         mbarrier_arrive(idx_free_addr + (slot) * 8);
-                        int k_free_stage = 0;
-                        int k_free_phase = i & 1 ^ 1;
-                        mbarrier_wait(k_free_addr + (k_free_stage) * 8, k_free_phase);
+                        int _parity_k_free = (int)((unsigned int)i % 2) ^ 1;
+                        mbarrier_wait(k_free_addr, _parity_k_free);
                         mbarrier_arrive_expect_tx(k_full_addr, 16384);
                         asm volatile(
                             "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
@@ -574,12 +573,13 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                 int lane_0 = lane;
                 int w = warp - 4;
                 int lane_base = (tid & 96) << 16;
-                int bslot_1 = tk_1 % 2;
-                int bphase_1 = tk_1 / 2 & 1;
-                mbarrier_wait(blocks_ready_addr + (bslot_1) * 8, bphase_1);
+                int bslot_1 = (int)((unsigned int)tk_1 % 2);
+                int _phase_bslot_1 = (int)((unsigned int)tk_1 / 2 % 2);
+                mbarrier_wait(blocks_ready_addr + (bslot_1) * 8, _phase_bslot_1);
                 int blocks_1 = blocks_word[bslot_1];
                 mbarrier_arrive(blocks_free_addr + (bslot_1) * 8);
-                mbarrier_wait(stats_full_addr, tk_1 & 1);
+                int _parity_stats_full = (int)((unsigned int)tk_1 % 2);
+                mbarrier_wait(stats_full_addr, _parity_stats_full);
                 int h0 = w * 16 + lane_0 / 4;
                 float lse0 = stats[h0];
                 float lse1 = stats[h0 + 8];
@@ -592,15 +592,14 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                 int hchunk = (2 * w + m4 % 2 ^ r8) * 16;
                 #pragma unroll 1
                 for (int i_1 = tord_1; i_1 < tord_1 + blocks_1; i_1++) {
-                    int slot_1 = i_1 % 2;
-                    int full_phase_1 = i_1 / 2 & 1;
-                    mbarrier_wait(idx_full_addr + (slot_1) * 8, full_phase_1);
+                    int slot_1 = (int)((unsigned int)i_1 % 2);
+                    int _phase_slot_1 = (int)((unsigned int)i_1 / 2 % 2);
+                    mbarrier_wait(idx_full_addr + (slot_1) * 8, _phase_slot_1);
                     unsigned int v0 = validity32[slot_1 * 80 + 64];
                     unsigned int v1 = validity32[slot_1 * 80 + 65];
                     mbarrier_arrive(idx_free_addr + (slot_1) * 8);
-                    int s_full_stage = 0;
-                    unsigned int s_full_phase = i_1 & 1;
-                    mbarrier_wait(s_full_addr + (s_full_stage) * 8, s_full_phase);
+                    int _parity_s_full = (int)((unsigned int)i_1 % 2);
+                    mbarrier_wait(s_full_addr, _parity_s_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float s[32];
                     asm volatile(
@@ -757,9 +756,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(s_free_addr);
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
-                    int p_free_stage = 0;
-                    unsigned int p_free_phase = i_1 & 1 ^ 1;
-                    mbarrier_wait(p_free_addr + (p_free_stage) * 8, p_free_phase);
+                    int _parity_p_free = (int)((unsigned int)i_1 % 2) ^ 1;
+                    mbarrier_wait(p_free_addr, _parity_p_free);
                     unsigned int p_bf16[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
@@ -788,9 +786,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(p_full_addr);
-                    int dp_full_stage = 0;
-                    unsigned int dp_full_phase = i_1 & 1;
-                    mbarrier_wait(dp_full_addr + (dp_full_stage) * 8, dp_full_phase);
+                    int _parity_dp_full = (int)((unsigned int)i_1 % 2);
+                    mbarrier_wait(dp_full_addr, _parity_dp_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float dp[32];
                     asm volatile(
@@ -835,9 +832,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(dp_free_addr);
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
-                    int ds_free_stage = 0;
-                    unsigned int ds_free_phase = i_1 & 1 ^ 1;
-                    mbarrier_wait(ds_free_addr + (ds_free_stage) * 8, ds_free_phase);
+                    int _parity_ds_free = (int)((unsigned int)i_1 % 2) ^ 1;
+                    mbarrier_wait(ds_free_addr, _parity_ds_free);
                     unsigned int ds_bf16[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
@@ -867,7 +863,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(ds_full_addr);
                 }
-                mbarrier_wait(dq_done_addr, tk_1 & 1);
+                int _parity_dq_done = (int)((unsigned int)tk_1 % 2);
+                mbarrier_wait(dq_done_addr, _parity_dq_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int ctid = w * 32 + lane_0;
                 int bidc = tok_1;
@@ -2583,18 +2580,18 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                 int w2 = (warp - 8) % 4;
                 int wg = (warp - 8) / 4;
                 int lane_base_1 = (tid & 96) << 16;
-                int bslot_2 = tk_2 % 2;
-                int bphase_2 = tk_2 / 2 & 1;
-                mbarrier_wait(blocks_ready_addr + (bslot_2) * 8, bphase_2);
+                int bslot_2 = (int)((unsigned int)tk_2 % 2);
+                int _phase_bslot_2 = (int)((unsigned int)tk_2 / 2 % 2);
+                mbarrier_wait(blocks_ready_addr + (bslot_2) * 8, _phase_bslot_2);
                 int blocks_2 = blocks_word[bslot_2];
                 mbarrier_arrive(blocks_free_addr + (bslot_2) * 8);
                 int lpos = 32 * w2 + 4 * (lane_0_1 / 4);
                 int npos = 32 * w2 + 8 * (lane_0_1 >> 2 & 3) + 4 * (lane_0_1 >> 4);
                 #pragma unroll 1
                 for (int i_2 = tord_2; i_2 < tord_2 + blocks_2; i_2++) {
-                    int slot_2 = i_2 % 2;
-                    int full_phase_2 = i_2 / 2 & 1;
-                    mbarrier_wait(idx_full_addr + (slot_2) * 8, full_phase_2);
+                    int slot_2 = (int)((unsigned int)i_2 % 2);
+                    int _phase_slot_2 = (int)((unsigned int)i_2 / 2 % 2);
+                    mbarrier_wait(idx_full_addr + (slot_2) * 8, _phase_slot_2);
                     int keys[8];
                     keys[0] = tile_idx[slot_2 * 80 + wg * 32 + 2 * (lane_0_1 % 4)];
                     keys[1] = tile_idx[slot_2 * 80 + wg * 32 + 2 * (lane_0_1 % 4) + 1];
@@ -2640,9 +2637,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                             rows_1[7] = dkv_dst_map[(long long)keys[7]];
                         }
                     }
-                    int dkv_a_full_stage = 0;
-                    unsigned int dkv_a_full_phase = i_2 & 1;
-                    mbarrier_wait(dkv_a_full_addr + (dkv_a_full_stage) * 8, dkv_a_full_phase);
+                    int _parity_dkv_a_full = (int)((unsigned int)i_2 % 2);
+                    mbarrier_wait(dkv_a_full_addr, _parity_dkv_a_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float a0[32];
                     float a1[32];
@@ -2789,9 +2785,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_58 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_56 : a0[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_59 : (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_56))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_57 : a0[29]) : _shfl_xor_58)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_57) : _shfl_xor_59)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_62 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_60 : a1[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_63 : (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_60))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_61 : a1[29]) : _shfl_xor_62)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_61) : _shfl_xor_63)), "l"(0x14F0000000000000ULL) : "memory");
                     }
-                    int dkv_b_full_stage = 0;
-                    unsigned int dkv_b_full_phase = i_2 & 1;
-                    mbarrier_wait(dkv_b_full_addr + (dkv_b_full_stage) * 8, dkv_b_full_phase);
+                    int _parity_dkv_b_full = (int)((unsigned int)i_2 % 2);
+                    mbarrier_wait(dkv_b_full_addr, _parity_dkv_b_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -2950,18 +2945,20 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
             #pragma unroll 1
             for (int tk_3 = 0; tk_3 < ntok_3; tk_3++) {
                 int tok_3 = blockIdx.x + tk_3 * gridDim.x;
-                int bslot_3 = tk_3 % 2;
-                int bphase_3 = tk_3 / 2 & 1;
-                mbarrier_wait(blocks_ready_addr + (bslot_3) * 8, bphase_3);
+                int bslot_3 = (int)((unsigned int)tk_3 % 2);
+                int _phase_bslot_3 = (int)((unsigned int)tk_3 / 2 % 2);
+                mbarrier_wait(blocks_ready_addr + (bslot_3) * 8, _phase_bslot_3);
                 int blocks_3 = blocks_word[bslot_3];
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(blocks_free_addr + (bslot_3) * 8);
-                mbarrier_wait(qdo_full_addr, tk_3 & 1);
+                int _parity_qdo_full = (int)((unsigned int)tk_3 % 2);
+                mbarrier_wait(qdo_full_addr, _parity_qdo_full);
                 if (elect_sync()) {
                     #pragma unroll 1
                     for (int i_3 = 0; i_3 < blocks_3; i_3++) {
                         if (i_3 == 0) {
-                            mbarrier_wait(k_full_addr, tord_3 + i_3 & 1);
+                            int _parity_k_full = (int)((unsigned int)(tord_3 + i_3) % 2);
+                            mbarrier_wait(k_full_addr, _parity_k_full);
                             if (tord_3 > 0) {
                                 int s_prev_stage = 0;
                                 unsigned int s_prev_phase = tord_3 + i_3 & 1 ^ 1;
@@ -3152,12 +3149,12 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                             tcgen05_commit(s_full_addr);
                         }
                         if (i_3 == 0) {
-                            mbarrier_wait(do_full_addr, tk_3 & 1);
+                            int _parity_do_full = (int)((unsigned int)tk_3 % 2);
+                            mbarrier_wait(do_full_addr, _parity_do_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                         }
-                        int dp_free_stage = 0;
-                        unsigned int dp_free_phase = tord_3 + i_3 & 1 ^ 1;
-                        mbarrier_wait(dp_free_addr + (dp_free_stage) * 8, dp_free_phase);
+                        int _parity_dp_free = (int)((unsigned int)(tord_3 + i_3) % 2) ^ 1;
+                        mbarrier_wait(dp_free_addr, _parity_dp_free);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_2 = ((do_k_addr) >> 4) & 0x7FFF;
@@ -3341,9 +3338,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                     "}\n"
                     :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_tmem + (1048576))), "r"(0) : "memory");
                         tcgen05_commit(dp_full_addr);
-                        int p_full_stage = 0;
-                        unsigned int p_full_phase = tord_3 + i_3 & 1;
-                        mbarrier_wait(p_full_addr + (p_full_stage) * 8, p_full_phase);
+                        int _parity_p_full = (int)((unsigned int)(tord_3 + i_3) % 2);
+                        mbarrier_wait(p_full_addr, _parity_p_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (tord_3 + i_3 > 0) {
                             int dkv_b_drained_stage = 0;
@@ -3431,12 +3427,12 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_4), "r"(_mma_b_lo_0), "r"((tmem_tmem + (128))), "r"(0) : "memory");
-                        int ds_full_stage = 0;
-                        unsigned int ds_full_phase = tord_3 + i_3 & 1;
-                        mbarrier_wait(ds_full_addr + (ds_full_stage) * 8, ds_full_phase);
+                        int _parity_ds_full = (int)((unsigned int)(tord_3 + i_3) % 2);
+                        mbarrier_wait(ds_full_addr, _parity_ds_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (i_3 == 0) {
-                            mbarrier_wait(dq_drained_addr, tk_3 & 1 ^ 1);
+                            int _parity_dq_drained = (int)((unsigned int)tk_3 % 2) ^ 1;
+                            mbarrier_wait(dq_drained_addr, _parity_dq_drained);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                         }
 #if __CUDA_ARCH__ == 1070
@@ -3679,9 +3675,8 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                     "}\n"
                     :: "r"(_smem_desc_lo_8), "r"(_mma_b_lo_2), "r"((tmem_tmem + (128))), "r"(1) : "memory");
                         tcgen05_commit(dkv_a_full_addr);
-                        int dkv_a_drained_stage = 0;
-                        unsigned int dkv_a_drained_phase = tord_3 + i_3 & 1;
-                        mbarrier_wait(dkv_a_drained_addr + (dkv_a_drained_stage) * 8, dkv_a_drained_phase);
+                        int _parity_dkv_a_drained = (int)((unsigned int)(tord_3 + i_3) % 2);
+                        mbarrier_wait(dkv_a_drained_addr, _parity_dkv_a_drained);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_9 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
@@ -4107,9 +4102,9 @@ kernel_cake_dsa_h64_nope_train_bf83fa2a070687feb74c(const __grid_constant__ CUte
                 long long scratch_base = (long long)bidv * (long long)topk;
                 int count = pass_counts[bidv];
                 int blocks_4 = (((count + 63) / 64) > (1) ? ((count + 63) / 64) : (1));
-                int bfree_slot = tk_5 % 2;
-                int bfree_phase = tk_5 / 2 & 1 ^ 1;
-                mbarrier_wait(blocks_free_addr + (bfree_slot) * 8, bfree_phase);
+                int bfree_slot = (int)((unsigned int)tk_5 % 2);
+                int _phase_bfree_slot_1 = (int)((unsigned int)tk_5 / 2 % 2) ^ 1;
+                mbarrier_wait(blocks_free_addr + (bfree_slot) * 8, _phase_bfree_slot_1);
                 if (lane_0_3 == 0) {
                     blocks_word[bfree_slot] = blocks_4;
                     mbarrier_arrive(blocks_ready_addr + (bfree_slot) * 8);
