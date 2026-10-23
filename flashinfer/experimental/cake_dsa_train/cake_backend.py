@@ -3118,7 +3118,7 @@ def dsa_sparse_attention_varlen(
             causal=causal,
             out=indices,
             topk_length=lengths,
-            compact=1,
+            compact=True,
             length_in=topk_length,
         )
     else:
