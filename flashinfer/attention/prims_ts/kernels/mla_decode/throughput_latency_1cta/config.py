@@ -879,19 +879,19 @@ def keeps_mma_ab_config_kwargs(
     elif is_dynamic_token_sparse:
         # Token-sparse: one warp cannot issue 32 Gather4 per 16 KB stage fast
         # enough (~0.6 us per stage measured), so the K/V loader spans warps
-        # 12-15 (8 gathers each) and warp 9 pads.  Register budget for 16
-        # warps: 4x168 + 4x160 + 8x80 = 62464 <= 65536.  V is the latent part
-        # of the K tile, so PV reads the K stages QK already consumed instead
-        # of gathering the 64 KB again (the second gather paced the loop).
-        # PV(t) runs before QK(t + 1), so one K tile (5 stages of 16 KB) stays
-        # resident while the loader gathers the next one into the other half
-        # of a 10-stage ring; one CTA runs one work tile, so a single Q stage
-        # suffices and its second 36 KB pays for the two extra stages.
+        # 12-15 (8 gathers each, issued from warp-uniform cached rows) and
+        # warp 9 pads.  Register budget for 16 warps: 4x168 + 4x160 + 8x80 =
+        # 62464 <= 65536.  QK(t + 1) is issued before PV(t) and V is gathered
+        # again from L2 (trtllm-gen's order): softmax(t) overlaps QK(t + 1).
+        # Keeping V resident instead (sparse_reuse_kv) forces PV(t) before
+        # QK(t + 1), which serializes softmax and QK (this order is 25 %
+        # faster at 1024 L2-hot tokens and 6 % at 148).  One CTA runs one
+        # work tile, so a single Q stage suffices and its second 36 KB pays
+        # for two more KV stages.
         kwargs.update(
             {
                 "q_stages": 1,
                 "kv_stages": 10,
-                "sparse_reuse_kv": True,
                 "cache_uniform_sparse_quads": True,
                 "load_warp_idx": 12,
                 "load_num_warps": 4,

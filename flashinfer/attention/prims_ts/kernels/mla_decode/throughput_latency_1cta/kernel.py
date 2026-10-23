@@ -1998,10 +1998,10 @@ def _make_single_kv_pipe_task_graph(
         tmem_allocator.add_resource(tmem_o)
     tmem_allocator.compute_layout()
 
-    if use_nvfp4 or (cfg.is_dynamic_token_sparse and cfg.sparse_reuse_kv):
-        # The single-stage S / P pipelines (NVFP4) and the reused E4M3 K
-        # stages (PV before the next QK) make the simulated dependency chain
-        # longer than any one task list (see helpers/ts_sim_patch.py).
+    if use_nvfp4 or cfg.is_dynamic_token_sparse:
+        # The single-stage S / P pipelines (NVFP4) and the 10-stage E4M3 K/V
+        # ring make the simulated dependency chain longer than any one task
+        # list (see helpers/ts_sim_patch.py).
         ensure_schedule_sim_step_budget()
     task_manager = TaskManager(
         tasks=tasks,
