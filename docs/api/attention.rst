@@ -195,6 +195,10 @@ single kernel launch.
 
     .. automethod:: __init__
 
+.. autoclass:: BatchDecodeWithAttentionSinkWrapper
+
+    .. automethod:: __init__
+
 
 SM120 NVFP4 Attention
 ---------------------

@@ -188,6 +188,12 @@ kernel_cake_deepgemm_mixed_gemm_1703f20cc39512449eef(const __grid_constant__ CUt
                     if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
+            #pragma unroll 1
+            for (int _ = 0; _ < 6; _++) {
+                mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                load_stage += 1;
+                if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
+            }
         }
     }
     // ---- Role: mma ----

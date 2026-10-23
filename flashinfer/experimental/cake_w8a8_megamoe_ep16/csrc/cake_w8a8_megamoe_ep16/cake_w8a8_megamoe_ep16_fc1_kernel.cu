@@ -74,11 +74,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_EPI_STAGING_STAGE_BYTES 8192
 #define SMEM_EPI_STAGING_STRIDE 8192
 #define SMEM_TOTAL 162816
-#define BLOCK_M 256
-#define BLOCK_N 32
-#define BLOCK_K 128
-#define NUM_STAGES 4
-#define num_tiles grid_m
 
 #include <math_constants.h>
 
@@ -235,16 +230,16 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
   const int cta_rank = 0;
 
   // Kernel setup ops
-  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_A_OFF);
-  const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
-  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_B_OFF);
-  const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
-  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFA_CP_OFF);
-  const int smem_sfa_cp_addr = smem + SMEM_SMEM_SFA_CP_OFF;
-  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFB_CP_OFF);
-  const int smem_sfb_cp_addr = smem + SMEM_SMEM_SFB_CP_OFF;
-  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_EPI_STAGING_OFF);
-  const int epi_staging_addr = smem + SMEM_EPI_STAGING_OFF;
+  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
+  const int smem_a_addr = smem + 1024;
+  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 33792);
+  const int smem_b_addr = smem + 33792;
+  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + 37888);
+  const int smem_sfa_cp_addr = smem + 37888;
+  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + 38912);
+  const int smem_sfb_cp_addr = smem + 38912;
+  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 154624);
+  const int epi_staging_addr = smem + 154624;
 
   // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 10 barriers)
   // Mbarriers at smem_raw[0..80)
@@ -306,7 +301,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
       int n_out = N / 2;
       unsigned int _phase_mainloop_done = 0;
 #pragma unroll 1
-      for (unsigned int tile_idx = bid; tile_idx < num_tiles; tile_idx += num_bids) {
+      for (unsigned int tile_idx = bid; tile_idx < grid_m; tile_idx += num_bids) {
         int batch_idx = tile_expert[tile_idx];
         int off_n_out = tile_m_local[tile_idx];
         int expert_row_base = expert_row_offsets[batch_idx];
@@ -320,15 +315,15 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
         float beta_sg = be * sg;
         float alpha_sg = al * sg;
 #pragma unroll 1
-        for (int n_chunk = 0; n_chunk < BLOCK_N / 8; n_chunk++) {
+        for (int n_chunk = 0; n_chunk < 4; n_chunk++) {
           int route_col = n_chunk * 8;
           float _tmem_load_0[8];
           tmem_ld_x8(&_tmem_load_0[0],
-                     taddr + (unsigned int)(epi_warp * 32 + lane << 16) + (unsigned int)route_col);
+                     taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)route_col);
           asm volatile("tcgen05.wait::ld.sync.aligned;");
           float _tmem_load_1[8];
-          tmem_ld_x8(&_tmem_load_1[0], taddr + (unsigned int)(epi_warp * 32 + lane << 16) +
-                                           (unsigned int)BLOCK_N + (unsigned int)route_col);
+          tmem_ld_x8(&_tmem_load_1[0],
+                     taddr + (unsigned int)(epi_warp * 32 << 16) + 32 + (unsigned int)route_col);
           asm volatile("tcgen05.wait::ld.sync.aligned;");
 #pragma unroll
           for (int j = 0; j < 8; j++) {
@@ -339,16 +334,17 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
             float sig = 0.0f;
             float _tanh_approx_0;
             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(u * 0.5f));
-            sig = _tanh_approx_0 * 0.5f + 0.5f;
+            sig = __fmaf_rn(_tanh_approx_0, 0.5f, 0.5f);
             result = g * u * sig;
-            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)result;
             epi_staging[expert_row * 128 + hidden_lane] = _cvt_bf16_0;
           }
         }
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        asm volatile("tcgen05.fence::before_thread_sync;");
         asm volatile("barrier.sync 15, 128;" ::: "memory");
 #pragma unroll
-        for (int task_iter = 0; task_iter < BLOCK_N / 32; task_iter++) {
+        for (int task_iter = 0; task_iter < 1; task_iter++) {
           int task = hidden_lane + task_iter * 128;
           int expert_row_1 = task / 4;
           int hidden_group = task - expert_row_1 * 4;
@@ -368,21 +364,22 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
           int route = route_map[packed_row];
           int active = ((route >= 0) ? 1 : 0);
           int safe_route = ((active != 0) ? route : 0);
-          float rw = route_weights[safe_route] * (float)active;
+          float _cvt_f32_0 = (float)active;
+          float rw = route_weights[safe_route] * _cvt_f32_0;
           float amax = 1e-07f;
 #pragma unroll
           for (int c = 0; c < 4; c++) {
-            float packed_results_f32[8];
+            float _unpack_bf16_0[8];
 #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
-              (&packed_results_f32[_pair * 2])[0] =
+              (&_unpack_bf16_0[_pair * 2])[0] =
                   __uint_as_float(static_cast<uint32_t>((packed_results + c * 4)[_pair]) << 16);
-              (&packed_results_f32[_pair * 2])[1] = __uint_as_float(
+              (&_unpack_bf16_0[_pair * 2])[1] = __uint_as_float(
                   static_cast<uint32_t>((packed_results + c * 4)[_pair]) & 0xffff0000u);
             }
 #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
-              float _fabs_0 = fabsf(packed_results_f32[j_1] * rw);
+              float _fabs_0 = fabsf(_unpack_bf16_0[j_1] * rw);
               float _max_0 = max_noftz(amax, _fabs_0);
               amax = _max_0;
             }
@@ -395,7 +392,8 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
           unsigned int _min_0 = ((scale_code) < (254) ? (scale_code) : (254));
           scale_code = _min_0;
           int scale_i = scale_code;
-          float _exp2_0 = approx_exp2(127.0f - (float)scale_i);
+          float _cvt_f32_1 = (float)scale_i;
+          float _exp2_0 = approx_exp2(127.0f - _cvt_f32_1);
           float sf_inv = _exp2_0;
           int block_column = off_n_out / 32 + hidden_group;
           int tile_m_out = expert_row_1 / 128;
@@ -418,17 +416,17 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
 #pragma unroll
           for (int c_1 = 0; c_1 < 4; c_1++) {
             float normalized[8];
-            float packed_results_f32_1[8];
+            float _unpack_bf16_1[8];
 #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
-              (&packed_results_f32_1[_pair * 2])[0] =
+              (&_unpack_bf16_1[_pair * 2])[0] =
                   __uint_as_float(static_cast<uint32_t>((packed_results + c_1 * 4)[_pair]) << 16);
-              (&packed_results_f32_1[_pair * 2])[1] = __uint_as_float(
+              (&_unpack_bf16_1[_pair * 2])[1] = __uint_as_float(
                   static_cast<uint32_t>((packed_results + c_1 * 4)[_pair]) & 0xffff0000u);
             }
 #pragma unroll
             for (int j_2 = 0; j_2 < 8; j_2++) {
-              normalized[j_2] = packed_results_f32_1[j_2] * rw * sf_inv;
+              normalized[j_2] = _unpack_bf16_1[j_2] * rw * sf_inv;
             }
             {
               unsigned int _fp8_pk[2];
@@ -478,7 +476,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
       unsigned int _phase_epilogue_done = 1;
       unsigned int _phase_tma_full = 0;
 #pragma unroll 1
-      for (unsigned int tile_idx_1 = bid; tile_idx_1 < num_tiles; tile_idx_1 += num_bids) {
+      for (unsigned int tile_idx_1 = bid; tile_idx_1 < grid_m; tile_idx_1 += num_bids) {
         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
 #pragma unroll 1
         for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
@@ -578,7 +576,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
       unsigned int load_stage = 0;
       unsigned int pf_first_tile = bid;
       if (elect_sync()) {
-        if (bid < num_tiles) {
+        if (bid < grid_m) {
           int pf_batch_idx = tile_expert[bid];
           int pf_packed_off = tile_m_local[bid] * 2;
 #pragma unroll
@@ -586,9 +584,9 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
             if (pf_k < K_tiles) {
               mbarrier_arrive_expect_tx(tma_full_addr + (pf_k) * 8, 38400);
               tma_4d_gmem2smem(smem_a_addr + (unsigned int)(pf_k * 38400), (&A), 0, 0, pf_k,
-                               pf_batch_idx * (N / BLOCK_M) + pf_packed_off / BLOCK_M,
+                               pf_batch_idx * (N / 256) + pf_packed_off / 256,
                                tma_full_addr + (pf_k) * 8);
-              int pf_sfa_tile = pf_packed_off / BLOCK_M * K_tiles + pf_k;
+              int pf_sfa_tile = pf_packed_off / 256 * K_tiles + pf_k;
               tma_4d_gmem2smem(smem_sfa_cp_addr + (unsigned int)(pf_k * 38400), (&SFA), 0, 0,
                                pf_sfa_tile, pf_batch_idx, tma_full_addr + (pf_k) * 8);
             }
@@ -599,12 +597,12 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
       unsigned int _phase_mma_done = 1;
       if (elect_sync()) {
 #pragma unroll 1
-        for (unsigned int tile_idx_2 = bid; tile_idx_2 < num_tiles; tile_idx_2 += num_bids) {
-          if (num_bids + (int)tile_idx_2 >= num_tiles) {
+        for (unsigned int tile_idx_2 = bid; tile_idx_2 < grid_m; tile_idx_2 += num_bids) {
+          if (num_bids + (int)tile_idx_2 >= grid_m) {
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
           }
           int batch_idx_1 = tile_expert[tile_idx_2];
-          int input_batch_idx = ((0) ? batch_idx_1 / 8 : batch_idx_1);
+          int input_batch_idx = batch_idx_1;
           int off_n_out_1 = tile_m_local[tile_idx_2];
           int packed_off = off_n_out_1 * 2;
 #pragma unroll 1
@@ -618,9 +616,9 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
             }
             if (pf_issued == 0) {
               tma_4d_gmem2smem(smem_a_addr + load_stage * 38400, (&A), 0, 0, iter_k_1,
-                               batch_idx_1 * (N / BLOCK_M) + packed_off / BLOCK_M,
+                               batch_idx_1 * (N / 256) + packed_off / 256,
                                tma_full_addr + (load_stage) * 8);
-              int pdl_sfa_tile = packed_off / BLOCK_M * K_tiles + iter_k_1;
+              int pdl_sfa_tile = packed_off / 256 * K_tiles + iter_k_1;
               tma_4d_gmem2smem(smem_sfa_cp_addr + load_stage * 38400, (&SFA), 0, 0, pdl_sfa_tile,
                                batch_idx_1, tma_full_addr + (load_stage) * 8);
             }
@@ -643,6 +641,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
   }
 
   // Cleanup
+  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __syncthreads();  // barrier before TMEM dealloc
 
   if (warp == 0) {

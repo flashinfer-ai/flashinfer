@@ -27,7 +27,7 @@ MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py tests/comm/test_trtllm_allreduce_fusion_pdl.py"
 
 # Tests that require torchrun instead of mpirun
-TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py tests/comm/test_mnnvl_cutedsl_numerical_contract.py tests/comm/test_mnnvl_cutedsl_no_rms_norm.py tests/comm/test_mnnvl_cutedsl_h7168.py tests/comm/test_mnnvl_cutedsl_static_fp8.py"
+TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py tests/comm/test_mnnvl_cutedsl_numerical_contract.py tests/comm/test_mnnvl_cutedsl_no_rms_norm.py tests/comm/test_mnnvl_cutedsl_h7168.py tests/comm/test_mnnvl_cutedsl_static_fp8.py tests/comm/test_mnnvl_cutedsl_dynamic_fp8.py tests/comm/test_mnnvl_cutedsl_allreduce_api.py"
 : "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
 
 _run_pytest_group() {
@@ -46,6 +46,7 @@ _run_pytest_group() {
 
 # Main execution
 main() {
+    test_status_begin
     parse_args "$@"
     print_test_mode_banner
 
@@ -54,6 +55,7 @@ main() {
     TORCHRUN_TEST_FILES="$(filter_files_by_test_path "$TORCHRUN_TEST_FILES")"
     if [ -n "${TEST_PATH:-}" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}" ]; then
         echo "No multi-GPU files overlap TEST_PATH=${TEST_PATH}; skipping."
+        test_status_complete 0
         exit 0
     fi
 
@@ -88,17 +90,24 @@ main() {
         echo "Running: ${TORCHRUN_PREFIX} -m pytest ${test_file} -v --junitxml=${junit_file}"
         echo "=========================================="
         if [ "$DRY_RUN" != "true" ]; then
+            local receipt pytest_status=0
+            receipt=$(test_status_start)
+            local -a TEST_STATUS_PYTEST_COMMAND
+            test_status_pytest_command "${receipt}" torchrun
             rm -f "$junit_file"
-            if ${TORCHRUN_PREFIX} -m pytest "${test_file}" -v --junitxml="${junit_file}"; then
+            if ${TORCHRUN_PREFIX} "${TEST_STATUS_PYTEST_COMMAND[@]}" "${test_file}" -v --junitxml="${junit_file}"; then
                 echo "PASSED: $test_file"
             else
+                pytest_status=$?
                 echo "FAILED: $test_file"
                 EXIT_CODE=1
             fi
+            test_status_finish "${receipt}" "${pytest_status}"
         fi
         echo ""
     done
 
+    test_status_complete "$EXIT_CODE"
     exit "$EXIT_CODE"
 }
 

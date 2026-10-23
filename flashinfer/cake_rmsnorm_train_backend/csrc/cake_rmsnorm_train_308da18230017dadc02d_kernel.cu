@@ -112,7 +112,7 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;
@@ -155,7 +155,7 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
                 float hsum[8];
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(u_words[v_1 * 4 + k]));
+                    float2 _f32x2_bf16x2_add_rhs_2 = __bfloat1622float2(__as_bf16x2(u_words[v_1 * 4 + k]));
                     float _bf16x2_add_f32_0[2];
                     asm volatile(
                         "{\n\t"
@@ -164,11 +164,11 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
                         "add.rn.f32.bf16 %0, lo, %3;\n\t"
                         "add.rn.f32.bf16 %1, hi, %4;\n\t"
                         "}\n"
-                        : "=&f"(_bf16x2_add_f32_0[0]), "=&f"(_bf16x2_add_f32_0[1]) : "r"(x_words[v_1 * 4 + k]), "f"(_cvt_f32_0.x), "f"(_cvt_f32_0.y));
+                        : "=&f"(_bf16x2_add_f32_0[0]), "=&f"(_bf16x2_add_f32_0[1]) : "r"(x_words[v_1 * 4 + k]), "f"(_f32x2_bf16x2_add_rhs_2.x), "f"(_f32x2_bf16x2_add_rhs_2.y));
                     __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(_bf16x2_add_f32_0[0], _bf16x2_add_f32_0[1]));
                     unsigned int hword = __as_u32(_bf16x2_0);
                     x_words[v_1 * 4 + k] = hword;
-                    float _bf16x2_dot_f32_0;
+                    float _dot_3;
                     asm volatile(
                         "{\n\t"
                         ".reg .b16 a_lo, a_hi, b_lo, b_hi;\n\t"
@@ -177,11 +177,11 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
                         "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
                         "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
                         "}\n"
-                        : "=f"(_bf16x2_dot_f32_0) : "r"(hword), "r"(hword), "f"(sum_sq));
-                    sum_sq = _bf16x2_dot_f32_0;
-                    float2 _cvt_f32_1 = __bfloat1622float2(_bf16x2_0);
-                    hsum[2 * k] = _cvt_f32_1.x;
-                    hsum[2 * k + 1] = _cvt_f32_1.y;
+                        : "=f"(_dot_3) : "r"(hword), "r"(hword), "f"(sum_sq));
+                    sum_sq = _dot_3;
+                    float2 _cvt_f32_0 = __bfloat1622float2(_bf16x2_0);
+                    hsum[2 * k] = _cvt_f32_0.x;
+                    hsum[2 * k + 1] = _cvt_f32_0.y;
                 }
                 {
                     __nv_bfloat162 _pk[4];
@@ -193,11 +193,11 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
                 }
             }
         }
-        float _warp_reduce_0 = sum_sq;
+        float _warp_reduce_4 = sum_sq;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-        sum_sq = _warp_reduce_0;
+            _warp_reduce_4 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset);
+        sum_sq = _warp_reduce_4;
         int par = (it & 1) * 4;
         if (lane == 0) {
             partials[par + warp_0] = sum_sq;
@@ -209,12 +209,10 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
             total += partials[par + group * 4 + k_1];
         }
         it += 1;
-        float _fdiv_rn_0 = __fdiv_rn(total, h_f);
-        float mean = _fdiv_rn_0;
-        float _sqrt_0;
-        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(mean + eps));
-        float _rcp_0 = __frcp_rn(_sqrt_0);
-        float rstd = _rcp_0;
+        float mean = __fdiv_rn(total, h_f);
+        float _sqrt_5;
+        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_5) : "f"(mean + eps));
+        float rstd = __frcp_rn(_sqrt_5);
         if (row < T) {
             if (gtid == 0) {
                 r[row] = rstd;
@@ -223,21 +221,21 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
             for (int v_2 = 0; v_2 < 6; v_2++) {
                 unsigned int wwords[4];
                 {
-                    const uint4* _vptr_2 = reinterpret_cast<const uint4*>(w + (gtid * 8 + v_2 * (GROUP_THREADS * 8)) + 0);
-                    uint4* _vdst_2 = reinterpret_cast<uint4*>(&wwords[0]);
+                    const uint4* _vptr_6 = reinterpret_cast<const uint4*>(w + (gtid * 8 + v_2 * (GROUP_THREADS * 8)) + 0);
+                    uint4* _vdst_6 = reinterpret_cast<uint4*>(&wwords[0]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
                         asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_vdst_2[_blk].x), "=r"(_vdst_2[_blk].y), "=r"(_vdst_2[_blk].z), "=r"(_vdst_2[_blk].w) : "l"((const void*)(_vptr_2 + _blk)) : "memory");
+                            : "=r"(_vdst_6[_blk].x), "=r"(_vdst_6[_blk].y), "=r"(_vdst_6[_blk].z), "=r"(_vdst_6[_blk].w) : "l"((const void*)(_vptr_6 + _blk)) : "memory");
                     }
                 }
                 float out[8];
                 #pragma unroll
                 for (int k_2 = 0; k_2 < 4; k_2++) {
-                    float2 _cvt_f32_2 = __bfloat1622float2(__as_bf16x2(x_words[v_2 * 4 + k_2]));
-                    float2 _cvt_f32_3 = __bfloat1622float2(__as_bf16x2(wwords[k_2]));
-                    out[2 * k_2] = _cvt_f32_2.x * rstd * _cvt_f32_3.x;
-                    out[2 * k_2 + 1] = _cvt_f32_2.y * rstd * _cvt_f32_3.y;
+                    float2 _cvt_f32_1 = __bfloat1622float2(__as_bf16x2(x_words[v_2 * 4 + k_2]));
+                    float2 _cvt_f32_2 = __bfloat1622float2(__as_bf16x2(wwords[k_2]));
+                    out[2 * k_2] = _cvt_f32_1.x * rstd * _cvt_f32_2.x;
+                    out[2 * k_2 + 1] = _cvt_f32_1.y * rstd * _cvt_f32_2.y;
                 }
                 {
                     __nv_bfloat162 _pk[4];
@@ -253,4 +251,3 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
 }
 
 } // extern "C"
-

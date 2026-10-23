@@ -178,9 +178,12 @@ Per-call tensors on `MoEEpTensors` override the matching config tensor. An
 omitted override restores the config default, or one if the config also omits
 it. Scalars have shape `[E_local]`, are contiguous FP32 tensors on the input
 device, and follow local expert order. Their device assertions remain active
-in graph replay. Values are copied into stable workspace buffers on every
-forward, including empty batches, so sequential pooled layers do not share
-stale values. Update captured source tensor contents in place for graph replay.
+in graph replay. Contiguous FP32 per-call tensors are bound as launch
+arguments on every forward, including empty batches, so sequential pooled
+layers do not share stale values; keep them alive while launches or captured
+graphs use them. Other values are copied into stable workspace buffers, and an
+omitted scalar resets its buffer to one. Update captured source tensor
+contents in place for graph replay.
 
 For `quantize_input=False`, input bytes and scales are copied unchanged;
 `input_norm_const` does not requantize them. The caller must supply alphas

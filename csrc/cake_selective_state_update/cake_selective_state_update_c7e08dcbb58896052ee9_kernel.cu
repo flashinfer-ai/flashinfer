@@ -560,6 +560,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_selective_state_updat
                        "r"(*reinterpret_cast<uint32_t*>(&state_values_bf16[(4) + 2])),
                        "r"(*reinterpret_cast<uint32_t*>(&state_values_bf16[(4) + 3])));
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          __syncwarp();
           if (elect_sync()) {
             mbarrier_arrive(state_updated_addr + (stage_1) * 8);
           }

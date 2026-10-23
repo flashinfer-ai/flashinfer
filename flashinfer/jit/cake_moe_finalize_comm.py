@@ -29,9 +29,6 @@ CakeMoeFinalizeArch = Literal["sm_100a", "sm_103a"]
 
 SOURCE_PACKAGE = "cake_moe_finalize_allreduce_fusion"
 HIDDEN_DIM = 7168
-WORLD_SIZES = (2, 4, 8)
-DTYPES = ("float16", "bfloat16")
-OUTPUT_PROFILES = ("110", "111")  # residual + norm, optionally + NVFP4 quant
 
 _ARCH_BY_CAPABILITY: dict[tuple[int, int], CakeMoeFinalizeArch] = {
     (10, 0): "sm_100a",
@@ -50,16 +47,6 @@ def _source_dir() -> Path:
     raise FileNotFoundError(
         "Cake MoE finalize CUDA sources were not found. Checked:\n"
         f"  - {installed}\n  - {checkout}"
-    )
-
-
-def kernel_names() -> tuple[str, ...]:
-    """The twelve generated kernels: dtype x world size x output profile."""
-    return tuple(
-        f"cake_trtllm_moe_finalize_{dtype}_ws{world_size}_o{profile}"
-        for dtype in DTYPES
-        for world_size in WORLD_SIZES
-        for profile in OUTPUT_PROFILES
     )
 
 
@@ -154,14 +141,10 @@ def run_cake_moe_finalize(
 
 
 __all__ = [
-    "DTYPES",
     "HIDDEN_DIM",
-    "OUTPUT_PROFILES",
     "SOURCE_PACKAGE",
-    "WORLD_SIZES",
     "gen_cake_moe_finalize_module",
     "get_cake_moe_finalize_module",
-    "kernel_names",
     "run_cake_moe_finalize",
     "target_arch",
 ]

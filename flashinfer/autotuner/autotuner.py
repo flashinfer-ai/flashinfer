@@ -42,6 +42,13 @@ from flashinfer.autotuner.initializers import (
     TensorInitializer,
     autotuner_initializer_rand_scaled,
 )
+from flashinfer.autotuner.protocol import (
+    T,
+    TuningContext,
+    TuningProtocol,
+    _protocol_cache_key,
+    _tuning_scope,
+)
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
@@ -1034,6 +1041,8 @@ def autotune(
     if pushed:
         override_stack.append((new_buckets, new_round_up, new_profile_replays))
 
+    scope_token = _tuning_scope.set(object())
+
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
     # autotune(False) context overlaps on another thread.
@@ -1047,6 +1056,7 @@ def autotune(
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process starts ...")
     except BaseException:
+        _tuning_scope.reset(scope_token)
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
@@ -1056,6 +1066,7 @@ def autotune(
     try:
         yield
     finally:
+        _tuning_scope.reset(scope_token)
         with tuner._lock:
             if tune_mode:
                 tuner._active_tuning_contexts -= 1
@@ -1144,7 +1155,9 @@ def set_autotune_process_group(
     ranks that requires identical: ``get_valid_tactics`` and shape buckets;
     ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
     reduces). Cache hits are coordinated per profile: if any rank misses,
-    every rank profiles again. Set the group from the first ``choose_one``;
+    every rank profiles again. Cached runner/tactic selections must also agree;
+    disagreement triggers the same coordinated re-profile. Set the group from
+    the first ``choose_one``;
     distributed tuning must run outside CUDA Graph capture. Input
     synthesis and ``do_preparation`` OOMs are reduced across the group before
     tactic profiling, giving every rank the same fallback decision.
@@ -1181,7 +1194,8 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     return bool(oom_flag.item())
 
 
-def _all_ranks_hit_cache(local_hit: bool) -> bool:
+def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
+    """Reuse cached results only when every rank has the same selection."""
     if _tune_process_group is None:
         return local_hit
     if torch.cuda.is_current_stream_capturing():
@@ -1194,9 +1208,29 @@ def _all_ranks_hit_cache(local_hit: bool) -> bool:
 
     backend = str(dist.get_backend(_tune_process_group)).lower()
     device = "cuda" if backend == "nccl" else "cpu"
-    hit = torch.tensor([int(local_hit)], dtype=torch.int32, device=device)
-    dist.all_reduce(hit, op=dist.ReduceOp.MIN, group=_tune_process_group)
-    return bool(hit.item())
+    digest = bytes(32)
+    if local_hit:
+        try:
+            encoded = json.dumps(
+                _tactic_to_json(selection),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+            digest = hashlib.sha256(encoded).digest()
+        except (TypeError, ValueError):
+            # An unrepresentable selection cannot establish agreement. Every
+            # rank still joins the collective and takes the re-profile path.
+            local_hit = False
+    # Packing the digest and its negation checks both min and max using the
+    # existing single collective, including when some ranks miss the cache.
+    agreement = torch.tensor(
+        [int(local_hit), *digest, *(-value for value in digest)],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(agreement, op=dist.ReduceOp.MIN, group=_tune_process_group)
+    return bool(agreement[0].item()) and torch.equal(agreement[1:33], -agreement[33:])
 
 
 @dataclass(frozen=True)
@@ -1351,6 +1385,7 @@ def _cupti_measure_spans(
     run_iteration: Callable[[], None],
     repeat: int,
     prologue: Optional[Callable[[], None]] = None,
+    check_ready: Optional[Callable[[str | None], None]] = None,
 ) -> list[float]:
     """Time *run_iteration* ``repeat`` times, returning per-iteration GPU
     kernel spans in milliseconds (first kernel start to last kernel end,
@@ -1369,6 +1404,10 @@ def _cupti_measure_spans(
     once per tactic; flush + disable suffices) and deliberately
     per-measurement enable/disable (session-scoped tracing would instrument
     every intervening warmup/synthesis kernel).
+
+    Collective callers can supply ``check_ready`` to agree on initialization
+    before launching any kernels. It receives the local error or None and must
+    raise on every rank if any rank failed initialization.
 
     Raises:
         _CuptiInfraError: CUPTI activity tracing could not be initialised
@@ -1413,8 +1452,12 @@ def _cupti_measure_spans(
         for kind in enabled:
             with contextlib.suppress(Exception):
                 cupti.activity_disable(kind)
+        if check_ready is not None:
+            check_ready(str(e))
         raise _CuptiInfraError(str(e)) from e
     try:
+        if check_ready is not None:
+            check_ready(None)
         for _ in range(repeat):
             if prologue is not None:
                 prologue()
@@ -1565,6 +1608,7 @@ class AutoTuner:
         self._ranked_tactics_cache: dict[
             ProfilingCacheKey, tuple[tuple[Any, ...], tuple[Any, ...]]
         ] = {}
+        self._ranked_tactics_partitions: dict[tuple, dict] = {}
         # Keep measurement provenance separate from the runtime cache key.
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
@@ -1603,6 +1647,12 @@ class AutoTuner:
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
         self._file_config_policies: dict[str, tuple[Any, ...]] = {}
+        # Keep disk merges from reviving superseded runners, including when
+        # exporting the same cache to more than one path. Reset by clear_cache.
+        self._invalidated_file_keys: set[str] = set()
+        # Reject legacy entries within one managed/policy identity without
+        # deleting the user's global v1 configs. Keep these across v2 reload.
+        self._excluded_file_keys: dict[tuple, set[str]] = {}
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -1657,6 +1707,9 @@ class AutoTuner:
         self._dirty_seq = 0
         # Product-owned current-schema records persisted beside tactic records.
         self._namespaced_records: dict[str, dict[str, Any]] = {}
+        # Namespace index of JSON results, partitioned like managed winners.
+        self._protocol_record_partitions: dict[tuple, dict[str, dict[str, Any]]] = {}
+        self._protocol_cache_generation = 0
         # Namespaces changed in this process and requiring single-writer checks.
         self._dirty_namespaces: set[str] = set()
         # File generation observed at cache-context entry or explicit load.
@@ -1850,6 +1903,13 @@ class AutoTuner:
         fields = tuple(sorted(policy.manifest_fields().items())) if policy else ()
         return ("__policy__", *fields) if fields else None
 
+    def _ranked_cache(self) -> dict:
+        """Shortlists share the winner's store/policy ownership."""
+        identity = self._winner_cache_identity()
+        if identity is None:
+            return self._ranked_tactics_cache
+        return self._ranked_tactics_partitions.setdefault(identity, {})
+
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
         """Return the per-thread skip_ops stack, creating it on first access."""
         local = self._skip_ops_local
@@ -1982,6 +2042,7 @@ class AutoTuner:
             # 1. In-memory winners and provenance share the same partition.
             winners = self._winner_cache()
             winner_identity = self._winner_cache_identity()
+            excluded_file_keys = self._excluded_file_keys.get(winner_identity, ())
             check_memory_policy = require_profiling_policy or (
                 self.is_tuning_mode and self._active_managed_store is None
             )
@@ -2017,6 +2078,8 @@ class AutoTuner:
             if self._file_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
+                    if file_key in excluded_file_keys:
+                        continue
                     if file_key in self._file_configs:
                         if (
                             self.is_tuning_mode
@@ -2097,6 +2160,11 @@ class AutoTuner:
                 and not self.is_tuning_mode
             ):
                 for r_id, cache_key in runner_keys:
+                    if cache_key.file_key in excluded_file_keys or (
+                        winner_identity is None
+                        and cache_key.file_key in self._invalidated_file_keys
+                    ):
+                        continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
                         return True, r_id, file_tactic, None
@@ -2179,6 +2247,60 @@ class AutoTuner:
             new_config
         )
         return new_config
+
+    def protocol_context(
+        self, custom_op: str, *, force_tune: bool = False
+    ) -> TuningContext:
+        """Current controls and cache identity for a protocol's prepared state."""
+        return TuningContext(
+            tuner=self,
+            namespace=custom_op,
+            tuning_enabled=force_tune
+            or (self.is_tuning_mode and custom_op not in self._effective_skip_ops),
+            force_tune=force_tune,
+            scope=_tuning_scope.get(),
+        )
+
+    def choose_with_protocol(
+        self,
+        custom_op: str,
+        protocol: TuningProtocol[T],
+        *,
+        force_tune: bool = False,
+    ) -> T:
+        """Run a custom tuning loop using this tuner's controls and storage.
+
+        The protocol runs under the tuner's lock, including when tuning is
+        disabled or the operation is skipped. It owns cache selection,
+        preparation, measurement and result installation. Distributed protocols
+        must coordinate their participants; this method performs no collectives.
+        Calls sharing a tuner are serialized. Collective participants must not
+        wait for another call blocked on that lock.
+
+        ``force_tune`` requests a fresh search regardless of the ambient tuning
+        mode or skip_ops policy. The protocol must honor it. The flag does not
+        enable persistence or change the ambient tuning mode.
+
+        Return the value from TuningResult and update tuning statistics.
+        Records must be published explicitly through the context. They use the
+        active v2 managed store or a separate memory partition, with keys owned
+        by the protocol, and are not imported or exported by the v1 JSON API.
+        """
+        with self._lock:
+            context = self.protocol_context(custom_op, force_tune=force_tune)
+            result = protocol.run(context)
+            if result.candidates:
+                self.stats.tuned_op_total_configs[custom_op] = (
+                    self.stats.tuned_op_total_configs.get(custom_op, 0)
+                    + result.candidates
+                )
+                self.stats.tuned_op_successful_configs[custom_op] = (
+                    self.stats.tuned_op_successful_configs.get(custom_op, 0)
+                    + result.successful_candidates
+                )
+            if not result.cache_hit and not context.skipped:
+                self.stats.cache_misses += 1
+            return result.value
 
     def choose_one(
         self,
@@ -2377,7 +2499,12 @@ class AutoTuner:
                         inputs=inputs,
                         require_profiling_policy=True,
                     )
-                    if not _all_ranks_hit_cache(is_cache_hit):
+                    selection = (
+                        (runner_id, type(runners[runner_id]).__name__, tactic)
+                        if is_cache_hit
+                        else None
+                    )
+                    if not _all_ranks_hit_cache(is_cache_hit, selection):
                         if _tune_process_group is not None:
                             self._discard_profile_cache(
                                 custom_op,
@@ -2422,6 +2549,15 @@ class AutoTuner:
 
                         assert tensors is not None
                         assert prepared_input_batches is not None
+                        if _tune_process_group is not None:
+                            self._discard_profile_cache(
+                                custom_op,
+                                runners,
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                inputs,
+                                profile_inputs=tensors,
+                            )
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -2566,40 +2702,26 @@ class AutoTuner:
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
-                            cache_key = AutoTuner._get_cache_key(
+                            cache_key = self._get_cache_key(
                                 custom_op,
                                 runners[runner_id],
                                 p.get_opt_shapes(),
                                 tuning_config,
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
-                            self._winner_cache()[cache_key] = (tactic, p)
-                            profiling_policy = self._profiling_policy(tuning_config)
-                            self._profiling_cache_policies[
-                                (self._winner_cache_identity(), cache_key)
-                            ] = profiling_policy
-                            self._dirty = True
-                            self._dirty_seq += 1
-                            publish_store = self._active_managed_store
-                            if publish_store is not None:
-                                # Eager atomic publish; best-effort, never raises.
-                                publish_store.publish(
-                                    cache_key.file_key,
-                                    cache_key.runner_class_name,
-                                    _tactic_to_json(tactic),
-                                    key_fields=cache_key.key_fields,
-                                    profiling_policy=profiling_policy,
+                            if _tune_process_group is None:
+                                self._discard_profile_cache(
+                                    custom_op,
+                                    runners,
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    inputs,
+                                    profile_inputs=tensors,
+                                    republish_key=cache_key.file_key,
                                 )
-                                memo_key = (
-                                    str(publish_store.root),
-                                    publish_store.env_hash,
-                                    cache_key.key_fields,
-                                )
-                                self._managed_decoded[memo_key] = ManagedCacheEntry(
-                                    cache_key.runner_class_name,
-                                    tactic,
-                                    profiling_policy,
-                                )
+                            self._cache_profile_result(
+                                cache_key, p, tuning_config, tactic
+                            )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -2635,33 +2757,84 @@ class AutoTuner:
             return runners[runner_id], tactic
 
     def _discard_profile_cache(
-        self, custom_op, runners, input_shapes, tuning_config, inputs
+        self,
+        custom_op,
+        runners,
+        input_shapes,
+        tuning_config,
+        inputs,
+        *,
+        profile_inputs=None,
+        republish_key: str | None = None,
     ) -> None:
-        """Remove old candidates before a coordinated re-profile.
+        """Retire old winners and shortlists within the active identity.
 
-        Another runner may win this time. Its new entry must take precedence
-        both now and after reloading the store, including on ranks that hit.
+        Distributed rejection runs before profiling so failure cannot revive
+        divergent winners. Single-process retuning commits only on success.
         """
         winners = self._winner_cache()
+        ranked = self._ranked_cache()
         identity = self._winner_cache_identity()
         store = self._active_managed_store
         for runner in runners:
-            key = self._get_cache_key(
-                custom_op,
-                runner,
-                input_shapes,
-                tuning_config,
-                runner.get_cache_key_extras(inputs),
-            )
-            winners.pop(key, None)
-            self._profiling_cache_policies.pop((identity, key), None)
-            self._file_configs.pop(key.file_key, None)
-            self._file_config_policies.pop(key.file_key, None)
-            if store is not None:
-                self._managed_decoded.pop(
-                    (str(store.root), store.env_hash, key.key_fields), None
+            # Older runners may include exact dimensions in their extras.
+            # Retire both the lookup key and the synthesized bucket's key.
+            keys = {
+                self._get_cache_key(
+                    custom_op,
+                    runner,
+                    input_shapes,
+                    tuning_config,
+                    runner.get_cache_key_extras(tensors),
                 )
-                store.discard(key.file_key)
+                for tensors in (inputs, profile_inputs)
+                if tensors is not None
+            }
+            for key in keys:
+                winners.pop(key, None)
+                ranked.pop(key, None)
+                self._profiling_cache_policies.pop((identity, key), None)
+                if identity is None:
+                    self._file_configs.pop(key.file_key, None)
+                    self._file_config_policies.pop(key.file_key, None)
+                    self._invalidated_file_keys.add(key.file_key)
+                else:
+                    self._excluded_file_keys.setdefault(identity, set()).add(
+                        key.file_key
+                    )
+                if store is not None:
+                    self._managed_decoded.pop(
+                        (str(store.root), store.env_hash, key.key_fields), None
+                    )
+                    # Keep a successful same-key replacement visible to other
+                    # readers until publish atomically overwrites the file.
+                    if key.file_key != republish_key:
+                        store.discard(key.file_key)
+        if identity is None:
+            self._dirty = True
+            self._dirty_seq += 1
+
+    def _cache_profile_result(
+        self, key: ProfilingCacheKey, profile, tuning_config, tactic
+    ) -> None:
+        """Publish a winner and its provenance through one ownership path."""
+        policy = self._profiling_policy(tuning_config)
+        self._winner_cache()[key] = (tactic, profile)
+        self._profiling_cache_policies[(self._winner_cache_identity(), key)] = policy
+        self._dirty = True
+        self._dirty_seq += 1
+        store = self._active_managed_store
+        if store is not None:
+            store.publish(
+                key.file_key,
+                key.runner_class_name,
+                _tactic_to_json(tactic),
+                key_fields=key.key_fields,
+                profiling_policy=policy,
+            )
+            self._managed_decoded[(str(store.root), store.env_hash, key.key_fields)] = (
+                ManagedCacheEntry(key.runner_class_name, tactic, policy)
+            )
 
     def rank_tactics(
         self,
@@ -2703,8 +2876,16 @@ class AutoTuner:
             return [-1]
 
         with self._lock:
-            if self._override_tuning_buckets is not None or self._override_round_up:
+            if (
+                self._override_tuning_buckets is not None
+                or self._override_round_up
+                or self._override_cuda_graph_profile_replays is not None
+            ):
                 tuning_config = self._apply_tuning_overrides(tuning_config)
+            if self._effective_measure_policy is not None:
+                tuning_config = self._apply_measure_policy(
+                    tuning_config, self._effective_measure_policy
+                )
 
             input_shapes = tuple(self._get_input_sizes(inputs))
             profiles = self._generate_optimization_profiles(tuning_config, inputs)
@@ -2738,11 +2919,19 @@ class AutoTuner:
                 runner.get_cache_key_extras(inputs),
             )
             policy = self._profiling_policy(tuning_config)
-            cached = self._ranked_tactics_cache.get(cache_key)
-            if _all_ranks_hit_cache(cached is not None and cached[0] == policy):
+            ranked_cache = self._ranked_cache()
+            cached = ranked_cache.get(cache_key)
+            if _all_ranks_hit_cache(
+                cached is not None and cached[0] == policy,
+                (type(runner).__name__, k, cached[1][:k]) if cached else None,
+            ):
                 assert cached is not None
                 return list(cached[1][:k])
-            self._ranked_tactics_cache.pop(cache_key, None)
+            ranked_cache.pop(cache_key, None)
+            if _tune_process_group is not None:
+                self._discard_profile_cache(
+                    custom_op, runners, profile.get_opt_shapes(), tuning_config, inputs
+                )
 
             tensors = None
             input_preparation_oom = False
@@ -2763,6 +2952,15 @@ class AutoTuner:
                 raise MemoryError("OOM during tactic-ranking input preparation")
 
             assert tensors is not None
+            if _tune_process_group is not None:
+                self._discard_profile_cache(
+                    custom_op,
+                    runners,
+                    profile.get_opt_shapes(),
+                    tuning_config,
+                    inputs,
+                    profile_inputs=tensors,
+                )
             runner_preparation_oom = False
             try:
                 valid_tactics = runner.get_valid_tactics(tensors, profile)
@@ -2807,15 +3005,25 @@ class AutoTuner:
             if not ranked:
                 return [-1]
 
-            # Populate the choose_one cache with the winner so stage lookups
-            # remain consistent between rank_tactics and choose_one.
-            self.profiling_cache[cache_key] = (ranked[0], profile)
-            # profiling_cache is the unpartitioned winner cache, so its
-            # provenance lives under the None winner identity.
-            self._profiling_cache_policies[(None, cache_key)] = policy
-            self._ranked_tactics_cache[cache_key] = (policy, tuple(ranked))
-            self._dirty = True
-            self._dirty_seq += 1
+            cache_key = self._get_cache_key(
+                custom_op,
+                runner,
+                profile.get_opt_shapes(),
+                tuning_config,
+                runner.get_cache_key_extras(tensors),
+            )
+            if _tune_process_group is None:
+                self._discard_profile_cache(
+                    custom_op,
+                    runners,
+                    profile.get_opt_shapes(),
+                    tuning_config,
+                    inputs,
+                    profile_inputs=tensors,
+                    republish_key=cache_key.file_key,
+                )
+            self._cache_profile_result(cache_key, profile, tuning_config, ranked[0])
+            ranked_cache[cache_key] = (policy, tuple(ranked))
 
             return ranked[:k]
 
@@ -3579,6 +3787,7 @@ class AutoTuner:
             configs: dict[str, Any] = {}
             namespaced_records = copy.deepcopy(self._namespaced_records)
             dirty_namespaces = frozenset(self._dirty_namespaces)
+            invalidated_file_keys = frozenset(self._invalidated_file_keys)
 
             # Include previously loaded file configs as a base
             for file_key, (runner_name, tactic) in self._file_configs.items():
@@ -3655,6 +3864,8 @@ class AutoTuner:
             if not soft:
                 # Same environment: merge on-disk entries and preserve the
                 # original "created by" record.
+                for file_key in invalidated_file_keys:
+                    disk_configs.pop(file_key, None)
                 disk_configs.update(configs)
                 configs = disk_configs
                 original_metadata = disk_meta
@@ -3879,6 +4090,50 @@ class AutoTuner:
         with self._lock:
             self._observed_cache_generations[os.path.abspath(path)] = generation
 
+    def _protocol_records_for_namespace(self, namespace: str) -> dict[str, Any]:
+        _protocol_cache_key(namespace, "")
+        store = self._active_managed_store
+        if store is not None:
+            from flashinfer.autotune_cache import _hydrate_from_store
+
+            _hydrate_from_store(self, store)
+        identity = self._winner_cache_identity() or ("__memory__",)
+        return self._protocol_record_partitions.setdefault(identity, {}).setdefault(
+            namespace, {}
+        )
+
+    def get_protocol_records(self, namespace: str) -> dict[str, Any]:
+        """Read protocol records under the active persistence identity."""
+        with self._lock:
+            return copy.deepcopy(self._protocol_records_for_namespace(namespace))
+
+    def get_protocol_record(self, namespace: str, key: str) -> Any:
+        """Look up one record without copying the entire namespace."""
+        fields = _protocol_cache_key(namespace, key)
+        with self._lock:
+            records = self._protocol_records_for_namespace(namespace)
+            store = self._active_managed_store
+            if key not in records and store is not None:
+                entry = store.lookup(str(fields))
+                if entry is not None and entry.runner == namespace:
+                    records[key] = entry.tactic
+            return copy.deepcopy(records.get(key))
+
+    def publish_protocol_record(
+        self, namespace: str, key: str, value: Any, *, persist: bool
+    ) -> None:
+        """Publish a JSON result through the ordinary managed-entry writer."""
+        fields = _protocol_cache_key(namespace, key)
+        # Keep memory and disk results in the same JSON representation. Unlike
+        # runner tactics, protocol payloads do not require hashable tuples.
+        value = json.loads(json.dumps(value, allow_nan=False))
+        with self._lock:
+            records = self._protocol_records_for_namespace(namespace)
+            records[key] = value
+            store = self._active_managed_store
+            if store is not None and persist:
+                store.publish(str(fields), namespace, value, key_fields=fields)
+
     def get_namespaced_records(self, namespace: str) -> dict[str, Any]:
         """Return a copy of product-owned records loaded for one namespace."""
         if not namespace or namespace.startswith("_"):
@@ -3989,9 +4244,12 @@ class AutoTuner:
         with self._lock:
             self.profiling_cache.clear()
             self._ranked_tactics_cache.clear()
+            self._ranked_tactics_partitions.clear()
             self._profiling_cache_policies.clear()
             self._file_configs.clear()
             self._file_config_policies.clear()
+            self._invalidated_file_keys.clear()
+            self._excluded_file_keys.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
             self._observed_cache_generations.clear()
@@ -4000,6 +4258,8 @@ class AutoTuner:
             self._dirty = False
             self._dirty_seq = 0
             self._winner_partitions.clear()
+            self._protocol_record_partitions.clear()
+            self._protocol_cache_generation += 1
             self._managed_decoded.clear()
             # Forget the hydration markers too, or the next attach would
             # skip its bulk preload and every cleared key would pay a lazy

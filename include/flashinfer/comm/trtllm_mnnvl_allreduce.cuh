@@ -1006,8 +1006,10 @@ __global__ void __launch_bounds__(1024)
     float threadSum = 0.F;
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      // FIXME: Use float square if accuracy issue
-      threadSum += toFloat<T>(packedAccum.elements[i] * packedAccum.elements[i]);
+      // Square in fp32: a half x*x overflows to inf for |x| > 255.94, which turns
+      // rsqrtf into 0 and zeroes the whole token (the two-shot kernel already does this).
+      float const value = toFloat<T>(packedAccum.elements[i]);
+      threadSum += value * value;
     }
     float blockSum = blockReduceSum<float, true>(threadSum);
 

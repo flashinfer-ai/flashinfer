@@ -47,26 +47,43 @@ module; they differ in who owns the plan and the workspace.
 | | prepared path (`prepare_*` + `launch()`) | convenience path (`dense_projection_gemm`, `projection_*`, `router_*`) |
 |---|---|---|
 | planning | once, in `prepare_*` | once per cache key, on the first call |
-| workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, scratch, split-K partials) | owned by the prepared object | owned by the cache entry |
-| per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), launch; `out` is allocated only when the caller passes none |
+| workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, scratch, split-K partials) | owned by the prepared object | carved out of the workspace arena of the (device, stream): one growable buffer per kind shared by every cached entry of that device and stream, grown to the largest requirement seen, never per entry |
+| per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), resolve the workspace views of the arena (memoised until the arena grows), launch; `out` is allocated only when the caller passes none |
 | device queries | none after `prepare_*` | none after the first call |
-| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; `clear_convenience_caches()` |
-| CUDA Graphs | capture `launch()` | do not capture (an evicted entry frees the workspace a graph replays) |
+| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; the arena of a (device, stream) is released with its last entry and by `clear_convenience_caches()` |
+| memory held | the prepared object's workspace | bounded by the largest geometry seen per workspace kind, however many token counts the cache has planned (a ragged T adds entries, not workspace) |
+| CUDA Graphs | capture `launch()` | do not capture (a later growth replaces, an eviction frees, the workspace a graph replays) |
 
 The cache key is `(device index, raw stream, flags / knobs, geometry of A, B,
 out)` where a view's geometry is its shape, strides, dtype, storage offset and
 the 16-byte alignment residue of its first element -- never its address, so new
 tensors of the same geometry hit (a training step with fresh activations) and
 an entry never holds a caller's tensor.  Launches on different streams never
-share a workspace (the stream is in the key); launches of one entry are ordered
-by their stream.  The stream-K slice counters are zero-initialised once and
-reused without a memset: the kernel resets every counter it uses (the last
-arriver of a tail tile's slice writes zero after the fixup), so they are zero
-again when the launch completes -- the same contract the Cake launcher's
-per-device counters rely on.  The caches are plain dicts under the GIL; two
-threads planning one key at once both get a valid launch (the later entry is
-kept).  The device facts a plan depends on (architecture tag, SM count, L2
-size) are read once per device index (`device_facts`).
+share a workspace (the stream is in the key and each (device, stream) has its
+own arena); launches of one device and stream -- the only users of its arena --
+are ordered by that stream, which is what makes one buffer per kind safe to
+share: the K2 split rewrites the BF16x3 stack and its scratch in full before
+every launch, the split-K partials are reduced into `out` right after the
+launch, and growing a buffer replaces it while an earlier launch may still be
+in flight on the old one -- safe because PyTorch's caching allocator is
+stream-ordered (a freed block is handed out again only to a later allocation on
+the stream it was freed on, or after a device-synchronising `cudaFree`).  The
+stream-K slice counters are zero-initialised once and reused without a memset:
+the kernel resets every counter it uses (the last arriver of a tail tile's slice
+writes zero after the fixup), so the shared counter buffer is zero again when
+each launch completes -- the same contract the Cake launcher's per-device
+counters rely on.  Threads: planning and the arena bookkeeping (creation,
+growth, reference counts, insertion, eviction, `clear_convenience_caches()`)
+are serialised by a module lock (a miss re-checks the cache under it, so a key
+is planned once; a growth keeps the larger buffer); the K2 hit path holds its
+arena's lock from the carve of the workspace views through the split-K
+reduction, because one router call is three stream operations (split, kernel,
+reduction) on the shared BF16x3 stack and partials that two threads issuing on
+one stream must not interleave; the K1 hit path (one self-contained kernel per
+call) and the cache lookup take no lock.  The stream-ordering argument assumes
+one issuer per stream at a time, as CUDA stream semantics do.  The device facts
+a plan depends on (architecture tag, SM count, L2 size) are read once per
+device index (`device_facts`).
 
 ### K1 contract
 
@@ -201,9 +218,9 @@ template on a compute capability 10.3 device.
 CUDA Graphs: prepare outside capture and replay the prepared launch
 (`prepare_*` once, `launch` many times).  The convenience entry points
 (`dense_projection_gemm`, `projection_*`, `router_*`) reuse a cached planned
-launch and its workspace per (device, stream, geometry) key; capture a
-prepared launch object rather than the convenience entry points (see "Host
-paths").
+launch per (device, stream, geometry) key and the shared workspace arena of its
+(device, stream); capture a prepared launch object rather than the convenience
+entry points (see "Host paths").
 
 Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered

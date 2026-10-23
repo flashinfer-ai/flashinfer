@@ -95,7 +95,7 @@ kernel_cake_rmsnorm_train_288d7b1d51c340236cb7(__nv_bfloat16* __restrict__ x, __
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int warp_0 = warp;
     int group = tid / GROUP_THREADS;
     int gtid = tid - group * GROUP_THREADS;
@@ -125,7 +125,7 @@ kernel_cake_rmsnorm_train_288d7b1d51c340236cb7(__nv_bfloat16* __restrict__ x, __
             for (int v_1 = 0; v_1 < 3; v_1++) {
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    float _bf16x2_dot_f32_0;
+                    float _dot_1;
                     asm volatile(
                         "{\n\t"
                         ".reg .b16 a_lo, a_hi, b_lo, b_hi;\n\t"
@@ -134,16 +134,16 @@ kernel_cake_rmsnorm_train_288d7b1d51c340236cb7(__nv_bfloat16* __restrict__ x, __
                         "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
                         "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
                         "}\n"
-                        : "=f"(_bf16x2_dot_f32_0) : "r"(x_words[v_1 * 4 + k]), "r"(x_words[v_1 * 4 + k]), "f"(sum_sq));
-                    sum_sq = _bf16x2_dot_f32_0;
+                        : "=f"(_dot_1) : "r"(x_words[v_1 * 4 + k]), "r"(x_words[v_1 * 4 + k]), "f"(sum_sq));
+                    sum_sq = _dot_1;
                 }
             }
         }
-        float _warp_reduce_0 = sum_sq;
+        float _warp_reduce_2 = sum_sq;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-        sum_sq = _warp_reduce_0;
+            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
+        sum_sq = _warp_reduce_2;
         int par = (it & 1) * 8;
         if (lane == 0) {
             partials[par + warp_0] = sum_sq;
@@ -155,12 +155,10 @@ kernel_cake_rmsnorm_train_288d7b1d51c340236cb7(__nv_bfloat16* __restrict__ x, __
             total += partials[par + group * 8 + k_1];
         }
         it += 1;
-        float _fdiv_rn_0 = __fdiv_rn(total, h_f);
-        float mean = _fdiv_rn_0;
-        float _sqrt_0;
-        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(mean + eps));
-        float _rcp_0 = __frcp_rn(_sqrt_0);
-        float rstd = _rcp_0;
+        float mean = __fdiv_rn(total, h_f);
+        float _sqrt_3;
+        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_3) : "f"(mean + eps));
+        float rstd = __frcp_rn(_sqrt_3);
         if (row < T) {
             if (gtid == 0) {
                 r[row] = rstd;
@@ -169,12 +167,12 @@ kernel_cake_rmsnorm_train_288d7b1d51c340236cb7(__nv_bfloat16* __restrict__ x, __
             for (int v_2 = 0; v_2 < 3; v_2++) {
                 unsigned int wwords[4];
                 {
-                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(w + (gtid * 8 + v_2 * (GROUP_THREADS * 8)) + 0);
-                    uint4* _vdst_1 = reinterpret_cast<uint4*>(&wwords[0]);
+                    const uint4* _vptr_4 = reinterpret_cast<const uint4*>(w + (gtid * 8 + v_2 * (GROUP_THREADS * 8)) + 0);
+                    uint4* _vdst_4 = reinterpret_cast<uint4*>(&wwords[0]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
                         asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_vdst_1[_blk].x), "=r"(_vdst_1[_blk].y), "=r"(_vdst_1[_blk].z), "=r"(_vdst_1[_blk].w) : "l"((const void*)(_vptr_1 + _blk)) : "memory");
+                            : "=r"(_vdst_4[_blk].x), "=r"(_vdst_4[_blk].y), "=r"(_vdst_4[_blk].z), "=r"(_vdst_4[_blk].w) : "l"((const void*)(_vptr_4 + _blk)) : "memory");
                     }
                 }
                 float out[8];
@@ -199,4 +197,3 @@ kernel_cake_rmsnorm_train_288d7b1d51c340236cb7(__nv_bfloat16* __restrict__ x, __
 }
 
 } // extern "C"
-
