@@ -1749,30 +1749,51 @@ def _inventory(ctx, H: int) -> dict:
     }
 
 
+# the rows of :func:`_kb_rows` on which the P = 1 tie rule changes at least one rank's P at 152 SMs (the enumeration
+# of record of the rule's adoption): the two-fragment Z ranks of the perf packs at CP 8 / 16 and four coverage rows, all
+# H = 64
+P1TIE_CHANGED_ROWS = frozenset(
+    [(f"Q{i}", W, "Z", 64) for i in range(1, 7) for W in (8, 16)]
+    + [("C2", 4, "D", 64), ("C2", 4, "Z", 64), ("C6", 8, "Z", 64), ("C8", 8, "Z", 64)]
+)
+
+
 @HARNESS
 @pytest.mark.parametrize(
     "case", KB_ROWS, ids=[f"{n}-cp{W}-{lay}-H{H}" for n, W, lay, H in KB_ROWS]
 )
 def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
-    """Plan enumeration of the P = 1 tie rule: per rank of every row of :func:`_kb_rows` the P under the shipped
-    rule and under "wave_fill1_p1tie" (with the actual fragment chunk counts), the P = 1 / base-P walk makespans of the tie
-    test, and -- for the H = 64 rows at CP 8 / 16 -- the K4 / walk inventory of both programs (the pre-estimate
-    reads it).  The module equals the oracle, the rule changes only two- / three-fragment ranks below the cap whose base P
-    exceeds 1, never an H <= 4 rank, and a context built with the knob plans with it.  Evidence record `plan_p1tie_rows`."""
+    """Plan enumeration of the P = 1 tie rule: per rank of every row of :func:`_kb_rows` the P under the previous rule
+    "wave_fill1" (named explicitly: the default is the tie rule itself) and under the shipped default "wave_fill1_p1tie"
+    (with the actual fragment chunk counts), the P = 1 / base-P walk makespans of the tie test, and -- for the H = 64 rows
+    at CP 8 / 16 -- the K4 / walk inventory of both programs (the pre-estimate reads it).  The module equals the oracle, the
+    rule changes only two- / three-fragment ranks below the cap whose base P exceeds 1, never an H <= 4 rank, the rows it
+    changes are exactly :data:`P1TIE_CHANGED_ROWS`, and a context built without a knob plans with it.  Evidence record
+    `plan_p1tie_rows`."""
     name, W, lay, H = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, lay)
     monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    assert (
+        kp.P_RULE_DEFAULT == "wave_fill1_p1tie"
+        and kp.P1_TIE_BASE[kp.P_RULE_DEFAULT] == "wave_fill1"
+    )
     want_inv = H == 64 and W >= 8
     ranks = []
     for r in range(W):
         mine = part.fragments[r]
         actual = [-(-f.length // 64) for f in mine]
         n_frag, nc = len(mine), max(actual, default=0)
-        shipped = kp.kcp_plan(n_frag, nc, H, SM_COUNT, nc_frags=actual).P
-        cand = kp.kcp_plan(
-            n_frag, nc, H, SM_COUNT, p_rule="wave_fill1_p1tie", nc_frags=actual
+        base = kp.kcp_plan(
+            n_frag, nc, H, SM_COUNT, p_rule="wave_fill1", nc_frags=actual
         ).P
+        cand = kp.kcp_plan(n_frag, nc, H, SM_COUNT, nc_frags=actual).P
+        assert (
+            cand
+            == kp.kcp_plan(
+                n_frag, nc, H, SM_COUNT, p_rule="wave_fill1_p1tie", nc_frags=actual
+            ).P
+        ), (case, r)
         rec = {
             "rank": r,
             "nc_frags": actual,
@@ -1782,41 +1803,42 @@ def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
                 (f.doc, f.off, f.length, bool(f.crossing_in), bool(f.crossing_out))
                 for f in mine
             ],
-            "wave_fill1": shipped,
+            "wave_fill1": base,
             "wave_fill1_p1tie": cand,
             "steps_p1": kp.p1_tie_steps(actual, H, SM_COUNT, 1) if nc else 0,
-            "steps_base": kp.p1_tie_steps(actual, H, SM_COUNT, shipped) if nc else 0,
+            "steps_base": kp.p1_tie_steps(actual, H, SM_COUNT, base) if nc else 0,
             "sm148": kp.kcp_plan(
                 n_frag, nc, H, 148, p_rule="wave_fill1_p1tie", nc_frags=actual
             ).P,
         }
         assert cand == _p1tie_ref(n_frag, actual, H, SM_COUNT), (case, rec)
-        if cand != shipped:
-            assert cand == 1 and shipped > 1 and 2 <= n_frag <= 3 and 0 < nc < 257, (
+        if cand != base:
+            assert cand == 1 and base > 1 and 2 <= n_frag <= 3 and 0 < nc < 257, (
                 case,
                 rec,
             )
             assert rec["steps_p1"] <= rec["steps_base"], (case, rec)
         if H <= 4:
-            assert cand == shipped, (case, rec)
+            assert cand == base, (case, rec)
         if want_inv:
-            ctx_s = kp.build_kcp_context(part, None, r, "cpu", 4, sm_count=SM_COUNT)
-            ctx_c = kp.build_kcp_context(
+            ctx_b = kp.build_kcp_context(
                 part,
                 None,
                 r,
                 "cpu",
                 4,
                 sm_count=SM_COUNT,
-                _kcp_test_knobs={"p_rule": "wave_fill1_p1tie"},
+                _kcp_test_knobs={"p_rule": "wave_fill1"},
             )
-            inv_s, inv_c = _inventory(ctx_s, H), _inventory(ctx_c, H)
-            assert (inv_s["P"], inv_c["P"]) == (shipped, cand), (case, rec)
-            if cand == shipped:
-                assert inv_s == inv_c
-            rec["inv_shipped"], rec["inv_p1tie"] = inv_s, inv_c
+            ctx_c = kp.build_kcp_context(part, None, r, "cpu", 4, sm_count=SM_COUNT)
+            inv_b, inv_c = _inventory(ctx_b, H), _inventory(ctx_c, H)
+            assert (inv_b["P"], inv_c["P"]) == (base, cand), (case, rec)
+            if cand == base:
+                assert inv_b == inv_c
+            rec["inv_wave_fill1"], rec["inv_p1tie"] = inv_b, inv_c
         ranks.append(rec)
     changed = [x["rank"] for x in ranks if x["wave_fill1_p1tie"] != x["wave_fill1"]]
+    assert bool(changed) == ((name, W, lay, H) in P1TIE_CHANGED_ROWS), (case, changed)
     _evidence(
         "plan_p1tie_rows",
         {
@@ -1833,15 +1855,7 @@ def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
         },
     )
     for r in changed[:1] or [0]:
-        ctx = kp.build_kcp_context(
-            part,
-            None,
-            r,
-            "cpu",
-            4,
-            sm_count=SM_COUNT,
-            _kcp_test_knobs={"p_rule": "wave_fill1_p1tie"},
-        )
+        ctx = kp.build_kcp_context(part, None, r, "cpu", 4, sm_count=SM_COUNT)
         assert (ctx.p_rule, ctx.heads(H).P, ctx.describe(H)["p_rule"]) == (
             "wave_fill1_p1tie",
             ranks[r]["wave_fill1_p1tie"],
