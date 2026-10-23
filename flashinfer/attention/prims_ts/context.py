@@ -328,6 +328,8 @@ def _make_context_kernel(
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
     fp8_psmem_early_token: bool = False,
+    kv_ring_stages: int = 0,
+    umma_fp8_k64: bool = False,
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
@@ -364,6 +366,8 @@ def _make_context_kernel(
         d_v=head_dim_vo,
         is_persistent=is_persistent,
         fp8_psmem_early_token=fp8_psmem_early_token,
+        kv_ring_stages=kv_ring_stages,
+        umma_fp8_k64=umma_fp8_k64,
         two_cta_umma=two_cta_umma,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
@@ -585,22 +589,58 @@ def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
     return 2 if cfg.single_qkv_instance else 0
 
 
+def _default_exp2_packed_f16x2(device_index: int, cfg) -> bool:
+    """Softmax exp2 as one packed f16x2 MUFU op per score pair, on for the SM107
+    paths with 8-bit V. SM100 and SM103 split the packed op into two MUFU ops and
+    keep the scalar form."""
+    return (
+        torch.cuda.get_device_capability(device_index) == (10, 7)
+        and cfg.v_dtype.width == 8
+    )
+
+
+def _default_kv_ring_stages(device_index: int, qk_bits: int, pv_bits: int) -> int:
+    """K/V ring depth of the SM107 dense paths with 8-bit V, 0 elsewhere for the
+    budget-derived depth. Deeper rings stall the softmax P stores behind the TMA
+    fills, so the fp8 K ring stops at 6 stages, and the bf16 K ring takes the 4
+    stages the larger SM107 shared memory fits."""
+    if torch.cuda.get_device_capability(device_index) == (10, 7) and pv_bits == 8:
+        return 6 if qk_bits == 8 else 4
+    return 0
+
+
+def _default_umma_fp8_k64(device_index: int, qk_bits: int) -> bool:
+    """K=64 fp8 UMMA instructions for the PV of the SM107 bf16-QK paths. The
+    fp8-QK paths are shared-memory-port bound on operand fetch and keep K=32."""
+    return torch.cuda.get_device_capability(device_index) == (10, 7) and qk_bits == 16
+
+
 def _default_fp8_psmem_early_token(device_index: int) -> bool:
     """Release the S0/S1 token early on the fp8 SMEM-P path, on for SM103."""
     return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
-def _default_two_cta_umma(device_index: int) -> bool:
-    """Two-CTA UMMA for the dense paired D128 context kernel: on for SM103, where the
-    kernel is tensor-pipe bound and halving UMMA issues and K/V traffic per SM pays."""
-    return torch.cuda.get_device_capability(device_index) == (10, 3)
+def _default_two_cta_umma(device_index: int, qk_bits: int) -> bool:
+    """Two-CTA UMMA for the dense paired D128 context kernel. On for SM103, where
+    the kernel is tensor-pipe bound and halving the UMMA issues and the K/V
+    traffic per SM pays. On SM107 only for bf16 QK, which is shared-memory-port
+    bound on operand fetch, since fp8 QK is slower with it."""
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 3):
+        return True
+    return capability == (10, 7) and qk_bits == 16
 
 
-def _default_uses_ldtm_stat(device_index: int) -> bool:
-    """Enable LDTM.STAT where the shared tcgen05 gate allows it."""
+def _default_uses_ldtm_stat(device_index: int, qk_bits: int, pv_bits: int) -> bool:
+    """Enable LDTM.STAT where the shared tcgen05 gate allows it. SM107 keeps it
+    off for the dense QK-BF16 PV-FP8 path, which is faster with the register
+    row max."""
     from .kernels.tcgen05_compat import ldtm_stat_supported
 
-    return ldtm_stat_supported(torch.cuda.get_device_capability(device_index))
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 7) and qk_bits == 16 and pv_bits == 8:
+        return False
+    return ldtm_stat_supported(capability)
 
 
 def _resolve_cuda_device(
@@ -1571,7 +1611,11 @@ def _make_context_scheduler_probe(
         has_q_offset=geometry.has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler="static_persistent",
-        uses_ldtm_stat=_default_uses_ldtm_stat(geometry.device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            geometry.device_index,
+            geometry.qk_dtype.itemsize * 8,
+            geometry.pv_dtype.itemsize * 8,
+        ),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -1684,8 +1728,24 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     # VC-Attention always runs two-CTA. With P in SMEM, the bf16 K ring,
     # tile-mean ring and row-sum operands leave room for one K/V stage per CTA
     # at one CTA and three in the halved form. The VC tail needs two.
+    two_cta = _default_two_cta_umma(
+        geometry.device_index, geometry.qk_dtype.itemsize * 8
+    )
+    if two_cta and torch.cuda.get_device_capability(geometry.device_index) == (10, 7):
+        # Pairs are coarser work units. Keep them only where they fill their
+        # waves at least as well as single CTAs fill theirs.
+        sms = torch.cuda.get_device_properties(
+            geometry.device_index
+        ).multi_processor_count
+        tiles = math.ceil(geometry.max_seq_len_q / (2 * _CONTEXT_TILE_SIZE_Q))
+        heads = geometry.batch_size * geometry.num_qo_heads
+        single_waves = heads * tiles / sms
+        pair_waves = heads * math.ceil(tiles / 2) / (sms // 2)
+        two_cta = pair_waves / math.ceil(pair_waves) >= single_waves / math.ceil(
+            single_waves
+        )
     return (
-        (_default_two_cta_umma(geometry.device_index) or geometry.vc is not None)
+        (two_cta or geometry.vc is not None)
         and geometry.head_dim == 128
         and geometry.head_dim_vo in (None, 128)
         and geometry.mask_type == "dense"
@@ -2025,13 +2085,24 @@ def _get_compiled_context(
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
         two_cta_umma=two_cta_umma,
-        uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        kv_ring_stages=_default_kv_ring_stages(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
+        umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
         vc_attention=("means" if compile_spec.vc.demean else "outliers")
         if vc_attention
         else None,
         sage_scale_layout=sage_scale_layout,
     )
+    if vc_attention and torch.cuda.get_device_capability(device_index) == (10, 7):
+        raise ValueError(
+            "vc_config is not supported on SM107, where the dense fp8 kernel runs "
+            "the softmax exp2 natively"
+        )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
     if uniform_packed_lengths:
@@ -2039,6 +2110,7 @@ def _get_compiled_context(
         fmha.cfg.uniform_seq_len_k = max_seq_len_k
     fmha.cfg.has_q_offset = has_q_offset
     fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
+    fmha.cfg.exp2_packed_f16x2 = _default_exp2_packed_f16x2(device_index, fmha.cfg)
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="
@@ -2300,8 +2372,14 @@ def _get_compiled_paged_context(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=False,
         scheduler=scheduler,
-        uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        kv_ring_stages=_default_kv_ring_stages(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
+        umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -2312,6 +2390,7 @@ def _get_compiled_paged_context(
         fmha.cfg.uniform_seq_len_k = max_kv_len
     fmha.cfg.has_q_offset = has_q_offset
     fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
+    fmha.cfg.exp2_packed_f16x2 = _default_exp2_packed_f16x2(device_index, fmha.cfg)
     fmha.cfg.paged_v_tail_is_zero = paged_v_tail_is_zero
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
