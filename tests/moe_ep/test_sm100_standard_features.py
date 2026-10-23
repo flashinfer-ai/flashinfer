@@ -209,15 +209,16 @@ def test_standard_padded_mxfp8_staging(kind, fused, monkeypatch):
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1" if fused else "0")
     x = torch.randn(65, 192, device="cuda", dtype=torch.bfloat16)
+    weights = moe_ep.MoEWeightPack(
+        torch.randn(4, 256, 192, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(4, 192, 128, device="cuda", dtype=torch.bfloat16) / 16,
+    )
     layer = moe_ep.MoEEpLayer(
         moe_ep.BootstrapConfig(world_size=1, rank=0),
         moe_ep.FleetParams(
             num_experts=4, max_tokens_per_rank=65, token_hidden_size=192
         ),
-        moe_ep.MoEWeightPack(
-            torch.randn(4, 256, 192, device="cuda", dtype=torch.bfloat16) / 16,
-            torch.randn(4, 192, 128, device="cuda", dtype=torch.bfloat16) / 16,
-        ),
+        weights,
         backend=moe_ep.MegaConfig(
             megakernel=moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=128,
@@ -228,6 +229,25 @@ def test_standard_padded_mxfp8_staging(kind, fused, monkeypatch):
         ),
     )
     try:
+        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+            kernel_helpers as helpers,
+        )
+
+        dtype = torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
+        q13, sf13 = helpers.quantize_mxfp8_block32(weights.w13.float(), dtype)
+        q2, sf2 = helpers.quantize_mxfp8_block32(weights.w2.float(), dtype)
+        prequantized = helpers.preprocess_prequantized_block_scaled_weights(
+            q13,
+            q2,
+            sf13,
+            sf2,
+            quant_kind=kind,
+            hidden_size=192,
+            intermediate_size=128,
+        )
+        for actual, expected_leg in zip(layer._transformed, prequantized, strict=True):
+            for a, b in zip(actual, expected_leg, strict=True):
+                assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
         result = layer.forward(
             moe_ep.MoEEpTensors(
                 hidden_states=x,

@@ -303,7 +303,8 @@ def preprocess_block_scaled_weights(
     ):
         raise ValueError("canonical weight shapes must be [E, 2I, H] and [E, H, I].")
     intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
-    if hidden % (4 * sf_vec) or intermediate_size % intermediate_alignment:
+    hidden_alignment = 64 if quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2") else 4 * sf_vec
+    if hidden % hidden_alignment or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the block-scaled scale-vector alignment."
         )
@@ -391,7 +392,8 @@ def preprocess_prequantized_block_scaled_weights(
     if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
     intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
-    if hidden_size % (4 * sf_vec) or intermediate_size % intermediate_alignment:
+    hidden_alignment = 64 if quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2") else 4 * sf_vec
+    if hidden_size % hidden_alignment or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the block-scaled scale-vector alignment."
         )
