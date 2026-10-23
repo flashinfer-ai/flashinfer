@@ -4,10 +4,16 @@ The FP8-output programs (hidden 5120, SM100a / SM103a) are one generated source
 per schedule class (shifted x shared scale layout x the unroll and partition
 choices of a split-count class); the loader compiles each with the exact flag
 set of the device it runs on and passes the split count, its FP8 norm partition
-count and the device SM count on the compile line. The BF16-output program
-(hidden 4096, normal mode, ``sf_layout="bf16"``, SM107a) takes the split count
-and the launch grid as kernel arguments, so one JIT module serves every SM
-count. The token count is a run-time argument everywhere: the split count and
+count and the device SM count on the compile line. The hidden-4096 programs
+(normal mode, SM107a) take the split count and the launch grid as kernel
+arguments, so one JIT module serves every SM count: the BF16-output program
+(``sf_layout="bf16"``) and the quantized-output variants, which store the same
+BF16 output and beside it its quantization: ``"fp8_group128"`` the FP8 E4M3
+values with one FP32 scale per 128-element group of a token (vLLM's
+``per_token_group_quant_fp8(y_bf16, 128, use_ue8m0=fp8_sf_ue8m0)``), ``"nvfp4"``
+the packed NVFP4 values with one E4M3 scale per 16-element group under a global
+scale (vLLM's ``scaled_fp4_quant(y_bf16, fp4_global_scale)`` in the linear scale
+layout). The token count is a run-time argument everywhere: the split count and
 the launch grid are chosen here from the same rules the producer uses.
 """
 
@@ -27,8 +33,12 @@ BF16_HIDDEN = 4096
 FN_ROWS = 24
 FNP_PIECES = 3
 FNP_ROWS = 32
-# The output layouts a route serves: the FP8 layouts ("col" and "extra") share the FP8 programs.
+# The output layouts a route serves: the FP8 layouts ("col" and "extra") share the FP8 programs; a quantized
+# layout of the hidden-4096 route is a program of its own, storing the BF16 output and its quantization.
 FP8_LAYOUTS = ("col", "extra")
+QUANT_LAYOUTS = ("fp8_group128", "nvfp4")
+FP8_GROUP = 128
+FP4_GROUP = 16
 
 # Registry written by the exporter: one record per delivered source, and the
 # schedule keys (hidden, split count, shifted, shared scale layout, output
@@ -271,6 +281,120 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "use_pdl": False,
         },
     },
+    "cake_mega_mhc_a940c94296afad2b2497": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a940c94296afad2b2497_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a940c94296afad2b2497_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_a940c94296afad2b2497",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp8"],
+            ["buffer", "y_fp8_sf"],
+            ["parameter", "fp8_sf_ue8m0"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_1c61fed11caf93d1b762": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1c61fed11caf93d1b762_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1c61fed11caf93d1b762_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_1c61fed11caf93d1b762",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp4"],
+            ["buffer", "y_fp4_sf"],
+            ["buffer", "fp4_global_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
 }
 ROUTES: list[dict[str, Any]] = [
     {
@@ -408,6 +532,24 @@ ROUTES: list[dict[str, Any]] = [
         "shared_sf": False,
         "sf_layout": "bf16",
         "program": "cake_mega_mhc_f24c2f3f98bfe3356398",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "program": "cake_mega_mhc_a940c94296afad2b2497",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "program": "cake_mega_mhc_1c61fed11caf93d1b762",
         "defines": {},
     },
 ]
@@ -628,10 +770,16 @@ def record_compile_flags(record):
     return flags
 
 
+def route_output(sf_layout):
+    """The output a route serves for ``sf_layout``: the FP8 layouts share the FP8
+    programs (``"fp8"``); ``"bf16"`` and the quantized layouts are their own."""
+    return "fp8" if sf_layout in FP8_LAYOUTS else sf_layout
+
+
 def supported(arch, hidden, sf_layout):
     """Whether an exported program serves ``hidden`` with the output layout
     ``sf_layout`` on ``arch``, without loading anything."""
-    output = "bf16" if sf_layout == "bf16" else "fp8"
+    output = route_output(sf_layout)
     return any(
         route["hidden"] == hidden
         and route.get("sf_layout", "fp8") == output
@@ -659,7 +807,7 @@ def _support_matrix():
 
 def select_program(hidden, splits, shifted, shared_sf, sf_layout, arch):
     """(source name, compile-line defines) serving the schedule key on ``arch``, or raise."""
-    output = "bf16" if sf_layout == "bf16" else "fp8"
+    output = route_output(sf_layout)
     for route in ROUTES:
         if (
             route["hidden"] == hidden
@@ -740,7 +888,21 @@ def _new_outputs(
     )
     if shifted_prev_mix is not None:
         outputs["new_prev_mix"] = torch.empty_like(shifted_prev_mix)
-    if sf_layout != "bf16":
+    if sf_layout == "fp8_group128":
+        outputs["y_fp8"] = torch.empty(
+            (tokens, hidden), dtype=torch.float8_e4m3fn, device=x.device
+        )
+        outputs["y_fp8_sf"] = torch.empty(
+            (tokens, hidden // FP8_GROUP), dtype=torch.float32, device=x.device
+        )
+    elif sf_layout == "nvfp4":
+        outputs["y_fp4"] = torch.empty(
+            (tokens, hidden // 2), dtype=torch.uint8, device=x.device
+        )
+        outputs["y_fp4_sf"] = torch.empty(
+            (tokens, hidden // FP4_GROUP), dtype=torch.float8_e4m3fn, device=x.device
+        )
+    elif sf_layout in FP8_LAYOUTS:
         outputs["y_fp8"] = torch.empty(
             (tokens, hidden), dtype=torch.float8_e4m3fn, device=x.device
         )
@@ -830,9 +992,20 @@ class MegaMHCPlan:
     per-32 UE8M0 scales: ``'col'`` stores column-major scale words, ``'extra'``
     also stores the shared-expert padded row permutation. ``sf_layout='bf16'``
     (hidden 4096, normal mode) stores the BF16 output alone: no FP8 values, no
-    scale words. Any token count in [1, 2**20] is accepted; the split count
-    follows the token count (or ``deterministic``), and the program for that
-    split count must be exported for ``hidden`` on the device's architecture.
+    scale words. The quantized layouts of hidden 4096 store the BF16 output and
+    its quantization beside it, bitwise what vLLM computes from that BF16
+    output: ``'fp8_group128'`` writes ``y_fp8`` (float8_e4m3fn [T, H]) and
+    ``y_fp8_sf`` (float32 [T, H // 128], one scale per 128-element group of a
+    token; ``fp8_sf_ue8m0`` keeps each scale a power of two, as
+    ``per_token_group_quant_fp8(y_bf16, 128, use_ue8m0=True)`` does, ``False``
+    the raw ``amax / 448`` scale); ``'nvfp4'`` writes ``y_fp4`` (uint8 [T, H // 2],
+    element 2i in the low nibble of byte i) and ``y_fp4_sf`` (float8_e4m3fn
+    [T, H // 16] in the linear layout) under the caller's ``fp4_global_scale``
+    (float32 [1] on the device), as ``scaled_fp4_quant(y_bf16, fp4_global_scale,
+    is_sf_swizzled_layout=False)`` does, a zero scale guarded as there. Any token
+    count in [1, 2**20] is accepted; the split count follows the token count (or
+    ``deterministic``), and the program for that split count must be exported
+    for ``hidden`` with that layout on the device's architecture.
 
     The BF16-output program reads the projection ``fn`` through its three BF16
     pieces (``split_fn``), built once here from ``fn`` as given to the plan, or
@@ -881,15 +1054,24 @@ class MegaMHCPlan:
         split_barriers=None,
         launch_epochs=None,
         fnp=None,
+        fp8_sf_ue8m0=True,
+        fp4_global_scale=None,
     ):
         import torch
 
         if x.device.type != "cuda":
             raise RuntimeError("Mega mHC requires a CUDA device")
-        if x.ndim != 2 or hc_mult != 4 or sf_layout not in ("bf16", *FP8_LAYOUTS):
+        layouts = ("bf16", *FP8_LAYOUTS, *QUANT_LAYOUTS)
+        if x.ndim != 2 or hc_mult != 4 or sf_layout not in layouts:
             raise ValueError(
-                "Expected x[T,H], four residual routes and col/extra/bf16 scale layout"
+                f"Expected x[T,H], four residual routes and a scale layout of {layouts}"
             )
+        if sf_layout != "fp8_group128" and fp8_sf_ue8m0 is not True:
+            raise ValueError(
+                "fp8_sf_ue8m0 selects the scale format of sf_layout='fp8_group128'"
+            )
+        if sf_layout != "nvfp4" and fp4_global_scale is not None:
+            raise ValueError("fp4_global_scale is the operand of sf_layout='nvfp4'")
         tokens, hidden = x.shape
         if hidden % 1024 or not 1 <= tokens <= MAX_TOKENS or num_sinkhorn_iters < 1:
             raise ValueError(
@@ -899,12 +1081,12 @@ class MegaMHCPlan:
             raise ValueError("shared_sf_block_m must be positive")
         arch, sms = device_facts(x.device.index)
         shifted = shifted_prev_mix is not None
-        store_fp8 = sf_layout != "bf16"
+        store_fp8 = sf_layout in FP8_LAYOUTS
         if not store_fp8 and (hidden != BF16_HIDDEN or shifted):
             raise NotImplementedError(
-                f"The BF16-output mHC program serves hidden={BF16_HIDDEN} in normal mode "
-                f"(shifted_prev_mix=None); got hidden={hidden}, shifted={shifted}. "
-                f"Exported: {_support_matrix()}"
+                f"The hidden-{BF16_HIDDEN} mHC programs (sf_layout {sf_layout!r}) serve "
+                f"normal mode (shifted_prev_mix=None); got hidden={hidden}, "
+                f"shifted={shifted}. Exported: {_support_matrix()}"
             )
         shared_sf = sf_layout == "extra"
         if store_fp8:
@@ -940,6 +1122,7 @@ class MegaMHCPlan:
         )
         self.program = program
         self.defines = defines
+        self.sf_layout = sf_layout
 
         def require(name, tensor, dtype, shape, *, contiguous=True):
             if (
@@ -985,6 +1168,25 @@ class MegaMHCPlan:
             require(name, out[name], dtype, shape)
         if shifted:
             require("new_prev_mix", out["new_prev_mix"], torch.float32, (tokens, 4, 1))
+        if sf_layout == "fp8_group128":
+            require("y_fp8", out["y_fp8"], torch.float8_e4m3fn, (tokens, hidden))
+            require(
+                "y_fp8_sf",
+                out["y_fp8_sf"],
+                torch.float32,
+                (tokens, hidden // FP8_GROUP),
+            )
+        if sf_layout == "nvfp4":
+            if fp4_global_scale is None:
+                raise ValueError("sf_layout='nvfp4' requires fp4_global_scale")
+            require("fp4_global_scale", fp4_global_scale, torch.float32, (1,))
+            require("y_fp4", out["y_fp4"], torch.uint8, (tokens, hidden // 2))
+            require(
+                "y_fp4_sf",
+                out["y_fp4_sf"],
+                torch.float8_e4m3fn,
+                (tokens, hidden // FP4_GROUP),
+            )
         if store_fp8:
             require("y_fp8", out["y_fp8"], torch.float8_e4m3fn, (tokens, hidden))
             primary = out["y_gemm_sf" if sf_layout == "col" else "y_routed_sf"]
@@ -1124,7 +1326,19 @@ class MegaMHCPlan:
                 grid_y=1,
                 grid_z=1,
             )
-            retained = (fnp,)
+            if sf_layout == "fp8_group128":
+                self.bindings.update(
+                    y_fp8=out["y_fp8"],
+                    y_fp8_sf=out["y_fp8_sf"],
+                    fp8_sf_ue8m0=int(bool(fp8_sf_ue8m0)),
+                )
+            elif sf_layout == "nvfp4":
+                self.bindings.update(
+                    y_fp4=out["y_fp4"],
+                    y_fp4_sf=out["y_fp4_sf"],
+                    fp4_global_scale=fp4_global_scale,
+                )
+            retained = (fnp, fp4_global_scale)
         module, self.library_path = load_program(
             program, arch, sms, tuple(sorted(defines.items()))
         )
