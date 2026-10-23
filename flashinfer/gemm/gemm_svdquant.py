@@ -1131,7 +1131,7 @@ def svdquant_linear(
     backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"]
         Backend forwarded to smooth quantization and SVDQuant GEMM. Defaults to
         architecture-based automatic selection.
-        ``"cutlass-sm120"`` supports ranks 32 and 64, with fused or separate
+        ``"cutlass-sm120"`` supports ranks 32, 64 and 128, with fused or separate
         quantization and LoRA-down selected by complete-linear autotuning.
         On SM120, ``"auto"`` also compares complete CuTe DSL and CUTLASS chains
         for these ranks. Without a cached winner, CuTe DSL remains the default
