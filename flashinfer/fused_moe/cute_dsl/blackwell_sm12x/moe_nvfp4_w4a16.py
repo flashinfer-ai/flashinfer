@@ -1800,6 +1800,16 @@ def _scale_shape(E: int, rows: int, k: int) -> tuple[int, int, int]:
 
 
 def _entry(T, H, I, N13, E, TOPK, dev, activation=None):
+    """Plan and in-process cache entry for one W4A16 specialization.
+
+    Keyed like ``moe_nvfp4_w4a4._entry``: token count, geometry, device and
+    resolved activation. Uses the persistent launcher when each expert tile
+    holds at most one routed slot (``_pick_bm`` returns 1) and a persistent
+    plan exists, and the tiled launcher otherwise. Returns ``[persistent,
+    consts, sizes, compiled]``: the launcher choice, its compile-time
+    constants, the workspace sizes, and the compiled kernel, which the first
+    ``run_moe_w4a16`` call for the key fills in.
+    """
     act = resolve_activation(activation, N13, I)
     sf13 = _scale_shape(E, N13, H)
     sf2 = _scale_shape(E, H, I)

@@ -1182,6 +1182,14 @@ def _check_shape(H: int, I: int, N13: int) -> None:
 
 
 def _entry(T, H, I, N13, E, TOPK, dev, activation=None):
+    """Plan and in-process cache entry for one W4A4 specialization.
+
+    Keyed on the token count, the geometry, the device and the resolved
+    activation (see ``resolve_activation``). Returns ``[prog, shapes,
+    compiled]``: the program built by ``_build``, the workspace tensor shapes,
+    and the compiled kernel, which the first ``run_moe_w4a4`` call for the key
+    fills in.
+    """
     _check_shape(H, I, N13)
     act = resolve_activation(activation, N13, I)
     # SwiGLU and GeGLU-tanh share the geometry (N13 == 2*I) and the workspace

@@ -8677,6 +8677,9 @@ class SM12xNvfp4Bf16Runner(MoERunner):
 
     @property
     def _kernel_activation(self) -> str:
+        """Kernel name of the configured activation (``"silu"``,
+        ``"geglu_tanh"`` or ``"relu2"``), passed as ``activation=`` to the
+        W4A4 / W4A16 kernels and their workspace allocators."""
         return self._KERNEL_ACTIVATIONS[type(self.config.activation)]
 
     def _check_activation_parameters(self) -> None:
