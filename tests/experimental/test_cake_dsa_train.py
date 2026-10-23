@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -22,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from tests.test_helpers import cake_dsa_train_reference as nope_ref
 from tests.test_helpers.cake_dsa_train_reference import (
@@ -6907,3 +6910,356 @@ def test_rope_varlen_fallback_routes_give_the_stage_route_results_on_hole_rows()
     )
     torch.cuda.synchronize()
     assert torch.equal(out, stage[0]) and torch.equal(lse, stage[1])
+
+
+# --- activation checkpointing (flashinfer-ai/flashinfer#7039): the autograd entries keep nothing alive after a
+# non-reentrant checkpointed forward, their outputs and gradients are those of the eager pair, and the backward is
+# recompute-safe (GPU) ---
+
+# Bytes an autograd entry may keep after ``checkpoint(fn, *inputs, use_reentrant=False)`` beyond the output storage:
+# allocator granularity (a few ``[T]`` int32 vectors and scalars at most), never an activation-sized tensor.  Under
+# non-reentrant checkpointing only tensors passed through ``ctx.save_for_backward`` are freed after the forward and
+# recomputed; a tensor kept as a ``ctx`` attribute (or on a returned handle) stays alive for every layer at once.
+CKPT_RETAINED_LIMIT_MIB = 2.0
+# the test shape of the issue's construction: one causal segment, each query attends to its last W keys
+CKPT_T, CKPT_W = 2048, 256
+CKPT_DST_ROWS = 32768  # the CP-gather style destination buffer (the issue's 262144-row accumulator, scaled)
+# ``FLASHINFER_CAKE_DSA_CKPT_DIGESTS``: a JSON written by ``work/bench/ckpt_retained.py --shape small`` with the
+# reference package (the same inputs: generator seed 0, the same tensor order); when set, the eager outputs and
+# gradients of this package must digest-match it (the cross-package bitwise evidence) and the eager peak memory must
+# not exceed its ``eager_peak_mib`` (allocator granularity allowed)
+CKPT_DIGESTS_ENV = "FLASHINFER_CAKE_DSA_CKPT_DIGESTS"
+MIB = 2**20
+
+
+def _sha16(t):
+    return hashlib.sha256(
+        t.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    ).hexdigest()[:16]
+
+
+def _ckpt_retained_mib(fn, *inputs) -> float:
+    """The issue's ``retained()``: ``memory_allocated`` kept after a checkpointed forward, less the output storage."""
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    out = checkpoint(fn, *inputs, use_reentrant=False)
+    torch.cuda.synchronize()
+    kept = torch.cuda.memory_allocated() - before - out.untyped_storage().nbytes()
+    del out
+    return kept / MIB
+
+
+def _sliding_window_rows(T, W, device="cuda"):
+    rows = torch.arange(T, device=device, dtype=torch.int32)[:, None] - torch.arange(
+        W, device=device, dtype=torch.int32
+    )
+    return torch.where(rows >= 0, rows, -1).to(torch.int32)
+
+
+def _ckpt_inputs():
+    """The construction of ``work/bench/ckpt_retained.py --shape small`` (generator seed 0, this tensor order): the
+    NoPE and rotary leaves, ``dout``, the sliding-window rows (one document: local rows == global rows), the prefix
+    sums and the destination map of the scaled CP gather."""
+    _require_program(backward=True)
+    _require_nope_program(backward=True)
+    T, W = CKPT_T, CKPT_W
+    dev = torch.device("cuda")
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(T, 64, 512, device=dev, generator=g).bfloat16().requires_grad_()
+    kv = torch.randn(T, 512, device=dev, generator=g).bfloat16().requires_grad_()
+    q_rope = torch.randn(T, 64, 64, device=dev, generator=g).bfloat16().requires_grad_()
+    k_rope = torch.randn(T, 64, device=dev, generator=g).bfloat16().requires_grad_()
+    dout = torch.randn(T, 64, 512, device=dev, generator=g).bfloat16()
+    idx = _sliding_window_rows(T, W)
+    cu = torch.tensor([0, T], device=dev, dtype=torch.int32)
+    dst_map = (torch.arange(T, device=dev, dtype=torch.int64) * CKPT_DST_ROWS // T).to(
+        torch.int32
+    )
+    return SimpleNamespace(
+        q=q,
+        kv=kv,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        dout=dout,
+        idx=idx,
+        cu=cu,
+        dst_map=dst_map,
+    )
+
+
+def _dkv_acc_argument(form, buffer):
+    """How the caller's FP32 accumulator reaches an autograd entry: ``"tensor"`` -- the buffer itself (the buffer is
+    owned outside the checkpointed region, so the recomputed forward meets the same tensor); ``"callable"`` -- a
+    zero-argument callable returning it, the deferred form: the entry resolves the buffer at backward time and
+    keeps no accumulator on ``ctx``.  An entry that does not accept the deferred form raises ``TypeError`` /
+    ``ValueError`` at forward time, which the tests turn into a skip."""
+    if form == "tensor":
+        return buffer
+    assert form == "callable"
+    return lambda: buffer
+
+
+DEFERRED_FORM_ERRORS = (TypeError, ValueError, AttributeError)
+
+
+def _skip_if_deferred_form_unsupported(exc):
+    pytest.skip(
+        f"the package does not accept a callable dkv_acc (the deferred accumulator form): {exc}"
+    )
+
+
+def _kv_leaf_indices(name):
+    """Positions of the key-side leaves in the entry's leaf tuple: ``(kv,)`` for NoPE, ``(kv, k_rope)`` for rotary."""
+    return (1,) if name.startswith("nope") else (2, 3)
+
+
+def _ckpt_entry(name, inp, *, acc_form=None, dst_map=False):
+    """``(fn, leaves, acc)`` of one autograd entry over the issue's construction: ``fn(*leaves) -> out``.  With
+    ``acc_form`` the FP32 accumulator ``acc`` (zeroed by the caller per step) is passed in that form; ``dst_map``
+    adds the destination map into the ``CKPT_DST_ROWS``-row buffer (NoPE varlen only)."""
+    S = int(inp.kv.shape[0])
+    nope = name.startswith("nope")
+    cols = D_LATENT if nope else D_QK
+    acc = None
+    kw = {}
+    if acc_form is not None:
+        rows = CKPT_DST_ROWS if dst_map else S
+        acc = torch.zeros(rows, cols, device="cuda")
+        kw["dkv_acc"] = _dkv_acc_argument(acc_form, acc)
+        if dst_map:
+            kw["dkv_dst_map"] = inp.dst_map
+    if name == "nope_varlen":
+        leaves = (inp.q, inp.kv)
+
+        def fn(q, kv):
+            return cake_backend.dsa_sparse_attention_nope_varlen(
+                q, kv, inp.idx, inp.cu, inp.cu, causal=True, softmax_scale=1 / 16, **kw
+            )
+
+    elif name == "nope_flat":
+        leaves = (inp.q, inp.kv)
+
+        def fn(q, kv):
+            return cake_backend.dsa_sparse_attention_nope(
+                q, kv, inp.idx, softmax_scale=1 / 16, **kw
+            )
+
+    elif name == "rope":
+        leaves = (inp.q, inp.q_rope, inp.kv, inp.k_rope)
+
+        def fn(q, q_rope, kv, k_rope):
+            return cake_backend.dsa_sparse_attention(
+                q, q_rope, kv, k_rope, inp.idx, **kw
+            )
+
+    elif name == "rope_varlen":
+        leaves = (inp.q, inp.q_rope, inp.kv, inp.k_rope)
+
+        def fn(q, q_rope, kv, k_rope):
+            return cake_backend.dsa_sparse_attention_varlen(
+                q, q_rope, kv, k_rope, inp.idx, inp.cu, inp.cu, causal=True, **kw
+            )
+
+    else:
+        raise ValueError(name)
+    return fn, leaves, acc
+
+
+def _eager_step(fn, leaves, dout, acc):
+    """Eager forward + backward: ``(out, grads, acc_copy)`` with the gradients of the leaves (``None`` for a kv leaf
+    whose gradient went into the accumulator)."""
+    if acc is not None:
+        acc.zero_()
+    out = fn(*leaves)
+    grads = torch.autograd.grad(out, leaves, dout, allow_unused=True)
+    torch.cuda.synchronize()
+    return out.detach(), grads, None if acc is None else acc.clone()
+
+
+def _assert_same_results(got, want, *, acc_got=None, acc_want=None):
+    """``out`` and the query gradients bitwise; the key-side gradients and the FP32 accumulator (``red.global`` sums in
+    no fixed order, so never bitwise run to run; cast to the BF16 leaf a few one-ulp flips) within ``ACC_REL_L2``."""
+    out_g, grads_g = got
+    out_w, grads_w = want
+    assert torch.equal(out_g, out_w)
+    for i, (a, b) in enumerate(zip(grads_g, grads_w, strict=True)):
+        if a is None or b is None:
+            assert a is None and b is None
+            continue
+        if i < len(grads_g) - (2 if len(grads_g) == 4 else 1):
+            assert torch.equal(a, b), f"gradient {i} differs"
+        else:
+            assert rel_l2(a, b) < ACC_REL_L2, f"gradient {i}: rel-L2 {rel_l2(a, b)}"
+    if acc_got is not None or acc_want is not None:
+        assert rel_l2(acc_got, acc_want) < ACC_REL_L2
+
+
+CKPT_ENTRIES = ("nope_varlen", "nope_flat", "rope", "rope_varlen")
+CKPT_ACC_FORMS = (None, "tensor", "callable")
+
+
+def _ckpt_case_ids():
+    cases = []
+    for name in CKPT_ENTRIES:
+        for form in CKPT_ACC_FORMS:
+            cases.append((name, form, False))
+            if name == "nope_varlen" and form is not None:
+                cases.append((name, form, True))
+    return cases
+
+
+def _ckpt_case_name(case):
+    name, form, dst = case
+    return (
+        name
+        + ("" if form is None else f"+dkv_acc[{form}]")
+        + (f"+dst_map{CKPT_DST_ROWS}" if dst else "")
+    )
+
+
+@pytest.mark.parametrize("case", _ckpt_case_ids(), ids=_ckpt_case_name)
+def test_ckpt_autograd_entries_keep_nothing_alive_after_a_checkpointed_forward(case):
+    """The issue's measurement on every autograd entry (the NoPE varlen entry at the issue's construction, the flat
+    NoPE entry, the rotary flat and varlen Functions), with and without the caller's FP32 accumulator (and the
+    destination map into a CP-gather buffer): after ``checkpoint(fn, *inputs, use_reentrant=False)`` the entry
+    keeps at most ``CKPT_RETAINED_LIMIT_MIB`` beyond its output -- no ``o_lo``, no index rows or lengths, no
+    accumulator on ``ctx`` (the accumulator is the caller's, allocated outside the checkpointed region; the
+    deferred callable form resolves it at backward time)."""
+    name, form, dst = case
+    inp = _ckpt_inputs()
+    fn, leaves, acc = _ckpt_entry(name, inp, acc_form=form, dst_map=dst)
+    try:
+        fn(*leaves)  # warm-up: kernels, plans, per-device workspaces
+    except DEFERRED_FORM_ERRORS as exc:
+        if form == "callable":
+            _skip_if_deferred_form_unsupported(exc)
+        raise
+    torch.cuda.synchronize()
+    if acc is not None:
+        acc.zero_()
+    kept = _ckpt_retained_mib(fn, *leaves)
+    assert kept <= CKPT_RETAINED_LIMIT_MIB, (
+        f"{_ckpt_case_name(case)}: {kept:.1f} MiB kept alive after a checkpointed forward"
+    )
+
+
+@pytest.mark.parametrize("case", _ckpt_case_ids(), ids=_ckpt_case_name)
+def test_ckpt_outputs_and_gradients_match_the_eager_pair_and_the_reference_digests(
+    case,
+):
+    """Under checkpointing every entry gives the eager pair's ``out`` and query gradients bitwise and its key-side
+    gradients within the FP32 summation spread (the fresh ``dkv`` path, the ``dkv_acc`` accumulate path and the
+    ``dkv_dst_map`` path alike), with the accumulator zero-filled between the checkpointed forward and its backward
+    as a trainer does.  With ``FLASHINFER_CAKE_DSA_CKPT_DIGESTS`` set, the eager ``out`` / ``dq`` digests also equal
+    the reference package's on the same inputs (``work/bench/ckpt_retained.py --shape small``)."""
+    name, form, dst = case
+    inp = _ckpt_inputs()
+    fn, leaves, acc = _ckpt_entry(name, inp, acc_form=form, dst_map=dst)
+    try:
+        out_e, grads_e, acc_e = _eager_step(fn, leaves, inp.dout, acc)
+    except DEFERRED_FORM_ERRORS as exc:
+        if form == "callable":
+            _skip_if_deferred_form_unsupported(exc)
+        raise
+    out_c = checkpoint(fn, *leaves, use_reentrant=False)
+    if acc is not None:
+        # the trainer's pattern: the accumulator is zero-filled between the forward and the backward (the tensor
+        # form stays an attribute of the autograd node, so autograd's saved-tensor version check does not see it)
+        acc.zero_()
+    grads_c = torch.autograd.grad(out_c, leaves, inp.dout, allow_unused=True)
+    torch.cuda.synchronize()
+    acc_c = None if acc is None else acc.clone()
+    _assert_same_results(
+        (out_c.detach(), grads_c), (out_e, grads_e), acc_got=acc_c, acc_want=acc_e
+    )
+    if acc is not None:
+        for i in _kv_leaf_indices(
+            name
+        ):  # the key-side gradients went into the accumulator
+            assert grads_e[i] is None and grads_c[i] is None
+        assert float(acc_e.abs().sum()) > 0
+        if dst:
+            hit = torch.zeros(CKPT_DST_ROWS, dtype=torch.bool, device="cuda")
+            hit[inp.dst_map.long()] = True
+            assert torch.all(acc_e[~hit] == 0)
+    path = os.environ.get(CKPT_DIGESTS_ENV, "")
+    if not path:
+        return
+    # ``out`` and the query gradients do not depend on the accumulator form, so every variant of an entry must
+    # digest-match the reference package's plain entry
+    recorded = json.loads(Path(path).read_text())["entries"]
+    if name not in recorded or "digests" not in recorded[name]:
+        pytest.skip(f"{path} carries no digests for {name}")
+    want = recorded[name]["digests"]["eager"]
+    assert _sha16(out_e) == want["out"], "out differs from the reference package"
+    assert _sha16(grads_e[0]) == want["dq"], "dq differs from the reference package"
+    if name.startswith("rope"):
+        assert _sha16(grads_e[1]) == want["dq_rope"], (
+            "dq_rope differs from the reference package"
+        )
+
+
+@pytest.mark.parametrize("name", CKPT_ENTRIES)
+def test_ckpt_backward_is_recompute_safe_after_an_unrelated_forward(name):
+    """The checkpointed backward of one call runs after a second, unrelated forward on the same inputs (another
+    layer's call in a training step) and after the binding cache served other geometries: the recompute finds its
+    saved tensors by position, not by identity with the live forward, and the gradients equal the eager pair's.
+    The forward's saved-tensor count is the same for the live and the recomputed forward."""
+    inp = _ckpt_inputs()
+    fn, leaves, _acc = _ckpt_entry(name, inp)
+    out_e, grads_e, _ = _eager_step(fn, leaves, inp.dout, None)
+    out_c = checkpoint(fn, *leaves, use_reentrant=False)
+    unrelated = fn(
+        *leaves
+    )  # another call on the same inputs, its graph alive during the backward
+    # another geometry through the same entry (a different binding) between the forward and its backward
+    n = 512
+    other_fn, other_leaves, _ = _ckpt_entry(
+        name,
+        SimpleNamespace(
+            q=inp.q[:n],
+            kv=inp.kv[:n],
+            q_rope=inp.q_rope[:n],
+            k_rope=inp.k_rope[:n],
+            dout=inp.dout[:n],
+            idx=inp.idx[:n],
+            cu=inp.cu.new_tensor([0, n]),
+            dst_map=inp.dst_map[:n],
+        ),
+    )
+    other_out = other_fn(*other_leaves)
+    torch.cuda.synchronize()
+    grads_c = torch.autograd.grad(out_c, leaves, inp.dout, allow_unused=True)
+    torch.cuda.synchronize()
+    del unrelated, other_out
+    _assert_same_results((out_c.detach(), grads_c), (out_e, grads_e))
+
+
+@pytest.mark.parametrize("name", CKPT_ENTRIES)
+def test_ckpt_eager_peak_memory_is_not_above_the_reference_package(name):
+    """The eager (non-checkpointed) forward + backward of every entry allocates no more above the inputs than the
+    reference package measured on the same construction (``FLASHINFER_CAKE_DSA_CKPT_DIGESTS``: ``eager_peak_mib`` of
+    ``work/bench/ckpt_retained.py --shape small``; allocator granularity allowed).  Without the recording the peak
+    is measured and reported only."""
+    inp = _ckpt_inputs()
+    fn, leaves, _acc = _ckpt_entry(name, inp)
+    fn(*leaves)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    out = fn(*leaves)
+    torch.autograd.grad(out, leaves, inp.dout, allow_unused=True)
+    torch.cuda.synchronize()
+    peak = (torch.cuda.max_memory_allocated() - base) / MIB
+    path = os.environ.get(CKPT_DIGESTS_ENV, "")
+    if not path:
+        pytest.skip(
+            f"eager peak {peak:.1f} MiB above the inputs; set {CKPT_DIGESTS_ENV} to compare"
+        )
+    recorded = json.loads(Path(path).read_text())["entries"]
+    if name not in recorded or "eager_peak_mib" not in recorded[name]:
+        pytest.skip(f"{path} carries no eager peak for {name}")
+    want = recorded[name]["eager_peak_mib"]
+    assert peak <= want + CKPT_RETAINED_LIMIT_MIB, (
+        f"{name}: eager peak {peak:.1f} MiB above the inputs vs {want:.1f} MiB with the reference package"
+    )
