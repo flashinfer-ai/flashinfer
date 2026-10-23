@@ -4586,8 +4586,8 @@ NOPE_CONVERT_MASK = 2
 # its size); hole-free rows give the same bytes on either route.  The value is a measured crossover: the largest
 # measured table at which the one-launch forward stays within 0.95x of the stage route on the eager forward and
 # within 1.02x on the GPU-busy step, plus one, rounded up to the next power of two when the next measured table
-# also stays within 1.02x on the GPU-busy step.  1 << 20 is the provisional value until the ladder of this round
-# is run.
+# also stays within 1.02x on the GPU-busy step.  Measured on GB200 and GB300 (CUDA 13.4): tables up to 1024 x 512
+# qualify and the two one-million-slot tables (4096 x 256, 1024 x 1024) meet the step gate, so the limit is 1 << 20.
 NOPE_CONVERT_SLOT_LIMIT = 1 << 20
 _INT32_MAX = 2**31 - 1
 
