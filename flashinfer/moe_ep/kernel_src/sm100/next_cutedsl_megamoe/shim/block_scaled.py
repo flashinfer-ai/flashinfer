@@ -198,9 +198,9 @@ class BlockScaledMoeConfig:
                 f"across world_size ({self.world_size})."
             )
         vec = self.sf_vec_size
-        if self.hidden % (4 * vec) != 0:
+        if self.hidden % self.hidden_alignment != 0:
             raise ValueError(
-                f"hidden ({self.hidden}) must be a multiple of {4 * vec} "
+                f"hidden ({self.hidden}) must be a multiple of {self.hidden_alignment} "
                 f"for {self.quant_kind}."
             )
         if self.intermediate % (2 * vec) != 0 or self.intermediate % 32 != 0:
@@ -411,6 +411,10 @@ class BlockScaledMoeConfig:
     @property
     def sf_vec_size(self) -> int:
         return _KIND_TABLE[self.quant_kind][2]
+
+    @property
+    def hidden_alignment(self) -> int:
+        return 4 * self.sf_vec_size
 
     @property
     def instruction_k(self) -> int:

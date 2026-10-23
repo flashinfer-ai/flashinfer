@@ -1450,3 +1450,25 @@ def test_standard_cake_requires_reducer_warmup(monkeypatch):
         backend.validate_capture_ready(workspace, None)
     monkeypatch.setattr(cake, "is_cake_megamoe_topk_reduce_module_loaded", lambda: True)
     backend.validate_capture_ready(workspace, None)
+
+
+@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
+def test_standard_hidden_alignment_preserves_genphase_constraints(kind):
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
+        Sm100BlockScaledMoeConfig,
+        Sm100GenphaseMoeConfig,
+    )
+
+    fields = dict(
+        num_total_experts=4,
+        max_tokens_per_rank=65,
+        num_topk=2,
+        hidden=192,
+        intermediate=128,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+    )
+    assert Sm100BlockScaledMoeConfig(**fields).hidden_alignment == 64
+    with pytest.raises(ValueError, match="multiple of 128"):
+        Sm100GenphaseMoeConfig(**fields)

@@ -36,6 +36,10 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
         return 64 if self.quant_kind == "nvfp4" else 32
 
     @property
+    def hidden_alignment(self) -> int:
+        return 64
+
+    @property
     def resolved_mma_tiler_mnk(self) -> tuple[int, int, int]:
         return self.mma_tiler_mnk or (256, 128, 128)
 
