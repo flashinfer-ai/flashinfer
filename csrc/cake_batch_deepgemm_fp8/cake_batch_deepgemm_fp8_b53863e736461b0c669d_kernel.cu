@@ -218,6 +218,7 @@ kernel_cake_batch_deepgemm_fp8_b53863e736461b0c669d(const __grid_constant__ CUte
                 for (int strip = 0; strip < 14; strip++) {
                     int col_strip = strip * 16;
                     if (epi_warp == 0) {
+                        asm volatile("cp.async.bulk.commit_group;");
                         asm volatile("cp.async.bulk.wait_group.read 1;");
                     }
                     __syncwarp();
@@ -261,7 +262,6 @@ kernel_cake_batch_deepgemm_fp8_b53863e736461b0c669d(const __grid_constant__ CUte
                                 tma_store_2d((&C_tma), off_n, flat_row + (unsigned int)col_strip, stage_base);
                                 tma_store_2d((&C_tma), off_n + 64, flat_row + (unsigned int)col_strip, stage_base + 2048);
                             }
-                            asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                     __syncwarp();
@@ -277,6 +277,7 @@ kernel_cake_batch_deepgemm_fp8_b53863e736461b0c669d(const __grid_constant__ CUte
                 if (epi_stage == 2) { epi_stage = 0; _phase_mainloop_done ^= 1; }
             }
             if (epi_warp == 0) {
+                asm volatile("cp.async.bulk.commit_group;");
                 asm volatile("cp.async.bulk.wait_group.read 0;");
             }
         }
