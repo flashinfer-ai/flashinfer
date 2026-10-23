@@ -25,9 +25,6 @@ from ....attention.prims_ts.kernels.mla_decode.helpers.ops import (
     pack_float4_to_fp8_e4m3,
 )
 from ....attention.prims_ts.kernels.mla_decode.helpers.stage import MlaStage
-from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
-    validate_split_softmax_scale_config,
-)
 from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
     SmemKvResource,
 )
@@ -322,12 +319,6 @@ class MixedFp8KvProducer(Fp4Fp8KvProducer):
         return bind_combined_sparse_views(
             indices, seq_lens, topk_lens, pools, capacity, request
         )
-
-    def pipeline_config(self, cfg, load_group, umma_group, cta_layout_vmnk):
-        if not cfg.sparse_split_softmax_scale:
-            raise ValueError("mixed V4.1 KV requires ordered runtime BMM1 softmax")
-        validate_split_softmax_scale_config(cfg)
-        return super().pipeline_config(cfg, load_group, umma_group, cta_layout_vmnk)
 
     def make_resource(self, pools, *, runtime_args=None, **kwargs):
         if runtime_args is not None:

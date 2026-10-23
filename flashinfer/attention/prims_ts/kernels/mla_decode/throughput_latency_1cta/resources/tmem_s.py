@@ -63,9 +63,7 @@ from ...helpers.layout import (
     softmax_scratch_words,
 )
 from ...helpers.math import (
-    fadd2,
     ffma2,
-    fmul2,
     float_to_u32_for_atomic_max,
     init_softmax_scratch_u32,
     mma_k_step_for_qkv,
@@ -118,7 +116,6 @@ class TmemSResource(MlaResource):
     )
     inst_id: cutlass.Constexpr[int] = 0
     scale_softmax_log2: Float32 = None
-    raw_softmax_scale: Float32 = None
     p_ref: Optional[MemoryResource] = None
     global_ref: Optional[MemoryResource] = None
     cache_seqs: object = None
@@ -899,27 +896,10 @@ class TmemSResource(MlaResource):
             new_max = new_max_arr[0]
             old_sum = sum_arr[0]
             local_sum = self._p_local_sum_arr[0]
-            if cutlass.const_expr(self.cfg.sparse_split_softmax_scale):
-                exp_scale = Float32(1.0)
-                if old_max != new_max:
-                    exp_scale = Float32(0.0)
-                    if old_max != neg_max_f32():
-                        # Match P and the O correction in the raw-max frame;
-                        # never reassociate runtime BMM1 with LOG2_E.
-                        max_delta = fadd2((old_max, old_max), (-new_max, -new_max))
-                        natural_delta = fmul2(
-                            max_delta, (self.raw_softmax_scale, self.raw_softmax_scale)
-                        )
-                        log2_delta = fmul2(
-                            natural_delta,
-                            (self.scale_softmax_log2, self.scale_softmax_log2),
-                        )
-                        exp_scale = cute.math.exp2(log2_delta[0], fastmath=True)
-            else:
-                exp_scale = cute.math.exp2(
-                    self.scale_softmax_log2 * (old_max - new_max),
-                    fastmath=True,
-                )
+            exp_scale = cute.math.exp2(
+                self.scale_softmax_log2 * (old_max - new_max),
+                fastmath=True,
+            )
             updated_sum = exp_scale * old_sum + local_sum
             self.new_max_state[0] = new_max
             self.sum_state[0] = updated_sum

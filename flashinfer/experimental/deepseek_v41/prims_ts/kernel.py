@@ -66,7 +66,6 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4):
     # binaries; both BMM factors remain runtime Float32.
     attention.direct_sparse = True
     attention.direct_static_scales = True
-    attention.direct_split_softmax_scale = True
     attention.direct_sparse_capacities = (128, compressed_k)
     return attention
 
