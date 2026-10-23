@@ -56,7 +56,7 @@ _ROWS_PER_WARP = _HEAD_DIM // _NUM_WARPS
 _CONV_THREADS = 3 * _HEAD_DIM // 4
 _Q_SCALE = _HEAD_DIM**-0.5
 _L2_EPS = 1.0e-6
-_SUPPORTED_HEADS = (8, 12, 24, 32, 48, 96)
+_SUPPORTED_HEADS = (8, 12, 16, 24, 32, 48, 64, 96)
 _CUTE_DSL_MODULE = "fused_kda_decode"
 _SOURCE_FILES = (str(Path(__file__).resolve()),)
 
@@ -101,6 +101,7 @@ def _fused_kda_decode_kernel(
     use_lower_bound: cutlass.Constexpr,
     lower_bound: cutlass.Constexpr,
     norm_eps: cutlass.Constexpr,
+    conv_dim_first: cutlass.Constexpr,
 ):
     thread_idx, _, _ = cute.arch.thread_idx()
     head_idx, row_idx, _ = cute.arch.block_idx()
@@ -196,23 +197,38 @@ def _fused_kda_decode_kernel(
                 weight_registers[(None, width_idx)],
             )
         for history_idx in cutlass.range_constexpr(3):
-            cute.copy(
-                copy_bf16x4,
-                _aligned_tensor(
-                    conv_state[
+            if cutlass.const_expr(conv_dim_first):
+                # DS layout: a channel's history is contiguous, channels are
+                # not, so the four channels are loaded one by one.
+                for element_idx in cutlass.range_constexpr(4):
+                    conv_registers[(element_idx, history_idx)] = conv_state[
                         (
-                            None,
+                            element_idx,
                             channel_in_warp,
                             history_idx,
                             vector_idx,
                             head_idx,
                             slot,
                         )
-                    ],
-                    8,
-                ),
-                conv_registers[(None, history_idx)],
-            )
+                    ]
+            else:
+                cute.copy(
+                    copy_bf16x4,
+                    _aligned_tensor(
+                        conv_state[
+                            (
+                                None,
+                                channel_in_warp,
+                                history_idx,
+                                vector_idx,
+                                head_idx,
+                                slot,
+                            )
+                        ],
+                        8,
+                    ),
+                    conv_registers[(None, history_idx)],
+                )
 
         mixed_registers = cute.make_rmem_tensor((4,), F32)
         for qkv_idx in cutlass.range_constexpr(4):
@@ -237,23 +253,36 @@ def _fused_kda_decode_kernel(
         )
         if is_live:
             for history_idx in cutlass.range_constexpr(3):
-                cute.copy(
-                    copy_bf16x4,
-                    conv_registers[(None, history_idx)],
-                    _aligned_tensor(
+                if cutlass.const_expr(conv_dim_first):
+                    for element_idx in cutlass.range_constexpr(4):
                         conv_state[
                             (
-                                None,
+                                element_idx,
                                 channel_in_warp,
                                 history_idx,
                                 vector_idx,
                                 head_idx,
                                 slot,
                             )
-                        ],
-                        8,
-                    ),
-                )
+                        ] = conv_registers[(element_idx, history_idx)]
+                else:
+                    cute.copy(
+                        copy_bf16x4,
+                        conv_registers[(None, history_idx)],
+                        _aligned_tensor(
+                            conv_state[
+                                (
+                                    None,
+                                    channel_in_warp,
+                                    history_idx,
+                                    vector_idx,
+                                    head_idx,
+                                    slot,
+                                )
+                            ],
+                            8,
+                        ),
+                    )
     elif thread_idx >= _NUM_THREADS - _HEAD_DIM:
         # Four otherwise-idle warps build the per-channel recurrence decay and
         # gated RMSNorm scale once, rather than recomputing them in every warp.
@@ -443,6 +472,7 @@ def _fused_kda_decode_launch(
     use_lower_bound: cutlass.Constexpr,
     lower_bound: cutlass.Constexpr,
     norm_eps: cutlass.Constexpr,
+    conv_dim_first: cutlass.Constexpr,
 ):
     num_heads = A_log.shape[0]
     num_rows = x.shape[0]
@@ -463,18 +493,17 @@ def _fused_kda_decode_launch(
             stride=(1, 4, hidden_size, 4 * hidden_size, _HEAD_DIM),
         ),
     )
+    # (channel in vector, vector, history, q/k/v, head, slot). SD stores the
+    # three history columns as [3, 3 * H * 128] per slot, DS as [3 * H * 128, 3].
+    if cutlass.const_expr(conv_dim_first):
+        conv_strides = (3, 12, 1, 3 * hidden_size, 3 * _HEAD_DIM)
+    else:
+        conv_strides = (1, 4, qkv_size, hidden_size, _HEAD_DIM)
     conv_state_layout = cute.make_tensor(
         conv_state.iterator,
         cute.make_layout(
             (4, 32, 3, 3, num_heads, conv_state.shape[0]),
-            stride=(
-                1,
-                4,
-                qkv_size,
-                hidden_size,
-                _HEAD_DIM,
-                conv_state.stride[0],
-            ),
+            stride=(*conv_strides, conv_state.stride[0]),
         ),
     )
     gate_layout = cute.make_tensor(
@@ -543,6 +572,7 @@ def _fused_kda_decode_launch(
         use_lower_bound,
         lower_bound,
         norm_eps,
+        conv_dim_first,
     ).launch(
         grid=[num_heads, num_rows, 1],
         block=[_NUM_THREADS, 1, 1],
@@ -551,7 +581,7 @@ def _fused_kda_decode_launch(
     )
 
 
-def _make_compile_inputs(state_dtype):
+def _make_compile_inputs(state_dtype, conv_dim_first=False):
     """Build shape- and stride-dynamic inputs for CuTe compilation."""
     num_rows = cute.sym_int()
     num_heads = cute.sym_int()
@@ -577,7 +607,11 @@ def _make_compile_inputs(state_dtype):
     conv_state = cute.runtime.make_fake_tensor(
         BF16,
         shape=(conv_slots, qkv_size, 3),
-        stride=(cute.sym_int64(), 1, qkv_size),
+        stride=(cute.sym_int64(), 3, 1) if conv_dim_first else (
+            cute.sym_int64(),
+            1,
+            qkv_size,
+        ),
         assumed_align=16,
     )
     raw_beta = cute.runtime.make_fake_tensor(
@@ -632,7 +666,9 @@ def _make_compile_inputs(state_dtype):
 
 
 @functools.cache
-def _get_compiled_kernel(state_dtype, lower_bound, norm_eps, packed_t1=False):
+def _get_compiled_kernel(
+    state_dtype, lower_bound, norm_eps, packed_t1=False, conv_dim_first=False
+):
     """Get a shape-dynamic specialization from the two-level CuTe DSL cache."""
     state_is_bf16 = state_dtype == torch.bfloat16
     compile_state_dtype = BF16 if state_is_bf16 else F32
@@ -648,18 +684,20 @@ def _get_compiled_kernel(state_dtype, lower_bound, norm_eps, packed_t1=False):
         f"d128_w4_{gate_name}_state{state_name}"
         f"_eps{str(float(norm_eps)).replace('.', '_').replace('-', 'm')}"
         f"_packed{int(packed_t1)}"
+        f"{'_ds' if conv_dim_first else ''}"
     )
     kernel = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         kernel_name,
         lambda: cute.compile(
             _fused_kda_decode_launch,
-            *_make_compile_inputs(compile_state_dtype),
+            *_make_compile_inputs(compile_state_dtype, conv_dim_first),
             state_is_bf16,
             packed_t1,
             use_lower_bound,
             compile_lower_bound,
             float(norm_eps),
+            conv_dim_first,
             options="--enable-tvm-ffi --generate-line-info",
         ),
         extra_key_files=_SOURCE_FILES,
@@ -919,13 +957,14 @@ def run_fused_kda_decode(
         conv_state.ndim != 3
         or conv_state.shape[1:] != (3 * hidden_size, 3)
         or conv_state.stride(0) < 9 * hidden_size
-        or conv_state.stride(1) != 1
-        or conv_state.stride(2) != 3 * hidden_size
+        or conv_state.stride()[1:] not in ((1, 3 * hidden_size), (3, 1))
     ):
         raise ValueError(
-            "conv_state must have shape [slots, 3 * H * 128, 3] "
-            "and use the SD cache layout"
+            "conv_state must have shape [slots, 3 * H * 128, 3] and use the SD "
+            "(strides [slot, 1, 3 * H * 128]) or DS (strides [slot, 3, 1]) "
+            "cache layout"
         )
+    conv_dim_first = conv_state.stride(2) == 1
     if raw_gate.shape != (1, num_rows, num_heads, _HEAD_DIM):
         raise ValueError("raw_gate must have shape [1, num_rows, H, 128]")
     if not raw_gate.is_contiguous():
@@ -1018,7 +1057,7 @@ def run_fused_kda_decode(
         raise ValueError("packed T=1 metadata requires backend='cute-dsl'")
 
     cake_variant = None
-    if backend != "cute-dsl" and state_indices_mode is not None:
+    if backend != "cute-dsl" and state_indices_mode is not None and not conv_dim_first:
         cake_variant = _select_cake_variant(
             x=x,
             conv_state=conv_state,
@@ -1056,7 +1095,11 @@ def run_fused_kda_decode(
         )
 
     kernel = _get_compiled_kernel(
-        state.dtype, lower_bound, float(norm_eps), packed_t1=packed_t1
+        state.dtype,
+        lower_bound,
+        float(norm_eps),
+        packed_t1=packed_t1,
+        conv_dim_first=conv_dim_first,
     )
     args = (
         x,

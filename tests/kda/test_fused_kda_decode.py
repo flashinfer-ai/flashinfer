@@ -322,6 +322,44 @@ def test_fused_kda_decode_kimi_k3_shapes(num_heads, num_rows):
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("num_heads", "num_rows"),
+    [(16, 1), (16, 64), (64, 1), (64, 32)],
+    ids=["h16-n1", "h16-n64", "h64-n1", "h64-n32"],
+)
+def test_fused_kda_decode_glm_heads_and_ds_layout(num_heads, num_rows, state_dtype):
+    """GLM-5.3-Flash ranks hold 16 (TP4) or 64 (TP1) heads, and vLLM's NIXL
+    prefill/decode transfer needs its dimension-first (DS) conv-state layout,
+    [slots, 3 * H * 128, 3] with strides [slot, 3, 1]. DS must match SD
+    bit for bit."""
+    inputs = _make_inputs(num_heads, num_rows, state_dtype=state_dtype)
+    reference_conv_state = _clone_strided(inputs["conv_state"])
+    reference_state = _clone_strided(inputs["state"])
+    expected = _reference(inputs, reference_conv_state, reference_state)
+
+    results = {}
+    for layout in ("SD", "DS"):
+        conv_state = (
+            _clone_strided(inputs["conv_state"])
+            if layout == "SD"
+            else inputs["conv_state"].contiguous()
+        )
+        state = _clone_strided(inputs["state"])
+        output = _fused_kda_decode(
+            **{**inputs, "conv_state": conv_state, "state": state}
+        )
+        results[layout] = (output, conv_state, state)
+
+    actual, actual_conv_state, actual_state = results["DS"]
+    assert actual_conv_state.stride()[1:] == (3, 1)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+    torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
+    for ds, sd in zip(results["DS"], results["SD"]):
+        torch.testing.assert_close(ds, sd, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_rows", [1, 4, 32, 128])
 def test_fused_kda_decode_kimi_linear_softplus(num_rows, state_dtype):
     inputs = _make_inputs(num_heads=32, num_rows=num_rows, state_dtype=state_dtype)
@@ -484,6 +522,8 @@ def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
         pytest.param(32, 2, 4, id="h32-n2-t4"),
         pytest.param(48, 2, 8, id="h48-n2-t8"),
         pytest.param(96, 1, 3, id="h96-n1-t3"),
+        pytest.param(16, 4, 3, id="h16-n4-t3"),
+        pytest.param(64, 2, 2, id="h64-n2-t2"),
         pytest.param(12, 32, 5, id="h12-n32-t5-wide"),
     ],
 )
