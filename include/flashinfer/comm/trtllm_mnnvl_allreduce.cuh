@@ -46,6 +46,8 @@ enum class QuantType : int {
   kFP8 = 1,
   kFP4 = 2,
   kDynamicFP8 = 3,
+  // E4M3 data with one UE8M0 scale per 32 elements (SWIZZLED_128x4 or LINEAR scales).
+  kMXFP8 = 4,
 };
 
 struct AllReduceFusionParams {
@@ -1050,7 +1052,11 @@ __global__ void __launch_bounds__(1024)
         tokenDim, packedIdx, params.sfLayout);
   }
 #endif
-  else if constexpr (QType == QuantType::kDynamicFP8) {
+  else if constexpr (QType == QuantType::kMXFP8) {
+    trtllm_allreduce_fusion::utils::mxfp8_quantize_store<T, kELTS_PER_THREAD>(
+        packedAccum.elements, token, packedIdx * kELTS_PER_THREAD, tokenDim, params.sfLayout,
+        params.quantOutPtr, params.scalingFactorOutPtr);
+  } else if constexpr (QType == QuantType::kDynamicFP8) {
     float threadMax = 0.F;
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
@@ -1100,6 +1106,15 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 
   auto [blockSize, clusterSize, loadsPerThread] =
       adjustGridConfig(numTokens, tokenDim, eltsPerThread, true);
+  if (params.quantType == QuantType::kMXFP8) {
+    // Keep every 32-element scale group inside one CTA (and warp): its threads reduce the
+    // group amax with warp shuffles. Narrowing the cluster widens the CTA.
+    int const threadsPerSf = trtllm_allreduce_fusion::details::kMXFP8SFVecSize / eltsPerThread;
+    while (blockSize % threadsPerSf != 0 && clusterSize > 1) {
+      clusterSize /= 2;
+      blockSize = ceil_div(ceil_div(tokenDim, eltsPerThread), clusterSize);
+    }
+  }
   dim3 grid(numTokens, clusterSize, 1);
 
   FLASHINFER_LOG_DEBUG(
@@ -1124,7 +1139,8 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
           "[MNNVL AllReduceOneShot] quantOut must be non-null when quantization is enabled");
       return cudaErrorInvalidValue;
     }
-    if (params.quantType != QuantType::kDynamicFP8 && params.outputScale == nullptr) {
+    if (params.quantType != QuantType::kDynamicFP8 && params.quantType != QuantType::kMXFP8 &&
+        params.outputScale == nullptr) {
       FLASHINFER_ERROR(
           "[MNNVL AllReduceOneShot] outputScale must be non-null for static quantization");
       return cudaErrorInvalidValue;
@@ -1133,6 +1149,23 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   if (params.quantType == QuantType::kDynamicFP8 && params.scalingFactorOut == nullptr) {
     FLASHINFER_ERROR("[MNNVL AllReduceOneShot] scale_out is required for dynamic FP8");
     return cudaErrorInvalidValue;
+  }
+  if (params.quantType == QuantType::kMXFP8) {
+    if (params.scalingFactorOut == nullptr) {
+      FLASHINFER_ERROR("[MNNVL AllReduceOneShot] scale_out is required for MXFP8 quantization");
+      return cudaErrorInvalidValue;
+    }
+    if (tokenDim % trtllm_allreduce_fusion::details::kMXFP8SFVecSize != 0) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceOneShot] MXFP8 quantization requires tokenDim divisible by 32");
+      return cudaErrorInvalidValue;
+    }
+    if (params.sfLayout != QuantizationSFLayout::SWIZZLED_128x4 &&
+        params.sfLayout != QuantizationSFLayout::LINEAR) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceOneShot] MXFP8 supports SWIZZLED_128x4 or LINEAR scale layouts");
+      return cudaErrorInvalidValue;
+    }
   }
   if (params.quantType == QuantType::kFP4) {
 #if CUDA_VERSION < 12080
@@ -1195,6 +1228,9 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
         break;                                                                       \
       case QuantType::kDynamicFP8:                                                   \
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kDynamicFP8);           \
+        break;                                                                       \
+      case QuantType::kMXFP8:                                                        \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kMXFP8);                \
         break;                                                                       \
       case QuantType::kNone:                                                         \
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kNone);                 \
@@ -1498,6 +1534,11 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
             params.tokenDim, tokenOffset / kELTS_PER_LOAD, params.sfLayout);
       }
 #endif
+      else if constexpr (QType == QuantType::kMXFP8) {
+        trtllm_allreduce_fusion::utils::mxfp8_quantize_store<T, kELTS_PER_LOAD>(
+            out.elements, token, tokenOffset, params.tokenDim, params.sfLayout, params.quantOutPtr,
+            params.scalingFactorOutPtr);
+      }
     }
   }
 
@@ -1568,7 +1609,8 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
           "[MNNVL AllReduceTwoShot] quantOut must be non-null when quantization is enabled");
       return cudaErrorInvalidValue;
     }
-    if (params.quantType != QuantType::kDynamicFP8 && params.outputScale == nullptr) {
+    if (params.quantType != QuantType::kDynamicFP8 && params.quantType != QuantType::kMXFP8 &&
+        params.outputScale == nullptr) {
       FLASHINFER_ERROR(
           "[MNNVL AllReduceTwoShot] outputScale must be non-null for static quantization");
       return cudaErrorInvalidValue;
@@ -1577,6 +1619,23 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   if (params.quantType == QuantType::kDynamicFP8 && params.scalingFactorOut == nullptr) {
     FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] scale_out is required for dynamic FP8");
     return cudaErrorInvalidValue;
+  }
+  if (params.quantType == QuantType::kMXFP8) {
+    if (params.scalingFactorOut == nullptr) {
+      FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] scale_out is required for MXFP8 quantization");
+      return cudaErrorInvalidValue;
+    }
+    if (tokenDim % trtllm_allreduce_fusion::details::kMXFP8SFVecSize != 0) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceTwoShot] MXFP8 quantization requires tokenDim divisible by 32");
+      return cudaErrorInvalidValue;
+    }
+    if (params.sfLayout != QuantizationSFLayout::SWIZZLED_128x4 &&
+        params.sfLayout != QuantizationSFLayout::LINEAR) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceTwoShot] MXFP8 supports SWIZZLED_128x4 or LINEAR scale layouts");
+      return cudaErrorInvalidValue;
+    }
   }
   if (params.quantType == QuantType::kFP4) {
 #if CUDA_VERSION < 12080
@@ -1692,6 +1751,29 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     rnUseCGA = false;
   }
 
+  if (params.quantType == QuantType::kMXFP8) {
+    // Keep every 32-element scale group inside one CTA and one warp (see the oneshot dispatch).
+    // With a cluster each CTA owns a contiguous chunk of blockSize packed loads, so narrow the
+    // cluster; without one, a CTA covers the row in strides of blockSize loads, so round the
+    // CTA up (the extra threads skip the out-of-range tail).
+    int const threadsPerSf = trtllm_allreduce_fusion::details::kMXFP8SFVecSize / numEltsPerThread;
+    int const threadsNeeded = ceil_div(tokenDim, numEltsPerThread);
+    while (rnUseCGA && rnBlockSize % threadsPerSf != 0 && rnClusterSize > 1) {
+      rnClusterSize /= 2;
+      rnBlockSize = ceil_div(threadsNeeded, rnClusterSize);
+    }
+    if (rnClusterSize == 1) {
+      rnUseCGA = false;
+    }
+    if (rnBlockSize > 1024 && !rnUseCGA) {
+      rnLoadsPerThread = ceil_div(threadsNeeded, 1024);
+      rnBlockSize = ceil_div(threadsNeeded, rnLoadsPerThread);
+    }
+    if (!rnUseCGA) {
+      rnBlockSize = round_up(rnBlockSize, threadsPerSf);
+    }
+  }
+
   if (rnBlockSize > 1024 || rnLoadsPerThread > 8) {
     FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] Unsupported hidden dimension " +
                      std::to_string(tokenDim));
@@ -1758,6 +1840,9 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       break;                                                                       \
     case QuantType::kDynamicFP8:                                                   \
       LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kDynamicFP8);    \
+      break;                                                                       \
+    case QuantType::kMXFP8:                                                        \
+      LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kMXFP8);         \
       break;                                                                       \
     case QuantType::kNone:                                                         \
       LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kNone);          \
