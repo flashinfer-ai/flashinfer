@@ -32,10 +32,14 @@ evaluates the SiLU derivative in FP32 from the rounded value ``p`` (policy A),
     dx[t, c]      = bf16(sum_k w[c, k] * dpre[t + 3 - k, c])   # dpre of another document is 0
     dweight[c, k] = sum_t dpre[t, c] * x[t - 3 + k, c]         # FP32, fixed order
 
-in one cooperative launch: ``dweight`` is reduced in a fixed order through a
-per-CTA FP32 partial workspace (no floating-point atomics), so it is bitwise
-reproducible for a given ``(S, C, device)``.  Nothing is saved from the
-forward but ``x``, ``w`` and ``cu_seqlens``.
+in two ordinary launches on one stream: a persistent main program writes
+``dx`` and one FP32 partial row of ``dweight`` per CTA into a workspace, and a
+reduce program launched programmatically dependent on it sums the rows in a
+fixed order (no floating-point atomics), so ``dweight`` is bitwise
+reproducible for a given ``(S, C, device)``.  Neither launch is cooperative:
+the backward keeps its speed while kernels of other streams (NCCL
+collectives) are resident, which a whole-device cooperative grid had to wait
+for.  Nothing is saved from the forward but ``x``, ``w`` and ``cu_seqlens``.
 
 Inputs and outputs are contiguous (``C`` a multiple of 8); ``weight`` and
 ``dweight`` are FP32 ``[C, 4]``.  ``S``, ``C`` and the document count are
@@ -147,7 +151,11 @@ def cake_causal_conv1d_train_backward(
 
     Recomputes the FP32 preactivation from ``x``, rounds it to BF16 and takes
     the SiLU derivative of the rounded value (policy A), then produces ``dx``
-    and the FP32 weight gradient in one cooperative launch.
+    and the FP32 weight gradient in two ordinary launches on the current
+    stream: the main program writes ``dx`` and per-CTA partial rows of the
+    weight gradient, and a reduce program launched programmatically dependent
+    on it sums the rows in a fixed order (no cooperative grid, so kernels
+    resident on other streams never stall the call).
 
     The architecture's backward route may ship several programs of the kernel;
     a call runs exactly one, chosen by ``C`` through a host-side rule of the

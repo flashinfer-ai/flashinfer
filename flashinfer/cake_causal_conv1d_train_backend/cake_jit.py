@@ -27,33 +27,54 @@ map.  What to compile -- sources, digests, nvcc flags -- is recorded once in
 and otherwise through FlashInfer's JIT from the same sources and flags,
 verifying every source digest before the first build.
 
-A route lists every program one public call may launch: ``fwd`` (``y`` from
+A route lists every program one public call may select: ``fwd`` (``y`` from
 ``x``, ``weight`` and ``cu_seqlens``) and ``bwd`` (``dx`` and the deterministic
-FP32 ``dweight`` in one cooperative launch).  The forward launches its route in
-order.  The backward route of an architecture may carry several programs of
-the kernel and launches exactly one per call, chosen by the channel count: a
-record's ``select_rule`` (``channels_at_least``: ``C >= channels[arch]``)
-names the channel counts it owns, of several owners the one of the highest
-threshold runs, the record without a rule is the architecture's fallback, and
-:func:`selected_modules` applies that rule (a pure function of the
-architecture and ``C``; the host never reads the data).
+FP32 ``dweight``).  The forward launches its route in order.  The backward
+route of an architecture may carry several programs of the kernel and selects
+exactly one per call, chosen by the channel count: a record's ``select_rule``
+(``channels_at_least``: ``C >= channels[arch]``) names the channel counts it
+owns, of several owners the one of the highest threshold runs, the record
+without a rule is the architecture's fallback, and :func:`selected_modules`
+applies that rule (a pure function of the architecture and ``C``; the host
+never reads the data).
+
+A backward call is two ordinary launches on one stream.  The selected program
+(persistent, ``ctas_per_sm x SM count`` CTAs) writes ``dx`` and one FP32
+partial row of ``dweight`` per CTA into the workspace and signals its
+dependents; then the route's reduce program (``record["reduce"]``), launched
+programmatically dependent on it (``launch.use_pdl``: its binding sets the
+programmatic-stream-serialization attribute, and the kernel waits for the
+main grid before its first load), sums the rows per channel in a fixed order.
+Until round 6 the backward was one cooperative launch whose grid-wide barrier
+preceded the same reduction in-kernel.  A cooperative grid cannot start while
+any kernel is resident on another stream -- NCCL collectives are, for most of
+a training backward (FlashInfer issue #7038) -- whereas an ordinary launch
+whose CTAs find no free slot runs them in a later wave.  The grid and the
+reduction order are unchanged, so ``dweight`` is bitwise what the cooperative
+form produced.
 Token and channel counts are runtime scalars, so a changed problem size never
 recompiles anything; building every library of the architecture
 (:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
 capture.
 
 The host plan is the three functions :func:`plan` (the kernel scalars),
-:func:`launch_grid` (the grid) and :func:`partial_rows` (the backward
-workspace rows); everything else derives from them.  The public workspace is
-sized by the largest grid of the architecture's backward programs
-(:func:`workspace_record`, the capacity owner); each program writes and
-reduces the leading rows of its own grid.
+:func:`launch_grid` (the grid: ``co_resident`` and ``occupancy`` records
+launch ``ctas_per_sm x SM count`` CTAs, ``channels_per_cta`` records ``ceil(C
+/ channels_per_cta)``)
+and :func:`partial_rows` (the backward workspace rows, the ``rows`` scalar of
+the reduce program); everything else derives from them.  The public workspace
+is sized by the largest grid of the architecture's backward programs
+(:func:`workspace_record`, the capacity owner); each program writes the
+leading rows of its own grid and its reduce program sums exactly those.
 
 The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
-from; the forward is built with its kernel file's default keywords; the
-backward with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
+from; the forward and the reduce program are built with their kernel files'
+default keywords; every backward program carries ``revision=6`` (the build
+revision of the split that retired the cooperative form; the exporter hashes
+it so the split programs replaced the cooperative ones under new names) and is
+built with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
 thread; 2-D TMA row copies) on sm_100a and sm_103a, with ``vec=8,
 min_blocks=2`` (two CTAs per SM) on sm_107a, and the backwards the
 ``channels_at_least`` rules select, builds of ``vec=8, copy="tma2d",
@@ -147,7 +168,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd",
         "workspace_rule": None,
     },
-    "cake_causal_conv1d_train_21cc8e5b2b49282a47ef": {
+    "cake_causal_conv1d_train_e08749684c395f2ab65e": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -174,30 +195,33 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # Cooperative (a grid-wide barrier precedes the fixed-order dweight
-        # reduction): the grid is exactly the co-resident CTA count.
+        # An ordinary launch of ``ctas_per_sm x SM count`` CTAs, the measured
+        # co-residency (a CTA another stream's kernel displaces runs in a
+        # later wave; the grid, hence the partial rows and the dweight order,
+        # never changes).  Each CTA writes one partial row; ``reduce`` sums
+        # them.
         # ``ctas_per_sm``: 3 CTAs per SM (168 registers at 128 threads, the
         # launch bound; ncu launch__occupancy_limit_registers), the occupancy
         # query's answer on B200 and GB300.
         "grid_rule": {
-            "cooperative": True,
+            "cooperative": False,
             "ctas_per_sm": 3,
             "geometry": {
                 "threads": 128,
                 "vec": 8,
             },
-            "kind": "co_resident",
+            "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+        "kernel": "cake_causal_conv1d_train_e08749684c395f2ab65e",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_e08749684c395f2ab65e",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
-            "cooperative": True,
+            "cooperative": False,
             "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+        "library": "cake_causal_conv1d_train_e08749684c395f2ab65e",
         "logical": {
             "C": "C",
             "S": "S",
@@ -216,16 +240,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "x": "x",
             "x_map": "x",
         },
+        "reduce": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
         "role": "bwd",
         # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
         # rows (row ``b // n_ch_tiles`` belongs to CTA ``b``) the kernel fully
-        # writes and reduces in a fixed order; nothing is zeroed by the host.
+        # writes and ``reduce`` sums in a fixed order; nothing is zeroed by the
+        # host.
         "workspace_rule": {
             "kind": "partial_rows",
             "taps": 4,
         },
     },
-    "cake_causal_conv1d_train_a93b636beb1d573942bf": {
+    "cake_causal_conv1d_train_9a07bcaa0223632640ee": {
         "arches": [
             "sm_107a",
         ],
@@ -249,32 +275,35 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # Cooperative (a grid-wide barrier precedes the fixed-order dweight
-        # reduction): the grid is exactly the co-resident CTA count.
+        # An ordinary launch of ``ctas_per_sm x SM count`` CTAs, the measured
+        # co-residency (a CTA another stream's kernel displaces runs in a
+        # later wave; the grid, hence the partial rows and the dweight order,
+        # never changes).  Each CTA writes one partial row; ``reduce`` sums
+        # them.
         # ``ctas_per_sm``: 2 CTAs per SM, the program's ``min_blocks`` 2 launch
         # bound (234 registers at 128 threads; ncu
         # launch__occupancy_limit_registers), the occupancy query's answer on
         # R200; the ``min_blocks`` 3 build of the other two architectures
         # measured 10 % slower at C = 128 on its 212 SMs.
         "grid_rule": {
-            "cooperative": True,
+            "cooperative": False,
             "ctas_per_sm": 2,
             "geometry": {
                 "threads": 128,
                 "vec": 8,
             },
-            "kind": "co_resident",
+            "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_a93b636beb1d573942bf",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_a93b636beb1d573942bf",
+        "kernel": "cake_causal_conv1d_train_9a07bcaa0223632640ee",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_9a07bcaa0223632640ee",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
-            "cooperative": True,
+            "cooperative": False,
             "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_a93b636beb1d573942bf",
+        "library": "cake_causal_conv1d_train_9a07bcaa0223632640ee",
         "logical": {
             "C": "C",
             "S": "S",
@@ -291,10 +320,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "w": "w",
             "x": "x",
         },
+        "reduce": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
         "role": "bwd",
         # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
         # rows (row ``b // n_ch_tiles`` belongs to CTA ``b``) the kernel fully
-        # writes and reduces in a fixed order; nothing is zeroed by the host.
+        # writes and ``reduce`` sums in a fixed order; nothing is zeroed by the
+        # host.
         "workspace_rule": {
             "kind": "partial_rows",
             "taps": 4,
@@ -304,7 +335,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # with stage_tokens 8, copy tma2d, min_blocks 2 (2 CTAs per SM); it runs when
     # C >= select_rule.channels[arch] and no routed record of a higher threshold
     # admits C; below every threshold the fallback record (no select_rule) runs.
-    "cake_causal_conv1d_train_90351ecca30604957251": {
+    "cake_causal_conv1d_train_37e428406a0cc4a8ca1b": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -333,24 +364,24 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {
-            "cooperative": True,
+            "cooperative": False,
             "ctas_per_sm": 2,
             "geometry": {
                 "threads": 128,
                 "vec": 8,
             },
-            "kind": "co_resident",
+            "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_90351ecca30604957251",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_90351ecca30604957251",
+        "kernel": "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
-            "cooperative": True,
+            "cooperative": False,
             "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_90351ecca30604957251",
+        "library": "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
         "logical": {
             "C": "C",
             "S": "S",
@@ -369,6 +400,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "x": "x",
             "x_map": "x",
         },
+        "reduce": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
         "role": "bwd",
         "select_rule": {
             "channels": {
@@ -389,7 +421,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # (2 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
     # routed record of a higher threshold admits C; below every threshold the
     # fallback record (no select_rule) runs.
-    "cake_causal_conv1d_train_0a99a2434b55be502f04": {
+    "cake_causal_conv1d_train_be6f561d1572ef3c852a": {
         "arches": [
             "sm_103a",
             "sm_107a",
@@ -417,24 +449,24 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {
-            "cooperative": True,
+            "cooperative": False,
             "ctas_per_sm": 2,
             "geometry": {
                 "threads": 128,
                 "vec": 8,
             },
-            "kind": "co_resident",
+            "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_0a99a2434b55be502f04",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_0a99a2434b55be502f04",
+        "kernel": "cake_causal_conv1d_train_be6f561d1572ef3c852a",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_be6f561d1572ef3c852a",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
-            "cooperative": True,
+            "cooperative": False,
             "dynamic_smem_bytes": 66560,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_0a99a2434b55be502f04",
+        "library": "cake_causal_conv1d_train_be6f561d1572ef3c852a",
         "logical": {
             "C": "C",
             "S": "S",
@@ -453,6 +485,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "x": "x",
             "x_map": "x",
         },
+        "reduce": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
         "role": "bwd",
         "select_rule": {
             "channels": {
@@ -472,7 +505,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # (2 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
     # routed record of a higher threshold admits C; below every threshold the
     # fallback record (no select_rule) runs.
-    "cake_causal_conv1d_train_a3be389511a0f0889469": {
+    "cake_causal_conv1d_train_aeff6106e2822f313a0c": {
         "arches": [
             "sm_107a",
         ],
@@ -499,24 +532,24 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {
-            "cooperative": True,
+            "cooperative": False,
             "ctas_per_sm": 2,
             "geometry": {
                 "threads": 128,
                 "vec": 8,
             },
-            "kind": "co_resident",
+            "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_a3be389511a0f0889469",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_a3be389511a0f0889469",
+        "kernel": "cake_causal_conv1d_train_aeff6106e2822f313a0c",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_aeff6106e2822f313a0c",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
-            "cooperative": True,
+            "cooperative": False,
             "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_a3be389511a0f0889469",
+        "library": "cake_causal_conv1d_train_aeff6106e2822f313a0c",
         "logical": {
             "C": "C",
             "S": "S",
@@ -535,6 +568,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "x": "x",
             "x_map": "x",
         },
+        "reduce": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
         "role": "bwd",
         "select_rule": {
             "channels": {
@@ -547,13 +581,66 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
+    # The reduce program every backward route shares: the second launch of a
+    # backward call.  Launched programmatically dependent on the main program
+    # (``use_pdl``: the binding sets the programmatic-stream-serialization
+    # launch attribute; the kernel's first statement waits for the main grid,
+    # so the launch latency overlaps the main kernel's tail and an ordinary
+    # launch stays correct), it sums the ``rows`` FP32 ``[C, 4]`` partial rows
+    # of the workspace per channel in the order the cooperative backward used
+    # in-kernel -- one warp per channel, lane sums over rows ``lane, lane +
+    # 32, ...`` then the xor tree 16, 8, 4, 2, 1 -- so ``dweight`` is bitwise
+    # what one launch produced.  Built with its kernel file's default
+    # keywords, one program for the three architectures.
+    "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "partial"],
+            ["buffer", "dw"],
+            ["parameter", "C"],
+            ["parameter", "rows"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # One warp per channel, four channels per 128-thread CTA: the grid is
+        # ``ceil(C / channels_per_cta)`` CTAs, a function of the call's ``C``.
+        "grid_rule": {
+            "channels_per_cta": 4,
+            "cooperative": False,
+            "kind": "channels_per_cta",
+        },
+        "kernel": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
+        "logical": {
+            "C": "C",
+            "dw": "dw",
+            "partial": "partial",
+            "rows": "rows",
+        },
+        "role": "reduce",
+        "workspace_rule": None,
+    },
 }
 
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
-            "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
-            "cake_causal_conv1d_train_90351ecca30604957251",
+            "cake_causal_conv1d_train_e08749684c395f2ab65e",
+            "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -561,9 +648,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_103a": {
         "bwd": [
-            "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
-            "cake_causal_conv1d_train_90351ecca30604957251",
-            "cake_causal_conv1d_train_0a99a2434b55be502f04",
+            "cake_causal_conv1d_train_e08749684c395f2ab65e",
+            "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
+            "cake_causal_conv1d_train_be6f561d1572ef3c852a",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -571,10 +658,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_107a": {
         "bwd": [
-            "cake_causal_conv1d_train_a93b636beb1d573942bf",
-            "cake_causal_conv1d_train_90351ecca30604957251",
-            "cake_causal_conv1d_train_0a99a2434b55be502f04",
-            "cake_causal_conv1d_train_a3be389511a0f0889469",
+            "cake_causal_conv1d_train_9a07bcaa0223632640ee",
+            "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
+            "cake_causal_conv1d_train_be6f561d1572ef3c852a",
+            "cake_causal_conv1d_train_aeff6106e2822f313a0c",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -593,6 +680,19 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 7): "sm_107a",
 }
 KINDS = ("fwd", "bwd")
+# The role of a module record: a forward program, a backward program (the
+# first launch of a backward call) or the reduce program a backward record
+# names in ``record["reduce"]`` (the second launch).
+ROLES = ("fwd", "bwd", "reduce")
+# The grid-rule vocabulary (``record["grid_rule"]["kind"]``, see
+# :func:`launch_grid`): ``co_resident`` and ``occupancy`` launch ``ctas_per_sm
+# x SM count`` CTAs -- the former names a grid that must be exactly the
+# co-resident count (the forward's record and the cooperative KCP programs of
+# :mod:`.kcp_jit`, which share this host plan), the latter a grid sized by
+# occupancy and launched normally (the backward programs since the split);
+# ``channels_per_cta`` launches ``ceil(C / channels_per_cta)`` CTAs (the
+# reduce programs).
+GRID_KINDS = ("co_resident", "occupancy", "channels_per_cta")
 # The selection-rule vocabulary of a backward record (``record["select_rule"]
 # ["kind"]``); of the records whose rule admits a call the one of the highest
 # threshold runs, a backward record without a rule is its route's fallback and
@@ -619,7 +719,8 @@ LOGICAL_TENSORS = (
     "dw",
     "partial",
 )
-LOGICAL_SCALARS = (
+# The scalars :func:`plan` derives from ``(S, C, num_docs)`` and a geometry.
+PLAN_SCALARS = (
     "S",
     "C",
     "num_docs",
@@ -628,6 +729,10 @@ LOGICAL_SCALARS = (
     "n_sub",
     "n_ch_tiles",
 )
+# ``rows``, the partial rows of the selected backward program's grid
+# (:func:`partial_rows`), is the reduce program's row count; the host sets it
+# from the grid, not from :func:`plan`.
+LOGICAL_SCALARS = (*PLAN_SCALARS, "rows")
 
 
 def arch_for_capability(device_capability: Sequence[int]) -> str | None:
@@ -649,10 +754,12 @@ def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
 
 
 def route_modules(arch: str, kind: str) -> tuple[str, ...]:
-    """Ordered module names of one route on ``arch`` (every program the route may launch).
+    """Ordered module names of one route on ``arch`` (every program the route may select).
 
     The forward launches them all, in order; the backward launches the one
-    :func:`selected_modules` picks for the call's channel count.
+    :func:`selected_modules` picks for the call's channel count, then that
+    record's ``reduce`` program (not listed in the route: the route is the
+    selection, and the reduce program is shared).
     """
 
     if kind not in KINDS:
@@ -704,11 +811,11 @@ def _admits(rule: dict[str, Any], *, arch: str, C: int) -> bool:
 def selected_modules(
     arch: str, kind: str, *, C: int, S: int | None = None
 ) -> tuple[str, ...]:
-    """Ordered module names one public call launches on ``arch`` for ``C`` channels.
+    """Ordered module names one public call selects on ``arch`` for ``C`` channels.
 
     The forward launches every program of its route (:func:`route_modules`).
-    The backward route may carry several programs of the kernel and launches
-    exactly one: of the records whose :func:`select_rule` admits ``C`` on
+    The backward route may carry several programs of the kernel and selects
+    exactly one (the call launches it, then its ``reduce`` program): of the records whose :func:`select_rule` admits ``C`` on
     ``arch`` the one of the highest threshold, else the route's single fallback
     record (the one without a rule).  The choice is a pure function of the
     architecture and the channel count -- ``S`` is accepted and unused, and the
@@ -852,29 +959,46 @@ def sm_count(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
 
 
-def launch_grid(record: dict[str, Any], *, device_index: int) -> tuple[int, int, int]:
+def launch_grid(
+    record: dict[str, Any], *, device_index: int, C: int | None = None
+) -> tuple[int, int, int]:
     """Launch grid of one module on ``device_index`` under its recorded grid rule.
 
-    ``co_resident`` modules launch exactly ``ctas_per_sm x SM count`` CTAs: the
-    co-resident CTA count of the program, which the cooperative backward never
-    exceeds.  The grid depends on the device only, so the deterministic
+    ``co_resident`` and ``occupancy`` modules launch ``ctas_per_sm x SM
+    count`` CTAs, the measured co-residency of the program: exactly the
+    co-resident count for the former (a cooperative KCP backward never exceeds
+    it), a grid sized by occupancy for the latter (an ordinary launch: a CTA
+    that finds no free slot beside another stream's kernel runs in a later
+    wave).  That grid depends on the device only, so the deterministic
     ``dweight`` order is a pure function of ``(S, C, device)`` and one
-    workspace serves every token count.
+    workspace serves every token count.  ``channels_per_cta`` modules (the
+    reduce programs) launch ``ceil(C / channels_per_cta)`` CTAs for the call's
+    ``C`` channels.
     """
 
     rule = record["grid_rule"]
-    if rule["kind"] != "co_resident":
+    kind = rule["kind"]
+    if kind in ("co_resident", "occupancy"):
+        grid_x = int(rule["ctas_per_sm"]) * sm_count(device_index)
+    elif kind == "channels_per_cta":
+        if C is None:
+            raise ValueError(
+                f"the {kind} grid rule of module {record['kernel']} needs the channel count C"
+            )
+        grid_x = _ceil_div(C, int(rule["channels_per_cta"]))
+    else:
         raise ValueError(
-            f"unknown Cake causal conv1d training grid rule: {rule['kind']!r}"
+            f"unknown Cake causal conv1d training grid rule: {kind!r} (known: {GRID_KINDS})"
         )
-    return (max(1, int(rule["ctas_per_sm"]) * sm_count(device_index)), 1, 1)
+    return (max(1, grid_x), 1, 1)
 
 
 def partial_rows(grid_x: int, n_ch_tiles: int) -> int:
     """Rows of the backward ``partial`` workspace for a grid: ``ceil(grid_x / n_ch_tiles)``.
 
     CTA ``b`` of the grid owns channel tile ``b % n_ch_tiles`` and partial row
-    ``b // n_ch_tiles``; the kernel writes every row it reduces.
+    ``b // n_ch_tiles``; the kernel writes every row, and the reduce program
+    sums exactly these ``rows`` (its ``rows`` scalar).
     """
 
     return _ceil_div(grid_x, n_ch_tiles)
@@ -897,8 +1021,9 @@ def workspace_layout(
     The workspace is one CUDA ``uint8`` buffer holding the FP32 ``[rows, C, taps]``
     ``dweight`` partials, ``rows = partial_rows(grid, n_ch_tiles)`` for the
     device's launch grid; it depends on ``C`` and the device only, so one
-    buffer serves every token count.  The kernel fully writes the rows it
-    reduces, so nothing is zeroed between launches or CUDA Graph replays.
+    buffer serves every token count.  The kernel fully writes the rows its
+    reduce program sums, so nothing is zeroed between launches or CUDA Graph
+    replays.
     """
 
     grid_x = launch_grid(record, device_index=device_index)[0]
@@ -963,13 +1088,16 @@ def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
     ``values`` maps the logical names in ``LOGICAL_TENSORS`` /
     ``LOGICAL_SCALARS`` to tensors and Python scalars; the module record maps
     its kernel parameter names onto that vocabulary.  The launch grid is the
-    module's :func:`launch_grid` on ``device_index``, and the kernel runs on
-    the current torch stream.
+    module's :func:`launch_grid` on ``device_index`` (for the call's ``C`` when
+    the rule needs it), and the kernel runs on the current torch stream; a
+    module whose launch record enables programmatic dependent launch
+    (``use_pdl``) overlaps its launch with the preceding kernel of that stream
+    and waits for it in-kernel.
     """
 
     record = MODULES[name]
     logical = record["logical"]
-    grid = launch_grid(record, device_index=device_index)
+    grid = launch_grid(record, device_index=device_index, C=values.get("C"))
     grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
     args = []
     for kind, key in record["arg_plan"]:
@@ -991,11 +1119,14 @@ __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "CHANNEL_MULTIPLE",
+    "GRID_KINDS",
     "INT32_MAX",
     "KINDS",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MODULES",
+    "PLAN_SCALARS",
+    "ROLES",
     "ROUTES",
     "SELECT_KINDS",
     "WIDTH",

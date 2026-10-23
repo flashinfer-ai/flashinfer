@@ -30,10 +30,21 @@ partial workspace's round trip).  Timing uses CUPTI kernel activity with a
 cold L2 (``flashinfer.testing.bench_gpu_time(enable_cupti=True)``);
 multi-kernel comparators report the sum of their kernels' GPU time.
 
+``--side-kernel`` adds, per row and comparator, the backward's wall latency on
+its stream (CUDA events, median of seven calls after three warm-ups) alone and
+with a kernel resident on another stream, and their ratio (FlashInfer issue
+#7038: a cooperative launch waits for such a kernel to finish; the Cake
+backward is two ordinary launches).  ``one-thread`` is the issue's recipe,
+one CTA of one thread (``torch.cuda._sleep``); ``nccl-like`` a spin kernel of
+8 CTAs x 512 threads, the footprint of a communication kernel, which takes
+slots from eight SMs so the displaced CTAs run in a later wave.  Information,
+not a gate: the kernel's own GPU time is unchanged either way.
+
 Example::
 
     python benchmarks/bench_cake_causal_conv1d_train.py
     python benchmarks/bench_cake_causal_conv1d_train.py --channels 512 --tokens 250340 --json out.json
+    python benchmarks/bench_cake_causal_conv1d_train.py --channels 512 --tokens 261393 --side-kernel nccl-like
 """
 
 from __future__ import annotations
@@ -63,6 +74,32 @@ P2_CHANNELS = (128, 256, 1024, 2048, 4096, 8192)
 # Four unequal documents: floor(fraction x S) tokens each, nudged off a multiple of 64, the rest last.
 PERF_FRACTIONS = (0.37, 0.29, 0.21)
 SEED = 0
+# The kernels resident on another stream while the backward is timed (``--side-kernel``): CTAs x threads.
+SIDE_KERNELS = {"one-thread": (1, 1), "nccl-like": (8, 512)}
+# About 5 ms at 2 GHz: resident for the whole timed call.
+SIDE_KERNEL_CYCLES = 10_000_000
+SIDE_KERNEL_WARMUPS = 3
+SIDE_KERNEL_SAMPLES = 7
+
+# The ``nccl-like`` side kernel: every thread spins on the SM clock for ``cycles``.
+_SPIN_DECLARATION = (
+    "#include <cstdint>\nvoid spin(int64_t ctas, int64_t threads, int64_t cycles);"
+)
+_SPIN_SOURCE = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <cstdint>
+
+__global__ void spin_kernel(long long cycles) {
+  const long long start = clock64();
+  while (clock64() - start < cycles) {
+  }
+}
+
+void spin(int64_t ctas, int64_t threads, int64_t cycles) {
+  spin_kernel<<<static_cast<unsigned>(ctas), static_cast<unsigned>(threads), 0,
+                at::cuda::getCurrentCUDAStream()>>>(cycles);
+}
+"""
 
 
 def perf_rows() -> list[tuple[int, int]]:
@@ -93,6 +130,55 @@ def _time(fn: Callable[[], object]) -> float:
 
     times = bench_gpu_time(fn, enable_cupti=True, cold_l2_cache=True)
     return _median_ms(times)
+
+
+def side_kernel_launcher(name: str) -> Callable[[], None]:
+    """A launcher of the resident side kernel ``name`` (:data:`SIDE_KERNELS`) on the current stream."""
+
+    ctas, threads = SIDE_KERNELS[name]
+    if (ctas, threads) == (1, 1):
+        return lambda: torch.cuda._sleep(SIDE_KERNEL_CYCLES)
+    from torch.utils.cpp_extension import load_inline
+
+    module = load_inline(
+        name="cake_causal_conv1d_bench_spin",
+        cpp_sources=_SPIN_DECLARATION,
+        cuda_sources=_SPIN_SOURCE,
+        functions=["spin"],
+    )
+    return lambda: module.spin(ctas, threads, SIDE_KERNEL_CYCLES)
+
+
+def _latency_beside(
+    fn: Callable[[], object], side_kernel: Callable[[], None], device: torch.device
+) -> tuple[float, float]:
+    """``(alone_ms, beside_ms)``: the median wall latency of ``fn`` on the current stream (CUDA events) over
+    :data:`SIDE_KERNEL_SAMPLES` calls after :data:`SIDE_KERNEL_WARMUPS`, alone and with ``side_kernel``
+    resident on another stream (launched there first, then given time to become resident)."""
+
+    side = torch.cuda.Stream(device=device)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    def timed(beside: bool) -> float:
+        torch.cuda.synchronize(device)
+        if beside:
+            with torch.cuda.stream(side):
+                side_kernel()
+        torch.cuda._sleep(
+            1_000_000
+        )  # let the side kernel become resident before fn's launch
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize(device)
+        return start.elapsed_time(end)
+
+    for _ in range(SIDE_KERNEL_WARMUPS):
+        timed(False)
+    alone = _median_ms(timed(False) for _ in range(SIDE_KERNEL_SAMPLES))
+    beside = _median_ms(timed(True) for _ in range(SIDE_KERNEL_SAMPLES))
+    return alone, beside
 
 
 def _doc_ids(tokens: int, cu: torch.Tensor) -> torch.Tensor:
@@ -246,7 +332,9 @@ def _partial_rows(program: str, channels: int, *, device_index: int) -> int:
     return loader.workspace_layout(record, channels, device_index=device_index)["rows"]
 
 
-def bench_row(tokens: int, channels: int, *, comparators, device) -> dict:
+def bench_row(
+    tokens: int, channels: int, *, comparators, device, side_kernel=None
+) -> dict:
     generator = torch.Generator(device=device).manual_seed(SEED)
     lens = doc_lengths(tokens)
     cu = torch.tensor(
@@ -286,6 +374,11 @@ def bench_row(tokens: int, channels: int, *, comparators, device) -> dict:
             for mode in ("fwd", "bwd", "step"):
                 nbytes = _bytes(mode, tokens, channels, partial_rows=partial_rows)
                 entry[f"{mode}_gbps"] = nbytes / (entry[f"{mode}_ms"] * 1e-3) / 1e9
+            if side_kernel is not None:
+                alone, beside = _latency_beside(lambda: bwd(dy), side_kernel, device)
+                entry["bwd_alone_ms"] = alone
+                entry["bwd_beside_ms"] = beside
+                entry["bwd_beside_ratio"] = beside / alone
         except Exception as exc:  # keep the other comparators' rows
             entry["error"] = repr(exc)[:200]
         result["comparators"][comparator.name] = entry
@@ -309,6 +402,14 @@ def _format(result: dict, names) -> list[str]:
         if gbps is not None:
             line += f" | cake {gbps:8.0f} GB/s"
         lines.append(line)
+    for name in names:
+        entry = result["comparators"].get(name, {})
+        if "bwd_beside_ms" in entry:
+            lines.append(
+                f"S={result['tokens']:6d} C={result['channels']:5d} bwd beside the side kernel | {name}: "
+                f"alone {entry['bwd_alone_ms'] * 1e3:9.2f} us, beside {entry['bwd_beside_ms'] * 1e3:9.2f} us, "
+                f"{entry['bwd_beside_ratio']:.2f}x"
+            )
     return lines
 
 
@@ -331,6 +432,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--json", type=str, default=None, help="write all rows to this JSON file"
+    )
+    parser.add_argument(
+        "--side-kernel",
+        choices=sorted(SIDE_KERNELS),
+        default=None,
+        help="also time the backward's wall latency alone and beside this kernel resident on another stream",
     )
     args = parser.parse_args(argv)
 
@@ -355,9 +462,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         tokens = args.tokens or [P2_TOKENS]
         channels = args.channels or [P1_CHANNELS]
         rows = [(s, c) for s in tokens for c in channels]
+    side_kernel = (
+        None if args.side_kernel is None else side_kernel_launcher(args.side_kernel)
+    )
     results = []
     for tokens, channels in rows:
-        result = bench_row(tokens, channels, comparators=comparators, device=device)
+        result = bench_row(
+            tokens,
+            channels,
+            comparators=comparators,
+            device=device,
+            side_kernel=side_kernel,
+        )
         results.append(result)
         for line in _format(result, names):
             print(line, flush=True)
@@ -368,6 +484,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "device": torch.cuda.get_device_name(device),
                     "capability": list(torch.cuda.get_device_capability(device)),
                     "torch": torch.__version__,
+                    "side_kernel": args.side_kernel,
                     "rows": results,
                 },
                 handle,
