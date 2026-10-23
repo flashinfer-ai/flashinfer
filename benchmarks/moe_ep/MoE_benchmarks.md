@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+
 # MoE-EP benchmarks (NCCL-EP) — container, how to run, and results
 
 Benchmarking the FlashInfer **MoE expert-parallel** path (`nccl.ep` dispatch / combine,
@@ -191,3 +193,22 @@ B200, both `nccl_ep` and `nixl_ep`. Correctness is covered in `docs/design_docs/
 - nsys kernel times: `nsys profile -t cuda … bench_ep_matrix.py` then
   `nsys stats --report cuda_gpu_kern_sum`. Host burn-down: `EP_PROFILE_HOST=1`.
 - ep_bench reference (separate C++ build) for the parity numbers above.
+
+## MXFP8 x MXFP4 MegaMoE
+
+`benchmarks/bench_mxfp8_mxfp4.py` measures the native SM100
+MegaMoE block with pre-staged inputs, default tactics, and cold-L2 CUPTI
+timing over CUDA graph replay. It records absolute latency, GPU identity,
+geometry, software versions, and tactics. Use `--save-outputs` for exact
+before/after checks. Run each revision in a fresh process on the same B200,
+then repeat the baseline to detect drift:
+
+```bash
+python benchmarks/bench_mxfp8_mxfp4.py \
+  --tokens 32 128 512 --hidden 4096 --intermediate 6400 \
+  --experts 32 --top-k 8 \
+  --output /tmp/mxfp8-mxfp4.json --save-outputs /tmp/mxfp8-mxfp4.pt
+```
+
+`benchmarks/profile_mxfp8_mxfp4_lean.py` provides focused FC1/FC2 profiling.
+Routing and attention are excluded from these measurements.

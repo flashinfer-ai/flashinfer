@@ -1,9 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Offline tuning for CuTe DSL MegaMoE backends.
 
 ``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
 ``sm90_fp8_*`` / ``sm90_mxfp4`` / ``sm90_bf16`` dtypes select the Hopper tuners. BF16 and
 mixed BF16/MXFP8 are supported by the SM100 tuner only. MXFP4/MXFP8 is
 wired for SM107.
+
+The native SM100 MXFP8/MXFP4 backend uses FlashInfer's general autotuner
+for selection and GPU timing, and exports winners to the existing knob cache.
+Other backends retain their existing collective tuner.
 
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
@@ -67,6 +74,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "bf16",
             "bf16_mxfp8_e4m3",
             "bf16_mxfp8_e5m2",
+            "mxfp8_mxfp4",
         ),
         default="nvfp4",
     )
@@ -349,7 +357,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     else:
         family = _resolve_arch(args.arch)
-        if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
+        if family == "sm90" or (
+            family == "sm107"
+            and (args.dtype.startswith("bf16") or args.dtype == "mxfp8_mxfp4")
+        ):
             print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
             return 2
         if args.dtype == "mxfp4_mxfp8":
@@ -363,6 +374,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             backend = "bf16_bf16_bf16_cutedsl"
         elif args.dtype.startswith("bf16_mxfp8"):
             backend = "bf16_mxfp8_bf16_cutedsl"
+        elif args.dtype == "mxfp8_mxfp4":
+            backend = "mxfp8_mxfp4_bf16_cutedsl"
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CLI dispatch across the SM90, SM100, and SM107 tuners."""
 
 from types import SimpleNamespace
@@ -50,6 +53,7 @@ def dispatched(monkeypatch):
         ("sm100", "bf16", "sm100.bf16_bf16_bf16_cutedsl"),
         ("sm100", "bf16_mxfp8_e4m3", "sm100.bf16_mxfp8_bf16_cutedsl"),
         ("sm100", "bf16_mxfp8_e5m2", "sm100.bf16_mxfp8_bf16_cutedsl"),
+        ("sm100", "mxfp8_mxfp4", "sm100.mxfp8_mxfp4_bf16_cutedsl"),
         ("auto", "sm90_fp8_e4m3", "sm90.fp8_fp8_bf16_pull_cutedsl"),
         ("sm90", "sm90_fp8_e5m2", "sm90.fp8_fp8_bf16_pull_cutedsl"),
     ],
@@ -63,6 +67,9 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
     "options",
     [
         ["--arch", "sm107", "--dtype", "bf16"],
+        ["--arch", "sm107", "--dtype", "mxfp8_mxfp4"],
+        ["--arch", "auto", "--dtype", "mxfp8_mxfp4"],
+        ["--arch", "sm90", "--dtype", "mxfp8_mxfp4"],
         ["--arch", "auto", "--dtype", "bf16_mxfp8_e4m3"],
         ["--arch", "sm107", "--dtype", "bf16_mxfp8_e5m2"],
         ["--arch", "sm107", "--dtype", "sm90_fp8_e4m3"],

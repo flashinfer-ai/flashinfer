@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+
 # moe_ep Design
 
 `flashinfer.moe_ep` implements expert-parallel MoE layers, communication
@@ -39,6 +41,7 @@ owns dispatch, expert compute, and combine; output is always BF16
 | `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16) | BF16 | SM100/SM103 | same `knobs` surface as the NVFP4 backend |
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
+| `sm100_mxfp8_mxfp4_bf16_cutedsl` | MXFP8 (block-32 UE8M0) | MXFP4 (block-32 UE8M0) | BF16 combined or per-route | SM100/SM103 | capacity-keyed defaults; pinned `knobs=dict`; collective general autotuner with `knobs="auto"` or `autotune()`; knob-cache overrides |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
 | `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | same `knobs` surface as the SM100 backends (heuristic table / knob cache / `knobs="auto"`) |
 | `sm90_bf16_bf16_bf16_pull_cutedsl` | BF16 | BF16 | BF16 | SM90 exactly | same `knobs` surface as the FP8 pull backend, shared knob cache |

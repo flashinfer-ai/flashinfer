@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -630,6 +632,17 @@ options, and embedded device-capacity constants. It hashes the attention source
 tree, including shared preparation, masks, and reductions. Occupancy queries
 are cached per device and cluster size by `_hardware.py`.
 
+### Collective Kernel Autotuning
+
+The native MXFP8 x MXFP4 MegaMoE uses the general autotuner via
+`flashinfer/moe_ep/cute_dsl/megamoe/mxfp8_mxfp4/autotune.py`. Its runner prepares
+each workspace layout before timing and uses `TuningConfig.rank_reduction="max"`
+with `preserve_input_storage=True` for collective symmetric-memory launches.
+Both `knobs="auto"` and an enclosing `autotune()` context select tactics; explicit
+knob dictionaries stay pinned. Complete collective tuning/warmup before CUDA
+graph capture. Existing offline CLI winners are still exported to the MoE knob
+cache for compatibility; other MegaMoE dtypes retain their current tuner.
+
 ### Dispatch Macros
 
 Handle combinatorial parameter spaces:
@@ -842,6 +855,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Group scaling of the session's host plan: `auto` the per-(architecture, world size) default (`2` on SM100 with 4 or 2 ranks and on SM103, `1` otherwise), or `1` / `2` / `4`; applies to grouped rows with a hidden size of at least 6144 and changes the tile order only. Every rank of a group must use the same value. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
+| `FLASHINFER_MXFP8_MXFP4_WAIT_STATS` | `0` | `flashinfer/moe_ep/cute_dsl/megamoe/mxfp8_mxfp4/wait_stats_config.py` | Compile-time diagnostic for per-CTA waits and startup events. Set before workspace creation; compiled out when unset. Disable for performance measurements. |
 | `FLASHINFER_DISABLE_EAGLE_VERIFY_FP8KV_SM90` | `0` | `flashinfer/prefill.py` | `1` keeps `BatchPrefillWithPagedKVCacheWrapper.run` on the FA2 kernel for the speculative-decoding target-verify problems that the specialized SM90 fp8-KV split-KV kernel (`csrc/eagle_verify_fp8kv_sm90.cu`) would otherwise serve: `plan(..., uniform_q_len=4)` with a custom mask, 4 query heads per KV head, head_dim 256, page size 1, NHD, bf16 q/o, e4m3 KV, compute capability 9.0. Read at plan and run time. The `uniform_q_len` plan hint itself is unaffected. |
 | `FLASHINFER_SPECIALIZED_KERNEL_DISABLE` | unset | `flashinfer/mla_kv_pack.py` | `1` forces `concat_mla_kv_quant_fp8` onto its composable PyTorch fallback (two fp8 casts + two strided copies, same bytes) instead of the fused MLA K/V pack kernel. Read at call time; the kill switch for A/B testing the fused path. |
 | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |

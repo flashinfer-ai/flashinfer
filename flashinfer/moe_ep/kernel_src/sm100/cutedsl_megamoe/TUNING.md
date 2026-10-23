@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+
 # CuTeDSL MegaMoE tuning + performance notes
 
 This document collects the performance work on the CuTeDSL mega
@@ -733,3 +735,19 @@ the thunk is zero+launch, both graphable), streaming weight reload
 (on demand — from TRT-LLM PR #16190: a load/reload lifecycle with
 partial-group coverage tracking for serving-oriented live weight updates;
 import only if the FI serving integration needs reload).
+
+## Native MXFP8 x MXFP4 tactics
+
+The FlashInfer-owned MXFP8 x MXFP4 backend uses dtype key `mxfp8_mxfp4`
+in the knob cache. Cached knobs override the shipped GB200 EP16 tactic
+bands; explicit dictionaries remain pinned. `knobs="auto"` and the general
+`autotune()` context use the collective general autotuner, preserving
+symmetric input addresses and minimizing the slowest rank's latency.
+Workspace preparation occurs outside timed launches; failures are reported
+collectively before any rank launches the next tactic.
+
+The binding is keyed by allocated token capacity and geometry, rather than active token count. Tune and warm the full capacity
+before capture; smaller serving batches reuse that layout and tactic.
+`epilogue_warps`, `in_kernel_reduce`, and `load_balance_mode` are tactic
+fields, including for benchmark A/B overrides. The wait-stat environment
+flag is diagnostic only and is compiled out when unset.
