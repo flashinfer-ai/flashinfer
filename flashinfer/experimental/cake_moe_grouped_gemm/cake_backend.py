@@ -42,7 +42,6 @@ from typing import Any, Callable, Optional
 import torch
 import tvm_ffi
 
-from ._experimental import warn_experimental_backend_once
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
     PROGRAMS,
@@ -742,9 +741,11 @@ def grouped_mm_bf16_cake(
     with ``a`` ``[cum_m, K]`` bf16, ``b`` ``[E, N, K]`` bf16 and ``m_indptr``
     ``[E + 1]`` int32 on the device (read by the kernel, never on the host).
     Only bfloat16 outputs are produced and there is no tactic index; rows of
-    ``a`` past ``m_indptr[-1]`` are left untouched in ``out``.
+    ``a`` past ``m_indptr[-1]`` are left untouched in ``out``.  The
+    experimental-backend warning is emitted by
+    ``flashinfer.grouped_mm.grouped_mm_bf16`` when the backend is named; this
+    function emits none.
     """
-    warn_experimental_backend_once("grouped_mm_bf16", "cake")
     if out is not None:
         out_dtype = out.dtype
     if out_dtype != torch.bfloat16:

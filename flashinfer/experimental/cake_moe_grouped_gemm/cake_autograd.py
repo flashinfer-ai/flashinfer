@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import torch
 
-from ._experimental import flashinfer_experimental_api
 from .cake_backend import (
     prepare_grouped_gemm_dgrad,
     prepare_grouped_gemm_fwd,
@@ -105,7 +104,6 @@ class CakeGroupedMm(torch.autograd.Function):
         return dx, dw, None, None
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.cake_grouped_mm")
 def cake_grouped_mm(
     x: torch.Tensor,
     w: torch.Tensor,

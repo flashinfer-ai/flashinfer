@@ -18,7 +18,7 @@ from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
+from ..api_logging import flashinfer_api, warn_experimental_backend_once
 from ..utils import (
     backend_requirement,
     get_compute_capability,
@@ -145,6 +145,7 @@ def grouped_mm_bf16(
     >>> out_cake = flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")
     """
     if backend == "cake":
+        warn_experimental_backend_once("grouped_mm_bf16", "cake")
         from ..experimental.cake_moe_grouped_gemm.cake_backend import (
             grouped_mm_bf16_cake,
         )
