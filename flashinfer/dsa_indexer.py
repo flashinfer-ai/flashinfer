@@ -150,7 +150,9 @@ def dsa_indexer_topk(
         (128 e4m3 / 64 packed MXFP4 bytes each) followed by their scales (FP32 /
         int32 ue8m0 x4), ``w [B * next_n, H]``, int32 ``block_table
         [B, max_blocks]`` and int32 ``context_lens [B, next_n]`` (row ``j`` of
-        request ``b`` sees keys ``[0, context_lens[b, j])``).
+        request ``b`` sees keys ``[0, context_lens[b, j])``; every length must lie in
+        ``[0, block_table.shape[1] * k.shape[1]]``, which is not checked on the
+        device).
         ``cu_seqlens_q``, ``cu_seqlens_k`` and ``k_scale`` are ``None``;
         ``next_n`` (speculative-decoding verify: drafts + 1) is 1 to 16.  The
         outputs are ``[B * next_n, top_k]``
@@ -256,6 +258,8 @@ def dsa_indexer_topk(
     if k_scale is not None or q_scale is not None:
         raise ValueError("k_scale and q_scale are only used by backend='sm120'")
     if backend == "cake":
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise ValueError("backend='cake' needs cu_seqlens_q and cu_seqlens_k")
         if not return_scores and scores is not None:
             raise ValueError("scores given with return_scores=False")
         from .experimental.cake_dsa_indexer.cake_backend import (

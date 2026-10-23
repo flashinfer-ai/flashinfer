@@ -28,6 +28,7 @@ import torch
 
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.dsa_indexer import dsa_indexer_topk
+from flashinfer.experimental import sm120_dsa_indexer as sm120
 from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.skipif(
@@ -771,6 +772,15 @@ def test_paged_validation():
         _run_decode(q, w, ctx, paged, 512, ratio=2)
     with pytest.raises(ValueError, match="top_k"):
         _run_decode(q, w, ctx, paged, 0)
+    with pytest.raises(ValueError, match="capacity"):
+        sm120.dsa_indexer_topk_paged(
+            q.data,
+            paged.cache,
+            w,
+            ctx,
+            paged.table,
+            max_context_len=paged.table.shape[1] * paged.P + 1,
+        )
 
 
 @pytest.mark.parametrize("top_k", [1, 4096])

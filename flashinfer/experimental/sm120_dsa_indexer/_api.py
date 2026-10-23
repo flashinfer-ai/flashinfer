@@ -124,9 +124,11 @@ def _decode_logits(
     stride = (max(max_context_len, 1) + 3) // 4 * 4
     buf = _LOGITS.get(key)
     if buf is None or buf.numel() < num_rows * stride:
+        need = max(num_rows * stride, 4)
         if buf is not None:
             _RETIRED.append(buf)
-        buf = torch.empty(max(num_rows * stride, 4), dtype=torch.float32, device=dev)
+            need = max(need, 2 * buf.numel())  # bounds what _RETIRED keeps
+        buf = torch.empty(need, dtype=torch.float32, device=dev)
         _LOGITS[key] = buf
     return buf[: num_rows * stride].view(num_rows, stride)
 
@@ -145,9 +147,11 @@ def _decode_long_ws(dev: torch.device, num_rows: int) -> torch.Tensor:
                 "backend='sm120': run the paged form once outside CUDA graph "
                 f"capture with at least {num_rows} rows before capturing it"
             )
+        need = words
         if buf is not None:
             _RETIRED.append(buf)
-        buf = torch.zeros(words, dtype=torch.int32, device=dev)
+            need = max(need, 2 * buf.numel())
+        buf = torch.zeros(need, dtype=torch.int32, device=dev)
         _LONG_WS[key] = buf
     return buf[:words]
 
@@ -384,7 +388,7 @@ def dsa_indexer_topk_paged(
 
     q ``[B, next_n, H, 128]`` e4m3, or packed MXFP4 ``[B, next_n, H, 64]`` with
     ``q_scale [B, next_n, H]``; ``context_lens [B, next_n]``; ``max_context_len``
-    bounds every row's keys and fixes the launches.
+    bounds every row's keys (not checked on the device) and fixes the launches.
     """
     fp4 = q_scale is not None
     if q.dim() != 4:
@@ -405,6 +409,8 @@ def dsa_indexer_topk_paged(
         raise ValueError("context_lens must be [B, next_n]")
     if page_rows is None:
         page_rows = kv_cache.shape[1]
+    if max_context_len > block_table.shape[1] * page_rows:
+        raise ValueError("max_context_len exceeds the block table's capacity")
     dev = q.device
     _check_device(dev)
     q = q.contiguous().view(num_rows, num_heads, row_bytes)

@@ -84,7 +84,9 @@ spot checks keep the same picture.
 ## Limitations
 
 - Paged calls on concurrent streams of one device must not overlap: they share
-  the per-device logits and long-row buffers. These buffers only grow.
+  the per-device logits and long-row buffers. A call that needs more replaces
+  a buffer with one at least twice its size; the replaced one stays alive for
+  the CUDA graphs captured with it.
   - The logits take `rows * block_table.shape[1] * page_rows * 4` bytes.
   - The long-row state takes about 113 KB per row.
 - Run a paged call outside CUDA graph capture before capturing it, so the
