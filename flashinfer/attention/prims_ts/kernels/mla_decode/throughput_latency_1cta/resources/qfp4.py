@@ -242,11 +242,13 @@ class SmemQFp4Resource(MlaResource):
 
         Warp ``w`` (of the 256-thread softmax task) takes heads ``8w .. 8w + 7``.
         For each head, lane ``l`` loads the 16 E4M3 values of latent block
-        ``l`` (one coalesced 512-byte row per warp instruction) and lanes 0-3
-        also rope group ``l``; every 16-element block is quantized by the lane
-        that loaded it, so no lane exchange is needed.  The head's row is
-        written to both operand rows that carry it.  All loads are issued
-        before the first block is quantized.
+        ``l`` (one coalesced 512-byte row per warp instruction).  The eight
+        heads' rope blocks (4 per head) fill the warp once: lane ``l`` takes
+        rope group ``l & 3`` of head ``l >> 2``, so the rope costs one block
+        per lane instead of one warp-wide block per head.  Every 16-element
+        block is quantized by the lane that loaded it, so no lane exchange is
+        needed.  Each head is written to both operand rows that carry it.
+        All loads are issued before the first block is quantized.
         """
         cfg = self.cfg
         task_cache = decode_gen_task_cache(stage_info)
@@ -259,8 +261,9 @@ class SmemQFp4Resource(MlaResource):
         lat = self.q_latent
         rope = self.q_rope
         heads_per_warp = QFP4_ROWS // 2 // 8
+        rope_groups = 64 // 16  # rope dims / NVFP4 block
+        assert heads_per_warp * rope_groups == 32, "rope blocks must fill one warp"
         inv6 = Float32(1.0 / 6.0)
-        rope_group = lane & Int32(3)
 
         def quantize_block(words4):
             """16 E4M3 (four Int32 words) -> (scale byte, two E2M1 words)."""
@@ -277,18 +280,19 @@ class SmemQFp4Resource(MlaResource):
             hi = f32x8_to_e2m1x8(*scaled[8:16])
             return sf_byte, lo, hi
 
-        lat_words = []
-        rope_words = []
-        for i in cutlass.range_constexpr(heads_per_warp):
-            # TMA-equivalent coordinates: flat query row = cta_idx_q * H + head.
-            flat_row = (
-                cta_idx_q * Int32(cfg.num_heads_q)
-                + head_idx
-                + warp * Int32(heads_per_warp)
-                + Int32(i)
-            )
+        def q_head_coords(local_head):
+            """(head, q_pos) of this CTA's Q head ``local_head`` (TMA-equivalent)."""
+            flat_row = cta_idx_q * Int32(cfg.num_heads_q) + head_idx + local_head
             q_pos = flat_row // Int32(cfg.num_heads_q)
-            head = flat_row - q_pos * Int32(cfg.num_heads_q)
+            return flat_row - q_pos * Int32(cfg.num_heads_q), q_pos
+
+        def operand_row0(local_head):
+            # Operand rows 32q + j and 32q + j + 16 carry head 16q + j.
+            return ((local_head >> Int32(4)) << Int32(5)) + (local_head & Int32(15))
+
+        lat_words = []
+        for i in cutlass.range_constexpr(heads_per_warp):
+            head, q_pos = q_head_coords(warp * Int32(heads_per_warp) + Int32(i))
             lat_words.append(
                 ld_global_v4(
                     lat.iterator.toint()
@@ -298,17 +302,16 @@ class SmemQFp4Resource(MlaResource):
                     + Int64(lane) * Int64(16)
                 )
             )
-            # Every lane loads a rope group (lanes 4-31 repeat 0-3); only
-            # lanes 0-3 quantize them.
-            rope_words.append(
-                ld_global_v4(
-                    rope.iterator.toint()
-                    + Int64(head) * Int64(rope.stride[0])
-                    + Int64(q_pos) * Int64(rope.stride[2])
-                    + Int64(batch_idx) * Int64(rope.stride[3])
-                    + Int64(rope_group) * Int64(16)
-                )
-            )
+        rope_group = lane & Int32(rope_groups - 1)
+        rope_local_head = warp * Int32(heads_per_warp) + (lane >> Int32(2))
+        rope_head, rope_q_pos = q_head_coords(rope_local_head)
+        rope_words = ld_global_v4(
+            rope.iterator.toint()
+            + Int64(rope_head) * Int64(rope.stride[0])
+            + Int64(rope_q_pos) * Int64(rope.stride[2])
+            + Int64(batch_idx) * Int64(rope.stride[3])
+            + Int64(rope_group) * Int64(16)
+        )
 
         sf_base = self._sf_byte_address(0)
         seg = lane >> Int32(4)
@@ -316,10 +319,7 @@ class SmemQFp4Resource(MlaResource):
         half = lane & Int32(1)
         for i in cutlass.range_constexpr(heads_per_warp):
             sf_byte, lo, hi = quantize_block(lat_words[i])
-            rope_sf, rope_lo, rope_hi = quantize_block(rope_words[i])
-            local_head = warp * Int32(heads_per_warp) + Int32(i)
-            # Operand rows 32q + j and 32q + j + 16 carry head 16q + j.
-            row0 = ((local_head >> Int32(4)) << Int32(5)) + (local_head & Int32(15))
+            row0 = operand_row0(warp * Int32(heads_per_warp) + Int32(i))
             for dup in cutlass.range_constexpr(2):
                 row = row0 + Int32(16 * dup)
                 # Latent: blocks 2c / 2c + 1 are the two halves of the SW128
@@ -341,27 +341,31 @@ class SmemQFp4Resource(MlaResource):
                     + (lane & Int32(3)),
                     sf_byte,
                 )
-                if lane < Int32(4):
-                    # Rope: 16-byte chunk g = group g twice ([main | residual],
-                    # SW64); K64 chunk 8 covers groups 0-1 and chunk 9 groups
-                    # 2-3, each group's scale twice.
-                    st_shared_v4(
-                        self._tile_byte_address(2 * QFP4_SEG_BYTES)
-                        + row * Int32(QFP4_ROPE_BYTES)
-                        + ((lane ^ ((row >> Int32(1)) & Int32(3))) * Int32(16)),
-                        rope_lo,
-                        rope_hi,
-                        rope_lo,
-                        rope_hi,
-                    )
-                    rope_sf_addr = (
-                        sf_base
-                        + sf_block_byte_offset(row, 8)
-                        + (lane >> Int32(1)) * Int32(SF_BLOCK_BYTES)
-                        + (lane & Int32(1)) * Int32(2)
-                    )
-                    st_shared_u8(rope_sf_addr, rope_sf)
-                    st_shared_u8(rope_sf_addr + Int32(1), rope_sf)
+
+        rope_sf, rope_lo, rope_hi = quantize_block(rope_words)
+        rope_row0 = operand_row0(rope_local_head)
+        for dup in cutlass.range_constexpr(2):
+            row = rope_row0 + Int32(16 * dup)
+            # Rope: 16-byte chunk g = group g twice ([main | residual], SW64);
+            # K64 chunk 8 covers groups 0-1 and chunk 9 groups 2-3, each
+            # group's scale twice.
+            st_shared_v4(
+                self._tile_byte_address(2 * QFP4_SEG_BYTES)
+                + row * Int32(QFP4_ROPE_BYTES)
+                + ((rope_group ^ ((row >> Int32(1)) & Int32(3))) * Int32(16)),
+                rope_lo,
+                rope_hi,
+                rope_lo,
+                rope_hi,
+            )
+            rope_sf_addr = (
+                sf_base
+                + sf_block_byte_offset(row, 8)
+                + (rope_group >> Int32(1)) * Int32(SF_BLOCK_BYTES)
+                + (rope_group & Int32(1)) * Int32(2)
+            )
+            st_shared_u8(rope_sf_addr, rope_sf)
+            st_shared_u8(rope_sf_addr + Int32(1), rope_sf)
 
     @producer_work
     @cute.jit
