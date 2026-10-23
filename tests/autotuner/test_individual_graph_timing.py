@@ -10,7 +10,7 @@ import torch
 
 from flashinfer.autotuner import AutoTuner, TuningConfig, autotune
 from flashinfer.autotuner._graph_timing import profile_individual_graph_calls
-from flashinfer.autotune_cache import MeasurementPolicy
+from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2
 
 from .utils import DummyRunner, reset_autotuner
 
@@ -75,6 +75,68 @@ def test_measurement_policy_can_enable_and_disable_individual_timing():
 def test_measurement_policy_rejects_incompatible_graph_timing(kwargs):
     with pytest.raises(ValueError, match="graph_timing"):
         MeasurementPolicy(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "policy,initial_graph,initial_individual,expected",
+    [
+        (MeasurementPolicy(graph_timing="individual"), True, False, (True, True)),
+        (MeasurementPolicy(graph_timing="amortized"), True, True, (True, False)),
+        (MeasurementPolicy(execution_mode="cuda_graph"), False, False, (True, False)),
+        (MeasurementPolicy(execution_mode="eager"), True, False, (False, False)),
+        (MeasurementPolicy(_timer="cupti"), True, True, (True, False)),
+    ],
+)
+def test_explicit_tactic_profile_matches_selection_policy(
+    monkeypatch, policy, initial_graph, initial_individual, expected
+):
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = [torch.ones(1)]
+    runner = DummyRunner(valid_tactics=(0,))
+    config = TuningConfig(
+        use_cuda_graph=initial_graph,
+        use_cuda_graph_individual_timing=initial_individual,
+    )
+    measured = []
+
+    def profile(runner, inputs, tactic, effective_config, **kwargs):
+        measured.append(effective_config)
+        return 1.0
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    with (
+        autotune_v2(persistent_cache=False, measurement_policy=policy),
+        autotune(cuda_graph_profile_replays=3),
+    ):
+        tuner.choose_one("explicit_profile_policy", [runner], config, inputs)
+        ordinary = measured[-1]
+        effective, batches = tuner.prepare_tactic_profile(inputs, config)
+        assert tuner.profile_tactic(runner, inputs, 0, effective, batches) == 1.0
+
+    assert measured[-1] is ordinary
+    assert (effective.use_cuda_graph, effective.use_cuda_graph_individual_timing) == (
+        expected
+    )
+    assert effective.cuda_graph_profile_replays == 3
+    assert config.cuda_graph_profile_replays == 1
+    assert config.use_cuda_graph_individual_timing == initial_individual
+
+
+def test_explicit_profile_applies_hot_policy_before_arena_preparation(monkeypatch):
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    inputs = [torch.ones(1)]
+    config = TuningConfig(use_cold_l2_cache=True, profile_arena_input_indices=(0,))
+    # A hot policy must reuse the input without trying to create a CUDA arena.
+    with autotune_v2(
+        persistent_cache=False, measurement_policy=MeasurementPolicy(cold_l2=False)
+    ):
+        effective, batches = tuner.prepare_tactic_profile(inputs, config)
+    assert not effective.use_cold_l2_cache
+    assert batches == [inputs]
+    assert config.use_cold_l2_cache
 
 
 def test_individual_timing_preserves_globaltimer_selection(monkeypatch):

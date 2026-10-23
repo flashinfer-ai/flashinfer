@@ -3428,8 +3428,17 @@ class AutoTuner:
     ) -> tuple[TuningConfig, list[list[Any]]]:
         """Prepare one reusable input schedule shared by explicitly profiled tactics."""
         with self._lock:
-            if self._override_tuning_buckets is not None or self._override_round_up:
+            if (
+                self._override_tuning_buckets is not None
+                or self._override_round_up
+                or self._override_cuda_graph_profile_replays is not None
+            ):
                 tuning_config = self._apply_tuning_overrides(tuning_config)
+            measure_policy = self._effective_measure_policy
+            if measure_policy is not None:
+                tuning_config = self._apply_measure_policy(
+                    tuning_config, measure_policy
+                )
             batches = self._prepare_input_tensors_with_batches(inputs, tuning_config)
             return tuning_config, batches
 
@@ -3442,7 +3451,7 @@ class AutoTuner:
         input_batches: list[list[Any]],
         **kwargs,
     ) -> float:
-        """Measure one tactic against a caller-retained prepared input schedule."""
+        """Measure using the config and schedule from ``prepare_tactic_profile``."""
         with self._lock:
             return self._profile_single_kernel(
                 runner,

@@ -70,6 +70,7 @@ class TuningContext:
                 execution_mode=fields.get("measure_execution_mode", "auto"),
                 cold_l2=None if cold is None else cold == "True",
                 _timer=fields.get("measure_timer", "auto"),
+                graph_timing=fields.get("measure_graph_timing"),
             )
         return policy
 

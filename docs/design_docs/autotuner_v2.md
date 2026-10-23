@@ -228,6 +228,10 @@ default in either direction. It does not enable graph capture by itself; specify
 measurement path. Explicit eager or CUPTI policies reject `graph_timing`;
 CUPTI also overrides an inherited per-op individual-timing flag.
 
+`prepare_tactic_profile` applies the same measurement and replay-count overrides
+before preparing the input schedule used by `profile_tactic`. Delegated tuning
+contexts also preserve the attached store's graph-timing objective after warmup.
+
 Each newly tuned entry also records an optional `profiling_policy` payload: the effective
 CUDA-graph replay count (or `null` without graphs), hot-/cold-L2 policy and active
 individual-call graph timing after context

@@ -268,11 +268,14 @@ def test_protocol_policy_partition_and_inherited_controls(managed):
         ] == [128, 256]
 
 
-def test_protocol_policy_is_preserved_after_persistent_context(managed):
+@pytest.mark.parametrize("graph_timing", [None, "amortized", "individual"])
+def test_protocol_policy_is_preserved_after_persistent_context(managed, graph_timing):
     from flashinfer import autotune_v2
     from flashinfer.autotune_cache import MeasurementPolicy
 
-    policy = MeasurementPolicy(execution_mode="cuda_graph", cold_l2=True)
+    policy = MeasurementPolicy(
+        execution_mode="cuda_graph", cold_l2=True, graph_timing=graph_timing
+    )
     with autotune_v2(measurement_policy=policy):
         identity = managed.protocol_context("test.protocol").cache_identity
     context = managed.protocol_context("test.protocol")
