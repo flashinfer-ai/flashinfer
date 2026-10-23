@@ -423,9 +423,19 @@ struct CollectiveMmaLoRaSm120 {
 
   static constexpr bool EnableLoRaSmemSwizzle = Row80ProductionTraits_;
   static constexpr bool UseRow80SideSlot = UseDedicatedLoRaTma && Row80ProductionTraits_;
+  // K256 stages hold 128-byte bf16 rows. Where a whole 64-column chunk is folded (rank 64
+  // and up), mma_lora reads it with ldmatrix through the 128-byte swizzle the row80
+  // production path already uses. With unswizzled 32-bit LDS the rank-128 fold took
+  // ~6.5k cycles per tile at M=64 (5KP, 128x32x256), longer than its two stages' DRAM
+  // round trip. Row80 keeps its own layout and copies.
+  static constexpr bool UseLoRaSmemLdsm128 = SVDQ_SM120_LORA_LDSM && !Row80ProductionTraits_ &&
+                                             LoRaPath_ == Sm120LoRaPath::kByteExactMainloop &&
+                                             LoRaStorageK == 64 && LoRaChunkK == 64;
   static constexpr bool UseLoRaSmemSwizzle128 =
-      EnableLoRaSmemSwizzle &&
-      (LoRaPath_ == Sm120LoRaPath::kByteExactMainloop || UseRow80SideSlot) && LoRaStorageK == 64;
+      (EnableLoRaSmemSwizzle &&
+       (LoRaPath_ == Sm120LoRaPath::kByteExactMainloop || UseRow80SideSlot) &&
+       LoRaStorageK == 64) ||
+      UseLoRaSmemLdsm128;
   // Multi-chunk ranks on K128 stages (rank 64 and up) fold LoRaChunks stage-wide
   // chunks in mma_lora. Their 64-byte rows are read with ldmatrix through a
   // 64-byte swizzle; with narrow unswizzled LDS the tail showed 2.5x the shared
@@ -1683,8 +1693,9 @@ struct CollectiveMmaLoRaSm120 {
     Tensor tCrD = thread_lora.partition_fragment_A(sD(_, _, Int<0>{}));    // (MMA,MMA_M,MMA_K)
     Tensor tCrL1 = thread_lora.partition_fragment_B(sL1(_, _, Int<0>{}));  // (MMA,MMA_N,MMA_K)
 
-    using LoRaSmemCopyOp = cute::conditional_t<UseLoRaSmemSwizzle64, SM75_U32x4_LDSM_N,
-                                               AutoVectorizingCopyWithAssumedAlignment<32>>;
+    using LoRaSmemCopyOp =
+        cute::conditional_t<UseLoRaSmemSwizzle64 || UseLoRaSmemLdsm128, SM75_U32x4_LDSM_N,
+                            AutoVectorizingCopyWithAssumedAlignment<32>>;
     auto smem_tiled_copy_D =
         make_tiled_copy_A(Copy_Atom<LoRaSmemCopyOp, cutlass::bfloat16_t>{}, lora_mma);
     auto smem_thr_copy_D = smem_tiled_copy_D.get_thread_slice(thread_idx);
