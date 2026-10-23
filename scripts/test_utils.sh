@@ -304,19 +304,9 @@ install_and_verify() {
 
         # Sync the branch's direct dependencies without re-resolving the CUDA
         # stack already selected and validated by the image build.
-        _dependency_args=(-r requirements.txt -r requirements-test.txt)
-
-        # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
-        # version skew between libs-base and libs-cu13.  requirements.txt
-        # cannot add the extra conditionally, hence the separate install.
-        #
-        # Keep the floor in sync with the package and ci/cuda-versions.json
-        # without downgrading a newer DSL already installed in the test image.
-        if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            _dependency_args+=("nvidia-cutlass-dsl[cu13]>=4.8.0")
-        fi
-        pip install --no-deps "${_dependency_args[@]}"
-        unset _dependency_args
+        pip install --no-deps -r requirements.txt -r requirements-test.txt
+        # Repair the complete DSL stack before show-config imports FlashInfer.
+        bash "$(dirname "${BASH_SOURCE[0]}")/install_cutlass_dsl.sh" || return 1
         python -c "import pytest_timeout"
 
         # Install local python sources. The env var keeps --no-build-isolation
