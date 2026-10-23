@@ -4775,6 +4775,118 @@ def test_batched_small_m_swap_and_row_rules():
         ROW_RULES.update(saved)
 
 
+def _ht_rows_without_half_fit(sm_count, arch):
+    """``(row, op, T, plan)`` of the ``_ht`` rule rows whose half-tail items do not fit ``sm_count``'s pairs, planned
+    with a caller-forced ``sk=True`` (the planner's view: empty CPU tensors)."""
+    found = []
+    for row in PROJECTION_ROWS:
+        for op in ("fwd", "dgrad", "wgrad"):
+            for T in range(4096, 16385, 1024):
+                v = _views("proj", row, op, "bf16", T)
+                kw = dict(
+                    sm_count=sm_count,
+                    l2_bytes=L2_BYTES,
+                    arch=arch,
+                    transposed_out=v.get("transposed", False),
+                    _fallback=False,
+                )
+                try:
+                    plan, *_ = plan_dense_projection_gemm(
+                        v["A"], v["B"], v["out"], sk=True, **kw
+                    )
+                except (ValueError, NotImplementedError):
+                    continue
+                if "_ht" not in plan.template or plan.htail_plan:
+                    continue
+                found.append((row, op, T, plan))
+    return found
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count", [("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)]
+)
+def test_ht_program_never_plans_linearised_stream_k_units(arch, sm_count):
+    # The ``_ht`` program reads every unit past ``num_full`` as a half-height item of full K; a linearised stream-K
+    # plan (a caller-forced ``sk=True`` / ``sk="tiles"`` on an ``_ht`` rule row whose half items do not fit the pairs)
+    # would be misread.  The planner keeps the program and runs the plain whole-tile plan there instead.
+    found = _ht_rows_without_half_fit(sm_count, arch)
+    assert found, "no _ht rule row without the half-tail fit in the sweep"
+    for row, op, T, plan in found:
+        assert (plan.num_full, plan.tail_tiles, plan.sk_units, plan.iters_per_unit) == (
+            plan.pair_tiles,
+            0,
+            0,
+            plan.k_blocks,
+        ), (row, op, T, plan.template)
+        # the same row with the default policy plans identically (auto never splits where the half items do not fit)
+        v = _views("proj", row, op, "bf16", T)
+        auto, *_ = plan_dense_projection_gemm(
+            v["A"],
+            v["B"],
+            v["out"],
+            sm_count=sm_count,
+            l2_bytes=L2_BYTES,
+            arch=arch,
+            transposed_out=v.get("transposed", False),
+            _fallback=False,
+        )
+        assert auto.template == plan.template and auto.sk_units == 0
+    # and where the half items fit, a forced ``sk`` still yields the half-tail plan of the program
+    fits = [
+        p
+        for row in PROJECTION_ROWS
+        for op in ("fwd", "dgrad", "wgrad")
+        for T in (4096, 8192, 12288)
+        for p in [_plan_or_none(row, op, T, sm_count, arch, sk=True)]
+        if p is not None and "_ht" in p.template and p.htail_plan
+    ]
+    for p in fits:
+        assert p.sk_units == 2 * p.tail_tiles and p.iters_per_unit == p.k_blocks
+
+
+def _plan_or_none(row, op, T, sm_count, arch, **knobs):
+    v = _views("proj", row, op, "bf16", T)
+    try:
+        plan, *_ = plan_dense_projection_gemm(
+            v["A"],
+            v["B"],
+            v["out"],
+            sm_count=sm_count,
+            l2_bytes=L2_BYTES,
+            arch=arch,
+            transposed_out=v.get("transposed", False),
+            _fallback=False,
+            **knobs,
+        )
+    except (ValueError, NotImplementedError):
+        return None
+    return plan
+
+
+def test_ht_program_with_forced_stream_k_matches_fp64_reference():
+    # end to end on the device: the first ``_ht`` rule row without the half-tail fit, launched with ``sk=True``
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch = arch_for(torch.device("cuda"))
+    found = [f for f in _ht_rows_without_half_fit(_sm_count(), arch) if f[1] != "wgrad"]
+    if not found:
+        pytest.skip(
+            f"no _ht rule row without the half-tail fit on {arch} with {_sm_count()} SMs"
+        )
+    row, op, T, _ = found[0]
+    v = _make_inputs("proj", row, op, "bf16", T, seed=SEED + 7)
+    _require_program(_plan_template(v, sk=True))
+    prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"], sk=True)
+    assert "_ht" in prepared.plan.template and prepared.plan.sk_units == 0
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    expected = torch.matmul(v["A"].double(), v["B"].double())
+    _check(out, expected)
+
+
 @pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
 def test_sk_parts_rule(pairs):
     # Cake round 4 (L20): a measured ``sk_parts = p`` row rule splits every tail tile p ways when the units

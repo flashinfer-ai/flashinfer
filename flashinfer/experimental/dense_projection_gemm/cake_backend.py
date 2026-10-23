@@ -2399,6 +2399,11 @@ def plan_dense_projection_gemm(
             2 * tail_h,
             k_blocks,
         )
+    elif htail:
+        # The ``_ht`` program reads every unit past ``num_full`` as a half-height item of full K (the half-tail
+        # mapping above); it cannot run linearised stream-K units.  Where the half items do not fit, the program
+        # runs the plain whole-tile plan, whatever ``sk`` the row or the caller asked for.
+        num_full, tail_tiles, sk_units, iters_per_unit = pair_tiles, 0, 0, k_blocks
     else:
         num_full, tail_tiles, sk_units, iters_per_unit = stream_k_plan(
             pair_tiles, k_blocks, units, sk, sk_max_units
