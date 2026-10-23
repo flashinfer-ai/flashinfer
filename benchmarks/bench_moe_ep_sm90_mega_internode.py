@@ -8,10 +8,13 @@ Modes (one process per GPU under torchrun):
 * ``--mode intranode``: the same EP world inside one NVLink domain (NVSHMEM
   symmetric heap), the all-NVLink reference for the same per-rank problem.
 * ``--mode nccl_ep_ll | nccl_ep_ht | deepep``: split (non-fused) baselines --
-  EP dispatch, the CUTLASS per-tensor FP8 fused MoE over the received rows,
-  EP combine -- as three serial stages, ported from the Blackwell wide-EP
-  harness (NCCL-EP LL rank-major, NCCL-EP HT flat, DeepEP).  Tokens travel as
-  the same per-tensor E4M3 rows the mega kernel dispatches and come back BF16.
+  EP dispatch, the SM90 CUTLASS FP8 fused MoE over the received rows, EP
+  combine -- as serial stages, ported from the Blackwell wide-EP harness
+  (NCCL-EP LL rank-major, NCCL-EP HT flat, DeepEP).  Tokens travel as the same
+  E4M3 rows (and 1x128 block scales under blockwise) the mega kernel
+  dispatches and come back BF16.  per_tensor computes with the per-tensor FP8
+  runner; blockwise with the DeepSeek block-scale runner, which takes BF16
+  activations, so the received rows are dequantized in a timed handoff stage.
   ``nccl_ep_*`` need ``nccl.ep`` (nccl-extensions 0.1.0, whose kernels are
   built against the NCCL 2.30 device API: run it on NCCL 2.30.x, it faults on
   2.32); ``deepep`` needs DeepEP V2 (``deep_ep.ElasticBuffer``, NCCL GIN).
@@ -174,13 +177,14 @@ def _print_timeline(stamps, rank, tokens):
 # ---------------------------------------------------------------------------
 # Split baselines: EP dispatch -> CUTLASS FP8 fused MoE -> EP combine.
 #
-# Every engine dispatches the per-tensor E4M3 rows [T, H] (the scale is
-# static; NCCL-EP's FP8 transport also forwards a 16-byte per-token scale row,
-# the counterpart of the mega kernel's x_sf plane), returns the received rows
-# with LOCAL expert ids (-1 = not routed here) and their routing weights, and
-# combines BF16 rows of the same shape.  The compute stage applies the routing
-# weights and sums this rank's experts per row (CUTLASS finalize), so combine
-# only sums ranks.
+# Every engine dispatches the E4M3 rows [T, H] the mega kernel stages for the
+# same --scale-mode, plus a per-token scale row: the [T, H/128] fp32 1x128
+# block scales under blockwise, a 16-byte filler row under per_tensor (the
+# scale is static, but NCCL-EP carries FP8 tokens only under its
+# scale-forwarding recipe).  It returns the received rows with LOCAL expert
+# ids (-1 = not routed here) and their routing weights, and combines BF16 rows
+# of the same shape.  The compute stage applies the routing weights and sums
+# this rank's experts per row (CUTLASS finalize), so combine only sums ranks.
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +193,7 @@ class _NcclEp:
 
     _comm = None  # one NCCL communicator per process, shared by the groups
 
-    def __init__(self, algorithm, tokens, x, topk_idx, topk_w, args, world):
+    def __init__(self, algorithm, tokens, x, sf, topk_idx, topk_w, args, world):
         import nccl.ep as ep
         from nccl.ep.interop.torch import get_nccl_comm_from_group
 
@@ -212,34 +216,24 @@ class _NcclEp:
                 num_topk=k,
             ),
         )
+        self.blockwise = sf is not None
+        if sf is None:
+            sf = torch.full((tokens, 4), _ACT_SCALE, device="cuda")
         # The descriptors below do not own their buffers: keep them alive.
-        self.x, self.topk_idx, self.topk_w = x, topk_idx, topk_w
+        self.x, self.sf, self.topk_idx, self.topk_w = x, sf, topk_idx, topk_w
         self.out = torch.empty(tokens, h, dtype=torch.bfloat16, device="cuda")
         if self.ht:
-            rows = tokens * world
+            lead = (tokens * world,)
             self.recv_total = torch.zeros(1, dtype=torch.int64, device="cuda")
             self.handle_info = ep.LayoutInfo(
                 recv_total_counter=ep.Tensor(self.recv_total),
                 recv_topk_idx_kind=ep.ExpertIdKind.LOCAL,
             )
-            self.recv_x = torch.empty(rows, h, dtype=x.dtype, device="cuda")
-            self.recv_sf = torch.empty(rows, 4, dtype=torch.float32, device="cuda")
-            self.recv_w = torch.empty(rows, k, dtype=torch.float32, device="cuda")
-            self.recv_idx = torch.empty(rows, k, dtype=torch.int64, device="cuda")
-            self.row_ids = torch.arange(rows, device="cuda")
+            self.row_ids = torch.arange(lead[0], device="cuda")
             self.dispatch_info = None
             layout = ep.Layout.FLAT
         else:
-            self.recv_x = torch.empty(world, tokens, h, dtype=x.dtype, device="cuda")
-            self.recv_sf = torch.empty(
-                world, tokens, 4, dtype=torch.float32, device="cuda"
-            )
-            self.recv_w = torch.empty(
-                world, tokens, k, dtype=torch.float32, device="cuda"
-            )
-            self.recv_idx = torch.empty(
-                world, tokens, k, dtype=torch.int32, device="cuda"
-            )
+            lead = (world, tokens)
             self.src_counts = torch.zeros(world, dtype=torch.int32, device="cuda")
             self.slot_ids = torch.arange(tokens, device="cuda")
             self.handle_info = None
@@ -248,18 +242,19 @@ class _NcclEp:
                 recv_topk_idx_kind=ep.ExpertIdKind.LOCAL,
             )
             layout = ep.Layout.RANK_MAJOR
+        self.recv_x = torch.empty(*lead, h, dtype=x.dtype, device="cuda")
+        self.recv_sf = torch.empty(*lead, sf.shape[1], dtype=sf.dtype, device="cuda")
+        self.recv_w = torch.empty(*lead, k, dtype=torch.float32, device="cuda")
+        idx_dtype = torch.int64 if self.ht else torch.int32
+        self.recv_idx = torch.empty(*lead, k, dtype=idx_dtype, device="cuda")
         # Descriptors over persistent buffers are built once (host overhead
         # stays out of the comparison, as in the Blackwell harness).
         T = ep.Tensor
         self.t_idx = T(topk_idx)
-        # FP8 tokens travel only under the scale-forwarding recipe.
-        self.sf = torch.full((tokens, 4), _ACT_SCALE, device="cuda")
         self.d_cfg = ep.DispatchConfig(
             quantization_recipe=ep.DispatchQuantizationRecipe.FWD
         )
-        self.d_in = ep.DispatchInputs(
-            tokens=T(x), topk_weights=T(topk_w), scales=T(self.sf)
-        )
+        self.d_in = ep.DispatchInputs(tokens=T(x), topk_weights=T(topk_w), scales=T(sf))
         self.d_out = ep.DispatchOutputs(
             tokens=T(self.recv_x),
             topk_weights=T(self.recv_w),
@@ -295,8 +290,10 @@ class _NcclEp:
             valid = self.row_ids < self.recv_total
         else:
             valid = (self.slot_ids[None, :] < self.src_counts[:, None]).reshape(-1)
+        sf = self.recv_sf.view(-1, self.recv_sf.shape[-1]) if self.blockwise else None
         return (
             self.recv_x.view(-1, h),
+            sf,
             self.recv_idx.view(-1, k),
             self.recv_w.view(-1, k),
             valid,
@@ -326,7 +323,7 @@ class _NcclEp:
 class _DeepEp:
     """DeepEP V2 ``ElasticBuffer`` (NCCL GIN), non-expanded layout."""
 
-    def __init__(self, tokens, x, topk_idx, topk_w, args, world):
+    def __init__(self, tokens, x, sf, topk_idx, topk_w, args, world):
         import deep_ep
 
         self.buf = deep_ep.ElasticBuffer(
@@ -338,7 +335,9 @@ class _DeepEp:
             explicitly_destroy=True,
         )
         self.num_experts = args.num_experts
-        self.x, self.topk_idx, self.topk_w = x, topk_idx, topk_w
+        # FP32 scale factors ride along as DeepEP's FP8 (x, sf) pair.
+        self.x = x if sf is None else (x, sf)
+        self.topk_idx, self.topk_w = topk_idx, topk_w
         self.row_ids = torch.arange(tokens * world, device="cuda")
         self.handle = None
 
@@ -351,11 +350,12 @@ class _DeepEp:
             do_cpu_sync=False,
             do_handle_copy=False,
         )
+        recv_x, recv_sf = recv_x if isinstance(recv_x, tuple) else (recv_x, None)
         # Without a CPU sync the outputs are sized for the worst case; the
         # received rows are the prefix counted on device by the handle.
         total = self.handle.psum_num_recv_tokens_per_scaleup_rank[-1]
         valid = self.row_ids[: recv_idx.shape[0]] < total
-        return recv_x, recv_idx, recv_w, valid
+        return recv_x, recv_sf, recv_idx, recv_w, valid
 
     def combine(self, y):
         return self.buf.combine(y, handle=self.handle)[0]
@@ -368,63 +368,88 @@ class _DeepEp:
         self.buf.destroy()
 
 
+def _dequant(x, sf):
+    """E4M3 rows (+ [M, H/128] fp32 1x128 block scales) -> BF16."""
+    if sf is None:
+        return x.to(torch.bfloat16) * _ACT_SCALE
+    m, h = x.shape
+    blocks = x.view(m, sf.shape[1], -1).to(torch.bfloat16)
+    return blocks.mul_(sf.to(torch.bfloat16).unsqueeze(-1)).view(m, h)
+
+
 class _Fp8Experts:
-    """This rank's experts as the CUTLASS per-tensor FP8 fused MoE (SM90)."""
+    """This rank's experts as the SM90 CUTLASS FP8 fused MoE: per-tensor, or
+    DeepSeek 128x128 block scales under blockwise.  The block runner takes
+    BF16 activations and quantizes them 1x128 itself, so the received rows are
+    dequantized first (the handoff stage)."""
 
     def __init__(self, rank, experts, args):
         from flashinfer.fused_moe.api import (
+            CutlassFp8BlockConfig,
             CutlassFp8PerTensorConfig,
             MoEWeightPack as FusedWeightPack,
+            QuantFormat,
             SwiGLU,
         )
 
+        self.blockwise = args.scale_mode == "blockwise"
         w13, w2 = _bf16_weights(rank, experts, args.hidden, args.intermediate)
         self.activation = SwiGLU(limit=10.0)
-        view = CutlassFp8PerTensorConfig.prepare_weights(
-            w13,
-            w2,
-            hidden_states_scale_global=1.0 / _ACT_SCALE,
-            intermediate_scale_global=1.0 / _ACT_SCALE,
+        shape = dict(
             num_local_experts=experts,
             hidden_size=args.hidden,
             intermediate_size=args.intermediate,
             activation=self.activation,
         )
+        if self.blockwise:
+            self.config_cls, self.key = CutlassFp8BlockConfig, "cutlass_fp8_block"
+            self.fmt = QuantFormat.DeepSeekFp8
+            view = CutlassFp8BlockConfig.prepare_weights(w13, w2, **shape)
+        else:
+            self.config_cls = CutlassFp8PerTensorConfig
+            self.key, self.fmt = "cutlass_fp8_per_tensor", QuantFormat.FP8PerTensor
+            view = CutlassFp8PerTensorConfig.prepare_weights(
+                w13,
+                w2,
+                hidden_states_scale_global=1.0 / _ACT_SCALE,
+                intermediate_scale_global=1.0 / _ACT_SCALE,
+                **shape,
+            )
         del w13, w2
         torch.cuda.empty_cache()
         self.pack = FusedWeightPack()
-        self.pack.prepare_for("cutlass_fp8_per_tensor", view)
+        self.pack.prepare_for(self.key, view)
         self.experts, self.args = experts, args
         self.layer = None
 
     def build(self, max_rows):
         from flashinfer.fused_moe.api import (
             BackendOptions,
-            CutlassFp8PerTensorConfig,
             ExecutionConfig,
             ExpertConfig,
             MoEConfig,
             QuantConfig,
-            QuantFormat,
             RoutingConfig,
         )
         from flashinfer.fused_moe.layer import MoELayer
 
-        fp8 = QuantFormat.FP8PerTensor
         self.layer = MoELayer(
             MoEConfig(
                 routing=RoutingConfig(num_experts=self.experts, top_k=self.args.top_k),
-                quant=QuantConfig(weight=fp8, activation=fp8),
+                quant=QuantConfig(weight=self.fmt, activation=self.fmt),
                 experts=ExpertConfig(
                     intermediate_size=self.args.intermediate,
                     local_expert_offset=0,
                     local_num_experts=self.experts,
                 ),
                 activation=self.activation,
-                backend=BackendOptions(candidates=(CutlassFp8PerTensorConfig(),)),
+                backend=BackendOptions(candidates=(self.config_cls(),)),
                 execution=ExecutionConfig(tune_max_num_tokens=max_rows),
             )
         )
+
+    def activations(self, x, sf):
+        return _dequant(x, sf) if self.blockwise else x
 
     def __call__(self, x, ids, w):
         from flashinfer.fused_moe.api import MoEActivationPack
@@ -450,16 +475,16 @@ def _local_routing(recv_idx, recv_w, valid):
     return ids, torch.where(keep, recv_w.float(), 0.0)
 
 
-def _identity_check(engine, x, rank, tokens, local_experts):
+def _identity_check(engine, x, sf, rank, tokens, local_experts):
     """dispatch -> y = dequant(x) * sum(local weights) -> combine == dequant(x)."""
-    recv_x, recv_idx, recv_w, valid = engine.dispatch()
+    recv_x, recv_sf, recv_idx, recv_w, valid = engine.dispatch()
     ids, ws = _local_routing(recv_idx, recv_w, valid)
     if not bool(((ids >= -1) & (ids < local_experts)).all()):
         raise SystemExit(f"[check] rank {rank} T={tokens}: received ids not LOCAL")
-    y = (recv_x.float() * _ACT_SCALE * ws.sum(-1, keepdim=True)).to(torch.bfloat16)
+    y = (_dequant(recv_x, recv_sf).float() * ws.sum(-1, keepdim=True)).bfloat16()
     out = engine.combine(y).float()
     torch.cuda.synchronize()
-    ref = x.float() * _ACT_SCALE
+    ref = _dequant(x, sf).float()
     err = ((out - ref).norm() / ref.norm()).item()
     if not err < 1e-2:
         raise SystemExit(f"[check] rank {rank} T={tokens}: rel_l2 {err:.3e}")
@@ -467,15 +492,18 @@ def _identity_check(engine, x, rank, tokens, local_experts):
 
 
 _BASELINES = ("nccl_ep_ll", "nccl_ep_ht", "deepep")
+_STAGES = ("dispatch", "handoff", "compute", "combine")
 
 
 def _run_baselines(args, rank, world, per_node):
     """Time the split baselines; returns the result rows."""
-    if args.scale_mode != "per_tensor":
-        raise SystemExit("the split baselines run the per_tensor FP8 recipe only")
     dist.init_process_group("gloo")
-    from flashinfer.autotuner import autotune
+    from flashinfer.autotuner import autotune, set_autotune_process_group
     from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        Fp8BlockScaleK,
+        quantize_fp8_per_token_block,
+    )
 
     # One rank at a time: the JIT file lock races across nodes sharing an NFS
     # cache.  The module is cached per process for the runners built below.
@@ -483,31 +511,45 @@ def _run_baselines(args, rank, world, per_node):
         if r == rank:
             get_cutlass_fused_moe_module("90")
         dist.barrier()
+    # Average the tactic timings across ranks: tuned independently, timing
+    # noise (or a failing tactic) can leave one rank on a slow tactic that
+    # every other rank then waits for in combine.  All ranks tune the same
+    # shapes (T * world rows), as the reduction requires.
+    set_autotune_process_group(dist.group.WORLD)
     experts = _Fp8Experts(rank, args.num_experts // world, args)
     rows = []
     for tokens in [int(t) for t in args.tokens.split(",")]:
         hs, w, idx = _inputs(rank, tokens, args.hidden, args.num_experts, args.top_k)
-        # The per-tensor E4M3 rows the mega kernel stages, quantized up front.
-        x = (hs.float() / _ACT_SCALE).to(torch.float8_e4m3fn)
-        if args.mode == "deepep":
-            engine = _DeepEp(tokens, x, idx, w, args, world)
+        # The E4M3 rows (and block scales) the mega kernel stages, up front.
+        if experts.blockwise:
+            x, sf = quantize_fp8_per_token_block(
+                hs.float(), torch.float8_e4m3fn, block_k=Fp8BlockScaleK
+            )
+            sf = sf.contiguous()
         else:
-            engine = _NcclEp(args.mode[-2:], tokens, x, idx, w, args, world)
+            x, sf = (hs.float() / _ACT_SCALE).to(torch.float8_e4m3fn), None
+        if args.mode == "deepep":
+            engine = _DeepEp(tokens, x, sf, idx, w, args, world)
+        else:
+            engine = _NcclEp(args.mode[-2:], tokens, x, sf, idx, w, args, world)
         experts.build(tokens * world)
         check_err = (
-            _identity_check(engine, x, rank, tokens, experts.experts)
+            _identity_check(engine, x, sf, rank, tokens, experts.experts)
             if args.check
             else None
         )
 
         def call(ev=None):
-            recv_x, recv_idx, recv_w, valid = engine.dispatch()
+            recv_x, recv_sf, recv_idx, recv_w, valid = engine.dispatch()
             if ev is not None:
                 ev[1].record()
             ids, ws = _local_routing(recv_idx, recv_w, valid)
-            y = experts(recv_x, ids, ws)
+            act = experts.activations(recv_x, recv_sf)
             if ev is not None:
                 ev[2].record()
+            y = experts(act, ids, ws)
+            if ev is not None:
+                ev[3].record()
             return engine.combine(y)
 
         # Tune the CUTLASS tactics for this row count first: untuned, the
@@ -518,20 +560,22 @@ def _run_baselines(args, rank, world, per_node):
             call()
         torch.cuda.synchronize()
         dist.barrier()
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
-        samples = {"total": [], "dispatch": [], "compute": [], "combine": []}
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(len(_STAGES) + 1)]
+        samples = {s: [] for s in ("total", "excl_handoff", *_STAGES)}
         for _ in range(args.iters):
             dist.barrier()
             torch.cuda.synchronize()
             engine.align()
             ev[0].record()
             call(ev)
-            ev[3].record()
+            ev[-1].record()
             torch.cuda.synchronize()
-            samples["total"].append(ev[0].elapsed_time(ev[3]) * 1e3)
-            samples["dispatch"].append(ev[0].elapsed_time(ev[1]) * 1e3)
-            samples["compute"].append(ev[1].elapsed_time(ev[2]) * 1e3)
-            samples["combine"].append(ev[2].elapsed_time(ev[3]) * 1e3)
+            for i, s in enumerate(_STAGES):
+                samples[s].append(ev[i].elapsed_time(ev[i + 1]) * 1e3)
+            samples["total"].append(ev[0].elapsed_time(ev[-1]) * 1e3)
+            samples["excl_handoff"].append(
+                samples["total"][-1] - samples["handoff"][-1]
+            )
         meds = torch.tensor(
             [statistics.median(samples[s]) for s in samples], dtype=torch.float64
         )
@@ -546,18 +590,21 @@ def _run_baselines(args, rank, world, per_node):
             scale_mode=args.scale_mode,
             max_rank_us=float(per_rank[:, 0].max()),
             min_rank_us=float(per_rank[:, 0].min()),
-            dispatch_us=float(per_rank[:, 1].max()),
-            compute_us=float(per_rank[:, 2].max()),
-            combine_us=float(per_rank[:, 3].max()),
+            # The same slowest-rank median with the handoff stage (routing
+            # masks + the blockwise dequant the BF16-input runner forces) out.
+            excl_handoff_us=float(per_rank[:, 1].max()),
         )
+        for i, s in enumerate(_STAGES):
+            row[f"{s}_us"] = float(per_rank[:, i + 2].max())
         rows.append(row)
         if rank == 0:
             chk = "" if check_err is None else f" [check rel_l2 {check_err:.1e}]"
+            stages = " ".join(f"{s} {row[s + '_us']:.1f}" for s in _STAGES)
             print(
                 f"BENCH {args.mode} W={world} R={per_node} T={tokens} {args.scale_mode}: "
                 f"max-rank median {row['max_rank_us']:.1f} us (min-rank "
-                f"{row['min_rank_us']:.1f} us) | dispatch {row['dispatch_us']:.1f} "
-                f"compute {row['compute_us']:.1f} combine {row['combine_us']:.1f}{chk}",
+                f"{row['min_rank_us']:.1f} us, excl. handoff "
+                f"{row['excl_handoff_us']:.1f} us) | {stages}{chk}",
                 flush=True,
             )
         dist.barrier()
@@ -736,7 +783,8 @@ _FUSED = ("internode", "intranode")
 def _summarize(inputs, output):
     """One row per (world, per_node, scale_mode, tokens) across the given runs:
     every mode's max-rank median, the baselines' stage breakdown, the fastest
-    split baseline and each fused mode's speedup over it (> 1 = fused faster)."""
+    split baseline and each fused mode's speedup over it (> 1 = fused faster),
+    both on the full baseline time and with its handoff stage excluded."""
     import csv
 
     runs = {}
@@ -747,6 +795,7 @@ def _summarize(inputs, output):
                 runs.setdefault(key + (int(r["tokens"]),), {})[r["mode"]] = r
     order = ["internode", "intranode", *_BASELINES]
     modes = [m for m in order if any(m in v for v in runs.values())]
+    fused = [m for m in modes if m in _FUSED]
     rows = []
     for (world, per_node, scale_mode, tokens), by_mode in sorted(runs.items()):
         row = dict(world=world, per_node=per_node, scale_mode=scale_mode, tokens=tokens)
@@ -755,21 +804,25 @@ def _summarize(inputs, output):
             row[f"{m}_us"] = f"{float(r['max_rank_us']):.1f}" if r else ""
         for m in modes:
             if m in _BASELINES:
-                r = by_mode.get(m)
-                for stage in ("dispatch", "compute", "combine"):
-                    row[f"{m}_{stage}_us"] = (
-                        f"{float(r[stage + '_us']):.1f}" if r else ""
-                    )
-        timed = {
-            m: float(by_mode[m]["max_rank_us"]) for m in _BASELINES if m in by_mode
-        }
-        best = min(timed, key=timed.get) if timed else ""
-        row["best_baseline"] = best
-        row["best_baseline_us"] = f"{timed[best]:.1f}" if best else ""
-        for m in modes:
-            if m in _FUSED:
+                r = by_mode.get(m) or {}
+                for col in ("excl_handoff", *_STAGES):
+                    v = r.get(f"{col}_us", "")
+                    row[f"{m}_{col}_us"] = f"{float(v):.1f}" if v else ""
+        for metric, suffix in (
+            ("max_rank_us", ""),
+            ("excl_handoff_us", "_excl_handoff"),
+        ):
+            timed = {
+                m: float(by_mode[m][metric])
+                for m in _BASELINES
+                if by_mode.get(m, {}).get(metric)
+            }
+            best = min(timed, key=timed.get) if timed else ""
+            row[f"best_baseline{suffix}"] = best
+            row[f"best_baseline{suffix}_us"] = f"{timed[best]:.1f}" if best else ""
+            for m in fused:
                 ok = best and m in by_mode
-                row[f"{m}_speedup_vs_best"] = (
+                row[f"{m}_speedup_vs_best{suffix}"] = (
                     f"{timed[best] / float(by_mode[m]['max_rank_us']):.3f}"
                     if ok
                     else ""
