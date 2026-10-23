@@ -26,6 +26,7 @@ import pytest
 
 from flashinfer.jit import core as jit_core
 from flashinfer.jit import cute_dsl_core
+from flashinfer.jit import _cute_dsl_source as source_analysis
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -58,14 +59,14 @@ def fake_package(tmp_path, monkeypatch):
         path = pkg / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    monkeypatch.setattr(cute_dsl_core, "_PACKAGE_DIR", pkg.resolve())
-    cute_dsl_core._import_closure.cache_clear()
+    monkeypatch.setattr(source_analysis, "_PACKAGE_DIR", pkg.resolve())
+    source_analysis._import_closure.cache_clear()
     yield pkg.resolve()
-    cute_dsl_core._import_closure.cache_clear()
+    source_analysis._import_closure.cache_clear()
 
 
 def test_import_closure_follows_helpers_but_not_unkeyed_files(fake_package):
-    closure = cute_dsl_core._package_import_closure(
+    closure = source_analysis._package_import_closure(
         fake_package / "kernels" / "kernel.py"
     )
     names = {str(p.relative_to(fake_package)) for p in closure}
@@ -189,7 +190,7 @@ def test_strict_key_tracks_imported_helpers(fake_package, monkeypatch):
     strict_before = cute_dsl_core._hash_source_files((kernel,))
 
     helper.write_text("SCALE = 3\n")
-    cute_dsl_core._import_closure.cache_clear()
+    source_analysis._import_closure.cache_clear()
 
     assert cute_dsl_core._hash_source_files((kernel,)) != strict_before
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY")
@@ -208,7 +209,7 @@ def test_strict_key_leaves_files_outside_the_package_alone(
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
     outside = tmp_path / "standalone.py"
     outside.write_text("from flashinfer.helpers import math\n")
-    assert cute_dsl_core._expand_key_files((str(outside),)) == (str(outside),)
+    assert source_analysis._expand_key_files((str(outside),)) == (str(outside),)
 
 
 def test_strict_key_parse_failure_bypasses_disk_cache(fake_package, monkeypatch):
@@ -227,7 +228,7 @@ def test_strict_closure_of_real_kernel_stays_small(monkeypatch):
     """Guards against the closure ballooning to the whole package again."""
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
     kernel = Path(cute_dsl_core.__file__).resolve().parents[1] / "gdn_kernels"
-    closure = cute_dsl_core._package_import_closure(kernel / "gdn_decode_mtp.py")
+    closure = source_analysis._package_import_closure(kernel / "gdn_decode_mtp.py")
     assert any(
         p.parent.name == "gdn_kernels" and p.name != "gdn_decode_mtp.py"
         for p in closure

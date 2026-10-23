@@ -24,11 +24,11 @@ from pathlib import Path
 
 import pytest
 
-from flashinfer.jit import cute_dsl_core
+from flashinfer.jit import _cute_dsl_source as source_analysis
 
 
 def _clear_closure_caches():
-    cute_dsl_core._import_closure.cache_clear()
+    source_analysis._import_closure.cache_clear()
 
 
 @pytest.fixture
@@ -69,7 +69,7 @@ def fake_package(tmp_path, monkeypatch):
     }
     for rel, text in files.items():
         _write(pkg / rel, text)
-    monkeypatch.setattr(cute_dsl_core, "_PACKAGE_DIR", pkg.resolve())
+    monkeypatch.setattr(source_analysis, "_PACKAGE_DIR", pkg.resolve())
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
     _clear_closure_caches()
     yield pkg.resolve()
@@ -82,17 +82,17 @@ def _write(path, text):
 
 
 def _closure_names(pkg, rel):
-    closure = cute_dsl_core._package_import_closure(pkg / rel)
+    closure = source_analysis._package_import_closure(pkg / rel)
     return {str(p.relative_to(pkg)) for p in closure}
 
 
 def _edit_changes_key(pkg, kernel_rel, edited_rel, new_text):
     kernel = str(pkg / kernel_rel)
     _clear_closure_caches()
-    before = cute_dsl_core._hash_source_files((kernel,))
+    before = source_analysis._hash_source_files((kernel,))
     _write(pkg / edited_rel, new_text)
     _clear_closure_caches()
-    return cute_dsl_core._hash_source_files((kernel,)) != before
+    return source_analysis._hash_source_files((kernel,)) != before
 
 
 # Edits that cannot change what a kernel runs must leave its key alone.
@@ -347,7 +347,7 @@ def test_reading_all_through_star_import_keys_it(fake_package):
 # cute_dsl_core 7, gdn_decode_mtp 12, nvfp4_quantize 22. Every kernel now also
 # keys its package initializers and the Trace Apply code flashinfer/__init__.py
 # runs at import when FLASHINFER_TRACE_APPLY is set (about 20 files).
-_FLASHINFER_DIR = Path(cute_dsl_core.__file__).resolve().parents[1]
+_FLASHINFER_DIR = Path(source_analysis.__file__).resolve().parents[1]
 _REAL_KERNELS = [
     "jit/cute_dsl_core.py",
     "gdn_kernels/gdn_decode_mtp.py",
@@ -373,7 +373,7 @@ def real_package(monkeypatch):
     ],
 )
 def test_real_kernel_closure_stays_near_its_imports(real_package, kernel, limit):
-    closure = cute_dsl_core._package_import_closure(real_package / kernel)
+    closure = source_analysis._package_import_closure(real_package / kernel)
     assert len(closure) <= limit, sorted(
         str(p.relative_to(real_package)) for p in closure
     )
@@ -381,7 +381,7 @@ def test_real_kernel_closure_stays_near_its_imports(real_package, kernel, limit)
 
 @pytest.mark.parametrize("kernel", _REAL_KERNELS)
 def test_real_public_api_gaining_an_export_keeps_keys(real_package, kernel, tmp_path):
-    files, initializers = cute_dsl_core._key_sources((str(real_package / kernel),))
+    files, initializers = source_analysis._key_sources((str(real_package / kernel),))
     root = str(real_package / "__init__.py")
     assert root not in files  # keyed by the bindings used, not by content
     used = initializers[root]
@@ -390,13 +390,13 @@ def test_real_public_api_gaining_an_export_keeps_keys(real_package, kernel, tmp_
         (real_package / "__init__.py").read_text()
         + "\nfrom .utils import get_compute_capability as _new_public_api\n"
     )
-    assert cute_dsl_core._initializer_digest(
+    assert source_analysis._initializer_digest(
         Path(root), used
-    ) == cute_dsl_core._initializer_digest(edited, used)
+    ) == source_analysis._initializer_digest(edited, used)
 
 
 def test_cute_dsl_core_closure_excludes_unrelated_module_generators(real_package):
-    closure = cute_dsl_core._package_import_closure(
+    closure = source_analysis._package_import_closure(
         real_package / "jit" / "cute_dsl_core.py"
     )
     unrelated = sorted(
@@ -411,7 +411,7 @@ def test_cute_dsl_core_closure_excludes_unrelated_module_generators(real_package
 def test_gemm_kernel_closure_excludes_attention_stack(real_package):
     # gemm_svdquant reaches flashinfer/__init__.py through the trace
     # templates' function-local ``from flashinfer import ...``.
-    closure = cute_dsl_core._package_import_closure(
+    closure = source_analysis._package_import_closure(
         real_package / "gemm" / "gemm_svdquant.py"
     )
     attention = sorted(

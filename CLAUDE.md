@@ -629,7 +629,9 @@ kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`. The SHA256 covers only the files a caller
 passes as `extra_key_files` (often just `__file__`); with
 `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` it also covers every flashinfer module
-those files can run. Plain modules are keyed by content with everything they
+those files can run. Source analysis and hashing live in
+`flashinfer/jit/_cute_dsl_source.py`; `cute_dsl_core.py` manages compilation and
+cached artifacts. Plain modules are keyed by content with everything they
 import, including literal `importlib.import_module` calls. Package initializers
 are resolved name by name: a name looked up in a package follows the binding
 that defines it (a re-export to its source, a function into its body, a module

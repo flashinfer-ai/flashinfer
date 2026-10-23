@@ -49,6 +49,11 @@ As with the existing process-local compiler cache, dependencies must not be
 replaced inside a live Python process. Unversioned edits to external editable
 dependencies are not captured by wheel metadata.
 
+Source dependency analysis and hashing are implemented in
+`flashinfer/jit/_cute_dsl_source.py`, separate from compilation and artifact
+management in `cute_dsl_core.py`. Its module docstring describes the intended
+CI use and analysis limitations.
+
 Strict source hashing follows static imports and resolvable literal dynamic
 imports. Package initializers are resolved per name a kernel looks up, so a
 re-export leads to its source rather than to everything the package exports;
