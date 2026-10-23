@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host plan and loader glue of the Cake single-GPU norm kernels of the Muse
-Spark family: today the gated residual with the next RMSNorm fused
-(``flashinfer.norm.gated_residual_next_rmsnorm``, hidden size 8192, BF16
-branch and FP32 residual stream; SM100 / SM103).
+Spark family: the gated residual with the next RMSNorm fused
+(``flashinfer.norm.gated_residual_next_rmsnorm``) and the gated residual
+RMSNorm (``flashinfer.norm.gated_residual_rmsnorm``), hidden size 8192, BF16
+branch and FP32 residual stream; SM100 / SM103.
 
 Every record of ``MODULES`` is one mechanically exported production build: a
 CUDA device translation unit, a tvm-ffi binding and an occupancy query
@@ -32,15 +33,18 @@ verifying every source digest before the first build.
 
 A route is the list of records one public call may launch:
 ``<op>_<variant>`` per architecture (``ROUTES``), the variant naming which of
-the call's optional inputs the programs take (``alpha`` a tensor or a scalar,
-``post_weight`` present or not).  Each record admits a window of row counts on
+the call's optional inputs the programs take (``gated_residual_next_rmsnorm``:
+``alpha`` a tensor or a scalar, ``post_weight`` present or not) or the mode and
+the PDL form of the call (``gated_residual_rmsnorm``: ``mode0`` / ``mode1``,
+with ``_pdl`` for ``enable_pdl``).  Each record admits a window of row counts on
 each of its architectures (``select_rule``: ``above < rows <= at_most``, the
 last window unbounded); the windows of a route partition every positive row
 count, so ``selected_module`` always answers.  The grid follows the record's
-``grid_rule``: one cluster of ``cluster`` CTAs per row, or a persistent cluster
-loop of ``min(rows, co-resident clusters)`` clusters, the co-residency read once
-per (record, architecture, device) from the record's occupancy query
-(``occupancy_entry``).  No program owns a workspace (``workspace_rule`` is
+``grid_rule``: ``row_ctas`` CTAs per row (the cluster when the rule names none;
+``gated_residual_rmsnorm`` groups the ``split`` CTAs of a row in placement
+clusters of ``cluster``), or a persistent cluster loop of ``min(rows,
+co-resident clusters)`` clusters, the co-residency read once per (record,
+architecture, device) from the record's occupancy query (``occupancy_entry``).  No program owns a workspace (``workspace_rule`` is
 ``None`` on every record).  Batch size is a runtime scalar, so a changed row
 count never recompiles anything.
 """
@@ -2627,8 +2631,9 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 HIDDEN_SIZE = 8192
 
 #: The operators of the package and the variants of each (the route suffixes a
-#: public call maps onto: which optional inputs the programs take).
-OPS = ("gated_residual_next_rmsnorm",)
+#: public call maps onto: which optional inputs the programs take, or the mode
+#: and the PDL form).
+OPS = ("gated_residual_next_rmsnorm", "gated_residual_rmsnorm")
 VARIANTS: dict[str, tuple[str, ...]] = {
     "gated_residual_next_rmsnorm": (
         "alpha_tensor_pw",
@@ -2636,6 +2641,7 @@ VARIANTS: dict[str, tuple[str, ...]] = {
         "alpha_scalar_pw",
         "alpha_tensor_nopw",
     ),
+    "gated_residual_rmsnorm": ("mode0", "mode0_pdl", "mode1", "mode1_pdl"),
 }
 SELECT_KIND = "rows_between"
 GRID_KINDS = ("rows", "persistent_rows")
@@ -2650,6 +2656,8 @@ LOGICAL_TENSORS = (
     "post_weight",
     "residual_out",
     "ffn_input",
+    "weight",
+    "out",
 )
 LOGICAL_SCALARS = (
     "rows",
@@ -2658,6 +2666,8 @@ LOGICAL_SCALARS = (
     "post_gain_center",
     "next_gain_center",
     "alpha_value",
+    "eps",
+    "gain_center",
 )
 
 
@@ -2786,15 +2796,16 @@ def cluster_capacity(name: str, arch: str, device_index: int) -> int:
 def launch_grid(
     record: dict[str, Any], rows: int, *, device_index: int
 ) -> tuple[int, int, int]:
-    """Launch grid of one record under its recorded grid rule: ``rows x cluster`` CTAs (one cluster per row), or
-    ``min(rows, co-resident clusters) x cluster`` CTAs for the persistent row loop."""
+    """Launch grid of one record under its recorded grid rule: ``rows x row_ctas`` CTAs (``row_ctas`` the
+    rule's CTAs per row, the cluster when it names none), or ``min(rows, co-resident clusters) x cluster``
+    CTAs for the persistent row loop."""
     if rows <= 0:
         raise ValueError(f"Cake norm launches need a positive row count, got {rows}")
     rule = record["grid_rule"]
     cluster = int(rule["cluster"])
     kind = rule.get("kind")
     if kind == "rows":
-        return (rows * cluster, 1, 1)
+        return (rows * int(rule.get("row_ctas", cluster)), 1, 1)
     if kind == "persistent_rows":
         capacity = cluster_capacity(
             record["library"], device_arch(device_index), device_index
