@@ -335,7 +335,8 @@ def kcp_partition(
         The number of ranks of the context-parallel group.
     layout : str
         ``"contiguous"`` (equal token shares in order), ``"zigzag"`` or ``"zigzag_per_document"`` (the load-balanced
-        layouts); ``fragments`` or ``cut_points`` give an explicit layout instead.
+        layouts); ``fragments`` gives an explicit ragged layout instead, and ``cut_points`` (per document the
+        ``2 * world_size + 1`` cut offsets) applies to ``layout="zigzag_per_document"`` only.
 
     Returns
     -------

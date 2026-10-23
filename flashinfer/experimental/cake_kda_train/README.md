@@ -407,7 +407,8 @@ the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 The packed batch of one training step may be split over the ranks of a
 `torch.distributed` process group.  `kcp_partition` cuts the documents into
 per-rank fragments (`"contiguous"`, `"zigzag"` or `"zigzag_per_document"`
-layouts, or explicit cut points); `build_kcp_context` gives every rank the
+layouts, an explicit `fragments` table, or `cut_points` with the
+`"zigzag_per_document"` layout); `build_kcp_context` gives every rank the
 device tables of its fragments, the collectives that carry the per-document
 state recurrences and the convolution's history rows across the rank
 boundaries, and the segment plan of its fragment walks.  The per-rank entry
@@ -430,9 +431,11 @@ dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, be
                                           dout_local, saved=saved)
 ```
 
-CUDA-graph replay: every KCP entry point -- `chunk_kda_kcp`,
-`chunk_kda_kcp_fwd`, `chunk_kda_kcp_bwd` and `cake_causal_conv1d_kcp` -- takes
-`graph="replay"` (default `"off"`, the eager path). The first call of a
+CUDA-graph replay: the three KDA entry points -- `chunk_kda_kcp`,
+`chunk_kda_kcp_fwd` and `chunk_kda_kcp_bwd` -- take `graph="replay"`
+(default `"off"`, the eager path); the convolution halo takes `graph=` only
+through the backend module's function, the `cake_causal_conv1d_kcp` facade
+has no such parameter. The first call of a
 validity key runs eagerly, the second is captured into a CUDA graph and every
 later call of the key replays it: the same launches and collectives, bitwise
 the eager result, with no host work between them. The key is the call's kind,
@@ -447,17 +450,25 @@ and `LAST_CALL[kind]["graph_event"]` say what happened; a capture failure
 disables that key for the process), `exchange="ring"`, `debug_sequence` and
 calls without a caller-owned workspace are never captured. Memory: every
 cached key pins a private memory pool -- 0.7-9.0 GiB per rank per key on the
-the A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
-B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (LRU). Call
+A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
+B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (the oldest key is
+evicted). Call
 `graph_cache_clear()` (both modules) before
 `torch.distributed.destroy_process_group()` and whenever a layer's operands
-are gone for good. A captured call runs its one-CTA-per-SM tape programs
-without the device cache-config bracket of the shipped walk geometry (the
-bracket cannot be issued inside a capture): on the CP8 / CP16 rows replay is
-still 1.9-9.1 % faster than the eager default, on the CP4 row 1.3-2.3 % slower
-(the eager default keeps the full geometry gain; `graph="off"` is the shipped
-default). The A/B record was taken with pointer-stable harness inputs; its
-gain is an upper bound of what a framework sees.
+are gone for good. A replayed call keeps the tape programs at one CTA per SM:
+the device cache-config bracket of the eager path cannot be issued inside a
+capture, so right after each tape launch is captured the host sets the
+preferred shared-memory carveout as a launch attribute of the kernel node it
+just added (`cudaStreamGetCaptureInfo` + `cudaGraphKernelNodeSetAttribute`,
+host-only `ctypes` calls into the runtime that is already loaded) and the
+replayed graph carries the cap itself. Without those entry points, or when the
+runtime cannot name the captured node, the capture continues without the cap
+after one warning (`LAST_CALL[kind]["cache_config"] == "unavailable"`); the
+results are bitwise identical either way. The previous replay form stays
+reachable for A/B records through the private test knob `graph_cap`
+(`CAKE_KCP_TEST_KNOBS=1`); `graph="off"` is the shipped default. The A/B
+record was taken with pointer-stable harness inputs; its gain is an upper
+bound of what a framework sees.
 
 Limits of a partition: at most 65536 fragments per rank (the layout table's
 document search), at most 64 segments per fragment and no walk chain longer
@@ -466,6 +477,15 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 `kcp_comm_bytes(ctx, H=..., C=...)` size the rank's workspace, saved set and
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
+
+Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
+(the initial states of its fragments), with `save_transfer` the owner's c1
+receive tensor and `M_seg`, and the call's scalars; the int32 tables are
+rebuilt from the context.  The token-row `Aqk` / `Akk` of the single-rank
+saved set are not part of it: the backward recomputes the internal rows in
+both modes (saved set and checkpoint replay run the same local programs), so
+`kcp_saved_bytes` counts the tables, `S_in` and the `save_transfer` tensors
+(and the convolution's history rows with `with_conv`).
 
 Walk-launch geometry: the walk kernels' CTA lists are issued
 longest-segment-first and the two tape programs (`fwdh_tape`, `dhu_tape`) run
@@ -478,6 +498,19 @@ itself (occupancy only -- results never depend on the geometry). The earlier
 geometry stays reachable for A/B records through the private test knob
 `walk_geometry` (`CAKE_KCP_TEST_KNOBS=1`).
 
+Host path: the eager KCP calls reuse the call-independent host work -- the
+validated options, the workspace's last tables and pool views, the local
+stages' launch templates and the table set's own device tables -- keyed on
+object identity plus host integers and bounded (`ID_CACHE_MAX = 256` entries
+per table-set cache; the conv halo module keeps at most `HOST_CACHE_MAX = 64`
+contexts). The launch templates live on the workspace's local arena and
+reference the table set only weakly, so a training loop that builds a new
+context and workspace per step releases everything with them. The kernels,
+their arguments and their order are unchanged, so the results are bitwise
+those of the previous host path, which stays reachable for A/B records
+through the private test knob `host_trim` (`CAKE_KCP_TEST_KNOBS=1`; the conv
+module's `_set_test_knobs({"host_trim": 0})`).
+
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
 exchange -- the default with the all-to-all exchange (an earlier revision).
@@ -487,22 +520,35 @@ automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
-chain cap the equal-segment wave rule, below it on one-fragment ranks the
+chain cap the equal-segment wave rule on ranks with at most three fragments,
+below it on one-fragment ranks the
 largest `P` that runs one CTA per SM (`floor(SM / H)`), on every other rank
-one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`);
-`ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1"`).
+one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`) -- except that a rank
+with two or three fragments below the cap whose `P = 1` walks run one wave
+(`n_frag H <= SM`) takes `P = 1` when the longest-processing-time makespan of
+its actual fragment chunk counts at `P = 1` is not above the makespan at the
+occupancy `P` (such a rank runs no segment composition and no backward
+re-walk; at H = 64 on 152 SMs equal two-fragment ranks tie, unequal ones
+keep `P > 1`);
+`ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1_p1tie"`). The
+previous rules stay selectable through the private test knob `p_rule`, as
+does the fused form of the carry merges (`merge_fuse="carry"`: the two carry
+families of a phase in one launch; off by default).
 
 The KCP kernels live beside the single-rank programs:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the seven KCP programs (the
+* `cake_kcp_jit.py` -- the `MODULES` registry of the nine KCP programs (the
   fragment walks of the forward and backward state recurrences in their
-  `offset` and `tape` forms, the TF32 hi/lo transfer walk and the affine
-  merge at `cols_per_cta` 8 and 16; selection by `always` or by `columns` on
-  the merge's `ncols`, grids by `kcp_segments_heads` or `kcp_chains`), the
-  logical vocabulary of the KCP arguments, and `run_program(name, args,
-  device_index=)`, the lowering of the host backend's walk and merge requests
-  to the registry's launches.  Its `TEST_MODULES` are test-only programs of
-  `build.test.json` (below).
+  `offset` and `tape` forms, the TF32 hi/lo transfer walk, the affine
+  merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
+  context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
+  `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
+  `kcp_chains`, `kcp_sm_bounded` or `kcp_pairs`), the logical vocabulary of
+  the KCP arguments, `run_program(name, args, device_index=)`, the lowering
+  of the host backend's walk and merge requests to the registry's launches,
+  and `run_module` for the two chunk stages.  Its `TEST_MODULES` are
+  test-only programs of `build.test.json` (below).
 * `cake_kcp_plan.py` -- the partition, the segment plan and the context's
   tables and collectives, with the byte queries.
 * `cake_kcp.py` -- the per-rank launch sequences, the saved set and workspace
@@ -515,7 +561,7 @@ The KCP kernels live beside the single-rank programs:
   entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
   also admits the test knobs (`precision_mode`, `transfer_walk`) of the
   package's own tests; without the file those tests skip.
-* `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the eleven KCP
+* `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the thirteen KCP
   programs, rendered like the single-rank ones (digests in `build.json` and
   `build.test.json`).
 

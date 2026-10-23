@@ -37,7 +37,7 @@ PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 GRID = [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
 
-# The frozen kernel argument lists (name, kind) of the four KCP kernel packages.
+# The frozen kernel argument lists (name, kind) of the four KCP kernel packages and the two chunk stages of the route.
 FWDH_PLAN = [
     ["buffer", "w_tma"], ["buffer", "kg_tma"], ["buffer", "u"], ["buffer", "gk"], ["parameter", "num_heads"],
     ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"], ["buffer", "walk_seg"], ["buffer", "h0"],
@@ -64,6 +64,15 @@ MERGE_PLAN = [
     ["parameter", "ncols"], ["parameter", "transpose_m"], ["parameter", "write_states"], ["parameter", "cols_per_cta"],
     *GRID,
 ]  # fmt: skip
+FWD_O_PLAN = [
+    ["buffer", "qg_tma"], ["buffer", "h_tma"], ["buffer", "aqk_tma"], ["buffer", "vn_tma"], ["buffer", "o_out"],
+    ["buffer", "chunk_bos"], ["buffer", "chunk_len"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
+    ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
+]  # fmt: skip
+DAV_PLAN = [
+    ["buffer", "do_tma"], ["buffer", "vnew_tma"], ["buffer", "aqk_tma"], ["buffer", "dAqk"], ["buffer", "dv1"],
+    ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
+]  # fmt: skip
 PLANS = {
     "kcp_fwdh_offset": FWDH_PLAN,
     "kcp_fwdh_tape": FWDH_PLAN,
@@ -72,6 +81,8 @@ PLANS = {
     "kcp_transfer_walk": TRANSFER_PLAN,
     "kcp_affine_merge_c8": MERGE_PLAN,
     "kcp_affine_merge_c16": MERGE_PLAN,
+    "kcp_fwd_o": FWD_O_PLAN,
+    "kcp_dav": DAV_PLAN,
     "kcp_transfer_walk_three_mma": TRANSFER_PLAN,
     "kcp_transfer_walk_plain_tf32": TRANSFER_PLAN,
     "kcp_transfer_walk_bf16x3": TRANSFER_PLAN,
@@ -108,6 +119,8 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
         {"cols_per_cta": 16},
     ),
+    "kcp_fwd_o": (f"tart.kda_chunk_fwd_o.{_W}.kda_chunk_train_fwd_o_v1", {}),
+    "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
     "kcp_transfer_walk_three_mma": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
         {"precision_mode": 1},
@@ -147,6 +160,8 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_dhu_tape",
         "kcp_transfer_walk",
         "kcp_affine_merge",
+        "kcp_fwd_o",
+        "kcp_dav",
     )
     assert kcp_jit.PRECISION_MODES == (0, 1, 2)
     assert kcp_jit.TRANSFER_WALKS == ("tf32_hilo", "bf16x3", "bf16x3_hw64")
@@ -227,6 +242,16 @@ def test_selection_and_grids() -> None:
     )
     with pytest.raises(ValueError):
         kcp_jit.launch_grid("kcp_fwdh_offset", n_walk=0, num_heads=4)
+    # the chunk stages: persistent CTAs bounded by the SMs, one CTA per chunk pair and head
+    assert kcp_jit.launch_grid(
+        "kcp_fwd_o", num_chunks_pad=10, num_heads=3, sm_count=152
+    ) == (30, 1, 1)
+    assert kcp_jit.launch_grid(
+        "kcp_fwd_o", num_chunks_pad=400, num_heads=4, sm_count=152
+    ) == (152, 1, 1)
+    assert kcp_jit.launch_grid("kcp_dav", num_chunks_pad=10, num_heads=3) == (5, 3, 1)
+    with pytest.raises(ValueError):
+        kcp_jit.launch_grid("kcp_dav", num_chunks_pad=9, num_heads=3)
 
 
 def test_test_record_selection_by_knobs() -> None:
@@ -296,7 +321,13 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
         == shipped["package"]
         == "flashinfer.experimental.cake_kda_train"
     )
-    assert document["generator"] == shipped["generator"]
+    # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
+    # programs change: the two generator records share their form, not their stamp
+    assert (
+        set(document["generator"])
+        == set(shipped["generator"])
+        == {"cake_revision", "cuda", "rendered_at"}
+    )
     names = {entry["name"] for entry in document["libraries"]}
     assert names == {
         f"{record['library']}_{arch}"
