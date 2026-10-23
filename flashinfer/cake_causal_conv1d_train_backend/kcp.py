@@ -35,7 +35,13 @@ through the record's ``arg_plan`` / ``logical`` / ``ffi_entry`` and ``load``);
 logical tensor names are ``cake_jit.LOGICAL_TENSORS`` plus ``hist``,
 ``hist_row_off``, ``dpre_tail``, ``tail_row_off``, ``dpre_head``,
 ``head_row_off`` (``x_map`` / ``dy_map`` map to ``x`` / ``dy``); the scalars are
-``cake_jit.LOGICAL_SCALARS``.
+``cake_jit.PLAN_SCALARS`` (the KCP programs take no ``flags``).  The KCP path
+keeps the package's pre-round-6 contract: FP32 taps only (``_weight``'s default
+dtype set), no bias, and the legacy channel tile rule ``cake_jit.plan(...,
+legacy=True)`` (``ct_vec = min(C / 8, 128)``; its kernels pick the grouped path
+from ``ct_vec`` on the device and were validated and measured under that rule),
+so C = 1280 still plans (128, 1, 2) here while the training routes tile it as
+(32, 4, 5).
 
 Numerics against the zero-history kernels of this package: the forward runs
 the zero-history forward's instructions with history rows, so ``y`` is bitwise
@@ -449,7 +455,7 @@ def _kcp_forward(
     (name,) = route_modules(arch, KCP_FWD)
     device_index = _device_index(device)
     record = _loader.MODULES[name]
-    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"])
+    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
     if scalars["n_ch_tiles"] > launch_grid(record, device_index=device_index)[0]:
         raise ValueError(
             f"C={C} spans more channel tiles than the forward's grid on this device holds"
@@ -603,7 +609,7 @@ def _kcp_backward(
     )
     names = selected_modules(arch, KCP_BWD, C=C, S=S)
     record = _loader.MODULES[names[0]]
-    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"])
+    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
     grid_x = launch_grid(record, device_index=device_index)[0]
     if scalars["n_ch_tiles"] > grid_x:
         raise ValueError(
