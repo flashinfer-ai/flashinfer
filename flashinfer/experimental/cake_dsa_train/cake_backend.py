@@ -736,9 +736,10 @@ def validate_dsa_nope_inputs(
     stride); ``indices``: int32 ``[T, K_slots]`` global key rows with contiguous rows (any row stride; ``-1`` or
     ``>= S`` invalid), any ``K_slots >= 1`` -- no width alignment is required (rows whose stride and start are
     multiples of eight elements take the kernels' vector index path, the others the scalar path);
-    ``topk_length``: contiguous int32 ``[T]`` or ``None`` (the kernel-level entries read the rows as given; the
-    public autograd entries compact rows with ``-1`` holes through the index-preparation stage first at or above
-    :data:`NOPE_CONVERT_SLOT_LIMIT` slots and read them as given below it, see :func:`nope_compact_indices`);
+    ``topk_length``: contiguous int32 ``[T]`` or ``None`` (the kernel-level entries read the rows as given; without
+    it the public autograd entries compact rows with ``-1`` holes through the index-preparation stage first at or
+    above :data:`NOPE_CONVERT_SLOT_LIMIT` slots and read them as given below it; with it the varlen entry runs the
+    stage at every size and the flat entry reads rows and lengths as given, see :func:`nope_compact_indices`);
     ``dout``: BF16 ``[T, 64, 512]`` with ``T`` rows, under
     the same layout rules as ``q_latent`` (:func:`_check_head_tensor`: unit channel stride, token and head strides
     positive multiples of 8 elements, head stride >= 512, 16-byte base) -- a dense array or a strided view such as
@@ -4549,8 +4550,10 @@ def dsa_sparse_attention_nope(
 # the position-preserving rewrite with last valid slot + 1.  Its torch formulation, ``offset_gather_kv_indices``
 # (``compact=True`` for the compacting mode), is the reference the tests hold the stage to and the rope varlen
 # entry's fallback where the stage is not available.  The rope varlen entry launches the stage at every size; the
-# NoPE entries launch it at or above :data:`NOPE_CONVERT_SLOT_LIMIT` slots and with caller lengths, and take the
-# one-launch position-preserving forward below it (:func:`nope_varlen_index_mode`, :func:`nope_flat_index_mode`).
+# NoPE entries launch it at or above :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths -- the varlen
+# entry also with caller lengths at every size, the flat entry with caller lengths never (the forward alone over
+# the rows and lengths as given) -- and take the one-launch position-preserving forward below it
+# (:func:`nope_varlen_index_mode`, :func:`nope_flat_index_mode`).
 NOPE_INDEX_PREP_STAGE = "index_prep"
 INDEX_PREP_ROWS_PER_CTA = 4
 # Launch arguments a forward program that converts the per-document rows itself appends to its argument list
@@ -4576,12 +4579,15 @@ NOPE_CONVERT_MASK = 2
 # rows reach the kernel as given (a ``-1`` anywhere stays a masked slot at its position) and the forward derives
 # each row's length -- the last valid slot + 1 -- itself, so no host gap separates a preparation launch from the
 # forward.  At or above the limit the compacting preparation stage runs first (valid keys first, the count as the
-# length) and the forward follows over its rows back to back; a caller ``topk_length`` takes the stage at every
-# size (the cut it applies before compacting).  The rule reads the table size alone -- the host cannot see holes
+# length) and the forward follows over its rows back to back; on the varlen entry a caller ``topk_length`` takes
+# the stage at every size (the cut it applies before compacting), on the flat entry it skips the stage (rows and
+# lengths as given).  The rule reads the table size alone -- the host cannot see holes
 # without a device sync -- so a small table with holes pays the position-preserving cost of its holes (bounded by
 # its size); hole-free rows give the same bytes on either route.  The value is a measured crossover: the largest
-# table at which the one-launch forward stays within 0.95x of the stage route on the eager forward and within
-# 1.02x on the GPU-busy step, plus one.  1 << 20 is the provisional value until the ladder of this round is run.
+# measured table at which the one-launch forward stays within 0.95x of the stage route on the eager forward and
+# within 1.02x on the GPU-busy step, plus one, rounded up to the next power of two when the next measured table
+# also stays within 1.02x on the GPU-busy step.  1 << 20 is the provisional value until the ladder of this round
+# is run.
 NOPE_CONVERT_SLOT_LIMIT = 1 << 20
 _INT32_MAX = 2**31 - 1
 

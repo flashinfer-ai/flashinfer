@@ -35,20 +35,14 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
 * `indices [T, topk]` int32 (any row stride) hold **global** key rows; `-1` or `>= S` marks an
   invalid slot anywhere in the row; `topk_length [T]` int32 optionally
   invalidates slots `>= topk_length[t]`; any positive `topk`.  Without
-  `topk_length` the route follows the table size (`NOPE_CONVERT_SLOT_LIMIT`,
-  `nope_flat_index_mode`): below the limit the forward kernel derives each
-  row's length (last valid slot + 1) itself while it runs and the training
-  entry hands that vector to the backward with the rows as given -- one
-  launch, a `-1` anywhere stays a masked slot, both kernels skip only the
-  trailing invalid key blocks; at or above it the index-preparation stage
-  compacts the rows first (valid keys first in ascending slot order, then
-  `-1`, the valid count as the length) into a fresh buffer the forward and the
-  backward read, so rows with `-1` holes cost their valid slots.  The results
-  are those of the full row either way; hole-free rows give the same bytes on
-  both routes.
+  `topk_length` the forward kernel derives each row's length (last valid slot
+  + 1) itself while it runs and the training entry hands that vector to the
+  backward, so both skip the trailing invalid key blocks of short rows; the
+  results are those of the full row.
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
   to `cu_seqlens_k[d]`) and turns them into global key rows on device.  The
-  NoPE entry follows the same size rule (`nope_varlen_index_mode`): below the
+  NoPE varlen entry follows the size rule of its own section below
+  (`NOPE_CONVERT_SLOT_LIMIT`, `nope_varlen_index_mode`): below the
   limit, without caller lengths, the forward kernel converts the rows itself in
   its single launch, position-preserving -- the global key or `-1` at the slot
   it came from, the length the last valid slot + 1, bitwise the torch twin
@@ -435,8 +429,8 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
 * Varlen: per-document indices become global key rows on device; the route
   follows the table size (`nope_varlen_index_mode`).  Below
-  `NOPE_CONVERT_SLOT_LIMIT` slots (`1 << 20`; both small bench tables, 1024 x
-  128 and 1024 x 512, sit below it) and without caller lengths the forward
+  `NOPE_CONVERT_SLOT_LIMIT` slots (both small bench tables, 1024 x 128 and
+  1024 x 512, sit below it) and without caller lengths the forward
   converts the rows itself in its single launch (`convert = 2`): its scan lanes
   write the position-preserving global rows -- the global key or `-1` at the
   slot it came from -- into the fresh `indices_out` the backward reads and the
@@ -453,9 +447,10 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   `topk_length` passed as `length_in`; the forward and the saved backward read
   the stage's rows and counts (bitwise the torch twin
   `offset_gather_kv_indices(..., compact=True)`).  The limit is a measured
-  crossover (the largest table at which the one-launch forward stays within
-  0.95x of the stage route on the eager forward and 1.02x on the GPU-busy
-  step, plus one).  Both forward
+  crossover (the largest measured table at which the one-launch forward stays
+  within 0.95x of the stage route on the eager forward and 1.02x on the
+  GPU-busy step, plus one, rounded up to the next power of two when the next
+  measured table also stays within 1.02x on the GPU-busy step).  Both forward
   stages (`fwd`, `nope_fwd`) launch with the programmatic-dependent-launch
   attribute (`use_pdl` in their launch records, a fixed attribute of their
   bindings): `index_prep` signals `launch_dependents` at entry and the forward

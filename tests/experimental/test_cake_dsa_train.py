@@ -6465,8 +6465,8 @@ def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(
 def test_nope_hole_rows_below_the_limit_are_bitwise_the_position_preserving_forward(
     name, monkeypatch
 ):
-    """Below the slot limit (raised above every case here; every case but the 652,800-slot repro also sits below
-    the shipped limit) the packed entry converts in-kernel, position-preserving (``convert = 2``).  Through
+    """Below the slot limit (raised above every case here; every case, the 652,800-slot repro included, also sits
+    below the shipped limit) the packed entry converts in-kernel, position-preserving (``convert = 2``).  Through
     ``forward_nope_varlen`` the hole rows give the globalized rows of ``offset_gather_kv_indices`` with their
     holes in place and the last valid slot + 1 as lengths, and ``out`` / ``lse`` / ``o_lo`` bitwise the eager
     ``forward_nope`` over those rows (the same kernel over the same slot order); ``backward_nope`` over the
@@ -6939,7 +6939,9 @@ def test_nope_autograd_backward_on_masked_rows_in_raw_order_matches_the_referenc
     _require_nope_mask_route()
     monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 40)
     if construction == "every_third_causal":
-        inp = _nope_inputs([256, 128], [512, 512], seed=NOPE_SEED + 870, topk=96)
+        inp = nope_ref.make_nope_inputs(
+            [256, 128], [512, 512], seed=NOPE_SEED + 870, topk=96, index="iid"
+        )
         local = inp.idx_local.clone()
         local[:, 1::3] = -1
         local[7] = -1

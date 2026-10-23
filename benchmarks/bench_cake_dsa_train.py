@@ -1069,9 +1069,14 @@ def _glue_compacts():
 
 
 def _globalize(local, cu_q, cu_k):
-    """Global rows and lengths of per-document rows through the torch glue: the stable compaction with the valid
-    counts where the package compacts (what its entries do on device), else the position-preserving rows."""
-    kw = dict(compact=True) if _glue_compacts() else {}
+    """Global rows and lengths of per-document rows through the torch glue, in the form the package's entries
+    produce on device for a table of this size: the stable compaction with the valid counts where they run the
+    compacting stage, else the position-preserving rows with the last valid slot + 1."""
+    mode = getattr(cake_backend, "nope_varlen_index_mode", None)
+    compact = _glue_compacts() and (
+        mode is None or mode(int(local.shape[0]), int(local.shape[1])) == "index_prep"
+    )
+    kw = dict(compact=True) if compact else {}
     return cake_backend.offset_gather_kv_indices(
         local, cu_q, cu_k, causal=True, return_topk_length=True, **kw
     )
