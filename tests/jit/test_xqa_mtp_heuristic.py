@@ -220,3 +220,26 @@ def test_xqa_mtp_run_fallback_guards(make_wrapper, monkeypatch, options, expecte
     kv = torch.zeros(16 * 64, 2, 16, 8, 128, dtype=torch.float16)
     wrapper.run(q, kv, enable_pdl=False, **options)
     assert calls == [expected]
+
+
+def test_xqa_mtp_q2_keeps_fast_planner(make_wrapper, monkeypatch):
+    wrapper, plan, indices = make_wrapper()
+    plan(q_len_per_req=2)
+
+    def unexpected_regular_plan(*args, **kwargs):
+        raise AssertionError("q2 must keep the ordinary fast planner")
+
+    monkeypatch.setattr(wrapper, "_plan_impl", unexpected_regular_plan)
+    decode.fast_decode_plan(
+        wrapper,
+        torch.arange(17, dtype=torch.int32) * 64,
+        indices,
+        torch.full((16,), 16, dtype=torch.int32),
+        32,
+        8,
+        128,
+        16,
+        q_len_per_req=2,
+        q_data_type=torch.float16,
+    )
+    assert not wrapper._use_xqa_mtp_decode

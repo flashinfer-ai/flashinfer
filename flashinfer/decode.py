@@ -5423,7 +5423,16 @@ def fast_decode_plan(
         wants_cudnn
         or self._cudnn_auto
         or getattr(self, "_use_xqa_mtp_decode", False)
-        or (self._requested_backend == "auto" and self.is_cuda_graph_enabled)
+        or (
+            self._requested_backend == "auto"
+            and self.is_cuda_graph_enabled
+            and get_compute_capability(self.device) == (9, 0)
+            and (num_qo_heads, num_kv_heads, head_dim, page_size) == (32, 8, 128, 16)
+            and (
+                (q_len_per_req == 8 and len(last_page_len) in (4, 16, 64))
+                or (q_len_per_req == 4 and len(last_page_len) == 16)
+            )
+        )
     ):
         # XQA needs its KV lengths and block table refreshed by the regular
         # planner too; the FA2 copy-elision path leaves that metadata stale.
