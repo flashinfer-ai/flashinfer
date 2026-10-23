@@ -308,8 +308,9 @@ P2_KNOBS = {  # knob -> admitted values
 SCHEDULE_DEFAULT = "wait_first"
 FUSED_WALKS_DEFAULT = 1
 
-# Program names of the dispatch table (the K1-K4 programs of the design note §14) and the local chunk stages
-# (``cake_backend`` stages at the per-rank shape, launched through ``KdaWorkspace.run``).
+# Program names of the dispatch table (the K1-K4 programs of the design note §14) and the local chunk stages: the
+# existing backend's stages at the per-rank shape (launched with the records its plan selects on
+# :data:`LOCAL_PATH_FWD` / :data:`LOCAL_PATH_BWD`) and the two KCP-owned records of :data:`KCP_LOCAL_RECORDS`.
 KCP_PROGRAMS = (
     "kcp_fwdh_offset",  # K1 ``_offset``: walk from zero, final state -> compact tiles (B_f / b_seg)
     "kcp_fwdh_tape",  # K1 ``_tape``: walk from an indexed initial state, h / v_new tapes
@@ -318,8 +319,30 @@ KCP_PROGRAMS = (
     "kcp_transfer_walk",  # K3: FP32-class transfer M_f (^T) (or the FP32-class offset with init_mode = 1)
     "kcp_affine_merge",  # K4: exact FP32 affine chain (state / map / transposed modes)
 )
-LOCAL_STAGES_FWD = ("fwd_prep", "fwd_intra", "wy", "fwd_o")
-LOCAL_STAGES_BWD = ("bwd_prep", "wy", "dav", "dqkg", "glm_intra", "gate_epilogue")
+LOCAL_STAGES_FWD = ("fwd_intra", "wy_fwd", "fwd_o")
+LOCAL_STAGES_BWD = (
+    "bwd_prep",
+    "fwd_intra",
+    "wy",
+    "dav",
+    "dqkg",
+    "glm_intra",
+    "gate_epilogue",
+)
+# The paths of the existing backend's plan the local stages take their records from (the forward without a saved
+# set, the checkpoint replay for both backward modes: :mod:`.cake_kcp_plan`) and the arena layouts they run on.
+LOCAL_PATH_FWD = cake_kcp_plan.LOCAL_PATH_FWD
+LOCAL_PATH_BWD = cake_kcp_plan.LOCAL_PATH_BWD
+LOCAL_LAYOUT_FWD = "fwd"
+LOCAL_LAYOUT_BWD = "replay"
+# The KCP-owned local records (:mod:`.cake_kcp_jit`), by the stage name the launch sequences use: the output program
+# over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program whose ``dv1`` K2 reads (the forms the
+# existing backend's output and dA / dv programs had before its fused recurrences took them over).
+KCP_LOCAL_RECORDS = {"fwd_o": "kcp_fwd_o", "dav": "kcp_dav"}
+# The WY records the KCP launches directly where the plan fuses the WY representation into a state recurrence the
+# KCP does not run (its recurrences are the K1 / K2 walks): the forward's program and the replay's.
+WY_DIRECT_RECORDS = {"wy_fwd": "wy_fwd", "wy": "wy_bwd_replay"}
+SCRATCH_TABLES_ATTR = "_kcp_scratch_tables"  # the arena attribute holding the table set the intra record writes
 COLLECTIVES = ("c1", "c2", "b1", "b2")
 
 
@@ -487,7 +510,7 @@ _SPEC3_ROWS = (
     "w",
     "u",
 )  # the prep rows SPEC-3 compares (the design note §6.4)
-SPEC3_ENV = "CAKE_KCP_SPEC3"  # "0": skip the debug assertion; "warn": record a failure without raising; default: assert
+SPEC3_ENV = "CAKE_KCP_SPEC3"  # "0": skip the probe; default: record; "warn": warn on a difference; "assert": raise
 _PROGRAM_OF = {
     "kcp_fwdh_offset": "fwdh_offset",
     "kcp_fwdh_tape": "fwdh_tape",
@@ -499,9 +522,11 @@ _PROGRAM_OF = {
 
 
 class KcpPreconditionError(RuntimeError):
-    """SPEC-3 failed: ``bwd_prep`` + ``wy`` did not reproduce the forward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows
-    bitwise (the design note §6.4); saved mode and replay mode would differ.  Options (a) / (b) / (c) of §6.4 are a parent
-    decision (``NEED_PARENT``), never a silent relaxation."""
+    """The SPEC-3 probe found the backward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows different from the forward's
+    on a real token row and ``CAKE_KCP_SPEC3=assert`` asked for an error (the design note §6.4).  The requirement of
+    record is that the two backward modes (saved set, checkpoint replay) produce identical gradients: both run the
+    same prep, intra and WY programs on the same operands, which the GPU tests check bitwise.  The forward's prep
+    rows come from the intra program's fused prep and may differ from the prep program's."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -527,18 +552,31 @@ class KernelBackend(Backend):
     registry (:mod:`.cake_kcp_jit`, imported at the first launch so this module imports without it); a bring-up
     provider launching the source builds directly can be passed (``path="direct"``; never a gated row).
 
-    Local stages: a forward call runs ``fwd_prep`` / ``fwd_intra`` / ``wy`` / ``fwd_o`` on the arena's ``fwd`` layout;
-    a backward call runs on the ``bwd`` layout — saved mode ``bwd_prep`` (``copy_saved = 1`` from the saved ``Aqk`` /
-    ``Akk``) + ``wy``, replay mode ``bwd_prep`` (``copy_saved = 0``) + ``fwd_intra`` (``write_int``) + ``wy`` as the
-    existing replay path (``cake_backend.chunk_kda_bwd``) — then ``dav`` / ``dqkg`` / ``glm_intra`` / ``gate_epilogue``.
-    The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and write
+    Local stages (:data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`): a forward call runs the existing backend's
+    intra program (``write_prep = 1``: the GLM prep's rows, the internal ``Aqk`` / ``Akk`` rows and, with a saved set,
+    the token rows), its forward WY program and the KCP's output program ``kcp_fwd_o`` (the output from the K1 ``h``
+    / ``v_new`` tapes) on the arena's ``fwd`` layout, with the records the plan selects on the forward path without a
+    saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout with the records of the replay
+    path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows and the internal ``dout`` copy
+    ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk`` rows), the replay's WY program,
+    then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk`` and the intra-chunk ``dv1`` K2 reads) and after K2
+    the fused gradient, GLM intra and the gate epilogue.  Where the plan fuses the WY representation into a state
+    recurrence the KCP does not run, the WY program is launched directly (:data:`WY_DIRECT_RECORDS`) on its grid
+    rule.  The intra record that computes the chunk layout from ``cu_seqlens`` writes its tables into a scratch set
+    on the arena (:data:`SCRATCH_TABLES_ATTR`); every other program reads the context's CPU-built tables.  The saved
+    set's token-row ``Aqk`` / ``Akk`` are kept (the saved-set contract) and read by no local program: the backward
+    recomputes the internal rows in both modes, so the two modes run the same programs on the same operands.  The
+    K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and write
     its ``h`` / ``v_new`` (``dh`` / ``dv2``) tapes.
 
-    SPEC-3 (debug assertion, once per process on the first saved-mode backward): before that backward's ``bwd_prep``
-    the forward's ``fwd_prep`` + ``fwd_intra`` + ``wy`` run on the ``fwd`` layout and their five rows are kept; after
-    ``bwd_prep`` + ``wy`` the ``bwd`` layout's rows must equal them bitwise on every real token row (pad rows are
-    reported separately).  ``CAKE_KCP_SPEC3=0`` skips it, ``=warn`` records without raising; the result is in
-    ``LAST_CALL["bwd"]["spec3"]`` and :attr:`spec3`.
+    SPEC-3 (debug probe, once per process on the first saved-mode backward): before that backward's prep the
+    forward's intra program and WY program run on the ``fwd`` layout and their five rows (``gk`` / ``kg`` / ``qg`` /
+    ``w`` / ``u``) are kept; after the backward's WY program the ``replay`` layout's rows are compared with them on
+    every real token row (pad rows are reported separately).  The requirement of record is that the two backward
+    modes produce identical gradients (the GPU tests check saved mode against the replay bitwise); the forward's
+    prep rows come from the intra program's fused prep and may differ from the prep program's, so the probe records
+    by default.  ``CAKE_KCP_SPEC3=0`` skips it, ``=warn`` warns on a difference, ``=assert`` raises
+    :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and :attr:`spec3`.
     """
 
     name = "kernels"
@@ -596,7 +634,7 @@ class KernelBackend(Backend):
             raise ValueError(
                 f"local plan geometry (NC_pad, R) = {(p.NC_pad, p.R)} differs from the KCP context's {(ctx.NC_pad, ctx.R)}"
             )
-        views = ws.views("bwd" if call.backward else "fwd")
+        views = ws.views(LOCAL_LAYOUT_BWD if call.backward else LOCAL_LAYOUT_FWD)
         if call.host_trim:  # the call-independent part of the value dict is built once per (arena, tables, direction)
             # the template is cached on the ARENA whose views it holds (it dies with the arena), keyed by the
             # table set's identity with a WEAK reference to it (a hit needs that very table set alive); the backend
@@ -612,7 +650,7 @@ class KernelBackend(Backend):
                     del cache[stale]
                 hit = (
                     weakref.ref(call.tb),
-                    self._local_template(ws, views, ctx, call.tb, p, call.backward),
+                    self._local_template(views, ctx, p, call.backward),
                 )
                 cache[key] = hit
             values: dict[str, Any] = dict(hit[1])
@@ -621,35 +659,22 @@ class KernelBackend(Backend):
             call.local_values = values
             call.scratch["views"] = views
             return
-        values = dict(vars(views))
-        for name in cake_backend.TABLE_NAMES[:4]:
-            values[name] = ctx.tables[name]
-        values["seg_chunk_start"] = call.tb.hp.device_tables["seg_chunk_start"]
-        values.update(
-            num_seqs=p.N,
-            num_chunks_pad=p.NC_pad,
-            num_heads=p.H,
-            group=1,
-            num_segments=p.NSEG,
-            segments=p.P,
-        )
+        values = self._local_template(views, ctx, p, call.backward)
         values.update(call.ops)
-        values.update(h2d=views.h.view(-1, D), scale=call.scale)
-        if call.backward:
-            values["dh2d"] = views.dh.view(-1, D)
+        values["scale"] = call.scale
         call.local_values = values
         call.scratch["views"] = views
 
     @staticmethod
-    def _local_template(
-        ws: Any, views: Any, ctx: Any, tb: _Tables, p: Any, backward: bool
-    ) -> dict[str, Any]:
-        """Trimmed host path: the values of ``begin_call`` that do not depend on the call (the arena views, the context tables, the
-        plan scalars, the ``h2d`` / ``dh2d`` views); the operands and ``scale`` are added per call."""
+    def _local_template(views: Any, ctx: Any, p: Any, backward: bool) -> dict[str, Any]:
+        """The values of ``begin_call`` that do not depend on the call: the arena views of the layout, the context's
+        four chunk tables (the existing backend's vocabulary; the KCP's segment table is a K1-K4 argument, not a
+        local one), the plan scalars of the existing backend's logical vocabulary and the ``h2d`` / ``dh2d`` views.
+        The operands and ``scale`` are added per call (the trimmed host path caches this part per (arena, table set,
+        direction))."""
         values: dict[str, Any] = dict(vars(views))
         for name in cake_backend.TABLE_NAMES[:4]:
             values[name] = ctx.tables[name]
-        values["seg_chunk_start"] = tb.hp.device_tables["seg_chunk_start"]
         values.update(
             num_seqs=p.N,
             num_chunks_pad=p.NC_pad,
@@ -657,6 +682,9 @@ class KernelBackend(Backend):
             group=1,
             num_segments=p.NSEG,
             segments=p.P,
+            seg_arg=p.seg_arg,
+            proportional=p.proportional,
+            num_pairs=p.R // cake_jit.PAIR_ROWS,
         )
         values["h2d"] = views.h.view(-1, D)
         if backward:
@@ -664,20 +692,21 @@ class KernelBackend(Backend):
         return values
 
     def stage(self, name: str, call: KcpCall, **extra: Any) -> None:
+        """One local stage of :data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`: the plan's record on the call's path
+        (or the direct WY record), the KCP-owned record of ``fwd_o`` / ``dav``."""
         values, views = call.local_values, call.scratch["views"]
+        local = call.local
+        p = local.plan
+        path = LOCAL_PATH_BWD if call.backward else LOCAL_PATH_FWD
         if call.out is not None:
             values["out"] = call.out
         if call.grads is not None:
             values.update(call.grads)
-        if (
-            name == "fwd_prep" and call.backward
-        ):  # replay: the backward layout's prep without the saved copies
-            name, extra = "bwd_prep", {"saved": None}
         if name == "bwd_prep":
+            # both backward modes run the replay prep (the GLM prep's rows, the internal dout copy K2 and dav read);
+            # the saved rows are checked here and read by no local program (the intra program recomputes the rows)
             saved = extra.pop("saved", None)
-            if saved is None:
-                extra.update(aqk_src=views.akk_int, akk_src=views.akk_int, copy_saved=0)
-            else:
+            if saved is not None:
                 if saved.Aqk is None or saved.Akk is None:
                     raise ValueError(
                         "saved: the saved set has no Aqk / Akk rows (forward without save_for_backward?)"
@@ -696,7 +725,6 @@ class KernelBackend(Backend):
                     torch.bfloat16,
                     call.device,
                 )
-                extra.update(aqk_src=saved.Aqk, akk_src=saved.Akk, copy_saved=1)
                 if self._spec3_pending:
                     self._spec3_forward_rows(
                         call
@@ -712,31 +740,64 @@ class KernelBackend(Backend):
                 extra.update(aqk_ext=aqk, akk_ext=akk)
             else:  # not written: any BF16 tensor serves as the unused pointer (as cake_backend does)
                 extra.update(aqk_ext=views.akk_int, akk_ext=views.akk_int)
-        local = call.local
-        if (
-            call.host_trim and local.launcher is cake_jit.run_module
-        ):  # a diagnostics launcher keeps the base path
-            _stage_launch_trim(local, name, {**values, **extra})
-        else:
-            local.run(name, {**values, **extra})
+            # the internal rows every KCP consumer reads; the GLM prep's rows on the forward, the backward's prep
+            # program wrote them already
+            extra.setdefault("write_int", 1)
+            extra.setdefault("write_prep", 0 if call.backward else 1)
+            if cake_kcp_plan.intra_writes_tables(p, path):
+                extra.update(
+                    cu_seqlens=call.ctx.cu_seqlens_local, **_scratch_tables(local)
+                )
+        elif name in KCP_LOCAL_RECORDS:
+            self.programs().run_record(
+                KCP_LOCAL_RECORDS[name],
+                {**values, **extra},
+                grid=kcp_local_grid(name, p),
+                device_index=local.device_index,
+            )
+            return
+        record, grid = _local_record(p, name, path)
+        self._launch(call, record, grid, {**values, **extra})
         if name == "wy" and call.scratch.get("spec3_ref") is not None:
             self._spec3_compare(call)
 
+    @staticmethod
+    def _launch(
+        call: KcpCall,
+        record: str,
+        grid: tuple[int, int, int],
+        values: dict[str, Any],
+    ) -> None:
+        """A record of the existing backend's registry on the local arena: the trimmed launch, or the arena's
+        launcher (a diagnostics launcher keeps the base path)."""
+        local = call.local
+        if call.host_trim and local.launcher is cake_jit.run_module:
+            _launch_record_trim(local, record, grid, values)
+        else:
+            local.launcher(record, values, grid=grid, device_index=local.device_index)
+
     # -- SPEC-3
     def _spec3_forward_rows(self, call: KcpCall) -> None:
+        """The probe's reference: the forward's intra program (``write_prep = 1``) and WY program on the ``fwd``
+        layout, their five rows kept (the backward's layout shares the arena, so this runs before its prep)."""
         self._spec3_pending = False
-        ws = call.local
-        a = ws.views("fwd")
+        local = call.local
+        p = local.plan
+        a = local.views(LOCAL_LAYOUT_FWD)
         vals = {**call.local_values, **vars(a)}
         vals.update(
             h2d=a.h.view(-1, D),
             aqk_ext=a.akk_int,
             akk_ext=a.akk_int,
-            out=call.grads["dv"],
+            write_ext=0,
+            write_int=1,
+            write_prep=1,
         )
-        ws.run("fwd_prep", vals)
-        ws.run("fwd_intra", {**vals, "write_ext": 0, "write_int": 1})
-        ws.run("wy", vals)
+        if cake_kcp_plan.intra_writes_tables(p, LOCAL_PATH_FWD):
+            vals.update(cu_seqlens=call.ctx.cu_seqlens_local, **_scratch_tables(local))
+        for stage in ("fwd_intra", "wy_fwd"):
+            record, grid = _local_record(p, stage, LOCAL_PATH_FWD)
+            self._launch(call, record, grid, vals)
         call.scratch["spec3_ref"] = {n: getattr(a, n).clone() for n in _SPEC3_ROWS}
 
     def _spec3_compare(self, call: KcpCall) -> None:
@@ -763,10 +824,16 @@ class KernelBackend(Backend):
             if n_real:
                 result["equal"] = False
         self.spec3 = call.scratch["spec3"] = result
-        if not result["equal"] and os.environ.get(SPEC3_ENV, "1") != "warn":
-            raise KcpPreconditionError(
-                f"SPEC-3: bwd_prep + wy differ from fwd_prep + wy on real rows: {result['rows']}"
+        if not result["equal"]:
+            mode = os.environ.get(SPEC3_ENV, "1")
+            message = (
+                "SPEC-3 probe: the backward's prep + WY rows differ from the forward's intra + WY rows on real "
+                f"token rows: {result['rows']}"
             )
+            if mode == "assert":
+                raise KcpPreconditionError(message)
+            if mode == "warn":
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     # -- KCP programs (positional ABI of the design note §14)
     def abi(
@@ -1511,13 +1578,57 @@ def _arch_of(device_index: int) -> str:
     return arch
 
 
-def _stage_launch_trim(local: Any, stage: str, values: dict[str, Any]) -> None:
-    """Trimmed host path: ``cake_backend.KdaWorkspace.run(stage, values)`` with the launch of ``cake_jit.run_module`` inlined -- the
-    record's argument plan (cached by cake_jit), the arena's cached arch, the raw-stream FFI context.  Same record, same
-    grid, same positional arguments, same stream as ``local.run``."""
+def _local_record(p: Any, stage: str, path: str) -> tuple[str, tuple[int, int, int]]:
+    """``(record, grid)`` of local stage ``stage`` on ``path`` of plan ``p``: the plan's selection, or the direct WY
+    record (:data:`WY_DIRECT_RECORDS`) on its own grid rule where the plan fuses the WY representation into a state
+    recurrence the KCP does not run."""
+    if stage in WY_DIRECT_RECORDS and not p.dispatched(stage, path):
+        record = WY_DIRECT_RECORDS[stage]
+        grid = cake_jit.launch_grid(
+            record,
+            num_chunks_pad=p.NC_pad,
+            num_seqs=p.N,
+            num_heads=p.H,
+            sm_count=p.sm_count,
+        )
+        return record, grid
+    return p.record(stage, path), p.grid(stage, path)
+
+
+def kcp_local_grid(stage: str, p: Any) -> tuple[int, int, int]:
+    """The launch grid of the KCP-owned local record of ``stage`` (:data:`KCP_LOCAL_RECORDS`) from the plan's
+    scalars: the output program is persistent over the (chunk, head) items, ``min(NC_pad * H, sm_count)`` CTAs; the
+    ``dA_qk`` / ``dv1`` program launches one CTA per chunk pair and head, ``(NC_pad / 2, H, 1)``."""
+    if stage == "fwd_o":
+        return (max(1, min(int(p.NC_pad) * int(p.H), int(p.sm_count))), 1, 1)
+    if stage == "dav":
+        return (int(p.NC_pad) // 2, int(p.H), 1)
+    raise ValueError(f"no KCP-owned local record for stage {stage!r}")
+
+
+def _scratch_tables(local: Any) -> dict[str, torch.Tensor]:
+    """The table set the intra record that computes the chunk layout from ``cu_seqlens`` writes (the existing
+    backend's tables, its block table included), on a scratch buffer held by the arena: the KCP's CPU-built tables
+    are never rewritten by a kernel and no KCP program reads this set (:func:`cake_kcp_plan.local_scratch_table_bytes`
+    counts it)."""
+    tables = local.__dict__.get(SCRATCH_TABLES_ATTR)
+    if tables is None:
+        p = local.plan
+        buffer = torch.zeros((p.table_words(),), dtype=torch.int32, device=local.device)
+        tables = {
+            name: buffer[off : off + words] for name, off, words in p.table_layout()
+        }
+        setattr(local, SCRATCH_TABLES_ATTR, tables)
+    return tables
+
+
+def _launch_record_trim(
+    local: Any, name: str, grid: tuple[int, int, int], values: dict[str, Any]
+) -> None:
+    """Trimmed host path: ``cake_jit.run_module(name, values, grid=grid, device_index=local.device_index)`` with the
+    launch inlined -- the record's argument plan (cached by cake_jit), the arena's cached arch, the raw-stream FFI
+    context.  Same record, same grid, same positional arguments, same stream as ``local.run``."""
     jit = cake_jit
-    name = local.plan.record(stage)
-    grid = local.plan.grid(stage, 0)
     record = jit.MODULES[name]
     args = []
     for logical_name, axis in jit._argument_plan(name):
@@ -1599,6 +1710,18 @@ class _FiPrograms:
         self.node_attr_log: dict[
             tuple[str, int], list[dict[str, Any]]
         ] = {}  # (program, device) -> evidence of the first node attributes
+
+    def run_record(
+        self,
+        record: str,
+        values: dict[str, Any],
+        *,
+        grid: tuple[int, int, int],
+        device_index: int,
+    ) -> None:
+        """A KCP-owned local record (:data:`KCP_LOCAL_RECORDS`) with logical ``values`` on ``grid``: the registry's
+        ``run_module`` (the record maps its kernel parameters onto the logical vocabulary)."""
+        self.jit.run_module(record, values, grid=grid, device_index=device_index)
 
     def set_cache_config(self, program: str, device_index: int, config: int) -> None:
         """One side of a capped launch's bracket.  The first brackets of a (program, device) go through
@@ -2925,7 +3048,14 @@ class KcpWorkspace:
     @property
     def bytes(self) -> int:
         kcp = sum(t.numel() * t.element_size() for t in self._pools.values())
-        return kcp + (int(self.local.bytes) if self.local is not None else 0)
+        local = 0
+        if (
+            self.local is not None
+        ):  # the arena and the intra record's scratch table set where it writes one
+            local = int(self.local.bytes) + cake_kcp_plan.local_scratch_table_bytes(
+                self.local.plan
+            )
+        return kcp + local
 
     @property
     def pool_bytes(self) -> dict[str, int]:
@@ -2940,8 +3070,9 @@ class KcpWorkspace:
 class KcpSaved:
     """The saved context of one forward (``boundary_mode="saved"``, the design note §16): ``S_in`` (the fresh c2
     output), the owner's c1 receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the
-    token-row ``Aqk`` / ``Akk`` of the existing version-1 set (kernel path), and the scalars of the call.  The int32
-    tables are rebuilt from ``ctx`` (droppable, §16 item 3)."""
+    forward's token-row ``Aqk`` / ``Akk`` (kernel path; kept for the saved-set contract, the backward recomputes the
+    internal rows it reads), and the scalars of the call.  The int32 tables are rebuilt from ``ctx`` (droppable, §16
+    item 3)."""
 
     version: int
     S_in: torch.Tensor
@@ -3949,9 +4080,13 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
         call.fresh("c1_recv")
         if tb.P > 1:
             call.fresh("stage_m")  # M_seg^T of the segmented fragments (§16 item 5b)
-    call.stage("fwd_prep")
-    call.stage("fwd_intra", write_ext=1 if (save and not replay) else 0, write_int=1)
-    call.stage("wy")
+    if replay:  # the replay's prep (the GLM prep's rows, the internal dout copy), then the internal Aqk / Akk rows
+        call.stage("bwd_prep", saved=None)
+        call.stage("fwd_intra", write_ext=0)
+        call.stage("wy")
+    else:  # the intra program writes the GLM prep's rows itself (write_prep = 1)
+        call.stage("fwd_intra", write_ext=1 if save else 0)
+        call.stage("wy_fwd")
     _summaries(call)
     carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
     if (
@@ -4011,6 +4146,9 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
         if saved.M_seg is not None:
             call.bufs["stage_m"] = saved.M_seg
         call.stage("bwd_prep", saved=saved)
+        call.stage(
+            "fwd_intra", write_ext=0
+        )  # the internal Aqk / Akk rows the WY, dav and gradient programs read
         call.stage("wy")
         if (
             tb.P > 1

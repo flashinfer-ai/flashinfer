@@ -2185,6 +2185,32 @@ def kcp_arena_layout(
     return out
 
 
+# The paths of the existing backend's plan the KCP's local stages take their records from: the forward without a
+# saved set (its records read the internal ``Aqk`` / ``Akk`` rows the intra program writes; the output program is
+# the KCP's own) and the checkpoint replay for both backward modes (its prep keeps the internal ``dout`` copy K2 and
+# the KCP's ``dav`` read; its WY and fused-gradient records read the recomputed internal rows).
+LOCAL_PATH_FWD = "fwd_nosave"
+LOCAL_PATH_BWD = "replay"
+
+
+def intra_writes_tables(plan, path: str = LOCAL_PATH_FWD) -> bool:
+    """Whether the existing backend's intra record of ``path`` (a :class:`cake_backend.Plan`) computes the chunk
+    layout from ``cu_seqlens`` and writes the tables itself (its logical vocabulary binds ``cu_seqlens``): the kernel
+    backend then hands it a scratch table set so the KCP's CPU-built tables are never rewritten by a kernel."""
+    from . import (
+        cake_jit,
+    )  # the registry literal; imported here so the metadata module stays torch-only
+
+    record = plan.record("fwd_intra", path)
+    return "cu_seqlens" in cake_jit.MODULES[record]["logical"].values()
+
+
+def local_scratch_table_bytes(plan) -> int:
+    """Bytes of the scratch table set of :func:`intra_writes_tables` on the arena of ``plan`` (its table buffer: the
+    four chunk tables and the block table, 256 B aligned), zero where the intra record reads the tables instead."""
+    return int(plan.table_words()) * 4 if intra_writes_tables(plan) else 0
+
+
 def kcp_workspace_bytes(
     ctx: KcpContext,
     *,
@@ -2195,7 +2221,8 @@ def kcp_workspace_bytes(
     C: int = 8192,
 ) -> int:
     """Caller-held workspace bytes of one rank: the existing backend's local arena for ``(T_r, n_frag, H)``
-    (``kda_train_workspace_bytes``; zero on a rank without tokens) plus the KCP arena of transient buffers
+    (``kda_train_workspace_bytes``; zero on a rank without tokens) with the intra record's scratch table set where
+    it writes one (:func:`local_scratch_table_bytes`), plus the KCP arena of transient buffers
     (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by :func:`kcp_saved_bytes`)."""
     _check_save_mode(save_mode)
     local = 0
@@ -2214,6 +2241,16 @@ def kcp_workspace_bytes(
                 sm_count=ctx.sm_count,
             )
         )
+        # the scratch table set where the intra record writes one (the rule is architecture-independent; the
+        # buffer size follows the same segment-count convention as the arena bytes above)
+        if intra_writes_tables(
+            cake_backend.plan(ctx.T_r, ctx.n_frag, int(H), ctx.sm_count)
+        ):
+            local += int(
+                cake_backend.tables_bytes(
+                    ctx.T_r, ctx.n_frag, int(H), sm_count=ctx.sm_count
+                )
+            )
     arena = kcp_arena_layout(
         ctx,
         H=H,

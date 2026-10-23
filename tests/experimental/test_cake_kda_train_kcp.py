@@ -38,6 +38,7 @@ from tests.test_helpers.cake_package import cake_package
 kp = cake_package("cake_kda_train", "cake_kcp_plan")
 cake_backend = cake_package("cake_kda_train", "cake_backend")
 cake_jit = cake_package("cake_kda_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 
 try:  # the reference harness (rows of record and the reference partitions)
     import kcp_shapes
@@ -4311,6 +4312,8 @@ def test_host_trim_templates_live_on_the_arena_and_weakly_key_the_table_set() ->
                 R=int(ctx.R),
                 NSEG=4,
                 P=2,
+                seg_arg=2,
+                proportional=0,
             )
             n = max(int(ctx.NC_pad), 1)
             self._views = {
@@ -4319,7 +4322,7 @@ def test_host_trim_templates_live_on_the_arena_and_weakly_key_the_table_set() ->
                     dh=torch.zeros(n, 2, cake_kcp.D),
                     w=torch.zeros(4),
                 )
-                for mode in ("fwd", "bwd")
+                for mode in (cake_kcp.LOCAL_LAYOUT_FWD, cake_kcp.LOCAL_LAYOUT_BWD)
             }
 
         def views(self, mode: str):
@@ -4390,6 +4393,213 @@ def test_host_trim_templates_live_on_the_arena_and_weakly_key_the_table_set() ->
     backend.begin_call(c0)
     assert not hasattr(arena_b, cake_kcp.TEMPLATE_CACHE_ATTR)
     assert c0.local_values["h2d"].data_ptr() == arena_b.views("fwd").h.data_ptr()
+
+
+LOCAL_RECORD_CASES = [
+    (4, "sm_103a", 152),
+    (64, "sm_103a", 152),
+    (64, "sm_107a", 216),
+    (4, "sm_100a", 148),
+]
+
+
+@pytest.mark.parametrize(
+    "H,arch,sm",
+    LOCAL_RECORD_CASES,
+    ids=[f"h{h}-{a}-{s}" for h, a, s in LOCAL_RECORD_CASES],
+)
+def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
+    """The local stages against the existing backend's registry on the CPU: the kernel backend's value dict of a
+    forward (with a saved set), a saved-mode backward and a replay backward binds every logical name of every
+    record it launches -- the plan's records on the forward path without a saved set and on the replay path, the
+    direct WY record where the plan fuses the WY representation into a recurrence the KCP does not run, and the
+    KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids; the two backward modes launch the same records on the same
+    grids; the intra record that computes the layout itself gets the arena's scratch table set (and the workspace
+    bytes count it) while every other program reads the context's tables."""
+    monkeypatch.setenv(cake_kcp.SPEC3_ENV, "0")
+    part = _small_partition(2)
+    ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=sm)
+    assert ctx.T_r > 0
+    plan = cake_backend.plan(ctx.T_r, ctx.n_frag, H, sm, arch)
+    tb = cake_kcp._Tables(ctx, H, fused_walks=1)
+    launches: list[tuple[str, str, tuple[int, int, int], dict]] = []
+
+    class Arena:  # the arena's surface used by begin_call / stage: the plan, the layout views, the launcher
+        def __init__(self) -> None:
+            self.plan = plan
+            self.device = torch.device("cpu")
+            self.device_index = 0
+            self.arch = arch
+            self.launcher = self._launch
+            self._views: dict = {}
+
+        def views(self, mode: str):
+            ns = self._views.get(mode)
+            if ns is None:
+                ns = types.SimpleNamespace()
+                for r in plan.layout(mode):
+                    small = (
+                        torch.zeros(2, cake_kcp.D)
+                        if r.name in ("h", "dh")
+                        else torch.zeros(1)
+                    )
+                    setattr(ns, r.name, small)
+                self._views[mode] = ns
+            return ns
+
+        def _launch(self, record, values, *, grid, device_index) -> None:
+            launches.append(("backend", record, grid, dict(values)))
+
+    class Provider:
+        def run_record(self, record, values, *, grid, device_index) -> None:
+            launches.append(("kcp", record, grid, dict(values)))
+
+    arena = Arena()
+    backend = cake_kcp.KernelBackend(programs=Provider())
+
+    def call_for(backward: bool, *, ops, out=None, grads=None):
+        return types.SimpleNamespace(
+            local=arena,
+            ctx=ctx,
+            tb=tb,
+            T_r=int(ctx.T_r),
+            H=H,
+            backward=backward,
+            host_trim=1,
+            ops=ops,
+            scale=0.5,
+            scratch={},
+            local_values=None,
+            out=out,
+            grads=grads,
+            device=torch.device("cpu"),
+        )
+
+    def run(call, stages) -> list:
+        backend.begin_call(call)
+        for name, extra in stages:
+            backend.stage(name, call, **extra)
+        done = list(launches)
+        launches.clear()
+        return done
+
+    ops = {n: torch.zeros(1) for n in ("q", "k", "v", "g", "beta")}
+    fwd = run(
+        call_for(False, ops=ops, out=torch.zeros(1)),
+        (("fwd_intra", {"write_ext": 1}), ("wy_fwd", {}), ("fwd_o", {})),
+    )
+    bwd_ops = {**ops, "dout": torch.zeros(1)}
+    grads = {n: torch.zeros(1) for n in ("dq", "dk", "dv", "dg", "dbeta")}
+    rows = torch.zeros(ctx.T_r, H, cake_kcp.BT, dtype=torch.bfloat16)
+    saved = types.SimpleNamespace(Aqk=rows, Akk=rows)
+    bwd_stages = (
+        ("fwd_intra", {"write_ext": 0}),
+        ("wy", {}),
+        ("dav", {}),
+        ("dqkg", {}),
+        ("glm_intra", {}),
+        ("gate_epilogue", {}),
+    )
+    bwd = run(
+        call_for(True, ops=bwd_ops, grads=grads),
+        (("bwd_prep", {"saved": saved}), *bwd_stages),
+    )
+    replay = run(
+        call_for(True, ops=bwd_ops, grads=grads),
+        (("bwd_prep", {"saved": None}), *bwd_stages),
+    )
+    # the two backward modes: the same records on the same grids
+    assert [(k, r, g) for k, r, g, _ in replay] == [(k, r, g) for k, r, g, _ in bwd]
+    # every launched record of the existing backend's registry finds its logical names in the value dict
+    for kind, record, _grid, values in fwd + bwd:
+        if kind == "backend":
+            missing = set(cake_jit.MODULES[record]["logical"].values()) - set(values)
+            assert not missing, (record, sorted(missing))
+    # the records of record and their paths
+    f, b = cake_kcp.LOCAL_PATH_FWD, cake_kcp.LOCAL_PATH_BWD
+
+    def expect(stage: str, path: str) -> str:
+        if stage in cake_kcp.WY_DIRECT_RECORDS and not plan.dispatched(stage, path):
+            return cake_kcp.WY_DIRECT_RECORDS[stage]
+        return plan.record(stage, path)
+
+    assert [r for _, r, _, _ in fwd] == [
+        expect("fwd_intra", f),
+        expect("wy_fwd", f),
+        "kcp_fwd_o",
+    ]
+    assert [r for _, r, _, _ in bwd] == [
+        expect("bwd_prep", b),
+        expect("fwd_intra", b),
+        expect("wy", b),
+        "kcp_dav",
+        expect("dqkg", b),
+        expect("glm_intra", b),
+        expect("gate_epilogue", b),
+    ]
+    if (
+        H == 64 and arch != "sm_107a"
+    ):  # the plan fuses the WY representation into its recurrences there
+        assert (
+            not plan.dispatched("wy_fwd", f)
+            and [r for _, r, _, _ in fwd][1] == "wy_fwd"
+        )
+    # the write switches, the scratch tables and the grids
+    intra, bintra = fwd[0][3], bwd[1][3]
+    assert (intra["write_ext"], intra["write_int"], intra["write_prep"]) == (1, 1, 1)
+    assert (bintra["write_ext"], bintra["write_int"], bintra["write_prep"]) == (0, 1, 0)
+    assert (
+        intra["aqk_ext"] is not intra["akk_ext"]
+        and bintra["aqk_ext"] is bintra["akk_ext"]
+    )
+    if kp.intra_writes_tables(plan):
+        scratch = getattr(arena, cake_kcp.SCRATCH_TABLES_ATTR)
+        assert intra["seg_table"] is scratch["seg_table"]
+        assert intra["chunk_bos"] is scratch["chunk_bos"]
+        assert intra["cu_seqlens"] is ctx.cu_seqlens_local
+        assert kp.local_scratch_table_bytes(plan) == plan.table_words() * 4 > 0
+    else:
+        assert "seg_table" not in intra and "cu_seqlens" not in intra
+        assert kp.local_scratch_table_bytes(plan) == 0
+    assert (
+        fwd[1][3]["chunk_bos"] is ctx.tables["chunk_bos"]
+    )  # the WY program reads the context's tables
+    assert fwd[2][2] == (max(1, min(plan.NC_pad * H, sm)), 1, 1)
+    assert bwd[3][2] == (plan.NC_pad // 2, H, 1)
+    for kind, record, grid, _values in fwd + bwd:
+        if kind == "backend":
+            stage = cake_jit.MODULES[record]["stage"]
+            path = f if record in [r for _, r, _, _ in fwd] else b
+            if plan.dispatched(stage, path):
+                assert grid == plan.grid(stage, path)
+            else:
+                assert grid == cake_jit.launch_grid(
+                    record,
+                    num_chunks_pad=plan.NC_pad,
+                    num_seqs=plan.N,
+                    num_heads=H,
+                    sm_count=sm,
+                )
+    # the workspace prediction counts the scratch set
+    scratch_bytes = (
+        cake_backend.tables_bytes(ctx.T_r, ctx.n_frag, H, sm_count=sm)
+        if kp.intra_writes_tables(plan)
+        else 0
+    )
+    assert kp.kcp_workspace_bytes(ctx, H=H) == (
+        cake_backend.workspace_bytes(
+            ctx.T_r, ctx.n_frag, H, backward=True, save_mode="light", sm_count=sm
+        )
+        + scratch_bytes
+        + kp.kcp_arena_layout(ctx, H=H)["arena"]
+    )
+    # the KCP-owned records (the registry's kcp_fwd_o / kcp_dav) find their logical names too
+    for kind, record, _grid, values in fwd + bwd:
+        if kind == "kcp":
+            missing = set(cake_kcp_jit.MODULES[record]["logical"].values()) - set(
+                values
+            )
+            assert not missing, (record, sorted(missing))
 
 
 def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> None:

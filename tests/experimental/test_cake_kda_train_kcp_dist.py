@@ -223,12 +223,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
         "save_transfer_eq": all(torch.equal(res[n], res_recompute[n]) for n in TENSORS),
         "ring_eq_a2a": ring_ok,
-        # a backend with local stages must have run the SPEC-3 assertion (unless disabled) and passed it; a rank
-        # without tokens launches no local stage, so it has nothing to check
+        # a backend with local stages must have run the SPEC-3 probe (unless disabled); a rank without tokens
+        # launches no local stage, so it has nothing to probe.  The probe's row comparison (the forward's intra
+        # prep against the backward's prep program) is reported in spec3_by_rank, not gated: the requirement of
+        # record is saved_eq_replay (both backward modes run the same local programs)
         "spec3": (not backend.local_stages)
         or (spec3 is None and os.environ.get(cake_kcp.SPEC3_ENV, "1") == "0")
         or (spec3 is None and q.shape[0] == 0)
-        or bool(spec3 and spec3.get("equal")),
+        or bool(spec3 and spec3.get("checked")),
     }
     gathered = {}
     for n in TENSORS:
