@@ -160,6 +160,7 @@ def _workspace():
     ws.config = _config()
     ws.device = torch.device("cpu")
     ws._destroyed = False
+    ws._tuning_state = block_scaled.AutoTuningState()
     ws._compiled = mock.Mock()
     # Model a kernel that requires launch-side clearing. Native masked BF16
     # reducers opt out via this capability; quantized combine still clears.

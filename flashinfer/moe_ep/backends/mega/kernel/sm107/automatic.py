@@ -72,10 +72,10 @@ def coordinate_workspace_replacement(
                 "or measurement policy, before CUDA graph capture."
             )
         return False
-    if not state.graph_captured:
-        return False
-    replace = needs_selection(workspace, context) and (
-        context.tuning_enabled or state.cache_identity != context.cache_identity
+    replace = (
+        state.graph_captured
+        and needs_selection(workspace, context)
+        and (context.tuning_enabled or state.cache_identity != context.cache_identity)
     )
     if backend.ep_world_size > 1:
         import torch.distributed as dist
@@ -116,7 +116,22 @@ def prepare_auto_configuration(
     if backend._kernel_config.knobs != "auto":
         return
     context = tuning_context()
-    if not needs_selection(workspace, context):
+    select = needs_selection(workspace, context)
+    import torch
+
+    capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    if backend.ep_world_size > 1 and not capturing:
+        import torch.distributed as dist
+
+        # A peer may have invalidated its cache even when this rank is settled.
+        decisions = [(False, False)] * backend.ep_world_size
+        dist.all_gather_object(
+            decisions, (context.tuning_enabled, select), group=backend.ep_comm_group
+        )
+        if any(enabled != context.tuning_enabled for enabled, _ in decisions):
+            raise ValueError("EP ranks disagree on whether MegaMoE tuning is enabled")
+        select = any(pending for _, pending in decisions)
+    if not select:
         return
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
         KNOB_KEYS,

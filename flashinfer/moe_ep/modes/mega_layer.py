@@ -230,7 +230,7 @@ class MoEEpMegaLayer(nn.Module):
         ``live_tokens`` selects an offline workload profile without shrinking
         capacity. Explicit knobs take precedence over that profile's cache.
         ``live_tokens=None`` selects full capacity, even when the layer has a
-        different default tuning profile. Handles retain their compiled tactics
+        different default tuning profile. Fixed handles retain compiled tactics
         and stable addresses.
         Automatic handles warn when ``live_tokens`` is supplied because
         selection uses the actual warmup or forward batch size.

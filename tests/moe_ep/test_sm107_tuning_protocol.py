@@ -242,6 +242,69 @@ def test_pending_capture_freezes_workspace(state, monkeypatch):
     state.sweep.assert_not_called()
 
 
+def test_explicit_search_preserves_attached_measurement_policy(state):
+    from flashinfer.autotune_cache import MeasurementPolicy
+
+    policy = MeasurementPolicy(execution_mode="cuda_graph", cold_l2=True)
+    with autotune_v2(measurement_policy=policy):
+        state.run()
+    store = state.tuner._managed_cache
+    assert native.autotune_sm107_block_scaled_mega_moe(
+        None, None, None, state.workspace, candidates=[{"fc2_use_bulk": False}]
+    ) == {"fc2_use_bulk": False}
+    assert state.tuner._managed_cache is store
+    assert state.sweep.call_count == 2
+    measurement = state.sweep.call_args.kwargs["measurement"]
+    assert measurement["cold_l2"] is True
+    assert measurement["cuda_graph_profile_replays"] == 1
+    with autotune_v2(mode="replay", measurement_policy=policy):
+        assert state.run() == {"fc2_use_bulk": False}
+    assert state.sweep.call_count == 2
+
+
+def test_foreign_records_are_filtered_before_kernel_validation(state, monkeypatch):
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    query = protocol._query(4)
+    matching = knob_cache.make_record(
+        {"fc2_use_bulk": False}, **{**query, "max_tokens": 256, "live_tokens": 256}
+    )
+    foreign = {**matching, "hidden": query["hidden"] * 2}
+    build = Mock()
+    monkeypatch.setattr(block_scaled.Sm107BlockScaledSymmBuffer, "_build_kernel", build)
+    with autotune_v2(mode="replay", persistent_cache=False):
+        for key, record in (("foreign", foreign), ("matching", matching)):
+            state.tuner.publish_protocol_record(
+                tuning_protocol.NAMESPACE, key, record, persist=False
+            )
+        assert state.run() == {"fc2_use_bulk": False}
+    build.assert_called_once()
+
+
+def test_execution_storage_allocation_preserves_staged_state(state, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import comm
+
+    workspace = object.__new__(block_scaled.Sm107BlockScaledSymmBuffer)
+    workspace.config = dataclasses.replace(
+        state.workspace.config, reduce_topk_in_kernel=True
+    )
+    workspace.kernel = SimpleNamespace(
+        _device_workspace=SimpleNamespace(total_bytes=lambda kind: 128)
+    )
+    workspace._routing_checks = {"routing": object()}
+    workspace.note_staged_tokens(4)
+    scalar = torch.tensor([2.0])
+    workspace.bind_scalars({"fc1_alpha": scalar})
+    storage = Mock()
+    storage.data_ptr.return_value = 128
+    monkeypatch.setattr(torch, "zeros", lambda *a, **k: storage)
+    monkeypatch.setattr(comm, "sym_zeros", lambda *a, **k: storage)
+    monkeypatch.setattr(comm, "compute_peer_offsets", lambda *a: (0, [0]))
+    workspace._allocate_execution_state()
+    assert workspace._scalar_tensor("fc1_alpha") is scalar
+    assert workspace._routing_checks
+    assert workspace.staged_tokens() == 4
+
+
 def test_cli_persists_managed_cache_by_default(state, monkeypatch, tmp_path):
     from flashinfer.moe_ep import tune
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
@@ -618,10 +681,59 @@ def _subgroup_worker(rank, rendezvous):
                 from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
 
                 backend = SimpleNamespace(
-                    _kernel_config=SimpleNamespace(knobs="auto"),
+                    _kernel_config=SimpleNamespace(
+                        knobs="auto", in_kernel_fc2_reduce=False
+                    ),
                     ep_world_size=2,
                     ep_comm_group=group,
                 )
+                from flashinfer.moe_ep.kernel_src.sm107 import (
+                    next_cutedsl_megamoe as package,
+                )
+
+                patch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
+                for explicit in (False, True):
+                    workspace._tuning_state = AutoTuningState()
+                    workspace.install_tuned_knobs.reset_mock()
+                    with autotune_v2(mode="replay", persistent_cache=False):
+                        tuner.clear_cache()
+
+                        def select():
+                            if not explicit:
+                                assert not automatic.coordinate_workspace_replacement(
+                                    backend, workspace
+                                )
+                            automatic.prepare_auto_configuration(
+                                backend, workspace, (None, None), None, rank * 4
+                            )
+
+                        # Both ranks remember a miss. Only one sees a new record.
+                        select()
+                        select()
+                        workspace.install_tuned_knobs.assert_not_called()
+                        if rank == 1:
+                            tuner.clear_cache()
+                            tuner.publish_protocol_record(
+                                tuning_protocol.NAMESPACE,
+                                "winner",
+                                knob_cache.make_record(
+                                    {"fc2_use_bulk": False}, **protocol._query(16)
+                                ),
+                                persist=False,
+                            )
+                        select()
+                        assert automatic.get_tuned_knobs(workspace) == {
+                            "fc2_use_bulk": False
+                        }
+                        workspace.install_tuned_knobs.assert_called_once()
+                        select()
+                        workspace.install_tuned_knobs.assert_called_once()
+                        # A settled peer must join selection after local invalidation.
+                        if rank == 2:
+                            tuner.clear_cache()
+                        select()
+                        assert workspace.install_tuned_knobs.call_count == 2
+
                 with autotune_v2(mode="replay", persistent_cache=False):
                     workspace._tuning_state.graph_captured = True
                     workspace._tuning_state.winner = {"fc2_use_bulk": False}

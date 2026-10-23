@@ -168,9 +168,10 @@ workspace. The replacement shares transformed weights and needs its own graph
 capture. Tuning and graph replay must run sequentially.
 Repeated capture and replacement can retain more than two workspaces. Use
 explicit handles when old workspaces need to be released before layer destruction.
-For a captured default workspace, each subsequent Python forward coordinates
-replacement across the EP group, even when this rank needs no change. A peer
-may have invalidated its local cache. CUDA graph replay does not run this check.
+Each eager automatic forward coordinates selection across the EP group, even
+when this rank needs no change. A peer may have invalidated its local cache.
+Default workspaces also coordinate replacement before allocating storage.
+CUDA graph replay does not run these host checks.
 
 For explicit lifetime control, use `layer.create_workspace(capacity)` on an
 automatic layer. Each handle has independent storage and selection state, even

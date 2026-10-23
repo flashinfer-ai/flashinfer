@@ -519,6 +519,9 @@ class Sm107BlockScaledSymmBuffer:
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
         self._tuning_state = AutoTuningState()
+        self._routing_checks: dict[tuple, Any] = {}
+        # Missing scalar bindings use the workspace's own tensors.
+        self._bound_scalars: dict = {}
 
     def _allocate_execution_state(self) -> None:
         cfg, kernel = self.config, self.kernel
@@ -583,9 +586,6 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
-        self._routing_checks: dict[tuple, Any] = {}
-        # Missing scalar bindings use the workspace's own tensors.
-        self._bound_scalars: dict = {}
 
     @staticmethod
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):

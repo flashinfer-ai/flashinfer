@@ -422,7 +422,7 @@ def autotune_sm107_block_scaled_mega_moe(
         store = tuner._active_managed_store
         with autotune_v2(
             cache_root=None if store is None else store.root,
-            measurement_policy=tuner._effective_measure_policy,
+            measurement_policy=tuner.protocol_context(NAMESPACE).measurement_policy,
         ):
             return tuner.choose_with_protocol(NAMESPACE, protocol, force_tune=True)
     return tuner.choose_with_protocol(NAMESPACE, protocol, force_tune=force_tune)

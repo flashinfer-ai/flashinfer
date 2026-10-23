@@ -180,7 +180,10 @@ class RubinTuningProtocol:
                     records.setdefault(_json(entry), entry)
                 except (TypeError, ValueError):
                     continue
-        entries = list(records.values())
+        entries = knob_cache._matching_entries(
+            entries=[e for e in records.values() if isinstance(e, dict)],
+            **{k: v for k, v in query.items() if k != "live_tokens"},
+        )
         valid = [self._compatible(e, contract, context, measurement) for e in entries]
         ranks = self._gather(valid)
         return knob_cache.lookup_record(
@@ -226,10 +229,6 @@ class RubinTuningProtocol:
                     "create a new workspace and tune it before capture."
                 )
             return TuningResult(None)
-        if not context.tuning_enabled and (
-            state.lookup_scope == (context.scope, context.cache_identity)
-        ):
-            return TuningResult(None)
         if cfg.world_size > 1 and (
             not dist.is_initialized()
             or dist.get_world_size(self.group) != cfg.world_size
@@ -238,6 +237,14 @@ class RubinTuningProtocol:
             raise ValueError(
                 "autotune process_group must match the workspace EP rank and world size"
             )
+
+        lookup_done = not context.tuning_enabled and state.lookup_scope == (
+            context.scope,
+            context.cache_identity,
+        )
+        # Misses are remembered locally, but every rank must join a peer's retry.
+        if all(self._gather(lookup_done)):
+            return TuningResult(None)
 
         spec = dataclasses.asdict(cfg)
         spec.pop("rank")
