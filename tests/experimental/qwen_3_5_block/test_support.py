@@ -154,9 +154,9 @@ def test_version_probe_and_vendored_manifest_digests():
         "/cudnn-frontend"
     ), src.origin
     assert (
-        src.commit.startswith("b4664a2d4")
+        src.commit.startswith("f2aa360e5")
         and src.version == "1.32.0"
-        and src.files == 112
+        and src.files == 114
     )
     assert (
         src.validated_cutedsl == "4.8.0"

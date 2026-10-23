@@ -62,7 +62,7 @@ assert q.Qwen38BlockWrapper.is_experimental is True and q.Qwen38BlockWrapper.pla
 import torch
 g = q.Qwen38BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
 sup = q.qwen_3_8_block_support(torch.device("cpu"), g)
-assert sup.served is False and sup.source.commit.startswith("b4664a2d4")
+assert sup.served is False and sup.source.commit.startswith("f2aa360e5")
 # the probe on a CPU host reads no vendored tree and imports no kernel module (FlashInfer's own cute_dsl availability probe may load the
 # DSL's Python frontend: the Qwen 3.5 package's rule, not this package's)
 assert not any(k.startswith("flashinfer.experimental.qwen_3_5_block._cudnn_frost") for k in sys.modules), "the probe on CPU reads no vendored tree"
@@ -147,8 +147,8 @@ def test_the_closure_modules_the_decode_route_added_import_without_cudnn():
 import importlib
 root = "flashinfer.experimental.qwen_3_5_block._cudnn_frost."
 added = ("sdpa.fwd.sparse_gqa_sm107", "sdpa.fwd.kernels.sm107.sparse_d256_f16", "gated_attention_block.kernels.qsa_prepare",
-         "gated_attention_block.kernels.qsa_compress", "gated_attention_block.kernels.qsa_score_paged", "gated_attention_block.qsa_select_paged",
-         "gated_attention_block.kernels.qsa_topk_decode", "gated_attention_block.qsa_topk", "gated_attention_block.qsa_select")
+         "gated_attention_block.kernels.qsa_compress", "gated_attention_block.kernels.qsa_score_paged", "QSA.selection_paged",
+         "gated_attention_block.kernels.qsa_topk_decode", "gated_attention_block.qsa_topk", "QSA.selection", "QSA", "_tupledict")
 failed, declined = [], []
 for name in added:
     try:
