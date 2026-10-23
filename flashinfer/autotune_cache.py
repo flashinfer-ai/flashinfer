@@ -527,9 +527,24 @@ def _hydrate_from_store(tuner, store) -> None:
         return
     try:
         from .autotuner.autotuner import _json_to_tactic
+        from .autotuner.protocol import _PROTOCOL_KEY, _protocol_cache_key
 
         entries, total, skipped = store.preload()
         for key_fields, entry in entries:
+            if key_fields[:1] == (_PROTOCOL_KEY,):
+                try:
+                    _, namespace, key = key_fields
+                    _protocol_cache_key(namespace, key)
+                    if entry.runner != namespace:
+                        raise ValueError("protocol identifier mismatch")
+                except (ValueError, TypeError) as exc:
+                    logger.warning(f"[Autotuner]: Ignoring protocol entry: {exc}")
+                    continue
+                records = tuner._protocol_record_partitions.setdefault(
+                    marker, {}
+                ).setdefault(namespace, {})
+                records.setdefault(key, entry.tactic)
+                continue
             memo_key = (*marker, key_fields)
             tuner._managed_decoded.setdefault(
                 memo_key, entry._replace(tactic=_json_to_tactic(entry.tactic))
@@ -572,11 +587,15 @@ def autotune_v2_reload() -> None:
         tuner._ranked_tactics_cache.clear()
         tuner._ranked_tactics_partitions.clear()
         tuner._winner_partitions.clear()
+        tuner._protocol_record_partitions.clear()
+        tuner._protocol_cache_generation += 1
         tuner._profiling_cache_policies.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.
         tuner._preloaded_stores.clear()
+        for registered_store in tuner._managed_stores.values():
+            registered_store.clear_memo()
         store = tuner._managed_cache
         if store is not None:
             store.clear_memo()

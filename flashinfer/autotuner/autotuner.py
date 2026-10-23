@@ -42,6 +42,13 @@ from flashinfer.autotuner.initializers import (
     TensorInitializer,
     autotuner_initializer_rand_scaled,
 )
+from flashinfer.autotuner.protocol import (
+    T,
+    TuningContext,
+    TuningProtocol,
+    _protocol_cache_key,
+    _tuning_scope,
+)
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
@@ -1034,6 +1041,8 @@ def autotune(
     if pushed:
         override_stack.append((new_buckets, new_round_up, new_profile_replays))
 
+    scope_token = _tuning_scope.set(object())
+
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
     # autotune(False) context overlaps on another thread.
@@ -1047,6 +1056,7 @@ def autotune(
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process starts ...")
     except BaseException:
+        _tuning_scope.reset(scope_token)
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
@@ -1056,6 +1066,7 @@ def autotune(
     try:
         yield
     finally:
+        _tuning_scope.reset(scope_token)
         with tuner._lock:
             if tune_mode:
                 tuner._active_tuning_contexts -= 1
@@ -1374,6 +1385,7 @@ def _cupti_measure_spans(
     run_iteration: Callable[[], None],
     repeat: int,
     prologue: Optional[Callable[[], None]] = None,
+    check_ready: Optional[Callable[[str | None], None]] = None,
 ) -> list[float]:
     """Time *run_iteration* ``repeat`` times, returning per-iteration GPU
     kernel spans in milliseconds (first kernel start to last kernel end,
@@ -1392,6 +1404,10 @@ def _cupti_measure_spans(
     once per tactic; flush + disable suffices) and deliberately
     per-measurement enable/disable (session-scoped tracing would instrument
     every intervening warmup/synthesis kernel).
+
+    Collective callers can supply ``check_ready`` to agree on initialization
+    before launching any kernels. It receives the local error or None and must
+    raise on every rank if any rank failed initialization.
 
     Raises:
         _CuptiInfraError: CUPTI activity tracing could not be initialised
@@ -1436,8 +1452,12 @@ def _cupti_measure_spans(
         for kind in enabled:
             with contextlib.suppress(Exception):
                 cupti.activity_disable(kind)
+        if check_ready is not None:
+            check_ready(str(e))
         raise _CuptiInfraError(str(e)) from e
     try:
+        if check_ready is not None:
+            check_ready(None)
         for _ in range(repeat):
             if prologue is not None:
                 prologue()
@@ -1687,6 +1707,9 @@ class AutoTuner:
         self._dirty_seq = 0
         # Product-owned current-schema records persisted beside tactic records.
         self._namespaced_records: dict[str, dict[str, Any]] = {}
+        # Namespace index of JSON results, partitioned like managed winners.
+        self._protocol_record_partitions: dict[tuple, dict[str, dict[str, Any]]] = {}
+        self._protocol_cache_generation = 0
         # Namespaces changed in this process and requiring single-writer checks.
         self._dirty_namespaces: set[str] = set()
         # File generation observed at cache-context entry or explicit load.
@@ -2224,6 +2247,60 @@ class AutoTuner:
             new_config
         )
         return new_config
+
+    def protocol_context(
+        self, custom_op: str, *, force_tune: bool = False
+    ) -> TuningContext:
+        """Current controls and cache identity for a protocol's prepared state."""
+        return TuningContext(
+            tuner=self,
+            namespace=custom_op,
+            tuning_enabled=force_tune
+            or (self.is_tuning_mode and custom_op not in self._effective_skip_ops),
+            force_tune=force_tune,
+            scope=_tuning_scope.get(),
+        )
+
+    def choose_with_protocol(
+        self,
+        custom_op: str,
+        protocol: TuningProtocol[T],
+        *,
+        force_tune: bool = False,
+    ) -> T:
+        """Run a custom tuning loop using this tuner's controls and storage.
+
+        The protocol runs under the tuner's lock, including when tuning is
+        disabled or the operation is skipped. It owns cache selection,
+        preparation, measurement and result installation. Distributed protocols
+        must coordinate their participants; this method performs no collectives.
+        Calls sharing a tuner are serialized. Collective participants must not
+        wait for another call blocked on that lock.
+
+        ``force_tune`` requests a fresh search regardless of the ambient tuning
+        mode or skip_ops policy. The protocol must honor it. The flag does not
+        enable persistence or change the ambient tuning mode.
+
+        Return the value from TuningResult and update tuning statistics.
+        Records must be published explicitly through the context. They use the
+        active v2 managed store or a separate memory partition, with keys owned
+        by the protocol, and are not imported or exported by the v1 JSON API.
+        """
+        with self._lock:
+            context = self.protocol_context(custom_op, force_tune=force_tune)
+            result = protocol.run(context)
+            if result.candidates:
+                self.stats.tuned_op_total_configs[custom_op] = (
+                    self.stats.tuned_op_total_configs.get(custom_op, 0)
+                    + result.candidates
+                )
+                self.stats.tuned_op_successful_configs[custom_op] = (
+                    self.stats.tuned_op_successful_configs.get(custom_op, 0)
+                    + result.successful_candidates
+                )
+            if not result.cache_hit and not context.skipped:
+                self.stats.cache_misses += 1
+            return result.value
 
     def choose_one(
         self,
@@ -4013,6 +4090,50 @@ class AutoTuner:
         with self._lock:
             self._observed_cache_generations[os.path.abspath(path)] = generation
 
+    def _protocol_records_for_namespace(self, namespace: str) -> dict[str, Any]:
+        _protocol_cache_key(namespace, "")
+        store = self._active_managed_store
+        if store is not None:
+            from flashinfer.autotune_cache import _hydrate_from_store
+
+            _hydrate_from_store(self, store)
+        identity = self._winner_cache_identity() or ("__memory__",)
+        return self._protocol_record_partitions.setdefault(identity, {}).setdefault(
+            namespace, {}
+        )
+
+    def get_protocol_records(self, namespace: str) -> dict[str, Any]:
+        """Read protocol records under the active persistence identity."""
+        with self._lock:
+            return copy.deepcopy(self._protocol_records_for_namespace(namespace))
+
+    def get_protocol_record(self, namespace: str, key: str) -> Any:
+        """Look up one record without copying the entire namespace."""
+        fields = _protocol_cache_key(namespace, key)
+        with self._lock:
+            records = self._protocol_records_for_namespace(namespace)
+            store = self._active_managed_store
+            if key not in records and store is not None:
+                entry = store.lookup(str(fields))
+                if entry is not None and entry.runner == namespace:
+                    records[key] = entry.tactic
+            return copy.deepcopy(records.get(key))
+
+    def publish_protocol_record(
+        self, namespace: str, key: str, value: Any, *, persist: bool
+    ) -> None:
+        """Publish a JSON result through the ordinary managed-entry writer."""
+        fields = _protocol_cache_key(namespace, key)
+        # Keep memory and disk results in the same JSON representation. Unlike
+        # runner tactics, protocol payloads do not require hashable tuples.
+        value = json.loads(json.dumps(value, allow_nan=False))
+        with self._lock:
+            records = self._protocol_records_for_namespace(namespace)
+            records[key] = value
+            store = self._active_managed_store
+            if store is not None and persist:
+                store.publish(str(fields), namespace, value, key_fields=fields)
+
     def get_namespaced_records(self, namespace: str) -> dict[str, Any]:
         """Return a copy of product-owned records loaded for one namespace."""
         if not namespace or namespace.startswith("_"):
@@ -4137,6 +4258,8 @@ class AutoTuner:
             self._dirty = False
             self._dirty_seq = 0
             self._winner_partitions.clear()
+            self._protocol_record_partitions.clear()
+            self._protocol_cache_generation += 1
             self._managed_decoded.clear()
             # Forget the hydration markers too, or the next attach would
             # skip its bulk preload and every cleared key would pay a lazy

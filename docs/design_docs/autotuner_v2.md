@@ -143,6 +143,51 @@ maintaining a migration path for data that is, by construction, an optimization.
   neither the filesystem nor the JSON decoder, and v1/v2 state mixing is impossible by
   construction.
 
+### Custom tuning protocols
+
+`AutoTuner.choose_with_protocol()` supports operations that own candidate
+enumeration, measurement and result installation, on one device or across
+processes. It supplies the tuner's controls, lock, statistics and record storage.
+The protocol defines cache compatibility and handles any distributed coordination.
+The tuner always invokes it, even when tuning is disabled or the operation is
+skipped, so a protocol can coordinate its fallback or cache decision.
+
+`TuningContext.records()` reads the active store's protocol records.
+`context.publish()` keeps a record in memory and writes it to that store when
+ambient tuning is enabled and the operation is not in `skip_ops`.
+`force_tune` can request a fresh search but does not override these write
+controls. Returning a `TuningResult` does not publish it. Replay imports remain
+in memory. No JSON filename is required.
+
+Protocol results use the same `entries/` files, writer and preload as runner
+tactics. Their structural key is `("__protocol__", namespace, record_key)`;
+`runner` holds the stable protocol namespace and `tactic` holds the JSON result,
+including any metadata needed for selection. Neither field requires a runner
+instance. The protocol owns its record keys and payload schema. Changing
+aggregation or selection requires a distinct key or compatibility check when
+previous results are no longer reusable.
+
+Preload indexes these results by namespace for `context.records()`, preserving
+JSON lists and dictionaries. `context.lookup(key)` reads one result without
+copying the namespace. Both return copies. Ordinary runner tactics keep their
+existing decoding. Atomic writes preserve unrelated entries; writes to the same
+key can overwrite each other. `clear_cache()` and `autotune_v2_reload()` clear
+the namespace index along with other lookup memos. The protocol retains its
+own compatibility and capacity selection rules.
+
+Root and environment switches isolate protocol records. With persistence disabled,
+records use the in-memory measurement-policy partition, and the protocol must
+also disable any compatibility-file reads and writes. Measurement policies,
+inherited graph replay counts, `tuning_buckets` and `round_up` are passed to the
+protocol, which must implement or reject them. Protocol records are separate
+from v1 JSON import/export.
+Existing `autotune()` controls still compose with v2 as described above.
+`context.cache_identity` includes the store or policy identity, reload generation
+and skip state so protocols can invalidate prepared selections. Replay counts
+and bucket overrides are exposed separately; protocols must account for them
+when reusing prepared state or tuning results.
+Serving outside a context uses the attached store's measurement policy.
+
 ### 2.5 MeasurementPolicy — tune the way you deploy
 
 ```python
@@ -361,5 +406,6 @@ single ambient policy matching the mode-sensitive path is sufficient.
   supported cleanup.
 - **Representative probe construction** for MoE (skewed routing / EP-deflated shapes) is a
   separate op-level track; balanced probes cannot exercise the regression class in #3622.
-- **Comm/collective op tuning** is out of scope: it needs lockstep candidate enumeration, a
-  MAX-reduction, one group-level decision, and topology fields in the manifest.
+- **Built-in collective orchestration** is not provided. A custom tuning protocol must
+  coordinate candidates and timing aggregation, agree on results, and include any required
+  topology information in its cache keys.
