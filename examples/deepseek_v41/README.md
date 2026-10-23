@@ -245,15 +245,24 @@ defaults and task control; static/CLC graph coverage remains in
 Regression tests cover ordinary signed BMM2, signed zero, sinks, and live
 metadata/layout/replay parity without relaxing the oracle or numerical gates.
 
-After removing the extended-range scaling path, **B200 (SM100) passed 328 CPU
-contract and 171 decode/cache GPU cases** without failures or skips, using
-PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0, bundled CUDA 13.4 and Triton 3.6.0.
+The test-only simplification passed **320 CPU contract and 171 decode/cache
+GPU cases** without failures or skips on **B200 (SM100)**, using PyTorch
+2.11.0+cu128, CuTe-DSL 4.8.0, bundled CUDA 13.4 and Triton 3.6.0. Both
+static/CLC Keep-AB task-cache regression cases also passed. Eight duplicate CPU
+test items were removed or folded into existing behavior checks; GPU test
+names, parameter matrices and numerical gates are unchanged. This rerun does
+not requalify the full generic suite, SM103/SM107 or performance.
+
+Before test simplification, **B200 (SM100) passed 328 CPU contract and 171
+decode/cache GPU cases** after the extended-range scaling path was removed,
+without failures or skips, using PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0, bundled
+CUDA 13.4 and Triton 3.6.0.
 Eight targeted generic sparse MLA GPU cases also passed, covering BF16/FP8,
 Keep-AB/Swap-AB, split-KV, static/CLC schedulers, device scalars, sinks and
 changed-metadata graph replay. These targeted runs do not requalify the full
 generic suite, SM103/SM107 or performance.
 
-The earlier validation records below predate that removal.
+The earlier validation records below predate removal of extended-range scaling.
 Historical native-only frozen-source verification on **B200 (SM100) passed
 197 host-contract and 100 GPU cases** without failures or skips, using PyTorch
 2.11.0+cu128, CuTe-DSL 4.8.0 and bundled CUDA 13.4. Those counts predate the

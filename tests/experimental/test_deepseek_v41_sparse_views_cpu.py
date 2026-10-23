@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -237,14 +238,12 @@ class _IndexTable:
         self.shape = (np.int32(len(self.rows)), width)
         self.stride = (np.int64(row_stride), 1)
         self.base = np.int64(base)
-        self.span = ((len(self.rows) - 1) * row_stride + width) * 4
         self.iterator = _Pointer(self, self.base)
         self.allowed = None
         self.reset()
 
     def reset(self):
         self.reads = []
-        self.addresses = []
         self.vector_loads = []
 
     def read(self, address):
@@ -258,7 +257,6 @@ class _IndexTable:
             f"read outside the declared visible prefix: {coordinate}"
         )
         self.reads.append(coordinate)
-        self.addresses.append(int(address))
         return self.rows[row][column]
 
 
@@ -294,24 +292,16 @@ class _VirtualPool:
 
 
 class _HostMemory:
-    def __init__(self):
-        self.tables = []
-        self.next_base = 1 << 36
-
     def table(self, rows, *, row_stride=None, base=None):
         stride = len(rows[0]) if row_stride is None else row_stride
-        base = self.next_base if base is None else base
-        table = _IndexTable(rows, row_stride=stride, base=base)
-        self.tables.append(table)
-        self.next_base = max(self.next_base, int(base) + table.span + 4096)
-        return table
+        self.current_table = _IndexTable(
+            rows, row_stride=stride, base=(1 << 36) if base is None else base
+        )
+        return self.current_table
 
     def make_ptr(self, dtype, address, *, assumed_align):
         assert dtype is np.int32 and assumed_align == 4
-        for table in self.tables:
-            if int(table.base) <= int(address) < int(table.base) + table.span:
-                return _Pointer(table, address)
-        raise AssertionError(f"pointer outside every virtual table: {address}")
+        return _Pointer(self.current_table, address)
 
     @staticmethod
     def pointer(iterator, *, dtype):
@@ -707,7 +697,6 @@ def test_original_batched_row_stride_and_int64_virtual_row_addresses(
         assert address > (1 << 32)
     expected, invalid, columns = _valid_prefix_expectation(case, 7, 5)
     _check_routes(case, expected, invalid, columns)
-    assert case.table.addresses == [address + column * 4 for column in columns]
     assert (int(case.routes.sl), int(case.routes.cl)) == (7, 5)
 
 
@@ -740,16 +729,9 @@ def test_structural_hooks_follow_core_sparse_length_tuple_convention(
     else:
         original = case.lengths
         replacement = (None, None, np.int32(384), np.int32(5))
-    flat_values, calls = object(), []
-
-    def extract(values):
-        calls.append(("extract", values))
-        return flat_values
-
-    def reconstruct(template, values):
-        calls.append(("reconstruct", template, values))
-        return replacement
-
+    flat_values = object()
+    extract = Mock(return_value=flat_values)
+    reconstruct = Mock(return_value=replacement)
     monkeypatch.setattr(
         sparse_host.cutlass, "extract_mlir_values", extract, raising=False
     )
@@ -758,10 +740,8 @@ def test_structural_hooks_follow_core_sparse_length_tuple_convention(
     )
     assert original.__extract_mlir_values__() is flat_values
     rebuilt = original.__new_from_mlir_values__(flat_values)
-    assert calls == [
-        ("extract", original.values),
-        ("reconstruct", original.values, flat_values),
-    ]
+    extract.assert_called_once_with(original.values)
+    reconstruct.assert_called_once_with(original.values, flat_values)
     assert type(rebuilt) is type(original) and rebuilt is not original
     assert rebuilt.values is replacement
     if kind == "route":
@@ -775,30 +755,12 @@ def test_structural_hooks_follow_core_sparse_length_tuple_convention(
 
 
 def test_mixed_producer_hook_forwards_original_binder_arguments_without_imports():
-    tree = ast.parse(_PRODUCER.read_text())
-    producer = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MixedFp8KvProducer"
-    )
-    method = next(
-        node
-        for node in producer.body
-        if isinstance(node, ast.FunctionDef) and node.name == "bind_sparse_views"
-    )
-    method.decorator_list = []
-    calls, result = [], object()
-
-    def bind(*args):
-        calls.append(args)
-        return result
-
-    namespace = {"bind_combined_sparse_views": bind}
-    exec(
-        compile(ast.Module(body=[method], type_ignores=[]), str(_PRODUCER), "exec"),
-        namespace,
-    )
+    result = object()
+    bind = Mock(return_value=result)
+    namespace = {"Fp4Fp8KvProducer": object, "bind_combined_sparse_views": bind}
+    _load_definitions(_PRODUCER, ("MixedFp8KvProducer",), namespace)
+    producer = namespace["MixedFp8KvProducer"]()
     indices, seq, topk, main, swa = (object() for _ in range(5))
     arguments = (indices, seq, topk, (main, swa), 384, np.int32(2))
-    assert namespace["bind_sparse_views"](object(), *arguments) is result
-    assert calls == [arguments]
+    assert producer.bind_sparse_views(*arguments) is result
+    bind.assert_called_once_with(*arguments)

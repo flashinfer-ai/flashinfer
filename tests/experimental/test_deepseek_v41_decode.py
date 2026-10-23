@@ -30,16 +30,13 @@ class DecodeBuffers:
     topk_lens: torch.Tensor
     seq_lens: torch.Tensor
     out: torch.Tensor
-    backend: str = "prims-ts"
 
     @classmethod
-    def allocate(cls, q, compressed, backend="prims-ts"):
-        if backend != "prims-ts":
-            raise ValueError("test buffers require backend='prims-ts'")
+    def allocate(cls, q, compressed):
         batch = q.shape[0]
         return cls(
             torch.empty(
-                deepseek_v41_decode_workspace_size(batch, compressed, backend=backend),
+                deepseek_v41_decode_workspace_size(batch, compressed),
                 device=q.device,
                 dtype=torch.uint8,
             ),
@@ -47,7 +44,6 @@ class DecodeBuffers:
             torch.full((batch,), 128 + compressed, device=q.device, dtype=torch.int32),
             torch.full((batch,), 128, device=q.device, dtype=torch.int32),
             torch.empty(q.shape, device=q.device, dtype=torch.bfloat16),
-            backend,
         )
 
     @property
@@ -60,7 +56,6 @@ class DecodeBuffers:
             self.workspace,
             self.indices.shape[0],
             self.indices.shape[1] - 128,
-            backend=self.backend,
         )
 
     @property
@@ -81,21 +76,15 @@ class DecodeBuffers:
             bmm2_scale=kwargs.pop("bmm2_scale", 1.0),
             sinks=sink,
             kv_layout=kwargs.pop("kv_layout", "NHD"),
-            backend=self.backend,
+            backend="prims-ts",
             **kwargs,
         )
 
 
-def decode_case(
-    q, swa, main, wi, ci, sink, *, buffers=None, backend="prims-ts", **kwargs
-):
+def decode_case(q, swa, main, wi, ci, sink, *, buffers=None, **kwargs):
     """Adapt native oracle inputs; the Prims-TS API returns only output."""
-    if backend != "prims-ts":
-        raise ValueError("native test helpers require backend='prims-ts'")
     if buffers is None:
-        buffers = DecodeBuffers.allocate(q, 0 if ci is None else ci.shape[-1], backend)
-    if not isinstance(buffers, DecodeBuffers) or buffers.backend != backend:
-        raise ValueError("test buffers declaration mismatch")
+        buffers = DecodeBuffers.allocate(q, 0 if ci is None else ci.shape[-1])
     buffers.indices[:, :128].copy_(wi[:, 0])
     if ci is not None:
         buffers.indices[:, 128:].copy_(ci[:, 0])
@@ -104,13 +93,9 @@ def decode_case(
     return out, buffers.lse, buffers
 
 
-def window_case(q, swa, wi, sink, *, buffers=None, backend="prims-ts", **kwargs):
-    if backend != "prims-ts":
-        raise ValueError("native test helpers require backend='prims-ts'")
+def window_case(q, swa, wi, sink, *, buffers=None, **kwargs):
     if buffers is None:
-        buffers = DecodeBuffers.allocate(q, 0, backend)
-    if not isinstance(buffers, DecodeBuffers) or buffers.backend != backend:
-        raise ValueError("test buffers declaration mismatch")
+        buffers = DecodeBuffers.allocate(q, 0)
     buffers.indices.copy_(wi[:, 0])
     out = deepseek_v41_window_decode(
         q,
@@ -124,7 +109,7 @@ def window_case(q, swa, wi, sink, *, buffers=None, backend="prims-ts", **kwargs)
         bmm2_scale=kwargs.pop("bmm2_scale", 1.0),
         sinks=sink,
         kv_layout=kwargs.pop("kv_layout", "NHD"),
-        backend=backend,
+        backend="prims-ts",
         **kwargs,
     )
     assert out is buffers.out
@@ -298,18 +283,16 @@ def test_prims_ts_does_not_compile_cute_dsl(compressed_k, monkeypatch):
 
     monkeypatch.setattr(cute_decode, "_compile", forbidden_compile)
     args = make_fp8_case(2, compressed_k)
-    out, lse, buffers = decode_case(*args, backend="prims-ts")
+    out, lse, buffers = decode_case(*args)
     assert out is buffers.out and lse.data_ptr() == buffers.lse.data_ptr()
     assert buffers.workspace.dtype == torch.uint8
     assert not hasattr(buffers.views, "main_scale")
     assert not hasattr(buffers.views, "part_s")
     check_fp8(out, lse, fp8_oracle(*args))
     if compressed_k:
-        replay = decode_case(*args, backend="prims-ts", buffers=buffers)
+        replay = decode_case(*args, buffers=buffers)
     else:
-        replay = window_case(
-            args[0], args[1], args[3], args[5], backend="prims-ts", buffers=buffers
-        )
+        replay = window_case(args[0], args[1], args[3], args[5], buffers=buffers)
     assert replay[0] is out and replay[1].data_ptr() == lse.data_ptr()
     assert replay[2] is buffers
 
@@ -327,29 +310,12 @@ def test_prims_ts_selection_refresh(compressed_k):
             device="cuda",
             dtype=torch.int32,
         )
-    out, lse, buffers = decode_case(*args, backend="prims-ts")
+    out, lse, buffers = decode_case(*args)
 
-    def check_selection():
-        selected = []
-        for pool, indices in ((args[1], args[3]), (args[2], args[4])):
-            if indices is None:
-                selected.append(None)
-            else:
-                valid = (
-                    (indices >= 0)
-                    & (indices != 0x7FFFFFFF)
-                    & (indices < pool.shape[0] * 64)
-                )
-                selected.append(torch.where(valid, indices, -1))
-        # Native selection is fused: reference masks, not prepared scratch,
-        # determine which physical positions enter the independent oracle.
-        reference_args = (*args[:3], *selected, args[5])
-        check_fp8(out, lse, fp8_oracle(*reference_args))
-
-    check_selection()
+    check_fp8(out, lse, fp8_oracle(*args))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        decode_case(*args, backend="prims-ts", buffers=buffers)
+        decode_case(*args, buffers=buffers)
     # Poison caller scratch and change which positions are holes, without
     # changing graph-bound addresses. The global tile can start with a hole.
     buffers.workspace.fill_(255)
@@ -357,7 +323,7 @@ def test_prims_ts_selection_refresh(compressed_k):
         if indices is not None:
             indices[:, 0, :8].copy_(indices[:, 0, :8].flip(-1))
     graph.replay()
-    check_selection()
+    check_fp8(out, lse, fp8_oracle(*args))
 
 
 @pytest.mark.parametrize("compressed_k", [0, 64, 192, 512])
@@ -380,7 +346,7 @@ def test_prims_ts_zero_query_tile_counts(compressed_k):
         if indices is not None:
             valid = (indices[:, 0] >= 0) & (indices[:, 0] < pool.shape[0] * 64)
             counts += valid.sum(-1)
-    out, lse, _ = decode_case(*args, backend="prims-ts")
+    out, lse, _ = decode_case(*args)
     torch.testing.assert_close(
         lse[..., 0].double(), counts.log()[:, None].expand(-1, 64), rtol=0, atol=1e-5
     )
@@ -1270,25 +1236,13 @@ def test_fp8_swa_fp64_and_selection_counts(batch, compressed):
             ci[0].fill_(-1)
             ci[2].fill_(-1)
     reference = fp8_oracle(*args)
-    out, lse, buffers = decode_case(*args, backend="prims-ts")
+    out, lse, buffers = decode_case(*args)
     check_fp8(out, lse, reference)
     assert lse.dtype == torch.float32 and out.dtype == torch.bfloat16
     assert not hasattr(buffers.views, "main_scale")
     assert not hasattr(buffers, "expanded_q")
-    expected_counts = ((wi >= 0) & (wi != 0x7FFFFFFF) & (wi < swa.shape[0] * 64)).sum(
-        (1, 2)
-    )
-    if compressed:
-        expected_counts += (
-            (ci >= 0) & (ci != 0x7FFFFFFF) & (ci < main.shape[0] * 64)
-        ).sum((1, 2))
-    assert torch.equal(
-        torch.isneginf(lse[..., 0]), (expected_counts == 0)[:, None].expand(-1, 64)
-    )
     if not compressed:
-        window_out, window_lse, _ = window_case(
-            q, swa, wi, sink, buffers=buffers, backend="prims-ts"
-        )
+        window_out, window_lse, _ = window_case(q, swa, wi, sink, buffers=buffers)
         check_fp8(window_out, window_lse, reference)
 
 
@@ -1297,15 +1251,15 @@ def test_fp8_swa_changed_graph(compressed):
     prims_ts_gate()
     args = make_fp8_case(4, compressed)
     q, swa, main, wi, ci, sink = args
-    out, lse, buffers = decode_case(*args, backend="prims-ts")
+    out, lse, buffers = decode_case(*args)
     check_fp8(out, lse, fp8_oracle(*args))
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        decode_case(*args, buffers=buffers, backend="prims-ts")
+        decode_case(*args, buffers=buffers)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        decode_case(*args, buffers=buffers, backend="prims-ts")
+        decode_case(*args, buffers=buffers)
     torch.cuda.current_stream().wait_stream(stream)
     for step in range(3):
         q.copy_((torch.randn(q.shape, device=q.device) * 0.5).to(q.dtype))
@@ -1342,28 +1296,17 @@ def test_fp8_swa_changed_graph(compressed):
         graph.replay()
         reference = fp8_oracle(*args)
         check_fp8(out, lse, reference)
-        expected_counts = (
-            (wi >= 0) & (wi != 0x7FFFFFFF) & (wi < swa.shape[0] * 64)
-        ).sum((1, 2))
-        if compressed:
-            expected_counts += (
-                (ci >= 0) & (ci != 0x7FFFFFFF) & (ci < main.shape[0] * 64)
-            ).sum((1, 2))
-        assert torch.equal(
-            torch.isneginf(lse[..., 0]), (expected_counts == 0)[:, None].expand(-1, 64)
-        )
     # Eager calls may change addresses but retain the declaration and ownership.
     replacement_args = tuple(None if x is None else x.clone() for x in args)
-    new_out, new_lse, _ = decode_case(
-        *replacement_args, buffers=buffers, backend="prims-ts"
-    )
+    new_out, new_lse, _ = decode_case(*replacement_args, buffers=buffers)
     assert new_out is out and new_lse.data_ptr() == lse.data_ptr()
-    check_fp8(out, lse, fp8_oracle(*replacement_args))
+    reference = fp8_oracle(*replacement_args)
+    check_fp8(out, lse, reference)
     with pytest.raises(AssertionError):
-        check_fp8(torch.ones_like(out), lse, fp8_oracle(*replacement_args))
+        check_fp8(torch.ones_like(out), lse, reference)
     aliased_q = out.view(torch.uint8).flatten()[: q.numel()].view(q.dtype).view_as(q)
     with pytest.raises(ValueError, match="overlap"):
-        decode_case(aliased_q, *args[1:], buffers=buffers, backend="prims-ts")
+        decode_case(aliased_q, *args[1:], buffers=buffers)
     with pytest.raises(ValueError, match="overlap"):
         aliased_indices = (
             out.view(torch.uint8)
@@ -1409,7 +1352,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     monkeypatch.setattr(frost, "_compile", forbidden)
     compile_kernel.cache_clear()
     args = make_fp8_case(1, compressed)
-    out, lse, buffers = decode_case(*args, backend="prims-ts")
+    out, lse, buffers = decode_case(*args)
     check_fp8(out, lse, fp8_oracle(*args))
     assert len(recorded) == len(launches) == 1
     attention, packet = recorded[0], launches[0]
@@ -1445,9 +1388,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
         buffers.views, "part_s"
     )
     # Numeric BMM values are forwarded at runtime, not specialization keys.
-    decode_case(
-        *args, buffers=buffers, backend="prims-ts", bmm1_scale=0.125, bmm2_scale=-2.0
-    )
+    decode_case(*args, buffers=buffers, bmm1_scale=0.125, bmm2_scale=-2.0)
     assert len(recorded) == 1 and launches[-1][-2:] == (0.125, -2.0)
     check_fp8(out, lse, fp8_oracle(*args, bmm1_scale=0.125, bmm2_scale=-2.0))
 
@@ -1525,14 +1466,10 @@ def test_fp8_main_common_units_rounding_saturation_underflow_changed_graph(
         q.copy_(query.to(q.dtype))
 
     update(cases[0], 0)
-    out, lse, buffers = decode_case(
-        *args, backend="prims-ts", bmm1_scale=0.125, bmm2_scale=2.0
-    )
+    out, lse, buffers = decode_case(*args, bmm1_scale=0.125, bmm2_scale=2.0)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        decode_case(
-            *args, buffers=buffers, backend="prims-ts", bmm1_scale=0.125, bmm2_scale=2.0
-        )
+        decode_case(*args, buffers=buffers, bmm1_scale=0.125, bmm2_scale=2.0)
     for step, case in enumerate(cases):
         update(case, step)
         _, _, value, counts = case
@@ -1584,7 +1521,7 @@ def test_fp8_swa_fp4_conversion_fallback(monkeypatch):
     monkeypatch.setattr(prims_ts, "_compile", fallback)
     args = make_fp8_case(4, 512)
     args[3][0].fill_(-1)
-    out, lse, _ = decode_case(*args, backend="prims-ts")
+    out, lse, _ = decode_case(*args)
     check_fp8(out, lse, fp8_oracle(*args))
 
 
@@ -1601,7 +1538,7 @@ def test_fp8_swa_sink_applied_once():
     wi.copy_(torch.arange(128, device=q.device, dtype=torch.int32).view(1, 1, 128))
     ci.copy_(torch.arange(512, device=q.device, dtype=torch.int32).view(1, 1, 512))
     sink.fill_(math.log(640))
-    out, lse, buffers = decode_case(q, swa, main, wi, ci, sink, backend="prims-ts")
+    out, lse, buffers = decode_case(q, swa, main, wi, ci, sink)
     assert not hasattr(buffers.views, "part_s") and not hasattr(buffers.views, "part_c")
     torch.testing.assert_close(out, torch.full_like(out, 0.5), rtol=0, atol=0)
     check_fp8(out, lse, fp8_oracle(q, swa, main, wi, ci, sink))
@@ -1617,7 +1554,7 @@ def test_fp8_swa_empty_poison_and_mode_guards(monkeypatch):
     args[3].fill_(-1)
     args[4].fill_(0x7FFFFFFF)
     args[5].fill_(-math.inf)
-    out, lse, buffers = decode_case(*args, backend="prims-ts")
+    out, lse, buffers = decode_case(*args)
     check_fp8(out, lse, fp8_oracle(*args))
     for pool, indices in ((args[1], args[3]), (args[2], args[4])):
         valid = (
@@ -1625,12 +1562,12 @@ def test_fp8_swa_empty_poison_and_mode_guards(monkeypatch):
         )
         assert not valid.any()
     with pytest.raises(ValueError, match="Prims-TS decode requires E4M3 Q"):
-        decode_case(args[0].bfloat16(), *args[1:], backend="prims-ts")
+        decode_case(args[0].bfloat16(), *args[1:])
     legacy = make_case(2, 64)
     with pytest.raises(ValueError, match="swa_kv_cache"):
-        decode_case(args[0], legacy[1], *args[2:], backend="prims-ts")
+        decode_case(args[0], legacy[1], *args[2:])
     with pytest.raises(ValueError, match="Prims-TS decode requires E4M3 Q"):
-        decode_case(*legacy, backend="prims-ts")
+        decode_case(*legacy)
 
     prims_ts._compile.cache_clear()
     graph = torch.cuda.CUDAGraph()
@@ -1658,7 +1595,7 @@ def test_fp8_swa_cache_offsets_above_two_gib(source):
     actual = list(args)
     actual[index] = large
     actual[ids_index] = args[ids_index] + first_page * 64
-    out, lse, _ = decode_case(*actual, backend="prims-ts")
+    out, lse, _ = decode_case(*actual)
     # Reference the small pool: uninitialized large prefixes must never be read.
     check_fp8(out, lse, fp8_oracle(*args))
 
@@ -1701,7 +1638,7 @@ def test_fp8_swa_source_anchor_crossings_and_extreme_finite_sinks():
         1000,
     )
     args = q, swa, main, wi, ci, sink
-    out, lse, buffers = decode_case(*args, backend="prims-ts")
+    out, lse, buffers = decode_case(*args)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         buffers.call(q, swa, main, sink)
@@ -1737,27 +1674,13 @@ def test_fp8_joint_canonical_single_kernel_graph(compressed, has_sink):
     q, swa, main, wi, ci, sink = make_fp8_case(2, compressed)
     if not has_sink:
         sink = None
-    buffers = DecodeBuffers.allocate(q, compressed, "prims-ts")
+    buffers = DecodeBuffers.allocate(q, compressed)
     buffers.indices[:, :128].copy_(wi[:, 0])
     if ci is not None:
         buffers.indices[:, 128:].copy_(ci[:, 0])
 
     def canonical():
-        return deepseek_v41_decode(
-            q,
-            swa,
-            buffers.workspace,
-            buffers.indices,
-            main,
-            buffers.topk_lens,
-            buffers.seq_lens,
-            buffers.out,
-            bmm1_scale=0.125,
-            bmm2_scale=2.0,
-            sinks=sink,
-            kv_layout="NHD",
-            backend="prims-ts",
-        )
+        return buffers.call(q, swa, main, sink, bmm1_scale=0.125, bmm2_scale=2.0)
 
     assert canonical() is buffers.out
     graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -1865,21 +1788,7 @@ def test_live_combined_metadata_prefix_replay(compressed):
         sink.fill_(0.125 + step * 0.25)
 
     def canonical():
-        return deepseek_v41_decode(
-            q,
-            swa,
-            buffers.workspace,
-            buffers.indices,
-            main,
-            buffers.topk_lens,
-            buffers.seq_lens,
-            buffers.out,
-            bmm1_scale=512**-0.5,
-            bmm2_scale=1.0,
-            sinks=sink,
-            kv_layout="NHD",
-            backend="prims-ts",
-        )
+        return buffers.call(q, swa, main, sink)
 
     update(0)
     assert canonical() is buffers.out

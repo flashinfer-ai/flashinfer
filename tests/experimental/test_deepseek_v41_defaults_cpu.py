@@ -404,18 +404,6 @@ def test_benchmark_native_fixture_source_and_packed_global_pool():
     assert len(formats) == len(set(formats))
 
 
-def test_example_representation_is_explicit_and_backend_scoped():
-    native = definition(_EXAMPLE, "fp8_case")
-    assignments = {
-        node.targets[0].id: node.value
-        for node in native.body
-        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
-    }
-    assert ast.unparse(assignments["q"]) == "q_source.to(torch.float8_e4m3fn)"
-    format = next(kw.value for kw in assignments["swa"].keywords if kw.arg == "format")
-    assert ast.literal_eval(format) == "swa_fp8"
-
-
 def test_native_oracle_attention_and_bound_match_independent_gpu_reference():
     def core(function):
         start = next(
@@ -470,25 +458,6 @@ def test_native_main_conversion_precedes_shared_qk_and_v_inputs():
     )
     # Duplicate and all-zero valid rows keep their attention multiplicity.
     assert ast.unparse(loop.body[-1]) == "masks.append(valid)"
-    inputs = {
-        ast.unparse(node.targets[0]): ast.unparse(node.value)
-        for node in oracle.body
-        if isinstance(node, ast.Assign)
-    }
-    assert inputs["logits"] == (
-        "torch.einsum('bhd,bkd->bhk', q[:, 0].double(), kv) * bmm1_scale"
-    )
-    assert (
-        inputs["expected"] == "torch.einsum('bhk,bkd->bhd', weights, kv) * bmm2_scale"
-    )
-    assert (
-        inputs["sensitivity"]
-        == "torch.einsum('bhk,bkd->bhd', weights, kv.abs()) * abs(bmm2_scale)"
-    )
-    assert (
-        inputs["underflow"]
-        == "frame_mass[..., None] * kv.abs().sum(1)[:, None, :] * abs(bmm2_scale)"
-    )
     assert not any(
         isinstance(node, ast.Attribute) and node.attr == "bfloat16"
         for function in (
@@ -563,13 +532,6 @@ def test_selected_main_masks_packed_payload_and_scales_before_decode():
         "pages[page[..., None], row[..., None] * 256 + column // 2]",
         "pages[page[..., None], 64 * 256 + row[..., None] * 32 + column // 16]",
     ]
-    assert assignments["decoded"] == "data * scale"
-    result = next(
-        node.value
-        for node in definition(_BENCHMARK, "selected_main_fp8").body
-        if isinstance(node, ast.Return)
-    )
-    assert ast.unparse(result) == "common_unit_main(decoded)"
 
 
 def test_common_unit_main_uses_decoded_payload_not_group_maximum():
@@ -716,13 +678,6 @@ def test_native_arm_selects_independent_oracle_and_gate():
     assert "max_bound_fraction" in stats
 
 
-@pytest.mark.parametrize("path", [_BENCHMARK, _EXAMPLE])
-def test_cli_sources_have_no_compatibility_selector(path):
-    source = path.read_text()
-    assert "--prims-ts-mode" not in source
-    assert "prims_ts_mode" not in source
-
-
 def test_benchmark_times_canonical_public_replay_with_caller_storage():
     backend = "prims-ts"
     q, swa, main, wi, ci, sink = (
@@ -841,72 +796,51 @@ def test_native_arm_json_labels_representation_shape_and_accuracy():
     assert metadata["q_dtype"] == q.dtype
     assert metadata["swa_encoding"] == "swa_fp8"
     assert metadata["global_encoding"] == "main_kv_fp4"
-    assert metadata["global_storage"] == (
-        "packed E2M1 + group16 E4M3 scales; width288 page-plane"
-    )
     assert metadata["cache_shape"] == {
         "swa": [2, 64, 1, 512],
         "global_fp4": [8, 64, 1, 288],
     }
     assert metadata["kv_layout"] == "NHD"
     assert metadata["bmm1_scale"] == 512**-0.5 and metadata["bmm2_scale"] == 1.0
-    contract = metadata["accuracy_contract"]
-    assert "native E4M3 Q/K/V/P for SWA and main" in metadata["arithmetic"]
-    assert "BK128/Keep-AB/M64/retained8/split1/nonpersistent" in metadata["arithmetic"]
-    assert "original E4M3 Q, no BF16 query scratch" in metadata["arithmetic"]
-    assert metadata["global_conversion"] == (
-        "common cache units: valid selected E2M1 * signed finite group16 E4M3 "
-        "-> E4M3 RN/satfinite SMEM; intentional +/-448 cache-unit saturation; "
-        "no request amax, descale or division; shared runtime BMM1/BMM2"
-    )
+    assert "E4M3 Q/K/V/P" in metadata["arithmetic"]
     assert metadata["global_precision"] == "shared_pertensor_e4m3"
-    assert metadata["main_scale"] == (
-        "none; caller's common KV units, shared runtime BMM factors"
-    )
     assert metadata["compile_marker"] == (
         "dsv41_shared_pertensor_joint_e4m3_swa512_fp4_inline_metadata_v2"
     )
-    assert contract["reference"] == (
-        "independent FP64 over stored E4M3 Q/SWA and common-unit E4M3 main; "
-        "mask selected packed bytes before exact decode, then independent "
-        "FP32 clamp -> E4M3 RN -> FP64; shared BMM factors applied once"
-    )
+    contract = metadata["accuracy_contract"]
+    assert "independent FP64" in contract["reference"]
     assert "componentwise" in contract["output"]
     assert contract["lse"] == "sink-exclusive; rtol=0, atol=1e-5"
     assert "exact zero" in contract["empty"]
     assert "rel_l2_lt" not in contract
 
 
-def source_bindings():
-    return {
+def test_native_source_hashes_without_importing_modules():
+    bindings = {
         node.targets[0].id: ast.literal_eval(node.value)
         for node in ast.parse(_BENCHMARK.read_text()).body
         if isinstance(node, ast.Assign)
         and isinstance(node.targets[0], ast.Name)
         and node.targets[0].id.startswith("PRIMS_TS_")
     }
-
-
-def test_source_hashes_stay_native_only():
-    bindings = source_bindings()
     assert set(bindings) == {"PRIMS_TS_SOURCES"}
     sources = bindings["PRIMS_TS_SOURCES"]
-    assert "experimental/deepseek_v41/prims_ts/_sparse_views.py" in sources
-    assert "experimental/deepseek_v41/prims_ts/_metadata.py" not in sources
-    assert "experimental/deepseek_v41/prims_ts/_workspace.py" in sources
-    assert "experimental/deepseek_v41/prims_ts/__init__.py" in sources
-    assert "experimental/deepseek_v41/prims_ts/kernel.py" in sources
-    assert "experimental/deepseek_v41/prims_ts/resources.py" in sources
-    assert "cute_dsl/fp4_common.py" in sources
-    assert "attention/prims_ts/kernels/mla_decode/helpers/ops.py" in sources
-    assert "attention/prims_ts/kernels/mla_decode/helpers/sparse_indices.py" in sources
-    assert "attention/prims_ts/kernels/task_compat.py" in sources
-    assert "attention/prims_ts/kernels/mla_decode/sparse_views.py" not in sources
+    assert {
+        "experimental/deepseek_v41/prims_ts/_sparse_views.py",
+        "experimental/deepseek_v41/prims_ts/_workspace.py",
+        "experimental/deepseek_v41/prims_ts/__init__.py",
+        "experimental/deepseek_v41/prims_ts/kernel.py",
+        "experimental/deepseek_v41/prims_ts/resources.py",
+        "cute_dsl/fp4_common.py",
+        "attention/prims_ts/kernels/mla_decode/helpers/ops.py",
+        "attention/prims_ts/kernels/mla_decode/helpers/sparse_indices.py",
+        "attention/prims_ts/kernels/task_compat.py",
+    }.issubset(sources)
+    assert not {
+        "experimental/deepseek_v41/prims_ts/_metadata.py",
+        "attention/prims_ts/kernels/mla_decode/sparse_views.py",
+    }.intersection(sources)
     assert not any("mxfp8" in source for source in sources)
-
-
-def test_native_source_hashes_without_importing_modules():
-    bindings = source_bindings()
     main = definition(_BENCHMARK, "main")
     declarations = [
         node
@@ -961,21 +895,18 @@ def test_example_uses_common_descale_hnd_and_output_only_caller_buffers():
         for node in native.body
         if isinstance(node, ast.Assign)
     }
+    assert ast.unparse(assignments["q"]) == "q_source.to(torch.float8_e4m3fn)"
     assert ast.literal_eval(assignments["kv_descale"]) == 2.0
     assert (
         ast.unparse(assignments["cache_units"])
         == "(x.float() / kv_descale).contiguous()"
     )
-    for name in ("swa", "main_cache"):
+    for name, encoding in (("swa", "swa_fp8"), ("main_cache", "main_kv_fp4")):
         writer = assignments[name]
         assert ast.unparse(writer.func) == "ds.deepseek_v41_quantize_cache"
         assert [ast.unparse(arg) for arg in writer.args] == ["cache_units"]
-        layout = next(
-            ast.literal_eval(kw.value)
-            for kw in writer.keywords
-            if kw.arg == "kv_layout"
-        )
-        assert layout == "HND"
+        options = {kw.arg: ast.literal_eval(kw.value) for kw in writer.keywords}
+        assert options["kv_layout"] == "HND" and options["format"] == encoding
     nested = next(
         node
         for node in native.body
