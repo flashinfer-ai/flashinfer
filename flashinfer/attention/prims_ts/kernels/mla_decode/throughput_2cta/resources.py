@@ -2838,7 +2838,7 @@ class TmemSResource(HighThroughputMlaResource):
                     row_max_prev, row_sum_prev = load_peer_state()
 
         row_max_new = fmax_f32(row_max_prev, row_max_tile)
-        if cutlass.const_expr(cfg.skip_corr_threshold > 0.0):
+        if cutlass.const_expr(cfg.softmax_rescale_threshold_log2 > 0.0):
             # Freeze the running row max while this K tile raises it by at most
             # the threshold. P then grows by at most 2^T, and the unchanged max
             # keeps this row's O rescale on the existing exact-equality skip
@@ -2846,7 +2846,7 @@ class TmemSResource(HighThroughputMlaResource):
             # infinite or NaN increase and never freezes. Compare in log2 units with
             # the threshold as an immediate: the scale is already live here.
             max_increase_log2 = (row_max_new - row_max_prev) * self.softmax_scale_log2
-            if max_increase_log2 <= Float32(cfg.skip_corr_threshold):
+            if max_increase_log2 <= Float32(cfg.softmax_rescale_threshold_log2):
                 row_max_new = row_max_prev
         row_has_values = row_max_new != neg_inf
         safe_row_max_prev = row_max_prev if row_has_values else Float32(0)
@@ -2866,7 +2866,7 @@ class TmemSResource(HighThroughputMlaResource):
         fma_c = Float32(0) - safe_row_max_new * self.softmax_scale_log2
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             # Use the same selected FP8 probability scale as output and LSE:
-            # 448 with exact maxima, 1.75 with threshold skip correction.
+            # 448 with exact maxima, 448 * 2**-T with a rescale threshold T.
             fma_c = fma_c + fp8_log2_p_scale(cfg)
         for i in cutlass.range_constexpr(0, 64, 2):
             fma_result = fma_packed_f32x2(

@@ -84,7 +84,7 @@ from .resources import (
     MlaWorkQueue,
     WorkThrottleBarrierResource,
 )
-from ..helpers.math import qkv_dtype, validate_skip_corr_threshold
+from ..helpers.math import qkv_dtype, canonicalize_softmax_rescale_threshold_log2
 from ..parallel_reduction_topology import (
     ParallelReductionTopology,
     make_balanced_parallel_reduction_topology,
@@ -831,7 +831,7 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
-        skip_corr_threshold: float = 0.0,
+        softmax_rescale_threshold_log2: float = 0.0,
     ):
         """
         Parameters
@@ -879,7 +879,7 @@ class MlaDecodeTs:
         mask_type : MaskType or str, optional
             ``causal`` (default) for bottom-right speculative decoding or
             ``dense`` for full per-batch KV visibility.
-        skip_corr_threshold : float, optional
+        softmax_rescale_threshold_log2 : float, optional
             Compile-time skip-correction threshold in log2 units. ``0.0``
             (default) keeps the exact online-softmax rescale.
         """
@@ -919,8 +919,10 @@ class MlaDecodeTs:
         self.mask_type = normalize_mask_type(mask_type)
         # Validate eagerly: the config (and its own check) is only built when
         # the kernel is traced, after plan() has bound a workspace.
-        self.skip_corr_threshold = validate_skip_corr_threshold(
-            skip_corr_threshold, qkv_dtype=qkv_dtype
+        self.softmax_rescale_threshold_log2 = (
+            canonicalize_softmax_rescale_threshold_log2(
+                softmax_rescale_threshold_log2, qkv_dtype=qkv_dtype
+            )
         )
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
@@ -986,7 +988,7 @@ class MlaDecodeTs:
             self.num_heads,
             self.seq_len_q,
             self.mask_type,
-            self.skip_corr_threshold,
+            self.softmax_rescale_threshold_log2,
             self.reduction_split_capacity,
             self.query_tile_layout,
             self.num_q_tiles,
@@ -1085,7 +1087,7 @@ class MlaDecodeTs:
             balance_sparse_registers=self.sparse_balanced_registers,
             fuse_output_quant=self.output_quant is not None
             and self.fuse_sparse_epilogue,
-            skip_corr_threshold=self.skip_corr_threshold,
+            softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
         )
 
         # One flattened sparse query supplies a complete M128 tile. Its two

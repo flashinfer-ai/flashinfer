@@ -23,7 +23,6 @@ from typing import Tuple
 
 from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
-from ..helpers.math import validate_skip_corr_threshold
 
 
 # The separate reducer follows the public MLA output contract: partial O is
@@ -271,14 +270,14 @@ class MlaDecodeConfig:
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
-    # Threshold skip correction in log2 units (public option
-    # ``skip_correction_threshold``); 0 disables it.  A positive value
+    # Threshold skip correction in log2 units (binades); 0 disables it.  A positive value
     # freezes the running row max while a K tile raises it by at most this
     # amount.  It is a compile-time constant: a runtime scalar stays live in
     # every softmax iteration and costs registers under the 128-register cap.
-    # With E4M3 P it also moves the P scale from 448 to 1.75 (as trtllm-gen);
-    # BF16 P stays unscaled.  See ``max_skip_corr_threshold`` for the bounds.
-    skip_corr_threshold: float = 0.0
+    # With E4M3 P it also lowers the P scale from 448 to ``448 * 2**-T``;
+    # BF16 P stays unscaled.  See ``max_softmax_rescale_threshold_log2`` for
+    # the bounds.
+    softmax_rescale_threshold_log2: float = 0.0
 
     @property
     def tokens_per_k_tile(self) -> int:
@@ -357,7 +356,7 @@ def make_mla_decode_config(
     cache_uniform_sparse_pages: bool = False,
     balance_sparse_registers: bool = False,
     fuse_output_quant: bool = False,
-    skip_corr_threshold: float = 0.0,
+    softmax_rescale_threshold_log2: float = 0.0,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
     cfg = MlaDecodeConfig()
@@ -372,10 +371,8 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
-    # Direct kernel/config construction bypasses plan(); enforce the bound here.
-    cfg.skip_corr_threshold = validate_skip_corr_threshold(
-        skip_corr_threshold, qkv_dtype=qkv_dtype
-    )
+    # Range-checked by MlaDecodeTs and plan().
+    cfg.softmax_rescale_threshold_log2 = softmax_rescale_threshold_log2
 
     def _require_positive(name: str, value: int) -> None:
         """Validate that a named configuration value is positive."""

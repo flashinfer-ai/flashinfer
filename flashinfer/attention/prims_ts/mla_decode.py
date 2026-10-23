@@ -134,7 +134,7 @@ class _MLADecodePlanState:
     compiled: Callable[..., object]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
-    skip_correction_threshold: float = 0.0
+    softmax_rescale_threshold_log2: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -691,7 +691,7 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
-def _check_skip_correction_threshold_range(
+def _check_softmax_rescale_threshold_log2_range(
     threshold: object, *, q_dtype: torch.dtype
 ) -> float:
     """Return the threshold as float32-rounded ``float``; raise if out of range.
@@ -700,13 +700,15 @@ def _check_skip_correction_threshold_range(
     clamped, as trtllm-gen's ``checkSkipCorrThreshold`` does.
     """
 
-    from .kernels.mla_decode.helpers.math import validate_skip_corr_threshold
+    from .kernels.mla_decode.helpers.math import (
+        canonicalize_softmax_rescale_threshold_log2,
+    )
 
     if threshold == 0.0 and type(threshold) in (int, float):
         # Zero selects the default kernel for every dtype, including ones
         # without a threshold bound.
         return 0.0
-    return validate_skip_corr_threshold(
+    return canonicalize_softmax_rescale_threshold_log2(
         threshold, qkv_dtype=_kernel_dtype_name(_dtype_key(q_dtype))
     )
 
@@ -760,7 +762,7 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
-    skip_corr_threshold: float = 0.0,
+    softmax_rescale_threshold_log2: float = 0.0,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -891,7 +893,7 @@ def _resolve_mla_decode_launch_spec(
                 explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
-                skip_corr_threshold=skip_corr_threshold,
+                softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
@@ -974,7 +976,7 @@ def _resolve_mla_decode_launch_spec(
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
-                skip_corr_threshold=skip_corr_threshold,
+                softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
@@ -1517,7 +1519,7 @@ class BatchMLADecodePagedTSWrapper:
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
-        skip_correction_threshold: float = 0.0,
+        softmax_rescale_threshold_log2: float = 0.0,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1563,20 +1565,20 @@ class BatchMLADecodePagedTSWrapper:
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
-        skip_correction_threshold : float
+        softmax_rescale_threshold_log2 : float
             Opt-in skip of the online-softmax O rescale (correction), in
-            binades: 0 to 8 for FP8 QKV, 0 to 32 for BF16 QKV. The name,
-            unit, default and bounds follow the trtllm-gen FMHA
-            ``skipCorrThreshold``. ``0.0`` (default) rescales on every new row
-            maximum. A positive value keeps a row's softmax anchor while a K
-            tile raises the row maximum by at most this many binades, which
-            skips that tile's rescale of the accumulated output.
-            Probabilities then reach ``2**threshold``, so for any positive
-            threshold FP8 P is quantized at the fixed scale 1.75
-            (``448 * 2**-8``, as in trtllm-gen) instead of 448. E4M3 P then
-            loses precision from about 4.7 nats below the anchor (about 10
-            nats at 448) and flushes to zero below about 7.5 nats (about 13);
-            the FP32 row sum keeps the exact values, so the tail's weight is
+            binades: 0 to 8 for FP8 QKV, 0 to 32 for BF16 QKV. The name and
+            the FP8 P scale follow the Prims-TS FMHA decode option of the same
+            name; the bounds follow the trtllm-gen FMHA ``skipCorrThreshold``.
+            ``0.0`` (default) rescales on every new row maximum. A positive
+            value T keeps a row's softmax anchor while a K tile raises the row
+            maximum by at most T binades, which skips that tile's rescale of
+            the accumulated output. Probabilities then reach ``2**T``, so FP8
+            P is quantized at ``448 * 2**-T`` instead of 448 (1.75 at T = 8,
+            the trtllm-gen scale). E4M3 P then loses precision from about
+            ``10.3 - 0.69 * T`` nats below the anchor and flushes to zero
+            below about ``13 - 0.69 * T`` nats (4.7 and 7.5 at T = 8); the
+            FP32 row sum keeps the exact values, so the tail's weight is
             biased low. The loss covers the KV range
             that shares the anchor's split, which is the whole row when
             split-KV is not used (typically large batches). Rows whose largest
@@ -1608,8 +1610,8 @@ class BatchMLADecodePagedTSWrapper:
             _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
         # Range-check the threshold even when validate is False: it selects a
         # compiled kernel, and a value past the per-dtype bound saturates FP8 P.
-        skip_correction_threshold = _check_skip_correction_threshold_range(
-            skip_correction_threshold, q_dtype=q_data_type
+        softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
+            softmax_rescale_threshold_log2, q_dtype=q_data_type
         )
 
         device, device_index = _resolve_cuda_device(device)
@@ -1632,7 +1634,9 @@ class BatchMLADecodePagedTSWrapper:
             mask_type,
             max_seq_len_q,
         )
-        spec = _resolve_mla_decode_launch_spec(*spec_key, skip_correction_threshold)
+        spec = _resolve_mla_decode_launch_spec(
+            *spec_key, softmax_rescale_threshold_log2
+        )
         compile_spec = _make_mla_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -1685,7 +1689,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=int(dict(policy)["split_kv"]),
-            skip_correction_threshold=skip_correction_threshold,
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         )
 
     @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -1812,7 +1816,7 @@ def batch_mla_decode_with_paged_kv_cache(
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
     validate: bool = True,
-    skip_correction_threshold: float = 0.0,
+    softmax_rescale_threshold_log2: float = 0.0,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1856,11 +1860,12 @@ def batch_mla_decode_with_paged_kv_cache(
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
-    skip_correction_threshold : float
+    softmax_rescale_threshold_log2 : float
         Opt-in skip of the online-softmax O rescale in binades; see
         :meth:`BatchMLADecodePagedTSWrapper.plan`. ``0.0`` (default) keeps the
-        exact rescale. A positive value quantizes FP8 P at 1.75 instead of
-        448, which costs E4M3 precision for probabilities far below the anchor.
+        exact rescale. A positive value T quantizes FP8 P at ``448 * 2**-T``
+        instead of 448, which costs E4M3 precision for probabilities far below
+        the anchor.
 
     Returns
     -------
@@ -1984,7 +1989,7 @@ def batch_mla_decode_with_paged_kv_cache(
         mask_type=mask_type,
         workspace_buffer=workspace_buffer,
         validate=validate,
-        skip_correction_threshold=skip_correction_threshold,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     return wrapper.run(
         query,
@@ -2174,7 +2179,7 @@ def _resolve_sparse_mla_plan(
     output_quant_block_size=None,
     out_scale_format="ue8m0",
     num_output_groups=None,
-    skip_correction_threshold=None,
+    softmax_rescale_threshold_log2=None,
 ):
     """Resolve sparse geometry and scratch sizing without allocation/compilation."""
     import cutlass
@@ -2218,9 +2223,9 @@ def _resolve_sparse_mla_plan(
         raise ValueError("native BF16 or E4M3 is required")
     if kv_layout not in ("NHD", "HND"):
         raise ValueError("kv_layout must be NHD or HND")
-    if skip_correction_threshold is not None:
-        skip_correction_threshold = _check_skip_correction_threshold_range(
-            skip_correction_threshold, q_dtype=q_data_type
+    if softmax_rescale_threshold_log2 is not None:
+        softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
+            softmax_rescale_threshold_log2, q_dtype=q_data_type
         )
     max_rows = batch_size * max_seq_len_q
     capacity = max(
@@ -2238,12 +2243,12 @@ def _resolve_sparse_mla_plan(
         dtype="bf16" if q_data_type == torch.bfloat16 else "fp8",
         sm_count=sm_count,
     )
-    skip_corr_threshold = 0.0
-    if skip_correction_threshold is not None:
+    kernel_threshold = 0.0
+    if softmax_rescale_threshold_log2 is not None:
         # An explicit threshold replaces the schedule's fixed six-binade
         # deferral; zero restores exact maxima for every schedule.
         profile = replace(profile, defer_max_update=False)
-        skip_corr_threshold = skip_correction_threshold
+        kernel_threshold = softmax_rescale_threshold_log2
     family, tile = profile.family, profile.tile_size_q
     splits, head_dim_ctas = profile.split_kv, profile.head_dim_ctas
     dtype_name = "bf16" if q_data_type == torch.bfloat16 else "e4m3"
@@ -2262,7 +2267,7 @@ def _resolve_sparse_mla_plan(
             seq_len_q=1,
             batch_size=max_rows,
             mask_type="dense",
-            skip_corr_threshold=skip_corr_threshold,
+            softmax_rescale_threshold_log2=kernel_threshold,
         )
         kernel.sparse_gather_warps = profile.gather_issue_warps
         kernel.sparse_kv_stages = profile.kv_pipeline_stages
@@ -2306,7 +2311,7 @@ def _resolve_sparse_mla_plan(
             tile_size_q=tile,
             sparse_profile=profile,
             mask_type="dense",
-            skip_corr_threshold=skip_corr_threshold,
+            softmax_rescale_threshold_log2=kernel_threshold,
         )
         core_bytes = compute_workspace_size(
             cfg=kernel._make_config(),
@@ -2388,7 +2393,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         output_quant_block_size=None,
         out_scale_format="ue8m0",
         num_output_groups=None,
-        skip_correction_threshold=None,
+        softmax_rescale_threshold_log2=None,
     ):
         """Plan D512 attention over one primary and an optional extra pool.
 
@@ -2402,15 +2407,16 @@ class BatchSparseMLADecodePagedTSWrapper:
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
 
-        ``skip_correction_threshold`` has the meaning, unit and bounds of
+        ``softmax_rescale_threshold_log2`` has the meaning, unit and bounds of
         :meth:`BatchMLADecodePagedTSWrapper.plan` (0 to 8 binades for E4M3,
         0 to 32 for BF16). ``None`` (default) keeps each schedule's own
         behavior: some BF16 schedules keep the row anchor while a K tile
         raises it by at most 6 binades, and all others rescale on every new
         maximum. An explicit value applies to every schedule; ``0.0``
         disables the skip (slower than ``None`` on the deferred BF16
-        schedules), and a positive value also quantizes E4M3 P at 1.75
-        instead of 448, with the precision cost described there.
+        schedules), and a positive value T also quantizes E4M3 P at
+        ``448 * 2**-T`` instead of 448, with the precision cost described
+        there.
         """
         (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
@@ -2429,7 +2435,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 output_quant_block_size=output_quant_block_size,
                 out_scale_format=out_scale_format,
                 num_output_groups=num_output_groups,
-                skip_correction_threshold=skip_correction_threshold,
+                softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
         )
         kernel = spec.kernel
@@ -2907,14 +2913,14 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     token_positions=None,
     cos_sin_cache=None,
     out_scale=None,
-    skip_correction_threshold=None,
+    softmax_rescale_threshold_log2=None,
 ):
     """Eager plan-and-run helper using separate source indices and lengths.
 
     Use a planned wrapper for CUDA Graph replay. Index conversion and scale
     composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
-    Source contracts, output quantization arguments, ``skip_correction_threshold``
+    Source contracts, output quantization arguments, ``softmax_rescale_threshold_log2``
     and return layouts follow
     :class:`BatchSparseMLADecodePagedTSWrapper`.
     """
@@ -2949,7 +2955,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         output_quant_block_size=output_quant_block_size,
         out_scale_format=out_scale_format,
         num_output_groups=num_output_groups,
-        skip_correction_threshold=skip_correction_threshold,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     return wrapper.run(
         query,

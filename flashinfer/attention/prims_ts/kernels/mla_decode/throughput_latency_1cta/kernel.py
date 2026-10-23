@@ -96,7 +96,7 @@ from .parallel_reduction import (
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
 from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
-from ..helpers.math import validate_skip_corr_threshold
+from ..helpers.math import canonicalize_softmax_rescale_threshold_log2
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.tile import (
     runtime_query_tile_is_active,
@@ -1680,7 +1680,7 @@ class ThroughputLatencyMlaDecodeTs:
         mask_type: MaskType | str = MaskType.CAUSAL,
         sparse_profile=None,
         finalize_output: bool = False,
-        skip_corr_threshold: float = 0.0,
+        softmax_rescale_threshold_log2: float = 0.0,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1711,8 +1711,10 @@ class ThroughputLatencyMlaDecodeTs:
         self.mask_type = normalize_mask_type(mask_type)
         self.sparse_profile = sparse_profile
         self.finalize_output = finalize_output
-        self.skip_corr_threshold = validate_skip_corr_threshold(
-            skip_corr_threshold, qkv_dtype=qkv_dtype
+        self.softmax_rescale_threshold_log2 = (
+            canonicalize_softmax_rescale_threshold_log2(
+                softmax_rescale_threshold_log2, qkv_dtype=qkv_dtype
+            )
         )
         self.output_quant = None
         # Sparse attention binds separate source lists; dense attention uses
@@ -1854,7 +1856,7 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_split_kv=self.explicit_split_kv,
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
-            skip_corr_threshold=self.skip_corr_threshold,
+            softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
         )
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(

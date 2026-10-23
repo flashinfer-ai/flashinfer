@@ -237,33 +237,35 @@ def fp8_quant_scale_rcp():
     return Float32(1.0 / 448.0)
 
 
-# A positive skip-correction threshold T keeps a row's max anchor while a K tile
-# raises it by at most T binades, so P reaches 2**T. As in the trtllm-gen FMHA
-# (``getSoftmaxPScale``), E4M3 P then uses the fixed scale 1.75 = 448 * 2**-8
-# for every positive T up to the bound of 8, so the scaled P stays within 448.
-# T is a compile-time config value, so these are plain Python helpers rather
-# than ``cute.jit`` functions.
-FP8_SKIP_CORR_P_SCALE = 1.75
+# A positive ``softmax_rescale_threshold_log2`` T keeps a row's max anchor while
+# a K tile raises it by at most T binades, so P reaches 2**T. E4M3 P then uses
+# the scale 448 * 2**-T, as Prims-TS FMHA decode does (``fp8_p_quant_scale``),
+# so the scaled P stays within 448. This equals the trtllm-gen FMHA
+# ``getSoftmaxPScale`` at T = 0 (448) and at T = 8 (1.75). T is a compile-time
+# config value, so these are plain Python helpers rather than ``cute.jit``
+# functions.
+def _fp8_rescale_threshold_p_scale(cfg) -> float:
+    return 448.0 * 2.0**-cfg.softmax_rescale_threshold_log2
 
 
 def fp8_log2_p_scale(cfg):
     """Return log2 of the E4M3 P scale selected by the config."""
-    if cfg.skip_corr_threshold > 0.0:
-        return Float32(math.log2(FP8_SKIP_CORR_P_SCALE))
+    if cfg.softmax_rescale_threshold_log2 > 0.0:
+        return Float32(math.log2(_fp8_rescale_threshold_p_scale(cfg)))
     return fp8_log2_quant_scale()
 
 
 def fp8_p_scale(cfg):
-    """Return the E4M3 P scale selected by the config (1.75 or 448)."""
-    if cfg.skip_corr_threshold > 0.0:
-        return Float32(FP8_SKIP_CORR_P_SCALE)
+    """Return the E4M3 P scale selected by the config (``448 * 2**-T``)."""
+    if cfg.softmax_rescale_threshold_log2 > 0.0:
+        return Float32(_fp8_rescale_threshold_p_scale(cfg))
     return fp8_quant_scale()
 
 
 def fp8_p_scale_rcp(cfg):
     """Return the reciprocal of ``fp8_p_scale``."""
-    if cfg.skip_corr_threshold > 0.0:
-        return Float32(1.0 / FP8_SKIP_CORR_P_SCALE)
+    if cfg.softmax_rescale_threshold_log2 > 0.0:
+        return Float32(1.0 / _fp8_rescale_threshold_p_scale(cfg))
     return fp8_quant_scale_rcp()
 
 

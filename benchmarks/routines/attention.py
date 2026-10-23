@@ -530,17 +530,16 @@ def parse_attention_args(line, parser):
         ),
     )
     parser.add_argument(
-        "--mla_skip_correction_threshold",
+        "--mla_softmax_rescale_threshold_log2",
         type=float,
         default=0.0,
         help=(
             "BatchMLAPagedAttentionWrapper routine with the prims-ts backend only "
             "(ignored by other routines): passed to BatchMLADecodePagedTSWrapper."
-            "plan(skip_correction_threshold=...). A positive value skips the "
+            "plan(softmax_rescale_threshold_log2=...). A positive value skips the "
             "O rescale while a K tile raises a row maximum by at most this many "
             "binades (bound: 8 for FP8, 32 for BF16); FP8 P is then quantized at "
-            "1.75 instead of 448, as in trtllm-gen. 0 (default) keeps the exact "
-            "rescale."
+            "448 * 2**-T instead of 448. 0 (default) keeps the exact rescale."
         ),
     )
     parser.add_argument(
@@ -3402,8 +3401,8 @@ def testBatchMLAPagedAttentionWrapper(args):
     # CuTe DSL decode kernel). None => do not pass cute_dsl_impl, keeping the
     # API default ('auto') so existing cases and perf baselines are unchanged.
     mla_cute_dsl_impl_arg = getattr(args, "mla_cute_dsl_impl", None)
-    mla_skip_correction_threshold = float(
-        getattr(args, "mla_skip_correction_threshold", 0.0)
+    mla_softmax_rescale_threshold_log2 = float(
+        getattr(args, "mla_softmax_rescale_threshold_log2", 0.0)
     )
     if mla_cute_dsl_impl_arg is not None:
         mla_api_extra_kwargs["cute_dsl_impl"] = mla_cute_dsl_impl_arg
@@ -3486,9 +3485,9 @@ def testBatchMLAPagedAttentionWrapper(args):
             )
         elif args.enable_pdl:
             print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
-    if mla_skip_correction_threshold != 0.0 and "prims-ts" not in backends:
+    if mla_softmax_rescale_threshold_log2 != 0.0 and "prims-ts" not in backends:
         print(
-            "[WARNING] --mla_skip_correction_threshold applies only to "
+            "[WARNING] --mla_softmax_rescale_threshold_log2 applies only to "
             "prims-ts; ignoring it."
         )
     if len(backends) == 0:
@@ -3677,7 +3676,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             o_data_type=torch.bfloat16,
             mask_type="causal",
             workspace_buffer=workspace_buffer,
-            skip_correction_threshold=mla_skip_correction_threshold,
+            softmax_rescale_threshold_log2=mla_softmax_rescale_threshold_log2,
         )
 
     direct_out = None
@@ -4084,8 +4083,10 @@ def testBatchMLAPagedAttentionWrapper(args):
                 if mla_cute_dsl_impl_arg is not None:
                     cur_res["cute_dsl_impl"] = mla_cute_dsl_impl_arg
                 # Same null-preserving rule for the prims-ts skip-correction threshold.
-                if backend == "prims-ts" and mla_skip_correction_threshold != 0.0:
-                    cur_res["skip_correction_threshold"] = mla_skip_correction_threshold
+                if backend == "prims-ts" and mla_softmax_rescale_threshold_log2 != 0.0:
+                    cur_res["softmax_rescale_threshold_log2"] = (
+                        mla_softmax_rescale_threshold_log2
+                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

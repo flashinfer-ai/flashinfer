@@ -33,7 +33,6 @@ from typing import Any
 from ....split_kv_mode_policy import select_split_kv_modes
 from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
-from ..helpers.math import validate_skip_corr_threshold
 from ..helpers.query import FlatQueryTileLayout
 
 
@@ -99,12 +98,11 @@ class MlaConfig:
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
-    # Threshold skip correction in log2 units (public option
-    # ``skip_correction_threshold``; 0 disables it): freeze the
-    # running row max while a K tile raises it by at most this compile-time
-    # amount and skip that tile's O rescale.  E4M3 P then uses the fixed
-    # 1.75 scale instead of 448.
-    skip_corr_threshold: float = 0.0
+    # Threshold skip correction in log2 units (binades; 0 disables it): freeze
+    # the running row max while a K tile raises it by at most this
+    # compile-time amount and skip that tile's O rescale.  E4M3 P then uses
+    # the scale ``448 * 2**-T`` instead of 448.
+    softmax_rescale_threshold_log2: float = 0.0
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512
@@ -1525,7 +1523,7 @@ def make_throughput_latency_mla_config(
     explicit_split_kv: int | None = None,
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
-    skip_corr_threshold: float = 0.0,
+    softmax_rescale_threshold_log2: float = 0.0,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile."""
 
@@ -1682,11 +1680,8 @@ def make_throughput_latency_mla_config(
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         mask_type=mask_type,
-        # Direct kernel/config construction bypasses plan(); enforce the
-        # per-dtype bound here.
-        skip_corr_threshold=validate_skip_corr_threshold(
-            skip_corr_threshold, qkv_dtype=qkv_dtype
-        ),
+        # Range-checked by ThroughputLatencyMlaDecodeTs and plan().
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         head_dim_qk=head_dim_qk,
         head_dim_v=latent_dim,
         latent_dim=latent_dim,
@@ -1805,11 +1800,11 @@ def configure_sparse_mla(
         raise ValueError("fused output requires one logical query per virtual request")
     if direct_inputs and (not finalize_output or cfg.qkv_dtype not in ("bf16", "e4m3")):
         raise ValueError("separate sparse indices require native BF16/FP8 final output")
-    if profile.defer_max_update and cfg.skip_corr_threshold > 0.0:
+    if profile.defer_max_update and cfg.softmax_rescale_threshold_log2 > 0.0:
         # The sparse fixed-bound deferral takes precedence in update_softmax;
         # a threshold would then only change the FP8 P scale.
         raise ValueError(
-            "skip_correction_threshold is not supported with deferred "
+            "softmax_rescale_threshold_log2 is not supported with deferred "
             "sparse max updates"
         )
     cfg = dataclass_replace(

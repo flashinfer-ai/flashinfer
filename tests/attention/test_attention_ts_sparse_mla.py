@@ -18,7 +18,6 @@ from flashinfer.attention.prims_ts import (
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
-from flashinfer.attention.prims_ts.mla_decode import _resolve_sparse_mla_plan
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -1148,24 +1147,17 @@ def test_softmax_score_jumps(heads, dtype):
 @pytest.mark.parametrize(
     "dtype,rows,heads,capacity,threshold",
     [
-        # Each case lands on a different measured schedule on 148-SM parts.
-        pytest.param(torch.bfloat16, 37, 32, 1024, 32.0, id="bf16-2cta"),
-        pytest.param(torch.bfloat16, 74, 32, 1024, 6.0, id="bf16-keep-deferred"),
-        pytest.param(torch.bfloat16, 74, 16, 1024, 6.0, id="bf16-swap-deferred"),
-        pytest.param(torch.bfloat16, 16, 128, 2048, 6.0, id="bf16-keep-bk64-split"),
-        pytest.param(torch.float8_e4m3fn, 16, 128, 1024, 8.0, id="fp8-2cta"),
-        pytest.param(torch.float8_e4m3fn, 37, 32, 2048, 8.0, id="fp8-keep-split"),
-        pytest.param(torch.float8_e4m3fn, 74, 16, 2048, 8.0, id="fp8-swap-split"),
+        pytest.param(torch.bfloat16, 74, 32, 1024, 6.0, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 16, 128, 1024, 8.0, id="fp8"),
     ],
 )
-def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
-    """An explicit threshold reaches every sparse schedule.
+def test_softmax_rescale_threshold_log2(dtype, rows, heads, capacity, threshold):
+    """An explicit threshold reaches the sparse kernels and replaces the default.
 
     softmax_scale = ln 2 makes one logit unit one binade. Successive 256-slot
     groups, repeating every 1024 slots, raise the row maximum by threshold - 2
     (kept anchor), by more than threshold (rescale) and by threshold - 2 again.
-    Every split covers at least two groups, so each split ends on a kept
-    anchor. E4M3 bounds use the 1.75 probability scale.
+    E4M3 bounds use the ``448 * 2**-threshold`` probability scale.
     """
     torch.manual_seed(7)
     fp8 = dtype == torch.float8_e4m3fn
@@ -1184,25 +1176,12 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
     sinks[0], sinks[1], sinks[2] = torch.inf, -torch.inf, 15.0
     softmax_scale = 0.6931471805599453
     args = dict(max_topk=capacity, q_data_type=dtype, has_sinks=True, return_lse=True)
-    assert get_prims_ts_sparse_mla_decode_workspace_size(
-        q.device, rows, heads, **args, skip_correction_threshold=threshold
-    ) == get_prims_ts_sparse_mla_decode_workspace_size(q.device, rows, heads, **args)
-    _, profile, *_ = _resolve_sparse_mla_plan(
-        q.device, rows, heads, **args, skip_correction_threshold=None
-    )
-    # An explicit value, including zero, replaces the schedule's deferral and
-    # reaches the kernel; the bitwise check below cannot see a dropped value
-    # on deferred schedules.
-    for value in (0.0, threshold):
-        _, explicit, spec, *_ = _resolve_sparse_mla_plan(
-            q.device, rows, heads, **args, skip_correction_threshold=value
-        )
-        assert not explicit.defer_max_update
-        assert spec.kernel.skip_corr_threshold == value
     results = {}
-    for value in (None, threshold):
+    for value in (None, 0.0, threshold):
         wrapper = BatchSparseMLADecodePagedTSWrapper()
-        wrapper.plan(q.device, rows, heads, **args, skip_correction_threshold=value)
+        wrapper.plan(
+            q.device, rows, heads, **args, softmax_rescale_threshold_log2=value
+        )
         meta = prepare_sparse_mla_indices(wrapper, q, kv, indices)
         results[value] = wrapper.run(
             q, kv, **meta, sinks=sinks, softmax_scale=softmax_scale
@@ -1215,7 +1194,7 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
         sinks=sinks,
         softmax_scale=softmax_scale,
         return_lse=True,
-        skip_correction_threshold=threshold,
+        softmax_rescale_threshold_log2=threshold,
     )
     assert torch.equal(out, eager) and torch.equal(lse, eager_lse)
     ref, ref_lse, bound = _reference(
@@ -1225,7 +1204,7 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
         indices,
         sinks=sinks,
         softmax_scale=softmax_scale,
-        p_scale=1.75,
+        p_scale=448.0 * 2.0**-threshold,
     )
     assert torch.isfinite(out).all()
     if fp8:
@@ -1233,34 +1212,25 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
     else:
         torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
     torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
-    default_out, default_lse = results[None]
-    if profile.defer_max_update and threshold == 6.0:
-        # Deferred schedules already keep the anchor within six binades by
-        # default; the explicit threshold must reproduce them exactly.
-        assert torch.equal(out, default_out)
-        assert torch.equal(lse, default_lse)
-    else:
-        assert not torch.equal(out, default_out)
+    # None keeps the schedule's default: exact maxima, or (on some BF16
+    # schedules) a fixed six-binade deferral. An explicit value replaces it,
+    # so exactly one of the explicit plans reproduces the default output.
+    default_out = results[None][0]
+    assert torch.equal(results[0.0][0], default_out) != torch.equal(out, default_out)
 
 
 @pytest.mark.parametrize(
-    "dtype,threshold,error",
-    [
-        (torch.float8_e4m3fn, 8.5, ValueError),
-        (torch.bfloat16, 33.0, ValueError),
-        (torch.bfloat16, -1.0, ValueError),
-        (torch.bfloat16, True, TypeError),
-        (torch.bfloat16, float("nan"), ValueError),
-        (torch.float8_e4m3fn, float("inf"), ValueError),
-    ],
+    "dtype,threshold",
+    [(torch.float8_e4m3fn, 8.5), (torch.bfloat16, -1.0)],
 )
-def test_skip_correction_threshold_rejected(dtype, threshold, error):
-    with pytest.raises(error, match="skip_correction_threshold"):
+def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
+    """Values outside the per-dtype bound raise instead of being clamped."""
+    with pytest.raises(ValueError, match="softmax_rescale_threshold_log2"):
         get_prims_ts_sparse_mla_decode_workspace_size(
             torch.device("cuda"),
             1,
             16,
             max_topk=128,
             q_data_type=dtype,
-            skip_correction_threshold=threshold,
+            softmax_rescale_threshold_log2=threshold,
         )

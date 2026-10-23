@@ -44,14 +44,14 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def max_skip_corr_threshold(qkv_dtype: str) -> float:
-    """Return the largest legal skip-correction threshold (binades) per P dtype.
+def max_softmax_rescale_threshold_log2(qkv_dtype: str) -> float:
+    """Return the largest legal ``softmax_rescale_threshold_log2`` per P dtype.
 
-    The public option is ``skip_correction_threshold``. ``"e4m3"`` caps at
-    8: P reaches ``2**T`` and is quantized at the fixed scale
-    1.75 = 448 * 2**-8, so the cap keeps the scaled P within 448.
-    ``"bf16"`` caps at 32 binades (P <= ``2**32``).  Both bounds match the trtllm-gen FMHA
-    ``skipCorrThreshold`` checks for E4M3 and BF16 BMM2.
+    P reaches ``2**T``. ``"e4m3"`` caps at 8 binades: P is quantized at
+    ``448 * 2**-T``, and a larger T would push more of the row into E4M3
+    subnormals. ``"bf16"`` caps at 32 binades (P <= ``2**32``). Both bounds
+    match the trtllm-gen FMHA ``skipCorrThreshold`` checks for E4M3 and BF16
+    BMM2.
     """
 
     if qkv_dtype == "e4m3":
@@ -61,8 +61,10 @@ def max_skip_corr_threshold(qkv_dtype: str) -> float:
     raise ValueError(f"unsupported qkv_dtype={qkv_dtype!r}")
 
 
-def validate_skip_corr_threshold(threshold: object, *, qkv_dtype: str) -> float:
-    """Validate ``skip_correction_threshold`` and return it as ``float``.
+def canonicalize_softmax_rescale_threshold_log2(
+    threshold: object, *, qkv_dtype: str
+) -> float:
+    """Range-check ``softmax_rescale_threshold_log2``; return it float32-rounded.
 
     Zero keeps the exact rescale.  A positive value is compiled into the
     kernel, which compares it with the log2-scaled row-max increase.  Any zero
@@ -70,7 +72,7 @@ def validate_skip_corr_threshold(threshold: object, *, qkv_dtype: str) -> float:
     """
 
     if isinstance(threshold, bool) or not isinstance(threshold, numbers.Real):
-        raise TypeError("skip_correction_threshold must be a real number")
+        raise TypeError("softmax_rescale_threshold_log2 must be a real number")
     try:
         value = float(threshold)
     except OverflowError:
@@ -78,7 +80,7 @@ def validate_skip_corr_threshold(threshold: object, *, qkv_dtype: str) -> float:
     if value == 0.0:
         # The default needs no per-dtype bound.
         return 0.0
-    bound = max_skip_corr_threshold(qkv_dtype)
+    bound = max_softmax_rescale_threshold_log2(qkv_dtype)
     if math.isfinite(value) and 0.0 < value <= bound:
         # The kernel compares in float32: canonicalize so values equal in
         # float32 share one compiled kernel, and reject positive values that
@@ -86,12 +88,12 @@ def validate_skip_corr_threshold(threshold: object, *, qkv_dtype: str) -> float:
         value = struct.unpack("<f", struct.pack("<f", value))[0]
         if value == 0.0:
             raise ValueError(
-                "skip_correction_threshold must be 0 or at least the smallest "
+                "softmax_rescale_threshold_log2 must be 0 or at least the smallest "
                 "positive float32"
             )
     if not math.isfinite(value) or not 0.0 <= value <= bound:
         raise ValueError(
-            "skip_correction_threshold must be a finite number in "
+            "softmax_rescale_threshold_log2 must be a finite number in "
             f"[0, {bound:g}] for {qkv_dtype} P"
         )
     return value
