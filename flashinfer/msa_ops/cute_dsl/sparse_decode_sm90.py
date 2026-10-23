@@ -50,11 +50,18 @@ _SPLITS = (1, 2, 4, 8, 16)
 
 
 class MsaSparseDecode:
-    def __init__(self, topk, nsplit, stages, nc, d, page, wide_addr):
+    def __init__(
+        self, topk, nsplit, stages, nc, d, page, wide_addr, softmax_scale=None
+    ):
         # Partials are read in batches whose fragment array stays inside 32
         # registers, so the fused combine never raises the mainloop's
         # allocation.  Eight fp16 per access is one 16-byte vector.
         """Record the split, ring depth and tile geometry this body is built for."""
+        # softmax_scale is a compile-time constant, as in the prefill schedules:
+        # vLLM uses one scale per model, so this costs one extra compile rather
+        # than a per-call q prescale and its allocation.
+        scale = 1.0 / (d**0.5) if softmax_scale is None else float(softmax_scale)
+        self.scale_log2 = scale * _LOG2E
         self.mgs = max(1, min(nsplit, 8))
         self.topk = topk
         self.nsplit = nsplit
@@ -503,7 +510,7 @@ class MsaSparseDecode:
         lp = cute.make_rmem_tensor(cute.make_layout(NS), self.acc_dtype)
         lp.fill(0.0)
         mrun = cutlass.Float32(0.0)
-        scale2 = cutlass.Float32(_LOG2E / (D**0.5))
+        scale2 = cutlass.Float32(self.scale_log2)
         lg = tidx // LANES
 
         sVb_one = sVb[None, None, 0]
@@ -967,7 +974,7 @@ def _plan(nc, d, grid, tiles_per_cta):
     return max(2, min(_MAX_STAGES, stages, max(2, tiles_per_cta)) - 1)
 
 
-def run(q, kv, q2k_indices, page_table, seqused_k, out):
+def run(q, kv, q2k_indices, page_table, seqused_k, out, softmax_scale=None):
     """Run MSA sparse decode attention. Writes ``out``."""
     total_q, Hq, D = q.shape
     num_pages, Hkv, page_size, two_d = kv.shape
@@ -1035,11 +1042,14 @@ def run(q, kv, q2k_indices, page_table, seqused_k, out):
     )
 
     wide_addr = not safe32_q
-    key = (topk, nsplit, stages, nc, D, page_size, wide_addr)
+    key = (topk, nsplit, stages, nc, D, page_size, wide_addr, softmax_scale)
     fn = _COMPILED.get(key)
     if fn is None:
         fn = cute.compile(
-            MsaSparseDecode(topk, nsplit, stages, nc, D, page_size, wide_addr), *args
+            MsaSparseDecode(
+                topk, nsplit, stages, nc, D, page_size, wide_addr, softmax_scale
+            ),
+            *args,
         )
         _COMPILED[key] = fn
     fn(*args)

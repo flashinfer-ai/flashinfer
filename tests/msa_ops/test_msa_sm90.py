@@ -1918,3 +1918,46 @@ def test_sparse_prefill_honours_non_default_softmax_scale(
     # of elements just past a 3e-2 bound at mult=0.5. The point of this test is
     # that the scale reaches the kernel at all, so bound it loosely.
     torch.testing.assert_close(out[rows].float(), ref, atol=6e-2, rtol=6e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("mult", [1.0, 2.0])
+def test_sparse_decode_cute_fallback_matches_reference(monkeypatch, mult):
+    """Sparse decode must not be single-sourced on the Cake program.
+
+    Force the CuTe DSL schedule the way an unadmitted geometry would, and check
+    it still matches the dense reference -- including a non-default
+    softmax_scale, which it now takes as a compile-time constant rather than by
+    pre-scaling q.
+    """
+    from flashinfer.msa_ops import _sm90_dispatch
+
+    monkeypatch.setattr(_sm90_dispatch, "_cake_decode_available", lambda *a, **k: False)
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(
+        batch=2, num_qo_heads=8, num_kv_heads=1, max_k_tiles=32, seed=int(mult) + 3
+    )
+    scale = mult / math.sqrt(HEAD_DIM)
+    out = msa_sparse_decode_attention(
+        q,
+        k,
+        v,
+        idx,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        seqlen_q=1,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    kv = torch.cat([k, v], dim=-1)
+    rows = list(range(q.shape[0]))
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        rows,
+        lambda r: (r, int(seqused_k[r]) - 1),
+    )
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
