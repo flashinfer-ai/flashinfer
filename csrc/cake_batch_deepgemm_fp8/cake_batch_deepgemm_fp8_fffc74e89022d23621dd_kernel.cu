@@ -260,8 +260,8 @@ kernel_cake_batch_deepgemm_fp8_fffc74e89022d23621dd(const __grid_constant__ CUte
                             if (m_block * 224 + (unsigned int)col_strip < shape_m) {
                                 tma_store_2d((&C_tma), off_n, flat_row + (unsigned int)col_strip, stage_base);
                                 tma_store_2d((&C_tma), off_n + 64, flat_row + (unsigned int)col_strip, stage_base + 2048);
-                                asm volatile("cp.async.bulk.commit_group;");
                             }
+                            asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                     __syncwarp();
