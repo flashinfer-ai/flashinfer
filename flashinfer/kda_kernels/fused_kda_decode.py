@@ -604,14 +604,16 @@ def _make_compile_inputs(state_dtype, conv_dim_first=False):
         stride=(cute.sym_int64(), 1),
         assumed_align=16,
     )
+    # DS keeps a channel's three history taps contiguous; SD keeps channels
+    # contiguous within each tap.
+    if conv_dim_first:
+        conv_stride = (cute.sym_int64(), 3, 1)
+    else:
+        conv_stride = (cute.sym_int64(), 1, qkv_size)
     conv_state = cute.runtime.make_fake_tensor(
         BF16,
         shape=(conv_slots, qkv_size, 3),
-        stride=(cute.sym_int64(), 3, 1) if conv_dim_first else (
-            cute.sym_int64(),
-            1,
-            qkv_size,
-        ),
+        stride=conv_stride,
         assumed_align=16,
     )
     raw_beta = cute.runtime.make_fake_tensor(
@@ -776,6 +778,12 @@ def _select_cake_variant(
 
     num_rows = int(x.shape[0])
     num_heads = int(x.shape[1]) // (3 * _HEAD_DIM)
+    # Cake routes cover a subset of _SUPPORTED_HEADS (16 and 64 have none); the
+    # selector raises for other head counts, so fall back to CuTe DSL here.
+    if not any(
+        num_heads in rule.heads for variant in variants for rule in variant.eligibility
+    ):
+        return None
     state_dtype = "bfloat16" if state.dtype == torch.bfloat16 else "float32"
     return select_cake_fused_kda_decode_variant(
         target=target,

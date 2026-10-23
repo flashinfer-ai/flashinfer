@@ -355,7 +355,7 @@ def test_fused_kda_decode_glm_heads_and_ds_layout(num_heads, num_rows, state_dty
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
     torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
     torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
-    for ds, sd in zip(results["DS"], results["SD"]):
+    for ds, sd in zip(results["DS"], results["SD"], strict=True):
         torch.testing.assert_close(ds, sd, rtol=0, atol=0)
 
 

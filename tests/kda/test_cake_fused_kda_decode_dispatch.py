@@ -72,9 +72,8 @@ class _FakeTensor:
         return torch.empty((), dtype=self.dtype).element_size()
 
 
-def _fake_inputs():
+def _fake_inputs(heads=12):
     rows = 4
-    heads = 12
     hidden = heads * 128
     qkv = 3 * hidden
     slots = rows + 1
@@ -121,7 +120,7 @@ def test_cake_selector_uses_only_explicit_mode_and_tensor_metadata(
     monkeypatch, capability, target
 ):
     inputs = _fake_inputs()
-    variant = object()
+    variant = SimpleNamespace(eligibility=(SimpleNamespace(heads=(12,)),))
     calls = []
     registry_targets = []
 
@@ -185,6 +184,38 @@ def test_cake_selector_rejects_unregistered_architectures(monkeypatch, capabilit
         lambda target: pytest.fail(
             "unsupported architectures must not load a registry"
         ),
+    )
+
+    assert (
+        fused._select_cake_variant(
+            x=inputs["x"],
+            conv_state=inputs["conv_state"],
+            raw_beta=inputs["raw_beta"],
+            state=inputs["state"],
+            output_gate=inputs["output_gate"],
+            output=inputs["output"],
+            state_indices_mode="positive_unique",
+            lower_bound=-5.0,
+            norm_eps=1e-5,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("heads", (16, 64))
+@pytest.mark.parametrize("capability", ((10, 0), (10, 3)))
+def test_cake_selector_falls_back_for_heads_without_routes(
+    monkeypatch, capability, heads
+):
+    # The CuTe DSL kernel serves 16 and 64 heads (GLM-5.3-Flash per-rank head
+    # counts) but Cake has no route for them, so backend="auto" must fall back
+    # instead of reaching the selector, which raises for unsupported counts.
+    inputs = _fake_inputs(heads)
+    monkeypatch.setattr(fused, "get_compute_capability", lambda device: capability)
+    monkeypatch.setattr(
+        fused,
+        "select_cake_fused_kda_decode_variant",
+        lambda **kwargs: pytest.fail("head counts without routes must not route"),
     )
 
     assert (
