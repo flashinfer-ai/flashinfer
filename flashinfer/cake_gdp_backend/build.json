@@ -797,7 +797,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "0f160ef789aec14ab5f583785b12eb3e9d67ed8beb2408051bb0e0b79b4ce2b9",
+      "closure_sha256": "6374207b83ef602bf6c5238336f1c2598b26b92c2ab529f0eda39bed35c5ad4b",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -808,7 +808,7 @@
       "nvcc_flags_if": [],
       "path": "aot/cake_gdp_f2f0c7abbf10082a6996_sm_100a.so",
       "sha256": {
-        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "6b554d55a45104f7f9292f45cc91ee809e57a7dae93816e9202cebc5e1e3678a",
+        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "4413d14fd372969373bf6261ea8ff0595a6ca52fce928f36d9c29240da78b448",
         "csrc/cake_gdp_f2f0c7abbf10082a6996_binding.cu": "36d75682cd4beef87565bb57789004c0855ae461653a3d2cb7da24eb870ce275"
       },
       "sources": [
@@ -818,7 +818,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "fa7ed05690b9bd32deadecec35479d0a1e0bb1b2c72c06cd0fee333e65dcc8d4",
+      "closure_sha256": "e22709780b0fc014cb0a2c9f492787305ea395ed33d0f552f1088edea4035acc",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -829,7 +829,7 @@
       "nvcc_flags_if": [],
       "path": "aot/cake_gdp_f2f0c7abbf10082a6996_sm_103a.so",
       "sha256": {
-        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "6b554d55a45104f7f9292f45cc91ee809e57a7dae93816e9202cebc5e1e3678a",
+        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "4413d14fd372969373bf6261ea8ff0595a6ca52fce928f36d9c29240da78b448",
         "csrc/cake_gdp_f2f0c7abbf10082a6996_binding.cu": "36d75682cd4beef87565bb57789004c0855ae461653a3d2cb7da24eb870ce275"
       },
       "sources": [
