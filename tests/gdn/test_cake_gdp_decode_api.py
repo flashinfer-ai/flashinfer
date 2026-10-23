@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the flashinfer public surface of the Cake Gated DeltaProduct (GDP)
-decode kernels for Nemotron 4 (SM100 / SM103): the ``flashinfer.cake_gdp``
+decode kernels (SM90 / SM100 / SM103): the ``flashinfer.cake_gdp``
 facade and its re-export from the ``flashinfer`` top-level package.  The
 facade's entry point is a pass-through to ``flashinfer.cake_gdp_backend``;
 this module checks that identity (same objects at the top level, the
@@ -37,7 +37,7 @@ from flashinfer.cake_gdp_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
-SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
+SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
 K = 128
 V = 64
 SEED = 760
@@ -74,7 +74,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_gdp needs an SM100 / SM103 device with exported routes",
+    reason="cake_gdp needs an SM90 / SM100 / SM103 device with exported routes",
 )
 
 

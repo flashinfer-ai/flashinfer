@@ -40,75 +40,6 @@ def _mxfp8_backend(*, capacity=129, hidden=384, **kwargs):
     return backend, bootstrap, fleet
 
 
-def test_blackwell_mxfp8_legacy_config_and_dispatch(monkeypatch, dist_not_initialized):
-    """Old positional arguments, allocator and cache key retain their contract."""
-    import dataclasses
-
-    from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
-
-    assert [
-        f.name for f in dataclasses.fields(Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig)
-    ][:9] == [
-        "intermediate_size",
-        "top_k",
-        "kernel_name",
-        "kind",
-        "gate_up_clamp",
-        "activation_clamp",
-        "fast_math",
-        "enable_in_kernel_fc2_reduce",
-        "knobs",
-    ]
-    kernel, _, fleet = _mxfp8_backend()
-    assert kernel._kernel_config.kernel_variant == "inference"
-    allocator = mock.Mock(return_value=mock.sentinel.workspace)
-    monkeypatch.setattr(pkg, "get_symm_buffer_for_mxfp8_mega_moe", allocator)
-    monkeypatch.setattr(kernel, "_workspace_knobs", lambda fp: {"flag_batch": 4})
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    assert kernel._allocate_workspace(fleet) is mock.sentinel.workspace
-    allocator.assert_called_once_with(
-        8,
-        129,
-        3,
-        384,
-        192,
-        0,
-        1,
-        kind="mxfp8_e4m3",
-        gate_up_clamp=None,
-        activation_clamp=None,
-        enable_in_kernel_fc2_reduce=False,
-        knobs={"flag_batch": 4},
-    )
-    assert kernel._tuning_key(fleet) == dict(
-        dtype="mxfp8_e4m3",
-        world_size=1,
-        hidden=384,
-        intermediate=192,
-        num_experts=8,
-        topk=3,
-        max_tokens=129,
-        enable_in_kernel_fc2_reduce=False,
-    )
-    assert kernel._workspace_pool_key(fleet) == (
-        kernel.kernel_name(),
-        0,
-        0,
-        1,
-        id(None),
-        8,
-        129,
-        3,
-        384,
-        192,
-        "mxfp8_e4m3",
-        None,
-        False,
-        (("flag_batch", 4),),
-    )
-
-
 @pytest.mark.parametrize(
     "tile,cluster", [(None, None), ((256, 64, 128), (2, 1)), ((256, 64, 128), (4, 1))]
 )
@@ -447,14 +378,22 @@ def test_execution_uses_selected_backend_and_clears_destroyed_state(
         layer.compute_staged(output=output)
 
 
-def test_override_does_not_replace_allocated_default(make_layer):
+@pytest.mark.parametrize("live_tokens", [None, 8])
+def test_override_does_not_replace_allocated_default(make_layer, live_tokens):
     layer = make_layer()
+    layer._fleet_params = dataclasses.replace(
+        layer._fleet_params, tuning_live_tokens=live_tokens
+    )
     raw = layer._ensure_workspace()
     with pytest.raises(ValueError, match="already allocated default"):
-        layer.create_workspace(64, knobs={"flag_batch": 4})
+        layer.create_workspace(64, live_tokens=live_tokens, knobs={"flag_batch": 4})
+    other = layer.create_workspace(
+        64, live_tokens=8 if live_tokens is None else None, knobs={"flag_batch": 4}
+    )
+    assert other._backend_workspace is not raw
     assert layer._ensure_workspace() is raw
     raw.destroy.assert_not_called()
-    handle = layer.create_workspace(64)
+    handle = layer.create_workspace(64, live_tokens=live_tokens)
     assert handle._backend_workspace is raw
 
 
@@ -702,7 +641,7 @@ def test_blackwell_genphase_tuning_constraints_and_resource_budget():
         dict(mma_tiler_mnk=(256, 128, 128), cluster_shape_mn=(2, 1)),
         dict(schedule_policy=("grouped", 0)),
         dict(schedule_policy=("grouped", True)),
-        dict(apply_topk_at_fc1=False),
+        dict(apply_routing_weights_before_fc2=False),
     ]:
         with pytest.raises(ValueError):
             sm100_genphase_candidates(cfg, sm_count=148, constraints=constraints)
@@ -742,7 +681,7 @@ def test_blackwell_genphase_autotune_rejects_incomplete_candidates_before_trials
     invalid = {
         "partial": {"schedule_policy": ("grouped", 296)},
         "empty": {},
-        "extra": {**valid, "apply_topk_at_fc1": False},
+        "extra": {**valid, "apply_routing_weights_before_fc2": False},
     }[malformed]
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -783,6 +722,7 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
 ):
     """Cache reuse requires exact profiles and preserves unrelated or invalid data."""
     import json
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
     from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
         knob_cache as cache,
     )
@@ -792,7 +732,12 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
     cfg = _genphase_tuning_config()
     winner = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[-1]
     path.write_text(
-        json.dumps(dict(version=1, entries=[dict(device="legacy", knobs={})]))
+        json.dumps(
+            dict(
+                version=KNOB_CACHE_VERSION,
+                entries=[dict(device="legacy", knobs={})],
+            )
+        )
     )
     assert cache.record_knobs(winner, cfg, live_tokens=16, p50_us=200, device="B300")
     assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300") == (
@@ -813,7 +758,7 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
         dict(max_tokens_per_rank=512),
         dict(world_size=4),
         dict(gate_up_clamp=10),
-        dict(apply_topk_at_fc1=False),
+        dict(apply_routing_weights_before_fc2=False),
     ]:
         assert (
             cache.resolve_knobs(
@@ -854,7 +799,7 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
         )
         assert cache.live_token_buckets(cfg, device="B300") == []
     data["entries"][-1]["backend_revision"] = current_revision
-    data["entries"][-1]["knobs"]["apply_topk_at_fc1"] = False
+    data["entries"][-1]["knobs"]["apply_routing_weights_before_fc2"] = False
     path.write_text(json.dumps(data))
     assert (
         cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300")[1]

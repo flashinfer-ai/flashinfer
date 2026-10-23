@@ -17,10 +17,14 @@ Hopper (SM90) variable block-sparse attention on the generated Cake kernel.
 
 ``backend="cake"`` of :class:`flashinfer.sparse.VariableBlockSparseAttentionWrapper`
 routes here on compute capability 9.0 (``cake_cute`` is accepted as an alias).
-Supported scope: BF16 HND ``q/k/v`` with shape ``(H, S, 128)``, equal query/KV
-head counts, noncausal 64-token query and KV blocks, 1..64 selected KV blocks
-per query block (ragged counts allowed), custom finite softmax scales
-(including 0 and negative), no LSE / PDL / positional encoding / logits soft cap.
+Supported scope: BF16 HND ``q/k/v`` with shape ``(H, S, 128)``, or Sage FP8
+``q/k/v`` (``torch.float8_e4m3fn``, same shapes; ``q_data_type=torch.float8_e4m3fn``
+at ``plan()`` with the FP32 scales ``q_scale (1, H, Sq)``, ``k_scale (1, H, ceil(Sk / 16))``,
+``v_scale (H, 128)``; BF16 output), equal query/KV head counts, noncausal 64-token
+query and KV blocks, 1..64 selected KV blocks per query block (ragged counts
+allowed), custom finite softmax scales (including 0 and negative), no LSE / PDL /
+positional encoding / logits soft cap.  :func:`sage_fp8_quantize_sm90` quantizes
+BF16 HND tensors into the FP8 inputs and scales with the package's kernels.
 
 The host planner, the plan object and the generated kernels live in the
 self-contained backend package :mod:`flashinfer.cake_vsa_sm90_backend` (host
@@ -39,7 +43,11 @@ from .cake_vsa_sm90_backend import (  # noqa: F401
     ARCHES,
     BLOCK,
     CLUSTER_VARIANTS,
+    FP8_DTYPE,
+    FP8_PERSISTENT_STAGES,
+    FP8_SMALL_STAGES,
     HEAD_DIM,
+    K_SCALE_GROUP,
     MAX_NSPLIT,
     MAX_SELECTED,
     MODULES,
@@ -49,6 +57,7 @@ from .cake_vsa_sm90_backend import (  # noqa: F401
     POOL_MIN_TILES,
     POOL_RAGGED_MIN_TILES,
     POOL_ROUNDS,
+    QUANTIZE_STAGES,
     SMALL_ITEM_ELEMS,
     SMALL_KMAX_VARIANTS,
     SMALL_OCCUPANCY,
@@ -67,16 +76,20 @@ from .cake_vsa_sm90_backend import (  # noqa: F401
     persistent_stage,
     plan_small,
     plan_vsa_sm90,
+    sage_fp8_quantize_sm90,
     small_kmax_for,
     small_route,
     small_stage,
     split_cluster_variant_for,
     split_cost,
     split_kmax,
+    stage_dtype,
 )
 
 __all__ = [
     "ARCHES",
+    "FP8_DTYPE",
+    "K_SCALE_GROUP",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeVsaSm90Plan",
     "cluster_capacity",
@@ -85,6 +98,7 @@ __all__ = [
     "is_cake_vsa_sm90_supported",
     "plan_small",
     "plan_vsa_sm90",
+    "sage_fp8_quantize_sm90",
     "small_route",
     "split_cluster_variant_for",
     "split_kmax",

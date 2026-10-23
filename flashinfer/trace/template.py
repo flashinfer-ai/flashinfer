@@ -395,6 +395,11 @@ class Const:
     value:
         Optional fixed integer value. When provided, tracing resolves this
         axis without requiring a tensor or scalar argument to carry it.
+    extract:
+        Optional callable ``(kwargs) -> Optional[int]`` that derives the value
+        from the call's arguments. ``None`` means "not in this call": the axis
+        is then left out of the definition (name and ``axes``), so adding a
+        derived axis does not change existing definitions.
     """
 
     def __init__(
@@ -402,12 +407,16 @@ class Const:
         description: str = "",
         abbrev: Optional[str] = None,
         value: Optional[int] = None,
+        extract: Optional[Callable[[Dict[str, Any]], Optional[int]]] = None,
     ) -> None:
         if value is not None and type(value) is not int:
             raise TypeError("Const value must be an integer or None")
+        if value is not None and extract is not None:
+            raise TypeError("Const takes either value or extract, not both")
         self.description = description
         self.abbrev = abbrev
         self.value = value
+        self.extract = extract
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +608,7 @@ class TraceTemplate:
         For each axis, pick a source that is *always present* in a generated
         trace sample, in priority order:
 
-          0. an explicit ``Const(value=...)``;
+          0. an explicit ``Const(value=...)`` or ``Const(extract=...)``;
           1. a required (non-optional) ``Tensor`` whose ``dim_names`` include
              the axis — read ``shape[dim_idx]``;
           2. a ``Scalar`` input named after the axis — read the kwarg value;
@@ -665,9 +674,11 @@ class TraceTemplate:
         for axis_name in self.axes:
             marker = self.axes[axis_name]
             extractor: Optional[Callable[[Dict[str, Any]], Optional[int]]]
-            # 0. Explicitly fixed Const, independent of runtime arguments.
+            # 0. Explicitly fixed or derived Const.
             if isinstance(marker, Const) and marker.value is not None:
                 extractor = _make_fixed_extractor(marker.value)
+            elif isinstance(marker, Const) and marker.extract is not None:
+                extractor = marker.extract
             else:
                 extractor = None
             # 1. Required tensor whose shape carries the axis.
@@ -748,6 +759,12 @@ class TraceTemplate:
             axes_json: Dict[str, Any] = {}
             for axis_name, marker in template.axes.items():
                 is_var = isinstance(marker, Var)
+                if (
+                    isinstance(marker, Const)
+                    and marker.extract is not None
+                    and axis_name not in axis_values
+                ):
+                    continue  # derived axis not present in this call
                 entry: Dict[str, Any] = {"type": "var" if is_var else "const"}
                 if not is_var and axis_name in axis_values:
                     entry["value"] = axis_values[axis_name]

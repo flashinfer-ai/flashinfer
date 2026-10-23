@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host plan and loader glue of the Cake Hopper (SM90) variable block-sparse
-attention kernels (BF16 HND, head_dim 128, 64-token blocks).
+attention kernels (BF16 or Sage FP8 E4M3 HND, head_dim 128, 64-token blocks).
 
 Every module below is one mechanically exported production build: a CUDA
 device translation unit plus a tvm-ffi binding compiled together for exactly
@@ -28,22 +28,32 @@ compiled it and otherwise through FlashInfer's JIT from the same sources and
 flags, verifying every source digest before the first build.
 
 A record is one *stage*: the persistent kernel (``attention``, its
-queue-scheduled twin ``attention_queue``) or one variant of the small-selection
-kernel (``small_k<kmax>[s][c<cluster>]``: ``kmax`` selected KV blocks per CTA,
-``s`` the split-KV variant with a plan-owned workspace, ``c<n>`` the
-thread-block-cluster variant, ``sc<n>`` the split-cluster variant whose slices
-form one cluster and merge through the workspace).  Which stage a problem runs is decided by the
-host planner (:mod:`.cake_planner`, ``small_route`` / ``plan_small`` /
-``plan_vsa_sm90``); the plan object (:class:`..CakeVsaSm90Plan`) binds the
-stage's arguments once and launches it on every call.  Problem sizes are plan
-data and runtime scalars, so a changed mask or sequence length never
-recompiles anything.
+queue-scheduled twin ``attention_queue``, its compact static form
+``attention_compact``, its tagged form ``attention_tagged``) or one variant of
+the small-selection kernel (``small_k<kmax>[s][c<cluster>]``: ``kmax`` selected
+KV blocks per CTA, ``s`` the split-KV variant with a plan-owned workspace,
+``c<n>`` the thread-block-cluster variant, ``sc<n>`` the split-cluster variant
+whose slices form one cluster and merge through the workspace).  The Sage FP8
+stages are the same table keyed by data type: ``attention_fp8[_queue|_compact|
+_tagged]`` and ``small_fp8_k<kmax>[s][c<cluster>]`` consume E4M3 ``q/k/v`` plus
+the per-token ``q_scale``, per-16-token ``k_scale`` and per-channel ``v_scale``
+(``route["dtype"] == "e4m3"``) on exactly the BF16 planner's ``meta`` / ``hdr``
+/ ``plan`` bytes; the two quantizer stages ``quantize_qk_vamax`` / ``quantize_v``
+(the names of the SM100 Sage package) produce those inputs from BF16 and are
+launched by :func:`..sage_fp8_quantize_sm90`, never by a plan.  Which stage a
+problem runs is decided by the host planner (:mod:`.cake_planner`,
+``small_route`` / ``plan_small`` / ``plan_vsa_sm90``) and the planned data type;
+the plan object (:class:`..CakeVsaSm90Plan`) binds the stage's arguments once
+and launches it on every call.  Problem sizes are plan data and runtime
+scalars, so a changed mask or sequence length never recompiles anything.
 
 The program name ``cake_vsa_sm90_<20 hex>`` is the first twenty hex digits of
 the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
 from: the persistent kernel with its default keywords and with
-``queue=True``, the small kernel with ``kmax`` / ``split`` / ``cluster``.
+``queue=True``, the small kernel with ``kmax`` / ``split`` / ``cluster``; the
+FP8 kernels are other modules with the same keywords, so adding their programs
+leaves every BF16 program name, source and digest unchanged.
 
 Numerics: every ``build.json`` entry records ``--use_fast_math`` (the flag the
 kernels were validated and measured with); the loader passes
@@ -119,8 +129,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "tl": "tl",
         },
         "route": {
+            "compact": False,
             "kind": "persistent",
             "queue": False,
+            "tagged": False,
         },
         "workspace_rule": {
             "dbg_words": 64,
@@ -179,8 +191,134 @@ MODULES: dict[str, dict[str, Any]] = {
             "tl": "tl",
         },
         "route": {
+            "compact": False,
             "kind": "persistent",
             "queue": True,
+            "tagged": False,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "attention_compact": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "Vt"],
+            ["buffer", "O"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_0f730e6ab6a65c1e7199",
+        "kernel_symbol": "kernel_cake_vsa_sm90_0f730e6ab6a65c1e7199",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 232064,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_0f730e6ab6a65c1e7199",
+        "logical": {
+            "K": "k",
+            "O": "out",
+            "Q": "q",
+            "Vt": "v",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": True,
+            "kind": "persistent",
+            "queue": False,
+            "tagged": False,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "attention_tagged": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "Vt"],
+            ["buffer", "O"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_dead614631d8a6b8d69e",
+        "kernel_symbol": "kernel_cake_vsa_sm90_dead614631d8a6b8d69e",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 232064,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_dead614631d8a6b8d69e",
+        "logical": {
+            "K": "k",
+            "O": "out",
+            "Q": "q",
+            "Vt": "v",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": False,
+            "kind": "persistent",
+            "queue": False,
+            "tagged": True,
         },
         "workspace_rule": {
             "dbg_words": 64,
@@ -993,6 +1131,1345 @@ MODULES: dict[str, dict[str, Any]] = {
             "stats_floats": 128,
         },
     },
+    # ----- Sage FP8 (E4M3) stages: hand-written host plan.  The derived leaves (kernel_symbol,
+    # launch.*, arg_plan, logical) are written here as the delivered kernels spell them (the exporter rewrites
+    # them from the rendered program and refuses a disagreement): Q / K / V e4m3 TMA maps, the FP32 scales Qs
+    # (q_scale, per token) / Ks (k_scale, per 16-token group) / Vs (v_scale, per channel) and the k_scale_groups
+    # scalar (the per-head stride of k_scale) right after O, then the BF16 tail.  dynamic_smem_bytes is what each
+    # rendered kernel computes (its declared pool -- persistent 184,192 B, +128 for the queue hand-off; small: the
+    # kernel's _smem_bytes per config -- plus the IR's 1024-byte alignment pad).
+    "attention_fp8": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_6610cc23937745c8a08c",
+        "kernel_symbol": "kernel_cake_vsa_sm90_6610cc23937745c8a08c",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 185216,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_6610cc23937745c8a08c",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "k_scale_groups": "k_scale_groups",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": False,
+            "dtype": "e4m3",
+            "kind": "persistent",
+            "queue": False,
+            "tagged": False,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "attention_fp8_queue": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_84c8db2f159dac9e696b",
+        "kernel_symbol": "kernel_cake_vsa_sm90_84c8db2f159dac9e696b",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 185344,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_84c8db2f159dac9e696b",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "k_scale_groups": "k_scale_groups",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": False,
+            "dtype": "e4m3",
+            "kind": "persistent",
+            "queue": True,
+            "tagged": False,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "attention_fp8_compact": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_adb8e0fa6f065e4b7348",
+        "kernel_symbol": "kernel_cake_vsa_sm90_adb8e0fa6f065e4b7348",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 185216,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_adb8e0fa6f065e4b7348",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "k_scale_groups": "k_scale_groups",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": True,
+            "dtype": "e4m3",
+            "kind": "persistent",
+            "queue": False,
+            "tagged": False,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "attention_fp8_tagged": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_26af5895053fb2e682d7",
+        "kernel_symbol": "kernel_cake_vsa_sm90_26af5895053fb2e682d7",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 185216,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_26af5895053fb2e682d7",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "k_scale_groups": "k_scale_groups",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": False,
+            "dtype": "e4m3",
+            "kind": "persistent",
+            "queue": False,
+            "tagged": True,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "small_fp8_k1": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_355b9eaa1f9bc36a2dc4",
+        "kernel_symbol": "kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 42496,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_355b9eaa1f9bc36a2dc4",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 0,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 1,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k3": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_536b230a4df8c02bf877",
+        "kernel_symbol": "kernel_cake_vsa_sm90_536b230a4df8c02bf877",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 93184,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_536b230a4df8c02bf877",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 0,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 3,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k4": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_ced6a0ff939e606aa796",
+        "kernel_symbol": "kernel_cake_vsa_sm90_ced6a0ff939e606aa796",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 109568,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_ced6a0ff939e606aa796",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 0,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 4,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k6": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_b7191bf07844fe0bb27f",
+        "kernel_symbol": "kernel_cake_vsa_sm90_b7191bf07844fe0bb27f",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 158720,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_b7191bf07844fe0bb27f",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 0,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 6,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k4s": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "Wo"],
+            ["buffer", "Ws"],
+            ["buffer", "Wc"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_73f404ad0db2fb1470b3",
+        "kernel_symbol": "kernel_cake_vsa_sm90_73f404ad0db2fb1470b3",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 109696,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_73f404ad0db2fb1470b3",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "Wc": "counters",
+            "Wo": "partial_o",
+            "Ws": "partial_stats",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 0,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 4,
+            "split": True,
+        },
+        "workspace_rule": {
+            "counter_words": "num_tiles",
+            "item_floats": 8192,
+            "kind": "split",
+            "stats_floats": 128,
+        },
+    },
+    "small_fp8_k6s": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "Wo"],
+            ["buffer", "Ws"],
+            ["buffer", "Wc"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_dd6025a4af4e123c9f13",
+        "kernel_symbol": "kernel_cake_vsa_sm90_dd6025a4af4e123c9f13",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 158848,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_dd6025a4af4e123c9f13",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "Wc": "counters",
+            "Wo": "partial_o",
+            "Ws": "partial_stats",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 0,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 6,
+            "split": True,
+        },
+        "workspace_rule": {
+            "counter_words": "num_tiles",
+            "item_floats": 8192,
+            "kind": "split",
+            "stats_floats": 128,
+        },
+    },
+    "small_fp8_k2c4": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_77fdd25c1aac4d03ef9c",
+        "kernel_symbol": "kernel_cake_vsa_sm90_77fdd25c1aac4d03ef9c",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (4, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 88064,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_77fdd25c1aac4d03ef9c",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 4,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 2,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k3c3": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_08523c71488a35926092",
+        "kernel_symbol": "kernel_cake_vsa_sm90_08523c71488a35926092",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (3, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128000,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_08523c71488a35926092",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 3,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 3,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k3c6": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_8eafda99b9c0448dd080",
+        "kernel_symbol": "kernel_cake_vsa_sm90_8eafda99b9c0448dd080",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (6, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 139264,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_8eafda99b9c0448dd080",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 6,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 3,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k4c2": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_ec88bb9633ecb71092f6",
+        "kernel_symbol": "kernel_cake_vsa_sm90_ec88bb9633ecb71092f6",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 126976,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_ec88bb9633ecb71092f6",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 2,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 4,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k4c4": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_3835f0b0025149d5cb07",
+        "kernel_symbol": "kernel_cake_vsa_sm90_3835f0b0025149d5cb07",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (4, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 137216,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_3835f0b0025149d5cb07",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 4,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 4,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k6c2": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_9a0f5e873d4b7aa78cab",
+        "kernel_symbol": "kernel_cake_vsa_sm90_9a0f5e873d4b7aa78cab",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 176128,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_9a0f5e873d4b7aa78cab",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 2,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 6,
+            "split": False,
+        },
+        "workspace_rule": None,
+    },
+    "small_fp8_k6sc3": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "Wo"],
+            ["buffer", "Ws"],
+            ["buffer", "Wc"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_8d9ab74d063d171a6289",
+        "kernel_symbol": "kernel_cake_vsa_sm90_8d9ab74d063d171a6289",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (3, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 158848,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_8d9ab74d063d171a6289",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "Wc": "counters",
+            "Wo": "partial_o",
+            "Ws": "partial_stats",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 3,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 6,
+            "split": True,
+        },
+        "workspace_rule": {
+            "counter_words": "num_tiles",
+            "item_floats": 8192,
+            "kind": "split",
+            "stats_floats": 128,
+        },
+    },
+    "small_fp8_k6sc4": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "Wo"],
+            ["buffer", "Ws"],
+            ["buffer", "Wc"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_d25756076e4eda6edf8f",
+        "kernel_symbol": "kernel_cake_vsa_sm90_d25756076e4eda6edf8f",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (4, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 158848,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_d25756076e4eda6edf8f",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "Wc": "counters",
+            "Wo": "partial_o",
+            "Ws": "partial_stats",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 4,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 6,
+            "split": True,
+        },
+        "workspace_rule": {
+            "counter_words": "num_tiles",
+            "item_floats": 8192,
+            "kind": "split",
+            "stats_floats": 128,
+        },
+    },
+    "small_fp8_k6sc8": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["param_array", "plan"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "Wo"],
+            ["buffer", "Ws"],
+            ["buffer", "Wc"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_items",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_e48195721ea49cc2b19d",
+        "kernel_symbol": "kernel_cake_vsa_sm90_e48195721ea49cc2b19d",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (8, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 158848,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_e48195721ea49cc2b19d",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "Wc": "counters",
+            "Wo": "partial_o",
+            "Ws": "partial_stats",
+            "k_scale_groups": "k_scale_groups",
+            "plan": "plan",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+        },
+        "route": {
+            "cluster": 8,
+            "dtype": "e4m3",
+            "kind": "small",
+            "kmax": 6,
+            "split": True,
+        },
+        "workspace_rule": {
+            "counter_words": "num_tiles",
+            "item_floats": 8192,
+            "kind": "split",
+            "stats_floats": 128,
+        },
+    },
+    "quantize_qk_vamax": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "q_in"],
+            ["buffer", "k_in"],
+            ["buffer", "v_in"],
+            ["buffer", "q_out"],
+            ["buffer", "k_out"],
+            ["buffer", "q_scale"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_amax"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "grid_heads"],
+            ["parameter", "k_scale_groups"],
+            ["parameter", "chunks_per_bh"],
+            ["parameter", "q_chunks"],
+            ["parameter", "k_chunks"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "batch_heads_chunks",
+        },
+        "kernel": "cake_vsa_sm90_b92fd42be592b9f0b56d",
+        "kernel_symbol": "kernel_cake_vsa_sm90_b92fd42be592b9f0b56d",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 2176,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_b92fd42be592b9f0b56d",
+        "logical": {
+            "chunks_per_bh": "chunks_per_bh",
+            "grid_heads": "grid_heads",
+            "k_chunks": "k_chunks",
+            "k_in": "k_in",
+            "k_out": "k_out",
+            "k_scale": "k_scale",
+            "k_scale_groups": "k_scale_groups",
+            "num_heads": "num_heads",
+            "num_kv_heads": "num_kv_heads",
+            "q_chunks": "q_chunks",
+            "q_in": "q_in",
+            "q_out": "q_out",
+            "q_scale": "q_scale",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "v_amax": "v_amax",
+            "v_in": "v_in",
+        },
+        "route": {
+            "kind": "quantize_qk_vamax",
+        },
+        "workspace_rule": None,
+    },
+    "quantize_v": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "v_in"],
+            ["buffer", "v_out"],
+            ["buffer", "v_amax"],
+            ["buffer", "v_scale"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "num_heads"],
+            ["parameter", "chunks_per_bh"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "batch_heads_chunks",
+        },
+        "kernel": "cake_vsa_sm90_8032532a14c27ac67b21",
+        "kernel_symbol": "kernel_cake_vsa_sm90_8032532a14c27ac67b21",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_8032532a14c27ac67b21",
+        "logical": {
+            "chunks_per_bh": "chunks_per_bh",
+            "num_heads": "num_heads",
+            "seqlen_k": "seqlen_k",
+            "v_amax": "v_amax",
+            "v_in": "v_in",
+            "v_out": "v_out",
+            "v_scale": "v_scale",
+        },
+        "route": {
+            "kind": "quantize_v",
+        },
+        "workspace_rule": None,
+    },
 }
 
 # One verified build: H100 / H200 (``sm_90a``).  The architecture is compiled
@@ -1002,18 +2479,54 @@ ARCHES = ("sm_90a",)
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (9, 0): "sm_90a",
 }
-# The stages in registry order; the two persistent stages and the fifteen
-# shipped small-selection variants.
+# The stages in registry order: the four BF16 persistent stages, the fifteen
+# shipped BF16 small-selection variants, their nineteen FP8 twins and the two
+# quantizers.  ``PERSISTENT_STAGES`` / ``SMALL_STAGES`` keep naming the BF16
+# stages (the planner's own table); the FP8 attention stages are keyed by
+# ``route["dtype"]`` and the quantizers by their route kind.
 STAGES: tuple[str, ...] = tuple(MODULES)
-PERSISTENT_STAGES = ("attention", "attention_queue")
+ATTENTION_KINDS = ("persistent", "small")
+QUANTIZE_STAGES = ("quantize_qk_vamax", "quantize_v")
+
+
+def stage_dtype(name: str) -> str | None:
+    """``"bf16"`` / ``"e4m3"`` for an attention stage (the data type of its ``q/k/v``), ``None`` for a quantizer."""
+
+    route = MODULES[name]["route"]
+    if route["kind"] not in ATTENTION_KINDS:
+        return None
+    return route.get("dtype", "bf16")
+
+
+PERSISTENT_STAGES: tuple[str, ...] = tuple(
+    name
+    for name in MODULES
+    if MODULES[name]["route"]["kind"] == "persistent" and stage_dtype(name) == "bf16"
+)
 SMALL_STAGES: tuple[str, ...] = tuple(
-    name for name in MODULES if MODULES[name]["route"]["kind"] == "small"
+    name
+    for name in MODULES
+    if MODULES[name]["route"]["kind"] == "small" and stage_dtype(name) == "bf16"
+)
+FP8_PERSISTENT_STAGES: tuple[str, ...] = tuple(
+    name
+    for name in MODULES
+    if MODULES[name]["route"]["kind"] == "persistent" and stage_dtype(name) == "e4m3"
+)
+FP8_SMALL_STAGES: tuple[str, ...] = tuple(
+    name
+    for name in MODULES
+    if MODULES[name]["route"]["kind"] == "small" and stage_dtype(name) == "e4m3"
 )
 # Logical argument names the plan object binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).  The
 # by-value parameter arrays (``hdr`` of the persistent kernel, ``plan`` of the
 # small kernel) are CPU int16 tensors copied into the kernel parameter space by
-# the generated binding; everything else is a device buffer or a scalar.
+# the generated binding; everything else is a device buffer or a scalar.  The
+# FP8 attention stages add the three scale tensors and ``k_scale_groups`` (the
+# per-head stride of ``k_scale``, ``ceil(seqlen_k / 16)``); the quantizer
+# stages use the SM100 Sage package's names (``q_in`` ... ``v_amax`` and the
+# chunk counts of their ``batch_heads_chunks`` grid).
 LOGICAL_TENSORS = (
     "q",
     "k",
@@ -1025,6 +2538,16 @@ LOGICAL_TENSORS = (
     "partial_o",
     "partial_stats",
     "counters",
+    "q_scale",
+    "k_scale",
+    "v_scale",
+    "q_in",
+    "k_in",
+    "v_in",
+    "q_out",
+    "k_out",
+    "v_out",
+    "v_amax",
 )
 LOGICAL_PARAM_ARRAYS = ("hdr", "plan")
 LOGICAL_SCALARS = (
@@ -1032,6 +2555,13 @@ LOGICAL_SCALARS = (
     "seqlen_q",
     "seqlen_k",
     "scale_log2",
+    "k_scale_groups",
+    "num_heads",
+    "num_kv_heads",
+    "grid_heads",
+    "chunks_per_bh",
+    "q_chunks",
+    "k_chunks",
 )
 GRID_NAMES = ("grid_x", "grid_y", "grid_z")
 
@@ -1045,7 +2575,8 @@ def arch_for_capability(device_capability: Sequence[int]) -> str | None:
 
 
 def stage_record(name: str) -> dict[str, Any]:
-    """The module record of stage ``name``; an unshipped stage (``small_k1s``, ``small_k3s``) is refused."""
+    """The module record of stage ``name``; an unshipped stage (``small_k1s``, ``small_k3s`` and their
+    ``small_fp8_`` twins) is refused."""
 
     record = MODULES.get(name)
     if record is None:
@@ -1055,17 +2586,28 @@ def stage_record(name: str) -> dict[str, Any]:
     return record
 
 
-def persistent_stage(queue: bool) -> str:
-    """The persistent kernel's stage: the queue-scheduled twin when ``queue``."""
+def persistent_stage(
+    queue: bool, compact: bool = False, tagged: bool = False, *, fp8: bool = False
+) -> str:
+    """The persistent kernel's stage: the queue-scheduled twin when ``queue``, the compact
+    static program when ``compact`` (uniform pair plans of short tiles with many tiles per
+    CTA; see ``cake_planner.COMPACT_MAX_TILE_POS``), the tagged static program when
+    ``tagged`` (single-reader K / V^T tags; see ``cake_planner.kv_tags_pay``); the
+    ``attention_fp8`` twin of each when ``fp8`` (the plan's data type, never a kernel flag)."""
 
-    return "attention_queue" if queue else "attention"
+    base = "attention_fp8" if fp8 else "attention"
+    if queue:
+        return f"{base}_queue"
+    return f"{base}_compact" if compact else f"{base}_tagged" if tagged else base
 
 
-def small_stage(kmax: int, split: bool = False, cluster: int = 0) -> str:
+def small_stage(
+    kmax: int, split: bool = False, cluster: int = 0, *, fp8: bool = False
+) -> str:
     """The small-selection stage of a ``plan_small`` plan: ``small_k<kmax>[s][c<cluster>]`` (``s`` and ``c``
-    together name a split-cluster stage)."""
+    together name a split-cluster stage), ``small_fp8_k...`` when ``fp8``."""
 
-    name = f"small_k{int(kmax)}"
+    name = f"small_fp8_k{int(kmax)}" if fp8 else f"small_k{int(kmax)}"
     if split:
         name += "s"
     if cluster:
@@ -1075,7 +2617,9 @@ def small_stage(kmax: int, split: bool = False, cluster: int = 0) -> str:
 
 
 def route_of(name: str) -> dict[str, Any]:
-    """The route a stage serves (``{"kind": "persistent", "queue"}`` or ``{"kind": "small", "kmax", "split", "cluster"}``)."""
+    """The route a stage serves (``{"kind": "persistent", "queue", "compact", "tagged"}`` or ``{"kind": "small",
+    "kmax", "split", "cluster"}``, plus ``"dtype": "e4m3"`` for an FP8 stage; ``{"kind": "quantize_..."}`` for a
+    quantizer)."""
 
     return dict(stage_record(name)["route"])
 
@@ -1088,7 +2632,9 @@ def workspace_rule(name: str) -> dict[str, Any] | None:
 
 
 def launch_grid(name: str, counts: Mapping[str, int]) -> tuple[int, int, int]:
-    """The grid of one launch of stage ``name`` from the plan's counts (``num_ctas`` / ``num_items``)."""
+    """The grid of one launch of stage ``name`` from the plan's counts (``num_ctas`` / ``num_items``).  The
+    quantizer stages (grid rule ``batch_heads_chunks``) are launched with an explicit grid by
+    :func:`..sage_fp8_quantize_sm90` and are refused here."""
 
     rule = stage_record(name)["grid_rule"]
     if rule["kind"] != "plan_count":
@@ -1190,12 +2736,16 @@ def run_module(
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
+    "ATTENTION_KINDS",
+    "FP8_PERSISTENT_STAGES",
+    "FP8_SMALL_STAGES",
     "GRID_NAMES",
     "LOGICAL_PARAM_ARRAYS",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MODULES",
     "PERSISTENT_STAGES",
+    "QUANTIZE_STAGES",
     "SMALL_STAGES",
     "STAGES",
     "arch_for_capability",
@@ -1209,6 +2759,7 @@ __all__ = [
     "run_module",
     "small_stage",
     "specs_for_arch",
+    "stage_dtype",
     "stage_record",
     "workspace_rule",
 ]

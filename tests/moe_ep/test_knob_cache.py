@@ -48,7 +48,10 @@ def _cache_env(monkeypatch, tmp_path):
         "sm107.next_cutedsl_megamoe",
     ],
 )
-def test_live_tokens_distinguish_workloads(monkeypatch, tmp_path, backend):
+@pytest.mark.parametrize("legacy_full_capacity", [False, True])
+def test_live_tokens_distinguish_workloads(
+    monkeypatch, tmp_path, backend, legacy_full_capacity
+):
     import importlib.util
     import json
     from importlib import resources
@@ -79,9 +82,16 @@ def test_live_tokens_distinguish_workloads(monkeypatch, tmp_path, backend):
     entries = json.loads(path.read_text())["entries"]
     assert len(entries) == 2
     assert {e["live_tokens"] for e in entries} == {128, 512}
+    if legacy_full_capacity:
+        contents = json.loads(path.read_text())
+        for entry in contents["entries"]:
+            if entry["live_tokens"] == 512:
+                del entry["live_tokens"]
+        path.write_text(json.dumps(contents))
     small = {**_KNOBS, "flag_batch": 4}
     cache.record_knobs(small, live_tokens=128, **key)
     assert len(json.loads(path.read_text())["entries"]) == 2
+    assert cache.lookup_knobs(**key) == _KNOBS
     assert cache.live_token_buckets(**key) == [128, 512]
     assert cache.lookup_knobs(live_tokens=64, **key) == small
     assert cache.lookup_knobs(live_tokens=129, **key) == _KNOBS
@@ -165,10 +175,10 @@ def test_record_upserts_same_key(monkeypatch, tmp_path):
     assert len(data["entries"]) == 1
 
 
-@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+@pytest.mark.parametrize("apply_routing_weights_before_fc2", [False, True])
 @pytest.mark.parametrize("dtype", ["nvfp4", "bf16_nvfp4"])
 def test_deferred_output_winners_do_not_replace_reduced_winners(
-    monkeypatch, tmp_path, dtype, apply_topk_in_fc1
+    monkeypatch, tmp_path, dtype, apply_routing_weights_before_fc2
 ):
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
 
@@ -176,23 +186,26 @@ def test_deferred_output_winners_do_not_replace_reduced_winners(
     monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
     key = dict(
         max_tokens=128,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         **{**_KEY, "dtype": dtype},
     )
     deferred = {**_KNOBS, "flag_batch": 8}
     knob_cache.record_knobs(_KNOBS, **key)
-    knob_cache.record_knobs(deferred, defer_topk_reduce=True, **key)
+    knob_cache.record_knobs(deferred, use_custom_finalize=True, **key)
     replacement = {**deferred, "flag_batch": 4}
-    knob_cache.record_knobs(replacement, defer_topk_reduce=True, **key)
+    knob_cache.record_knobs(replacement, use_custom_finalize=True, **key)
     assert knob_cache.resolve_knobs(**key) == (_KNOBS, "cache")
-    assert knob_cache.resolve_knobs(defer_topk_reduce=True, **key) == (
+    assert knob_cache.resolve_knobs(use_custom_finalize=True, **key) == (
         replacement,
         "cache",
     )
     assert (
         knob_cache.lookup_knobs(
-            **{**key, "apply_topk_in_fc1": not apply_topk_in_fc1},
-            defer_topk_reduce=True,
+            **{
+                **key,
+                "apply_routing_weights_before_fc2": not apply_routing_weights_before_fc2,
+            },
+            use_custom_finalize=True,
         )
         is None
     )
@@ -214,20 +227,20 @@ def test_legacy_reduced_entries_load_but_startup_profiles_are_ignored(
     record_knobs(_KNOBS, **key)
     data = json.loads(path.read_text())
     entry = data["entries"][0]
-    del entry["defer_topk_reduce"]
+    del entry["use_custom_finalize"]
     path.write_text(json.dumps(data))
     assert lookup_knobs(**key) == _KNOBS
-    assert lookup_knobs(defer_topk_reduce=True, **key) is None
-    entry["profile"] = {"defer_topk_reduce": True, "live_tokens": [32] * 4}
+    assert lookup_knobs(use_custom_finalize=True, **key) is None
+    entry["profile"] = {"use_custom_finalize": True, "live_tokens": [32] * 4}
     path.write_text(json.dumps(data))
     assert lookup_knobs(**key) is None
     record_knobs(_KNOBS, **key)
     assert lookup_knobs(**key) == _KNOBS
 
 
-@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+@pytest.mark.parametrize("apply_routing_weights_before_fc2", [False, True])
 def test_offline_deferred_tuning_rebuilds_launches_and_records_output_mode(
-    monkeypatch, tmp_path, apply_topk_in_fc1
+    monkeypatch, tmp_path, apply_routing_weights_before_fc2
 ):
     from types import SimpleNamespace
 
@@ -263,8 +276,8 @@ def test_offline_deferred_tuning_rebuilds_launches_and_records_output_mode(
         num_total_experts=8,
         hidden=128,
         intermediate=256,
-        apply_topk_in_fc1=apply_topk_in_fc1,
-        defer_topk_reduce=True,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        use_custom_finalize=True,
     )
     frontend = SimpleNamespace(config=config, generation=0)
 
@@ -314,9 +327,12 @@ def test_offline_deferred_tuning_rebuilds_launches_and_records_output_mode(
         num_experts=8,
         topk=2,
         max_tokens=64,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
-    assert knob_cache.resolve_knobs(defer_topk_reduce=True, **key) == (winner, "cache")
+    assert knob_cache.resolve_knobs(use_custom_finalize=True, **key) == (
+        winner,
+        "cache",
+    )
     assert knob_cache.lookup_knobs(**key) is None
 
 
@@ -464,13 +480,13 @@ def test_backend_warns_on_auto_knobs():
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("defer_topk_reduce", [False, True])
+@pytest.mark.parametrize("use_custom_finalize", [False, True])
 @pytest.mark.parametrize(
     "mode,mma_m,explicit",
     [("nvfp4", 256, False), ("bf16_nvfp4", 128, False), ("bf16_nvfp4", 128, True)],
 )
 def test_symm_buffer_resolves_cached_knobs(
-    monkeypatch, tmp_path, mode, mma_m, explicit, defer_topk_reduce
+    monkeypatch, tmp_path, mode, mma_m, explicit, use_custom_finalize
 ):
     """Cached and explicit partial tiles derive the same CTA instruction mode."""
     import torch
@@ -518,8 +534,8 @@ def test_symm_buffer_resolves_cached_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
-        apply_topk_in_fc1=mode == "nvfp4",
-        defer_topk_reduce=defer_topk_reduce,
+        apply_routing_weights_before_fc2=mode == "nvfp4",
+        use_custom_finalize=use_custom_finalize,
     )
     knobs = cached if explicit else None
     buf = get_symm_buffer_for_mega_moe(
@@ -531,11 +547,11 @@ def test_symm_buffer_resolves_cached_knobs(
         0,
         1,
         knobs=knobs,
-        defer_topk_reduce=defer_topk_reduce,
+        use_custom_finalize=use_custom_finalize,
     )
     try:
         cfg = buf._frontend.config
-        assert cfg.defer_topk_reduce == defer_topk_reduce
+        assert cfg.use_custom_finalize == use_custom_finalize
         assert cfg.mma_tiler_mnk == cached["mma_tiler_mnk"]
         assert cfg.use_2cta_instrs == (mma_m == 256)
         assert cfg.flag_batch == 16
@@ -556,18 +572,23 @@ def test_routing_weight_placement_partitions_cache(monkeypatch, tmp_path):
     key = dict(max_tokens=2048, **{**_KEY, "dtype": "bf16_nvfp4"})
     knob_cache.record_knobs(_KNOBS, **key)
     assert knob_cache.lookup_knobs(**key) == _KNOBS
-    assert knob_cache.lookup_knobs(apply_topk_in_fc1=False, **key) == _KNOBS
-    assert knob_cache.lookup_knobs(apply_topk_in_fc1=True, **key) is None
+    assert (
+        knob_cache.lookup_knobs(apply_routing_weights_before_fc2=False, **key) == _KNOBS
+    )
+    assert knob_cache.lookup_knobs(apply_routing_weights_before_fc2=True, **key) is None
 
     fc1_knobs = {**_KNOBS, "flag_batch": 8}
-    knob_cache.record_knobs(fc1_knobs, apply_topk_in_fc1=True, **key)
+    knob_cache.record_knobs(fc1_knobs, apply_routing_weights_before_fc2=True, **key)
     replacement = {**_KNOBS, "flag_batch": 2}
-    knob_cache.record_knobs(replacement, apply_topk_in_fc1=False, **key)
+    knob_cache.record_knobs(replacement, apply_routing_weights_before_fc2=False, **key)
     assert knob_cache.resolve_knobs(**key) == (replacement, "cache")
-    assert knob_cache.resolve_knobs(apply_topk_in_fc1=True, **key) == (
+    assert knob_cache.resolve_knobs(apply_routing_weights_before_fc2=True, **key) == (
         fc1_knobs,
         "cache",
     )
     entries = json.loads(path.read_text())["entries"]
     assert len(entries) == 2
-    assert {entry["apply_topk_in_fc1"] for entry in entries} == {False, True}
+    assert {entry["apply_routing_weights_before_fc2"] for entry in entries} == {
+        False,
+        True,
+    }

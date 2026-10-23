@@ -38,13 +38,13 @@ extern "C" __global__ void kernel_cake_gdp_f2f0c7abbf10082a6996(
     int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices,
     int* __restrict__ ssm_state_indices, CakeFastDivmod heads, int num_tokens, float scale,
     int disable_state_update, int use_ssm_state_indices, long long state_size_p0,
-    long long state_stride_p0, long long state_stride_p1, long long state_stride_p2,
-    long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long v_stride_p0,
-    long long v_stride_p1, long long v_stride_p2, long long b_stride_p0, long long b_stride_p1,
-    long long b_stride_p2, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2,
-    long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long out_stride_p0,
-    long long out_stride_p1, long long out_stride_p2, long long ssm_state_indices_stride_p0,
-    long long ssm_state_indices_stride_p1);
+    long long state_stride_p0, long long state_stride_p1, long long k_stride_p0,
+    long long k_stride_p1, long long k_stride_p2, long long v_stride_p0, long long v_stride_p1,
+    long long v_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2,
+    long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long a_stride_p0,
+    long long a_stride_p1, long long a_stride_p2, long long state_stride_p2,
+    long long out_stride_p0, long long out_stride_p1, long long out_stride_p2,
+    long long ssm_state_indices_stride_p0, long long ssm_state_indices_stride_p1);
 
 namespace cake_binding_kernel_cake_gdp_f2f0c7abbf10082a6996 {
 
@@ -184,7 +184,6 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_state, Ten
   int64_t v_state_size_p0 = a_state.size(0);
   int64_t v_state_stride_p0 = a_state.stride(0);
   int64_t v_state_stride_p1 = a_state.stride(1);
-  int64_t v_state_stride_p2 = a_state.stride(2);
   int64_t v_k_stride_p0 = a_k.stride(0);
   int64_t v_k_stride_p1 = a_k.stride(1);
   int64_t v_k_stride_p2 = a_k.stride(2);
@@ -200,6 +199,7 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_state, Ten
   int64_t v_a_stride_p0 = a_a.stride(0);
   int64_t v_a_stride_p1 = a_a.stride(1);
   int64_t v_a_stride_p2 = a_a.stride(2);
+  int64_t v_state_stride_p2 = a_state.stride(2);
   int64_t v_out_stride_p0 = a_out.stride(0);
   int64_t v_out_stride_p1 = a_out.stride(1);
   int64_t v_out_stride_p2 = a_out.stride(2);
@@ -225,7 +225,6 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_state, Ten
                          &v_state_size_p0,
                          &v_state_stride_p0,
                          &v_state_stride_p1,
-                         &v_state_stride_p2,
                          &v_k_stride_p0,
                          &v_k_stride_p1,
                          &v_k_stride_p2,
@@ -241,6 +240,7 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_state, Ten
                          &v_a_stride_p0,
                          &v_a_stride_p1,
                          &v_a_stride_p2,
+                         &v_state_stride_p2,
                          &v_out_stride_p0,
                          &v_out_stride_p1,
                          &v_out_stride_p2,

@@ -67,8 +67,8 @@ def nvfp4_candidates(
     the one-time compile cost) when ``enable_in_kernel_fc2_reduce`` adds the
     ikr axis; quantized ``combine_format`` values prune to the valid subset
     (dispatch-warp token-back only, no ikr).  Leave the permission unset when
-    the session cannot run ikr (``apply_topk_in_fc1=False``) or must stay
-    deterministic.
+    the session cannot run ikr (``apply_routing_weights_before_fc2=False``) or
+    must stay deterministic.
     """
     out: List[Dict[str, Any]] = []
     for tile in ((256, 128, 256), (256, 256, 256)):
@@ -390,7 +390,7 @@ def autotune_nvfp4_mega_moe(
 
     cfg = symm_buffer._frontend.config
     prepare_launch = None
-    if cfg.defer_topk_reduce:
+    if cfg.use_custom_finalize:
         n = num_tokens if num_tokens is not None else cfg.num_tokens_per_rank
         if n < 0 or n > cfg.num_tokens_per_rank:
             raise ValueError(
@@ -421,8 +421,8 @@ def autotune_nvfp4_mega_moe(
             combine_format=COMBINE_FORMAT_NAMES[cfg.combine_dtype],
             enable_in_kernel_fc2_reduce=(
                 cfg.enable_in_kernel_fc2_reduce
-                and cfg.apply_topk_in_fc1
-                and not cfg.defer_topk_reduce
+                and cfg.apply_routing_weights_before_fc2
+                and not cfg.use_custom_finalize
             ),
         )
 
@@ -446,8 +446,8 @@ def autotune_nvfp4_mega_moe(
                 max_tokens=cfg.num_tokens_per_rank,
                 live_tokens=live_tokens,
                 combine_dtype=cfg.combine_dtype,
-                apply_topk_in_fc1=cfg.apply_topk_in_fc1,
-                defer_topk_reduce=cfg.defer_topk_reduce,
+                apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
+                use_custom_finalize=cfg.use_custom_finalize,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )

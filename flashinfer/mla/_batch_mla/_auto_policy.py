@@ -37,6 +37,9 @@ from ._backends.cute_dsl_monolithic_backend import (
     _BatchMLAPagedAttentionCuteDslMonolithicBackend,
 )
 from ._backends.cutlass_backend import _BatchMLAPagedAttentionCutlassBackend
+from ._backends.cute_dsl_rubin_mtp_backend import (
+    _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
+)
 from ._backends.cutile_backend import _BatchMLAPagedAttentionCutileBackend
 from ._backends.fa2_backend import _BatchMLAPagedAttentionFa2Backend
 from ._backends.fa3_backend import _BatchMLAPagedAttentionFa3Backend
@@ -109,6 +112,7 @@ _AUTO_BACKEND_CANDIDATES = (
     "trtllm-gen",
     "cute-dsl-monolithic",
     "cute-dsl-modular",
+    "cute-dsl-rubin-mtp",
     "cutlass",
     "xqa",
     "cutile",
@@ -261,9 +265,79 @@ def ordered_sm100_backends(args):
 
 
 def _ordered_sm107_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
-    # The SM100 policy performed well in SM107 development measurements.
-    # Further investigation may identify useful SM107-specific ordering rules.
-    return ordered_sm100_backends(args)
+    """Prefer Rubin MTP in measured regions of the initial planned workload.
+
+    Later live-length updates retain the selected graph family. These bounds
+    are performance heuristics, not additional backend support restrictions.
+    """
+    order = ordered_sm100_backends(args)
+    if (
+        args.q_data_type != torch.float8_e4m3fn
+        or args.kv_data_type != torch.float8_e4m3fn
+        or args.output_dtype != torch.float8_e4m3fn
+        or args.num_heads != 128
+        or args.head_dim_ckv != 512
+        or args.head_dim_kpe != 64
+        or args.page_size not in (64, 128)
+        or not args.causal
+        or args.query_layout != "packed"
+        or args.kv_cache_layout != "packed"
+        or args.scale_mode != "default"
+        or args.sm_scale <= 0
+        or args.output_scale != "none"
+        or args.use_sinks
+        or args.use_profiler
+        or args.skip_softmax
+        or args.enable_pdl is True
+    ):
+        return order
+    csr = args.csr()
+    offsets = csr.qo_indptr.cpu().tolist()
+    lengths = csr.kv_len_arr.cpu().tolist()
+    q_lens = [end - begin for begin, end in zip(offsets, offsets[1:], strict=False)]
+    batch = len(lengths)
+    if (
+        not 32 <= batch <= 128
+        or len(q_lens) != batch
+        or q_lens[0] not in (2, 4)
+        or any(q != q_lens[0] for q in q_lens)
+        or min(lengths) < q_lens[0]
+    ):
+        return order
+    total_q = batch * q_lens[0]
+    min_k, max_k = min(lengths), max(lengths)
+    aligned_k = (max_k + 127) // 128 * 128
+    tables = args.metadata.block_tables
+    # Eager CSR plans derive their table from the initial lengths. Graph plans
+    # must retain caller-owned dense metadata; leave other formats to fallbacks.
+    if tables is None and args._use_cuda_graph:
+        return order
+    capacity = tables.shape[1] * args.page_size if tables is not None else aligned_k
+    capacity = (capacity + 127) // 128 * 128
+    if args._use_cuda_graph:
+        # Larger short-context batches favor MTP at native split1. Beyond two
+        # tiles, mixed lengths erase the measured advantage over monolithic.
+        prefer_mtp = (
+            total_q >= 256
+            and capacity <= 2048
+            and capacity <= aligned_k
+            and (capacity <= 256 or min_k == max_k)
+        )
+    else:
+        # Long uniform workloads amortize MTP's eager launch overhead. Avoid
+        # smaller batches and oversized capacity with different split behavior.
+        prefer_mtp = (
+            min_k == max_k
+            and total_q >= 128
+            and capacity <= 65536
+            and capacity <= 2 * max_k
+            and (min_k >= 32768 or (total_q >= 256 and min_k >= 8192))
+        )
+    if not prefer_mtp:
+        return order
+    remaining = tuple(backend for backend in order if backend != "cute-dsl-rubin-mtp")
+    position = remaining.index("cute-dsl-monolithic")
+    return remaining[:position] + ("cute-dsl-rubin-mtp",) + remaining[position:]
 
 
 def ordered_sm12x_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
@@ -337,6 +411,7 @@ class _BatchMLAPagedAttentionAutotuneBackend:
         _BatchMLAPagedAttentionTrtllmGenBackend,
         _BatchMLAPagedAttentionCuteDslMonolithicBackend,
         _BatchMLAPagedAttentionCuteDslModularBackend,
+        _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
         _BatchMLAPagedAttentionXqaBackend,
         _BatchMLAPagedAttentionCutlassBackend,
         _BatchMLAPagedAttentionFa2Backend,

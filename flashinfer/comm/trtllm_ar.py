@@ -99,6 +99,11 @@ class AllReduceFusionPattern:
     # quantization. MNNVL CuTe DSL only; the C++ trtllm_allreduce_fusion kernels
     # do not define this value.
     kMoEFinalizeARResidualRMSNormFP8Quant = 12
+    # All-reduce followed by residual add, RMS norm and MXFP8 quantization
+    # (E4M3 data, one UE8M0 scale per 32 elements, swizzled 128x4 or linear scales)
+    kARResidualRMSNormMXFP8Quant = 13
+    # Same as kARResidualRMSNormMXFP8Quant, with norm output
+    kARResidualRMSNormOutMXFP8Quant = 14
 
 
 class QuantizationSFLayout:

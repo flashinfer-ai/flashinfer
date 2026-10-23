@@ -14,43 +14,9 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#include "cake_moe_grouped_gemm_device.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define THREADS 256
-#define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
 #define CLUSTER_M 256
@@ -58,23 +24,31 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #ifndef WGRAD_TILE
 #error "WGRAD_TILE is a downstream specialization of this program; define it on the compile line"
 #endif
-
-#include <math_constants.h>
+#ifndef WGRAD_OUT
+#define WGRAD_OUT 16
+#endif
+#if WGRAD_OUT != 16 && WGRAD_OUT != 32
+#error "WGRAD_OUT selects the output element width of this program: 16 (bf16, default) or 32 (fp32); define it on the compile line"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c(float* __restrict__ partials, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, int num_groups, int N, int K, int ldc, int stride_e, int num_clusters_1, int tail_splits, int raster_rows)
+#if WGRAD_OUT == 32
+CAKE_PROGRAM_KERNEL(float* __restrict__ partials, float* __restrict__ C, int* __restrict__ offs, int num_groups, int N, int K, int ldc, int stride_e, int num_clusters_1, int tail_splits, int raster_rows)
+#else
+CAKE_PROGRAM_KERNEL(float* __restrict__ partials, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, int num_groups, int N, int K, int ldc, int stride_e, int num_clusters_1, int tail_splits, int raster_rows)
+#endif
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
 
 
     const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
 
-    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     const int threads_per_row = WGRAD_TILE / EPI_CHUNK;
@@ -172,6 +146,22 @@ kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c(float* __restrict__ partials, 
     if (count_r > 1) {
         {
             {
+#if WGRAD_OUT == 32
+                float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r)) + 0) = _v4;
+            }
+            {
+                float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 4)) + 0) = _v4;
+            }
+            {
+                float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 8)) + 0) = _v4;
+            }
+            {
+                float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 12)) + 0) = _v4;
+#else
                 {
                     __nv_bfloat162 _pk0 = __floats2bfloat162_rn(acc[0 + 0], acc[0 + 1]);
                     unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -193,6 +183,7 @@ kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c(float* __restrict__ partials, 
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                         :: "l"((void*)(&((__nv_bfloat16*)(C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
                 }
+#endif
             }
         }
     }

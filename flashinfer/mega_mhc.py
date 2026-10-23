@@ -30,15 +30,25 @@ def prepare_mega_mhc(
     scratch=None,
     split_barriers=None,
     launch_epochs=None,
+    fnp=None,
 ):
     """Prepare a reusable mHC plan; plan.run() returns the output tensor dict.
 
     BF16 x[T,H], residual[T,4,H] and rmsnorm_weight[H] combine with FP32
     projection fn[24,4H], mixing coefficients and optional shifted_prev_mix.
-    Results include updated residual/mixing tensors, normalized BF16 and FP8
-    E4M3 values, and exact packed UE8M0 scales. 'col' emits GEMM scale storage;
-    'extra' emits routed and padded shared-expert scale storage. Any token
-    count in [1, 2**20] is accepted. See MegaMHCPlan for caller-owned
+    Results include updated residual/mixing tensors and the normalized BF16
+    values; with sf_layout 'col' or 'extra' (hidden 5120) also FP8 E4M3 values
+    and exact packed UE8M0 scales: 'col' emits GEMM scale storage, 'extra'
+    emits routed and padded shared-expert scale storage. sf_layout 'bf16'
+    (hidden 4096, shifted_prev_mix=None) emits the BF16 output alone; its
+    program reads fn through the BF16 pieces fnp[3,32,4H], built here from fn
+    or taken from the caller's fnp, and plan.update_fn() re-splits a changed
+    fn. The eps, scale and iteration keywords are the model's constants (the
+    defaults are DeepSeek V4's). Any token count in [1, 2**20] is accepted. Plans
+    sharing a launch_epochs (caller-owned or another plan's) must launch the
+    same grid (one epoch slot per active CTA); a reuse with another grid is
+    refused, and a caller-owned launch_epochs must own its whole storage (a
+    sliced or offset view is refused). See MegaMHCPlan for caller-owned
     output/workspace layouts and invocation-state ownership. The prepared plan
     follows the current PyTorch stream and CUDA Graph replay.
     """
@@ -69,4 +79,5 @@ def prepare_mega_mhc(
         scratch=scratch,
         split_barriers=split_barriers,
         launch_epochs=launch_epochs,
+        fnp=fnp,
     )

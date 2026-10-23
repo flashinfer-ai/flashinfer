@@ -109,7 +109,7 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
   float* smem_w = reinterpret_cast<float*>(smem_raw + 0);
   const int smem_w_addr = smem + 0;
 
-  // === Task calls (dependency order) ===
+  // === Task calls (declaration order) ===
   asm volatile("griddepcontrol.wait;" ::: "memory");
   int part = warp % 4;
   int row = blockIdx.x * 2 + warp / 4;
@@ -1400,7 +1400,7 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           if (sum_w > 0.0f) {
             float _log2_67;
             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_67) : "f"(sum_w));
-            lse_v = (m + _log2_67) * 0.6931471805599453f;
+            lse_v = (m + _log2_67) * 0.6931472f;
           }
           *(reinterpret_cast<float*>(lse + row) + (0)) = lse_v;
         }

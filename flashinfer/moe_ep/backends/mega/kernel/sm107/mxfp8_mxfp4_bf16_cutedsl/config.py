@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 
+from flashinfer.moe_ep._compat import deprecated_aliases
 
+
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclass
 class Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     """Configure Rubin inference with MXFP8 E4M3 activations and packed MXFP4 weights.
@@ -26,7 +29,7 @@ class Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
     work_id_mode: Literal["grid_stride", "atomic_counter"] = "grid_stride"
     fc2_use_bulk: bool = False

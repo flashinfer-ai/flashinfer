@@ -1330,8 +1330,9 @@ def test_graph_timing_policy_namespace_and_replay(cache_root, monkeypatch):
 
 
 @pytest.mark.parametrize("storage", ["legacy", "managed"])
-def test_graph_timing_runner_change_survives_serving_and_restart(
-    cache_root, monkeypatch, storage
+@pytest.mark.parametrize("objective", ["replays", "individual"])
+def test_retuned_runner_survives_serving_and_restart(
+    cache_root, monkeypatch, storage, objective
 ):
     from contextlib import nullcontext
 
@@ -1350,10 +1351,18 @@ def test_graph_timing_runner_change_survives_serving_and_restart(
     runners = [RunnerA((0,)), RunnerB((0,))]
     inputs = [torch.ones(1)]
     before = TuningConfig(use_cuda_graph=True)
-    after = replace(before, use_cuda_graph_individual_timing=True)
+    after = (
+        replace(before, cuda_graph_profile_replays=2)
+        if objective == "replays"
+        else replace(before, use_cuda_graph_individual_timing=True)
+    )
 
     def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
-        want_b = tuning_config.use_cuda_graph_individual_timing
+        want_b = (
+            tuning_config.cuda_graph_profile_replays == 2
+            if objective == "replays"
+            else tuning_config.use_cuda_graph_individual_timing
+        )
         return 1.0 if isinstance(runner, RunnerB) == want_b else 2.0
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
@@ -1386,3 +1395,184 @@ def test_graph_timing_runner_change_survives_serving_and_restart(
                 tuner.choose_one("unrelated", [runners[0]], before, inputs)[1]
                 == unrelated_tactic
             )
+
+
+@pytest.mark.parametrize("storage", ["legacy", "managed"])
+@pytest.mark.parametrize("method", ["choose_one", "rank_tactics"])
+@pytest.mark.parametrize("failure", ["all_failed", "prepare_oom"])
+def test_failed_single_process_retune_preserves_previous_winner(
+    cache_root, monkeypatch, storage, method, failure
+):
+    from contextlib import nullcontext
+
+    tuner, runner, inputs = AutoTuner.get(), DummyRunner((0, 1)), [torch.ones(1)]
+    before = TuningConfig(use_cuda_graph=True)
+    after = replace(before, cuda_graph_profile_replays=2)
+    context = autotune_v2 if storage == "managed" else autotune
+    path = str(cache_root / "legacy.json")
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 1.0, 1: 2.0})
+    with context():
+        assert tuner.choose_one(_OP, [runner], before, inputs)[1] == 0
+    if storage == "legacy":
+        tuner.save_configs(path)
+    _install_fake_profile(
+        monkeypatch, {-1: float("inf"), 0: float("inf"), 1: float("inf")}
+    )
+    if failure == "prepare_oom":
+
+        def oom(*args, **kwargs):
+            raise MemoryError("simulated preparation failure")
+
+        monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", oom)
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    with context():
+        if method == "choose_one":
+            assert tuner.choose_one(_OP, [runner], after, inputs)[1] == -1
+        elif failure == "prepare_oom":
+            with pytest.raises(MemoryError):
+                tuner.rank_tactics(_OP, [runner], after, inputs, k=2)
+        else:
+            assert tuner.rank_tactics(_OP, [runner], after, inputs, k=2) == [-1]
+    assert tuner.choose_one(_OP, [runner], before, inputs)[1] == 0
+    if storage == "legacy":
+        tuner.save_configs(path)
+    tuner = _fresh_process()
+    if storage == "legacy":
+        tuner.load_configs(path)
+    with autotune_v2(mode="replay") if storage == "managed" else nullcontext():
+        assert tuner.choose_one(_OP, [runner], before, inputs)[1] == 0
+
+
+@pytest.mark.parametrize("method", ["choose_one", "rank_tactics"])
+@pytest.mark.parametrize("publish_fails", [False, True])
+def test_retune_keeps_entry_visible_until_atomic_replacement(
+    cache_root, monkeypatch, method, publish_fails
+):
+    """A reader between retirement and publication must not memoize a miss."""
+    tuner, runner, inputs = AutoTuner.get(), DummyRunner((0, 1)), [torch.ones(1)]
+    before = TuningConfig(use_cuda_graph=True)
+    after = replace(before, cuda_graph_profile_replays=2)
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 1.0, 1: 2.0})
+    with autotune_v2():
+        assert tuner.choose_one(_OP, [runner], before, inputs)[1] == 0
+
+    store = tuner._managed_cache
+    key = tuner._get_cache_key(_OP, runner, ((1,),), before).file_key
+    reader = ManagedAutotuneCache(store.manifest, store.root)
+    observed = []
+    atomic_write = autotune_cache_module._atomic_write_json
+
+    def interleaved_write(path, payload):
+        if path == store._entry_path(key):
+            # Independent reader state, before the writer's atomic replace.
+            observed.append(reader.lookup(key))
+            if publish_fails:
+                raise OSError("simulated publication failure")
+        atomic_write(path, payload)
+
+    monkeypatch.setattr(autotune_cache_module, "_atomic_write_json", interleaved_write)
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 2.0, 1: 1.0})
+    with autotune_v2():
+        if method == "choose_one":
+            assert tuner.choose_one(_OP, [runner], after, inputs)[1] == 1
+        else:
+            assert tuner.rank_tactics(_OP, [runner], after, inputs, k=2)[0] == 1
+
+    assert len(observed) == 1
+    assert observed[0] is not None
+    assert observed[0].tactic == 0
+    assert reader.lookup(key).tactic == 0
+    fresh_reader = ManagedAutotuneCache(store.manifest, store.root)
+    assert fresh_reader.lookup(key).tactic == (0 if publish_fails else 1)
+    # A failed disk write still leaves the newly measured winner in memory.
+    assert tuner.choose_one(_OP, [runner], after, inputs)[1] == 1
+
+
+@pytest.mark.parametrize("storage", ["legacy", "managed"])
+def test_replacement_discards_synthesized_bucket_extras(
+    cache_root, monkeypatch, storage
+):
+    from contextlib import nullcontext
+    from flashinfer.autotuner import DynamicTensorSpec
+
+    class ExactShapeRunner(DummyRunner):
+        def get_cache_key_extras(self, inputs):
+            return (inputs[0].shape[0],)
+
+    runners = [ExactShapeRunner((0,)), DummyRunnerB((1,))]
+    before = TuningConfig(
+        use_cuda_graph=True,
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(16, 32),
+                map_to_tuning_buckets=lambda size: size,
+            ),
+        ),
+    )
+    after = replace(before, cuda_graph_profile_replays=2)
+    tuner = AutoTuner.get()
+    context = autotune_v2 if storage == "managed" else autotune
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 1.0, 1: 2.0})
+    with context():
+        tuner.choose_one(_OP, runners, before, [torch.ones(32)])
+    path = str(cache_root / "legacy.json")
+    if storage == "legacy":
+        tuner.save_configs(path)
+        tuner = _fresh_process()
+        tuner.load_configs(path)
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 2.0, 1: 1.0})
+    # The M=32 bucket must retire extras=(32,), although the call's M is 16.
+    with context():
+        tuner.choose_one(_OP, runners, after, [torch.ones(16)])
+    assert tuner.choose_one(_OP, runners, after, [torch.ones(32)])[0] is runners[1]
+    if storage == "legacy":
+        tuner.save_configs(path)
+    tuner = _fresh_process()
+    if storage == "legacy":
+        tuner.load_configs(path)
+    with autotune_v2(mode="replay") if storage == "managed" else nullcontext():
+        assert tuner.choose_one(_OP, runners, after, [torch.ones(32)])[0] is runners[1]
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_shortlist_and_winner_share_measurement_identity(
+    cache_root, monkeypatch, persistent
+):
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    tuner, runner, inputs = AutoTuner.get(), DummyRunner((0, 1)), [torch.ones(1)]
+    calls = []
+
+    def profile(self, runner, inputs, tactic, config, **kwargs):
+        calls.append((tactic, config.use_cuda_graph, config.cuda_graph_profile_replays))
+        return 1.0 if tactic == int(config.use_cuda_graph) else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    for mode, winner in [("eager", 0), ("cuda_graph", 1), ("eager", 0)]:
+        with (
+            autotune_v2(
+                persistent_cache=persistent,
+                measurement_policy=MeasurementPolicy(execution_mode=mode),
+            ),
+            autotune(cuda_graph_profile_replays=3),
+        ):
+            count = len(calls)
+            assert tuner.rank_tactics(_OP, [runner], _CONFIG, inputs, k=2)[0] == winner
+            assert tuner.choose_one(_OP, [runner], _CONFIG, inputs)[1] == winner
+            assert len(calls) == (count if count == 4 else count + 2)
+    assert not tuner.profiling_cache
+    assert not tuner._ranked_tactics_cache
+    assert all(replays == 3 for _, _, replays in calls)
+    if persistent:
+        autotune_v2_reload()
+        assert not tuner._ranked_tactics_partitions
+        tuner = _fresh_process()
+        calls.clear()
+        for mode, winner in [("eager", 0), ("cuda_graph", 1)]:
+            with autotune_v2(
+                mode="replay", measurement_policy=MeasurementPolicy(execution_mode=mode)
+            ):
+                assert tuner.choose_one(_OP, [runner], _CONFIG, inputs)[1] == winner
+        assert calls == []

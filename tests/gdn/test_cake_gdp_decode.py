@@ -14,16 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests for the Cake Gated DeltaProduct (GDP) decode / MTP-verification kernels
-for Nemotron 4 (``K = 128``, ``V = 64``, one to four Householder updates per
-token, FP32 state pool; SM100 / SM103).
+(``K = 128``, ``V = 64``, one to four Householder updates per
+token, FP32 state pool; SM90 / SM100 / SM103).
 
 Every output row and every pool slot the call may touch is compared with an
 FP64 token-serial reference of the same math (inputs at their BF16 values,
 the state rounded to FP32 after each real token) at ``atol = 1e-2``,
 ``rtol = 5e-3`` with no mismatch allowed; every slot the call must not touch
 is checked bitwise.  The matrix covers ``num_householder`` 1 to 4, the head
-counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 48 Nemotron 4
-decode shapes among them), distinct write slots, padding rows (negative read
+counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 48 decode shapes
+of record among them), distinct write slots, padding rows (negative read
 slots, whose output rows keep the caller's values), rows without writeback,
 per-token state scatter with holes, ``disable_state_update``, the scale
 values, a padded pool, strided inputs and outputs, FP16 I/O, int64 indices,
@@ -57,7 +57,7 @@ loader = cake_package("cake_gdp", "cake_jit")
 cake_gated_delta_product_mtp = pkg.cake_gated_delta_product_mtp
 is_cake_gdp_supported = pkg.is_cake_gdp_supported
 
-SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
+SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
 K = 128
 V = 64
 ATOL = 1e-2
@@ -67,7 +67,7 @@ NUM_HOUSEHOLDER = (1, 2, 3, 4)
 HEADS = (1, 2, 3, 6, 10, 12, 20, 24, 40, 80)
 BATCHES = (1, 2, 3, 7, 16, 64, 257)
 TOKENS = (1, 2, 3, 4, 5, 8, 16)
-# The Nemotron 4 decode shapes (num_householder = 3): every performance row is a correctness case.
+# The 48 decode shapes of record (num_householder = 3): every performance row is a correctness case.
 PERF_HEADS = (80, 20, 10, 24)
 PERF_BATCHES = (1, 16, 64, 256)
 PERF_TOKENS = (1, 4, 8)
@@ -92,7 +92,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_gdp needs an SM100 / SM103 device with exported routes",
+    reason="cake_gdp needs an SM90 / SM100 / SM103 device with exported routes",
 )
 
 
@@ -441,8 +441,8 @@ def test_batch_sizes(B: int) -> None:
         for T in PERF_TOKENS
     ],
 )
-def test_nemotron4_decode_rows(H: int, B: int, T: int) -> None:
-    """The 48 Nemotron 4 decode shapes (num_householder = 3), each a full correctness case."""
+def test_decode_rows_of_record(H: int, B: int, T: int) -> None:
+    """The 48 decode shapes of record (num_householder = 3), each a full correctness case."""
     _skip_unless_route(3, T)
     c = _make(B, T, H, 3, generator=_generator(4, H, B, T))
     out, _ = _run(c)
@@ -768,8 +768,8 @@ def _program_cases() -> list:
     sms = loader.sm_count(_device().index or 0)
     cases = []
     for name, record in sorted(loader.MODULES.items()):
-        if arch not in record["arches"]:
-            continue
+        if arch not in record["arches"] or record["role"] != "decode":
+            continue  # the prefill records: tests/gdp/test_cake_gdp_prefill.py
         build = record["build"]
         n = build["num_householder"]
         T = build["t_steps"] if build["t_steps"] is not None else build["max_t_steps"]
@@ -779,7 +779,7 @@ def _program_cases() -> list:
             and loader.max_num_tokens(arch, n, use_qk_l2norm) > T
         ):
             T = loader.max_num_tokens(arch, n, use_qk_l2norm)
-        # 27 x 24 = 648 lies in the one-wave-of-5 T = 1 band on 132-160 SMs.
+        # 27 x 24 = 648 lies in the one-wave-of-5 T = 1 band of SM100 / SM103 on 132-160 SMs.
         for B, H in itertools.product((1, 3, 7, 16, 64, 257, 27), (6, 12, 20, 24, 80)):
             if build["t_steps"] is None:
                 # The runtime program is the fallback: a T no static program owns selects it.
@@ -928,7 +928,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
             record
         ), name
         assert set(record["arches"]) <= set(manifest["arch_flags"]), name
-        assert record["build"]["num_householder"] in NUM_HOUSEHOLDER, name
+        assert record["role"] in ("decode", "prefill"), name
+        if record["role"] == "decode":
+            assert record["build"]["num_householder"] in NUM_HOUSEHOLDER, name
         # The launch block is the built kernel's (the exporter writes it): the shape only is checked here.
         block = list(record["launch"]["block"])
         assert len(block) == 3, name
@@ -947,7 +949,10 @@ def test_registry_records_reference_the_build_manifest() -> None:
             for source in entry["sources"]:
                 assert (package / source).is_file(), source
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
-            assert "--use_fast_math" in entry["nvcc_flags"]
+            # Every decode entry compiles with fast math (the prefill records carry their own flags,
+            # checked by tests/gdp/test_cake_gdp_prefill.py).
+            if record["role"] == "decode":
+                assert "--use_fast_math" in entry["nvcc_flags"]
     assert referenced == set(libraries)
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
@@ -979,11 +984,20 @@ def test_route_tables_are_consistent() -> None:
     """Every route name lists exported modules of its architecture; static programs of a route own disjoint
     state-head bands per token count; ``ARCH_BY_CAPABILITY`` names the supported capabilities only."""
 
-    assert set(loader.ARCH_BY_CAPABILITY) == set(SUPPORTED_CAPABILITIES)
+    # The capability map names the decode capabilities and may name further ones of the prefill role
+    # (tests/gdp/test_cake_gdp_prefill.py); exactly the decode capabilities carry a decode route.
+    assert set(SUPPORTED_CAPABILITIES) <= set(loader.ARCH_BY_CAPABILITY)
+    assert {
+        capability
+        for capability, arch in loader.ARCH_BY_CAPABILITY.items()
+        if any(key.startswith("decode_") for key in loader.ROUTES.get(arch, {}))
+    } == set(SUPPORTED_CAPABILITIES)
     assert set(loader.ARCH_BY_CAPABILITY.values()) <= set(loader.ARCHES)
     for arch, routes in loader.ROUTES.items():
         assert arch in loader.ARCHES
         for key, names in routes.items():
+            if key == loader.PREFILL_ROUTE:
+                continue  # the prefill route: tests/gdp/test_cake_gdp_prefill.py
             assert re.fullmatch(r"decode_nh[1-4](?:_raw)?", key), key
             n = int(key[len("decode_nh")])
             for name in names:
@@ -1131,18 +1145,23 @@ def _static_pick(
 @pytest.mark.parametrize("sm", (148, 152))
 def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
     """T = 1, three Householder steps, on `sm` SMs: the row-partition program up to 160
-    state heads, l8r4 above it up to 4 x sm and again above 5 x sm, the one-wave-of-5
-    program l8r4w5 on (4 x sm, 5 x sm]; the choice depends on (T, B x HV, sm_count) only."""
-    expected = {
-        160: ("splitv", "splitv8_tile8"),
-        161: ("lanerow", "l8r4"),
-        4 * sm: ("lanerow", "l8r4"),
-        4 * sm + 1: ("lanerow", "l8r4w5"),
-        5 * sm: ("lanerow", "l8r4w5"),
-        5 * sm + 1: ("lanerow", "l8r4"),
-        20480: ("lanerow", "l8r4"),
-    }
+    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], the
+    one-wave-of-5 program l8r4w5 takes (4 x sm, 5 x sm] and l8r4 resumes above it, while
+    SM90 ships neither program and keeps l8r4 above 160.  The choice depends on
+    (arch, T, B x HV, sm_count) only."""
+    assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a"}
     for arch in loader.ROUTES:
+        one_wave = "l8r4" if arch == "sm_90a" else "l8r4p"
+        tail_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
+        expected = {
+            160: ("splitv", "splitv8_tile8"),
+            161: ("lanerow", one_wave),
+            4 * sm: ("lanerow", one_wave),
+            4 * sm + 1: ("lanerow", tail_wave),
+            5 * sm: ("lanerow", tail_wave),
+            5 * sm + 1: ("lanerow", "l8r4"),
+            20480: ("lanerow", "l8r4"),
+        }
         for state_heads, want in expected.items():
             assert _static_pick(arch, 3, 1, state_heads, sm) == want, (
                 arch,
@@ -1155,6 +1174,32 @@ def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
                     n,
                     state_heads,
                 )
+
+
+@pytest.mark.parametrize("sm", (132, 148, 152, 160))
+def test_t4_band_follows_the_architecture(sm: int) -> None:
+    """T = 4, three Householder steps: SM90 runs the one-CTA-per-SM program l4r2 up to
+    `sm` state heads and l8r4 above it; SM100 / SM103 run l8r4 on every state-head count
+    and ship no l4r2 program (and SM90 no l8r4p / l8r4w5 program)."""
+    for arch in loader.ROUTES:
+        for state_heads in (1, 24, sm, sm + 1, 4 * sm, 20480):
+            one_cta_wave = arch == "sm_90a" and state_heads <= sm
+            want = ("lanerow", "l4r2" if one_cta_wave else "l8r4")
+            assert _static_pick(arch, 3, 4, state_heads, sm) == want, (
+                arch,
+                state_heads,
+                sm,
+            )
+        variants = {
+            loader.MODULES[name]["build"]["variant"]
+            for key, names in loader.ROUTES[arch].items()
+            if key
+            != loader.PREFILL_ROUTE  # the prefill route: tests/gdp/test_cake_gdp_prefill.py
+            for name in names
+        }
+        assert ("l4r2" in variants) == (arch == "sm_90a"), (arch, sorted(variants))
+        assert ("l8r4w5" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
+        assert ("l8r4p" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
 
 
 def test_t1_static_programs_partition_every_sm_count() -> None:

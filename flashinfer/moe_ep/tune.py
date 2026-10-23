@@ -181,6 +181,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "after EP communication completes (SM100 NVFP4)",
     )
     parser.add_argument(
+        "--apply-routing-weights-before-fc2",
         "--apply-topk-in-fc1",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -327,6 +328,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             ".backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_tuner", __package__
         )
         return tuner.run_tuning(args)
+    if args.shared_expert:
+        print("--shared-expert requires --dtype sm120_mxfp4_mxfp8", file=sys.stderr)
+        return 2
     if args.dtype == "sm90_mxfp4":
         if args.arch not in ("auto", "sm90"):
             print("sm90_mxfp4 requires --arch auto or sm90", file=sys.stderr)
@@ -362,7 +366,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    if not args.do_finalize or not args.apply_topk_in_fc1:
+    if not args.do_finalize or not args.apply_routing_weights_before_fc2:
         if family != "sm100" or args.dtype != "nvfp4":
             print(
                 "caller finalization and routing-weight placement require SM100 NVFP4",

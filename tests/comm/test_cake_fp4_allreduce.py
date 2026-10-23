@@ -21,7 +21,9 @@ pre-quantised NVFP4 records, and the ``rmsnorm`` family (the two-rank one-shot
 exchange fused with the residual add and the Gemma RMSNorm; bfloat16, NVFP4 and
 MXFP8 outputs).  Each test spawns one process per rank on CUDA devices
 ``0..world_size-1`` and checks, against the exact float32 reference of
-``tests/comm/cake_fp4_allreduce_reference.py``: the workspace plan, two launches
+``tests/comm/cake_fp4_allreduce_reference.py`` (its sum of squares in the order
+of the fused-norm program the launch runs, from the registry): the workspace
+plan, two launches
 of every row case on one workspace (the second finds the rotated receive
 buffer and the advanced call state), an odd row count under a larger capacity,
 back-to-back and alternating-row calls, CUDA-graph capture and replay, negative
@@ -211,7 +213,8 @@ def _check_workspace(
     device: torch.device,
     capacity: int,
 ) -> None:
-    """World size, rank, grid == SM count, table entries, control words, capacity and target of a fresh workspace."""
+    """World size, rank, grid (the SM count within the programs' grid bound), table entries, control words,
+    capacity and target of a fresh workspace."""
     window = WINDOWS[f"{family}/{world_size}/{input_format}"]
     assert workspace.family == family
     assert workspace.input_format == input_format
@@ -219,19 +222,21 @@ def _check_workspace(
     assert workspace.rank == rank
     assert workspace.capacity == capacity
     assert workspace.device == device
-    assert workspace.grid == _sm_count(device)
+    # Every program keeps one four-word call-state slot per CTA in the control window, so the programs
+    # bound the grid on every path (one-shot, two-shot and fused norm) and the window provisions the bound.
+    bound = loader.grid_max(workspace.programs)
+    assert workspace.grid == min(_sm_count(device), bound)
+    assert 1 <= workspace.grid <= bound
     assert workspace.table.dtype == torch.int64
     assert workspace.table.numel() == len(window["table"]) * world_size
     assert all(int(pointer) != 0 for pointer in workspace.table.tolist())
     assert workspace.ctrl.dtype in (torch.int32, torch.uint32)
-    assert workspace.ctrl.numel() == window["ctrl_words"]
+    assert workspace.ctrl.numel() == window["ctrl_words"] == 4 * bound
     assert int(torch.count_nonzero(workspace.ctrl).item()) == 0
     assert workspace.target == loader.target_arch(device.index)
     assert workspace.target in ("sm_100a", "sm_103a", "sm_107a")
     capability = torch.cuda.get_device_capability(device)
     assert loader.supported_capability(capability) == tuple(capability)
-    if family == "allreduce" and world_size == 2:
-        assert workspace.grid <= LIMITS["tp2_oneshot_grid_max"]
     if world_size == 4:
         assert capacity <= LIMITS["tp4_cap_max"]
         for rows in (*ROWS[("allreduce", 4)], bv0_rows(workspace.grid)):
@@ -614,6 +619,7 @@ class NormCase:
                 self.weight,
                 eps=eps,
                 weight_bias=weight_bias,
+                ss_order=self.reference.ss_order,
             )
         return ref.reference_fused_rmsnorm(
             residual_bf16=self.residual,
@@ -622,6 +628,7 @@ class NormCase:
             global_scales=self.global_scales,
             eps=eps,
             weight_bias=weight_bias,
+            ss_order=self.reference.ss_order,
         )
 
     def launch(
@@ -641,21 +648,30 @@ class NormCase:
         )
 
 
+def _ss_order(workspace, rows: int, output: CakeFp4AllReduceFusedNormOutput) -> str:
+    """The sum-of-squares order of the fused-norm program a launch with ``rows`` rows and ``output`` runs on
+    this workspace's target (its registry record): the reference must sum in that order."""
+    return PROGRAMS[workspace.program(rows, output.value)]["ss_order"]
+
+
 def _norm_case(
     input_format: str,
     rows: int,
     seed: int,
     device: torch.device,
     *,
+    ss_order: str,
     eps: float = ref.EPS,
     weight_bias: float = ref.WEIGHT_BIAS,
 ) -> NormCase:
+    """The inputs of one fused launch and its reference, summing the squares in ``ss_order`` (the order of the
+    program the launch runs on this target, :func:`_ss_order`)."""
     xs = ref.partials(rows, seed, 2, device)
     residual = ref.residual(rows, seed, device)
     weight = ref.weight(seed, device)
     if input_format == "bf16":
         reference = ref.reference_fused_rmsnorm(
-            xs, residual, weight, eps=eps, weight_bias=weight_bias
+            xs, residual, weight, eps=eps, weight_bias=weight_bias, ss_order=ss_order
         )
         return NormCase(rows, xs, None, residual, weight, reference)
     records, global_scales = ref.records_of(xs)
@@ -666,6 +682,7 @@ def _norm_case(
         global_scales=global_scales,
         eps=eps,
         weight_bias=weight_bias,
+        ss_order=ss_order,
     )
     return NormCase(rows, records, global_scales, residual, weight, reference)
 
@@ -768,6 +785,8 @@ def _rmsnorm_cases(
             rows,
             workspace.grid,
         )
+        ss_order = PROGRAMS[program]["ss_order"]
+        assert ("_sop" in program) == (ss_order == "perm"), program
         previous = None
         for launch in range(LAUNCHES_PER_CASE):
             case = _norm_case(
@@ -775,6 +794,7 @@ def _rmsnorm_cases(
                 rows,
                 ref.launch_seed(seed + 17 * rows + 1000 * len(output.value), launch),
                 device,
+                ss_order=ss_order,
             )
             spec, expected = _spec_and_expected(case, output)
             buffers = _given_buffers(previous) if previous is not None else {}
@@ -797,9 +817,16 @@ def _rmsnorm_runtime_scalars(workspace, input_format, rank, device, group, seed)
     rows = MID_ROWS
     # mean(z^2) is about 80 for these inputs (the outliers): eps = 1e-5 is invisible in bfloat16 and
     # checks the plumbing, eps = 100 and weight_bias = 0 move y far outside the tolerance.
+    ss_order = _ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16)
     for eps, weight_bias in ((1e-5, 1.0), (100.0, 1.0), (1e-6, 0.0)):
         case = _norm_case(
-            input_format, rows, seed + 555, device, eps=eps, weight_bias=weight_bias
+            input_format,
+            rows,
+            seed + 555,
+            device,
+            ss_order=ss_order,
+            eps=eps,
+            weight_bias=weight_bias,
         )
         spec = CakeFp4AllReduceFusedNormSpec(
             weight=case.weight, eps=eps, weight_bias=weight_bias
@@ -822,7 +849,8 @@ def _rmsnorm_runtime_scalars(workspace, input_format, rank, device, group, seed)
 def _rmsnorm_negative_controls(workspace, input_format, rank, device, group, seed):
     """Stale expectations must fail: a reference with weight bias 1 + 2^-7, or (NVFP4 input) a wrong static scale."""
     rows = MID_ROWS
-    case = _norm_case(input_format, rows, seed + 99, device)
+    ss_order = _ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16)
+    case = _norm_case(input_format, rows, seed + 99, device, ss_order=ss_order)
     spec = CakeFp4AllReduceFusedNormSpec(weight=case.weight)
     result = case.launch(workspace, rank, spec)
     torch.cuda.synchronize(device)
@@ -858,6 +886,7 @@ def _rmsnorm_negative_controls(workspace, input_format, rank, device, group, see
                 weight_bf16=case.weight,
                 records=case.inputs,
                 global_scales=scales,
+                ss_order=ss_order,
             ),
         )
         result = wrong.launch(workspace, rank, spec)
@@ -879,9 +908,12 @@ def _rmsnorm_negative_controls(workspace, input_format, rank, device, group, see
 def _rmsnorm_back_to_back(workspace, input_format, rank, device, group, seed):
     """Four fused calls without host synchronisation into caller-provided buffers (rotation wrap-around)."""
     rows = MID_ROWS
+    ss_order = _ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16)
     calls = []
     for call in range(BACK_TO_BACK_CALLS):
-        case = _norm_case(input_format, rows, seed + 7777 * call, device)
+        case = _norm_case(
+            input_format, rows, seed + 7777 * call, device, ss_order=ss_order
+        )
         out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
         residual_out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
         calls.append((case, out, residual_out))
@@ -907,7 +939,13 @@ def _rmsnorm_alternating_rows(workspace, input_format, rank, device, group, seed
     key = ("rmsnorm", 2)
     sequence = (ROWS[key][-1], SMALL_ROWS[key], ROWS[key][-1], MID_ROWS)
     for call, rows in enumerate(sequence):
-        case = _norm_case(input_format, rows, seed + 31 * call, device)
+        case = _norm_case(
+            input_format,
+            rows,
+            seed + 31 * call,
+            device,
+            ss_order=_ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16),
+        )
         result = case.launch(
             workspace, rank, CakeFp4AllReduceFusedNormSpec(weight=case.weight)
         )
@@ -924,7 +962,13 @@ def _rmsnorm_alternating_rows(workspace, input_format, rank, device, group, seed
 
 def _rmsnorm_graph_replay(workspace, input_format, rank, device, group, seed):
     rows = MID_ROWS
-    case = _norm_case(input_format, rows, seed + 4242, device)
+    case = _norm_case(
+        input_format,
+        rows,
+        seed + 4242,
+        device,
+        ss_order=_ss_order(workspace, rows, CakeFp4AllReduceFusedNormOutput.BF16),
+    )
     spec = CakeFp4AllReduceFusedNormSpec(weight=case.weight)
     out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
     residual_out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
@@ -1164,7 +1208,13 @@ def _rmsnorm_suite(input_format, rank, device, group):
         dist.barrier(group=group)
         workspace.destroy()
         workspace.destroy()  # a second destroy is a no-op
-    after = _norm_case(input_format, 8, seed, device)
+    after = _norm_case(
+        input_format,
+        8,
+        seed,
+        device,
+        ss_order=_ss_order(workspace, 8, CakeFp4AllReduceFusedNormOutput.BF16),
+    )
     _expect(
         RuntimeError,
         lambda: after.launch(

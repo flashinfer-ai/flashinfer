@@ -92,8 +92,9 @@ minimax_h3_nvfp4_pre_attention_trace = TraceTemplate(
     description=(
         "BF16 RMSNorm and indexed AdaLN with dynamic NVFP4 activation "
         "quantization, prepacked NVFP4 (W4A4) QKV GEMM, Q/K RMSNorm and "
-        "split-half NeoX RoPE, followed by destination-major E2M1 and "
-        "swizzled E4M3 block-16 packing."
+        "split-half NeoX RoPE, followed by the destination-major output: E2M1 "
+        "nibble pairs with swizzled E4M3 block-16 scales (out_format nvfp4) or "
+        "float8_e4m3fn under one per-tensor scale per kind (out_format e4m3)."
     ),
     axes={
         "M": Var(description="Token rows."),
@@ -109,8 +110,10 @@ minimax_h3_nvfp4_pre_attention_trace = TraceTemplate(
         "heads_per_destination": Const(abbrev="hdst"),
         "qkv_kinds": Const(value=3, abbrev=""),
         "head_dim": Const(value=128, abbrev="d"),
-        "packed_head_dim": Const(
-            value=64, abbrev="", description="E2M1 nibble-pair bytes per head row."
+        "packed_head_dim": Var(
+            description=(
+                "Bytes per packed head row: 64 (nvfp4 E2M1 nibble pairs) or 128 (e4m3)."
+            )
         ),
         "weight_scale_elements": Var(),
         "output_scale_stride": Var(),
@@ -140,16 +143,36 @@ minimax_h3_nvfp4_pre_attention_trace = TraceTemplate(
         "rope_cos_sin": Tensor(["M", "rope_width"]),
         "out_global_scale": Tensor(
             ["1"],
-            description="Float32 NVFP4 global encode scale shared by Q/K/V outputs.",
+            dtype="float32",
+            optional=True,
+            description=(
+                "Float32 NVFP4 global encode scale shared by Q/K/V outputs "
+                "(out_format nvfp4); absent for e4m3."
+            ),
+        ),
+        "qkv_scales": Tensor(
+            ["qkv_kinds"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "Float32 per-tensor scales of Q, K and V for out_format e4m3 "
+                "(out_q = e4m3(value / qkv_scales[kind])); absent for nvfp4."
+            ),
         ),
         "out_q": Tensor(
             ["P", "M", "heads_per_destination", "qkv_kinds", "packed_head_dim"],
-            description="Caller-owned destination-major E2M1 nibble-pair output.",
+            description=(
+                "Caller-owned destination-major output: uint8 E2M1 nibble pairs "
+                "(nvfp4) or float8_e4m3fn (e4m3)."
+            ),
         ),
         "out_sf": Tensor(
             ["P", "output_scale_stride"],
+            dtype="uint8",
+            optional=True,
             description=(
-                "Caller-owned destination-major swizzled-128x4 E4M3 scale output."
+                "Caller-owned destination-major swizzled-128x4 E4M3 scale output "
+                "(out_format nvfp4); absent for e4m3."
             ),
         ),
         "debug_q_bf16": Tensor(
@@ -181,10 +204,12 @@ minimax_h3_nvfp4_pre_attention_trace = TraceTemplate(
             ["P", "output_scale_stride"],
             param="out_sf",
             dtype_from="out_sf",
+            dtype="uint8",
+            optional=True,
         ),
     },
     constraints=["P * heads_per_destination == 56"],
-    tags=["stage:pre_attention", "status:verified", "dtype:nvfp4"],
+    tags=["stage:pre_attention", "status:verified", "dtype:nvfp4", "dtype:e4m3"],
 )
 
 

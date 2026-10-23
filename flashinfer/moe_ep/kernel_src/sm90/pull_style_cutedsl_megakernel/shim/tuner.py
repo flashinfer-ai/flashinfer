@@ -32,6 +32,8 @@ import dataclasses
 import itertools
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 # --- knob value-sets (geometry domains mirror the kernel ctor validation;
 # see kernel_fp8_glu_fc12{,_swapab}.py _validate_mma_tiler_and_cluster_shape).
 
@@ -122,7 +124,10 @@ def default_knobs(
     }
 
 
-def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
+def is_valid(
+    knobs: Dict[str, Any], *, apply_routing_weights_before_fc2: bool = True
+) -> bool:
     """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
 
     Mirrors the kernel ctor / config ``__post_init__`` rules; unspecified
@@ -165,7 +170,7 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
         return False
     # Kernel invariant: the in-kernel reduce collapses topk before a separate
     # reducer could apply routing weights.
-    if in_kernel and not apply_topk_in_fc1:
+    if in_kernel and not apply_routing_weights_before_fc2:
         return False
     if knobs.get("active_dispatch_warps", 1) not in (1, 2, 4):
         return False
@@ -180,7 +185,7 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
             "reuse_dispatch_warps"
         ):
             return False
-        if in_kernel or not apply_topk_in_fc1:
+        if in_kernel or not apply_routing_weights_before_fc2:
             return False
     return True
 

@@ -293,6 +293,10 @@ _CG2_REGIONS = {
         [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
         [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
         [2, "float16", "k_major", 1024, 1024, 2048, 2048],
+        # The two measured SM-push ws4 M=512 rows (N = 2560), as points: the bf16
+        # k_major and fp16 k_major classes at exactly 512 padded rows.
+        [4, "bfloat16", "k_major", 512, 512, 2560, 2560],
+        [4, "float16", "k_major", 512, 512, 2560, 2560],
     ],
 }
 _CG2_CLASSES = {
@@ -308,6 +312,7 @@ _CG2_CLASSES = {
         (2, "bfloat16", "k_major"),
         (2, "float16", "k_major"),
         (4, "bfloat16", "k_major"),
+        (4, "float16", "k_major"),
         (8, "bfloat16", "k_major"),
     },
 }
@@ -319,9 +324,11 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
     and at its M=1024 point (exactly 1024 padded rows at N = 2048), the ws2 bf16
     k_major and fp16 k_major classes at their M=1024 points (exactly 1024 padded
     rows at N = 2048), the ws4 bf16 k_major class at 1024..1536 padded rows /
-    N <= 6058 and at its gate_up point (exactly 512 padded rows at N = 14336),
-    and the ws8 bf16 k_major class at its gate_up point (exactly 512 padded rows
-    at N = 7168; the M=2048 gate_up rows are not routed); on sm_100a
+    N <= 6058, at its gate_up point (exactly 512 padded rows at N = 14336) and
+    at its QKV M=512 point (exactly 512 padded rows at N = 2560), the ws4 fp16
+    k_major class at its M=512 point (exactly 512 padded rows at N = 2560), and
+    the ws8 bf16 k_major class at its gate_up point (exactly 512 padded rows at
+    N = 7168; the M=2048 gate_up rows are not routed); on sm_100a
     the ws2 bf16 n_major class at its three measured points (exactly 1024, 2048
     or 4096 padded rows at N = 2048), the ws2 bf16 k_major and fp16 k_major
     classes at their M=1024 points (exactly 1024 padded rows at N = 2048), the
@@ -352,19 +359,25 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
 
 
 # ``[world_size, dtype, b_layout, padded_rows, n, form]`` points: the spill-wave
-# N-split pair program of a measured row, on exact padded rows and exact N.
+# N-split pair program of a measured row, on exact padded rows and exact N. The
+# two measured bf16 k_major gate_up rows -- the ws4 M=512 row and the ws8 M=512
+# row -- on each architecture, each to the form its entry names (``cg2s2``: two
+# 256 x 128 spill tiles; ``cg2s1``, four 256 x 64, has no point).
 _CG2_SPILL_POINTS = {
-    "sm_100a": [],
+    "sm_100a": [
+        [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
+        [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
+    ],
     "sm_103a": [
-        # The two measured bf16 k_major gate_up rows -- the ws4 M=512 row and the
-        # ws8 M=512 row -- each to the form its entry names (``cg2s2``: two
-        # 256 x 128 spill tiles; ``cg2s1``, four 256 x 64, has no point).
         [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
         [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
     ],
 }
 _CG2S_CLASSES = {
-    "sm_100a": set(),
+    "sm_100a": {
+        (4, "bfloat16", "k_major", "cg2s2"),
+        (8, "bfloat16", "k_major", "cg2s2"),
+    },
     "sm_103a": {
         (4, "bfloat16", "k_major", "cg2s2"),
         (8, "bfloat16", "k_major", "cg2s2"),
@@ -374,9 +387,9 @@ _CG2S_CLASSES = {
 
 def test_cg2_spill_point_table_lists_the_measured_points_per_architecture():
     """The spill-wave N-split pair twins are delivered for the classes with a
-    measured point: on sm_103a the ws4 bf16 k_major class at exactly 512 padded
-    rows / N = 14336 and the ws8 bf16 k_major class at exactly 512 padded rows /
-    N = 7168, each to the form its pinned entry names; sm_100a has no point.
+    measured point: on both architectures the ws4 bf16 k_major class at exactly
+    512 padded rows / N = 14336 and the ws8 bf16 k_major class at exactly 512
+    padded rows / N = 7168, each to the form its pinned entry names.
     Every point lies inside a pair rectangle of its class and names a delivered
     spill class; the form order gives the host sequence's positional form
     codes."""
@@ -596,21 +609,40 @@ def test_every_route_has_one_host_sequence_per_architecture():
             assert row["sources"][-1].startswith(
                 "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_"
             )
-            assert row["sources"][-1].endswith(f"{name}.cu")
-            # Every sequence module compiles both SM push programs: the route and
-            # the push launch are decided per call (rows, world size).
-            assert loader.peer_push_program() in programs
-            assert loader.peer_push_wide_program() in programs
+            # The file is this class's sequence for one architecture of
+            # ``ARCH_FLAGS``; a row that builds from another architecture's
+            # file names its own host namespace through ``sequence_flags``.
+            file_arches = [
+                candidate
+                for candidate in loader.ARCH_FLAGS
+                if row["sources"][-1].endswith(
+                    loader.sequence_name(world_size, dtype_name, b_layout, candidate)
+                    + ".cu"
+                )
+            ]
+            assert len(file_arches) == 1
+            if file_arches != [arch]:
+                (flag,) = row["sequence_flags"]
+                assert flag.startswith("-DCAKE_SEQ_SHIM=cake_host_shim_seq_")
+            # A sequence of a world size the SM push route serves (4 and 8, as
+            # ``uses_sm_push`` decides) compiles both SM push programs: the route
+            # and the push launch are decided per call (rows, world size). No
+            # two-rank call takes that route, so a world-size-2 sequence compiles
+            # neither.
+            sm_push = row["world_size"] >= 4
+            assert (loader.peer_push_program() in programs) is sm_push
+            assert (loader.peer_push_wide_program() in programs) is sm_push
             # The ``_n128`` twin travels with the sequence exactly for the classes
             # with a delivered twin on this architecture (the per-call width is
             # chosen by ``main_block_n``, so both mains are compiled in).
             route = {
                 loader.barrier_program(0),
                 loader.barrier_program(1),
-                loader.peer_push_program(),
-                loader.peer_push_wide_program(),
                 loader.main_program(world_size, dtype_name, b_layout),
             }
+            if sm_push:
+                route.add(loader.peer_push_program())
+                route.add(loader.peer_push_wide_program())
             delivered = (world_size, dtype_name, b_layout) in _n128_classes(arch)
             assert ("main_n128" in row["programs"]) is delivered
             if delivered:
@@ -727,27 +759,35 @@ def test_every_program_is_delivered_for_both_architectures():
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout) in _n128_classes(arch)
         ), twin
-    # A ``_cg2`` main likewise (every pair class -- ws2 bf16 n_major, ws2 bf16
-    # k_major, ws2 fp16 k_major, ws4 bf16 k_major and ws8 bf16 k_major -- has
-    # pair-routed rows on both architectures).
+    # A ``_cg2`` main likewise (the pair classes ws2 bf16 n_major, ws2 bf16
+    # k_major, ws2 fp16 k_major, ws4 bf16 k_major and ws8 bf16 k_major have
+    # pair-routed rows on both architectures; ws4 fp16 k_major on sm_103a alone,
+    # its M=512 N=2560 point).
     assert sorted(_cg2_programs()) == [
         (2, "bfloat16", "k_major"),
         (2, "bfloat16", "n_major"),
         (2, "float16", "k_major"),
         (4, "bfloat16", "k_major"),
+        (4, "float16", "k_major"),
         (8, "bfloat16", "k_major"),
     ]
     for world_size, dtype_name, b_layout in _cg2_programs():
         pair = loader.main_program(world_size, dtype_name, b_layout, form="cg2")
-        assert loader.PROGRAMS[pair]["arches"] == sorted(
+        pair_arches = sorted(
             arch
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout) in _cg2_classes(arch)
+        )
+        assert loader.PROGRAMS[pair]["arches"] == pair_arches, pair
+        assert pair_arches == (
+            ["sm_103a"]
+            if (world_size, dtype_name, b_layout) == (4, "float16", "k_major")
+            else ["sm_100a", "sm_103a"]
         ), pair
-        assert loader.PROGRAMS[pair]["arches"] == ["sm_100a", "sm_103a"], pair
     # A spill-wave N-split pair twin is delivered for exactly the architectures
     # whose point table names its class (the pinned spill classes: the ws4 and
-    # ws8 bf16 k_major classes on sm_103a alone, each at the form of its points).
+    # ws8 bf16 k_major classes on both architectures, each at the form of its
+    # points).
     assert sorted(_cg2s_programs()) == sorted(
         {cls for classes in _CG2S_CLASSES.values() for cls in classes}
     )
@@ -758,7 +798,7 @@ def test_every_program_is_delivered_for_both_architectures():
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout, form) in _cg2s_classes(arch)
         ), spill
-        assert loader.PROGRAMS[spill]["arches"] == ["sm_103a"], spill
+        assert loader.PROGRAMS[spill]["arches"] == ["sm_100a", "sm_103a"], spill
     # A tile-order twin of the one-CTA main is delivered for exactly the
     # architectures whose point table names its class (the pinned order class:
     # the ws4 bf16 k_major ``po`` twin on sm_103a alone).
@@ -1374,11 +1414,11 @@ _INVENTORY_ROWS = (
         _N256,
     ),
     # The gate_up rows (896 / 3584 N256 tiles: beyond the cap of both
-    # architectures); on sm_103a the M=512 rows run the spill-wave N-split pair
-    # twin of their point and the M=2048 rows (not routed) keep the one-CTA
-    # program; on sm_100a the M=512 and M=1024 rows (measured points) run the
-    # CTA-pair twin and the M=1025 (1152 padded rows) / M=2048 rows keep the
-    # one-CTA program.
+    # architectures); on both architectures the M=512 rows run the spill-wave
+    # N-split pair twin of their point; on sm_100a the M=1024 rows (measured
+    # points) keep the CTA-pair twin and the M=1025 (1152 padded rows) / M=2048
+    # rows keep the one-CTA program; on sm_103a the M=1024 / M=1025 / M=2048
+    # rows (not routed) keep the one-CTA program.
     (
         "llama_tp4_gate_up_bf16_m512_kmajor",
         (512, 14336, 4, "bfloat16", "k_major"),
@@ -1547,8 +1587,9 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
     measured rectangle of its class on the architecture -- on sm_103a
     perf_bf16_m1024 / m2048 / m4096 and tail_ws2_bf16_m1000_n2048 (ws2 bf16
     n_major), kmajor_ws2_bf16_m1024_n2048 (ws2 bf16 k_major),
-    kmajor_ws2_fp16_m1024_n2048 (ws2 fp16 k_major), llama_tp4_qkv_bf16_m1024 /
-    m1025_kmajor and llama_tp4_gate_up_bf16_m512_kmajor (ws4 bf16 k_major) and
+    kmajor_ws2_fp16_m1024_n2048 (ws2 fp16 k_major), llama_tp4_qkv_bf16_m512 /
+    m1024 / m1025_kmajor and llama_tp4_gate_up_bf16_m512_kmajor (ws4 bf16
+    k_major), kmajor_ws4_fp16_m512_n2560 (ws4 fp16 k_major) and
     llama_tp8_gate_up_bf16_m512_kmajor (ws8 bf16 k_major); on sm_100a
     perf_bf16_m1024 / m2048 / m4096 and tail_ws2_bf16_m1000_n2048 (ws2 bf16
     n_major), kmajor_ws2_bf16_m1024_n2048 (ws2 bf16 k_major),
@@ -1556,7 +1597,7 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
     m1025 / m2048_kmajor and llama_tp4_gate_up_bf16_m512 / m1024_kmajor (ws4
     bf16 k_major) and llama_tp8_gate_up_bf16_m512 / m1024_kmajor (ws8 bf16
     k_major; the measured sm_100a points); the one-CTA form for every other row.
-    Of the pair rows, the two sm_103a spill points --
+    Of the pair rows, the two spill points of each architecture --
     llama_tp4_gate_up_bf16_m512_kmajor and llama_tp8_gate_up_bf16_m512_kmajor --
     run the spill-wave N-split pair twin of the form their point names instead;
     llama_tp4_qkv_bf16_m1024_kmajor stays on the CTA-pair twin. Of the one-CTA
@@ -1617,8 +1658,10 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
                     "tail_ws2_bf16_m1000_n2048",
                     "kmajor_ws2_bf16_m1024_n2048",
                     "kmajor_ws2_fp16_m1024_n2048",
+                    "llama_tp4_qkv_bf16_m512_kmajor",
                     "llama_tp4_qkv_bf16_m1024_kmajor",
                     "llama_tp4_qkv_bf16_m1025_kmajor",
+                    "kmajor_ws4_fp16_m512_n2560",
                     "llama_tp4_gate_up_bf16_m512_kmajor",
                     "llama_tp8_gate_up_bf16_m512_kmajor",
                 },
@@ -1640,7 +1683,7 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
             }[arch]
         )
         assert (form in loader.PAIR_FORMS) is expected_pair, (label, arch)
-        expected_spill = arch == "sm_103a" and label in {
+        expected_spill = label in {
             "llama_tp4_gate_up_bf16_m512_kmajor",
             "llama_tp8_gate_up_bf16_m512_kmajor",
         }
@@ -1738,11 +1781,11 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
             elif world_size == 4:
                 # (4, bfloat16, k_major): exactly 1024, 1152 or 2048 padded rows
                 # at N = 2560 (897..1024, 1025..1152 and 1921..2048 pad onto the
-                # points; M = 1000 is inside the 1024 point); no spill point here.
+                # points; M = 1000 is inside the 1024 point); the N = 2560 points
+                # carry no spill point.
                 cls = (4, "bfloat16", "k_major")
                 assert (dtype_name, b_layout) == cls[1:]
                 assert _spill_point_form(arch, *cls, 1024, 2560) is None
-                assert _spill_point_form(arch, *cls, 512, 14336) is None
                 # No tile-order point on sm_100a: the 1..128-row gate_up calls
                 # keep the one-CTA program (asserted below with rows 1 / 128).
                 assert loader._tile_order_point(arch, *cls, 128, 14336) is None
@@ -1759,11 +1802,15 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 assert rule(1024, n=5888) == "cg1" and rule(512, n=2560) == "cg1"
                 # ... and the gate_up points: exactly 512 or 1024 padded rows at
                 # N = 14336 (385..512 and 897..1024 pad onto them; 513 pads to 640,
-                # 1025 to 1152 and 2048 stays one-CTA).
+                # 1025 to 1152 and 2048 stays one-CTA). The 512 point is the spill
+                # point (llama_tp4_gate_up m512): the spill-wave N-split pair twin
+                # of its form; the 1024 point keeps the CTA-pair twin.
+                p_gate = _spill_point_form(arch, *cls, 512, 14336)
+                assert p_gate in loader.PAIR_FORMS[1:]
                 assert [
                     rule(rows, n=14336)
                     for rows in (385, 500, 511, 512, 897, 1000, 1023, 1024)
-                ] == ["cg2"] * 8
+                ] == [p_gate] * 4 + ["cg2"] * 4
                 assert [
                     rule(rows, n=14336)
                     for rows in (
@@ -1785,18 +1832,21 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
             else:
                 # (8, bfloat16, k_major): exactly 512 or 1024 padded rows at
                 # N = 7168 (385..512 and 897..1024 pad onto the points; 513 pads
-                # to 640, 1025 to 1152); every N = 1280 call stays one-CTA; no
-                # spill point here.
+                # to 640, 1025 to 1152); every N = 1280 call stays one-CTA. The
+                # 512 point is the spill point (llama_tp8_gate_up m512): the
+                # spill-wave N-split pair twin of its form; the 1024 point keeps
+                # the CTA-pair twin.
                 cls = (8, "bfloat16", "k_major")
                 assert (dtype_name, b_layout) == cls[1:]
-                assert _spill_point_form(arch, *cls, 512, 7168) is None
+                p_ws8 = _spill_point_form(arch, *cls, 512, 7168)
+                assert p_ws8 in loader.PAIR_FORMS[1:]
                 assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
                     "cg1"
                 ] * 6
                 assert [
                     rule(rows, n=7168)
                     for rows in (385, 500, 511, 512, 897, 1000, 1023, 1024)
-                ] == ["cg2"] * 8
+                ] == [p_ws8] * 4 + ["cg2"] * 4
                 assert [
                     rule(rows, n=7168)
                     for rows in (
@@ -1851,18 +1901,45 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
             for cols in (2047, 2049):
                 with pytest.raises(ValueError, match="multiple of 256"):
                     rule(1024, n=cols)
+        elif (world_size, dtype_name) == (4, "float16"):
+            # (4, float16, k_major), the measured SM-push ws4 M=512 point
+            # (kmajor_ws4_fp16_m512_n2560): exactly 512 padded rows at exactly
+            # N = 2560 run the CTA-pair twin (385..511 pad onto the point; 513 pads
+            # to 640 and leaves); the class has no other rectangle, no spill point
+            # and no tile-order point, so every other call stays cg1.
+            cls = (4, "float16", "k_major")
+            assert b_layout == "k_major"
+            assert _spill_point_form(arch, *cls, 512, 2560) is None
+            assert loader._tile_order_point(arch, *cls, 512, 2560) is None
+            assert [rule(rows) for rows in (385, 500, 511, 512)] == ["cg2"] * 4
+            assert [
+                rule(rows)
+                for rows in (1, 128, 384, 513, 640, 1024, 1025, 1536, 2048, 4096, 65536)
+            ] == ["cg1"] * 11
+            assert rule(512, n=2304) == "cg1" and rule(512, n=2816) == "cg1"
+            assert rule(512, n=14336) == "cg1" and rule(1024, n=14336) == "cg1"
+            assert rule(512, block_n=128) == "cg1"
+            for cols in (2559, 2561):
+                with pytest.raises(ValueError, match="multiple of 256"):
+                    rule(512, n=cols)
         elif world_size == 4:
             # (4, bfloat16, k_major) rectangle: 1024..1536 padded rows, N <= 6058;
             # every call of the rectangle runs the CTA-pair twin (the QKV M=1024
             # row at N = 2560 is no spill point: 897..1024 pad onto it and keep
-            # the twin like 1025..1536).
+            # the twin like 1025..1536); and the measured SM-push ws4 M=512 point
+            # (llama_tp4_qkv_bf16_m512_kmajor): exactly 512 padded rows at exactly
+            # N = 2560 run the twin too (385..511 pad onto the point; 513 pads to
+            # 640 and leaves; no spill point there either).
             assert _spill_point_form(arch, 4, "bfloat16", "k_major", 1024, 2560) is None
-            assert [rule(rows) for rows in (1, 512, 896, 1537, 2048, 4096, 65536)] == [
-                "cg1"
-            ] * 7
-            assert [rule(rows) for rows in (897, 1000, 1024, 1025, 1100, 1536)] == [
-                "cg2"
-            ] * 6
+            assert _spill_point_form(arch, 4, "bfloat16", "k_major", 512, 2560) is None
+            assert [
+                rule(rows) for rows in (1, 384, 513, 640, 896, 1537, 2048, 4096, 65536)
+            ] == ["cg1"] * 9
+            assert [
+                rule(rows)
+                for rows in (385, 500, 511, 512, 897, 1000, 1024, 1025, 1100, 1536)
+            ] == ["cg2"] * 10
+            assert rule(512, n=2304) == "cg1" and rule(512, n=2816) == "cg1"
             assert rule(1024, n=2304) == "cg2" and rule(1024, n=2816) == "cg2"
             assert (
                 rule(1024, n=5888) == "cg2"
@@ -2975,22 +3052,29 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
     assert state.next_phase == 1 and state.ready_epoch == 1
 
 
-def _pinned_spill_code(world_size, dtype_name, b_layout, padded, n):
-    """Host-sequence form code of the pinned sm_103a spill point naming the
+def _pinned_spill_code(arch, world_size, dtype_name, b_layout, padded, n):
+    """Host-sequence form code of the pinned spill point of ``arch`` naming the
     class, padded rows and ``n`` (``_CG2_SPILL_POINTS``): the launch rows below
     follow the pinned table when a point's form changes."""
 
     [form] = [
         entry[5]
-        for entry in _CG2_SPILL_POINTS["sm_103a"]
+        for entry in _CG2_SPILL_POINTS[arch]
         if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n)
     ]
     return loader.main_form_code(form)
 
 
-# The two sm_103a points: the ws4 gate_up M=512 row and the ws8 gate_up M=512 row.
-_GATE_WS4_CODE = _pinned_spill_code(4, "bfloat16", "k_major", 512, 14336)
-_GATE_WS8_CODE = _pinned_spill_code(8, "bfloat16", "k_major", 512, 7168)
+# The two points of each architecture: the ws4 gate_up M=512 row and the ws8
+# gate_up M=512 row.
+_GATE_WS4_CODE = _pinned_spill_code("sm_103a", 4, "bfloat16", "k_major", 512, 14336)
+_GATE_WS8_CODE = _pinned_spill_code("sm_103a", 8, "bfloat16", "k_major", 512, 7168)
+_GATE_WS4_CODE_SM100A = _pinned_spill_code(
+    "sm_100a", 4, "bfloat16", "k_major", 512, 14336
+)
+_GATE_WS8_CODE_SM100A = _pinned_spill_code(
+    "sm_100a", 8, "bfloat16", "k_major", 512, 7168
+)
 
 
 def _pinned_order_code(world_size, dtype_name, b_layout, padded, n):
@@ -3069,6 +3153,20 @@ _ORDER_WS4_CODE = _pinned_order_code(4, "bfloat16", "k_major", 128, 14336)
         (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS8_CODE),
         (2048, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (513, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        # The measured SM-push ws4 M=512 points on sm_103a: ws4 bf16 k_major and ws4
+        # fp16 k_major at exactly 512 padded rows and N = 2560 (500 pads to 512;
+        # 513 pads to 640 and leaves) select the CTA-pair twin (form code 1) on
+        # the SM push route (512 padded rows at N = 2560 is within the base push
+        # rule; 640 padded rows take the copy engines); the points carry no spill
+        # point. sm_100a routes the 512-row calls to the N128 twin (no pair form).
+        (512, 2560, 4, "sm_103a", "bfloat16", "k_major", "run_push", 256, 1),
+        (500, 2560, 4, "sm_103a", "bfloat16", "k_major", "run_push", 256, 1),
+        (513, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (512, 2560, 4, "sm_103a", "float16", "k_major", "run_push", 256, 1),
+        (500, 2560, 4, "sm_103a", "float16", "k_major", "run_push", 256, 1),
+        (513, 2560, 4, "sm_103a", "float16", "k_major", "run", 256, 0),
+        (512, 2560, 4, "sm_100a", "bfloat16", "k_major", "run_push", 128, 0),
+        (512, 2560, 4, "sm_100a", "float16", "k_major", "run_push", 128, 0),
         # The measured points on sm_100a: ws2 bf16 n_major at
         # exactly 1024, 2048 or 4096 padded rows and N = 2048, ws4 bf16 k_major at
         # exactly 1024, 1152 or 2048 padded rows and N = 2560 (1000 pads to 1024
@@ -3076,7 +3174,11 @@ _ORDER_WS4_CODE = _pinned_order_code(4, "bfloat16", "k_major", 128, 14336)
         # leaves) and at exactly 512 or 1024 padded rows and N = 14336, ws8 bf16
         # k_major at exactly 512 or 1024 padded rows and N = 7168 (500 / 1000 pad
         # to 512 / 1024 and take the twin; 513 / 1025 pad to 640 / 1152 and
-        # leave; the M=2048 gate_up rows stay one-CTA).
+        # leave; the M=2048 gate_up rows stay one-CTA). The sm_100a gate_up
+        # points -- ws4 bf16 k_major at exactly 512 padded rows and N = 14336,
+        # ws8 bf16 k_major at exactly 512 padded rows and N = 7168 (500 pads to
+        # 512) -- select the spill-wave N-split pair twin of the form each pinned
+        # point names; the 1024-row points keep the CTA-pair twin.
         (2048, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
         (4096, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
         (1024, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
@@ -3086,15 +3188,55 @@ _ORDER_WS4_CODE = _pinned_order_code(4, "bfloat16", "k_major", 128, 14336)
         (1153, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (3000, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
         (1024, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
-        (512, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
-        (500, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (
+            512,
+            14336,
+            4,
+            "sm_100a",
+            "bfloat16",
+            "k_major",
+            "run",
+            256,
+            _GATE_WS4_CODE_SM100A,
+        ),
+        (
+            500,
+            14336,
+            4,
+            "sm_100a",
+            "bfloat16",
+            "k_major",
+            "run",
+            256,
+            _GATE_WS4_CODE_SM100A,
+        ),
         (513, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (1024, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
         (1000, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
         (1025, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (2048, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
-        (512, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
-        (500, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (
+            512,
+            7168,
+            8,
+            "sm_100a",
+            "bfloat16",
+            "k_major",
+            "run",
+            256,
+            _GATE_WS8_CODE_SM100A,
+        ),
+        (
+            500,
+            7168,
+            8,
+            "sm_100a",
+            "bfloat16",
+            "k_major",
+            "run",
+            256,
+            _GATE_WS8_CODE_SM100A,
+        ),
         (513, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (1024, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
         (1000, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
