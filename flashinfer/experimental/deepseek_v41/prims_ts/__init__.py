@@ -1,6 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Joint shared-unit FP8 SWA/main attention for the V4.1 adapter."""
+"""Host entry points and JIT dispatch for V4.1 Prims-TS decode.
+
+Native attention configuration and ABI adaptation live in kernel.py; KV staging
+and inline metadata views live in resources.py and _sparse_views.py. GPU modules
+are imported only during compilation so workspace queries stay lightweight.
+"""
 
 import functools
 import hashlib
@@ -9,67 +14,6 @@ from pathlib import Path
 import torch
 
 from ._workspace import bind_inputs, device_sm_count
-
-
-def _make_fp8_attention(compressed_k, sm_count, native_fp4):
-    from ...attention.prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
-    from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
-        ThroughputLatencyMlaDecodeTs,
-    )
-    from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
-        MlaProfile,
-    )
-    from .prims_ts_resources import MixedFp8KvProducer
-
-    # A fixed SWA HEAD precedes ceil(K/128) main LOOP tiles, including when
-    # every SWA entry is invalid. One online softmax/PV state spans both pools.
-    capacity = max(256, 128 + ((compressed_k + 127) // 128) * 128)
-    attention = ThroughputLatencyMlaDecodeTs(
-        batch_size=1,
-        num_heads=64,
-        seq_len_q=1,
-        seq_len_k=capacity,
-        latent_dim=512,
-        rope_dim=0,
-        page_size=1,
-        max_active_clusters=sm_count,
-        qkv_dtype="e4m3",
-        out_dtype="bf16",
-        profile=MlaProfile(
-            name="dsv41_shared_pertensor_joint",
-            kernel_variant="keeps_mma_ab",
-            tile_size_q=64,
-            use_persistent_scheduler=0,
-        ),
-        logical_num_heads=64,
-        logical_seq_len_q=1,
-        tile_size_q=64,
-        explicit_split_kv=1,
-        explicit_persistent=False,
-        reduction_mode="gmem_separate",
-        mask_type="dense",
-        sparse_profile=SparseMlaProfile(
-            family="keep",
-            tile_size_q=64,
-            split_kv=1,
-            scheduler="nonpersistent",
-            head_dim_ctas=1,
-            gather_issue_warps=4,
-            reuse_kv=True,
-            reuse_kv_stages=8,
-            kv_tile_size=128,
-            page_pipeline_stages=1,
-        ),
-        finalize_output=True,
-        kv_producer=MixedFp8KvProducer(native_fp4=native_fp4),
-    )
-    # Static here means host scalars, not device scales or value-specialized
-    # binaries; both BMM factors remain runtime Float32.
-    attention.direct_sparse = True
-    attention.direct_static_scales = True
-    attention.direct_split_softmax_scale = True
-    attention.direct_sparse_capacities = (128, compressed_k)
-    return attention
 
 
 @functools.cache
@@ -91,24 +35,22 @@ def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
     if native_fp4 and compiler < (13, 2):
         raise RuntimeError("native FP4 conversion requires bundled CUDA >= 13.2")
 
-    from ...cute_dsl.availability import require_cute_dsl_arch
+    from ....cute_dsl.availability import require_cute_dsl_arch
 
     require_cute_dsl_arch(device_index)
 
-    from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import kernel
-    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
-    from ...cute_dsl import fp4_common
-    from . import (
-        _sparse_views,
-        _workspace,
-        hca_v41_primitives,
-        prims_ts_fp8,
-        prims_ts_resources,
+    from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+        kernel as native_kernel,
     )
+    from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ....cute_dsl import fp4_common
+    from .. import hca_v41_primitives
+    from . import _sparse_views, _workspace, resources
+    from . import kernel as adapter_kernel
 
     sm_count = device_sm_count(device_index)
-    attention = _make_fp8_attention(compressed_k, sm_count, native_fp4)
-    decode_kernel = prims_ts_fp8.Fp8SwaDecodeKernel(attention)
+    attention = adapter_kernel._make_fp8_attention(compressed_k, sm_count, native_fp4)
+    decode_kernel = adapter_kernel.Fp8SwaDecodeKernel(attention)
     batch = cute.sym_int()
     f = cute.runtime.make_fake_compact_tensor
 
@@ -155,7 +97,7 @@ def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
         compiler,
     )
     key = hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
-    native_root = Path(kernel.__file__).resolve().parents[3]
+    native_root = Path(native_kernel.__file__).resolve().parents[3]
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
         f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split1_i64"
@@ -181,8 +123,8 @@ def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
             __file__,
             _workspace.__file__,
             _sparse_views.__file__,
-            prims_ts_fp8.__file__,
-            prims_ts_resources.__file__,
+            adapter_kernel.__file__,
+            resources.__file__,
             hca_v41_primitives.__file__,
             fp4_common.__file__,
             *sorted(native_root.rglob("*.py")),

@@ -142,7 +142,7 @@ def workspace_host(monkeypatch):
         _PRIVATE / "_utils.py", "_dsv41_workspace_utils_cpu", monkeypatch
     )
     module = _load_host(
-        _PRIVATE / "_workspace.py",
+        _PRIVATE / "prims_ts/_workspace.py",
         "_dsv41_workspace_cpu",
         monkeypatch,
         torch=torch,
@@ -196,7 +196,7 @@ def workspace_host(monkeypatch):
     # Production global lookups see only these declared host simulations.
     # The real Torch CUDA guard remains installed and is never called.
     monkeypatch.setattr(module, "torch", HostTorch())
-    imports["experimental.deepseek_v41._workspace"] = module
+    imports["experimental.deepseek_v41.prims_ts._workspace"] = module
     assert torch.cuda._initialized == initialized and not blocked
     try:
         yield SimpleNamespace(
@@ -625,7 +625,7 @@ def test_window_delegates_k0_output_only(workspace_host):
     target = Mock(return_value=result)
     window = next(
         node
-        for node in ast.parse((_PRIVATE / "prims_ts.py").read_text()).body
+        for node in ast.parse((_PRIVATE / "prims_ts/__init__.py").read_text()).body
         if isinstance(node, ast.FunctionDef) and node.name == "decode_window"
     )
     namespace = {"decode_mixed": target}

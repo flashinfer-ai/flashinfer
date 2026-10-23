@@ -140,7 +140,7 @@ def deepseek_v41_decode_workspace_size(
     must be32-byte aligned. The original CuTe DSL API owns scratch via its
     plan and does not consume this caller workspace.
     """
-    from .experimental.deepseek_v41._workspace import workspace_size
+    from .experimental.deepseek_v41.prims_ts._workspace import workspace_size
 
     return workspace_size(batch_size, compressed_topk, backend=backend)
 

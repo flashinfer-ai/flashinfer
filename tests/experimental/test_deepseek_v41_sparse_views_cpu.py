@@ -24,11 +24,11 @@ import pytest
 
 
 _ROOT = Path(__file__).resolve().parents[2]
-_PRIVATE = _ROOT / "flashinfer/experimental/deepseek_v41/_sparse_views.py"
+_PRIVATE = _ROOT / "flashinfer/experimental/deepseek_v41/prims_ts/_sparse_views.py"
 _CORE = (
     _ROOT / "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/sparse_indices.py"
 )
-_PRODUCER = _PRIVATE.with_name("prims_ts_resources.py")
+_PRODUCER = _PRIVATE.with_name("resources.py")
 _INT_MIN = -(1 << 31)
 _INT_MAX = (1 << 31) - 1
 _WIDTH_EXTENTS = (

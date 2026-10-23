@@ -53,12 +53,12 @@ from flashinfer.deepseek_v41 import (
 
 
 PRIMS_TS_SOURCES = (
-    "experimental/deepseek_v41/_sparse_views.py",
-    "experimental/deepseek_v41/_workspace.py",
+    "experimental/deepseek_v41/prims_ts/_sparse_views.py",
+    "experimental/deepseek_v41/prims_ts/_workspace.py",
     "experimental/deepseek_v41/hca_v41_primitives.py",
-    "experimental/deepseek_v41/prims_ts.py",
-    "experimental/deepseek_v41/prims_ts_fp8.py",
-    "experimental/deepseek_v41/prims_ts_resources.py",
+    "experimental/deepseek_v41/prims_ts/__init__.py",
+    "experimental/deepseek_v41/prims_ts/kernel.py",
+    "experimental/deepseek_v41/prims_ts/resources.py",
     "cute_dsl/fp4_common.py",
     "attention/prims_ts/kernels/mla_decode/helpers/ops.py",
     "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py",
@@ -380,7 +380,9 @@ def prepare_decode(args, backend):
     if backend != "prims-ts":
         raise ValueError("backend must be cute-dsl or prims-ts")
 
-    from flashinfer.experimental.deepseek_v41._workspace import workspace_views
+    from flashinfer.experimental.deepseek_v41.prims_ts._workspace import (
+        workspace_views,
+    )
 
     q, swa, main, wi, ci, sink = args
     batch, compressed_k = q.shape[0], ci.shape[-1]
