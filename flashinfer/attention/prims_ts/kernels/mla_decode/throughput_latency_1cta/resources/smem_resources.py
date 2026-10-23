@@ -533,9 +533,21 @@ class SmemPageOffsetsResource(MlaResource):
                 batch_idx,
             )
             local_tile_idx = local_kv_tile_idx(
-                cfg, stage_info, inst_id, is_v, section=section
+                cfg,
+                stage_info,
+                inst_id,
+                is_v,
+                section=section,
+                requested_splits=self.runtime_split_kv,
             )
-            tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+            tile_idx = global_kv_tile_idx(
+                cfg,
+                local_tile_idx,
+                seq_len_kv,
+                cta_idx_kv,
+                requested_splits=self.runtime_split_kv,
+                task_cache=decode_gen_task_cache(stage_info),
+            )
             tile_start = tile_idx * pages_per_tile
             routes = self.page_offsets.select_source_tile(tile_start, batch_idx)
             position = lane_idx * Int32(4)
@@ -573,10 +585,20 @@ class SmemPageOffsetsResource(MlaResource):
                     batch_idx,
                 )
                 local_tile_idx = local_kv_tile_idx(
-                    cfg, stage_info, inst_id, is_v, section=section
+                    cfg,
+                    stage_info,
+                    inst_id,
+                    is_v,
+                    section=section,
+                    requested_splits=self.runtime_split_kv,
                 )
                 tile_idx = global_kv_tile_idx(
-                    cfg, local_tile_idx, seq_len_kv, cta_idx_kv
+                    cfg,
+                    local_tile_idx,
+                    seq_len_kv,
+                    cta_idx_kv,
+                    requested_splits=self.runtime_split_kv,
+                    task_cache=decode_gen_task_cache(stage_info),
                 )
                 last_valid_page = cute.math.max(
                     (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
@@ -958,7 +980,12 @@ class SmemKvResource(MlaResource):
         if cutlass.const_expr(tma_desc is None):
             return
         local_tile_idx = local_kv_tile_idx(
-            cfg, stage_info, inst_id, is_v, section=section
+            cfg,
+            stage_info,
+            inst_id,
+            is_v,
+            section=section,
+            requested_splits=self.runtime_split_kv,
         )
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
@@ -970,7 +997,14 @@ class SmemKvResource(MlaResource):
             self.cu_seqlens_q,
             batch_idx,
         )
-        tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+        tile_idx = global_kv_tile_idx(
+            cfg,
+            local_tile_idx,
+            seq_len_kv,
+            cta_idx_kv,
+            requested_splits=self.runtime_split_kv,
+            task_cache=decode_gen_task_cache(stage_info),
+        )
         stage_base = self._stage_base(stage_info)
         inner_width = min(tma_inner_dim_elems(cfg), active_width)
         uses_compact_fp8_rope_stage = (

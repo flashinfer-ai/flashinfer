@@ -19,6 +19,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
+from ..helpers.math import final_lse
 from .config import (
     REDUCTION_THREADS_PER_ROW,
     REDUCTION_VALUES_PER_THREAD,
@@ -54,6 +55,7 @@ def run_reduction_kernel(
     cfg,
     max_splits: cutlass.Constexpr[int],
     rows_per_cta: cutlass.Constexpr[int],
+    split_divisor=None,
 ):
     """Combine consecutive logical split rows in one reference-reducer CTA.
 
@@ -175,6 +177,7 @@ def run_reduction_kernel(
         row_k_tile_total,
         tile_k_tile_total,
         split_kv_cap,
+        split_divisor=split_divisor,
     )
 
     smem_lse_scale = cutlass.Array(
@@ -193,23 +196,25 @@ def run_reduction_kernel(
         local_lse = cutlass.Array(kernel.lse_dtype, lse_per_thread)
         lse_max = kernel.lse_dtype(-kernel.lse_dtype.inf)
         for i in cutlass.range_constexpr(lse_per_thread):
-            split_kv_idx = lane_idx + i * cfg.threads_per_warp
-            active_slot = query_is_valid & cute.elem_less(
-                split_kv_idx,
-                local_split_kv,
-            )
-            local_lse[i] = -kernel.lse_dtype.inf
-            # Keep the workspace access inside the dynamic predicate. Split
-            # capacities need not be warp-aligned, so padded lanes must not
-            # form an address beyond the producer allocation.
-            if active_slot:
-                local_lse[i] = acc_lse_tile[split_kv_idx]
-            lse_max = fmax_f32(lse_max, local_lse[i])
+            if Int32(i * cfg.threads_per_warp) < local_split_kv:
+                split_kv_idx = lane_idx + i * cfg.threads_per_warp
+                active_slot = query_is_valid & cute.elem_less(
+                    split_kv_idx,
+                    local_split_kv,
+                )
+                local_lse[i] = -kernel.lse_dtype.inf
+                # Keep the workspace access inside the dynamic predicate. Split
+                # capacities need not be warp-aligned, so padded lanes must not
+                # form an address beyond the producer allocation.
+                if active_slot:
+                    local_lse[i] = acc_lse_tile[split_kv_idx]
+                lse_max = fmax_f32(lse_max, local_lse[i])
         lse_max = warp_reduce_max_f32(lse_max)
         lse_max = lse_max if lse_max != -kernel.lse_dtype.inf else 0.0
         sum_lse = kernel.lse_dtype(0.0)
         for i in cutlass.range_constexpr(lse_per_thread):
-            sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
+            if Int32(i * cfg.threads_per_warp) < local_split_kv:
+                sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
         sum_lse = warp_reduce_sum_f32(sum_lse)
         has_finite_mass = sum_lse == sum_lse and sum_lse != kernel.lse_dtype(0.0)
         global_lse = (
@@ -218,15 +223,19 @@ def run_reduction_kernel(
             else -kernel.lse_dtype.inf
         )
         if lane_idx == 0 and query_is_valid:
-            (lse.iterator.raw_ptr() + Int64(public_flat_query_row)).store(global_lse)
-        for i in cutlass.range_constexpr(lse_per_thread):
-            split_kv_idx = lane_idx + i * cfg.threads_per_warp
-            if cute.elem_less(split_kv_idx, local_split_kv):
-                smem_lse_scale[row_scale_offset + split_kv_idx] = (
-                    cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
-                    if has_finite_mass
-                    else kernel.lse_dtype(0.0)
+            if cutlass.const_expr(lse is not None):
+                (lse.iterator.raw_ptr() + Int64(public_flat_query_row)).store(
+                    final_lse(global_lse, cfg.lse_base_on_e)
                 )
+        for i in cutlass.range_constexpr(lse_per_thread):
+            if Int32(i * cfg.threads_per_warp) < local_split_kv:
+                split_kv_idx = lane_idx + i * cfg.threads_per_warp
+                if cute.elem_less(split_kv_idx, local_split_kv):
+                    smem_lse_scale[row_scale_offset + split_kv_idx] = (
+                        cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
+                        if has_finite_mass
+                        else kernel.lse_dtype(0.0)
+                    )
 
     # Independent writer warps publish scales before any row consumes
     # them.  Invalid/padded rows participate so this remains a full CTA barrier.
@@ -249,16 +258,9 @@ def run_reduction_kernel(
     acc_output_ptr = acc_output.iterator.raw_ptr()
     if query_is_valid:
         partial_elem_offset_base = (
-            Int64(batch_idx)
-            * Int64(cute.size(acc_output.shape[3]))
-            * Int64(physical_tile_rows)
-            * Int64(split_kv)
-            * Int64(cfg.latent_dim)
-            + Int64(query_tile_idx)
-            * Int64(physical_tile_rows)
-            * Int64(split_kv)
-            * Int64(cfg.latent_dim)
-            + Int64(row_in_tile) * Int64(split_kv) * Int64(cfg.latent_dim)
+            Int64(batch_idx) * Int64(acc_output.stride[4])
+            + Int64(query_tile_idx) * Int64(acc_output.stride[3])
+            + Int64(row_in_tile) * Int64(acc_output.stride[0])
             + Int64(element_idx)
         )
         partial_output_ptr = acc_output_ptr + partial_elem_offset_base
@@ -279,7 +281,7 @@ def run_reduction_kernel(
                     scale = Float32(smem_lse_scale[row_scale_offset + Int32(i)])
                     acc_vec = acc_vec + partial_vec * scale
         else:
-            for i in range(local_split_kv):
+            for i in cutlass.range(local_split_kv, unroll=4):
                 partial_vec = (
                     (partial_output_ptr + Int64(i) * Int64(cfg.latent_dim))
                     .load(

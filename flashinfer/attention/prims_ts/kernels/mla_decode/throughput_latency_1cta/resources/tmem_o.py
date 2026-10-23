@@ -37,6 +37,7 @@ from ...helpers.constants import (
 )
 
 from ...helpers.layout import (
+    _TASK_CACHE_LOCAL_KV_TILES,
     _TASK_CACHE_TMEM_BASE_OFFSET,
     SMEM_ROW_BYTES,
     decode_gen_task_cache,
@@ -143,6 +144,10 @@ class TmemOResource(MlaResource):
     @cute.jit
     def _tail_has_prior_o(self, stage_info: StageInfo):
         """Return whether tail PV should accumulate into existing O state."""
+        if cutlass.const_expr(self.runtime_split_kv is not None):
+            return Int32(
+                decode_gen_task_cache(stage_info)[_TASK_CACHE_LOCAL_KV_TILES]
+            ) > Int32(self.cfg.num_insts_kv)
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, self.cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
         seq_len_kv = runtime_seq_len_kv_from_task_cache(
@@ -152,9 +157,9 @@ class TmemOResource(MlaResource):
             self.cu_seqlens_q,
             batch_idx,
         )
-        return runtime_local_kv_tiles(self.cfg, seq_len_kv) > Int32(
-            self.cfg.num_insts_kv
-        )
+        return runtime_local_kv_tiles(
+            self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
+        ) > Int32(self.cfg.num_insts_kv)
 
     @cute.jit
     def _p_desc_for_inst(self, p_inst: int):

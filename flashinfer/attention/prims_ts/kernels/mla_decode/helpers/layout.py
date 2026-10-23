@@ -48,6 +48,7 @@ _TASK_CACHE_WARP_GRP_THREAD_IDX = 1
 _TASK_CACHE_WARP_IDX = 2
 _TASK_CACHE_LANE_IDX = 3
 _TASK_CACHE_SEQ_LEN_KV = 4
+_TASK_CACHE_LOCAL_KV_TILES = 5
 
 
 def num_softmax_scale_groups(cfg: MlaConfig) -> int:

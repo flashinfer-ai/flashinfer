@@ -156,7 +156,7 @@ def _plan(
         k_dtype=torch.bfloat16,
         v_dtype=_FP8,
         out_dtype=torch.bfloat16,
-        sm_scale=sm_scale,
+        softmax_scale=sm_scale,
         vc_config=vc_config,
     )
     wrapper.plan(**{**arguments, **overrides})
@@ -170,7 +170,7 @@ def _run_case(case: _VCCase):
         ops = vc_quantize(k, v)
     sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
     if case.one_shot:
-        out = batch_prefill(q, ops.k, ops.v, sm_scale=sm_scale, vc=ops.params)
+        out = batch_prefill(q, ops.k, ops.v, softmax_scale=sm_scale, vc=ops.params)
     else:
         wrapper = BatchPrefillTSWrapper()
         _plan(
@@ -292,7 +292,9 @@ def test_vc_mean_step():
         pytest.param(
             {"mask_type": "causal"}, ValueError, "dense contiguous", id="causal"
         ),
-        pytest.param({"packed": True}, ValueError, "dense contiguous", id="packed"),
+        pytest.param(
+            {"packed_query": True}, ValueError, "dense contiguous", id="packed"
+        ),
         pytest.param(
             {"mask_type": "causal", "window_left": 256, "num_qo_heads": 2},
             ValueError,

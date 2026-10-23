@@ -49,11 +49,22 @@
     "len_qo_indptr": {
       "type": "var",
       "description": "Length of cumulative Q offsets."
+    },
+    "kv_storage_head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Stored K/V width; D/2 for packed NVFP4."
+    },
+    "kv_scale_groups": {
+      "type": "var",
+      "description": "NVFP4 scale groups; one per 16 logical values."
     }
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
     "page_size in (4, 8, 16, 32, 64, 128)",
+    "kv_storage_head_dim in (head_dim, head_dim // 2)",
+    "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
     "max_pages_per_seq * page_size >= max(seq_lens_kv)",
     "min(seq_lens_kv) >= 1",
     "num_qo_heads % num_kv_heads == 0",
@@ -77,7 +88,7 @@
         "num_pages",
         "num_kv_heads",
         "page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -86,7 +97,7 @@
         "num_pages",
         "num_kv_heads",
         "page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -127,6 +138,26 @@
       "dtype": "int32",
       "optional": true
     },
+    "k_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "v_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
     "seq_len_q": {
       "shape": null,
       "dtype": "int32",
@@ -152,12 +183,12 @@
       "dtype": "string",
       "optional": true
     },
-    "bmm1_scale": {
+    "softmax_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
     },
-    "bmm2_scale": {
+    "output_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true

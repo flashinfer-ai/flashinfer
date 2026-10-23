@@ -13,6 +13,10 @@ generated per-block scales. Dynamic scale composition belongs in upstream work.
 Index lists use `-1` for holes and need no 128-entry padding.
 The kernel keeps source boundaries aligned to its KV tiles internally.
 The dense API contract below retains its 512-latent plus 64-RoPE layout.
+Plans select cached kernel policies and compile/load kernels using explicit
+batch size and Q/KV bounds. Live request metadata belongs to `run()`.
+The [shared planning contract](../../README.md#reusable-plans) describes
+workspace sizing, standalone queries, cache reuse and CUDA graph lifetime.
 
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
@@ -35,7 +39,7 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchMLADecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
+| `BatchMLADecodePagedTSWrapper` | Reusable eager capacity `plan()`, followed by per-run request metadata. |
 | `batch_mla_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_mla_decode_workspace_size` | Size caller-owned standalone scratch. |
 
@@ -43,33 +47,33 @@ Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
 carry the wrapper's plan-owned fixed-versus-packed query mode.
 
-`plan()` receives the device, exact batch and head geometry, page size, static
-Q and K/V bounds, dtypes, mask, and fixed-versus-packed query mode. It compiles
-the specialization and either binds an optional caller-owned workspace or
-allocates private scratch; it does not retain request metadata. Every `run()`
-supplies the current query, cache, dense block table, and K/V lengths, plus Q
-offsets for packed queries. Validation is enabled by default. `validate=False`
-skips explicit wrapper checks and host metadata reads for a previously
-validated steady state or CUDA Graph launch; the caller then owns every value,
-bounds, aliasing, and lifetime precondition.
+`plan()` retains the device, exact batch size, Q/KV bounds, head geometry,
+page size, dtypes, mask and fixed-versus-packed query mode. It selects cached
+policy, obtains compiled kernels and binds reusable scratch before execution.
+Every `run()` supplies query, cache, page tables, live K/V lengths and packed-Q
+offsets when needed. Fixed Q length is exact; packed request lengths stay within
+planned `max_seq_len_q`. Validation is enabled by default. `validate=False`
+skips explicit checks and host metadata reads; callers own all preconditions.
 
-The one-shot helper reads request metadata to derive plan bounds and constructs
-a temporary wrapper, so it is not CUDA-graph-capturable. Graph-sensitive callers
-must plan `BatchMLADecodePagedTSWrapper` before capture and bind the live
-metadata directly in `run()`.
+Convenience one-shot calls may read request metadata and allocate scratch.
+The same API supports trusted capture-safe execution with caller workspace,
+preallocated `out`, explicit `max_kv_len`, and `validate=False`; packed Q also
+requires `max_seq_len_q`. Warm the execution before capture and provide `lse`
+when enabled. Reusable wrappers retain their prepared execution and workspace
+across calls; see the shared planning contract.
 
 ## Supported contract
 
 | Feature | Support |
 | --- | --- |
-| GPU | SM100a/B200 (qualified); SM103a/B300 (architecture-gated, not yet signoff-qualified) |
+| GPU | SM100a/B200 and SM103/GB300; see the shared validation scope |
 | Query/cache dimensions | `kv_lora_rank=512`, `qk_rope_head_dim=64` (576 input elements) |
 | Output dimension | 512 |
 | Q/cache dtype | Matching `torch.bfloat16` or `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` only |
 | Q length | Fixed or packed variable length; packed requests may be empty, while the static maximum remains positive |
 | K/V length | Positive runtime lengths are at most `2**31 - 32768`; nonpositive lengths mark inactive requests. The reserve keeps the largest padded split-KV coordinate span in signed `int32`. |
-| Q heads | Validated at 6, 8, 12, 16, 24, 32, 48, 64, 96, and 128; other positive counts are accepted only when automatic selection reports an implementation |
+| Q heads | Positive logical counts, subject to the flattened coordinate bounds; physical M128 tiling also supports counts above 128 without padding public Q/output storage |
 | K/V cache | Paged, one logical KV head; `[num_pages, page_size, 576]` or `[num_pages, 1, page_size, 576]` compact storage |
 | Metadata/cache index extents | Flattened query-head capacity, block-table elements, and physical page count must fit signed `int32` |
 | Page size | 16, 32, 64, or 128 tokens |
@@ -77,23 +81,27 @@ metadata directly in `run()`.
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection by kernel family and work shape |
 | Accumulation | FP32 QK/PV and softmax state |
 
-Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
-admitted by the runtime architecture guard but remains to be qualified.
+See the shared [validation scope](../../README.md#validation-scope) for the
+measured hardware and DSL versions.
 
-Some head and Q-length combinations outside the validated matrix do not have a
-generated implementation and are rejected.
+Automatic selection retains the optimized 1CTA profiles where eligible and
+uses the generic flattened 2CTA implementation otherwise. Logical head counts
+need not be powers of two or fit one physical tile. In particular, H129 and
+H256 queries may span tiles and cross token boundaries at arbitrary positive
+query lengths, subject to the ordinary dtype, cache, and coordinate contracts.
 
 Query, cache, and output tensors must be compact, 16-byte-aligned CUDA tensors
 on the metadata device. `block_tables` is a 4-byte-aligned CUDA
 `torch.int32[B, max_num_pages]` view with contiguous, non-overlapping rows:
 `stride(1) == 1` and `stride(0) >= max_num_pages`. This includes both compact
 tables and a plane view sliced from `[B, 2, max_num_pages]` metadata.
-`seq_lens` is compact, 4-byte-aligned CUDA `torch.int32`; packed `qo_indptr`
+`seq_lens_kv` is compact, 4-byte-aligned CUDA `torch.int32`; packed `qo_indptr`
 is contiguous CUDA `torch.int32`. A caller-provided `out` must not overlap
-query, cache, `block_tables`, `seq_lens`, packed `qo_indptr`, or caller-owned
+query, cache, `block_tables`, `seq_lens_kv`, packed `qo_indptr`, or caller-owned
 workspace.
-Storage overlap is an unchecked caller precondition in both validation modes. The API returns O
-only. FP32 LSE is internal workspace and is not exposed as an output.
+Storage overlap is an unchecked caller precondition in both validation modes.
+The default API returns O; an enabled LSE plan can also return final FP32 LSE.
+Public LSE is independent of the split-reduction workspace.
 
 ## Tensor and metadata layouts
 
@@ -109,7 +117,7 @@ only. FP32 LSE is internal workspace and is not exposed as an output.
   dimensions.
 - Dense page table: inner-contiguous, non-overlapping CUDA
   `int32[B, max_num_pages]` `block_tables`. Padding between rows is accepted.
-- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Positive lengths must not exceed the static K/V bound; nonpositive lengths mark inactive requests.
+- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens_kv`. Positive lengths must not exceed the static K/V bound; nonpositive lengths mark inactive requests.
 
 Internally, the query-token and query-head axes form one affine row space,
 `flat_row = query_idx * H + head_idx`. The 1-CTA profiles partition this space
@@ -127,7 +135,7 @@ rectangular tiles beyond a shorter request's active prefix retire scheduler
 bookkeeping without issuing Q/K/V or output accesses.
 
 For causal request `b`, query row `i` can attend through
-`seq_lens[b] - query_length[b] + i`. `bmm1_scale` and `bmm2_scale` default to
+`seq_lens_kv[b] - query_length[b] + i`. `softmax_scale` and `output_scale` default to
 1 and must be finite, positive Python scalars representable as positive
 `float32` values.
 
@@ -137,11 +145,11 @@ length must index the physical cache. Packed offsets start at zero, are
 nondecreasing, end at `total_q`, and have every nonnegative per-request delta
 no greater than `max_seq_len_q`.
 
-The wrapper receives `block_tables`, `seq_lens`, and packed `qo_indptr` on
+The wrapper receives `block_tables`, `seq_lens_kv`, and packed `qo_indptr` on
 every run. Their storage and values may change between completed launches
 without replanning while active page IDs remain valid, positive K/V lengths stay within the static bound, packed-Q deltas stay nonnegative and within their bound,
 and the final packed offset equals the current query/output extent. Causal
-metadata must also preserve `q_len[b] <= seq_lens[b]` for every active request.
+metadata must also preserve `q_len[b] <= seq_lens_kv[b]` for every active request.
 Individual packed requests may be empty. An all-empty packed launch requires a
 positive `max_seq_len_q` and returns an empty output without GPU dispatch.
 
@@ -228,27 +236,13 @@ kv_cache = torch.randn(
 block_tables = torch.arange(
     num_pages, device=device, dtype=torch.int32
 ).view(B, pages_per_request)
-seq_lens = torch.full(
+seq_lens_kv = torch.full(
     (B,), pages_per_request * page_size, device=device, dtype=torch.int32
 )
 
 wrapper = BatchMLADecodePagedTSWrapper()
-wrapper.plan(
-    query.device,
-    B,
-    H,
-    latent_dim,
-    rope_dim,
-    page_size,
-    pages_per_request * page_size,
-    max_seq_len_q=1,
-    packed_query=False,
-    q_data_type=query.dtype,
-    kv_data_type=kv_cache.dtype,
-    o_data_type=torch.bfloat16,
-    mask_type="causal",
-)
-out = wrapper.run(query, kv_cache, block_tables, seq_lens)
+wrapper.plan(query.device, batch_size=B, max_seq_len_q=1, max_kv_len=pages_per_request * page_size, num_qo_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=False, q_dtype=query.dtype, kv_dtype=kv_cache.dtype, out_dtype=torch.bfloat16, mask_type='causal')
+out = wrapper.run(query, kv_cache, block_tables, seq_lens_kv)
 assert out.shape == (B, 1, H, latent_dim)
 
 # Packed Q uses cumulative per-request offsets and compact token-major rows.
@@ -260,37 +254,22 @@ packed_query = torch.randn(
     dtype=torch.bfloat16,
 )
 packed_wrapper = BatchMLADecodePagedTSWrapper()
-packed_wrapper.plan(
-    packed_query.device,
-    B,
-    H,
-    latent_dim,
-    rope_dim,
-    page_size,
-    pages_per_request * page_size,
-    max_seq_len_q=max(q_lens),
-    packed_query=True,
-    q_data_type=packed_query.dtype,
-    kv_data_type=kv_cache.dtype,
-    o_data_type=torch.bfloat16,
-    mask_type="causal",
-)
+packed_wrapper.plan(packed_query.device, batch_size=B, max_seq_len_q=max(q_lens), max_kv_len=pages_per_request * page_size, num_qo_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=True, q_dtype=packed_query.dtype, kv_dtype=kv_cache.dtype, out_dtype=torch.bfloat16, mask_type='causal')
 packed_out = packed_wrapper.run(
     packed_query,
     kv_cache,
     block_tables,
-    seq_lens,
+    seq_lens_kv,
     qo_indptr=qo_indptr,
 )
 assert packed_out.shape == (sum(q_lens), H, latent_dim)
 ```
 
 For the standalone API, call
-`get_prims_ts_batch_mla_decode_workspace_size()` with the same shape, dtype,
-mask, and Q-bound arguments as the launch. Allocate at least that many bytes as
-a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8` tensor. The
-buffer includes internal FP32 LSE storage, does not require initialization,
-and is exclusive to one in-flight launch or captured graph. It must not overlap
+`get_prims_ts_batch_mla_decode_workspace_size()` with the batch size, Q/KV length bounds, head dimensions, dtypes, page size and device. Allocate at least that many bytes as
+a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8` tensor. Final public LSE uses a separate output buffer. Scratch does
+not require initialization and is exclusive to one in-flight launch or graph.
+It must not overlap
 query, K/V cache, metadata, or output storage. The standalone hot path does not
 copy metadata to the host; callers must maintain all page, length, and
 packed-offset preconditions for every launch. These live values are not fully
@@ -306,8 +285,9 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 - The latent/RoPE dimensions are fixed at 512/64.
 - Output is `torch.bfloat16` even when query/cache input is
   `torch.float8_e4m3fn`.
-- Only dense paged MLA cache addressing is exposed; sparse/indexed MLA,
-  sliding windows, attention sinks, and custom masks are not public features.
+- The dense wrapper does not support sparse indices, sliding windows,
+  attention sinks, or custom masks. Native two-source sparse MLA and its sink
+  support use `BatchSparseMLADecodePagedTSWrapper`, described above.
 - Query and cache dtypes must match.
 - Automatic kernel selection is intentionally not user-selectable through the
   public wrapper.
@@ -328,3 +308,13 @@ pytest -q tests/trace/test_fi_trace_template_consistency.py
 Both dense 1CTA and 2CTA families treat nonpositive runtime K/V lengths as inactive requests. They skip Q/K/V and partial-output work, preserve caller-owned O/LSE, and retain queue, cluster, TMEM-lifecycle and PDL progress. Separate reducers do not consume stale scratch for these requests. Newly allocated inactive output is unspecified. Positive plan capacity is still required.
 
 The two-source sparse API instead accepts nonnegative source lengths. An empty primary source may still attend to the extra source; two empty sources publish zero output and negative-infinity LSE.
+
+### Final softmax statistics
+
+See the shared [LSE, FP8 scaling and sink contract](../../README.md#final-statistics-and-sink-semantics).
+Dense MLA does not expose attention sinks.
+
+
+### Runtime split-KV policy
+
+See the shared [runtime split-KV policy](../../README.md#runtime-split-kv-policy).

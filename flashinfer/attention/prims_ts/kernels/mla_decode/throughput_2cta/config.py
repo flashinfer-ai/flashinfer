@@ -21,7 +21,7 @@ the same explicit configuration structure and output-reduction contract.
 from dataclasses import dataclass
 from typing import Tuple
 
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
@@ -92,7 +92,7 @@ def compute_split_kv(
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
-    return min(split_wave_aware, MAX_MLA_SPLITS_KV)
+    return split_wave_aware
 
 
 def compute_workspace_size(
@@ -270,6 +270,7 @@ class MlaDecodeConfig:
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
+    lse_base_on_e: bool = False
 
     @property
     def tokens_per_k_tile(self) -> int:
@@ -348,6 +349,7 @@ def make_mla_decode_config(
     cache_uniform_sparse_pages: bool = False,
     balance_sparse_registers: bool = False,
     fuse_output_quant: bool = False,
+    lse_base_on_e: bool = False,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
     cfg = MlaDecodeConfig()
@@ -362,6 +364,7 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
+    cfg.lse_base_on_e = lse_base_on_e
 
     def _require_positive(name: str, value: int) -> None:
         """Validate that a named configuration value is positive."""

@@ -323,8 +323,8 @@ separate from effective MMA dtypes (`qk_dtype`, `pv_dtype`). Transformed
 FP8/NVFP4 K/V uses Q's compute dtype; BF16 Q/K with FP8 V uses FP8 PV without
 that transform. Kernel predicates, P packing, and attention-sink scaling must
 follow effective compute precision; TMA descriptors and raw allocations must
-follow storage precision. The public plan accepts separate `k_data_type` and
-`v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
+follow storage precision. The public plan accepts separate `k_dtype` and
+`v_dtype`, with `kv_dtype` available as a common-KV shorthand.
 
 ## Code Linting
 

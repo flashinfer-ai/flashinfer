@@ -555,12 +555,26 @@ def _logical_head_batch(
 
 
 @cute.jit
+def split_kv_grid_coord(
+    cfg: Constexpr[FmhaDecodeConfig], coord: cute.Coord
+) -> cute.Coord:
+    """Map compact split/Q/batch launches to capacity-strided task coordinates."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        q_group = Int32(coord[2]) % Int32(cfg.num_q_ctas)
+        batch = Int32(coord[2]) // Int32(cfg.num_q_ctas)
+        return (q_group * Int32(cfg.splits_kv) + Int32(coord[0]), coord[1], batch)
+    return coord
+
+
+@cute.jit
 def _logical_q_group_idx(
     cfg: Constexpr[FmhaDecodeConfig],
     stage_info: StageInfo,
     fallback_q_group_idx: Int32,
 ) -> Int32:
     """Resolve the q-group from the persistent work tile or static launch."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        return Int32(cute.arch.block_idx()[2]) % Int32(cfg.num_q_ctas)
     if cutlass.const_expr(cfg.has_single_q_cta):
         # A split coordinate may still vary in grid X, but every physical CTA
         # maps to logical Q group zero. State this explicitly because the
