@@ -446,12 +446,6 @@ def record_name(
     return base
 
 
-def registered_arches() -> tuple[str, ...]:
-    """Architectures with at least one registered route, in ``ARCHES`` order."""
-    present = {arch for route in ROUTES.values() for arch in route["arches"]}
-    return tuple(arch for arch in ARCHES if arch in present)
-
-
 def program_registered(
     op: str,
     arch: str,
@@ -552,9 +546,3 @@ def load_module(
     library under ``aot/`` when the package ships it, else FlashInfer's JIT build of its ``build.json``
     entry."""
     return _load_module(program, arch, _specialization_items(specializations or {}))
-
-
-def specs_for_arch(arch: str):
-    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
-    ``flashinfer.jit.build_jit_specs`` warm-up)."""
-    return cake_build.jit_specs(arch)
