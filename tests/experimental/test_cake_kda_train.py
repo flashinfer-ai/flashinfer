@@ -3467,3 +3467,1288 @@ def test_lean_arena_content_never_reaches_a_result(device, manifest) -> None:
             q, k, v, g, beta, cu, save_for_backward=False, workspace=poisoned
         )
         assert torch.equal(nosave, reference_out), case
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# The batched arena option (document groups, KdaArena.batch_tokens): host checks
+
+
+def _partitions(lengths):
+    """``(label, KdaArena keywords)`` of the document groupings a test runs on a pack: two groups and three (the
+    smallest token budget under which the greedy partition gives exactly that many groups, when one exists; the
+    group count never grows with the budget, so a binary search finds it) and one document per group."""
+    lengths = tuple(int(n) for n in lengths)
+    S, longest = sum(lengths), max(lengths)
+    out = []
+    for k in (2, 3):
+        lo, hi = longest, S
+        while lo < hi:  # the smallest budget with at most k groups
+            mid = (lo + hi) // 2
+            if len(cake_backend.doc_batches(lengths, mid)) <= k:
+                hi = mid
+            else:
+                lo = mid + 1
+        if len(cake_backend.doc_batches(lengths, lo)) == k:
+            out.append((f"g{k}", {"batch_tokens": lo}))
+    out.append(("gdoc", {"batch_tokens": S, "max_docs_per_batch": 1}))
+    return out
+
+
+def test_doc_batches_partitions() -> None:
+    db = cake_backend.doc_batches
+    assert db((10, 20, 30), 60) == ((0, 3),)
+    assert db((10, 20, 30), 30) == ((0, 2), (2, 3))
+    assert db((10, 20, 30), 59) == ((0, 2), (2, 3))
+    assert db((10, 20, 30), 60, 1) == ((0, 1), (1, 2), (2, 3))
+    assert db((10, 20, 30), 60, 2) == ((0, 2), (2, 3))
+    assert db((30, 30, 30, 30), 60) == ((0, 2), (2, 4))
+    # a zero-length document joins the group before it (never a group of its own); leading ones open the first
+    assert db((100, 0, 300), 300) == ((0, 2), (2, 3))
+    assert db((100, 0, 300), 400, 1) == ((0, 2), (2, 3))
+    assert db((0, 0, 100), 100, 1) == ((0, 3),)
+    assert db((100, 0), 100, 1) == ((0, 2),)
+    assert db((1,), 1) == ((0, 1),)
+    assert db([10, 20], 25) == ((0, 1), (1, 2))
+    with pytest.raises(ValueError, match="document 2 has 30 tokens"):
+        db((10, 20, 30), 29)
+    with pytest.raises(ValueError, match="no token"):
+        db((0, 0), 5)
+    with pytest.raises(ValueError, match="non-negative"):
+        db((), 5)
+    with pytest.raises(ValueError, match="non-negative"):
+        db((1, -1), 5)
+    # the search helper of these tests: exact group counts, one document per group
+    parts = dict(_partitions((23496, 88510, 114974, 34413)))
+    assert (
+        len(cake_backend.doc_batches((23496, 88510, 114974, 34413), **parts["g2"])) == 2
+    )
+    assert (
+        len(cake_backend.doc_batches((23496, 88510, 114974, 34413), **parts["g3"])) == 3
+    )
+    assert parts["gdoc"]["max_docs_per_batch"] == 1
+
+
+def test_arena_option_validation_batched() -> None:
+    KdaArena = cake_backend.KdaArena
+    option = KdaArena(batch_tokens=1000)
+    assert option.batched and not option.lean and option.max_docs_per_batch is None
+    assert KdaArena(
+        lean=True, tail_passes=4, batch_tokens=10, max_docs_per_batch=1
+    ).batched
+    assert not KdaArena().batched and not KdaArena(lean=True, tail_passes=3).batched
+    for bad in (0, -1, True, 1.5, "3"):
+        with pytest.raises(ValueError, match="batch_tokens"):
+            KdaArena(batch_tokens=bad)
+    with pytest.raises(ValueError, match="max_docs_per_batch"):
+        KdaArena(batch_tokens=10, max_docs_per_batch=0)
+    with pytest.raises(ValueError, match="batch_tokens too"):
+        KdaArena(max_docs_per_batch=1)
+
+
+def test_batch_plans_pin_the_whole_problems_records_and_segments() -> None:
+    """The groups of a pack: contiguous, covering, each with its own geometry (at or above its real chunk count; the
+    tape bound even and inside the whole problem's tape), a plan with the whole problem's records, ``P`` and route
+    and the grids of the records' rules at the group's scalars; the arena of the exact groups never exceeds the
+    bound of every group, which the byte query gives without ``doc_lengths``."""
+    sm = 148
+    for arch in ARCHES:
+        for lengths, heads in (
+            ((23496, 88510, 114974, 34413), 4),
+            ((100, 0, 300), 2),
+            ((63, 1, 65), 64),
+            ((2000,) * 300, 1),
+            ((20,) * 7, 8),
+        ):
+            S, N = sum(lengths), len(lengths)
+            p = cake_backend.plan(S, N, heads, sm, arch)
+            for _label, kw in _partitions(lengths):
+                arena = cake_backend.KdaArena(lean=True, tail_passes=4, **kw)
+                batches = p.batches(arena, lengths)
+                assert [(b.d0, b.d1) for b in batches] == list(
+                    cake_backend.doc_batches(
+                        lengths, arena.batch_tokens, arena.max_docs_per_batch
+                    )
+                )
+                assert batches[0].d0 == 0 and batches[-1].d1 == N
+                assert all(
+                    a.d1 == b.d0 for a, b in zip(batches, batches[1:], strict=False)
+                )
+                c0 = 0
+                for b in batches:
+                    assert (b.S, b.N, b.c0) == (
+                        sum(lengths[b.d0 : b.d1]),
+                        b.d1 - b.d0,
+                        c0,
+                    )
+                    real = sum(-(-n // BT) for n in lengths[b.d0 : b.d1])
+                    _nc_max, nc_pad, _rows = cake_backend._geometry(b.S, b.N)
+                    assert b.NC_pad == nc_pad >= real
+                    assert b.NC_pad_tape % 2 == 0 and real <= b.NC_pad_tape <= b.NC_pad
+                    assert c0 + b.NC_pad_tape <= p.NC_pad
+                    c0 += real
+                    for tape in (False, True):
+                        pb = p.batch_plan(b, tape=tape)
+                        assert pb.records is p.records and (pb.P, pb.recur) == (
+                            p.P,
+                            p.recur,
+                        )
+                        assert pb.proportional == 0
+                        assert pb.NC_pad == (b.NC_pad_tape if tape else b.NC_pad)
+                        assert BT * pb.NC_pad == pb.R and pb.NC_max <= pb.NC_pad
+                        assert (b.N * p.P if p.recur == "seg" else 0) == pb.NSEG
+                        assert pb.seg_arg == (p.P if p.recur == "seg" else p.seg_arg)
+                        assert set(pb.grids) == set(p.grids)
+                        for name, grids in pb.grids.items():
+                            assert grids == tuple(
+                                cake_jit.launch_grid(
+                                    name,
+                                    num_chunks_pad=pb.NC_pad,
+                                    num_seqs=pb.N,
+                                    num_heads=heads,
+                                    sm_count=sm,
+                                    num_segments=pb.NSEG,
+                                    launch=launch,
+                                )
+                                for launch in range(cake_jit.launches(name))
+                            )
+                exact = p.arena_bytes(arena=arena, doc_lengths=lengths)
+                bound = p.arena_bytes(arena=arena)
+                nc_bar, rows_bar, nseg_bar = p.batch_bound(arena)
+                assert rows_bar == BT * nc_bar and nseg_bar == p.NSEG
+                assert all(b.NC_pad <= nc_bar for b in batches)
+                assert (
+                    exact
+                    <= bound
+                    <= p.arena_bytes(
+                        arena=cake_backend.KdaArena(lean=True, tail_passes=4)
+                    )
+                )
+                assert exact == max(
+                    cake_backend._arena_bytes(
+                        b.NC_pad * BT,
+                        heads,
+                        b.NC_pad,
+                        p.batch_segments(b),
+                        backward=True,
+                        save_mode="light",
+                        arena=arena,
+                    )
+                    for b in batches
+                )
+                assert (
+                    cake_backend.workspace_bytes(
+                        S,
+                        N,
+                        heads,
+                        sm_count=sm,
+                        arch=arch,
+                        arena=arena,
+                        doc_lengths=lengths,
+                    )
+                    == exact
+                )
+                assert (
+                    cake_backend.workspace_bytes(
+                        S, N, heads, sm_count=sm, arch=arch, arena=arena
+                    )
+                    == bound
+                )
+                assert (
+                    p.arena_bytes(backward=False, arena=arena, doc_lengths=lengths)
+                    <= p.arena_bytes(backward=False, arena=arena)
+                    <= p.arena_bytes(backward=False)
+                )
+                tape_exact = p.arena_bytes(
+                    save_mode="tape", arena=arena, doc_lengths=lengths
+                )
+                assert tape_exact <= p.arena_bytes(save_mode="tape", arena=arena)
+            with pytest.raises(ValueError, match="doc_lengths"):
+                p.batches(cake_backend.KdaArena(batch_tokens=S), None)
+            with pytest.raises(ValueError, match="doc_lengths"):
+                p.batches(cake_backend.KdaArena(batch_tokens=S), lengths[:-1])
+            with pytest.raises(ValueError, match="doc_lengths"):
+                p.check_doc_lengths(tuple(lengths[:-1]) + (lengths[-1] + 1,))
+            with pytest.raises(ValueError, match="above batch_tokens"):
+                p.batches(cake_backend.KdaArena(batch_tokens=max(lengths) - 1), lengths)
+
+
+def test_batched_arena_refuses_the_proportional_rows() -> None:
+    for arch in ARCHES:
+        p = cake_backend.plan(
+            128, 2, 1, 148, arch
+        )  # two chains: proportional segment counts
+        assert p.recur == "seg" and p.proportional == 1
+        arena = cake_backend.KdaArena(batch_tokens=64)
+        with pytest.raises(ValueError, match="proportional"):
+            p.check_arena(arena)
+        with pytest.raises(ValueError, match="proportional"):
+            p.check_arena(arena, backward=False)
+        with pytest.raises(ValueError, match="proportional"):
+            p.arena_bytes(arena=arena, doc_lengths=(64, 64))
+        with pytest.raises(ValueError, match="proportional"):
+            cake_backend.workspace_bytes(
+                128, 2, 1, sm_count=148, arch=arch, arena=arena
+            )
+        with pytest.raises(ValueError, match="proportional"):
+            cake_backend.memory_report(128, 2, 1, sm_count=148, arch=arch, arena=arena)
+        p5 = cake_backend.plan(320, 5, 1, 148, arch)  # five chains are not
+        assert p5.recur == "seg" and p5.proportional == 0
+        p5.check_arena(arena)
+        p64 = cake_backend.plan(128, 2, 64, 148, arch)  # the serial route never is
+        assert p64.recur == "serial" and p64.proportional == 0
+        p64.check_arena(arena)
+
+
+def test_arena_for_budget_search_order() -> None:
+    lengths, heads = (23496, 88510, 114974, 34413), 4
+    S, N = sum(lengths), len(lengths)
+    A = cake_backend.KdaArena
+    for arch in ARCHES:
+        p = cake_backend.plan(S, N, heads, 148, arch)
+        steps = [
+            A(),
+            A(lean=True),
+            A(lean=True, tail_passes=2),
+            A(lean=True, tail_passes=4),
+        ]
+        sizes = [p.arena_bytes(arena=a) for a in steps]
+        assert sizes == sorted(sizes, reverse=True) and len(set(sizes)) == 4
+        for a, nbytes in zip(steps, sizes, strict=True):
+            assert cake_backend.arena_for_budget(p, nbytes) == a
+            assert cake_backend.arena_for_budget(p, nbytes, doc_lengths=lengths) == a
+        below = sizes[-1] - 1
+        with pytest.raises(ValueError, match="doc_lengths"):
+            cake_backend.arena_for_budget(p, below)
+        got = cake_backend.arena_for_budget(p, below, doc_lengths=lengths)
+        assert got == A(
+            lean=True, tail_passes=4, batch_tokens=max(max(lengths), S // 2)
+        )
+        assert p.arena_bytes(arena=got, doc_lengths=lengths) <= below
+        single = A(
+            lean=True, tail_passes=4, batch_tokens=max(lengths), max_docs_per_batch=1
+        )
+        floor = p.arena_bytes(arena=single, doc_lengths=lengths)
+        got = cake_backend.arena_for_budget(p, floor, doc_lengths=lengths)
+        assert got.batched and p.arena_bytes(arena=got, doc_lengths=lengths) <= floor
+        with pytest.raises(ValueError, match="floor"):
+            cake_backend.arena_for_budget(p, floor - 1, doc_lengths=lengths)
+        # the dav rows skip the lean steps and batch the default layouts; the proportional rows refuse batching
+        p12 = cake_backend.plan(S, N, 12, 148, arch)
+        assert cake_backend.arena_for_budget(p12, p12.arena_bytes()) == A()
+        got = cake_backend.arena_for_budget(
+            p12, p12.arena_bytes() - 1, doc_lengths=lengths
+        )
+        assert got.batched and not got.lean and got.tail_passes == 1
+        p2 = cake_backend.plan(128, 2, 1, 148, arch)
+        with pytest.raises(ValueError, match="refuses the batched option"):
+            cake_backend.arena_for_budget(p2, 1, doc_lengths=(64, 64))
+
+
+def test_memory_report_batched_fields() -> None:
+    lengths, heads = (23496, 88510, 114974, 34413), 4
+    S, N = sum(lengths), len(lengths)
+    for sm in (148, 152):
+        for arch in ARCHES:
+            base = cake_backend.memory_report(S, N, heads, sm_count=sm, arch=arch)
+            assert base["batch_tokens"] is None and base["batches"] is None
+            assert (
+                base["arena_bwd_bound_batched"] is None
+                and base["arena_floor_batched"] is None
+            )
+            arena = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=120000)
+            p = cake_backend.plan(S, N, heads, sm, arch)
+            r = cake_backend.memory_report(
+                S, N, heads, sm_count=sm, arch=arch, arena=arena
+            )
+            assert r["batch_tokens"] == 120000 and r["max_docs_per_batch"] is None
+            assert r["batches"] is None and r["batch_scratch"] is None
+            assert (
+                r["arena_bwd_configured"]
+                == r["arena_bwd_bound_batched"]
+                == p.arena_bytes(arena=arena)
+            )
+            assert r["largest_batch_rows"] == p.batch_bound(arena)[1]
+            assert r["bwd_total"] == r["arena_bwd_configured"] + r["out_bwd"]
+            r2 = cake_backend.memory_report(
+                S, N, heads, sm_count=sm, arch=arch, arena=arena, doc_lengths=lengths
+            )
+            groups = p.batches(arena, lengths)
+            assert r2["batches"] == [(b.d0, b.d1, b.S, b.N) for b in groups]
+            assert r2["batches"] == [
+                (0, 2, 112006, 2),
+                (2, 3, 114974, 1),
+                (3, 4, 34413, 1),
+            ]
+            assert r2["arena_bwd_configured"] == p.arena_bytes(
+                arena=arena, doc_lengths=lengths
+            )
+            assert r2["arena_bwd_configured"] <= r2["arena_bwd_bound_batched"]
+            assert r2["largest_batch_rows"] == max(b.NC_pad for b in groups) * BT
+            assert r2["arena_fwd_configured"] == p.arena_bytes(
+                backward=False, arena=arena, doc_lengths=lengths
+            )
+            big = max(groups, key=lambda b: b.NC_pad)
+            blocks = 3 * p.batch_segments(big) * heads * D * D * 4
+            assert (
+                blocks
+                <= r2["batch_scratch"]
+                <= blocks
+                + 4
+                * (
+                    2 * big.NC_pad
+                    + 2 * big.N
+                    + 2
+                    + p.batch_segments(big)
+                    + 2 * big.N
+                    + 1
+                    + 5 * 64
+                )
+            )
+            nc_min = -(-max(lengths) // BT) + 1
+            rows_min = BT * (nc_min + nc_min % 2)
+            block_min = p.P * heads * D * D * 4 if p.recur == "seg" else 0
+            assert r2["arena_floor_batched"] == 2820 * rows_min * heads + 3 * block_min
+            single = cake_backend.KdaArena(
+                lean=True,
+                tail_passes=4,
+                batch_tokens=max(lengths),
+                max_docs_per_batch=1,
+            )
+            exact_floor = p.arena_bytes(arena=single, doc_lengths=lengths)
+            # the exact one-document arena: the floor plus the ceil slack of the last tail range
+            assert 0 <= exact_floor - r2["arena_floor_batched"] <= 2568 * 3 * BT * heads
+            tape = cake_backend.memory_report(
+                S,
+                N,
+                heads,
+                "tape",
+                sm_count=sm,
+                arch=arch,
+                arena=arena,
+                doc_lengths=lengths,
+            )
+            assert (
+                tape["arena_floor_batched"] == 2052 * rows_min * heads + 3 * block_min
+            )
+            assert tape["arena_bwd_configured"] == p.arena_bytes(
+                save_mode="tape", arena=arena, doc_lengths=lengths
+            )
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# The batched arena option: device checks
+
+# the rows with at least two documents and more than four (document, head) chains (the proportional rows refuse the
+# option), plus serial rows (16, 32 and 64 heads)
+D_ROWS = [s for s in SHAPES if len(s[0]) >= 2 and len(s[0]) * s[1] > 4] + [
+    ((63, 1, 65), 64),
+    ((129, 300), 16),
+    ((20, 20, 20, 20, 20, 20, 20), 32),
+]
+
+
+def _expected_batched_launches(p, arena, lengths, path, *, tail_passes=1):
+    """The launch order of a batched call: on the saving forward the whole problem's tables by the saved-set
+    paths' table program, then every group's forward list (its own tables where the row dispatches a table program
+    on the forward); on the backward every group's list with the group's tables first (the saved set's describe the
+    whole problem) and the tail once per range of the group's chunk bound."""
+    seq = []
+    batches = p.batches(arena, lengths)
+    if path in ("fwd", "fwd_nosave"):
+        if path == "fwd" and p.dispatched("table", "light"):
+            seq.append(p.record("table", "light"))
+            if p.recur == "seg" and p.dispatched("seg_table", "light"):
+                seq.append("seg_table")
+        for b in batches:
+            seq += _expected_launches(p.batch_plan(b), path)
+        return seq
+    for b in batches:
+        seq += _expected_launches(
+            p.batch_plan(b, tape=path == "tape"),
+            path,
+            saved_tables=False,
+            tail_passes=tail_passes,
+        )
+    return seq
+
+
+def _check_group_launches(launched, p, arena, lengths, path, *, tail_passes=1) -> None:
+    """Every launch of a group carries the group's scalars (``num_seqs``, ``num_chunks_pad``) and one of the
+    group plan's grids; the tail passes carry ``num_seqs = 0`` and their range's chunk count."""
+    batches = p.batches(arena, lengths)
+    forward = path in ("fwd", "fwd_nosave")
+    pos = 0
+    if forward and path == "fwd" and p.dispatched("table", "light"):
+        head = 2 if (p.recur == "seg" and p.dispatched("seg_table", "light")) else 1
+        for name, grid, num_seqs, nc in launched[:head]:
+            assert (num_seqs, nc) == (p.N, p.NC_pad) and grid in p.grids[name], name
+        pos = head
+    for b in batches:
+        pb = p.batch_plan(b, tape=path == "tape")
+        expected = (
+            _expected_launches(pb, path)
+            if forward
+            else _expected_launches(
+                pb, path, saved_tables=False, tail_passes=tail_passes
+            )
+        )
+        group = launched[pos : pos + len(expected)]
+        pos += len(expected)
+        assert [n for n, *_ in group] == expected
+        tail_names = (
+            set()
+            if forward
+            else {pb.record(s, path) for s in ("dqkg", "glm_intra", "gate_epilogue")}
+        )
+        ranges = cake_backend._tail_ranges(pb.NC_pad, tail_passes)
+        tails = []
+        for name, grid, num_seqs, nc in group:
+            if name in tail_names and tail_passes > 1:
+                tails.append((name, grid, num_seqs, nc))
+                continue
+            assert (num_seqs, nc) == (pb.N, pb.NC_pad), (name, b)
+            assert grid in pb.grids[name], (name, b, grid, pb.grids[name])
+        if tails:
+            assert len(tails) == 3 * len(ranges)
+            for i, (_c0, length) in enumerate(ranges):
+                for j in range(3):
+                    name, grid, num_seqs, nc = tails[3 * i + j]
+                    assert (num_seqs, nc) == (0, length), (name, b)
+                    want = cake_jit.launch_grid(
+                        name,
+                        num_chunks_pad=length,
+                        num_seqs=pb.N,
+                        num_heads=pb.H,
+                        sm_count=pb.sm_count,
+                        num_segments=pb.NSEG,
+                    )
+                    assert tuple(grid) == tuple(want), (name, b, i)
+    assert pos == len(launched)
+
+
+def _real_chunks(lengths) -> int:
+    return sum(-(-int(n) // BT) for n in lengths)
+
+
+@pytest.mark.parametrize("shape", D_ROWS, ids=_shape_id)
+def test_batched_arena_gives_the_default_results_bitwise(
+    device, manifest, shape
+) -> None:
+    """Two groups, three and one document per group, with and without the lean layouts: the batched forward gives
+    the default's ``out``, token rows, tables and saved states bit for bit, the batched backward the default's
+    gradients from the default's saved set and from its own, the default backward reads the batched set, the
+    per-call arena, the replay (a workspace that is not lean), the tape set (slices and transfers), a light set on
+    the tape workspace and the autograd node agree; ``doc_lengths`` are required and checked."""
+    lengths, heads = shape
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    out, grads, saved = _run_fwd_bwd(inputs)
+    ref_out, ref_grads = _clone_all(out, grads)
+    del out, grads
+    default = KdaWorkspace.for_problem(S, N, heads, device)
+    p = default.plan
+    real = _real_chunks(lengths)
+    tape_default = KdaWorkspace.for_problem(S, N, heads, device, save_mode="tape")
+    _, saved_t = cake_backend.chunk_kda_fwd(
+        q, k, v, g, beta, cu, workspace=tape_default
+    )
+    ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new[: BT * real].clone()
+    ref_seg_m = None if saved_t.seg_m is None else saved_t.seg_m.clone()
+    del tape_default
+    for label, kw in _partitions(lengths):
+        for lean in (False, True):
+            arena = cake_backend.KdaArena(lean=lean, tail_passes=3 if lean else 1, **kw)
+            tag = (label, lean)
+            ws = KdaWorkspace.for_problem(
+                S, N, heads, device, arena=arena, doc_lengths=lengths
+            )
+            assert ws.arena_option == arena and ws.doc_lengths == tuple(lengths)
+            assert ws.bytes == p.arena_bytes(arena=arena, doc_lengths=lengths)
+            assert ws.bytes <= p.arena_bytes(arena=arena) and ws.bytes <= default.bytes
+            batches = p.batches(arena, lengths)
+            assert len(batches) >= 2, tag
+            # the batched forward: the same out and saved set (tables, token rows, states)
+            o, saved_b = cake_backend.chunk_kda_fwd(
+                q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths
+            )
+            assert _bits_equal(o, ref_out), tag
+            assert _bits_equal(saved_b.Aqk, saved.Aqk) and _bits_equal(
+                saved_b.Akk, saved.Akk
+            ), tag
+            assert len(saved_b.tables) == len(saved.tables), tag
+            assert all(
+                torch.equal(a, b)
+                for a, b in zip(saved_b.tables, saved.tables, strict=True)
+            ), tag
+            assert (saved_b.hseg is None) == (saved.hseg is None), tag
+            if saved.hseg is not None:
+                assert _bits_equal(saved_b.hseg, saved.hseg), tag
+                assert _bits_equal(saved_b.seg_state, saved.seg_state), tag
+            # the batched backward from the default's set and from its own; the default backward from the batched set
+            for name, source in (("default set", saved), ("batched set", saved_b)):
+                got = cake_backend.chunk_kda_bwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu,
+                    dout,
+                    saved=source,
+                    workspace=ws,
+                    doc_lengths=lengths,
+                )
+                _check_bits(got, ref_grads, tag=(*tag, name))
+            got = cake_backend.chunk_kda_bwd(
+                q, k, v, g, beta, cu, dout, saved=saved_b, workspace=default
+            )
+            _check_bits(
+                got, ref_grads, tag=(*tag, "default backward from the batched set")
+            )
+            # a per-call batched arena (sized for the exact groups)
+            got = cake_backend.chunk_kda_bwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu,
+                dout,
+                saved=saved,
+                arena=arena,
+                doc_lengths=lengths,
+            )
+            _check_bits(got, ref_grads, tag=(*tag, "per-call"))
+            # the replay group by group on a workspace that is not lean; a lean one refuses it naming both options
+            if not lean:
+                got = cake_backend.chunk_kda_bwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu,
+                    dout,
+                    saved=None,
+                    workspace=ws,
+                    doc_lengths=lengths,
+                )
+                _check_bits(got, ref_grads, tag=(*tag, "replay"))
+            else:
+                with pytest.raises(ValueError, match="batch_tokens"):
+                    cake_backend.chunk_kda_bwd(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        cu,
+                        dout,
+                        saved=None,
+                        workspace=ws,
+                        doc_lengths=lengths,
+                    )
+            # the tape set: the batched forward's slices and transfers equal the default's; both backwards agree
+            tws = KdaWorkspace.for_problem(
+                S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
+            )
+            assert tws.bytes == p.arena_bytes(
+                save_mode="tape", arena=arena, doc_lengths=lengths
+            )
+            o, saved_tb = cake_backend.chunk_kda_fwd(
+                q, k, v, g, beta, cu, workspace=tws, doc_lengths=lengths
+            )
+            assert (
+                _bits_equal(o, ref_out)
+                and saved_tb.version == cake_backend.SAVED_VERSION_TAPE
+            ), tag
+            assert _bits_equal(saved_tb.h[:real], ref_h), tag
+            assert _bits_equal(saved_tb.v_new[: BT * real], ref_v_new), tag
+            assert (saved_tb.seg_m is None) == (ref_seg_m is None), tag
+            if ref_seg_m is not None:
+                assert _bits_equal(saved_tb.seg_m, ref_seg_m), tag
+            for name, source in (
+                ("own tape set", saved_tb),
+                ("default tape set", saved_t),
+            ):
+                got = cake_backend.chunk_kda_bwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu,
+                    dout,
+                    saved=source,
+                    workspace=tws,
+                    doc_lengths=lengths,
+                )
+                _check_bits(got, ref_grads, tag=(*tag, name))
+            got = cake_backend.chunk_kda_bwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu,
+                dout,
+                saved=saved_b,
+                workspace=tws,
+                doc_lengths=lengths,
+            )
+            _check_bits(got, ref_grads, tag=(*tag, "light set on the tape workspace"))
+            got = cake_backend.chunk_kda_bwd(
+                q, k, v, g, beta, cu, dout, saved=saved_tb, workspace=default
+            )
+            _check_bits(
+                got, ref_grads, tag=(*tag, "default backward from the batched tape set")
+            )
+            # the autograd node carries the option and doc_lengths; a forward without a saved set
+            leaves = [
+                inputs[n].detach().clone().requires_grad_(True)
+                for n in ("q", "k", "v", "g", "beta")
+            ]
+            o = cake_backend.chunk_kda(*leaves, cu, arena=arena, doc_lengths=lengths)
+            assert _bits_equal(o, ref_out), tag
+            o.backward(dout)
+            _check_bits(
+                [leaf.grad for leaf in leaves],
+                ref_grads,
+                ("dq", "dk", "dv", "dg", "dbeta"),
+                tag=(*tag, "autograd"),
+            )
+            nosave, none = cake_backend.chunk_kda_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu,
+                save_for_backward=False,
+                workspace=ws,
+                doc_lengths=lengths,
+            )
+            assert none is None and _bits_equal(nosave, ref_out), tag
+            # doc_lengths are required and checked on the host
+            with pytest.raises(ValueError, match="doc_lengths"):
+                cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
+            with pytest.raises(ValueError, match="doc_lengths"):
+                cake_backend.chunk_kda_bwd(
+                    q, k, v, g, beta, cu, dout, saved=saved, arena=arena
+                )
+            with pytest.raises(ValueError, match="doc_lengths"):
+                cake_backend.chunk_kda_fwd(
+                    q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths[:-1]
+                )
+            with pytest.raises(ValueError, match="doc_lengths"):
+                cake_backend.chunk_kda(
+                    *[inputs[n] for n in ("q", "k", "v", "g", "beta")], cu, arena=arena
+                )
+            del ws, tws
+
+
+def test_batched_arena_launches_per_group(device, manifest) -> None:
+    """The batched call's launch list is every group's list in turn (the whole problem's tables first on the saving
+    forward; the group's tables first on the backward), each launch at the group's scalars and grids; the overlap
+    pair's epoch advances once per group through the shared counter; the group tables are slices of the whole
+    problem's."""
+    for lengths, heads in (
+        ((63, 1, 65), 4),
+        ((100, 0, 300), 2),
+        ((63, 1, 65, 30), 2),
+        ((20, 20, 20, 20, 20, 20, 20), 8),
+        ((100, 640, 77, 1000, 129), 2),
+        ((63, 1, 65), 64),
+        ((129, 300), 16),
+    ):
+        S, N = sum(lengths), len(lengths)
+        inputs = make_inputs(lengths, heads, device)
+        q, k, v, g, beta, cu, dout = (
+            inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+        )
+        out, grads, saved = _run_fwd_bwd(inputs)
+        ref_out, ref_grads = _clone_all(out, grads)
+        del out, grads
+        launched: list = []
+
+        def recording(name, values, *, grid, device_index):
+            launched.append(
+                (
+                    name,
+                    tuple(grid),
+                    int(values["num_seqs"]),
+                    int(values["num_chunks_pad"]),
+                )
+            )
+            cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+
+        for label, kw in _partitions(lengths):
+            for t in (1, 3):
+                arena = cake_backend.KdaArena(lean=t > 1, tail_passes=t, **kw)
+                ws = KdaWorkspace.for_problem(
+                    S,
+                    N,
+                    heads,
+                    device,
+                    arena=arena,
+                    launcher=recording,
+                    doc_lengths=lengths,
+                )
+                p = ws.plan
+                batches = p.batches(arena, lengths)
+                case = (lengths, heads, label, t)
+                epoch0 = ws._epoch[0]
+                launched.clear()
+                o, saved_b = cake_backend.chunk_kda_fwd(
+                    q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths
+                )
+                assert _bits_equal(o, ref_out), case
+                names = [n for n, *_ in launched]
+                assert names == _expected_batched_launches(p, arena, lengths, "fwd"), (
+                    case
+                )
+                _check_group_launches(launched, p, arena, lengths, "fwd")
+                overlap = (
+                    p.recur == "seg" and p.record("seg_carry", "fwd") == "seg_carry_ov"
+                )
+                assert ws._epoch[0] - epoch0 == (len(batches) if overlap else 0), case
+                for view in ws._batch_views.values():
+                    assert view._epoch is ws._epoch
+                    assert view.eye.data_ptr() == ws.eye.data_ptr()
+                    assert view.arena.data_ptr() == ws.arena.data_ptr()
+                launched.clear()
+                nosave, _none = cake_backend.chunk_kda_fwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu,
+                    save_for_backward=False,
+                    workspace=ws,
+                    doc_lengths=lengths,
+                )
+                assert _bits_equal(nosave, ref_out), case
+                assert [n for n, *_ in launched] == _expected_batched_launches(
+                    p, arena, lengths, "fwd_nosave"
+                ), case
+                launched.clear()
+                got = cake_backend.chunk_kda_bwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu,
+                    dout,
+                    saved=saved_b,
+                    workspace=ws,
+                    doc_lengths=lengths,
+                )
+                _check_bits(got, ref_grads, tag=case)
+                path = p.light_path
+                names = [n for n, *_ in launched]
+                assert names == _expected_batched_launches(
+                    p, arena, lengths, path, tail_passes=t
+                ), case
+                _check_group_launches(launched, p, arena, lengths, path, tail_passes=t)
+                if t == 1:  # the replay group by group
+                    launched.clear()
+                    got = cake_backend.chunk_kda_bwd(
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        cu,
+                        dout,
+                        saved=None,
+                        workspace=ws,
+                        doc_lengths=lengths,
+                    )
+                    _check_bits(got, ref_grads, tag=(*case, "replay"))
+                    assert [n for n, *_ in launched] == _expected_batched_launches(
+                        p, arena, lengths, "replay"
+                    ), case
+                    _check_group_launches(launched, p, arena, lengths, "replay")
+                # the group tables: absolute chunk offsets, the group's chunk index base, a permutation of its documents
+                full = saved.tables
+                for b in batches:
+                    ws_b = ws.batch_view(b)
+                    tb = cake_backend._tables(ws_b, cu[b.d0 : b.d1 + 1], "light")
+                    real_b = _real_chunks(lengths[b.d0 : b.d1])
+                    assert torch.equal(tb[0][:real_b], full[0][b.c0 : b.c0 + real_b]), (
+                        case,
+                        b,
+                    )
+                    assert torch.equal(tb[1][:real_b], full[1][b.c0 : b.c0 + real_b]), (
+                        case,
+                        b,
+                    )
+                    assert torch.equal(
+                        tb[2][: b.N + 1] + b.c0, full[2][b.d0 : b.d1 + 1]
+                    ), (case, b)
+                    assert sorted(tb[3][: b.N].tolist()) == list(range(b.N)), (case, b)
+                    assert (
+                        not tb[0][real_b : b.NC_pad].any()
+                        and not tb[1][real_b : b.NC_pad].any()
+                    )
+                del ws
+
+
+def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
+    """A pack above the size rule (its light set carries the states) whose last document alone would be below it:
+    the groups follow the whole problem's rule, the forward scatters their blocks into the saved states by chain
+    rank, the backward gathers them (``light_states`` as pass 2 alone), everything bit for bit."""
+    lengths, heads = (40000, 20000, 20000, 1000), 4
+    S, N = sum(lengths), len(lengths)
+    sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    p = cake_backend.plan(S, N, heads, sm, arch)
+    assert p.recur == "seg" and p.seg_save and p.light_path == "light_states"
+    assert not cake_backend.plan(1000, 1, heads, sm, arch).seg_save
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    out, grads, saved = _run_fwd_bwd(inputs)
+    assert saved.hseg is not None and saved.seg_state is not None
+    ref_out, ref_grads = _clone_all(out, grads)
+    del out, grads
+    from torch.utils.checkpoint import checkpoint
+
+    for label, kw in _partitions(lengths):
+        arena = cake_backend.KdaArena(lean=True, tail_passes=4, **kw)
+        ws = KdaWorkspace.for_problem(
+            S, N, heads, device, arena=arena, doc_lengths=lengths
+        )
+        tag = (label,)
+        o, saved_b = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths
+        )
+        assert _bits_equal(o, ref_out), tag
+        assert _bits_equal(saved_b.hseg, saved.hseg) and _bits_equal(
+            saved_b.seg_state, saved.seg_state
+        ), tag
+        assert all(
+            torch.equal(a, b) for a, b in zip(saved_b.tables, saved.tables, strict=True)
+        ), tag
+        for name, source, space in (
+            ("batched backward, default set", saved, ws),
+            ("batched backward, batched set", saved_b, ws),
+            ("default backward, batched set", saved_b, None),
+        ):
+            got = cake_backend.chunk_kda_bwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu,
+                dout,
+                saved=source,
+                workspace=space,
+                doc_lengths=lengths if space is not None else None,
+            )
+            _check_bits(got, ref_grads, tag=(*tag, name))
+        leaves = [
+            inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        o = checkpoint(
+            lambda *a: cake_backend.chunk_kda(*a, cu, arena=arena, doc_lengths=lengths),
+            *leaves,
+            use_reentrant=False,
+        )
+        assert _bits_equal(o, ref_out), tag
+        o.backward(dout)
+        _check_bits(
+            [leaf.grad for leaf in leaves],
+            ref_grads,
+            ("dq", "dk", "dv", "dg", "dbeta"),
+            tag=(*tag, "checkpoint"),
+        )
+        del ws
+
+
+def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
+    """Rows with exact zeros in ``v`` and ``dout`` (a zero token row, a zero chunk at a group's first chunk, a whole
+    zero document at an odd chunk): the paired WY programs accumulate ``0 * partner`` for the other chunk of a
+    pair, so a changed partner could only change the sign of an exactly-zero entry; the bit-pattern comparison of
+    every output, over every grouping, shows whether it does."""
+    for lengths, heads in (
+        ((63, 1, 65, 30), 2),
+        ((63, 1, 65), 4),
+        ((100, 640, 77, 1000, 129), 2),
+    ):
+        S, N = sum(lengths), len(lengths)
+        inputs = make_inputs(lengths, heads, device)
+        v, dout = inputs["v"], inputs["dout"]
+        cu = [0]
+        for n in lengths:
+            cu.append(cu[-1] + n)
+        v[cu[1] : cu[2]] = (
+            0  # the second document (one token at an odd chunk, or a whole document)
+        )
+        v[cu[2] : cu[2] + 6] = (
+            0  # the first rows of the third document (a group's first chunk)
+        )
+        dout[cu[2] : cu[2] + 6] = 0
+        v[cu[-1] - 7 : cu[-1]] = 0  # the pack's last rows (a pad partner's neighbour)
+        dout[:5] = 0
+        q, k, g, beta, cu_t = (inputs[n] for n in ("q", "k", "g", "beta", "cu_seqlens"))
+        out, grads, saved = _run_fwd_bwd(inputs)
+        ref_out, ref_grads = _clone_all(out, grads)
+        del out, grads
+        real = _real_chunks(lengths)
+        tape_default = KdaWorkspace.for_problem(S, N, heads, device, save_mode="tape")
+        _, saved_t = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu_t, workspace=tape_default
+        )
+        ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new[: BT * real].clone()
+        del tape_default
+        for label, kw in _partitions(lengths):
+            arena = cake_backend.KdaArena(lean=True, tail_passes=2, **kw)
+            tag = (lengths, heads, label)
+            ws = KdaWorkspace.for_problem(
+                S, N, heads, device, arena=arena, doc_lengths=lengths
+            )
+            o, saved_b = cake_backend.chunk_kda_fwd(
+                q, k, v, g, beta, cu_t, workspace=ws, doc_lengths=lengths
+            )
+            assert _bits_equal(o, ref_out), tag
+            assert _bits_equal(saved_b.Aqk, saved.Aqk) and _bits_equal(
+                saved_b.Akk, saved.Akk
+            ), tag
+            got = cake_backend.chunk_kda_bwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_t,
+                dout,
+                saved=saved_b,
+                workspace=ws,
+                doc_lengths=lengths,
+            )
+            _check_bits(got, ref_grads, tag=tag)
+            tws = KdaWorkspace.for_problem(
+                S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
+            )
+            o, saved_tb = cake_backend.chunk_kda_fwd(
+                q, k, v, g, beta, cu_t, workspace=tws, doc_lengths=lengths
+            )
+            assert _bits_equal(o, ref_out), tag
+            assert _bits_equal(saved_tb.h[:real], ref_h), tag
+            assert _bits_equal(saved_tb.v_new[: BT * real], ref_v_new), tag
+            got = cake_backend.chunk_kda_bwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_t,
+                dout,
+                saved=saved_tb,
+                workspace=tws,
+                doc_lengths=lengths,
+            )
+            _check_bits(got, ref_grads, tag=(*tag, "tape"))
+            del ws, tws
+
+
+def test_batched_arena_under_checkpointing_and_a_dropped_workspace(
+    device, manifest, monkeypatch
+) -> None:
+    """A checkpointed forward with the batched option retains nothing beyond its output; the backward's own
+    workspace takes the recorded option and ``doc_lengths`` (sized for the exact groups); a dropped workspace is
+    replaced the same way; a kept workspace of another option is refused; ``doc_lengths`` are required."""
+    import gc
+
+    from torch.utils.checkpoint import checkpoint
+
+    lengths, heads = (100, 640, 77, 1000, 129), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    cu, dout = inputs["cu_seqlens"], inputs["dout"]
+    out, grads, _ = _run_fwd_bwd(inputs)
+    reference_out, reference_grads = _clone_all(out, grads)
+    del out, grads
+    arena = cake_backend.KdaArena(lean=True, tail_passes=2, batch_tokens=1000)
+    plan = cake_backend.plan(
+        S, N, heads, cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    )
+    assert [(b.d0, b.d1) for b in plan.batches(arena, lengths)] == [
+        (0, 3),
+        (3, 4),
+        (4, 5),
+    ]
+    exact = plan.arena_bytes(arena=arena, doc_lengths=lengths)
+    assert exact < plan.arena_bytes(arena=arena) < plan.arena_bytes()
+    created: list = []
+    original = cake_backend.KdaWorkspace.for_problem
+
+    def spy(
+        *args, **kwargs
+    ):  # records the option, not the workspace: a strong reference would be "retained"
+        ws_ = original(*args, **kwargs)
+        created.append(
+            types.SimpleNamespace(
+                arena_option=ws_.arena_option,
+                backward=ws_.backward,
+                bytes=ws_.bytes,
+                doc_lengths=ws_.doc_lengths,
+            )
+        )
+        return ws_
+
+    monkeypatch.setattr(cake_backend.KdaWorkspace, "for_problem", spy)
+
+    def leaves():
+        return [
+            inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+
+    def check(leaf_list, tag):
+        _check_bits(
+            [leaf.grad for leaf in leaf_list],
+            reference_grads,
+            ("dq", "dk", "dv", "dg", "dbeta"),
+            tag=tag,
+        )
+
+    def implicit(q, k, v, g, beta):
+        return cake_backend.chunk_kda(
+            q, k, v, g, beta, cu, arena=arena, doc_lengths=lengths
+        )
+
+    held = leaves()
+    warm = implicit(*held)
+    assert _bits_equal(warm, reference_out)
+    del warm
+    gc.collect()
+    assert _retained_after_checkpointed_forward(implicit, *held) == 0
+    created.clear()
+    o = checkpoint(implicit, *held, use_reentrant=False)
+    o.backward(dout)
+    check(held, "checkpoint")
+    assert created and all(w.arena_option == arena for w in created)
+    assert all(
+        w.doc_lengths == tuple(lengths) and w.bytes == exact
+        for w in created
+        if w.backward
+    )
+    assert any(w.backward for w in created)
+    dropped = KdaWorkspace(
+        plan, device, backward=True, arena=arena, doc_lengths=lengths
+    )
+    created.clear()
+    held = leaves()
+    o = cake_backend.chunk_kda(*held, cu, workspace=dropped, doc_lengths=lengths)
+    assert _bits_equal(o, reference_out)
+    del dropped
+    gc.collect()
+    o.backward(dout)
+    assert (
+        len(created) == 1 and created[0].arena_option == arena and created[0].backward
+    )
+    assert created[0].bytes == exact
+    check(held, "dropped")
+    kept = KdaWorkspace(plan, device, backward=True)
+    with pytest.raises(ValueError, match="arena="):
+        cake_backend.chunk_kda(
+            *leaves(), cu, workspace=kept, arena=arena, doc_lengths=lengths
+        )
+    with pytest.raises(ValueError, match="doc_lengths"):
+        cake_backend.chunk_kda(*leaves(), cu, arena=arena)
+
+
+def test_batched_views_share_the_arena_eye_and_epoch(device, manifest) -> None:
+    """The views of one arena (its groups, ``with_plan``) share the bytes, the identity / flag buffer and the epoch
+    counter; every group's layout fits the exact arena, and a packing whose group does not fit is refused before
+    any launch."""
+    lengths, heads = (63, 1, 65, 30), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")
+    )
+    arena = cake_backend.KdaArena(batch_tokens=95)
+    ws = KdaWorkspace.for_problem(S, N, heads, device, arena=arena, doc_lengths=lengths)
+    p = ws.plan
+    batches = p.batches(arena, lengths)
+    assert [(b.d0, b.d1) for b in batches] == [(0, 2), (2, 4)]
+    views = [ws.batch_view(b) for b in batches]
+    assert views[0] is ws.batch_view(batches[0]) and views[1] is not views[0]
+    for view in views:
+        assert view.arena.data_ptr() == ws.arena.data_ptr() and view.bytes == ws.bytes
+        assert view.eye.data_ptr() == ws.eye.data_ptr()
+        assert view.flags.data_ptr() == ws.flags.data_ptr()
+        assert view._epoch is ws._epoch and view.arena_option == arena
+        for mode in ("fwd", "bwd", "replay"):
+            view.views(mode)
+    e = ws.next_epoch()
+    assert views[0].next_epoch() == e + 1 and views[1].next_epoch() == e + 2
+    assert ws.next_epoch() == e + 3
+    twin = ws.with_plan(p)
+    assert twin._epoch is ws._epoch and twin.next_epoch() == e + 4
+    assert twin.eye.data_ptr() == ws.eye.data_ptr()
+    # a workspace sized for one document per group refuses a packing whose group is larger, before any launch
+    single = cake_backend.KdaArena(batch_tokens=S, max_docs_per_batch=1)
+    small = KdaWorkspace.for_problem(
+        S, N, heads, device, arena=single, doc_lengths=lengths
+    )
+    assert small.bytes < ws.bytes
+    other = (S, 0, 0, 0)  # the same S and num_docs, one group of every token
+    with pytest.raises(ValueError, match="needs"):
+        cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=small, doc_lengths=other
+        )
+    # the bound sizes a workspace without doc_lengths: every grouping of the budget fits it
+    bound = KdaWorkspace.for_problem(S, N, heads, device, arena=arena)
+    assert bound.doc_lengths is None and bound.bytes >= ws.bytes
+    for b in batches:
+        bound.batch_view(b).views("bwd")
+
+
+def test_batched_arena_content_never_reaches_a_result(device, manifest) -> None:
+    """Write-before-read on the batched option too: a batched arena filled with NaN bytes before every call gives
+    the zero-filled default arena's results bit for bit (the forward, the backward from the light and the tape
+    sets, a light set on the tape workspace, the forward without a saved set), including a row whose light set
+    carries the states (the gathers read the saved tensors, not the arena)."""
+    cases = (
+        ((63, 1, 65, 30), 2, "light", 1, {"batch_tokens": 95}),
+        ((100, 640, 77, 1000, 129), 2, "light", 3, {"batch_tokens": 1000}),
+        (
+            (20, 20, 20, 20, 20, 20, 20),
+            8,
+            "light",
+            2,
+            {"batch_tokens": 140, "max_docs_per_batch": 3},
+        ),
+        ((63, 1, 65), 64, "light", 3, {"batch_tokens": 129, "max_docs_per_batch": 1}),
+        ((100, 640, 77, 1000, 129), 2, "tape", 2, {"batch_tokens": 1000}),
+        ((40000, 20000, 20000, 1000), 4, "light", 4, {"batch_tokens": 40000}),
+    )
+    for lengths, heads, save_mode, t, kw in cases:
+        S, N = sum(lengths), len(lengths)
+        inputs = make_inputs(lengths, heads, device)
+        q, k, v, g, beta, cu, dout = (
+            inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+        )
+        plan = cake_backend.plan(
+            S,
+            N,
+            heads,
+            cake_jit.sm_count(device.index),
+            cake_jit.device_arch(device.index),
+        )
+        zeroed = KdaWorkspace(
+            plan, device, backward=True, zero_init=True, save_mode=save_mode
+        )
+        out, grads, saved = _run_fwd_bwd(inputs, workspace=zeroed)
+        reference_out, reference_grads = _clone_all(out, grads)
+        del out, grads
+        arena = cake_backend.KdaArena(lean=t > 1, tail_passes=t, **kw)
+        poisoned = KdaWorkspace(
+            plan,
+            device,
+            backward=True,
+            save_mode=save_mode,
+            arena=arena,
+            doc_lengths=lengths,
+        )
+        assert poisoned.zero_init is False and poisoned.bytes < zeroed.bytes
+        assert len(plan.batches(arena, lengths)) >= 2
+
+        def poison():
+            poisoned.arena.fill_(0xFF)  # NaN in every BF16 / FP32 view
+            torch.cuda.synchronize()
+
+        case = (lengths, heads, save_mode, t)
+        poison()
+        o, saved_p = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=poisoned, doc_lengths=lengths
+        )
+        assert _bits_equal(o, reference_out), case
+        assert _bits_equal(saved_p.Aqk, saved.Aqk) and _bits_equal(
+            saved_p.Akk, saved.Akk
+        ), case
+        if saved.hseg is not None:
+            assert _bits_equal(saved_p.hseg, saved.hseg) and _bits_equal(
+                saved_p.seg_state, saved.seg_state
+            ), case
+        poison()
+        got = cake_backend.chunk_kda_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=saved_p,
+            workspace=poisoned,
+            doc_lengths=lengths,
+        )
+        _check_bits(got, reference_grads, tag=case)
+        poison()
+        got = cake_backend.chunk_kda_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=saved,
+            workspace=poisoned,
+            doc_lengths=lengths,
+        )
+        _check_bits(got, reference_grads, tag=(*case, "default set"))
+        if (
+            save_mode == "tape"
+        ):  # a version-3 set on the poisoned tape workspace: per-call h / v_new per group
+            _, saved_light = cake_backend.chunk_kda_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu,
+                workspace=poisoned,
+                save_mode="light",
+                doc_lengths=lengths,
+            )
+            poison()
+            got = cake_backend.chunk_kda_bwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu,
+                dout,
+                saved=saved_light,
+                workspace=poisoned,
+                doc_lengths=lengths,
+            )
+            _check_bits(got, reference_grads, tag=(*case, "light set"))
+        poison()
+        nosave, _ = cake_backend.chunk_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            save_for_backward=False,
+            workspace=poisoned,
+            doc_lengths=lengths,
+        )
+        assert _bits_equal(nosave, reference_out), case
+        zeroed = poisoned = None  # (no del: the poison closure refers to the name)

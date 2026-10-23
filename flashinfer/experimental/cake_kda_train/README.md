@@ -155,9 +155,10 @@ of the calls on it.
 
 The lower-memory arena option, off by default, shrinks the arena of a
 backward workspace; the gradients stay bitwise the same.
-`kda_train_arena(lean=False, tail_passes=1)` in `flashinfer/kda_train.py`
-returns a `KdaArena`, a frozen dataclass with those two fields
-(`tail_passes >= 1`; `tail_passes > 1` implies `lean=True`), which
+`kda_train_arena(lean=False, tail_passes=1, batch_tokens=None,
+max_docs_per_batch=None)` in `flashinfer/kda_train.py` returns a `KdaArena`, a
+frozen dataclass with those four fields (`tail_passes >= 1`; `tail_passes > 1`
+implies `lean=True`; the two batching fields are described below), which
 `kda_train_workspace(...)`, `kda_train_workspace_bytes(...)`,
 `chunk_kda_fwd`, `chunk_kda_bwd` and `chunk_kda` take as the keyword-only
 `arena=`.  `None` takes the workspace's option (off without one); an option
@@ -241,6 +242,75 @@ configured backward arena (the replay total keeps the default's).
 layouts: their per-pass rows carry `unit="R_b*H"`, and from two passes on a
 `plan` is required, since the packing depends on the problem's geometry.  The
 context-parallel (KCP) entry points do not take the option in this version.
+
+#### Document groups (`batch_tokens`)
+
+`kda_train_arena(batch_tokens=B, max_docs_per_batch=M)` (`M` optional and
+needs `B`) runs the forward and the backward over groups of whole, contiguous
+documents of at most `B` tokens and `M` documents each, one group after
+another, in an arena sized for the largest group instead of the whole pack.
+`cake_backend.doc_batches(doc_lengths, B, M)` is the partition: greedy from the
+first document; a zero-length document joins the group before it; a document
+longer than `B` is refused, so the budget's floor is the longest document.  The
+calls then take `doc_lengths`, the documents' token counts as host integers in
+`cu_seqlens` order (`len == num_docs`, `sum == S`): the host reads no tensor,
+so `cu_seqlens` cannot supply them, and a device-side comparison trips an
+asynchronous assertion when the two disagree.  `kda_train_workspace(...,
+arena=, doc_lengths=)` and `kda_train_workspace_bytes(..., arena=,
+doc_lengths=)` size the arena for the exact groups; without `doc_lengths` the
+arena takes the bound of every group, `64 * even(ceil(min(B, S) / 64) +
+num_docs)` internal rows and the whole problem's segment count, at most
+`num_docs` chunks and `(num_docs - N_b) * P` state blocks above the largest
+group's.  The autograd node records `doc_lengths` with the option, so a
+backward that allocates its own workspace is sized for the exact groups too.
+
+Each group runs the whole problem's launch list through a view of the arena
+(`KdaWorkspace.batch_view`): the group's slice of `cu_seqlens`; the group's own
+tables (the segmented route's forward intra program writes them, the row's
+table program otherwise, one more launch per group on the backward, whose
+saved tables describe the whole problem); the whole token tensors and
+gradients (every program reaches the tokens through the absolute `chunk_bos`
+offsets of its tables); the group's slices of a saved `h` / `v_new` tape; and
+its state blocks, recomputed in the view on the `light` and `replay` paths,
+gathered from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
+`light_states` and `tape`, and scattered back from the view when the forward
+saves them.  The records, the segment count per document (`P`, with the
+non-proportional block table) and the saved set are the whole problem's; the
+saving forward therefore writes the whole problem's tables once with the
+saved-set paths' table program (`table_v3` / `table_v2`) before its groups.
+The views share the arena, the `eye` / `flags` buffer and one epoch counter
+(the overlap pair's release flags are stamped with the epoch).  The results
+are bitwise the whole problem's with one caveat: the paired WY programs
+(`wy_fwd`, `wy_bwd`) load the two chunks of a pair into one operand and
+accumulate `0 * partner` for the other chunk's rows, so an exactly-zero entry
+of `u` / `w` in a chunk whose pair partner changed (a group starting at an odd
+chunk, or a pad partner) may change sign; the package's tests compare bit
+patterns on rows built for this case.  The option refuses the rows whose block
+table gives the documents proportional segment counts (`num_docs * H <= 4` on
+the segmented route: a group of fewer documents would change every document's
+segments) and, on a lean workspace, the checkpoint replay (`saved=None`); a
+batched workspace that is not lean runs the replay group by group.  The costs
+per group are a table launch, the gathers (three state blocks of the group,
+`batch_scratch` of `memory_report`) and the smaller grids; the serial route's
+chains of different groups run one group after another.
+
+```python
+arena = kda_train_arena(lean=True, tail_passes=4, batch_tokens=120_000)
+ws = kda_train_workspace(S, num_docs, H, device, arena=arena, doc_lengths=lengths)
+out = chunk_kda(q, k, v, g, beta, cu_seqlens, workspace=ws, doc_lengths=lengths)
+```
+
+`cake_backend.memory_report(..., arena=, doc_lengths=)` adds `batch_tokens`,
+`max_docs_per_batch`, `arena_bwd_bound_batched` (the bound of every group),
+`batches` (`(d0, d1, S, N)` per group), `largest_batch_rows`, `batch_scratch`
+and `arena_floor_batched` (one document per group under the lean four-pass
+layouts: `2820 * R_min * H + 3 * P * H * 64 KiB`, `R_min` the internal rows of
+the longest document; 2052 for the tape forms).  `cake_backend.arena_for_budget(
+plan, budget, doc_lengths=)` and `KdaWorkspace.for_budget(S, num_docs, H,
+device, arena_budget_bytes=, doc_lengths=)` return the first option that fits a
+byte budget: the default, lean, two tail passes, four, then four passes over
+groups halving from half the pack down to one document per group (the rows
+that refuse an option skip it).
 
 ## Kernel structure of one training step
 
