@@ -4877,7 +4877,7 @@ def test_router_layout_classification_and_swap():
     assert (plan.layout, plan.template, plan.splits) == (
         "nn_t",
         "router_fp32_gemm_nn_t",
-        11,
+        6,
     )
     assert (
         plan.swapped and plan.transposed_out and (plan.M, plan.N, plan.K) == (K, N, T)
@@ -5225,9 +5225,9 @@ def test_convenience_arena_grows_to_the_largest_requirement_and_carves_views(
     )
     assert (fwd.partials_shape, wgrad.partials_shape) == (
         (4, 257, 256),
-        (11, 256, 6144),
+        (6, 256, 6144),
     )
-    assert arena.buffers["k2_partials"].numel() == 11 * 256 * 6144
+    assert arena.buffers["k2_partials"].numel() == 6 * 256 * 6144
     # a growth forgets every memo of the arena's cached entries and the next launch carves again
     cake_backend._K2_CACHE[("fwd",)] = fwd
     cake_backend._K2_CACHE[("wgrad",)] = wgrad
@@ -5450,6 +5450,146 @@ def test_convenience_router_launch_holds_the_arena_lock(monkeypatch):
     assert (
         cached.views["workspace"].data_ptr() == arena.buffers["k2_partials"].data_ptr()
     )
+
+
+_FAKE_SPLIT_MODULE = "cake_dense_projection_gemm_fake_split"
+_FAKE_SPLIT_RECORD = {
+    "arches": ["sm_100a"],
+    "template": cake_backend.SPLIT_TEMPLATE,
+    "kernel": "kernel_fake_split",
+    "library": _FAKE_SPLIT_MODULE,
+    "ffi_entry": "run",
+    "arg_plan": [
+        ["buffer", "src"],
+        ["buffer", "parts"],
+        ["parameter", "n"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
+}
+
+
+def _cpu_router_registry(monkeypatch, *, fused):
+    """CPU stand-ins for a K2 plan on ``sm_100a``: the device check and the architecture, the stream and FFI
+    context, and a module loader whose entries record ``(module, arguments, an arena lock was held)``; with
+    ``fused`` the registry holds a stand-in fused split program, without it none.  Returns the recorded calls."""
+    calls = []
+    kernels = dict(cake_jit.KERNELS["sm_100a"])
+    kernels.pop(cake_backend.SPLIT_TEMPLATE, None)
+    if fused:
+        kernels[cake_backend.SPLIT_TEMPLATE] = _FAKE_SPLIT_MODULE
+        monkeypatch.setitem(cake_jit.MODULES, _FAKE_SPLIT_MODULE, _FAKE_SPLIT_RECORD)
+    monkeypatch.setitem(cake_jit.KERNELS, "sm_100a", kernels)
+    monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
+    monkeypatch.setattr(cake_backend, "require_arch", lambda device: "sm_100a")
+    monkeypatch.setattr(cake_backend, "_cuda_index", lambda d: 0)
+    monkeypatch.setattr(cake_backend, "_device_index", lambda device: 0)
+    monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: 7)
+    monkeypatch.setattr(
+        cake_backend,
+        "_ffi_stream_context",
+        lambda index, raw=None: contextlib.nullcontext(),
+    )
+
+    def loader(name, arch):
+        def run(*args):
+            locked = any(a.lock.locked() for a in cake_backend._ARENAS.values())
+            calls.append((name, args, locked))
+
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(cake_backend, "load_cake_dense_projection_gemm_module", loader)
+    return calls
+
+
+def test_fused_split_selection_follows_the_registry(monkeypatch):
+    """The K2 paths split with the fused program only when the registry holds it for the architecture and the
+    source is a contiguous fp32 view of at most int32 elements; otherwise the torch chain splits."""
+    assert cake_backend._split_grid(1) == (1, 1, 1)
+    assert cake_backend._split_grid(3 * cake_backend.SPLIT_BLOCK_ELEMS + 1) == (4, 1, 1)
+    assert cake_backend._split_values("s", "p", 5) == {"src": "s", "parts": "p", "n": 5}
+    W = torch.empty(256, 6144)
+    _cpu_router_registry(monkeypatch, fused=False)
+    assert cake_backend.fused_split_module("sm_100a") is None
+    assert cake_backend._fused_split_for("sm_100a", W) is None
+    _cpu_router_registry(monkeypatch, fused=True)
+    assert cake_backend.fused_split_module("sm_100a") == _FAKE_SPLIT_MODULE
+    assert cake_backend.fused_split_module("sm_90a") is None
+    assert cake_backend._fused_split_for("sm_100a", W) == _FAKE_SPLIT_MODULE
+    base = torch.empty(W.numel() + 2)
+    offset = base[1 : 1 + W.numel()].view(
+        W.shape
+    )  # contiguous at a storage offset: fine
+    assert cake_backend._fused_split_for("sm_100a", offset) == _FAKE_SPLIT_MODULE
+    assert cake_backend._fused_split_for("sm_100a", W.t()) is None  # not contiguous
+    assert cake_backend._fused_split_for("sm_100a", W[:, 1:]) is None
+    monkeypatch.setattr(cake_backend, "_SPLIT_MAX_N", W.numel() - 1)
+    assert cake_backend._fused_split_for("sm_100a", W) is None  # beyond the int32 count
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_router_paths_split_through_the_registry(monkeypatch, fused):
+    """Both K2 paths select the split through the registry: with the fused program registered they bind one
+    launch of it over the fp32 source into the BF16x3 stack and allocate (prepared) or carve (convenience) no
+    fp32 scratch; otherwise the torch chain splits through the scratch.  The convenience path issues the fused
+    split under its arena's lock, before the kernel (CPU stand-ins for the device, the loader and the entries)."""
+    monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
+    monkeypatch.setattr(cake_backend, "_ARENAS", {})
+    calls = _cpu_router_registry(monkeypatch, fused=fused)
+    chain = []
+    split = cake_backend.split_fp32_to_bf16x3_
+
+    def chain_split(src, parts, resid):
+        chain.append(tuple(parts.shape))
+        return split(src, parts, resid)
+
+    monkeypatch.setattr(cake_backend, "split_fp32_to_bf16x3_", chain_split)
+    v = _router_inputs("fwd", 257, seed=SEED + 9, device="cpu")
+    n = v["W"].numel()
+    split_args = (n, -(-n // cake_backend.SPLIT_BLOCK_ELEMS), 1, 1)
+    # the prepared path
+    prepared = prepare_router_fp32_gemm(v["A"], v["B"], v["out"], splits=4)
+    assert prepared.fused_split is fused and ("resid" in prepared.tensors) is not fused
+    prepared.launch()
+    if fused:
+        assert chain == []
+        assert [c[0] for c in calls] == [_FAKE_SPLIT_MODULE, prepared.module_name]
+        _, args, _ = calls[0]
+        assert args[0].data_ptr() == v["W"].data_ptr() and args[0].shape == (256, 6144)
+        assert args[1] is prepared.tensors["parts"] and args[2:] == split_args
+    else:
+        assert chain == [(3, 256, 6144)]
+        assert [c[0] for c in calls] == [prepared.module_name]
+    # the convenience path
+    calls.clear()
+    chain.clear()
+    out = cake_backend.router_fp32_gemm(v["A"], v["B"], v["out"], splits=4)
+    assert out is v["out"]
+    cached = next(iter(cake_backend._K2_CACHE.values()))
+    arena = cached.arena
+    assert (cached.split is None) is not fused
+    assert ("k2_resid" in arena.buffers) is not fused
+    views = cake_backend._entry_views(cached)
+    assert ("resid" in views) is not fused
+    assert tuple(views["parts"].shape) == (3, 256, 6144)
+    assert not arena.lock.locked()
+    if fused:
+        assert chain == []
+        assert [(c[0], c[2]) for c in calls] == [
+            (_FAKE_SPLIT_MODULE, True),
+            (cached.module_name, True),
+        ]
+        _, args, _ = calls[0]
+        assert args[0].data_ptr() == v["W"].data_ptr() and args[0].shape == (256, 6144)
+        assert args[1].data_ptr() == arena.buffers["k2_parts"].data_ptr()
+        assert args[2:] == split_args
+    else:
+        assert chain == [(3, 256, 6144)]
+        assert [(c[0], c[2]) for c in calls] == [(cached.module_name, True)]
+        assert torch.equal(views["parts"], prepared.tensors["parts"])
 
 
 @pytest.mark.parametrize("sm_count", SM_COUNTS)
@@ -6832,7 +6972,7 @@ def test_convenience_path_memory_is_bounded_across_token_counts():
     torch.cuda.synchronize()
     assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
     dw = cake_backend.router_wgrad(G, X)
-    prepared_w = prepare_router_fp32_gemm(G.t(), X, torch.empty_like(dw), splits=11)
+    prepared_w = prepare_router_fp32_gemm(G.t(), X, torch.empty_like(dw), splits=6)
     assert torch.equal(dw, prepared_w.launch())
     cake_backend.clear_convenience_caches()
     assert cake_backend._ARENAS == {}
@@ -6942,3 +7082,65 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 1
     assert len(cake_backend._K2_CACHE) == 1 and torch.equal(again, v["out"])
+
+
+def test_fused_split_matches_the_torch_chain_bit_exactly():
+    """The fused split program writes the bits of the torch chain for W [256, 6144], a ragged element count
+    and contiguous sources at 4-, 8- and 16-byte storage offsets; the K2 paths bind it and allocate no fp32
+    scratch.  Runs only where this checkout registers the program for the device."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
+    device = torch.device("cuda")
+    arch = cake_backend.arch_for(device)
+    module = cake_backend.fused_split_module(arch)
+    if module is None:
+        pytest.skip(
+            f"fused split program {cake_backend.SPLIT_TEMPLATE!r} not registered for {arch}"
+        )
+    g = torch.Generator(device=device).manual_seed(SEED + 21)
+    W = torch.randn(256, 6144, device=device, generator=g) * torch.logspace(
+        -3, 3, 6144, device=device
+    )
+    ragged = torch.randn(
+        7, 1001, device=device, generator=g
+    )  # 7007: no multiple of 8 or of a block
+    base = torch.randn(3 * 1001 + 8, device=device, generator=g)
+    sources = [W, ragged] + [base[k : k + 3 * 1001].view(3, 1001) for k in (1, 2, 4)]
+    index = cake_backend._device_index(device)
+    for src in sources:
+        n = src.numel()
+        fused = torch.empty((3, *src.shape), device=device, dtype=torch.bfloat16)
+        chain = torch.empty_like(fused)
+        split_fp32_to_bf16x3_(src, chain, torch.empty_like(src))
+        launch = bind_launch(
+            module,
+            cake_backend._split_values(src, fused, n),
+            cake_backend._split_grid(n),
+            arch,
+        )
+        with cake_backend._ffi_stream_context(index):
+            launch()
+        torch.cuda.synchronize()
+        assert torch.equal(fused.view(torch.int16), chain.view(torch.int16)), tuple(
+            src.shape
+        )
+    # the K2 paths take the program: no fp32 scratch is allocated (prepared) or carved (convenience) and the
+    # two paths agree bit for bit
+    _require_program("router_fp32_gemm_kk")
+    X = torch.randn(257, 6144, device=device, generator=g)
+    prepared = prepare_router_fp32_gemm(
+        X, W.t(), torch.empty(257, 256, device=device), splits=4
+    )
+    assert prepared.fused_split and "resid" not in prepared.tensors
+    first = prepared.launch().clone()
+    cake_backend.clear_convenience_caches()
+    eager = cake_backend.router_forward(X, W)
+    cached = next(iter(cake_backend._K2_CACHE.values()))
+    assert cached.split is not None and "k2_resid" not in cached.arena.buffers
+    assert "resid" not in cake_backend._entry_views(cached)
+    torch.cuda.synchronize()
+    assert torch.equal(first, eager)
+    cake_backend.clear_convenience_caches()

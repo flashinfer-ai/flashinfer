@@ -68,7 +68,7 @@ partials are reduced on the host in a fixed order.  Splits, chunk boundaries
 and the reduction order are fixed: results are bit-exact run to run.  The
 operand layouts select the instance and the production split count
 (``kk`` forward 4, ``kn`` input gradient 1, ``nn`` -> the swapped
-transposed-store ``nn_t`` weight gradient 11).
+transposed-store ``nn_t`` weight gradient 6).
 
 Two host paths share one planner and one binding:
 
@@ -204,7 +204,7 @@ ROUTER_BLOCK_M = 128
 ROUTER_BLOCK_K = 32  # fp32 elements split per stage
 ROUTER_BLOCK_N = 128  # output columns per CTA pair
 # Production split-K counts per instance layout (router_forward / router_dgrad / router_wgrad).
-ROUTER_SPLITS = {"kk": 4, "kn": 1, "nn_t": 11}
+ROUTER_SPLITS = {"kk": 4, "kn": 1, "nn_t": 6}
 
 
 # ---------------------------------------------------------------------------
@@ -3030,7 +3030,8 @@ def _same_cuda_device(
 # ---------------------------------------------------------------------------
 
 # The workspace kinds an arena carves: ``(dtype, zero-initialised)``.  The kinds are separate buffers -- a K1
-# launch uses ``k1_ws`` + ``k1_counters``, a K2 launch ``k2_parts`` + ``k2_resid`` + ``k2_partials`` -- so no
+# launch uses ``k1_ws`` + ``k1_counters``, a K2 launch ``k2_parts`` + ``k2_partials`` (+ ``k2_resid``, the fp32
+# scratch of the torch-chain split, when the fused split program is not registered for the device) -- so no
 # launch depends on the carving of another kind and the slice-counter zero contract has a buffer of its own.
 _ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
     "k1_ws": (
@@ -3081,7 +3082,8 @@ class _Arena:
       are serialised by the stream and each one leaves the whole buffer zero again (the buffer is
       zero-initialised when allocated, by a memset on the same stream).  This is the contract the Cake
       launcher's per-device counters rely on;
-    * ``k2_parts`` / ``k2_resid``: the split rewrites both in full before every launch (same stream);
+    * ``k2_parts`` / ``k2_resid``: the split rewrites the stack (and, under the torch chain, the scratch) in full
+      before every launch (same stream);
     * ``k2_partials``: written by the kernel and consumed by ``torch.sum(..., out=out)`` right after the
       launch on the same stream; the next launch overwrites them only after that reduction has read them;
     * ``k1_ws``: the stream-K slabs carry no state between launches (the first arriver of a slice stores, the
@@ -3235,7 +3237,8 @@ def _carve(buf: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
 def _entry_views(entry: _CachedLaunch) -> dict[str, torch.Tensor]:
     """The workspace views of a cached entry, carved out of its arena's buffers by ``entry.carve(arena)``
     (K1: the slab and counter buffers themselves -- pointer parameters; K2: the ``[3, *split]`` parts, the
-    ``split`` scratch and the ``[splits, rows, cols]`` partials) and memoised until the arena grows."""
+    ``split`` scratch of the torch-chain split and the ``[splits, rows, cols]`` partials) and memoised until the
+    arena grows."""
     arena = entry.arena
     views = entry.views
     if views is None or entry.views_version != arena.version:
@@ -3964,11 +3967,52 @@ def split_fp32_to_bf16x3_(
     return parts
 
 
+# The fused split program: one launch reads the fp32 source once and writes the three BF16 parts (the residual
+# stays in registers, so it needs no fp32 scratch).  The K2 paths take it when the registry holds it for the
+# device's architecture and the source is a contiguous view, and split with the torch chain
+# :func:`split_fp32_to_bf16x3_` otherwise -- the same bits either way for finite inputs (a NaN differs in its
+# payload: the program writes the canonical BF16 NaN).  Its launch is ``exe(src, parts, n)`` over
+# ``grid = ceil(n / SPLIT_BLOCK_ELEMS)`` blocks of 256 threads, 8 elements per thread.
+SPLIT_TEMPLATE = "split_fp32_bf16x3"
+SPLIT_BLOCK_ELEMS = 2048
+_SPLIT_MAX_N = 2**31 - 1  # ``n`` is an int32 launch parameter
+
+
+def fused_split_module(arch: str) -> Optional[str]:
+    """The registered module serving the fused split program on ``arch``, or ``None`` (the torch chain splits)."""
+    if SPLIT_TEMPLATE not in KERNELS.get(arch, {}):
+        return None
+    return select_module(arch, SPLIT_TEMPLATE)
+
+
+def _fused_split_for(arch: str, split_src: torch.Tensor) -> Optional[str]:
+    """The fused split's module when it is registered for ``arch`` and can split ``split_src``: a contiguous
+    fp32 view (the program reads the elements in order; a storage offset is fine) of at most int32 elements.
+    ``None`` selects the torch chain."""
+    if not (split_src.is_contiguous() and split_src.numel() <= _SPLIT_MAX_N):
+        return None
+    return fused_split_module(arch)
+
+
+def _split_values(src: Any, parts: Any, n: int) -> dict[str, Any]:
+    """The keyword arguments of a fused split launch -- the fp32 source, the ``[3, *src.shape]`` BF16 stack and
+    the element count -- ordered by the module's argument plan in :func:`_bind`.  The one place the program's
+    binding names live."""
+    return dict(src=src, parts=parts, n=int(n))
+
+
+def _split_grid(n: int) -> tuple[int, int, int]:
+    """The grid of a fused split launch over ``n`` elements."""
+    return (_ceil_div(int(n), SPLIT_BLOCK_ELEMS), 1, 1)
+
+
 @dataclass
 class PreparedRouterGemm:
     """One prepared FP32 router GEMM: the retained BF16x3 stack of the second operand (re-split
-    from the bound fp32 view on every ``launch()``), the split-K workspace and the fixed-order
-    host reduction.  ``launch()`` writes ``out`` and returns it without allocating."""
+    from the bound fp32 view on every ``launch()`` -- one launch of the fused split program when
+    this checkout registers it for the device, else the torch chain through the fp32 scratch
+    ``resid``), the split-K workspace and the fixed-order host reduction.  ``launch()`` writes
+    ``out`` and returns it without allocating."""
 
     module_name: str
     arch: str
@@ -3977,6 +4021,7 @@ class PreparedRouterGemm:
     tensors: dict[str, torch.Tensor] = field(repr=False)
     device_index: int = 0
     _launch: Optional[_Launch] = field(default=None, repr=False)
+    _split: Optional[_Launch] = field(default=None, repr=False)
 
     @property
     def template(self) -> str:
@@ -3990,11 +4035,19 @@ class PreparedRouterGemm:
     def splits(self) -> int:
         return self.plan.splits
 
+    @property
+    def fused_split(self) -> bool:
+        """Whether ``launch()`` splits with the fused program (else the torch chain)."""
+        return self._split is not None
+
     def launch(self) -> torch.Tensor:
         assert self._launch is not None
         t = self.tensors
-        split_fp32_to_bf16x3_(t["split_src"], t["parts"], t["resid"])
+        if self._split is None:
+            split_fp32_to_bf16x3_(t["split_src"], t["parts"], t["resid"])
         with _ffi_stream_context(self.device_index):
+            if self._split is not None:
+                self._split()
             self._launch()
         if self.plan.splits > 1:
             torch.sum(
@@ -4052,12 +4105,19 @@ def _k2_checked_views(
 
 
 def _k2_workspace(
-    plan: RouterPlan, split_src: torch.Tensor, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """The retained BF16x3 stack of the second operand, its fp32 residual scratch and the split-K workspace
-    (``None`` for a single split: the kernel writes ``out`` directly)."""
+    plan: RouterPlan,
+    split_src: torch.Tensor,
+    device: torch.device,
+    *,
+    scratch: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The retained BF16x3 stack of the second operand, the fp32 residual scratch of the torch-chain split
+    (``None`` when the fused split program splits: ``scratch=False``) and the split-K workspace (``None`` for a
+    single split: the kernel writes ``out`` directly)."""
     parts = torch.empty((3, *split_src.shape), device=device, dtype=torch.bfloat16)
-    resid = torch.empty(split_src.shape, device=device, dtype=torch.float32)
+    resid = None
+    if scratch:
+        resid = torch.empty(split_src.shape, device=device, dtype=torch.float32)
     workspace = None
     if plan.splits > 1:
         expect = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
@@ -4111,12 +4171,18 @@ def prepare_router_fp32_gemm(
     splits: Optional[int] = None,
 ) -> PreparedRouterGemm:
     """Validate one fp32 binding, plan it and prepare its launch (the only allocations of the
-    K2 backend: the BF16x3 stack and its fp32 residual scratch and the split-K workspace)."""
+    K2 backend: the BF16x3 stack, the fp32 residual scratch of the torch-chain split and the
+    split-K workspace)."""
     plan, _, _, arch, module_name = _k2_plan(A, B, out, splits=splits)
     device = out.device
     a_view, split_src = _k2_views(A, B, plan)
-    parts, resid, workspace = _k2_workspace(plan, split_src, device)
-    tensors = dict(A=a_view, split_src=split_src, parts=parts, resid=resid)
+    split_module = _fused_split_for(arch, split_src)
+    parts, resid, workspace = _k2_workspace(
+        plan, split_src, device, scratch=split_module is None
+    )
+    tensors = dict(A=a_view, split_src=split_src, parts=parts)
+    if resid is not None:
+        tensors["resid"] = resid
     if workspace is not None:
         tensors["workspace"] = workspace
         out32, ldo, out_l = workspace, *_k2_workspace_strides(workspace)
@@ -4124,6 +4190,12 @@ def prepare_router_fp32_gemm(
         out32, ldo, out_l = _k2_out32(out), int(out.stride(0)), 0
     values = _k2_values(plan, A=a_view, parts=parts, out32=out32, ldo=ldo, out_l=out_l)
     launch = bind_launch(module_name, values, plan.grid, arch)
+    split_launch = None
+    if split_module is not None:
+        n = split_src.numel()
+        split_launch = bind_launch(
+            split_module, _split_values(split_src, parts, n), _split_grid(n), arch
+        )
     return PreparedRouterGemm(
         module_name=module_name,
         arch=arch,
@@ -4132,14 +4204,17 @@ def prepare_router_fp32_gemm(
         tensors=tensors,
         device_index=_device_index(device),
         _launch=launch,
+        _split=split_launch,
     )
 
 
 @dataclass
 class _CachedRouter:
-    """A planned K2 launch of the convenience path: the plan, the resolved module entry, the argument template
-    and the shapes of the workspace it carves out of its arena (the BF16x3 stack ``[3, *split_shape]``, the
-    fp32 scratch ``split_shape`` and, for more than one split, the partials ``partials_shape``)."""
+    """A planned K2 launch of the convenience path: the plan, the resolved module entry, the argument template,
+    the fused split's ``(entry, template)`` when the program is registered for the device (``None``: the torch
+    chain splits) and the shapes of the workspace it carves out of its arena (the BF16x3 stack
+    ``[3, *split_shape]``, under the torch chain the fp32 scratch ``split_shape`` and, for more than one split,
+    the partials ``partials_shape``)."""
 
     module_name: str
     arch: str
@@ -4151,15 +4226,15 @@ class _CachedRouter:
     partials_shape: Optional[tuple[int, ...]] = None
     views: Optional[dict[str, torch.Tensor]] = field(default=None, repr=False)
     views_version: int = -1
+    split: Optional[tuple[Callable[..., Any], tuple]] = field(default=None, repr=False)
 
     def carve(self, arena: _Arena) -> dict[str, torch.Tensor]:
-        """The ``parts`` stack (the TMA operand ``B``: exact shape), the ``resid`` scratch and the split-K
-        ``workspace`` as contiguous views over the first elements of the arena buffers."""
+        """The ``parts`` stack (the TMA operand ``B``: exact shape), the ``resid`` scratch (torch chain only) and
+        the split-K ``workspace`` as contiguous views over the first elements of the arena buffers."""
         bufs = arena.buffers
-        views = dict(
-            parts=_carve(bufs["k2_parts"], (3, *self.split_shape)),
-            resid=_carve(bufs["k2_resid"], self.split_shape),
-        )
+        views = dict(parts=_carve(bufs["k2_parts"], (3, *self.split_shape)))
+        if self.split is None:
+            views["resid"] = _carve(bufs["k2_resid"], self.split_shape)
         if self.partials_shape is not None:
             views["workspace"] = _carve(bufs["k2_partials"], self.partials_shape)
         return views
@@ -4192,6 +4267,7 @@ def _prepare_cached_router(
     a_view, split_src = _k2_checked_views(A, B, A_eff, B_eff, plan)
     split_shape = tuple(int(s) for s in split_src.shape)
     n = split_src.numel()
+    split_module = _fused_split_for(arch, split_src)
     partials_shape = None
     if plan.splits > 1:
         rows, cols = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
@@ -4208,14 +4284,31 @@ def _prepare_cached_router(
         out_l=out_l,
     )
     entry, template = _bind(module_name, values, plan.grid, arch)
-    # the workspace is a slot: grow the arena only once the module and the grid are known to be good
+    split = None
+    if split_module is not None:
+        split = _bind(
+            split_module,
+            _split_values(_Slot("src"), _Slot("parts"), n),
+            _split_grid(n),
+            arch,
+        )
+    # the workspace is a slot: grow the arena only once the modules and the grids are known to be good
     arena.require("k2_parts", 3 * n)
-    arena.require("k2_resid", n)
+    if split is None:
+        arena.require("k2_resid", n)
     if partials_shape is not None:
         arena.require("k2_partials", _numel(partials_shape))
     arena.refs += 1
     return _CachedRouter(
-        module_name, arch, plan, entry, template, arena, split_shape, partials_shape
+        module_name,
+        arch,
+        plan,
+        entry,
+        template,
+        arena,
+        split_shape,
+        partials_shape,
+        split=split,
     ), (a_view, split_src)
 
 
@@ -4223,8 +4316,9 @@ def _launch_cached_router(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
 ) -> torch.Tensor:
     """The convenience path of K2: plan on the first call for a (device, stream, geometry, splits) key; on every
-    call re-split the second operand into the BF16x3 stack carved out of the arena of the device and stream,
-    launch and reduce the split-K partials into ``out`` in the fixed order."""
+    call re-split the second operand into the BF16x3 stack carved out of the arena of the device and stream (one
+    launch of the fused split program when it is registered for the device, else the torch chain through the
+    arena's fp32 scratch), launch and reduce the split-K partials into ``out`` in the fixed order."""
     device = _same_cuda_device(A, B, out)
     index = _cuda_index(device)
     stream = _current_raw_stream(index)
@@ -4250,14 +4344,19 @@ def _launch_cached_router(
     # on this stream cannot interleave its own split or reduction (enqueue-only critical section).
     with cached.arena.lock:
         ws = _entry_views(cached)
-        split_fp32_to_bf16x3_(split_src, ws["parts"], ws["resid"])
+        if cached.split is None:
+            split_fp32_to_bf16x3_(split_src, ws["parts"], ws["resid"])
         workspace = ws.get("workspace")
         views = dict(
             A=a_view,
             parts=ws["parts"],
             out32=_k2_out32(out) if workspace is None else workspace,
+            src=split_src,
         )
         with _ffi_stream_context(index, stream):
+            if cached.split is not None:
+                split_entry, split_template = cached.split
+                split_entry(*_resolve_arguments(split_template, views))
             cached.entry(*_resolve_arguments(cached.template, views))
         if workspace is not None:
             torch.sum(
@@ -4301,7 +4400,7 @@ def router_wgrad(
     X: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
-    splits: int = 11,
+    splits: int = 6,
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store."""
     if out is None:
