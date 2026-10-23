@@ -68,14 +68,15 @@ def _workspace(
         quant_mode=quant_mode,
         **kwargs,
     )
+    assert nbytes > 0
     return torch.empty(nbytes, dtype=torch.uint8, device="cuda")
 
 
-def _routing(num_tokens: int, generator: torch.Generator):
+def _routing(num_tokens: int, generator: torch.Generator, top_k: int = TOP_K):
     logits = torch.rand(num_tokens, NUM_EXPERTS, device="cuda", generator=generator).to(
         torch.bfloat16
     )
-    weights, ids = torch.topk(logits.float().softmax(-1), TOP_K, dim=-1)
+    weights, ids = torch.topk(logits.float().softmax(-1), top_k, dim=-1)
     return logits, (
         ids.to(torch.int32),
         (weights / weights.sum(-1, keepdim=True)).to(torch.bfloat16),
@@ -96,13 +97,29 @@ def _bf16_weights(generator: torch.Generator):
     return prepare(w1 * 0.05), prepare(w2 * 0.05)
 
 
-def _make_bf16_case(seed: int, use_logits: bool) -> Launch:
+def _make_bf16_case(
+    seed: int,
+    use_logits: bool,
+    *,
+    packed: bool = False,
+    routing_method: RoutingMethodType = RoutingMethodType.Renormalize,
+) -> Launch:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     w1, w2 = _bf16_weights(generator)
     hidden = (
         torch.randn(MAX_TOKENS, HIDDEN, device="cuda", generator=generator) * 0.1
     ).to(torch.bfloat16)
-    logits, routed = _routing(MAX_TOKENS, generator)
+    top_k = 1 if routing_method == RoutingMethodType.Llama4 else TOP_K
+    logits, routed = _routing(MAX_TOKENS, generator, top_k)
+    packed_ids = (routed[0] << 16) | (
+        routed[1].view(torch.int16).to(torch.int32) & 0xFFFF
+    )
+    grouped = routing_method == RoutingMethodType.DeepSeekV3
+    bias = (
+        torch.rand(NUM_EXPERTS, device="cuda", generator=generator)
+        if routing_method in (RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2)
+        else None
+    )
 
     def launch(n: int, workspace_buffer=None, do_finalize: bool = True):
         common = dict(
@@ -110,14 +127,14 @@ def _make_bf16_case(seed: int, use_logits: bool) -> Launch:
             gemm1_weights=w1,
             gemm2_weights=w2,
             num_experts=NUM_EXPERTS,
-            top_k=TOP_K,
-            n_group=None,
-            topk_group=None,
+            top_k=top_k,
+            n_group=4 if grouped else None,
+            topk_group=2 if grouped else None,
             intermediate_size=INTER,
             local_expert_offset=0,
             local_num_experts=NUM_EXPERTS,
-            routed_scaling_factor=None,
-            routing_method_type=1,  # Renormalize
+            routed_scaling_factor=1.0 if bias is not None else None,
+            routing_method_type=int(routing_method),
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=do_finalize,
             # Tune only the buckets a MAX_TOKENS buffer can hold.
@@ -126,11 +143,12 @@ def _make_bf16_case(seed: int, use_logits: bool) -> Launch:
         )
         if use_logits:
             out = trtllm_bf16_moe(
-                routing_logits=logits[:n], routing_bias=None, **common
+                routing_logits=logits[:n], routing_bias=bias, **common
             )
         else:
             out = trtllm_bf16_routed_moe(
-                topk_ids=(routed[0][:n], routed[1][:n]), **common
+                topk_ids=packed_ids[:n] if packed else (routed[0][:n], routed[1][:n]),
+                **common,
             )
         return out if isinstance(out, torch.Tensor) else out[0]
 
@@ -254,10 +272,35 @@ def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 @pytest.mark.parametrize("quant_mode", QUANT_MODES)
-def test_workspace_size_is_positive_and_monotonic(quant_mode: str):
+@pytest.mark.parametrize("hidden", [HIDDEN])
+@pytest.mark.parametrize("inter", [INTER])
+@pytest.mark.parametrize("use_shuffled_weight", [False, True])
+@pytest.mark.parametrize("num_experts", [64, 128, 256])
+@pytest.mark.parametrize("top_k", [4, 8])
+def test_workspace_size_is_positive_and_monotonic(
+    quant_mode: str,
+    hidden: int,
+    inter: int,
+    use_shuffled_weight: bool,
+    num_experts: int,
+    top_k: int,
+):
+    if quant_mode == "bf16" and not use_shuffled_weight:
+        pytest.skip("BF16 requires shuffled BlockMajorK weights.")
     sizes = [
         trtllm_fused_moe_workspace_size(
-            n, HIDDEN, INTER, NUM_EXPERTS, TOP_K, quant_mode=quant_mode
+            n,
+            hidden,
+            inter,
+            num_experts,
+            top_k,
+            quant_mode=quant_mode,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=(
+                WeightLayout.BlockMajorK
+                if quant_mode == "bf16"
+                else WeightLayout.MajorK
+            ),
         )
         for n in (1, 16, 256, 4096)
     ]
@@ -373,6 +416,121 @@ def test_workspace_size_rejects_invalid_arguments():
 
 
 @pytest.mark.parametrize("case", list(CASES))
+def test_workspace_size_explicit_tactic(case: str, monkeypatch):
+    """Measure and execute actual configurations from each supported tile."""
+    quant_mode, factory = CASES[case]
+    launch = factory(seed=0)
+    tactics = []
+    selected = None
+
+    def choose_one(self, name, runners, config, inputs, **kwargs):
+        nonlocal tactics
+        if not tactics:
+            tactics = [tuple(t) for t in runners[0].get_valid_tactics(inputs, None)]
+        assert tactics
+        return runners[0], selected or tactics[0]
+
+    monkeypatch.setattr(AutoTuner, "choose_one", choose_one)
+    n = 32
+    launch(n)  # Collect the real runner's valid configurations.
+    # Cover distinct tiles and non-default configuration indices without running
+    # every GEMM combination in the kernel catalog.
+    by_tile = {}
+    for tactic in tactics:
+        by_tile.setdefault(tactic[0], []).append(tactic)
+    largest = _workspace(quant_mode, max_num_tokens=n)
+    sizes = []
+
+    def allocated(workspace):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        out = launch(n, workspace_buffer=workspace)
+        torch.cuda.synchronize()
+        count = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+        return out, count
+
+    for tile_tactics in by_tile.values():
+        for selected in dict.fromkeys(
+            ((tile_tactics[0][0], -1), tile_tactics[0], tile_tactics[-1])
+        ):
+            size = trtllm_fused_moe_workspace_size(
+                n,
+                HIDDEN,
+                INTER,
+                NUM_EXPERTS,
+                TOP_K,
+                quant_mode=quant_mode,
+                tactic=selected,
+            )
+            assert 0 < size <= largest.numel()
+            sizes.append(size)
+            workspace = torch.empty(size, dtype=torch.uint8, device="cuda")
+            expected = launch(n)
+            launch(n, workspace_buffer=workspace)  # Warm this configuration.
+            actual, count = allocated(workspace)
+            _, largest_count = allocated(largest)
+            _assert_bitwise_equal(actual, expected)
+            # An exact-sized buffer must not fall back to per-call scratch.
+            assert count == largest_count
+    assert min(sizes) < largest.numel()
+
+
+@pytest.mark.parametrize("quant_mode", QUANT_MODES)
+def test_workspace_size_explicit_tile_default_config(quant_mode):
+    args = (32, HIDDEN, INTER, NUM_EXPERTS, TOP_K)
+    maximum = trtllm_fused_moe_workspace_size(*args, quant_mode=quant_mode)
+    tiles = [8, 16, 32, 64]
+    if quant_mode != "mxfp4_bf16":
+        tiles.append(128)
+    if quant_mode in ("nvfp4", "mxfp4_mxfp8"):
+        tiles.append(192)
+    if quant_mode in ("mxfp8", "nvfp4", "mxfp4_mxfp8"):
+        tiles.append(256)
+    sizes = [
+        trtllm_fused_moe_workspace_size(*args, quant_mode=quant_mode, tactic=(tile, -1))
+        for tile in tiles
+    ]
+    # Unsupported tiles may have no valid config and return zero. The others
+    # must preserve tile-dependent sizes, rather than all returning the maximum.
+    valid_sizes = [size for size in sizes if size > 0]
+    assert valid_sizes
+    assert max(valid_sizes) == maximum
+    assert min(valid_sizes) < maximum
+
+
+@pytest.mark.parametrize("quant_mode", QUANT_MODES)
+@pytest.mark.parametrize("config", [-1, 0])
+def test_workspace_size_rejects_unsupported_tile(quant_mode, config):
+    with pytest.raises((ValueError, RuntimeError)):
+        trtllm_fused_moe_workspace_size(
+            32,
+            HIDDEN,
+            INTER,
+            NUM_EXPERTS,
+            TOP_K,
+            quant_mode=quant_mode,
+            tactic=(7, config),
+        )
+
+
+@pytest.mark.parametrize(
+    "tactic",
+    [-1, (), (32,), (32, 0, 1), (-1, -1), (32, -2), (0, 0), (32, 0.5), (True, 0)],
+)
+def test_workspace_size_rejects_malformed_tactic(tactic):
+    with pytest.raises(ValueError, match="tactic must be"):
+        trtllm_fused_moe_workspace_size(
+            32,
+            HIDDEN,
+            INTER,
+            NUM_EXPERTS,
+            TOP_K,
+            quant_mode="bf16",
+            tactic=tactic,
+        )
+
+
+@pytest.mark.parametrize("case", list(CASES))
 def test_workspace_buffer_matches_per_call_allocation(case: str):
     """One buffer sized for MAX_TOKENS serves every smaller batch, bit for bit."""
     quant_mode, factory = CASES[case]
@@ -383,6 +541,45 @@ def test_workspace_buffer_matches_per_call_allocation(case: str):
         # Poison the shared buffer: the launch must not depend on its prior contents.
         workspace.fill_(0xFF)
         actual = launch(n, workspace_buffer=workspace)
+        _assert_bitwise_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "routing_input_mode", list(RoutingInputMode), ids=lambda m: m.name
+)
+@pytest.mark.parametrize(
+    "routing_method",
+    [m for m in RoutingMethodType if m != RoutingMethodType.Unspecified],
+    ids=lambda m: m.name,
+)
+def test_workspace_buffer_covers_routing(
+    routing_input_mode: RoutingInputMode, routing_method: RoutingMethodType
+):
+    """The logits-based size query bounds scratch for each routing path."""
+    launch = _make_bf16_case(
+        seed=0,
+        use_logits=routing_input_mode == RoutingInputMode.FromLogits,
+        packed=routing_input_mode == RoutingInputMode.PackedPrecomputed,
+        routing_method=routing_method,
+    )
+    top_k = 1 if routing_method == RoutingMethodType.Llama4 else TOP_K
+    nbytes = trtllm_fused_moe_workspace_size(
+        MAX_TOKENS, HIDDEN, INTER, NUM_EXPERTS, top_k, quant_mode="bf16"
+    )
+    assert nbytes > 0
+    workspace = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+    for n in TOKEN_COUNTS:
+        expected = launch(n)
+        # Warm the buffered path before measuring allocations.
+        launch(n, workspace_buffer=workspace)
+        workspace.fill_(0xFF)
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        actual = launch(n, workspace_buffer=workspace)
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+        # Only the returned output may allocate; scratch must fit in the buffer.
+        assert allocated == 1, allocated
         _assert_bitwise_equal(actual, expected)
 
 
