@@ -28,8 +28,6 @@ class KDAForwardLaunch:
         initial_state=None,
         final_state=None,
         cu_seqlens=None,
-        allow_approximate_split=False,
-        use_expected_norm=False,
         offsets=None,
     ):
         self.out = out
@@ -48,8 +46,6 @@ class KDAForwardLaunch:
             initial_state=initial_state,
             final_state=final_state,
             cu_seqlens=cu_seqlens,
-            allow_approximate_split=allow_approximate_split,
-            use_expected_norm=use_expected_norm,
             offsets=offsets,
         )
 
@@ -85,8 +81,6 @@ def prepare_kda_forward(
     initial_state=None,
     final_state=None,
     cu_seqlens=None,
-    allow_approximate_split=False,
-    use_expected_norm=False,
     offsets=None,
 ):
     """Plan one launch; ``offsets`` are the host-known packed boundaries."""
@@ -108,14 +102,8 @@ def prepare_kda_forward(
         initial_state=initial_state,
         final_state=final_state,
         cu_seqlens=cu_seqlens,
-        allow_approximate_split=allow_approximate_split,
-        use_expected_norm=use_expected_norm,
         offsets=offsets,
     )
 
 
-def kda_forward(*args, **kwargs):
-    return prepare_kda_forward(*args, **kwargs).launch()
-
-
-__all__ = ["KDAForwardLaunch", "kda_forward", "prepare_kda_forward"]
+__all__ = ["KDAForwardLaunch", "prepare_kda_forward"]

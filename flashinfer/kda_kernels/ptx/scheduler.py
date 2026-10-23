@@ -547,8 +547,6 @@ class KDAPiecesLaunch:
         initial_state=None,
         final_state=None,
         cu_seqlens=None,
-        allow_approximate_split=False,
-        use_expected_norm=False,
         offsets=None,
     ):
         self.out = out
@@ -557,10 +555,6 @@ class KDAPiecesLaunch:
         self._g_dtype = g.dtype
         self._g = g
         self._initial_state = initial_state
-        if allow_approximate_split or use_expected_norm:
-            raise ValueError(
-                "PTX KDA supports exact state handoff and exact Q/K norms only"
-            )
         self.expected_norm_enabled = False
         self.normalization_mode = "exact_norm"
         self._staging_in = (
@@ -592,14 +586,6 @@ class KDAPiecesLaunch:
         offsets = [int(x) for x in offsets]
         num_heads = int(base_args["num_heads"])
         self._num_heads = num_heads
-        if num_heads not in (64, 96):
-            self._module = None
-            self._detector = None
-            self.expected_norm_enabled = False
-            self.normalization_mode = "exact_norm_fallback"
-            self.schedule = f"unsupported_heads_{self._fallback.schedule}"
-            self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
-            return
         num_sms = get_device_properties(q.device).multi_processor_count
         warm_tables = [None] * (len(offsets) - 1)
         rows, _, _ = plan_pieces(
@@ -989,8 +975,6 @@ def prepare_fwd_pieces(
     initial_state=None,
     final_state=None,
     cu_seqlens=None,
-    allow_approximate_split=False,
-    use_expected_norm=False,
     offsets=None,
 ):
     """Create a preallocated KDA forward launch.
@@ -1021,8 +1005,6 @@ def prepare_fwd_pieces(
     :type final_state: torch.Tensor
     :param cu_seqlens: Optional packed sequence boundaries.
     :type cu_seqlens: torch.Tensor
-    :param allow_approximate_split: Reserved; must be False.
-    :param use_expected_norm: Reserved; must be False.
     :param offsets: Host-known packed offsets; read from ``cu_seqlens`` when None.
     :return: Launch object with a launch() method.
     :rtype: KDAPiecesLaunch
@@ -1047,8 +1029,6 @@ def prepare_fwd_pieces(
         initial_state=initial_state,
         final_state=final_state,
         cu_seqlens=cu_seqlens,
-        allow_approximate_split=allow_approximate_split,
-        use_expected_norm=use_expected_norm,
         offsets=offsets,
     )
 
