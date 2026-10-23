@@ -31,8 +31,10 @@
 //   N % 8 == 0.  act, weight, out, bias and the workspace start at 16-byte aligned
 //   addresses (scale is one element and only needs to be contiguous).  The workspace is an
 //   optional contiguous buffer of any dtype, counted in bytes, that must hold at least what
-//   the query below reports for the same M, N, K, device and algo.  `algo` is 0 (the
-//   launcher's choice) or a variant code in the architecture's range.  `out` and the
+//   the query below reports for the same M, N, K, device and algo (a missing or shorter one
+//   is rejected as "workspace too small", also when algo 0 picked a variant that needs
+//   scratch).  `algo` is 0 (the launcher's choice) or a variant code in the architecture's
+//   range.  `out` and the
 //   workspace are written while the inputs are still being read, so neither may share bytes
 //   with act / weight / scale / bias, nor with each other; the inputs may alias one another.
 //   Any violation raises before anything is launched.
@@ -245,6 +247,16 @@ void W8A16LaunchGemm(const TensorView& out, const TensorView& act, const TensorV
   typename Launcher::Plan plan;
   W8A16CheckPlan(Launcher::Resolve(ops.M, ops.N, ops.K, ops.num_sms, algo, &plan), algo,
                  Launcher::FirstAlgoCode, Launcher::MaxAlgoCode, ops.K, Launcher::SliceRule);
+  // The capacity check the run path repeats, with the reason: the variant the plan picked
+  // (auto or forced) may need scratch the caller did not pass or passed too little of.
+  size_t needed = 0;
+  W8A16CheckWorkspaceBytes(Launcher::template WorkspaceBytes<T>(
+                               plan, ops.M, ops.N, ops.K, ops.device_id, ops.num_sms, &needed),
+                           ops.M, ops.N, plan.splits);
+  TVM_FFI_ICHECK(ops.workspace_bytes >= needed)
+      << "workspace too small: " << ops.workspace_bytes << " bytes, this call needs " << needed
+      << " (see w8a16_fp8_gemm_workspace_bytes for M=" << ops.M << ", N=" << ops.N
+      << ", K=" << ops.K << ", algo " << algo << ")";
 
   ffi::CUDADeviceGuard device_guard(ops.device_id);
   const cudaStream_t stream = get_stream(act.device());

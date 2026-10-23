@@ -863,10 +863,12 @@ def test_w8a16_fp8_gemm_caller_workspace_reuse(algo, dtype):
 def test_w8a16_fp8_gemm_native_checks():
     """The module's own FFI entry points reject what the contract says they reject,
     independently of the Python guards: the other activation dtype, misaligned out
-    and workspace, out / workspace overlapping an input, dimensions past the bounds,
-    and algo codes outside the table, including values whose low 32 bits are a valid
-    code (an int64 narrowed to int would accept them).  The context is alive
-    afterwards: a valid direct call still computes."""
+    and workspace, out / workspace overlapping an input, a missing or short workspace
+    for a variant that needs one (also when auto picked it: on Blackwell the launcher's
+    own choice at this small shape needs scratch, which the Python wrapper allocates
+    silently), dimensions past the bounds, and algo codes outside the table, including
+    values whose low 32 bits are a valid code (an int64 narrowed to int would accept
+    them).  The context is alive afterwards: a valid direct call still computes."""
     dev = torch.device("cuda")
     major = _major()
     mod = get_w8a16_fp8_gemm_module(dev, torch.bfloat16)
@@ -878,6 +880,51 @@ def test_w8a16_fp8_gemm_native_checks():
     launch = mod.w8a16_fp8_gemm
     query = mod.w8a16_fp8_gemm_workspace_bytes
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    # What the launcher's own choice needs here (0 on Hopper, scratch on Blackwell).
+    ws_auto_bytes = query(m, n, k, idx, 0)
+    ws_auto = (
+        torch.empty(ws_auto_bytes, device=dev, dtype=torch.uint8)
+        if ws_auto_bytes
+        else None
+    )
+    # A forced variant that needs scratch at a larger problem, for the capacity check.
+    first_valid = 2 if major == 9 else 1
+    m2, n2, k2 = 1024, 1024, 8192
+    code_ws, need = next(
+        (code, query(m2, n2, k2, idx, code))
+        for code in range(first_valid, 8)
+        if query(m2, n2, k2, idx, code) > 0
+    )
+    act2 = torch.ones(m2, k2, device=dev, dtype=torch.bfloat16)
+    w2 = torch.ones(n2, k2, device=dev).to(torch.float8_e4m3fn)
+    out2 = torch.empty(m2, n2, device=dev, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="workspace too small: 0 bytes"):
+        launch(out2, act2, w2, scale, None, None, code_ws)
+    with pytest.raises(RuntimeError, match=f"workspace too small: {need - 16} bytes"):
+        launch(
+            out2,
+            act2,
+            w2,
+            scale,
+            None,
+            torch.empty(need - 16, device=dev, dtype=torch.uint8),
+            code_ws,
+        )
+    if ws_auto is None:
+        # Hopper's choice here needs no scratch, so an unneeded buffer is simply unused;
+        # on Blackwell the same call without one must say so.
+        launch(
+            out,
+            act,
+            w_fp8,
+            scale,
+            None,
+            torch.empty(64, device=dev, dtype=torch.uint8),
+            0,
+        )
+    else:
+        with pytest.raises(RuntimeError, match="workspace too small: 0 bytes"):
+            launch(out, act, w_fp8, scale, None, None, 0)
 
     # The bf16 module refuses fp16 activations (one module per dtype).
     with pytest.raises(RuntimeError):
@@ -904,14 +951,13 @@ def test_w8a16_fp8_gemm_native_checks():
         query(_MAX_DIM, _MAX_DIM, 1024, idx, 0)
     # Algo codes: reserved, past the table, negative, and 2**32 + valid (low 32 bits
     # are 0 = auto or a real variant).
-    first_valid = 2 if major == 9 else 1
     reserved = 1 if major == 9 else 8
     for code in (reserved, 99, -1, 2**32, 2**32 + first_valid, 2**40 + first_valid):
         with pytest.raises(RuntimeError, match="algo"):
             query(m, n, k, idx, code)
         with pytest.raises(RuntimeError, match="algo"):
-            launch(out, act, w_fp8, scale, None, None, code)
+            launch(out, act, w_fp8, scale, None, ws_auto, code)
     # Still alive: a direct valid call computes 0.5 * K.
-    launch(out, act, w_fp8, scale, None, None, 0)
+    launch(out, act, w_fp8, scale, None, ws_auto, 0)
     torch.cuda.synchronize()
     assert torch.equal(out, torch.full((m, n), 512.0, device=dev, dtype=torch.bfloat16))
