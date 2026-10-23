@@ -15,6 +15,14 @@ HIDDEN_SIZE = 8192
 POST_EPS = 1e-8
 NEXT_EPS = 1e-5
 NEXT_GAIN_CENTER = 1.0
+BACKENDS = ("auto", "cake", "cute")
+
+
+def _skip_unless_supported(inputs, backend, **kwargs):
+    if not supports_gated_residual_next_rmsnorm(*inputs, **kwargs):
+        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
+    if not supports_gated_residual_next_rmsnorm(*inputs, backend=backend, **kwargs):
+        pytest.skip(f"backend {backend!r} is not available on this device")
 
 
 def _inputs(rows: int):
@@ -63,6 +71,7 @@ def _assert_close(actual, expected):
 def test_scalar_alpha_support_and_dispatch(monkeypatch, alpha, capability):
     # Check scalar dispatch without a GPU or allocating an alpha vector.
     monkeypatch.setattr(norm, "_HAS_CUTE_DSL_FUSED_NORM", True)
+    monkeypatch.setattr(norm, "_HAS_CAKE_FUSED_NORM", False)
     monkeypatch.setattr(norm, "_is_aligned", lambda *_: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
     monkeypatch.setattr(norm, "_cute_dsl_supports_arch", lambda *_: True)
@@ -88,30 +97,94 @@ def test_scalar_alpha_support_and_dispatch(monkeypatch, alpha, capability):
         assert len(calls) == 1
         assert calls[0][2] is beta
         assert calls[0][-1] == float(alpha)
+        assert not supports_gated_residual_next_rmsnorm(*inputs, backend="cake")
+        with pytest.raises(ValueError, match="backend 'cake' is not available"):
+            gated_residual_next_rmsnorm(*inputs, backend="cake")
 
 
+@pytest.mark.parametrize("alpha", [1, 0.5, None])
+@pytest.mark.parametrize("backend", ["auto", "cake"])
+@pytest.mark.parametrize("post_input_scale", [False, True])
+def test_cake_dispatch_prefers_the_package(
+    monkeypatch, alpha, backend, post_input_scale
+):
+    # The same dispatch check for the Cake route: auto and cake reach the package, cute keeps the kernel.
+    monkeypatch.setattr(norm, "_HAS_CUTE_DSL_FUSED_NORM", True)
+    monkeypatch.setattr(norm, "_HAS_CAKE_FUSED_NORM", True)
+    monkeypatch.setattr(norm, "_is_aligned", lambda *_: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    monkeypatch.setattr(norm, "_cute_dsl_supports_arch", lambda *_: True)
+    monkeypatch.setattr(
+        norm,
+        "_cake_gated_residual_next_rmsnorm_supported",
+        lambda *_, **__: True,
+        raising=False,
+    )
+    cake_calls, cute_calls = [], []
+    monkeypatch.setattr(
+        norm,
+        "_cake_gated_residual_next_rmsnorm",
+        lambda *args, **kwargs: cake_calls.append((args, kwargs)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        norm,
+        "_gated_residual_next_rmsnorm_cute",
+        lambda *args: cute_calls.append(args),
+        raising=False,
+    )
+    with FakeTensorMode():
+        branch = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        residual = torch.empty(1, HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        weight = torch.empty(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        beta = torch.empty(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        gate = torch.empty(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        kwargs = (
+            {"post_weight": weight, "post_gain_center": 1.0} if post_input_scale else {}
+        )
+        inputs = (branch, residual, weight, gate if alpha is None else alpha, beta)
+        assert supports_gated_residual_next_rmsnorm(
+            *inputs, backend=backend, post_weight=kwargs.get("post_weight")
+        )
+        residual_out, ffn_input = gated_residual_next_rmsnorm(
+            *inputs, backend=backend, **kwargs
+        )
+        assert residual_out.shape == branch.shape and ffn_input.shape == branch.shape
+        assert len(cake_calls) == 1 and not cute_calls
+        args, keywords = cake_calls[0]
+        assert args[3] is (gate if alpha is None else beta) and args[4] is beta
+        assert keywords["alpha_scalar"] == (None if alpha is None else float(alpha))
+        assert keywords["post_weight"] is kwargs.get("post_weight")
+        gated_residual_next_rmsnorm(*inputs, backend="cute", **kwargs)
+        assert len(cake_calls) == 1 and len(cute_calls) == 1
+        with pytest.raises(ValueError, match="backend must be one of"):
+            gated_residual_next_rmsnorm(*inputs, backend="fast", **kwargs)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("rows", [0, 1, 17, 128, 2048])
 @pytest.mark.parametrize("post_gain_center", [None, 0.0, 1.0])
-def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center):
+def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center, backend):
     torch.manual_seed(1000 + rows)
     inputs = _inputs(rows)
-    if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
     kwargs = {}
     if post_gain_center is not None:
         kwargs = {
             "post_weight": torch.randn_like(inputs[2]) * 0.1,
             "post_gain_center": post_gain_center,
         }
-    _assert_close(_call(inputs, **kwargs), _reference(inputs, **kwargs))
+    _skip_unless_supported(inputs, backend, post_weight=kwargs.get("post_weight"))
+    _assert_close(
+        _call(inputs, backend=backend, **kwargs), _reference(inputs, **kwargs)
+    )
 
 
-def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32():
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32(backend):
     inputs = list(_inputs(17))
-    if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
+    _skip_unless_supported(inputs, backend)
     inputs[1].mul_(64.0)
-    residual_out, ffn_input = _call(inputs)
+    residual_out, ffn_input = _call(inputs, backend=backend)
     expected_residual, expected_ffn = _reference(inputs)
     rounded_ffn = residual_out.to(torch.bfloat16).float()
     rounded_ffn *= torch.rsqrt(
@@ -125,25 +198,25 @@ def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32():
     assert not torch.equal(ffn_input, rounded_ffn)
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("alpha", [1.0, 0.5, -1.0])
 @pytest.mark.parametrize("rows", [0, 1, 17])
 @pytest.mark.parametrize("post_input_scale", [False, True])
-def test_scalar_alpha_matches_tensor(alpha, rows, post_input_scale):
+def test_scalar_alpha_matches_tensor(alpha, rows, post_input_scale, backend):
     torch.manual_seed(1000 + rows)
     inputs = list(_inputs(rows))
-    if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
+    _skip_unless_supported(inputs, backend)
     kwargs = {}
     if post_input_scale:
         kwargs = {"post_weight": inputs[2], "post_gain_center": 1.0}
     inputs[3] = alpha
     assert supports_gated_residual_next_rmsnorm(
-        *inputs, post_weight=kwargs.get("post_weight")
+        *inputs, post_weight=kwargs.get("post_weight"), backend=backend
     )
-    actual = _call(inputs, **kwargs)
+    actual = _call(inputs, backend=backend, **kwargs)
     _assert_close(actual, _reference(inputs, **kwargs))
     inputs[3] = torch.full_like(inputs[4], alpha)
-    _assert_close(actual, _call(inputs, **kwargs))
+    _assert_close(actual, _call(inputs, backend=backend, **kwargs))
 
 
 def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
@@ -185,14 +258,14 @@ def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
         )
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("post_input_scale", [False, True])
 @pytest.mark.parametrize("alpha", [None, 1.0, 0.5])
 def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(
-    post_input_scale, alpha
+    post_input_scale, alpha, backend
 ):
     inputs = list(_inputs(17))
-    if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
+    _skip_unless_supported(inputs, backend)
     if alpha is not None:
         inputs[3] = alpha
     kwargs = {}
@@ -201,10 +274,10 @@ def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(
             "post_weight": torch.randn_like(inputs[2]) * 0.1,
             "post_gain_center": 1.0,
         }
-    _call(inputs, **kwargs)
+    _call(inputs, backend=backend, **kwargs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = _call(inputs, **kwargs)
+        actual = _call(inputs, backend=backend, **kwargs)
 
     for seed in (3001, 4001):
         torch.manual_seed(seed)
