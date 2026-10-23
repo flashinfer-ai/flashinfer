@@ -443,21 +443,26 @@ def _decode_cp_a2a_lse_reduce_reference(
     cp_rank: int,
     cp_size: int,
     lse_mode: str = "base2",
+    mask=None,
     **_unused,
 ):
     """Local LSE merge reference; multi-rank exchange is tested under tests/comm."""
+    valid = torch.isfinite(partial_lse)
+    if mask is not None:
+        valid = valid & mask[:, None, None]
     lse = torch.where(
-        torch.isnan(partial_lse) | torch.isposinf(partial_lse),
+        ~valid,
         torch.full_like(partial_lse, float("-inf")),
         partial_lse,
     )
-    lse_max = lse.amax(dim=-1, keepdim=True)
+    lse_max = lse.amax(dim=-2, keepdim=True)
     lse_max = torch.where(torch.isneginf(lse_max), 0, lse_max)
     weights = (
         torch.exp(lse - lse_max) if lse_mode == "basee" else torch.exp2(lse - lse_max)
     )
-    denom = weights.sum(dim=-1, keepdim=True)
-    output = (partial_o.float() * weights.unsqueeze(-1)).sum(dim=-2)
+    denom = weights.sum(dim=-2).unsqueeze(-1)
+    safe_o = torch.where(valid.unsqueeze(-1), partial_o.float(), 0)
+    output = (safe_o * weights.unsqueeze(-1)).sum(dim=-3)
     output = output / denom.clamp_min(1e-20)
     output = torch.where(denom == 0, torch.zeros_like(output), output)
     return output.to(partial_o.dtype)
@@ -465,7 +470,7 @@ def _decode_cp_a2a_lse_reduce_reference(
 
 def _decode_cp_a2a_lse_reduce_init(
     *,
-    batch_dim: int,
+    heads: int,
     cp_size: int,
     head_dim: int = 128,
     workspace_bytes: int = 16,
@@ -478,11 +483,9 @@ def _decode_cp_a2a_lse_reduce_init(
     torch.manual_seed(seed)
     return {
         "partial_o": torch.randn(
-            batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device
+            cp_size, heads, head_dim, dtype=torch.bfloat16, device=device
         ),
-        "partial_lse": torch.randn(
-            batch_dim, cp_size, dtype=torch.float32, device=device
-        ),
+        "partial_lse": torch.randn(cp_size, heads, dtype=torch.float32, device=device),
         "workspace": torch.zeros(workspace_bytes, dtype=torch.uint8, device=device),
         "cp_rank": int(cp_rank),
         "cp_size": int(cp_size),
@@ -499,27 +502,22 @@ decode_cp_a2a_lse_reduce_trace = TraceTemplate(
         "LSE merge; multi-rank exchange correctness is exercised by tests/comm."
     ),
     axes={
-        "batch_dim": Var(
-            description=(
-                "Flattened batch and head dimensions (batch * heads); heads may "
-                "be local or total."
-            )
-        ),
+        "heads": Var(description="Number of heads per destination."),
         "cp_size": Var(description="Context-parallel group size."),
         "head_dim": Const(abbrev="d"),
         "workspace_bytes": Var(),
     },
     inputs={
         "partial_o": Tensor(
-            ["batch_dim", "cp_size", "head_dim"],
+            ["cp_size", "heads", "head_dim"],
             description=(
-                "Per-rank partial attention outputs [batch, heads, cp_size, head_dim]."
+                "Per-rank partial attention outputs [cp_size, heads, head_dim]."
             ),
         ),
         "partial_lse": Tensor(
-            ["batch_dim", "cp_size"],
+            ["cp_size", "heads"],
             dtype="float32",
-            description="Per-rank log-sum-exp values [batch, heads, cp_size].",
+            description="Per-rank log-sum-exp values [cp_size, heads].",
         ),
         "workspace": Tensor(["workspace_bytes"], dtype="uint8"),
         "cp_rank": Scalar("int32"),
@@ -528,12 +526,81 @@ decode_cp_a2a_lse_reduce_trace = TraceTemplate(
     },
     outputs={
         "output": Tensor(
-            ["batch_dim", "head_dim"],
+            ["heads", "head_dim"],
             dtype_from="partial_o",
-            description="Reduced output [batch, heads, head_dim].",
+            description="Reduced output [heads, head_dim].",
         ),
     },
     tags=["status:experimental", "stage:comm"],
     reference=_decode_cp_a2a_lse_reduce_reference,
     init=_decode_cp_a2a_lse_reduce_init,
+)
+
+
+def _decode_cp_a2a_lse_reduce_token_init(
+    *,
+    batch: int,
+    heads: int,
+    cp_size: int,
+    head_dim: int = 128,
+    workspace_bytes: int = 16,
+    cp_rank: int = 0,
+    lse_mode: str = "base2",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build validity schema inputs, without a collective workspace allocation."""
+    torch.manual_seed(seed)
+    return {
+        "partial_o": torch.randn(
+            batch, cp_size, heads, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "partial_lse": torch.randn(
+            batch, cp_size, heads, dtype=torch.float32, device=device
+        ),
+        "workspace": torch.zeros(workspace_bytes, dtype=torch.uint8, device=device),
+        "mask": torch.ones(batch, dtype=torch.bool, device=device),
+        "cp_rank": int(cp_rank),
+        "cp_size": int(cp_size),
+        "lse_mode": lse_mode,
+    }
+
+
+decode_cp_a2a_lse_reduce_token_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="decode_cp_a2a_lse_reduce_tokens",
+    description="Local LSE merge schema with optional source-token validity; distributed exchange is tested in tests/comm.",
+    axes={
+        "batch": Var(),
+        "heads": Var(),
+        "cp_size": Var(),
+        "head_dim": Const(abbrev="d"),
+        "workspace_bytes": Var(),
+    },
+    inputs={
+        "partial_o": Tensor(["batch", "cp_size", "heads", "head_dim"]),
+        "partial_lse": Tensor(["batch", "cp_size", "heads"], dtype="float32"),
+        "workspace": Tensor(["workspace_bytes"], dtype="uint8"),
+        "mask": Tensor(["batch"], dtype="bool", optional=True),
+        "cp_rank": Scalar("int32"),
+        "cp_size": Scalar("int32"),
+        "lse_mode": Scalar("str"),
+    },
+    outputs={"output": Tensor(["batch", "heads", "head_dim"], dtype_from="partial_o")},
+    tags=["status:experimental", "stage:comm"],
+    reference=_decode_cp_a2a_lse_reduce_reference,
+    init=_decode_cp_a2a_lse_reduce_token_init,
+)
+
+
+def decode_cp_a2a_lse_reduce_trace_dispatch(**kwargs):
+    partial_o = kwargs.get("partial_o")
+    if partial_o is not None and partial_o.ndim == 4:
+        return decode_cp_a2a_lse_reduce_token_trace
+    return decode_cp_a2a_lse_reduce_trace
+
+
+decode_cp_a2a_lse_reduce_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    decode_cp_a2a_lse_reduce_trace,
+    decode_cp_a2a_lse_reduce_token_trace,
 )
