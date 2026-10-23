@@ -495,7 +495,7 @@ class TuningConfig:
                 ...         ),
                 ...     )
                 ... )
-        use_cold_l2_cache (bool): Whether to measure every profiled invocation
+        use_cold_l2_cache (bool): Whether to measure every profiled sample
             with a cold L2 cache. A buffer twice the device L2 size is written
             immediately before each sample. The flush is ordered before the
             sample's start event, so its cost is excluded from the reported
@@ -510,10 +510,12 @@ class TuningConfig:
             ``None`` uses the autotuner default. This affects measurement
             precision, not tactic compatibility or persisted cache identity.
         use_cold_l2_graph_replay (bool): Replay the captured graph once untimed
-            (absorbing first-launch initialization), then evict L2 so the timed
-            replay starts from a cold L2, and give every launch in the graph its
-            own input copy. Requires ``use_cuda_graph``; the eviction also
-            requires ``use_cold_l2_cache``.
+            before hot-L2 timing (cold-L2 timing always does). Requires
+            ``use_cuda_graph``.
+        cold_chain_launches (int): Launches per cold-L2 graph sample, each on
+            its own profile-arena lane; the sample is reported per launch, so
+            launch latency no longer dominates microsecond kernels. Only the
+            first launch follows the flush. Part of the persisted policy.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -542,6 +544,7 @@ class TuningConfig:
     cuda_graph_profile_replays: int = 1
     profiling_repeat: int | None = None
     use_cold_l2_graph_replay: bool = False
+    cold_chain_launches: int = 1
     value_aware_input_indices: tuple[int, ...] = ()
     profile_arena_input_indices: tuple[int, ...] = ()
     # Optional callback invoked once per profile bucket, after dynamic
@@ -551,6 +554,25 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
+
+    @property
+    def uses_cold_chain(self) -> bool:
+        """Whether cold-L2 samples time a multi-launch arena chain."""
+        return (
+            self.cold_chain_launches > 1
+            and self.use_cuda_graph
+            and self.use_cold_l2_cache
+            and bool(self.profile_arena_input_indices or self.value_aware_input_indices)
+        )
+
+    @property
+    def l2_cache_policy(self) -> str:
+        """L2 measurement policy recorded in persisted profiling provenance."""
+        if not self.use_cold_l2_cache:
+            return "hot"
+        if self.uses_cold_chain:
+            return f"cold-chain:{self.cold_chain_launches}"
+        return "cold"
 
 
 class ValueProfileArena:
@@ -588,7 +610,9 @@ class ValueProfileArena:
         self._base_inputs = list(inputs)
         self._input_indices = unique_indices
         self._num_ring_lanes = num_ring_lanes
-        self._slot_layout: list[tuple[int, int, torch.dtype, tuple[int, ...]]] = []
+        self._slot_layout: list[
+            tuple[int, int, torch.dtype, tuple[int, ...], tuple[int, ...]]
+        ] = []
 
         lane_payload_bytes = 0
         device: torch.device | None = None
@@ -602,9 +626,9 @@ class ValueProfileArena:
                 )
             if not tensor.is_cuda:
                 raise ValueError(f"profile-arena input {input_index} must be on CUDA")
-            if not tensor.is_contiguous():
+            if not self.is_non_overlapping(tensor):
                 raise ValueError(
-                    f"profile-arena input {input_index} must be contiguous"
+                    f"profile-arena input {input_index} must be non-overlapping"
                 )
             if device is None:
                 device = tensor.device
@@ -612,9 +636,15 @@ class ValueProfileArena:
                 raise ValueError("all profile-arena inputs must use one CUDA device")
 
             lane_payload_bytes = self._align(lane_payload_bytes)
-            tensor_bytes = tensor.numel() * tensor.element_size()
+            tensor_bytes = self.span_bytes(tensor)
             self._slot_layout.append(
-                (input_index, lane_payload_bytes, tensor.dtype, tuple(tensor.shape))
+                (
+                    input_index,
+                    lane_payload_bytes,
+                    tensor.dtype,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                )
             )
             lane_payload_bytes += tensor_bytes
 
@@ -640,6 +670,31 @@ class ValueProfileArena:
         )
         self.stage(inputs)
 
+    @staticmethod
+    def is_non_overlapping(tensor: torch.Tensor) -> bool:
+        """Whether no two elements of ``tensor`` share memory (gaps allowed)."""
+        extent = 1
+        for stride, size in sorted(
+            (stride, size)
+            for stride, size in zip(tensor.stride(), tensor.shape, strict=True)
+            if size > 1
+        ):
+            if stride < extent:
+                return False
+            extent += stride * (size - 1)
+        return True
+
+    @staticmethod
+    def span_bytes(tensor: torch.Tensor) -> int:
+        """Bytes from the first to the last element, gaps included."""
+        if tensor.numel() == 0:
+            return 0
+        last = sum(
+            stride * (size - 1)
+            for stride, size in zip(tensor.stride(), tensor.shape, strict=True)
+        )
+        return (last + 1) * tensor.element_size()
+
     @classmethod
     def _align(cls, value: int) -> int:
         """Round a byte count up to the arena alignment."""
@@ -653,12 +708,13 @@ class ValueProfileArena:
         """Create one full logical input list backed by a selected arena lane."""
         lane_inputs = list(self._base_inputs)
         lane_offset = lane * self._lane_stride_bytes
-        for input_index, slot_offset, dtype, shape in self._slot_layout:
+        for input_index, slot_offset, dtype, shape, stride in self._slot_layout:
             template = self._base_inputs[input_index]
             assert isinstance(template, torch.Tensor)
-            tensor_bytes = template.numel() * template.element_size()
-            byte_view = arena.narrow(0, lane_offset + slot_offset, tensor_bytes)
-            lane_inputs[input_index] = byte_view.view(dtype).view(shape)
+            byte_view = arena.narrow(
+                0, lane_offset + slot_offset, self.span_bytes(template)
+            )
+            lane_inputs[input_index] = byte_view.view(dtype).as_strided(shape, stride)
         return lane_inputs
 
     def stage(self, inputs: list[Any]) -> None:
@@ -1588,6 +1644,7 @@ class AutoTuner:
     """
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
+    _COLD_CHAIN_SAMPLE_BUDGET_MS = 10.0
     _instance = None
     _class_lock = threading.Lock()
 
@@ -2226,22 +2283,14 @@ class AutoTuner:
                 )
             )
 
-        new_config = TuningConfig(
+        new_config = replace(
+            tuning_config,
             dynamic_tensor_specs=tuple(new_specs),
-            constraint_specs=tuning_config.constraint_specs,
-            tensor_initializers=tuning_config.tensor_initializers,
-            use_cold_l2_cache=tuning_config.use_cold_l2_cache,
-            use_cuda_graph=tuning_config.use_cuda_graph,
             cuda_graph_profile_replays=(
                 profile_replays
                 if profile_replays is not None
                 else tuning_config.cuda_graph_profile_replays
             ),
-            profiling_repeat=tuning_config.profiling_repeat,
-            use_cold_l2_graph_replay=tuning_config.use_cold_l2_graph_replay,
-            value_aware_input_indices=tuning_config.value_aware_input_indices,
-            profile_arena_input_indices=tuning_config.profile_arena_input_indices,
-            inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -3053,7 +3102,8 @@ class AutoTuner:
 
         Returns:
             Execution time in milliseconds. Cold-L2 profiling returns the
-            median isolated-invocation latency; hot profiling retains the
+            median isolated-invocation latency (per launch for a cold chain);
+            hot profiling retains the
             existing average over back-to-back invocations.
 
         Note:
@@ -3093,7 +3143,11 @@ class AutoTuner:
         avg_time = float("inf")
 
         def cold_l2_profile(stream: torch.cuda.Stream, repeat: int) -> float:
-            """Measure isolated invocations without charging for the L2 flush."""
+            """Measure cold-L2 samples without charging for the L2 flush.
+
+            A cold-chain sample is reported per launch, and chained samples
+            are capped at ``_COLD_CHAIN_SAMPLE_BUDGET_MS`` of chain time.
+            """
             profile_replays = (
                 tuning_config.cuda_graph_profile_replays
                 if tuning_config.use_cuda_graph
@@ -3122,22 +3176,44 @@ class AutoTuner:
                 device=device,
             )
             num_samples = repeat * profile_replays
-            starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
-            ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
+            chain = graph is not None and tuning_config.uses_cold_chain
 
             def _run_once(profile_inputs):
                 runner(profile_inputs, tactic=tactic, **kwargs)
 
+            captured_batches = (
+                input_tensor_batches if chain else input_tensor_batches[-1:]
+            )
             with torch.cuda.stream(stream):
                 if graph is not None:
                     with torch.cuda.graph(graph):
-                        _run_once(input_tensor_batches[-1])
+                        for profile_inputs in captured_batches:
+                            _run_once(profile_inputs)
                     # Exercise the captured graph before collecting samples;
                     # every measured replay below is cold independently.
+                    warm_start = torch.cuda.Event(enable_timing=True)
+                    warm_end = torch.cuda.Event(enable_timing=True)
+                    warm_start.record(stream)
                     graph.replay()
+                    warm_end.record(stream)
 
                 stream.synchronize()
+                if chain:
+                    chain_ms = max(warm_start.elapsed_time(warm_end), 1e-3)
+                    num_samples = max(
+                        1,
+                        min(
+                            num_samples,
+                            int(self._COLD_CHAIN_SAMPLE_BUDGET_MS // chain_ms),
+                        ),
+                    )
+                starts = [
+                    torch.cuda.Event(enable_timing=True) for _ in range(num_samples)
+                ]
+                ends = [
+                    torch.cuda.Event(enable_timing=True) for _ in range(num_samples)
+                ]
                 delay_kernel_time_usec = (
                     self._CUDA_GRAPH_DELAY_MICRO_SECS
                     if graph is not None
@@ -3164,21 +3240,10 @@ class AutoTuner:
             samples = [
                 start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)
             ]
-            return statistics.median(samples)
+            return statistics.median(samples) / len(captured_batches)
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             graph = torch.cuda.CUDAGraph()
-            l2_eviction_buffer = None
-            if (
-                tuning_config.use_cold_l2_cache
-                and tuning_config.use_cuda_graph
-                and tuning_config.use_cold_l2_graph_replay
-            ):
-                l2_eviction_buffer = torch.empty(
-                    2 * self._get_l2_cache_size_in_bytes(),
-                    dtype=torch.uint8,
-                    device=stream.device,
-                )
 
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device="cuda")
@@ -3227,9 +3292,6 @@ class AutoTuner:
                 ):
                     # Exclude first-replay initialization from the timed sample.
                     graph.replay()
-                    if l2_eviction_buffer is not None:
-                        # Restore cold-L2 state after graph initialization.
-                        l2_eviction_buffer.zero_()
                     stream.synchronize()
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
@@ -3672,7 +3734,7 @@ class AutoTuner:
                 else None
             ),
             "l2_cache_policy",
-            "cold" if tuning_config.use_cold_l2_cache else "hot",
+            tuning_config.l2_cache_policy,
         )
 
     @staticmethod
@@ -4166,7 +4228,11 @@ class AutoTuner:
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
-        profiling_repeat = self._get_profiling_repeat(tuning_config)
+        schedule_length = (
+            tuning_config.cold_chain_launches
+            if tuning_config.uses_cold_chain
+            else self._get_profiling_repeat(tuning_config)
+        )
 
         arena_indices = (
             tuning_config.profile_arena_input_indices
@@ -4191,15 +4257,29 @@ class AutoTuner:
                         f"profile-arena input {input_index} must be a torch.Tensor"
                     )
                 lane_payload_bytes = ValueProfileArena._align(lane_payload_bytes)
-                lane_payload_bytes += tensor.numel() * tensor.element_size()
+                lane_payload_bytes += ValueProfileArena.span_bytes(tensor)
             lane_payload_bytes = ValueProfileArena._align(lane_payload_bytes)
             target_working_set_bytes = (
                 2 * l2_cache_size_bytes + ValueProfileArena._ALIGNMENT_BYTES
             )
+            if (
+                tuning_config.uses_cold_chain
+                and not tuning_config.value_aware_input_indices
+            ):
+                touched_bytes = sum(
+                    inputs[i].numel() * inputs[i].element_size() for i in arena_indices
+                )
+                if touched_bytes > target_working_set_bytes:
+                    # Already streamed from DRAM each launch; no copy needed.
+                    return [inputs] * schedule_length
+                if lane_payload_bytes > target_working_set_bytes:
+                    # A small gapped tensor whose span is too large to copy
+                    # into distinct lanes: time single cold launches instead.
+                    return [inputs]
             # Each lane is visited once in both the A and B arenas, so a
-            # repeat-length schedule can reach at most repeat // 2 lanes per
-            # arena. Do not allocate lanes that the timed replay cannot touch.
-            reachable_ring_lanes = max(profiling_repeat // 2, 1)
+            # schedule can reach at most length // 2 lanes per arena. Do not
+            # allocate lanes that the timed replay cannot touch.
+            reachable_ring_lanes = max(schedule_length // 2, 1)
             num_ring_lanes = min(
                 reachable_ring_lanes,
                 max(
@@ -4217,7 +4297,7 @@ class AutoTuner:
             # Keep the full measurement schedule while cycling through only
             # enough physical lanes to evict L2. Profiling precision therefore
             # does not multiply the arena's state/cache allocation.
-            batches = arena.iteration_inputs(profiling_repeat)
+            batches = arena.iteration_inputs(schedule_length)
             logger.debug(
                 "[Autotuner] profile-arena cold-L2 profiling uses two "
                 f"{arena.arena_size_bytes}-byte arenas, {num_ring_lanes} physical "
