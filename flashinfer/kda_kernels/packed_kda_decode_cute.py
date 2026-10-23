@@ -248,26 +248,6 @@ def _stg_v4_b32(gmem_addr_i64, u0, u1, u2, u3):
     return cutlass.Int32(r)
 
 
-def _stg_cg_v4_b32(gmem_addr_i64, u0, u1, u2, u3):
-    """st.global.cg.v4.b32 — stream the state write past L1 (write-once)."""
-    r = mlir_llvm.inline_asm(
-        cutlass.Int32.mlir_type,
-        [
-            gmem_addr_i64.ir_value(),
-            u0.ir_value(),
-            u1.ir_value(),
-            u2.ir_value(),
-            u3.ir_value(),
-        ],
-        "{ st.global.cg.v4.b32 [$1], {$2, $3, $4, $5}; mov.u32 $0, 0; }",
-        "=r,l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Int32(r)
-
-
 def _cp_async_commit_group():
     r = mlir_llvm.inline_asm(
         cutlass.Int32.mlir_type,

@@ -138,11 +138,6 @@ KR_AK_TOKEN_XOR = BT // 2  # 8, token-row permutation for the Ak.T image
 PAIRWISE_COL_XOR = 8  # column permutation of the 16x16 pairwise image
 PAIRWISE_ROW_STRIDE = 16
 
-# Byte sizes of one staged tile.
-RAW_BF16_STAGE_ELEMS = BT * DK  # 2048 BF16 -> 4096 bytes
-RAW_F32_STAGE_ELEMS = BT * DK  # 2048 FP32 -> 8192 bytes
-PAIRWISE_STAGE_ELEMS = BT * BT  # 256 BF16 -> 512 bytes
-
 
 def raw_bf16_s128(token, dim):
     """Physical BF16 element index of logical ``(token, dim)``.
@@ -215,23 +210,6 @@ pair_idx = pairwise_sw32
 # ---------------------------------------------------------------------------
 
 
-def mma_a_coords(lane, reg):
-    """Logical ``(row, col)`` of the two BF16 halves in A register ``reg``."""
-    g = lane >> 2
-    q = lane & 3
-    row = g + 8 * (reg & 1)
-    col = 2 * q + 8 * (reg >> 1)
-    return ((row, col), (row, col + 1))
-
-
-def mma_b_coords(lane, reg):
-    """Logical ``(k, n)`` of the two BF16 halves in B register ``reg``."""
-    g = lane >> 2
-    q = lane & 3
-    k = 2 * q + 8 * reg
-    return ((k, g), (k + 1, g))
-
-
 def mma_c_coord(lane, n_block, reg):
     """Logical ``(row, col)`` of FP32 accumulator register ``reg``."""
     g = lane >> 2
@@ -241,51 +219,9 @@ def mma_c_coord(lane, n_block, reg):
     return (row, col)
 
 
-def ldmatrix_a_coord(lane):
-    """Row/col of the 16-byte row segment lane ``lane`` feeds to an A load.
-
-    The row half is keyed
-    on **bit 3** of the lane.
-    """
-    matrix_id = lane >> 3
-    row = (lane & 7) + (8 if (matrix_id & 1) else 0)
-    col = 8 if (matrix_id >> 1) else 0
-    return (row, col)
-
-
-def ldmatrix_b_coord(lane):
-    """Row/col of the 16-byte row segment lane ``lane`` feeds to a B load.
-
-    The row half is keyed
-    on **bit 4** of the lane, unlike the A rule; using the A rule here silently
-    transposes the operand.
-    """
-    matrix_id = lane >> 3
-    row = (lane & 7) + (8 if (lane >> 4) else 0)
-    col = 8 if (matrix_id & 1) else 0
-    return (row, col)
-
-
-def stmatrix_coord(lane):
-    """Row/col of the 16-byte row segment lane ``lane`` feeds to an x4 store.
-
-    Same tile/row convention as ``ldmatrix.x4`` and the same quadrant order as
-    the **A** fragment.
-    """
-    matrix_id = lane >> 3
-    row = (lane & 7) + (8 if (matrix_id & 1) else 0)
-    col = 8 if (matrix_id >= 2) else 0
-    return (row, col)
-
-
 #: ``movmatrix`` register order for converting an A-layout fragment into the B
 #: layout of the *same* matrix: transpose each 8x8 quadrant, identity order.
 MOVMATRIX_A_TO_B = (0, 1, 2, 3)
-
-#: ``movmatrix`` register order for converting an A-layout fragment into the
-#: A layout of the *transposed* matrix: quadrants (1,0) and (0,1) exchange, so
-#: registers 1 and 2 swap.
-MOVMATRIX_A_TO_AT = (0, 2, 1, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -304,15 +240,12 @@ factor_idx = raw_bf16_s128
 
 #: The V/output half is 64 values wide, so it has one 128-byte segment per row.
 VO_ROW_ELEMS = DV_HALF  # 64 BF16 = 128 B
-VO_STAGE_ELEMS = BT * VO_ROW_ELEMS  # 1024 BF16 = 2048 B
 
 #: Physical rows of one value in the state image, by element width.  The state
 #: is stored ``[V, K]`` and read logically as ``[K, V]``,
 #: so one value spans 128 keys = 2 BF16 or 4 FP32 128-byte segments.
 STATE_BF16_ROWS_PER_VALUE = DK // BF16_SEGMENT_ELEMS  # 2
 STATE_F32_ROWS_PER_VALUE = DK // F32_SEGMENT_ELEMS  # 4
-STATE_BF16_ELEMS = DV_HALF * DK  # 8192 BF16 = 16 KiB
-STATE_F32_ELEMS = DV_HALF * DK  # 8192 FP32 = 32 KiB
 
 
 def _s128_index(row, column, segment_elems, group_elems):
@@ -367,21 +300,6 @@ def state_f32_idx(v_local, k):
     return _s128_index(line, local, F32_SEGMENT_ELEMS, F32_GROUP_ELEMS)
 
 
-def gt_idx(k):
-    """``GTotal`` is a contiguous FP32 ``[128]`` record with no swizzle."""
-    return k
-
-
-def state_half_rows(dv_half, *, fp32: bool = False) -> int:
-    """First tensor-map row of DV half ``dv_half``.
-
-    The state descriptors encode each 128-byte segment as the tensor map's
-    inner mode, so the half's coordinate is a row index and not a value index.
-    """
-    per_value = STATE_F32_ROWS_PER_VALUE if fp32 else STATE_BF16_ROWS_PER_VALUE
-    return dv_half * per_value * DV_HALF
-
-
 def vo_global_index(token, head, heads, dv_half, v_local):
     """Flat element index of ``out[0, token, head, 64 * dv_half + v_local]``.
 
@@ -405,11 +323,6 @@ def vo_global_index(token, head, heads, dv_half, v_local):
 WARP_VALUES = 8
 #: Compute warps per CTA; ``COMPUTE_WARPS * WARP_VALUES == DV_HALF``.
 COMPUTE_WARPS = DV_HALF // WARP_VALUES
-
-
-def mma_n8_c_coord(lane, reg):
-    """``(row, col)`` of accumulator register ``reg`` in a native N=8 MMA."""
-    return mma_c_coord(lane, 0, reg)
 
 
 def state_x2_ptr(lane, kb, v_base):
@@ -436,23 +349,6 @@ def vo_x2_ptr(lane, v_base):
     matrix = (lane // 8) & 1
     row = (lane - (lane // 8) * 8) + 8 * matrix
     return vo_idx(row, v_base)
-
-
-def packed_c_reg_coords(lane, reg):
-    """Logical ``(row, col)`` of the two halves of packed C register ``reg``.
-
-    A 16x8 C tile is four FP32 accumulator registers, but only two b32 registers
-    once rounded to BF16, and an x2 matrix copy moves exactly those two.  Packed
-    register ``reg`` is the pair ``(2 * reg, 2 * reg + 1)``, which is one C row
-    and two adjacent columns -- so the ``ldmatrix``/``stmatrix`` halves line up
-    with the accumulator without any lane shuffle.
-
-    This is the register map for the V load, the output store, and the
-    ``.trans`` state read alike: :func:`vo_x2_ptr` and :func:`state_x2_ptr`
-    already absorb the orientation difference, so only the instruction's
-    ``.trans`` modifier changes between them.
-    """
-    return (mma_n8_c_coord(lane, 2 * reg), mma_n8_c_coord(lane, 2 * reg + 1))
 
 
 def factor_a_fragment_ptr(lane, kb):
@@ -491,12 +387,6 @@ def ak_a_fragment_ptr(lane, kb):
     return factor_idx(logical_j ^ KR_AK_TOKEN_XOR, key)
 
 
-#: ``movmatrix`` register order converting the BF16 residual from the C layout
-#: it is computed in to the B layout the Aq/Ak MMAs consume: transpose each
-#: packed 8x8 quadrant in place, keeping the register index.
-MOVMATRIX_C_TO_B = (0, 1)
-
-
 #: ``cute.make_swizzle`` takes the design's **byte**-unit parameters, not
 #: the element-unit ones.  A composed layout's swizzle is applied to the byte
 #: offset, so both S128 images spell as ``Swizzle<3,4,3>`` regardless of element
@@ -505,46 +395,6 @@ MOVMATRIX_C_TO_B = (0, 1)
 #: against the arithmetic formulas in ``test_layouts``.
 SWIZZLE_S128_BYTES = (3, 4, 3)
 SWIZZLE_SW32_BYTES = (1, 4, 3)
-
-
-def make_cute_layouts():
-    """Build the three CuTe composed layouts .
-
-    ``raw_bf16`` and ``raw_f32`` are what ``make_tiled_tma_atom`` consumes, so
-    they must reproduce :func:`raw_bf16_s128` and :func:`raw_f32_s128` exactly.
-
-    ``pairwise`` carries the SW32 swizzle only.  :func:`pairwise_sw32` also
-    permutes the column by ``^ PAIRWISE_COL_XOR``, which is not expressible as
-    a CuTe layout, so this object is *not* a complete model of that image.  No
-    TMA descriptor uses it: the design has warp 2 store ``Aq`` directly.
-
-    Imported lazily so that host-only consumers (workspace helpers, layout unit
-    tests) do not need the CUTLASS DSL installed.
-    """
-    import cutlass.cute as cute
-
-    raw_bf16 = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_S128_BYTES),
-        0,
-        cute.make_layout(
-            (BT, (BF16_SEGMENT_ELEMS, BF16_SEGMENTS)),
-            stride=(BF16_SEGMENT_ELEMS, (1, BF16_SEGMENT_STRIDE)),
-        ),
-    )
-    raw_f32 = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_S128_BYTES),
-        0,
-        cute.make_layout(
-            (BT, (F32_SEGMENT_ELEMS, F32_SEGMENTS)),
-            stride=(F32_SEGMENT_ELEMS, (1, F32_SEGMENT_STRIDE)),
-        ),
-    )
-    pairwise = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_SW32_BYTES),
-        0,
-        cute.make_layout((BT, BT), stride=(PAIRWISE_ROW_STRIDE, 1)),
-    )
-    return raw_bf16, raw_f32, pairwise
 
 
 # --------------------------------------------------------------------------
@@ -917,56 +767,6 @@ def unpack_bf16x2(value, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def cvt_bf16x2_to_f16x2(value, *, loc=None, ip=None):
-    """Re-round a packed BF16 pair through FP16 (for an FP16 inverse chain)."""
-    from cutlass._mlir.extras import types as _T
-
-    return cutlass.Int32(
-        llvm.inline_asm(
-            _T.IntegerType.get_signless(32),
-            [cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
-            "{ .reg .b16 lo, hi; .reg .f32 flo, fhi;"
-            "  mov.b32 {lo, hi}, $1;"
-            "  cvt.f32.bf16 flo, lo; cvt.f32.bf16 fhi, hi;"
-            "  cvt.rn.f16x2.f32 $0, fhi, flo; }",
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def cp_async_16(smem_ptr, gmem_ptr, src_bytes, *, loc=None, ip=None):
-    """``cp.async.cg.shared.global`` of 16 bytes.
-
-    ``src_bytes`` is the PTX src-size operand: pass 16 for a real copy and 0 to
-    have the hardware zero-fill the destination instead.  That is exactly what
-    an out-of-range tail row needs, so no separate tail-clear pass is required.
-    """
-    from cutlass._mlir.dialects import llvm
-
-    llvm.inline_asm(
-        None,
-        [
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            gmem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(src_bytes).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.cg.shared.global [$0], [$1], 16, $2;",
-        "r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
 # ---------------------------------------------------------------------------
 # TMA
 #
@@ -1122,11 +922,6 @@ def _align_up(value: int, alignment: int) -> int:
 def chunks_for_lengths(lengths) -> list[int]:
     """``ceil_div(len, 16)`` per sequence."""
     return [(int(length) + CHUNK - 1) // CHUNK for length in lengths]
-
-
-def total_chunks_for_lengths(lengths) -> int:
-    """Exact total chunk count; zero-length sequences contribute zero chunks."""
-    return sum(chunks_for_lengths(lengths))
 
 
 @dataclass(frozen=True)
@@ -1364,46 +1159,6 @@ def _build_metadata(host: list[int], device: torch.device) -> ChunkMetadata:
     )
 
 
-def chunk_metadata(cu_seqlens: torch.Tensor) -> ChunkMetadata:
-    """Build (or reuse) the canonical INT32 metadata for ``cu_seqlens``.
-
-    A content miss copies ``cu_seqlens`` to the host, which synchronizes; that is
-    unavoidable, because the chunk counts are not knowable otherwise.  The
-    identity cache remembers only the bounded cache key -- same tensor object,
-    unmutated -- so every device-payload hit still performs the bounded cache's
-    stream ordering and updates its LRU position.
-    """
-    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
-        raise ValueError("cu_seqlens must have shape [N + 1]")
-    if cu_seqlens.dtype not in (torch.int32, torch.int64):
-        raise TypeError(f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}")
-
-    device = cu_seqlens.device
-    cached_key = _META_IDENTITY.get(cu_seqlens)
-    if cached_key is not None:
-        cached = _META_CONTENT.get(device, cached_key)
-        if cached is not None:
-            return cached
-
-    host = cu_seqlens.detach().to("cpu", torch.int64).tolist()
-    if host[0] != 0:
-        raise ValueError(f"cu_seqlens[0] must be 0, got {host[0]}")
-    if any(b < a for a, b in zip(host, host[1:], strict=False)):
-        raise ValueError("cu_seqlens must be non-decreasing")
-
-    key = (tuple(host),)
-    meta = _META_CONTENT.get(device, key)
-    if meta is None:
-        meta = _build_metadata(host, device)
-        _META_CONTENT.put(device, key, meta, meta.device_tensors())
-    _META_IDENTITY.put(cu_seqlens, key)
-    return meta
-
-
-def metadata_cache_stats(device: torch.device | int):
-    return _META_CONTENT.stats(device)
-
-
 def clear_metadata_cache() -> None:
     _META_CONTENT.clear()
     _META_IDENTITY.clear()
@@ -1419,8 +1174,6 @@ def clear_metadata_cache() -> None:
 #: Elements per 128-byte S128 segment, by element size.
 
 DESCRIPTOR_BYTES = 128
-#: Q, K, G, Kd, Qd, Ak.
-NUM_TENSOR_MAPS = 6
 
 #: 64 descriptor sets per device, LRU, for each cache.
 DESCRIPTOR_MAX_ENTRIES = 64
@@ -1644,10 +1397,6 @@ _TENSOR_MAP_CACHE = BoundedDeviceCache(
 )
 
 
-def prepare_descriptor_cache_stats(device):
-    return _TENSOR_MAP_CACHE.stats(device)
-
-
 def clear_prepare_descriptor_cache() -> None:
     _TENSOR_MAP_CACHE.clear()
 
@@ -1727,14 +1476,6 @@ def build_tensor_maps(
 
 #: Descriptor roles, in the order they are packed into the upload buffer.
 ROLES = ("factor", "aq", "gt", "v", "out", "state_in", "state_out")
-
-#: Plane order inside the fused factor descriptor.
-FACTOR_PLANES = ("kd", "qd", "ak")
-
-
-def factor_plane(factor: str, head: int, heads: int) -> int:
-    """``Kd -> head``, ``Qd -> H + head``, ``Ak -> 2H + head``."""
-    return FACTOR_PLANES.index(factor) * heads + head
 
 
 def assert_factor_regions_are_fused(workspace, heads: int, total_chunks: int) -> None:
@@ -1855,13 +1596,6 @@ def _state_spec_fields(state_dtype: torch.dtype, planes: int) -> dict:
     )
 
 
-def state_box_bytes(state_dtype: torch.dtype) -> int:
-    """Transaction bytes of one state-half TMA (16 KiB BF16, 32 KiB FP32)."""
-    fields = _state_spec_fields(state_dtype, 1)
-    element_bytes = 2 if state_dtype is torch.bfloat16 else 4
-    return fields["box_dim"][0] * fields["box_dim"][1] * element_bytes
-
-
 def unique_descriptors(specs: dict[str, TensorMapSpec]) -> list[TensorMapSpec]:
     """Distinct descriptors, in first-use order; equality *is* exact alias."""
     seen: list[TensorMapSpec] = []
@@ -1870,10 +1604,6 @@ def unique_descriptors(specs: dict[str, TensorMapSpec]) -> list[TensorMapSpec]:
         if spec is not None and spec not in seen:
             seen.append(spec)
     return seen
-
-
-def descriptor_count(specs: dict[str, TensorMapSpec]) -> int:
-    return len(unique_descriptors(specs))
 
 
 @dataclass(frozen=True)
@@ -1937,10 +1667,6 @@ def get_recurrence_tensor_maps(
     return _DESCRIPTORS.put(device, key, maps, (maps.storage,))
 
 
-def recurrence_descriptor_cache_stats(device: torch.device | int):
-    return _DESCRIPTORS.stats(device)
-
-
 def clear_recurrence_descriptor_cache() -> None:
     _DESCRIPTORS.clear()
 
@@ -1974,8 +1700,6 @@ INPUT_STAGE_BYTES = 15360
 
 #: One ``arrive_and_expect_tx`` covers all nine loads of a stage.
 INPUT_STAGE_TX_BYTES = INPUT_STAGE_BYTES
-#: 2 Kd + 2 Qd + 2 Ak + 1 Aq + 1 GTotal + 1 V.
-INPUT_TMA_INSTRUCTIONS = 9
 
 OUTPUT_STAGE_BYTES = BT * DV_HALF * 2  # 2048
 
@@ -1993,7 +1717,6 @@ MBAR_OUTPUT_READY = MBAR_INPUT_CONSUMED + INPUT_STAGES * 8  # 80
 MBAR_OUTPUT_CONSUMED = MBAR_OUTPUT_READY + OUTPUT_STAGES * 8  # 96
 MBAR_STATE_READY = MBAR_OUTPUT_CONSUMED + OUTPUT_STAGES * 8  # 112
 BARRIER_BYTES = MBAR_STATE_READY + 8  # 120
-NUM_BARRIERS = BARRIER_BYTES // 8  # 15
 
 SMEM_RAW_END = REC_SMEM_BARRIERS + BARRIER_BYTES  # 97400
 
@@ -2012,13 +1735,7 @@ SMEM_DYNAMIC_BYTES = (
 #: union.  It is live only before the input ring starts and after it drains, so
 #: it does not raise the peak.
 SMEM_STATE_F32 = SMEM_INPUT
-STATE_F32_BYTES = DV_HALF * DK * 4  # 32768
 
-#: CC 12.0 per-CTA shared memory, and the driver's own per-CTA overhead.  The
-#: launch parameter excludes the driver's share; residency does not.
-REC_SMEM_PER_CTA_BYTES = 99 * 1024  # 101376
-REC_SMEM_PER_SM_BYTES = 100 * 1024  # 102400
-REC_DRIVER_SMEM_PER_BLOCK_BYTES = 1024
 MIN_BLOCKS_PER_MP = 1
 
 # --- Arrival counts --------------------------------------
@@ -2028,31 +1745,6 @@ INPUT_CONSUMED_ARRIVALS = COMPUTE_WARPS  # one per compute warp, not per thread
 OUTPUT_READY_ARRIVALS = COMPUTE_WARPS
 OUTPUT_CONSUMED_ARRIVALS = 1
 STATE_READY_ARRIVALS = 1
-
-
-def smem_regions() -> dict[str, tuple[int, int]]:
-    """``{name: (offset, bytes)}`` for every region of the fixed arena."""
-    regions: dict[str, tuple[int, int]] = {"state": (SMEM_STATE, STATE_BYTES)}
-    for stage in range(INPUT_STAGES):
-        regions[f"input{stage}"] = (
-            SMEM_INPUT + stage * INPUT_STAGE_BYTES,
-            INPUT_STAGE_BYTES,
-        )
-    for stage in range(OUTPUT_STAGES):
-        regions[f"output{stage}"] = (
-            SMEM_OUTPUT + stage * OUTPUT_STAGE_BYTES,
-            OUTPUT_STAGE_BYTES,
-        )
-    regions["barriers"] = (REC_SMEM_BARRIERS, BARRIER_BYTES)
-    return regions
-
-
-def input_stage_base(stage: int) -> int:
-    return SMEM_INPUT + stage * INPUT_STAGE_BYTES
-
-
-def output_stage_base(stage: int) -> int:
-    return SMEM_OUTPUT + stage * OUTPUT_STAGE_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -2151,18 +1843,6 @@ def recurrence_grid(sequences: int, heads: int) -> tuple[int, int, int]:
     ``(N, 2H, 1)`` already had; only the DV half moves.
     """
     return (2 * sequences, heads, 1)
-
-
-def dv_half_of(block_x: int) -> int:
-    return block_x & 1
-
-
-def seq_of(block_x: int) -> int:
-    return block_x >> 1
-
-
-def head_of(block_y: int) -> int:
-    return block_y
 
 
 # ---------------------------------------------------------------------------
@@ -2388,7 +2068,6 @@ def launch_recurrence(
 # --------------------------------------------------------------------------
 
 PREP_WARPS = 4
-PREP_THREADS = PREP_WARPS * 32
 
 #: CPC 2 is the measured optimum on sm_120, the supported target:
 #:
@@ -2438,38 +2117,11 @@ SUPPORTED_MIN_BLOCKS_PER_SM = (1, 2, 3)
 
 # --- SMEM arena byte offsets -------------------------------
 # Layout when Ki and QK have their own stages, i.e. CPC > 1.
-SMEM_KD_THEN_AK = 0
-SMEM_QD = 4096
-SMEM_Q_RAW = 8192
-SMEM_K_RAW = 12288
-SMEM_GATE_EXPG = 16384
-SMEM_KI = 24576
-SMEM_AINV = 28672
-SMEM_GAMMA_BF16 = 29184
-SMEM_BETA_ACT = 29440
 PREP_SMEM_BARRIERS = 29568
-SMEM_QK = 29616
 SMEM_ARENA_BYTES = 30128
-
-#: Six 64-bit mbarriers inside the 48-byte barrier arena.
-PREP_MBAR_TMA0 = PREP_SMEM_BARRIERS + 0
-PREP_MBAR_TMA1 = PREP_SMEM_BARRIERS + 8
-PREP_MBAR_K_HALF_READY = PREP_SMEM_BARRIERS + 16
-PREP_MBAR_K_FULL_READY = PREP_SMEM_BARRIERS + 24
-PREP_MBAR_RAW_RELEASED = PREP_SMEM_BARRIERS + 32
-PREP_MBAR_PAIRWISE_READY = PREP_SMEM_BARRIERS + 40
-
-#: Expected TMA load bytes per chunk: Q 4096 + K 4096 + G 8192.
-TMA_LOAD_BYTES_PER_CHUNK = 16384
-#: Same with the opt-in BF16 G: only G moves, 8192 -> 4096.  The SMEM stage
-#: stays 8192 bytes either way, because it is overwritten by FP32 ``exp_g``.
-TMA_LOAD_BYTES_PER_CHUNK_G_BF16 = 12288
 
 #: CC 12.0 shared-memory limits.
 PREP_SMEM_PER_SM_BYTES = 100 * 1024
-PREP_SMEM_PER_CTA_BYTES = 99 * 1024
-#: Static SMEM does not need the ``cudaFuncSetAttribute`` opt-in below 48 KiB.
-STATIC_SMEM_LIMIT_BYTES = 48 * 1024
 
 #: The driver adds 1024 bytes per CTA on top of the arena (NCU: "Driver Shared
 #: Memory Per Block 1.02 Kbyte"), so the residency thresholds are on
@@ -2483,15 +2135,6 @@ STATIC_SMEM_LIMIT_BYTES = 48 * 1024
 #: alias -- gamma is live through that loop and beta from the prologue, so
 #: neither can move onto a raw stage.
 PREP_DRIVER_SMEM_PER_BLOCK_BYTES = 1024
-SMEM_FOR_FOUR_CTAS = PREP_SMEM_PER_SM_BYTES // 4 - PREP_DRIVER_SMEM_PER_BLOCK_BYTES
-
-#: A four-CTA arena is reachable -- at CPC == 1, Qd over raw Q plus Ki over raw
-#: K frees 8192 B and lands here, with NCU confirming four resident CTAs and
-#: 32.9% achieved occupancy.  It was measured and not kept: it is 0.24-2.36%
-#: slower, because the kernel is at ~90% of peak DRAM and the extra warps have
-#: nothing to issue, while every CTA-wide rendezvous gets longer.  Occupancy is
-#: not this kernel's constraint; bytes are.
-SMEM_ARENA_BYTES_FOUR_CTA = SMEM_ARENA_BYTES - 2 * 4096
 
 
 @dataclass(frozen=True)
@@ -2536,73 +2179,6 @@ def default_chunks_per_cta(device=None) -> int:
     if not torch.cuda.is_available():
         return DEFAULT_PREP_CHUNKS_PER_CTA
     return default_chunks_per_cta_for(torch.cuda.get_device_capability(device))
-
-
-def max_resident_ctas_from_smem(arena_bytes: int | None = None) -> int:
-    """SMEM-side residency ceiling.
-
-    Counts the driver's own per-CTA shared memory, without which this
-    overestimates: 25,520 B looks like four CTAs and measures three.
-    """
-    if arena_bytes is None:
-        arena_bytes = SMEM_ARENA_BYTES
-    return PREP_SMEM_PER_SM_BYTES // (arena_bytes + PREP_DRIVER_SMEM_PER_BLOCK_BYTES)
-
-
-def uses_dynamic_smem(arena_bytes: int = SMEM_ARENA_BYTES) -> bool:
-    """Whether the arena needs the >48 KiB dynamic-SMEM opt-in."""
-    return arena_bytes > STATIC_SMEM_LIMIT_BYTES
-
-
-# ---------------------------------------------------------------------------
-# Device-side index helpers.
-#
-# Written with ``//``, ``*``, ``+``, ``-`` and ``^`` only, so the same bodies
-# evaluate for Python ``int`` on the host and ``cutlass.Int32`` on the device.
-# They mirror Section 1 exactly.
-# ---------------------------------------------------------------------------
-
-raw_bf16_index = raw_bf16_s128
-raw_f32_index = raw_f32_s128
-kr_ak_index = kr_ak_bf16_s128
-pairwise_index = pairwise_sw32
-
-
-# ---------------------------------------------------------------------------
-# Key-major global views
-# ---------------------------------------------------------------------------
-
-
-def activation_layout_strides(total_tokens: int, heads: int):
-    """Strides of the CuTe view of contiguous ``[1, T_total, H, 128]``."""
-    return (1, DK * heads, DK, DK * total_tokens * heads)
-
-
-def workspace_layout_strides(total_chunks: int, heads: int):
-    """Strides of the CuTe view of contiguous ``[1, H, total_chunks*16, 128]``."""
-    rows = total_chunks * BT
-    return (1, DK, DK * rows, DK * rows * heads)
-
-
-def prepare_grid(total_chunks: int, heads: int, chunks_per_cta: int):
-    """``(grid.x, grid.y, grid.z)``; the host must not launch with grid.x == 0."""
-    return ((total_chunks + chunks_per_cta - 1) // chunks_per_cta, heads, 1)
-
-
-def chunks_in_cta(total_chunks: int, block_x: int, chunks_per_cta: int) -> int:
-    """CTA-uniform loop bound ``my_chunks``."""
-    base = block_x * chunks_per_cta
-    return max(0, min(chunks_per_cta, total_chunks - base))
-
-
-def tma_slot_and_phase(local_chunk: int) -> tuple[int, int, int, int]:
-    """``(tma_slot, tma_wait_phase, compute_wait_phase, beta_stage)``."""
-    return (
-        local_chunk & 1,
-        (local_chunk >> 1) & 1,
-        local_chunk & 1,
-        local_chunk & 1,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2757,54 +2333,6 @@ def prepare_launch_plan(
     )
 
 
-def launch_prepare(
-    *,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float,
-    workspace: PrepareWorkspace,
-    cu_seqlens: torch.Tensor,
-    config: PrepareConfig | None = None,
-) -> None:
-    """Write the five prepare outputs into ``workspace`` in place."""
-    require_sm120a(q.device)
-    config = config or PrepareConfig(
-        safe_gate=True, chunks_per_cta=default_chunks_per_cta(q.device)
-    )
-
-    meta = chunk_metadata(cu_seqlens)
-    if meta.total_chunks == 0:
-        # return without launching; grid.x == 0 is invalid.
-        return
-
-    launch_prepare_device(
-        q=q,
-        k=k,
-        g=g,
-        beta=beta,
-        a_log_exp=a_log_exp_for(A_log, LOG2_E),
-        dt_bias=dt_bias,
-        # Narrowed once when the metadata was built.  ``cu_seqlens.to(int32)``
-        # here would allocate on every call whenever the caller holds INT64,
-        # which is the common case.
-        cu_seqlens=meta.cu_seqlens,
-        cu_chunks=meta.cu_chunks,
-        chunk_to_seq=meta.chunk_to_seq,
-        workspace=workspace,
-        scale=float(scale),
-        lower_bound=float(lower_bound),
-        heads=q.shape[2],
-        total_tokens=q.shape[1],
-        total_chunks=meta.total_chunks,
-        config=config,
-    )
-
-
 # --------------------------------------------------------------------------
 # Section 8: the prepare device kernel
 # --------------------------------------------------------------------------
@@ -2865,19 +2393,6 @@ def raw_f32_idx(token, dim):
     return (
         seg * F32_SEG_STRIDE + token * F32_SEG_ELEMS + (group ^ (token & 7)) * 4 + inner
     )
-
-
-@cute.jit
-def raw_g_idx(token, dim, G_FP32: cutlass.Constexpr):
-    """SMEM index of ``G[token, dim]``, in whichever image its dtype implies.
-
-    FP32 ``G`` gets its own 4-segment S128 image; BF16 ``G`` is byte-identical
-    in shape to Q and K, so it simply reuses theirs.  Both are 128-byte
-    segments -- only the element count per segment differs.
-    """
-    if cutlass.const_expr(G_FP32):
-        return raw_f32_idx(token, dim)
-    return raw_bf16_idx(token, dim)
 
 
 @cute.jit
@@ -3905,163 +3420,9 @@ def prepare_kernel(
             cute.arch.barrier()
 
 
-@cute.jit
-def _prepare_entry(
-    gq: cute.Tensor,
-    gk: cute.Tensor,
-    gg: cute.Tensor,
-    gbeta: cute.Tensor,
-    ga_log_exp: cute.Tensor,
-    gdt: cute.Tensor,
-    gcu_seqlens: cute.Tensor,
-    gcu_chunks: cute.Tensor,
-    gchunk_to_seq: cute.Tensor,
-    ws_kd: cute.Tensor,
-    ws_qd: cute.Tensor,
-    ws_ak: cute.Tensor,
-    ws_aq: cute.Tensor,
-    ws_gt: cute.Tensor,
-    desc_q: cutlass.Int64,
-    desc_k: cutlass.Int64,
-    desc_g: cutlass.Int64,
-    desc_factor: cutlass.Int64,
-    scale: cutlass.Float32,
-    gate_scale_log2: cutlass.Float32,
-    total_chunks: cutlass.Int32,
-    heads: cutlass.Int32,
-    grid_x: cutlass.Int32,
-    stream,
-    SAFE_GATE: cutlass.Constexpr,
-    CPC: cutlass.Constexpr,
-    G_FP32: cutlass.Constexpr,
-):
-    prepare_kernel(
-        gq,
-        gk,
-        gg,
-        gbeta,
-        ga_log_exp,
-        gdt,
-        gcu_seqlens,
-        gcu_chunks,
-        gchunk_to_seq,
-        ws_kd,
-        ws_qd,
-        ws_ak,
-        ws_aq,
-        ws_gt,
-        desc_q,
-        desc_k,
-        desc_g,
-        desc_factor,
-        scale,
-        gate_scale_log2,
-        total_chunks,
-        heads,
-        SAFE_GATE,
-        CPC,
-        G_FP32,
-    ).launch(
-        grid=(grid_x, heads, 1),
-        block=(PREPARE_DEVICE_THREADS, 1, 1),
-        stream=stream,
-    )
-
-
-_PREPARE_DEVICE_CACHE: dict = {}
-
-
 def _flat(t: torch.Tensor):
     """Flat CuTe view, cached on the address (see :func:`~.runtime.flat_view`)."""
     return flat_view(t, align=16)
-
-
-def launch_prepare_device(
-    *,
-    q,
-    k,
-    g,
-    beta,
-    a_log_exp,
-    dt_bias,
-    cu_seqlens,
-    cu_chunks,
-    chunk_to_seq,
-    workspace,
-    scale,
-    lower_bound,
-    heads,
-    total_tokens,
-    total_chunks,
-    config,
-):
-    import cuda.bindings.driver as cuda_driver
-
-    grid_x = (total_chunks + config.chunks_per_cta - 1) // config.chunks_per_cta
-    # The tensors' device, not the current one; see fused/launch.py.
-    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-
-    # Cached on the buffer addresses, so a steady-state launch does not pay for
-    # encoding descriptors.
-    tmaps = build_tensor_maps(
-        q=q,
-        k=k,
-        g=g,
-        ws_kd=workspace.kd,
-        ws_qd=workspace.qd,
-        ws_ak=workspace.ak,
-        total_tokens=total_tokens,
-        total_chunks=total_chunks,
-        heads=heads,
-    )
-
-    args = (
-        _flat(q),
-        _flat(k),
-        _flat(g),
-        _flat(beta),
-        _flat(a_log_exp),
-        _flat(dt_bias),
-        _flat(cu_seqlens),
-        _flat(cu_chunks),
-        _flat(chunk_to_seq),
-        _flat(workspace.kd),
-        _flat(workspace.qd),
-        _flat(workspace.ak),
-        _flat(workspace.aq),
-        _flat(workspace.g_total),
-        cutlass.Int64(tmaps.q),
-        cutlass.Int64(tmaps.k),
-        cutlass.Int64(tmaps.g),
-        cutlass.Int64(tmaps.factor),
-        cutlass.Float32(scale),
-        cutlass.Float32(lower_bound * LOG2_E),
-        cutlass.Int32(total_chunks),
-        cutlass.Int32(heads),
-        cutlass.Int32(grid_x),
-        stream,
-    )
-    g_fp32 = g.dtype is torch.float32
-    # Device is part of the in-process key because a loaded callable is tied to
-    # its CUDA context. Heads and grid remain runtime values.
-    key = (
-        q.device.index,
-        bool(config.safe_gate),
-        int(config.chunks_per_cta),
-        g_fp32,
-    )
-    compiled = _PREPARE_DEVICE_CACHE.get(key)
-    if compiled is None:
-        with torch.cuda.device(q.device):
-            compiled = cute.compile(
-                _prepare_entry,
-                *args,
-                bool(config.safe_gate),
-                int(config.chunks_per_cta),
-                g_fp32,
-            )
-        _PREPARE_DEVICE_CACHE[key] = compiled
-    compiled(*args)
 
 
 # --------------------------------------------------------------------------

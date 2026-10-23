@@ -6296,7 +6296,7 @@ def _cu_seqlens_contents(cu_seqlens: torch.Tensor) -> tuple:
 # ---------------------------------------------------------------------------
 # Single host entry: ONE callable that routes the plain engine vs
 # the two-kernel decomposition (DV2 chain) by a one-line occupancy rule
-# (_occupancy_pick_route).  The engine is compiled eagerly, the decomp route
+# (_route_for_workspace).  The engine is compiled eagerly, the decomp route
 # lazily on first use.  The decomp route takes a user-allocated opaque
 # workspace (query bytes with workspace_size(); engine needs none).
 # ---------------------------------------------------------------------------
@@ -6311,27 +6311,6 @@ def _device_sm_count(device) -> int:
         count = torch.cuda.get_device_properties(device).multi_processor_count
         _SM_COUNT_CACHE[key] = count
     return count
-
-
-# The route is a one-line occupancy rule: run the decomp DV2 split (2 CTAs
-# per sequence-head walk) iff the doubled k2 grid still fits one CTA-per-SM
-# wave, else the plain engine.  DV2 is the only decomp variant, so decomp
-# always dispatches at dv=2.
-def _occupancy_pick_route(
-    cu_list: tuple[int, ...], heads: int, sm_count: int
-) -> tuple[str, int]:
-    """Pick ("decomp", 2) or ("engine", 0) by a simple occupancy rule.
-
-    n_seq * heads is the number of sequence-head walks (B*H for uniform
-    seqlen; n_seq = len(cu_list) - 1).  DV2 doubles the k2 grid to 2 CTAs
-    per walk; take it iff that grid still fits one wave (<= sm_count), else
-    the plain engine.
-    """
-
-    n_seq = len(cu_list) - 1
-    if n_seq * heads * 2 <= sm_count:
-        return ("decomp", 2)
-    return ("engine", 0)
 
 
 # =============================================================================

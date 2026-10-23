@@ -130,10 +130,6 @@ WARP_VALUES = DV // RECURRENCE_WARPS  # 16
 TMA_WARP = 12
 QK_WARP = 13
 IO_WARP = 14
-INV_WARP = 15
-
-#: Key dimensions one prepare warp owns: ``[32 * p, 32 * p + 32)``.
-PREPARE_WARP_DIMS = DK // PREPARE_WARPS  # 32
 
 #: ``m16n8k16`` steps of one ``[16, 128] @ [128, *]`` reduction.
 KEY_BLOCKS = DK // BT  # 8
@@ -184,17 +180,6 @@ WG3_MAXNREG = 64  # W12-W15 TMA, QK/Aq, I/O, KK/inverse
 #: Registers the launch reserves per thread before redistribution.
 LAUNCH_MAXNREG = 128
 
-#: What the requested split would have cost, kept only so the test that pins
-#: it against the pool keeps meaning something.  The *actual* allocation is
-#: uniform: ``THREADS * LAUNCH_MAXNREG == 512 * 128 == 65,536``, the whole file.
-CTA_REGISTER_BUDGET = (
-    4 * WG0_MAXNREG + 4 * WG1_MAXNREG + 4 * WG2_MAXNREG + 4 * WG3_MAXNREG
-) * 32
-
-#: The allocation that actually happens, every warp alike.
-CTA_REGISTERS_ACTUAL = THREADS * LAUNCH_MAXNREG
-CTA_REGISTER_POOL = 65536
-
 # ---------------------------------------------------------------------------
 # SMEM arena
 # ---------------------------------------------------------------------------
@@ -204,16 +189,11 @@ MAIN_SLOT_BYTES = 16384
 V_STAGES = 3
 V_STAGE_BYTES = 4096
 
-MAIN_OFFSET = 0
 V_STAGE_OFFSET = MAIN_SLOTS * MAIN_SLOT_BYTES  # 49152
 CONTROL_OFFSET = V_STAGE_OFFSET + V_STAGES * V_STAGE_BYTES  # 61440
 CONTROL_BYTES = 1024
 
 DYNAMIC_SMEM_BYTES = CONTROL_OFFSET + CONTROL_BYTES  # 62464
-
-#: SM120's per-CTA opt-in maximum.  The arena deliberately leaves 38,912 B
-#: unused rather than adding a fourth main_slot.
-SM120_SMEM_LIMIT = 101376
 
 #: The design target and the acceptance result alike -- but deliberately *not*
 #: passed to the launch as ``min_blocks_per_mp``.
@@ -263,11 +243,8 @@ MIN_BLOCKS_PER_MP = 1
 SLOT_Q = 0  # Qraw -> Qd -> O
 SLOT_K = 4096  # Kraw -> Kd
 SLOT_G_LO = 8192  # raw G / E lower -> Ki -> Ak.T
-SLOT_G_HI = 12288  # raw G / E upper -> factor records
 
 #: Aliases naming the phase a consumer actually addresses.
-SLOT_QD = SLOT_Q
-SLOT_OUT = SLOT_Q
 SLOT_KD = SLOT_K
 SLOT_KI = SLOT_G_LO
 SLOT_AKT = SLOT_G_LO
@@ -276,18 +253,13 @@ SLOT_AKT = SLOT_G_LO
 SLOT_AINV_BETA = 12288  # [16, 16] BF16 SW32, 512 B
 SLOT_AQ = 12800  # [16, 16] BF16 SW32, 512 B
 SLOT_GTOTAL = 13312  # [128]    FP32,      512 B
-SLOT_RESERVED = 13824  # production must not touch [13824, 16384)
 
 # ---------------------------------------------------------------------------
 # Control arena, relative to CONTROL_OFFSET
 # ---------------------------------------------------------------------------
 
 #: 128 B per main_slot: 16 FP32 q_inv then 16 FP32 k_inv.
-SCRATCH_OFFSET = 0
 SCRATCH_SLOT_BYTES = 128
-SCRATCH_K_INV = 64
-
-BARRIER_OFFSET = 384
 
 #: ``(relative byte offset, arrival count)``; ``None`` marks a transaction
 #: barrier, which is initialized with an arrival count of 1 and completed by
@@ -305,30 +277,12 @@ BAR_OUTPUT_READY = 600
 BAR_OUTPUT_READ_DONE = 624
 BAR_STATE_DONE = 648
 BAR_STATE_IO = 672
-BAR_RESERVED = 680
 
 #: Arrival counts.  Transaction barriers take 1.
 ARRIVALS_TX = 1
 ARRIVALS_PREPARE = PREPARE_WARPS  # 4
 ARRIVALS_RECURRENCE = RECURRENCE_WARPS  # 8
 ARRIVALS_SINGLE = 1
-
-#: ``(name, byte offset, arrivals, per-main_slot)`` .3 table order.
-BARRIER_TABLE = (
-    ("qkg_ready", BAR_QKG_READY, ARRIVALS_TX, True),
-    ("v_ready", BAR_V_READY, ARRIVALS_TX, True),
-    ("materialized", BAR_MATERIALIZED, ARRIVALS_PREPARE, True),
-    ("qk_done", BAR_QK_DONE, ARRIVALS_SINGLE, True),
-    ("ainv_ready", BAR_AINV_READY, ARRIVALS_SINGLE, True),
-    ("aq_ready", BAR_AQ_READY, ARRIVALS_SINGLE, True),
-    ("ak_ready", BAR_AK_READY, ARRIVALS_PREPARE, True),
-    ("projection_done", BAR_PROJECTION_DONE, ARRIVALS_RECURRENCE, True),
-    ("r_formed", BAR_R_FORMED, ARRIVALS_RECURRENCE, True),
-    ("output_ready", BAR_OUTPUT_READY, ARRIVALS_RECURRENCE, True),
-    ("output_read_done", BAR_OUTPUT_READ_DONE, ARRIVALS_SINGLE, True),
-    ("state_done", BAR_STATE_DONE, ARRIVALS_RECURRENCE, True),
-    ("state_io", BAR_STATE_IO, ARRIVALS_TX, False),
-)
 
 #: The prepare group's named barrier: ``bar.sync 1, 128``.
 PREPARE_BARRIER_ID = 1
@@ -398,10 +352,6 @@ def reuse_parity(chunk: int) -> int:
     return 1 ^ ((chunk // MAIN_SLOTS) & 1)
 
 
-def chunks_for_seqlen(seqlen: int) -> int:
-    return (seqlen + BT - 1) // BT
-
-
 def grid(sequences: int, heads: int) -> tuple[int, int, int]:
     """One CTA per ``(sequence, head)``."""
     return (sequences, heads, 1)
@@ -436,9 +386,6 @@ PAIRWISE_ROW_STRIDE = BT
 #: Rows of the state image one value spans, by element width.
 STATE_BF16_ROWS_PER_VALUE = DK // BF16_SEGMENT_ELEMS  # 2
 STATE_F32_ROWS_PER_VALUE = DK // F32_SEGMENT_ELEMS  # 4
-
-#: Value columns one FP32 boundary window carries.
-STATE_F32_WINDOW_VALUES = 32
 
 SWIZZLE_S128_BYTES = (3, 4, 3)
 SWIZZLE_SW32_BYTES = (1, 4, 3)
@@ -540,24 +487,9 @@ def state_f32_window_idx(v_local, k):
     return line * F32_SEGMENT_ELEMS + (group ^ (line & 7)) * F32_GROUP_ELEMS + inner
 
 
-def gtotal_idx(k):
-    """``GTotal`` is a contiguous FP32 ``[128]`` record with no swizzle."""
-    return k
-
-
 # ---------------------------------------------------------------------------
 # Section 4.6: H register layout
 # ---------------------------------------------------------------------------
-
-
-def h32_idx(kb, nb, reg):
-    """Flat index of FP32 master-state register ``(kb, nb, reg)``, 64 per lane."""
-    return (kb * 2 + nb) * 4 + reg
-
-
-def h16_idx(kb, nb, reg):
-    """Flat index of packed BF16 state register ``(kb, nb, reg)``, 32 per lane."""
-    return (kb * 2 + nb) * 2 + reg
 
 
 def h32_coord(lane, kb, nb, reg, v_base):
@@ -571,32 +503,6 @@ def h32_coord(lane, kb, nb, reg, v_base):
     k = kb * BT + g + 8 * (reg >> 1)
     v = v_base + 8 * nb + 2 * q + (reg & 1)
     return (k, v)
-
-
-def h16_pair_coords(lane, kb, nb, reg, v_base):
-    """The two ``(k, v)`` coordinates packed into H16 register ``reg``.
-
-    H16 register ``reg`` holds ``pack(c[2 * reg], c[2 * reg + 1])``, which is
-    one key row and two adjacent values.
-    """
-    return (
-        h32_coord(lane, kb, nb, 2 * reg, v_base),
-        h32_coord(lane, kb, nb, 2 * reg + 1, v_base),
-    )
-
-
-def h_b_coords(lane, kb, nb, reg, v_base):
-    """The two ``(k, v)`` coordinates of B register ``reg`` after ``movmatrix``.
-
-    ``movmatrix.sync.aligned.m8n8.trans.b16`` on each of the
-    two packed H16 registers is a bitwise C-to-B conversion, so no rounding
-    happens here and the projection reads the state the MMA's B operand wants.
-    """
-    g = lane >> 2
-    q = lane & 3
-    k = kb * BT + 2 * q + 8 * reg
-    v = v_base + 8 * nb + g
-    return ((k, v), (k + 1, v))
 
 
 # ---------------------------------------------------------------------------
@@ -642,14 +548,6 @@ def h32t_coord(lane, kt, reg, v_base):
     return (k, v)
 
 
-def h16t_pair_coords(lane, kt, reg, v_base):
-    """The two ``(k, v)`` coordinates packed into transposed H16 register."""
-    return (
-        h32t_coord(lane, kt, 2 * reg, v_base),
-        h32t_coord(lane, kt, 2 * reg + 1, v_base),
-    )
-
-
 def h_a_reg(j, r):
     """H16 register holding A-fragment register ``r`` of key block ``j``.
 
@@ -690,9 +588,8 @@ def gtotal_shuffle_source(lane, kt, half):
 def ak_b_ptr(lane, j):
     """``Ak.T`` ``ldmatrix.x4.trans`` producing the ``[token, key]`` B operand.
 
-    :func:`ak_a_ptr` delivers the A operand the un-transposed recurrence wants;
-    the transposed one needs Ak as B, and the image is contiguous in key while
-    a B register wants two adjacent *tokens*, hence ``.trans``.
+    The transposed recurrence needs Ak as B, and the image is contiguous in key
+    while a B register wants two adjacent *tokens*, hence ``.trans``.
     """
     r = lane >> 3
     token = lane - 8 * r
@@ -739,23 +636,6 @@ def vo_x2t_ptr(lane, value_base, nb):
 # ---------------------------------------------------------------------------
 # Section 9.1: native m16n8k16 fragment coordinates
 # ---------------------------------------------------------------------------
-
-
-def mma_a_coords(lane, reg):
-    """Logical ``(row, k)`` of the two 16-bit halves in A register ``reg``."""
-    g = lane >> 2
-    q = lane & 3
-    row = g + 8 * (reg & 1)
-    k = 2 * q + 8 * (reg >> 1)
-    return ((row, k), (row, k + 1))
-
-
-def mma_b_coords(lane, reg):
-    """Logical ``(k, n)`` of the two 16-bit halves in B register ``reg``."""
-    g = lane >> 2
-    q = lane & 3
-    k = 2 * q + 8 * reg
-    return ((k, g), (k + 1, g))
 
 
 def mma_c_coord(lane, reg, n_base=0):
@@ -815,14 +695,6 @@ def pairwise_a_ptr(lane):
 pairwise_store_ptr = pairwise_a_ptr
 
 
-def ak_a_ptr(lane, kb):
-    """Ak.T ``ldmatrix.x4.trans`` producing the ``[key, token]`` A operand."""
-    m = lane // 8
-    logical_t = 8 * (m >> 1) + (lane - m * 8)
-    key = BT * kb + 8 * (m & 1)
-    return raw_bf16_s128(logical_t ^ AK_TOKEN_XOR, key)
-
-
 def ak_store_ptr(lane, key_base):
     """``stmatrix.x4`` of one ``[16, 16]`` Ak.T tile at ``key_base``."""
     m = lane // 8
@@ -856,20 +728,6 @@ def state_x2_ptr(lane, kb, value_base):
     return state_bf16_idx(v, key)
 
 
-def state_f32_window_reg_coord(lane, kb, nb, reg, local_v_base):
-    """``(v_local, k)`` an FP32 boundary window read/writes for H32 ``reg``.
-
-    the FP32 boundary has no matrix-copy path, so
-    each lane addresses its four accumulator elements individually through
-    :func:`state_f32_window_idx`.
-    """
-    g = lane >> 2
-    q = lane & 3
-    k = BT * kb + g + 8 * (reg >> 1)
-    v_local = local_v_base + 8 * nb + 2 * q + (reg & 1)
-    return (v_local, k)
-
-
 # ---------------------------------------------------------------------------
 # Section 3.5: prepare-warp ownership
 # ---------------------------------------------------------------------------
@@ -883,18 +741,6 @@ def gate_owner_dim(warp, lane):
 def norm_row(warp, lane):
     """Token row lane ``lane`` of prepare warp ``warp`` helps normalize."""
     return 4 * warp + (lane // 8)
-
-
-def norm_dims(lane):
-    """The 16 feature indices a norm lane squares, in accumulation order.
-
-    The order is part of the contract: the FP32 sum is not reassociated, so a
-    different traversal is a different number.
-    """
-    lane_in_row = lane & 7
-    return [8 * lane_in_row + i for i in range(8)] + [
-        64 + 8 * lane_in_row + i for i in range(8)
-    ]
 
 
 def materialize_coords(warp, lane, j, nb, r):
@@ -967,8 +813,7 @@ def materialize_b_ptr(warp, lane, j):
     The eight elements each addressed row contributes are keys ``base`` to
     ``base + 7`` of one token, and :func:`raw_bf16_s128` is contiguous in
     ``dim`` inside an eight-aligned group, so the S128 swizzle is absorbed
-    entirely into the row address -- unlike :func:`ak_a_ptr`, no coordinate
-    XOR is needed.
+    entirely into the row address and no coordinate XOR is needed.
     """
     reg = lane >> 3
     row = lane - 8 * reg
@@ -977,34 +822,12 @@ def materialize_b_ptr(warp, lane, j):
     return raw_bf16_s128(8 * r + row, 32 * warp + BT * j + 8 * nb)
 
 
-def kr_b_coords(warp, lane, j, nb, r):
-    """The two ``(token, key)`` coordinates of Kr B register ``2 * nb + r``.
-
-    Identical to :func:`materialize_coords`; named separately because plan
-    Section 9.3 pins the Kr B-fragment mapping as its own contract -- Kr is the
-    one factor that is never published to SMEM, so this map is the only
-    definition of where its values live.
-    """
-    t0, t1, key = materialize_coords(warp, lane, j, nb, r)
-    return ((t0, key), (t1, key))
-
-
 # ---------------------------------------------------------------------------
 # Section 9.3: fixed register permutations
 # ---------------------------------------------------------------------------
 
 #: A-layout -> B-layout of the same matrix: transpose each 8x8 quadrant.
 MOVMATRIX_A_TO_B = (0, 1, 2, 3)
-
-#: A-layout -> A-layout of the transpose: the off-diagonal quadrants exchange.
-MOVMATRIX_A_TO_AT = (0, 2, 1, 3)
-
-#: C-layout -> B-layout of a packed 16x8 tile (H16 and the residual R).
-MOVMATRIX_C_TO_B = (0, 1)
-
-#: Quadrant order of the packed A fragment the inverse chain works in
-#:: top-left, bottom-left, top-right, bottom-right.
-INVERSE_FRAG_QUADRANTS = ("TL", "BL", "TR", "BR")
 
 
 # ---------------------------------------------------------------------------
@@ -1024,43 +847,6 @@ def out_global_index(token, head, heads, dim):
 def beta_global_index(token, head, heads):
     """Flat element index of ``beta[0, token, head]``."""
     return token * heads + head
-
-
-# ---------------------------------------------------------------------------
-# CuTe layout objects (TMA descriptors only)
-# ---------------------------------------------------------------------------
-
-
-def make_cute_layouts():
-    """Build the three composed layouts the images above describe.
-
-    Imported lazily so host-only consumers -- the layout tests, the reference
-    and the validation matrix -- do not need the CUTLASS DSL installed.
-    """
-    import cutlass.cute as cute
-
-    raw_bf16 = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_S128_BYTES),
-        0,
-        cute.make_layout(
-            (BT, (BF16_SEGMENT_ELEMS, BF16_SEGMENTS)),
-            stride=(BF16_SEGMENT_ELEMS, (1, BF16_SEGMENT_STRIDE)),
-        ),
-    )
-    raw_f32 = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_S128_BYTES),
-        0,
-        cute.make_layout(
-            (BT, (F32_SEGMENT_ELEMS, F32_SEGMENTS)),
-            stride=(F32_SEGMENT_ELEMS, (1, F32_SEGMENT_STRIDE)),
-        ),
-    )
-    pairwise = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_SW32_BYTES),
-        0,
-        cute.make_layout((BT, BT), stride=(PAIRWISE_ROW_STRIDE, 1)),
-    )
-    return raw_bf16, raw_f32, pairwise
 
 
 # --------------------------------------------------------------------------
@@ -1784,15 +1570,6 @@ def activation_spec(t: torch.Tensor, total_tokens: int, heads: int) -> TensorMap
     )
 
 
-def activation_segments(dtype: torch.dtype) -> int:
-    """Boxes one ``[16, 128]`` tile takes: 2 at BF16, 4 at FP32."""
-    return 2 if dtype is torch.bfloat16 else 4
-
-
-def activation_segment_elems(dtype: torch.dtype) -> int:
-    return BF16_SEGMENT_ELEMS if dtype is torch.bfloat16 else F32_SEGMENT_ELEMS
-
-
 # ---------------------------------------------------------------------------
 # Section 6.2: state boundary
 # ---------------------------------------------------------------------------
@@ -1829,16 +1606,6 @@ def state_spec(t: torch.Tensor, sequences: int, heads: int) -> TensorMapSpec:
 def state_calls(dtype: torch.dtype) -> int:
     """TMA calls one state plane takes: 2 at BF16 (16 KiB each), 4 at FP32."""
     return 2 if dtype is torch.bfloat16 else 4
-
-
-def state_box_rows(dtype: torch.dtype) -> int:
-    """Line rows one state box covers: 128 either way, at 16 KiB per box."""
-    rows_per_value = (
-        STATE_BF16_ROWS_PER_VALUE
-        if dtype is torch.bfloat16
-        else STATE_F32_ROWS_PER_VALUE
-    )
-    return rows_per_value * DK // state_calls(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1941,8 +1708,6 @@ CTRL32 = CONTROL_OFFSET // 4  # 15360
 
 #: Quadrant slot pairs of an N=16 accumulator: TL, BL, TR, BR (plan Sec. 2.2).
 QUAD_TL = (0, 1)
-QUAD_BL = (2, 3)
-QUAD_TR = (4, 5)
 QUAD_BR = (6, 7)
 DIAGONAL_SLOTS = QUAD_TL + QUAD_BR
 
@@ -3772,14 +3537,6 @@ def clear_kernel_caches() -> None:
     _DESCRIPTOR_CACHE.clear()
 
 
-def kernel_cache_size() -> int:
-    return len(_KERNEL_CACHE)
-
-
-def descriptor_cache_stats(device):
-    return _DESCRIPTOR_CACHE.stats(device)
-
-
 def build_descriptors(
     *,
     q: torch.Tensor,
@@ -4105,13 +3862,6 @@ def prepare_launch(
         )
         _KERNEL_CACHE[key] = compiled
     return LaunchPlan(key=key, descriptors=descriptors, compiled=compiled, args=args)
-
-
-def launch_fused(**kwargs) -> tuple[KernelKey, TensorMapUpload, object]:
-    """Prepare and launch in one step.  Used by tests and one-shot callers."""
-    plan = prepare_launch(**kwargs)
-    plan.run()
-    return plan.key, plan.descriptors, plan.compiled
 
 
 # --------------------------------------------------------------------------

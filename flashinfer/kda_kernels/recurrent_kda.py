@@ -1299,10 +1299,6 @@ def _byte_ranges_overlap(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
     return lhs[0] < rhs[1] and rhs[0] < lhs[1]
 
 
-def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    return _byte_ranges_overlap(_tensor_byte_range(lhs), _tensor_byte_range(rhs))
-
-
 @functools.cache
 def _device_multi_processor_count(device_index: int) -> int:
     """Return the SM count of one CUDA device, queried once per process."""
