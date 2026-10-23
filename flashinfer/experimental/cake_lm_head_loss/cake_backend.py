@@ -4249,7 +4249,7 @@ class BindingCache:
 
 
 # Enabled, 64 bindings.  ``flashinfer.chunked_lm_head`` applies its environment variables through
-# :meth:`BindingCache.configure` when it is imported; this module reads none.
+# :meth:`BindingCache.configure` on its first backend use; this module reads none.
 BINDING_CACHE = BindingCache()
 
 

@@ -2584,7 +2584,7 @@ def test_binding_cache_is_lru_and_bounded():
 
 def test_binding_cache_configure():
     """The binding cache is configured through keywords and :meth:`BindingCache.configure` (the public module applies
-    its two environment variables through it at import): a positive-integer capacity, evicting the least recently used
+    its two environment variables through it on its first backend use): a positive-integer capacity, evicting the least recently used
     bindings when it shrinks; ``enabled=False`` bypasses the cache and drops the remembered bindings."""
     assert BindingCache().capacity == cake_backend.BINDING_CACHE_DEFAULT_CAPACITY == 64
     assert BindingCache().enabled and cake_backend.BINDING_CACHE.capacity >= 1

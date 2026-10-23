@@ -21,11 +21,12 @@ The experimental entry points ``flashinfer.chunked_lm_head.chunked_lm_head_loss`
 marking, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
 ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` -- a switch keyword left at ``None`` falls back to its
 variable and the resolved value is passed down; the two binding-cache variables are
-applied when the module is imported.  The tests here cover that wrapper: the marking,
-each variable's fallback and parsing, the import-time cache configuration and, on a
-supported device, the pass-down through the public entry.  The backend tests live in
-``test_cake_lm_head_loss.py``, which imports the package only through
-``tests.test_helpers.cake_package`` and reads no environment variable.
+read when the module is imported and applied when it first reaches the backend.  The
+tests here cover that wrapper: the marking, each variable's fallback and parsing, the
+cache configuration and, on a supported device, the pass-down through the public
+entry.  The backend tests live in ``test_cake_lm_head_loss.py``, which imports the
+package only through ``tests.test_helpers.cake_package`` and reads no environment
+variable.
 """
 
 import importlib
@@ -260,15 +261,17 @@ def test_gemm_tuning_default_env(monkeypatch):
 
 
 def test_binding_cache_capacity_from_environment(monkeypatch):
-    """The two binding-cache variables are applied when ``flashinfer.chunked_lm_head`` is imported (here: reloaded)
-    through ``BindingCache.configure`` on the backend's live cache: unset -> enabled, 64 bindings; a positive integer
-    sets the capacity; ``..._BINDING_CACHE=0`` disables it; anything but a positive integer is a ``ValueError`` at
-    import that leaves the cache as it was.  The backend itself never reads them."""
+    """The two binding-cache variables are read when ``flashinfer.chunked_lm_head`` is imported (here: reloaded) and
+    applied through ``BindingCache.configure`` on the backend's live cache when the reloaded module first reaches
+    the backend (``_cake_backend()``, the first call of either entry point): unset -> enabled, 64 bindings; a
+    positive integer sets the capacity; ``..._BINDING_CACHE=0`` disables it; anything but a positive integer is a
+    ``ValueError`` at import that leaves the cache as it was.  The backend itself never reads them."""
     cache = cake_backend.BINDING_CACHE
     was = (cache.enabled, cache.capacity)
     try:
         _clear(monkeypatch)
         importlib.reload(public)
+        public._cake_backend()
         # configured in place, never replaced
         assert cake_backend.BINDING_CACHE is cache
         assert cache.enabled and cache.capacity == 64
@@ -276,27 +279,33 @@ def test_binding_cache_capacity_from_environment(monkeypatch):
         monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, "5")
         assert BindingCache().capacity == 64  # the backend does not read the variable
         importlib.reload(public)
+        assert cache.capacity == 64  # read at import, applied on first use
+        public._cake_backend()
         assert cache.capacity == 5 and cache.enabled
         monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, " ")
         importlib.reload(public)
+        public._cake_backend()
         assert cache.capacity == 64
         monkeypatch.setenv(public.BINDING_CACHE_ENV, "0")
         importlib.reload(public)
+        public._cake_backend()
         assert not cache.enabled and len(cache) == 0 and cache.capacity == 64
         monkeypatch.setenv(public.BINDING_CACHE_ENV, "1")
         monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, "3")
         importlib.reload(public)
+        public._cake_backend()
         assert cache.enabled and cache.capacity == 3
         assert public._binding_cache_settings() == dict(enabled=True, capacity=3)
         for bad in ("0", "-1", "many", "2.5"):
             monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, bad)
             with pytest.raises(ValueError, match="positive integer"):
                 importlib.reload(public)
-            # a failed import changes nothing
+            # a failed import reads nothing to apply: the cache is as it was
             assert cache.enabled and cache.capacity == 3
     finally:
         monkeypatch.undo()
         importlib.reload(public)  # the process's real environment again
+        public._cake_backend()
         cache.configure(enabled=was[0], capacity=was[1])
 
 
@@ -347,6 +356,7 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
 
     monkeypatch.setattr(cake_backend, "_ffi_stream_context", spy_stream)
     monkeypatch.setattr(cake_backend, "_bind_all", spy_bind_all)
+    public._cake_backend()  # the first use applies the import-time cache settings: before the patch
     monkeypatch.setattr(
         cake_backend.BINDING_CACHE, "enabled", False
     )  # every call binds, so the bound stages show the switch
