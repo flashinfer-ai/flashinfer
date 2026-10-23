@@ -99,6 +99,246 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
     return c;
 }
 
+// One body shared by the six cluster variants (C > 1); the C == 1 kernel keeps its own body.
+
+template <int C, int T>
+__device__ __forceinline__ void
+cached_cluster_body(float* __restrict__ x, float* __restrict__ parameter, float* __restrict__ output, int rows, int vocab_size, int chunk_elements, int parameter_kind, float scalar_temperature)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const bool enable_pdl = (parameter_kind & 4) != 0;
+    parameter_kind &= 3;
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+#endif
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / C;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / C;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    // Kernel setup ops
+    float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
+    const int reduce_smem_addr = smem + 0;
+    float* publish = reinterpret_cast<float*>(smem_raw + 64);
+    const int publish_addr = smem + 64;
+    float* row_stats = reinterpret_cast<float*>(smem_raw + 96);
+    const int row_stats_addr = smem + 96;
+
+    // === Task calls (dependency order) ===
+    int rank = cta_rank;
+    int row = bid / C;
+    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
+    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
+    int chunk_begin = rank * chunk_elements;
+    int _min_0 = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
+    int chunk_end = _min_0;
+    float cache[64];
+    float local_max = -CUDART_INF_F;
+    #pragma unroll
+    for (int tile = 0; tile < T; tile++) {
+        int elem = chunk_begin + (tile * 256 + tid) * 8;
+        if (elem < chunk_end) {
+            unsigned long long index = row_base + (unsigned long long)elem;
+            float _vec_load_0[8];
+            {
+                unsigned _ldv8_0_0;
+                unsigned _ldv8_0_1;
+                unsigned _ldv8_0_2;
+                unsigned _ldv8_0_3;
+                unsigned _ldv8_0_4;
+                unsigned _ldv8_0_5;
+                unsigned _ldv8_0_6;
+                unsigned _ldv8_0_7;
+                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
+                asm volatile(
+                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index))) : "memory");
+                #else
+                asm volatile(
+                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3) : "l"((const void*)(x + (index))) : "memory");
+                asm volatile(
+                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index) + 4)) : "memory");
+                #endif
+                _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
+                _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
+                _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
+                _vec_load_0[0 + 3] = __uint_as_float(_ldv8_0_3);
+                _vec_load_0[0 + 4] = __uint_as_float(_ldv8_0_4);
+                _vec_load_0[0 + 5] = __uint_as_float(_ldv8_0_5);
+                _vec_load_0[0 + 6] = __uint_as_float(_ldv8_0_6);
+                _vec_load_0[0 + 7] = __uint_as_float(_ldv8_0_7);
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float scaled = _vec_load_0[j] / temperature;
+                cache[tile * 8 + j] = scaled;
+                float _max_0 = max_noftz(local_max, scaled);
+                local_max = _max_0;
+            }
+        }
+    }
+    float _warp_reduce_0 = local_max;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+    float warp_max = _warp_reduce_0;
+    if (lane == 0) {
+        reduce_smem[warp] = warp_max;
+    }
+    __syncthreads();
+    float warp_partial_max = ((lane < 8) ? reduce_smem[lane] : -CUDART_INF_F);
+    float _warp_reduce_1 = warp_partial_max;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
+    float cta_max = _warp_reduce_1;
+    __syncthreads();
+    float safe_max = ((cta_max == -CUDART_INF_F) ? 0.0f : cta_max);
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int tile_1 = 0; tile_1 < T; tile_1++) {
+        int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
+        if (elem_1 < chunk_end) {
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float _exp2_0 = approx_exp2((cache[tile_1 * 8 + j_1] - safe_max) * 1.4426950408889634f);
+                float p = _exp2_0;
+                cache[tile_1 * 8 + j_1] = p;
+                local_sum += p;
+            }
+        }
+    }
+    float _warp_reduce_2 = local_sum;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
+    float warp_sum = _warp_reduce_2;
+    if (lane == 0) {
+        reduce_smem[warp] = warp_sum;
+    }
+    __syncthreads();
+    float warp_partial_sum = ((lane < 8) ? reduce_smem[lane] : 0.0f);
+    float _warp_reduce_3 = warp_partial_sum;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
+    float cta_sum = _warp_reduce_3;
+    float row_max = cta_max;
+    float row_sum = cta_sum;
+    if (warp == 0) {
+        if (elect_sync()) {
+            publish[0] = cta_max;
+            publish[1] = cta_sum;
+        }
+    }
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (warp == 0) {
+        int _min_1 = ((lane) < (C - 1) ? (lane) : (C - 1));
+        int peer = _min_1;
+        uint32_t _mapa_0;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_0) : "r"(publish_addr), "r"(peer));
+        float _cluster_ld_0;
+        asm volatile(
+            "ld.shared::cluster.f32 %0, [%1];"
+            : "=f"(_cluster_ld_0) : "r"(_mapa_0) : "memory");
+        float peer_max = _cluster_ld_0;
+        uint32_t _mapa_1;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_1) : "r"(publish_addr + 4), "r"(peer));
+        float _cluster_ld_1;
+        asm volatile(
+            "ld.shared::cluster.f32 %0, [%1];"
+            : "=f"(_cluster_ld_1) : "r"(_mapa_1) : "memory");
+        float peer_sum = _cluster_ld_1;
+        if (lane > C - 1) {
+            peer_max = -CUDART_INF_F;
+            peer_sum = 0.0f;
+        }
+        float _warp_reduce_4 = peer_max;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_4 = max_noftz(_warp_reduce_4, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset));
+        float cluster_max = _warp_reduce_4;
+        float _exp2_1 = approx_exp2((peer_max - cluster_max) * 1.4426950408889634f);
+        float rescaled = peer_sum * _exp2_1;
+        float _warp_reduce_5 = rescaled;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
+        float cluster_sum = _warp_reduce_5;
+        if (lane == 0) {
+            row_stats[0] = cluster_max;
+            row_stats[1] = cluster_sum;
+        }
+    }
+    __syncthreads();
+    row_max = row_stats[0];
+    row_sum = row_stats[1];
+    float _exp2_2 = approx_exp2((cta_max - row_max) * 1.4426950408889634f);
+    float _rcp_0 = approx_rcp(row_sum);
+    float scale = _exp2_2 * _rcp_0;
+    #pragma unroll
+    for (int tile_2 = 0; tile_2 < T; tile_2++) {
+        int elem_2 = chunk_begin + (tile_2 * 256 + tid) * 8;
+        if (elem_2 < chunk_end) {
+            unsigned long long index_1 = row_base + (unsigned long long)elem_2;
+            float out_values[8];
+            #pragma unroll
+            for (int j_2 = 0; j_2 < 8; j_2++) {
+                out_values[j_2] = cache[tile_2 * 8 + j_2] * scale;
+            }
+            {
+                unsigned _stv8_1_0 = __float_as_uint(out_values[0 + 0]);
+                unsigned _stv8_1_1 = __float_as_uint(out_values[0 + 1]);
+                unsigned _stv8_1_2 = __float_as_uint(out_values[0 + 2]);
+                unsigned _stv8_1_3 = __float_as_uint(out_values[0 + 3]);
+                unsigned _stv8_1_4 = __float_as_uint(out_values[0 + 4]);
+                unsigned _stv8_1_5 = __float_as_uint(out_values[0 + 5]);
+                unsigned _stv8_1_6 = __float_as_uint(out_values[0 + 6]);
+                unsigned _stv8_1_7 = __float_as_uint(out_values[0 + 7]);
+                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
+                asm volatile(
+                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
+                #else
+                asm volatile(
+                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
+                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3) : "memory");
+                asm volatile(
+                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
+                    :: "l"((void*)(output + (index_1) + 4)), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
+                #endif
+            }
+        }
+    }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
+#endif
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+
 extern "C" {
 
 // ---- variant c1_t4 ----
@@ -282,1428 +522,42 @@ kernel_flashinfer_blackwell_softmax_cached_c1_t4(float* __restrict__ x, float* _
 __global__ __launch_bounds__(256, 4) __cluster_dims__(2,1,1) void
 kernel_flashinfer_blackwell_softmax_cached_c2_t4(float* __restrict__ x, float* __restrict__ parameter, float* __restrict__ output, int rows, int vocab_size, int chunk_elements, int parameter_kind, float scalar_temperature)
 {
-    const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    const bool enable_pdl = (parameter_kind & 4) != 0;
-    parameter_kind &= 3;
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-    }
-#endif
-
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 2;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 2;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-
-    // Kernel setup ops
-    float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
-    const int reduce_smem_addr = smem + 0;
-    float* publish = reinterpret_cast<float*>(smem_raw + 64);
-    const int publish_addr = smem + 64;
-    float* row_stats = reinterpret_cast<float*>(smem_raw + 96);
-    const int row_stats_addr = smem + 96;
-
-    // === Task calls (dependency order) ===
-    int rank = cta_rank;
-    int row = bid / 2;
-    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
-    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
-    int chunk_begin = rank * chunk_elements;
-    int _min_0 = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    int chunk_end = _min_0;
-    float cache[64];
-    float local_max = -CUDART_INF_F;
-    #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {
-        int elem = chunk_begin + (tile * 256 + tid) * 8;
-        if (elem < chunk_end) {
-            unsigned long long index = row_base + (unsigned long long)elem;
-            float _vec_load_0[8];
-            {
-                unsigned _ldv8_0_0;
-                unsigned _ldv8_0_1;
-                unsigned _ldv8_0_2;
-                unsigned _ldv8_0_3;
-                unsigned _ldv8_0_4;
-                unsigned _ldv8_0_5;
-                unsigned _ldv8_0_6;
-                unsigned _ldv8_0_7;
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index))) : "memory");
-                #else
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3) : "l"((const void*)(x + (index))) : "memory");
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index) + 4)) : "memory");
-                #endif
-                _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
-                _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
-                _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
-                _vec_load_0[0 + 3] = __uint_as_float(_ldv8_0_3);
-                _vec_load_0[0 + 4] = __uint_as_float(_ldv8_0_4);
-                _vec_load_0[0 + 5] = __uint_as_float(_ldv8_0_5);
-                _vec_load_0[0 + 6] = __uint_as_float(_ldv8_0_6);
-                _vec_load_0[0 + 7] = __uint_as_float(_ldv8_0_7);
-            }
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                float scaled = _vec_load_0[j] / temperature;
-                cache[tile * 8 + j] = scaled;
-                float _max_0 = max_noftz(local_max, scaled);
-                local_max = _max_0;
-            }
-        }
-    }
-    float _warp_reduce_0 = local_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-    float warp_max = _warp_reduce_0;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_max;
-    }
-    __syncthreads();
-    float warp_partial_max = ((lane < 8) ? reduce_smem[lane] : -CUDART_INF_F);
-    float _warp_reduce_1 = warp_partial_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-    float cta_max = _warp_reduce_1;
-    __syncthreads();
-    float safe_max = ((cta_max == -CUDART_INF_F) ? 0.0f : cta_max);
-    float local_sum = 0.0f;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 4; tile_1++) {
-        int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
-        if (elem_1 < chunk_end) {
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float _exp2_0 = approx_exp2((cache[tile_1 * 8 + j_1] - safe_max) * 1.4426950408889634f);
-                float p = _exp2_0;
-                cache[tile_1 * 8 + j_1] = p;
-                local_sum += p;
-            }
-        }
-    }
-    float _warp_reduce_2 = local_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-    float warp_sum = _warp_reduce_2;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_sum;
-    }
-    __syncthreads();
-    float warp_partial_sum = ((lane < 8) ? reduce_smem[lane] : 0.0f);
-    float _warp_reduce_3 = warp_partial_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
-    float cta_sum = _warp_reduce_3;
-    float row_max = cta_max;
-    float row_sum = cta_sum;
-    if (warp == 0) {
-        if (elect_sync()) {
-            publish[0] = cta_max;
-            publish[1] = cta_sum;
-        }
-    }
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (warp == 0) {
-        int _min_1 = ((lane) < (1) ? (lane) : (1));
-        int peer = _min_1;
-        uint32_t _mapa_0;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_0) : "r"(publish_addr), "r"(peer));
-        float _cluster_ld_0;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_0) : "r"(_mapa_0) : "memory");
-        float peer_max = _cluster_ld_0;
-        uint32_t _mapa_1;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_1) : "r"(publish_addr + 4), "r"(peer));
-        float _cluster_ld_1;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_1) : "r"(_mapa_1) : "memory");
-        float peer_sum = _cluster_ld_1;
-        if (lane > 1) {
-            peer_max = -CUDART_INF_F;
-            peer_sum = 0.0f;
-        }
-        float _warp_reduce_4 = peer_max;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_4 = max_noftz(_warp_reduce_4, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset));
-        float cluster_max = _warp_reduce_4;
-        float _exp2_1 = approx_exp2((peer_max - cluster_max) * 1.4426950408889634f);
-        float rescaled = peer_sum * _exp2_1;
-        float _warp_reduce_5 = rescaled;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
-        float cluster_sum = _warp_reduce_5;
-        if (lane == 0) {
-            row_stats[0] = cluster_max;
-            row_stats[1] = cluster_sum;
-        }
-    }
-    __syncthreads();
-    row_max = row_stats[0];
-    row_sum = row_stats[1];
-    float _exp2_2 = approx_exp2((cta_max - row_max) * 1.4426950408889634f);
-    float _rcp_0 = approx_rcp(row_sum);
-    float scale = _exp2_2 * _rcp_0;
-    #pragma unroll
-    for (int tile_2 = 0; tile_2 < 4; tile_2++) {
-        int elem_2 = chunk_begin + (tile_2 * 256 + tid) * 8;
-        if (elem_2 < chunk_end) {
-            unsigned long long index_1 = row_base + (unsigned long long)elem_2;
-            float out_values[8];
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                out_values[j_2] = cache[tile_2 * 8 + j_2] * scale;
-            }
-            {
-                unsigned _stv8_1_0 = __float_as_uint(out_values[0 + 0]);
-                unsigned _stv8_1_1 = __float_as_uint(out_values[0 + 1]);
-                unsigned _stv8_1_2 = __float_as_uint(out_values[0 + 2]);
-                unsigned _stv8_1_3 = __float_as_uint(out_values[0 + 3]);
-                unsigned _stv8_1_4 = __float_as_uint(out_values[0 + 4]);
-                unsigned _stv8_1_5 = __float_as_uint(out_values[0 + 5]);
-                unsigned _stv8_1_6 = __float_as_uint(out_values[0 + 6]);
-                unsigned _stv8_1_7 = __float_as_uint(out_values[0 + 7]);
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #else
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3) : "memory");
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1) + 4)), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #endif
-            }
-        }
-    }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    }
-#endif
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    cached_cluster_body<2, 4>(x, parameter, output, rows, vocab_size, chunk_elements, parameter_kind, scalar_temperature);
 }
 
 // ---- variant c4_t4 ----
 __global__ __launch_bounds__(256, 4) __cluster_dims__(4,1,1) void
 kernel_flashinfer_blackwell_softmax_cached_c4_t4(float* __restrict__ x, float* __restrict__ parameter, float* __restrict__ output, int rows, int vocab_size, int chunk_elements, int parameter_kind, float scalar_temperature)
 {
-    const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    const bool enable_pdl = (parameter_kind & 4) != 0;
-    parameter_kind &= 3;
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-    }
-#endif
-
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 4;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 4;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-
-    // Kernel setup ops
-    float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
-    const int reduce_smem_addr = smem + 0;
-    float* publish = reinterpret_cast<float*>(smem_raw + 64);
-    const int publish_addr = smem + 64;
-    float* row_stats = reinterpret_cast<float*>(smem_raw + 96);
-    const int row_stats_addr = smem + 96;
-
-    // === Task calls (dependency order) ===
-    int rank = cta_rank;
-    int row = bid / 4;
-    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
-    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
-    int chunk_begin = rank * chunk_elements;
-    int _min_0 = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    int chunk_end = _min_0;
-    float cache[64];
-    float local_max = -CUDART_INF_F;
-    #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {
-        int elem = chunk_begin + (tile * 256 + tid) * 8;
-        if (elem < chunk_end) {
-            unsigned long long index = row_base + (unsigned long long)elem;
-            float _vec_load_0[8];
-            {
-                unsigned _ldv8_0_0;
-                unsigned _ldv8_0_1;
-                unsigned _ldv8_0_2;
-                unsigned _ldv8_0_3;
-                unsigned _ldv8_0_4;
-                unsigned _ldv8_0_5;
-                unsigned _ldv8_0_6;
-                unsigned _ldv8_0_7;
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index))) : "memory");
-                #else
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3) : "l"((const void*)(x + (index))) : "memory");
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index) + 4)) : "memory");
-                #endif
-                _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
-                _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
-                _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
-                _vec_load_0[0 + 3] = __uint_as_float(_ldv8_0_3);
-                _vec_load_0[0 + 4] = __uint_as_float(_ldv8_0_4);
-                _vec_load_0[0 + 5] = __uint_as_float(_ldv8_0_5);
-                _vec_load_0[0 + 6] = __uint_as_float(_ldv8_0_6);
-                _vec_load_0[0 + 7] = __uint_as_float(_ldv8_0_7);
-            }
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                float scaled = _vec_load_0[j] / temperature;
-                cache[tile * 8 + j] = scaled;
-                float _max_0 = max_noftz(local_max, scaled);
-                local_max = _max_0;
-            }
-        }
-    }
-    float _warp_reduce_0 = local_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-    float warp_max = _warp_reduce_0;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_max;
-    }
-    __syncthreads();
-    float warp_partial_max = ((lane < 8) ? reduce_smem[lane] : -CUDART_INF_F);
-    float _warp_reduce_1 = warp_partial_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-    float cta_max = _warp_reduce_1;
-    __syncthreads();
-    float safe_max = ((cta_max == -CUDART_INF_F) ? 0.0f : cta_max);
-    float local_sum = 0.0f;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 4; tile_1++) {
-        int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
-        if (elem_1 < chunk_end) {
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float _exp2_0 = approx_exp2((cache[tile_1 * 8 + j_1] - safe_max) * 1.4426950408889634f);
-                float p = _exp2_0;
-                cache[tile_1 * 8 + j_1] = p;
-                local_sum += p;
-            }
-        }
-    }
-    float _warp_reduce_2 = local_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-    float warp_sum = _warp_reduce_2;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_sum;
-    }
-    __syncthreads();
-    float warp_partial_sum = ((lane < 8) ? reduce_smem[lane] : 0.0f);
-    float _warp_reduce_3 = warp_partial_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
-    float cta_sum = _warp_reduce_3;
-    float row_max = cta_max;
-    float row_sum = cta_sum;
-    if (warp == 0) {
-        if (elect_sync()) {
-            publish[0] = cta_max;
-            publish[1] = cta_sum;
-        }
-    }
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (warp == 0) {
-        int _min_1 = ((lane) < (3) ? (lane) : (3));
-        int peer = _min_1;
-        uint32_t _mapa_0;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_0) : "r"(publish_addr), "r"(peer));
-        float _cluster_ld_0;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_0) : "r"(_mapa_0) : "memory");
-        float peer_max = _cluster_ld_0;
-        uint32_t _mapa_1;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_1) : "r"(publish_addr + 4), "r"(peer));
-        float _cluster_ld_1;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_1) : "r"(_mapa_1) : "memory");
-        float peer_sum = _cluster_ld_1;
-        if (lane > 3) {
-            peer_max = -CUDART_INF_F;
-            peer_sum = 0.0f;
-        }
-        float _warp_reduce_4 = peer_max;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_4 = max_noftz(_warp_reduce_4, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset));
-        float cluster_max = _warp_reduce_4;
-        float _exp2_1 = approx_exp2((peer_max - cluster_max) * 1.4426950408889634f);
-        float rescaled = peer_sum * _exp2_1;
-        float _warp_reduce_5 = rescaled;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
-        float cluster_sum = _warp_reduce_5;
-        if (lane == 0) {
-            row_stats[0] = cluster_max;
-            row_stats[1] = cluster_sum;
-        }
-    }
-    __syncthreads();
-    row_max = row_stats[0];
-    row_sum = row_stats[1];
-    float _exp2_2 = approx_exp2((cta_max - row_max) * 1.4426950408889634f);
-    float _rcp_0 = approx_rcp(row_sum);
-    float scale = _exp2_2 * _rcp_0;
-    #pragma unroll
-    for (int tile_2 = 0; tile_2 < 4; tile_2++) {
-        int elem_2 = chunk_begin + (tile_2 * 256 + tid) * 8;
-        if (elem_2 < chunk_end) {
-            unsigned long long index_1 = row_base + (unsigned long long)elem_2;
-            float out_values[8];
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                out_values[j_2] = cache[tile_2 * 8 + j_2] * scale;
-            }
-            {
-                unsigned _stv8_1_0 = __float_as_uint(out_values[0 + 0]);
-                unsigned _stv8_1_1 = __float_as_uint(out_values[0 + 1]);
-                unsigned _stv8_1_2 = __float_as_uint(out_values[0 + 2]);
-                unsigned _stv8_1_3 = __float_as_uint(out_values[0 + 3]);
-                unsigned _stv8_1_4 = __float_as_uint(out_values[0 + 4]);
-                unsigned _stv8_1_5 = __float_as_uint(out_values[0 + 5]);
-                unsigned _stv8_1_6 = __float_as_uint(out_values[0 + 6]);
-                unsigned _stv8_1_7 = __float_as_uint(out_values[0 + 7]);
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #else
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3) : "memory");
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1) + 4)), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #endif
-            }
-        }
-    }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    }
-#endif
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    cached_cluster_body<4, 4>(x, parameter, output, rows, vocab_size, chunk_elements, parameter_kind, scalar_temperature);
 }
 
 // ---- variant c8_t4 ----
 __global__ __launch_bounds__(256, 4) __cluster_dims__(8,1,1) void
 kernel_flashinfer_blackwell_softmax_cached_c8_t4(float* __restrict__ x, float* __restrict__ parameter, float* __restrict__ output, int rows, int vocab_size, int chunk_elements, int parameter_kind, float scalar_temperature)
 {
-    const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    const bool enable_pdl = (parameter_kind & 4) != 0;
-    parameter_kind &= 3;
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-    }
-#endif
-
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 8;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 8;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-
-    // Kernel setup ops
-    float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
-    const int reduce_smem_addr = smem + 0;
-    float* publish = reinterpret_cast<float*>(smem_raw + 64);
-    const int publish_addr = smem + 64;
-    float* row_stats = reinterpret_cast<float*>(smem_raw + 96);
-    const int row_stats_addr = smem + 96;
-
-    // === Task calls (dependency order) ===
-    int rank = cta_rank;
-    int row = bid / 8;
-    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
-    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
-    int chunk_begin = rank * chunk_elements;
-    int _min_0 = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    int chunk_end = _min_0;
-    float cache[64];
-    float local_max = -CUDART_INF_F;
-    #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {
-        int elem = chunk_begin + (tile * 256 + tid) * 8;
-        if (elem < chunk_end) {
-            unsigned long long index = row_base + (unsigned long long)elem;
-            float _vec_load_0[8];
-            {
-                unsigned _ldv8_0_0;
-                unsigned _ldv8_0_1;
-                unsigned _ldv8_0_2;
-                unsigned _ldv8_0_3;
-                unsigned _ldv8_0_4;
-                unsigned _ldv8_0_5;
-                unsigned _ldv8_0_6;
-                unsigned _ldv8_0_7;
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index))) : "memory");
-                #else
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3) : "l"((const void*)(x + (index))) : "memory");
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index) + 4)) : "memory");
-                #endif
-                _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
-                _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
-                _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
-                _vec_load_0[0 + 3] = __uint_as_float(_ldv8_0_3);
-                _vec_load_0[0 + 4] = __uint_as_float(_ldv8_0_4);
-                _vec_load_0[0 + 5] = __uint_as_float(_ldv8_0_5);
-                _vec_load_0[0 + 6] = __uint_as_float(_ldv8_0_6);
-                _vec_load_0[0 + 7] = __uint_as_float(_ldv8_0_7);
-            }
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                float scaled = _vec_load_0[j] / temperature;
-                cache[tile * 8 + j] = scaled;
-                float _max_0 = max_noftz(local_max, scaled);
-                local_max = _max_0;
-            }
-        }
-    }
-    float _warp_reduce_0 = local_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-    float warp_max = _warp_reduce_0;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_max;
-    }
-    __syncthreads();
-    float warp_partial_max = ((lane < 8) ? reduce_smem[lane] : -CUDART_INF_F);
-    float _warp_reduce_1 = warp_partial_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-    float cta_max = _warp_reduce_1;
-    __syncthreads();
-    float safe_max = ((cta_max == -CUDART_INF_F) ? 0.0f : cta_max);
-    float local_sum = 0.0f;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 4; tile_1++) {
-        int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
-        if (elem_1 < chunk_end) {
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float _exp2_0 = approx_exp2((cache[tile_1 * 8 + j_1] - safe_max) * 1.4426950408889634f);
-                float p = _exp2_0;
-                cache[tile_1 * 8 + j_1] = p;
-                local_sum += p;
-            }
-        }
-    }
-    float _warp_reduce_2 = local_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-    float warp_sum = _warp_reduce_2;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_sum;
-    }
-    __syncthreads();
-    float warp_partial_sum = ((lane < 8) ? reduce_smem[lane] : 0.0f);
-    float _warp_reduce_3 = warp_partial_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
-    float cta_sum = _warp_reduce_3;
-    float row_max = cta_max;
-    float row_sum = cta_sum;
-    if (warp == 0) {
-        if (elect_sync()) {
-            publish[0] = cta_max;
-            publish[1] = cta_sum;
-        }
-    }
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (warp == 0) {
-        int _min_1 = ((lane) < (7) ? (lane) : (7));
-        int peer = _min_1;
-        uint32_t _mapa_0;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_0) : "r"(publish_addr), "r"(peer));
-        float _cluster_ld_0;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_0) : "r"(_mapa_0) : "memory");
-        float peer_max = _cluster_ld_0;
-        uint32_t _mapa_1;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_1) : "r"(publish_addr + 4), "r"(peer));
-        float _cluster_ld_1;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_1) : "r"(_mapa_1) : "memory");
-        float peer_sum = _cluster_ld_1;
-        if (lane > 7) {
-            peer_max = -CUDART_INF_F;
-            peer_sum = 0.0f;
-        }
-        float _warp_reduce_4 = peer_max;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_4 = max_noftz(_warp_reduce_4, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset));
-        float cluster_max = _warp_reduce_4;
-        float _exp2_1 = approx_exp2((peer_max - cluster_max) * 1.4426950408889634f);
-        float rescaled = peer_sum * _exp2_1;
-        float _warp_reduce_5 = rescaled;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
-        float cluster_sum = _warp_reduce_5;
-        if (lane == 0) {
-            row_stats[0] = cluster_max;
-            row_stats[1] = cluster_sum;
-        }
-    }
-    __syncthreads();
-    row_max = row_stats[0];
-    row_sum = row_stats[1];
-    float _exp2_2 = approx_exp2((cta_max - row_max) * 1.4426950408889634f);
-    float _rcp_0 = approx_rcp(row_sum);
-    float scale = _exp2_2 * _rcp_0;
-    #pragma unroll
-    for (int tile_2 = 0; tile_2 < 4; tile_2++) {
-        int elem_2 = chunk_begin + (tile_2 * 256 + tid) * 8;
-        if (elem_2 < chunk_end) {
-            unsigned long long index_1 = row_base + (unsigned long long)elem_2;
-            float out_values[8];
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                out_values[j_2] = cache[tile_2 * 8 + j_2] * scale;
-            }
-            {
-                unsigned _stv8_1_0 = __float_as_uint(out_values[0 + 0]);
-                unsigned _stv8_1_1 = __float_as_uint(out_values[0 + 1]);
-                unsigned _stv8_1_2 = __float_as_uint(out_values[0 + 2]);
-                unsigned _stv8_1_3 = __float_as_uint(out_values[0 + 3]);
-                unsigned _stv8_1_4 = __float_as_uint(out_values[0 + 4]);
-                unsigned _stv8_1_5 = __float_as_uint(out_values[0 + 5]);
-                unsigned _stv8_1_6 = __float_as_uint(out_values[0 + 6]);
-                unsigned _stv8_1_7 = __float_as_uint(out_values[0 + 7]);
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #else
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3) : "memory");
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1) + 4)), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #endif
-            }
-        }
-    }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    }
-#endif
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    cached_cluster_body<8, 4>(x, parameter, output, rows, vocab_size, chunk_elements, parameter_kind, scalar_temperature);
 }
 
 // ---- variant c8_t8 ----
 __global__ __launch_bounds__(256, 2) __cluster_dims__(8,1,1) void
 kernel_flashinfer_blackwell_softmax_cached_c8_t8(float* __restrict__ x, float* __restrict__ parameter, float* __restrict__ output, int rows, int vocab_size, int chunk_elements, int parameter_kind, float scalar_temperature)
 {
-    const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    const bool enable_pdl = (parameter_kind & 4) != 0;
-    parameter_kind &= 3;
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-    }
-#endif
-
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 8;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 8;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-
-    // Kernel setup ops
-    float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
-    const int reduce_smem_addr = smem + 0;
-    float* publish = reinterpret_cast<float*>(smem_raw + 64);
-    const int publish_addr = smem + 64;
-    float* row_stats = reinterpret_cast<float*>(smem_raw + 96);
-    const int row_stats_addr = smem + 96;
-
-    // === Task calls (dependency order) ===
-    int rank = cta_rank;
-    int row = bid / 8;
-    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
-    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
-    int chunk_begin = rank * chunk_elements;
-    int _min_0 = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    int chunk_end = _min_0;
-    float cache[64];
-    float local_max = -CUDART_INF_F;
-    #pragma unroll
-    for (int tile = 0; tile < 8; tile++) {
-        int elem = chunk_begin + (tile * 256 + tid) * 8;
-        if (elem < chunk_end) {
-            unsigned long long index = row_base + (unsigned long long)elem;
-            float _vec_load_0[8];
-            {
-                unsigned _ldv8_0_0;
-                unsigned _ldv8_0_1;
-                unsigned _ldv8_0_2;
-                unsigned _ldv8_0_3;
-                unsigned _ldv8_0_4;
-                unsigned _ldv8_0_5;
-                unsigned _ldv8_0_6;
-                unsigned _ldv8_0_7;
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index))) : "memory");
-                #else
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3) : "l"((const void*)(x + (index))) : "memory");
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index) + 4)) : "memory");
-                #endif
-                _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
-                _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
-                _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
-                _vec_load_0[0 + 3] = __uint_as_float(_ldv8_0_3);
-                _vec_load_0[0 + 4] = __uint_as_float(_ldv8_0_4);
-                _vec_load_0[0 + 5] = __uint_as_float(_ldv8_0_5);
-                _vec_load_0[0 + 6] = __uint_as_float(_ldv8_0_6);
-                _vec_load_0[0 + 7] = __uint_as_float(_ldv8_0_7);
-            }
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                float scaled = _vec_load_0[j] / temperature;
-                cache[tile * 8 + j] = scaled;
-                float _max_0 = max_noftz(local_max, scaled);
-                local_max = _max_0;
-            }
-        }
-    }
-    float _warp_reduce_0 = local_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-    float warp_max = _warp_reduce_0;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_max;
-    }
-    __syncthreads();
-    float warp_partial_max = ((lane < 8) ? reduce_smem[lane] : -CUDART_INF_F);
-    float _warp_reduce_1 = warp_partial_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-    float cta_max = _warp_reduce_1;
-    __syncthreads();
-    float safe_max = ((cta_max == -CUDART_INF_F) ? 0.0f : cta_max);
-    float local_sum = 0.0f;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 8; tile_1++) {
-        int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
-        if (elem_1 < chunk_end) {
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float _exp2_0 = approx_exp2((cache[tile_1 * 8 + j_1] - safe_max) * 1.4426950408889634f);
-                float p = _exp2_0;
-                cache[tile_1 * 8 + j_1] = p;
-                local_sum += p;
-            }
-        }
-    }
-    float _warp_reduce_2 = local_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-    float warp_sum = _warp_reduce_2;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_sum;
-    }
-    __syncthreads();
-    float warp_partial_sum = ((lane < 8) ? reduce_smem[lane] : 0.0f);
-    float _warp_reduce_3 = warp_partial_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
-    float cta_sum = _warp_reduce_3;
-    float row_max = cta_max;
-    float row_sum = cta_sum;
-    if (warp == 0) {
-        if (elect_sync()) {
-            publish[0] = cta_max;
-            publish[1] = cta_sum;
-        }
-    }
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (warp == 0) {
-        int _min_1 = ((lane) < (7) ? (lane) : (7));
-        int peer = _min_1;
-        uint32_t _mapa_0;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_0) : "r"(publish_addr), "r"(peer));
-        float _cluster_ld_0;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_0) : "r"(_mapa_0) : "memory");
-        float peer_max = _cluster_ld_0;
-        uint32_t _mapa_1;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_1) : "r"(publish_addr + 4), "r"(peer));
-        float _cluster_ld_1;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_1) : "r"(_mapa_1) : "memory");
-        float peer_sum = _cluster_ld_1;
-        if (lane > 7) {
-            peer_max = -CUDART_INF_F;
-            peer_sum = 0.0f;
-        }
-        float _warp_reduce_4 = peer_max;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_4 = max_noftz(_warp_reduce_4, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset));
-        float cluster_max = _warp_reduce_4;
-        float _exp2_1 = approx_exp2((peer_max - cluster_max) * 1.4426950408889634f);
-        float rescaled = peer_sum * _exp2_1;
-        float _warp_reduce_5 = rescaled;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
-        float cluster_sum = _warp_reduce_5;
-        if (lane == 0) {
-            row_stats[0] = cluster_max;
-            row_stats[1] = cluster_sum;
-        }
-    }
-    __syncthreads();
-    row_max = row_stats[0];
-    row_sum = row_stats[1];
-    float _exp2_2 = approx_exp2((cta_max - row_max) * 1.4426950408889634f);
-    float _rcp_0 = approx_rcp(row_sum);
-    float scale = _exp2_2 * _rcp_0;
-    #pragma unroll
-    for (int tile_2 = 0; tile_2 < 8; tile_2++) {
-        int elem_2 = chunk_begin + (tile_2 * 256 + tid) * 8;
-        if (elem_2 < chunk_end) {
-            unsigned long long index_1 = row_base + (unsigned long long)elem_2;
-            float out_values[8];
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                out_values[j_2] = cache[tile_2 * 8 + j_2] * scale;
-            }
-            {
-                unsigned _stv8_1_0 = __float_as_uint(out_values[0 + 0]);
-                unsigned _stv8_1_1 = __float_as_uint(out_values[0 + 1]);
-                unsigned _stv8_1_2 = __float_as_uint(out_values[0 + 2]);
-                unsigned _stv8_1_3 = __float_as_uint(out_values[0 + 3]);
-                unsigned _stv8_1_4 = __float_as_uint(out_values[0 + 4]);
-                unsigned _stv8_1_5 = __float_as_uint(out_values[0 + 5]);
-                unsigned _stv8_1_6 = __float_as_uint(out_values[0 + 6]);
-                unsigned _stv8_1_7 = __float_as_uint(out_values[0 + 7]);
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #else
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3) : "memory");
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1) + 4)), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #endif
-            }
-        }
-    }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    }
-#endif
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    cached_cluster_body<8, 8>(x, parameter, output, rows, vocab_size, chunk_elements, parameter_kind, scalar_temperature);
 }
 
 // ---- variant c16_t4 ----
 __global__ __launch_bounds__(256, 4) __cluster_dims__(16,1,1) void
 kernel_flashinfer_blackwell_softmax_cached_c16_t4(float* __restrict__ x, float* __restrict__ parameter, float* __restrict__ output, int rows, int vocab_size, int chunk_elements, int parameter_kind, float scalar_temperature)
 {
-    const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    const bool enable_pdl = (parameter_kind & 4) != 0;
-    parameter_kind &= 3;
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-    }
-#endif
-
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 16;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 16;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-
-    // Kernel setup ops
-    float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
-    const int reduce_smem_addr = smem + 0;
-    float* publish = reinterpret_cast<float*>(smem_raw + 64);
-    const int publish_addr = smem + 64;
-    float* row_stats = reinterpret_cast<float*>(smem_raw + 96);
-    const int row_stats_addr = smem + 96;
-
-    // === Task calls (dependency order) ===
-    int rank = cta_rank;
-    int row = bid / 16;
-    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
-    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
-    int chunk_begin = rank * chunk_elements;
-    int _min_0 = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    int chunk_end = _min_0;
-    float cache[64];
-    float local_max = -CUDART_INF_F;
-    #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {
-        int elem = chunk_begin + (tile * 256 + tid) * 8;
-        if (elem < chunk_end) {
-            unsigned long long index = row_base + (unsigned long long)elem;
-            float _vec_load_0[8];
-            {
-                unsigned _ldv8_0_0;
-                unsigned _ldv8_0_1;
-                unsigned _ldv8_0_2;
-                unsigned _ldv8_0_3;
-                unsigned _ldv8_0_4;
-                unsigned _ldv8_0_5;
-                unsigned _ldv8_0_6;
-                unsigned _ldv8_0_7;
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index))) : "memory");
-                #else
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3) : "l"((const void*)(x + (index))) : "memory");
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index) + 4)) : "memory");
-                #endif
-                _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
-                _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
-                _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
-                _vec_load_0[0 + 3] = __uint_as_float(_ldv8_0_3);
-                _vec_load_0[0 + 4] = __uint_as_float(_ldv8_0_4);
-                _vec_load_0[0 + 5] = __uint_as_float(_ldv8_0_5);
-                _vec_load_0[0 + 6] = __uint_as_float(_ldv8_0_6);
-                _vec_load_0[0 + 7] = __uint_as_float(_ldv8_0_7);
-            }
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                float scaled = _vec_load_0[j] / temperature;
-                cache[tile * 8 + j] = scaled;
-                float _max_0 = max_noftz(local_max, scaled);
-                local_max = _max_0;
-            }
-        }
-    }
-    float _warp_reduce_0 = local_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-    float warp_max = _warp_reduce_0;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_max;
-    }
-    __syncthreads();
-    float warp_partial_max = ((lane < 8) ? reduce_smem[lane] : -CUDART_INF_F);
-    float _warp_reduce_1 = warp_partial_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-    float cta_max = _warp_reduce_1;
-    __syncthreads();
-    float safe_max = ((cta_max == -CUDART_INF_F) ? 0.0f : cta_max);
-    float local_sum = 0.0f;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 4; tile_1++) {
-        int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
-        if (elem_1 < chunk_end) {
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float _exp2_0 = approx_exp2((cache[tile_1 * 8 + j_1] - safe_max) * 1.4426950408889634f);
-                float p = _exp2_0;
-                cache[tile_1 * 8 + j_1] = p;
-                local_sum += p;
-            }
-        }
-    }
-    float _warp_reduce_2 = local_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-    float warp_sum = _warp_reduce_2;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_sum;
-    }
-    __syncthreads();
-    float warp_partial_sum = ((lane < 8) ? reduce_smem[lane] : 0.0f);
-    float _warp_reduce_3 = warp_partial_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
-    float cta_sum = _warp_reduce_3;
-    float row_max = cta_max;
-    float row_sum = cta_sum;
-    if (warp == 0) {
-        if (elect_sync()) {
-            publish[0] = cta_max;
-            publish[1] = cta_sum;
-        }
-    }
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (warp == 0) {
-        int _min_1 = ((lane) < (15) ? (lane) : (15));
-        int peer = _min_1;
-        uint32_t _mapa_0;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_0) : "r"(publish_addr), "r"(peer));
-        float _cluster_ld_0;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_0) : "r"(_mapa_0) : "memory");
-        float peer_max = _cluster_ld_0;
-        uint32_t _mapa_1;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_1) : "r"(publish_addr + 4), "r"(peer));
-        float _cluster_ld_1;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_1) : "r"(_mapa_1) : "memory");
-        float peer_sum = _cluster_ld_1;
-        if (lane > 15) {
-            peer_max = -CUDART_INF_F;
-            peer_sum = 0.0f;
-        }
-        float _warp_reduce_4 = peer_max;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_4 = max_noftz(_warp_reduce_4, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset));
-        float cluster_max = _warp_reduce_4;
-        float _exp2_1 = approx_exp2((peer_max - cluster_max) * 1.4426950408889634f);
-        float rescaled = peer_sum * _exp2_1;
-        float _warp_reduce_5 = rescaled;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
-        float cluster_sum = _warp_reduce_5;
-        if (lane == 0) {
-            row_stats[0] = cluster_max;
-            row_stats[1] = cluster_sum;
-        }
-    }
-    __syncthreads();
-    row_max = row_stats[0];
-    row_sum = row_stats[1];
-    float _exp2_2 = approx_exp2((cta_max - row_max) * 1.4426950408889634f);
-    float _rcp_0 = approx_rcp(row_sum);
-    float scale = _exp2_2 * _rcp_0;
-    #pragma unroll
-    for (int tile_2 = 0; tile_2 < 4; tile_2++) {
-        int elem_2 = chunk_begin + (tile_2 * 256 + tid) * 8;
-        if (elem_2 < chunk_end) {
-            unsigned long long index_1 = row_base + (unsigned long long)elem_2;
-            float out_values[8];
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                out_values[j_2] = cache[tile_2 * 8 + j_2] * scale;
-            }
-            {
-                unsigned _stv8_1_0 = __float_as_uint(out_values[0 + 0]);
-                unsigned _stv8_1_1 = __float_as_uint(out_values[0 + 1]);
-                unsigned _stv8_1_2 = __float_as_uint(out_values[0 + 2]);
-                unsigned _stv8_1_3 = __float_as_uint(out_values[0 + 3]);
-                unsigned _stv8_1_4 = __float_as_uint(out_values[0 + 4]);
-                unsigned _stv8_1_5 = __float_as_uint(out_values[0 + 5]);
-                unsigned _stv8_1_6 = __float_as_uint(out_values[0 + 6]);
-                unsigned _stv8_1_7 = __float_as_uint(out_values[0 + 7]);
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #else
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3) : "memory");
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1) + 4)), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #endif
-            }
-        }
-    }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    }
-#endif
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    cached_cluster_body<16, 4>(x, parameter, output, rows, vocab_size, chunk_elements, parameter_kind, scalar_temperature);
 }
 
 // ---- variant c16_t8 ----
 __global__ __launch_bounds__(256, 2) __cluster_dims__(16,1,1) void
 kernel_flashinfer_blackwell_softmax_cached_c16_t8(float* __restrict__ x, float* __restrict__ parameter, float* __restrict__ output, int rows, int vocab_size, int chunk_elements, int parameter_kind, float scalar_temperature)
 {
-    const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    const bool enable_pdl = (parameter_kind & 4) != 0;
-    parameter_kind &= 3;
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-    }
-#endif
-
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 16;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 16;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-
-    // Kernel setup ops
-    float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
-    const int reduce_smem_addr = smem + 0;
-    float* publish = reinterpret_cast<float*>(smem_raw + 64);
-    const int publish_addr = smem + 64;
-    float* row_stats = reinterpret_cast<float*>(smem_raw + 96);
-    const int row_stats_addr = smem + 96;
-
-    // === Task calls (dependency order) ===
-    int rank = cta_rank;
-    int row = bid / 16;
-    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
-    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
-    int chunk_begin = rank * chunk_elements;
-    int _min_0 = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    int chunk_end = _min_0;
-    float cache[64];
-    float local_max = -CUDART_INF_F;
-    #pragma unroll
-    for (int tile = 0; tile < 8; tile++) {
-        int elem = chunk_begin + (tile * 256 + tid) * 8;
-        if (elem < chunk_end) {
-            unsigned long long index = row_base + (unsigned long long)elem;
-            float _vec_load_0[8];
-            {
-                unsigned _ldv8_0_0;
-                unsigned _ldv8_0_1;
-                unsigned _ldv8_0_2;
-                unsigned _ldv8_0_3;
-                unsigned _ldv8_0_4;
-                unsigned _ldv8_0_5;
-                unsigned _ldv8_0_6;
-                unsigned _ldv8_0_7;
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index))) : "memory");
-                #else
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3) : "l"((const void*)(x + (index))) : "memory");
-                asm volatile(
-                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(x + (index) + 4)) : "memory");
-                #endif
-                _vec_load_0[0 + 0] = __uint_as_float(_ldv8_0_0);
-                _vec_load_0[0 + 1] = __uint_as_float(_ldv8_0_1);
-                _vec_load_0[0 + 2] = __uint_as_float(_ldv8_0_2);
-                _vec_load_0[0 + 3] = __uint_as_float(_ldv8_0_3);
-                _vec_load_0[0 + 4] = __uint_as_float(_ldv8_0_4);
-                _vec_load_0[0 + 5] = __uint_as_float(_ldv8_0_5);
-                _vec_load_0[0 + 6] = __uint_as_float(_ldv8_0_6);
-                _vec_load_0[0 + 7] = __uint_as_float(_ldv8_0_7);
-            }
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                float scaled = _vec_load_0[j] / temperature;
-                cache[tile * 8 + j] = scaled;
-                float _max_0 = max_noftz(local_max, scaled);
-                local_max = _max_0;
-            }
-        }
-    }
-    float _warp_reduce_0 = local_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-    float warp_max = _warp_reduce_0;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_max;
-    }
-    __syncthreads();
-    float warp_partial_max = ((lane < 8) ? reduce_smem[lane] : -CUDART_INF_F);
-    float _warp_reduce_1 = warp_partial_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-    float cta_max = _warp_reduce_1;
-    __syncthreads();
-    float safe_max = ((cta_max == -CUDART_INF_F) ? 0.0f : cta_max);
-    float local_sum = 0.0f;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 8; tile_1++) {
-        int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
-        if (elem_1 < chunk_end) {
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float _exp2_0 = approx_exp2((cache[tile_1 * 8 + j_1] - safe_max) * 1.4426950408889634f);
-                float p = _exp2_0;
-                cache[tile_1 * 8 + j_1] = p;
-                local_sum += p;
-            }
-        }
-    }
-    float _warp_reduce_2 = local_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-    float warp_sum = _warp_reduce_2;
-    if (lane == 0) {
-        reduce_smem[warp] = warp_sum;
-    }
-    __syncthreads();
-    float warp_partial_sum = ((lane < 8) ? reduce_smem[lane] : 0.0f);
-    float _warp_reduce_3 = warp_partial_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
-    float cta_sum = _warp_reduce_3;
-    float row_max = cta_max;
-    float row_sum = cta_sum;
-    if (warp == 0) {
-        if (elect_sync()) {
-            publish[0] = cta_max;
-            publish[1] = cta_sum;
-        }
-    }
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (warp == 0) {
-        int _min_1 = ((lane) < (15) ? (lane) : (15));
-        int peer = _min_1;
-        uint32_t _mapa_0;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_0) : "r"(publish_addr), "r"(peer));
-        float _cluster_ld_0;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_0) : "r"(_mapa_0) : "memory");
-        float peer_max = _cluster_ld_0;
-        uint32_t _mapa_1;
-        asm volatile(
-            "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_mapa_1) : "r"(publish_addr + 4), "r"(peer));
-        float _cluster_ld_1;
-        asm volatile(
-            "ld.shared::cluster.f32 %0, [%1];"
-            : "=f"(_cluster_ld_1) : "r"(_mapa_1) : "memory");
-        float peer_sum = _cluster_ld_1;
-        if (lane > 15) {
-            peer_max = -CUDART_INF_F;
-            peer_sum = 0.0f;
-        }
-        float _warp_reduce_4 = peer_max;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_4 = max_noftz(_warp_reduce_4, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_4, offset));
-        float cluster_max = _warp_reduce_4;
-        float _exp2_1 = approx_exp2((peer_max - cluster_max) * 1.4426950408889634f);
-        float rescaled = peer_sum * _exp2_1;
-        float _warp_reduce_5 = rescaled;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
-        float cluster_sum = _warp_reduce_5;
-        if (lane == 0) {
-            row_stats[0] = cluster_max;
-            row_stats[1] = cluster_sum;
-        }
-    }
-    __syncthreads();
-    row_max = row_stats[0];
-    row_sum = row_stats[1];
-    float _exp2_2 = approx_exp2((cta_max - row_max) * 1.4426950408889634f);
-    float _rcp_0 = approx_rcp(row_sum);
-    float scale = _exp2_2 * _rcp_0;
-    #pragma unroll
-    for (int tile_2 = 0; tile_2 < 8; tile_2++) {
-        int elem_2 = chunk_begin + (tile_2 * 256 + tid) * 8;
-        if (elem_2 < chunk_end) {
-            unsigned long long index_1 = row_base + (unsigned long long)elem_2;
-            float out_values[8];
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                out_values[j_2] = cache[tile_2 * 8 + j_2] * scale;
-            }
-            {
-                unsigned _stv8_1_0 = __float_as_uint(out_values[0 + 0]);
-                unsigned _stv8_1_1 = __float_as_uint(out_values[0 + 1]);
-                unsigned _stv8_1_2 = __float_as_uint(out_values[0 + 2]);
-                unsigned _stv8_1_3 = __float_as_uint(out_values[0 + 3]);
-                unsigned _stv8_1_4 = __float_as_uint(out_values[0 + 4]);
-                unsigned _stv8_1_5 = __float_as_uint(out_values[0 + 5]);
-                unsigned _stv8_1_6 = __float_as_uint(out_values[0 + 6]);
-                unsigned _stv8_1_7 = __float_as_uint(out_values[0 + 7]);
-                #if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)
-                asm volatile(
-                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #else
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3) : "memory");
-                asm volatile(
-                    "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"((void*)(output + (index_1) + 4)), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                #endif
-            }
-        }
-    }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
-    if (enable_pdl) {
-        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    }
-#endif
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    cached_cluster_body<16, 8>(x, parameter, output, rows, vocab_size, chunk_elements, parameter_kind, scalar_temperature);
 }
 
 } // extern "C"
