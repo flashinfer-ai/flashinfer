@@ -451,7 +451,9 @@ def test_fused_kda_decode_compile_abi_orders_flags_and_metadata(monkeypatch):
     module = importlib.import_module("flashinfer.kda_kernels.fused_kda_decode")
     compiled = []
 
-    monkeypatch.setattr(module, "_make_compile_inputs", lambda dtype: (dtype,))
+    monkeypatch.setattr(
+        module, "_make_compile_inputs", lambda dtype, conv_dim_first: (dtype,)
+    )
 
     def fake_compile(function, *args, **kwargs):
         del function, kwargs
@@ -469,20 +471,27 @@ def test_fused_kda_decode_compile_abi_orders_flags_and_metadata(monkeypatch):
     try:
         for state_dtype in (torch.float32, torch.bfloat16):
             for packed_t1 in (False, True):
-                module._get_compiled_kernel(
-                    state_dtype, -5.0, 1e-5, packed_t1=packed_t1
-                )
+                for conv_dim_first in (False, True):
+                    module._get_compiled_kernel(
+                        state_dtype,
+                        -5.0,
+                        1e-5,
+                        packed_t1=packed_t1,
+                        conv_dim_first=conv_dim_first,
+                    )
     finally:
         module._get_compiled_kernel.cache_clear()
 
-    assert len(compiled) == 4
+    assert len(compiled) == 8
     # _make_compile_inputs contributes one sentinel; constexpr flags follow
-    # the launch signature: state_is_bf16, packed_t1.
-    assert {(args[-5], args[-4]) for args in compiled} == {
-        (False, False),
-        (False, True),
-        (True, False),
-        (True, True),
+    # the launch signature: state_is_bf16, packed_t1, use_lower_bound,
+    # lower_bound, norm_eps, conv_dim_first.
+    flags = (False, True)
+    assert {(args[-6], args[-5], args[-1]) for args in compiled} == {
+        (state_is_bf16, packed_t1, conv_dim_first)
+        for state_is_bf16 in flags
+        for packed_t1 in flags
+        for conv_dim_first in flags
     }
 
 
@@ -505,11 +514,14 @@ def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
     try:
         for state_dtype in (torch.float32, torch.bfloat16):
             for lower_bound in (-5.0, None):
-                kernel_module._get_compiled_kernel(state_dtype, lower_bound, 1e-5)
+                for conv_dim_first in (False, True):
+                    kernel_module._get_compiled_kernel(
+                        state_dtype, lower_bound, 1e-5, conv_dim_first=conv_dim_first
+                    )
     finally:
         kernel_module._get_compiled_kernel.cache_clear()
 
-    assert len(kernel_names) == len(set(kernel_names)) == 4
+    assert len(kernel_names) == len(set(kernel_names)) == 8
 
 
 @pytest.mark.parametrize(
