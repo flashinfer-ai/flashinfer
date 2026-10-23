@@ -1,0 +1,6449 @@
+{
+  "status": "Qualified against main after #7053 merged; component host-submission measurements.",
+  "baseline_revision": "3f398977d75b4017cbd4c00824a5108017aade06",
+  "candidate_commit": "91ae8a6996fd79d7e1c13f2e37348a0421b6f047",
+  "source_note": "All measured production source hashes match the candidate commit. The benchmark hash separately identifies the shared-workspace timing protocol.",
+  "hardware": {
+    "gpu": "NVIDIA B300 SXM6 AC",
+    "capability": [
+      10,
+      3
+    ],
+    "cpu": "Intel Xeon Platinum 8570",
+    "exclusive_cpu": false
+  },
+  "software": {
+    "torch": "2.14.1+cu130",
+    "dsl": "4.8.0",
+    "tvm_ffi": "0.1.11",
+    "python": "3.12.15",
+    "cuda_runtime": "13.0"
+  },
+  "protocol": {
+    "host": "Python entry to Python return; device synchronization outside timer; separate AB/BA loop per CPU metric; 101 samples",
+    "public": "Warm public call including winner-cache lookup, validation, pack and launch. Cold selection is pinned to the same tactic before timing.",
+    "graph_cpu": "One replay of an uninstrumented 50-call graph, in microseconds per replay; not divided by 50",
+    "gpu": "External events in a separate 50-call graph; microseconds per MoE call; both sides use identical input/workspace addresses; snapshots checked against independent buffers",
+    "gpu_cache": "Repeated fixed-input graph replay; no L2 flush or cold-cache claim",
+    "excluded": [
+      "weight preparation",
+      "input quantization",
+      "JIT compilation",
+      "cold tactic selection"
+    ],
+    "scope": "Component host/GPU microbenchmark; no model throughput claim"
+  },
+  "shape": {
+    "hidden": 2048,
+    "physical_intermediate": 1408,
+    "experts": 64,
+    "top_k": 6
+  },
+  "correctness": "All compared outputs bitwise equal between baseline/candidate and public/replay after changing routing IDs and scores. Separate tests use independent numerical references.",
+  "measured_manifests": {
+    "baseline": {
+      "__init__.py": "19cca05a476f8244eec58829041dec176a248e5f16d0aeb9e3ef969f94ad320d",
+      "activation.py": "69b1247b0c56b785171703208a9292dcd31d3d1e340720eb072b61315c0de07a",
+      "fma/__init__.py": "de6683449a20e3dad045d702e254ad5f62c17399513af286de9074a8c746ecc3",
+      "fma/activation_config.py": "1b51203e8fbb681395798ba8711592e00c37f48c48667a2c76ef12d3c069193a",
+      "fma/activations.py": "99f2ef68515e9d6c8bbf8626f4c1ad32acac9b7426b75292c6966769c61dcbfa",
+      "fma/bf16/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "fma/bf16/fma_fc1.py": "b69b4779ed84e97de34dd2b601d36ef07b5475b85c2a34edd30003662d088338",
+      "fma/bf16/fma_fc2.py": "37d1c94be99897be9210c62e9f179ce0572a3d0ebb64eb67830e554524b8e468",
+      "fma/bf16/runtime.py": "2b9fc78f9417151f3bb86565bde68f0bc6de6d24a1df2921363614f7bcecbc2e",
+      "fma/mxfp8/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "fma/mxfp8/fma_common.py": "3c5cc0878a17b82f21e09500dc3ea2bc34428facc04955bfaf5e95211f517ade",
+      "fma/mxfp8/fma_fc1.py": "a407fb74eba2cef85131f547d35f4e3206a1c729421addccd02d7541b20739b1",
+      "fma/mxfp8/fma_fc2.py": "fb2bed49c325e4c0b9ed9b003932f0416cdffac9babd6fa4a6bff1ce45b83397",
+      "fma/nvfp4/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "fma/nvfp4/fma_fc1_o2.py": "6086984981a456144f89d0c93b3566875fef39f2a98540ede3814dade0df42ae",
+      "fma/nvfp4/fma_fc1_o4.py": "cbb7ba0d68c7a0e5719f2fd82ccea55434cacfcaad6e2d35fdb8a8e5a55e22db",
+      "fma/nvfp4/fma_fc2.py": "d53520da9bee139699d159d8070ca20dda12e1fba69a14e9f2b943fec888fe7f",
+      "fma/nvfp4/runtime.py": "bf9da629d895376c91a1c465c700ef3bb11acabfc3f3b2c490a6d1d4cdee5cea",
+      "fma/runtime.py": "781e6fabc3cf0c512b8689f655b98ad518dafbf345df5c65bf5c5edd8395f6e0",
+      "gemm.py": "5d53868fb2190bc0499eb3b28fc46607c1d2c9b753c610780a8beb428c13cd83",
+      "io.py": "bce77e22086f81bf78f65f62ab31d465d721094d4160e4ace568fea914e268db",
+      "nvfp4.py": "04e7a0aa7dfbb04fa205380dfea4d27213ab2ceb7b55988267a0279899ce508c",
+      "pipeline.py": "b2d2f3de116cddb97ae6a6541487e639fbccd04352e93ff75184979adfd44a84",
+      "prepare.py": "49066aadd82a40d3bbcb3753dea67394c63cc12f5dae19af065db006c4987f79",
+      "quantization.py": "de0c5a7d2b63f0e5381560e75f6f97d9b7401d6134d8ac2dbfe30e0a6efec446",
+      "runner.py": "5568e12b1bbc3e6ef3e76d2b8728d458e9d1009469a8b9655c5dc127470c89a4",
+      "runtime.py": "cb758206a0325b349f2e94c83b1269df71566c27dc67a96b496d9e13eed113b9"
+    },
+    "candidate": {
+      "__init__.py": "19cca05a476f8244eec58829041dec176a248e5f16d0aeb9e3ef969f94ad320d",
+      "activation.py": "69b1247b0c56b785171703208a9292dcd31d3d1e340720eb072b61315c0de07a",
+      "fma/__init__.py": "de6683449a20e3dad045d702e254ad5f62c17399513af286de9074a8c746ecc3",
+      "fma/activation_config.py": "1b51203e8fbb681395798ba8711592e00c37f48c48667a2c76ef12d3c069193a",
+      "fma/activations.py": "99f2ef68515e9d6c8bbf8626f4c1ad32acac9b7426b75292c6966769c61dcbfa",
+      "fma/bf16/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "fma/bf16/fma_fc1.py": "b69b4779ed84e97de34dd2b601d36ef07b5475b85c2a34edd30003662d088338",
+      "fma/bf16/fma_fc2.py": "37d1c94be99897be9210c62e9f179ce0572a3d0ebb64eb67830e554524b8e468",
+      "fma/bf16/runtime.py": "7f7e03f47521df085aa95a1ce9decf0f48448583c9e9e879c7883c2a5af31563",
+      "fma/mxfp8/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "fma/mxfp8/fma_common.py": "3c5cc0878a17b82f21e09500dc3ea2bc34428facc04955bfaf5e95211f517ade",
+      "fma/mxfp8/fma_fc1.py": "a407fb74eba2cef85131f547d35f4e3206a1c729421addccd02d7541b20739b1",
+      "fma/mxfp8/fma_fc2.py": "fb2bed49c325e4c0b9ed9b003932f0416cdffac9babd6fa4a6bff1ce45b83397",
+      "fma/nvfp4/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "fma/nvfp4/fma_fc1_o2.py": "6086984981a456144f89d0c93b3566875fef39f2a98540ede3814dade0df42ae",
+      "fma/nvfp4/fma_fc1_o4.py": "cbb7ba0d68c7a0e5719f2fd82ccea55434cacfcaad6e2d35fdb8a8e5a55e22db",
+      "fma/nvfp4/fma_fc2.py": "d53520da9bee139699d159d8070ca20dda12e1fba69a14e9f2b943fec888fe7f",
+      "fma/nvfp4/runtime.py": "fd0f25d9c746dbe1da0a3829cec25d78d4a8d9394c801bc13839d7d1629cd651",
+      "fma/runtime.py": "4d1ad53bb03efa42a2b8224e4ba8b0e0cf343e6743498ec3243f3713f842a132",
+      "gemm.py": "5d53868fb2190bc0499eb3b28fc46607c1d2c9b753c610780a8beb428c13cd83",
+      "io.py": "bce77e22086f81bf78f65f62ab31d465d721094d4160e4ace568fea914e268db",
+      "nvfp4.py": "04e7a0aa7dfbb04fa205380dfea4d27213ab2ceb7b55988267a0279899ce508c",
+      "pipeline.py": "18e469ce116d4e8b01921c321e50125c76eb8c9a419a16392a5dba31ad8f1469",
+      "prepare.py": "49066aadd82a40d3bbcb3753dea67394c63cc12f5dae19af065db006c4987f79",
+      "quantization.py": "de0c5a7d2b63f0e5381560e75f6f97d9b7401d6134d8ac2dbfe30e0a6efec446",
+      "runner.py": "5568e12b1bbc3e6ef3e76d2b8728d458e9d1009469a8b9655c5dc127470c89a4",
+      "runtime.py": "4fd4836e985023a263745407682631ca1c2179cf2b3ed61b0e9afe82cf10ce77"
+    }
+  },
+  "benchmark_sha256": "1a26130f48c0ad49ac31dec2b99ebcaf82760bcb4655a86f30c67535350db6eb",
+  "commands": {
+    "main-ab": {
+      "baseline_root": "/baseline",
+      "output": "/out/results.json",
+      "formats": [
+        "bf16",
+        "mxfp4",
+        "mxfp8",
+        "nvfp4"
+      ],
+      "tokens": [
+        1,
+        2,
+        4
+      ],
+      "activations": [
+        "swiglu",
+        "situ",
+        "silu"
+      ],
+      "hidden": 2048,
+      "intermediate": 1408,
+      "experts": 64,
+      "top_k": 6,
+      "repeats": 101,
+      "calls_per_graph": 50,
+      "reverse": false
+    },
+    "main-ba": {
+      "baseline_root": "/baseline",
+      "output": "/out/results.json",
+      "formats": [
+        "bf16",
+        "mxfp4",
+        "mxfp8",
+        "nvfp4"
+      ],
+      "tokens": [
+        1,
+        2,
+        4
+      ],
+      "activations": [
+        "swiglu",
+        "situ",
+        "silu"
+      ],
+      "hidden": 2048,
+      "intermediate": 1408,
+      "experts": 64,
+      "top_k": 6,
+      "repeats": 101,
+      "calls_per_graph": 50,
+      "reverse": true
+    },
+    "main-aa": {
+      "baseline_root": "/source",
+      "output": "/out/results.json",
+      "formats": [
+        "bf16",
+        "mxfp4",
+        "mxfp8",
+        "nvfp4"
+      ],
+      "tokens": [
+        1,
+        2,
+        4
+      ],
+      "activations": [
+        "swiglu",
+        "situ",
+        "silu"
+      ],
+      "hidden": 2048,
+      "intermediate": 1408,
+      "experts": 64,
+      "top_k": 6,
+      "repeats": 101,
+      "calls_per_graph": 50,
+      "reverse": false
+    },
+    "main-tiny": {
+      "baseline_root": "/baseline",
+      "output": "/out/results.json",
+      "formats": [
+        "bf16",
+        "mxfp4",
+        "mxfp8",
+        "nvfp4"
+      ],
+      "tokens": [
+        1,
+        2,
+        4
+      ],
+      "activations": [
+        "swiglu"
+      ],
+      "hidden": 512,
+      "intermediate": 128,
+      "experts": 8,
+      "top_k": 2,
+      "repeats": 101,
+      "calls_per_graph": 50,
+      "reverse": false
+    }
+  },
+  "cases": [
+    {
+      "format": "bf16",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            84.553,
+            81.948
+          ],
+          "candidate": [
+            15.804,
+            13.475
+          ]
+        },
+        "public": {
+          "baseline": [
+            105.628,
+            106.446
+          ],
+          "candidate": [
+            37.037,
+            34.591
+          ]
+        },
+        "pack": {
+          "baseline": [
+            9.916,
+            9.846
+          ],
+          "candidate": [
+            9.99,
+            9.875
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.904,
+            2.886
+          ],
+          "candidate": [
+            2.926,
+            2.873
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          26.672639846801758,
+          26.594560146331787
+        ],
+        "candidate": [
+          26.67072057723999,
+          26.62208080291748
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0090604330887016,
+        "public": 1.0066043523764843,
+        "pack": 1.010352603526035,
+        "graph_replay": 1.002420470262794
+      },
+      "aa_gpu_change_percent": 0.00240300813578731
+    },
+    {
+      "format": "bf16",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            85.215,
+            84.027
+          ],
+          "candidate": [
+            15.65,
+            14.762
+          ]
+        },
+        "public": {
+          "baseline": [
+            108.241,
+            108.155
+          ],
+          "candidate": [
+            37.011,
+            35.593
+          ]
+        },
+        "pack": {
+          "baseline": [
+            9.852,
+            9.968
+          ],
+          "candidate": [
+            9.883,
+            9.98
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.915,
+            2.89
+          ],
+          "candidate": [
+            2.923,
+            2.891
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          42.82048225402832,
+          42.8115177154541
+        ],
+        "candidate": [
+          42.81856060028076,
+          42.812161445617676
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9926849092386888,
+        "public": 0.9974123989218329,
+        "pack": 1.0022350909275628,
+        "graph_replay": 1.0020898641588296
+      },
+      "aa_gpu_change_percent": 0.005979795640209673
+    },
+    {
+      "format": "bf16",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            85.502,
+            83.897
+          ],
+          "candidate": [
+            15.565,
+            15.13
+          ]
+        },
+        "public": {
+          "baseline": [
+            108.904,
+            106.776
+          ],
+          "candidate": [
+            37.849,
+            36.115
+          ]
+        },
+        "pack": {
+          "baseline": [
+            10.201,
+            10.15
+          ],
+          "candidate": [
+            10.303,
+            10.177
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.928,
+            2.956
+          ],
+          "candidate": [
+            2.935,
+            2.903
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          79.9507188796997,
+          79.95200157165527
+        ],
+        "candidate": [
+          79.96863842010498,
+          79.966721534729
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9900610923680131,
+        "public": 0.9968560200071455,
+        "pack": 1.0004975619464624,
+        "graph_replay": 0.9926341634514206
+      },
+      "aa_gpu_change_percent": 0.004801861762326887
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            219.449,
+            216.199
+          ],
+          "candidate": [
+            26.831,
+            22.968
+          ]
+        },
+        "public": {
+          "baseline": [
+            265.621,
+            256.077
+          ],
+          "candidate": [
+            63.808,
+            59.899
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.742,
+            17.598
+          ],
+          "candidate": [
+            17.721,
+            17.581
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.027,
+            3.06
+          ],
+          "candidate": [
+            3.023,
+            2.997
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.331519842147827,
+          10.332159996032715
+        ],
+        "candidate": [
+          10.33087968826294,
+          10.331519842147827
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9924468085106384,
+        "public": 0.9978712080894093,
+        "pack": 0.9998850508649921,
+        "graph_replay": 1.002375296912114
+      },
+      "aa_gpu_change_percent": 0.0
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            220.197,
+            212.31
+          ],
+          "candidate": [
+            26.607,
+            25.657
+          ]
+        },
+        "public": {
+          "baseline": [
+            264.687,
+            254.304
+          ],
+          "candidate": [
+            62.965,
+            60.478
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.884,
+            17.71
+          ],
+          "candidate": [
+            17.829,
+            17.692
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.016,
+            2.993
+          ],
+          "candidate": [
+            3.06,
+            3.031
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.049920082092285,
+          10.053119659423828
+        ],
+        "candidate": [
+          10.046720504760742,
+          10.051840543746948
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9910294278525325,
+        "public": 1.0001224689745265,
+        "pack": 1.0036336370977044,
+        "graph_replay": 1.0249915569064507
+      },
+      "aa_gpu_change_percent": 0.0
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            120.029,
+            115.926
+          ],
+          "candidate": [
+            15.568,
+            13.086
+          ]
+        },
+        "public": {
+          "baseline": [
+            156.414,
+            152.194
+          ],
+          "candidate": [
+            48.235,
+            46.372
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.499,
+            17.309
+          ],
+          "candidate": [
+            17.489,
+            17.411
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.911,
+            2.845
+          ],
+          "candidate": [
+            2.87,
+            2.833
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          17.251839637756348,
+          17.250560522079468
+        ],
+        "candidate": [
+          17.24992036819458,
+          17.247999906539917
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.988386978785662,
+        "public": 1.0021483402761404,
+        "pack": 1.0049013954561181,
+        "graph_replay": 0.9989376770538245
+      },
+      "aa_gpu_change_percent": -0.007414372633518518
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.883,
+            214.1
+          ],
+          "candidate": [
+            26.703,
+            24.882
+          ]
+        },
+        "public": {
+          "baseline": [
+            264.66,
+            256.156
+          ],
+          "candidate": [
+            63.277,
+            58.518
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.845,
+            17.61
+          ],
+          "candidate": [
+            17.719,
+            17.549
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.099,
+            3.06
+          ],
+          "candidate": [
+            3.071,
+            3.042
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          13.089280128479004,
+          13.086719512939453
+        ],
+        "candidate": [
+          13.112319707870483,
+          13.111040592193604
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.988450486295314,
+        "public": 0.9937802067826336,
+        "pack": 1.0021274149034038,
+        "graph_replay": 1.0180149558123726
+      },
+      "aa_gpu_change_percent": 0.18582730039049533
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.931,
+            214.556
+          ],
+          "candidate": [
+            26.466,
+            25.44
+          ]
+        },
+        "public": {
+          "baseline": [
+            262.413,
+            256.993
+          ],
+          "candidate": [
+            63.545,
+            59.667
+          ]
+        },
+        "pack": {
+          "baseline": [
+            18.003,
+            18.012
+          ],
+          "candidate": [
+            17.901,
+            17.938
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.078,
+            3.072
+          ],
+          "candidate": [
+            3.074,
+            3.056
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          14.793599843978882,
+          14.792319536209106
+        ],
+        "candidate": [
+          14.776959419250488,
+          14.766720533370972
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9900724001755156,
+        "public": 1.007872730981032,
+        "pack": 1.004823428079242,
+        "graph_replay": 1.0055374592833877
+      },
+      "aa_gpu_change_percent": -0.17304163603353295
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            120.837,
+            117.228
+          ],
+          "candidate": [
+            15.417,
+            13.041
+          ]
+        },
+        "public": {
+          "baseline": [
+            156.844,
+            153.193
+          ],
+          "candidate": [
+            49.468,
+            46.993
+          ]
+        },
+        "pack": {
+          "baseline": [
+            18.06,
+            17.783
+          ],
+          "candidate": [
+            18.001,
+            17.888
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.939,
+            2.873
+          ],
+          "candidate": [
+            2.941,
+            2.847
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          30.00511884689331,
+          29.99743938446045
+        ],
+        "candidate": [
+          30.00447988510132,
+          29.99552011489868
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9985380116959064,
+        "public": 0.9991184630143378,
+        "pack": 1.001763267163415,
+        "graph_replay": 1.0014079549454418
+      },
+      "aa_gpu_change_percent": -0.017073319814042698
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            221.351,
+            215.558
+          ],
+          "candidate": [
+            26.564,
+            23.069
+          ]
+        },
+        "public": {
+          "baseline": [
+            265.216,
+            258.778
+          ],
+          "candidate": [
+            64.544,
+            60.926
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.683,
+            17.931
+          ],
+          "candidate": [
+            17.77,
+            17.829
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.031,
+            3.071
+          ],
+          "candidate": [
+            3.051,
+            3.1
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          28.0185604095459,
+          28.02623987197876
+        ],
+        "candidate": [
+          28.02112102508545,
+          28.03136110305786
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9995066871300153,
+        "public": 1.0004693111328762,
+        "pack": 1.002039544501728,
+        "graph_replay": 1.0138067061143985
+      },
+      "aa_gpu_change_percent": -0.009128820417725336
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            214.736,
+            211.482
+          ],
+          "candidate": [
+            26.295,
+            25.202
+          ]
+        },
+        "public": {
+          "baseline": [
+            260.559,
+            254.892
+          ],
+          "candidate": [
+            63.118,
+            59.154
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.884,
+            17.632
+          ],
+          "candidate": [
+            17.782,
+            17.671
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.081,
+            3.034
+          ],
+          "candidate": [
+            3.052,
+            3.055
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          31.752960681915283,
+          31.7574405670166
+        ],
+        "candidate": [
+          31.740798950195312,
+          31.74015998840332
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9932590377820061,
+        "public": 0.9964065812052085,
+        "pack": 1.0061226825360494,
+        "graph_replay": 0.9948370442078089
+      },
+      "aa_gpu_change_percent": -0.056426273922982606
+    },
+    {
+      "format": "mxfp4",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            117.744,
+            114.803
+          ],
+          "candidate": [
+            15.158,
+            14.778
+          ]
+        },
+        "public": {
+          "baseline": [
+            154.188,
+            154.406
+          ],
+          "candidate": [
+            48.694,
+            46.587
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.891,
+            17.669
+          ],
+          "candidate": [
+            17.894,
+            17.696
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.916,
+            2.929
+          ],
+          "candidate": [
+            2.899,
+            2.879
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          54.293761253356934,
+          54.30975914001465
+        ],
+        "candidate": [
+          54.29696083068848,
+          54.29759979248047
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9986233480176211,
+        "public": 1.0022152723481887,
+        "pack": 0.9962433832318288,
+        "graph_replay": 1.0
+      },
+      "aa_gpu_change_percent": 0.0035304147868453484
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            214.801,
+            211.531
+          ],
+          "candidate": [
+            26.906,
+            24.584
+          ]
+        },
+        "public": {
+          "baseline": [
+            258.507,
+            253.915
+          ],
+          "candidate": [
+            62.075,
+            59.885
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.678,
+            17.719
+          ],
+          "candidate": [
+            17.813,
+            17.605
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.052,
+            3.034
+          ],
+          "candidate": [
+            3.059,
+            2.991
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.4966402053833,
+          10.497280359268188
+        ],
+        "candidate": [
+          10.4966402053833,
+          10.4966402053833
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9963793954687586,
+        "public": 0.9957364341085271,
+        "pack": 0.9947296058661779,
+        "graph_replay": 1.0045662100456623
+      },
+      "aa_gpu_change_percent": 0.006098283202682353
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            214.694,
+            209.041
+          ],
+          "candidate": [
+            26.545,
+            25.454
+          ]
+        },
+        "public": {
+          "baseline": [
+            258.892,
+            251.152
+          ],
+          "candidate": [
+            62.936,
+            58.926
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.596,
+            17.536
+          ],
+          "candidate": [
+            17.673,
+            17.465
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.061,
+            3.043
+          ],
+          "candidate": [
+            3.096,
+            3.048
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.821759700775146,
+          10.824320316314697
+        ],
+        "candidate": [
+          10.826879739761353,
+          10.824960470199585
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9982936092915725,
+        "public": 0.9989688595586718,
+        "pack": 1.0049542024310156,
+        "graph_replay": 0.9883913764510779
+      },
+      "aa_gpu_change_percent": 0.07097837236225146
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            118.173,
+            114.337
+          ],
+          "candidate": [
+            15.339,
+            14.93
+          ]
+        },
+        "public": {
+          "baseline": [
+            154.975,
+            150.613
+          ],
+          "candidate": [
+            48.51,
+            46.241
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.736,
+            17.606
+          ],
+          "candidate": [
+            17.656,
+            17.603
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.919,
+            2.857
+          ],
+          "candidate": [
+            2.901,
+            2.879
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          24.499199390411377,
+          24.53887939453125
+        ],
+        "candidate": [
+          24.499199390411377,
+          24.539520740509033
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.000730860588343,
+        "public": 1.0009808223421004,
+        "pack": 1.001599542987718,
+        "graph_replay": 1.0
+      },
+      "aa_gpu_change_percent": -0.005224961343075485
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            215.558,
+            212.494
+          ],
+          "candidate": [
+            26.487,
+            25.243
+          ]
+        },
+        "public": {
+          "baseline": [
+            261.824,
+            253.629
+          ],
+          "candidate": [
+            63.311,
+            60.063
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.921,
+            17.54
+          ],
+          "candidate": [
+            17.894,
+            17.513
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.07,
+            3.023
+          ],
+          "candidate": [
+            3.054,
+            3.029
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          21.2556791305542,
+          21.256959438323975
+        ],
+        "candidate": [
+          21.23840093612671,
+          21.2390398979187
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9932531693780945,
+        "public": 1.0029708853238264,
+        "pack": 1.0049751243781093,
+        "graph_replay": 1.014985014985015
+      },
+      "aa_gpu_change_percent": -0.024089118974113255
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            213.126,
+            210.944
+          ],
+          "candidate": [
+            26.565,
+            24.274
+          ]
+        },
+        "public": {
+          "baseline": [
+            255.54,
+            252.985
+          ],
+          "candidate": [
+            62.572,
+            58.272
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.655,
+            17.47
+          ],
+          "candidate": [
+            17.6,
+            17.476
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.03,
+            3.022
+          ],
+          "candidate": [
+            3.094,
+            3.042
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          23.674240112304688,
+          23.67232084274292
+        ],
+        "candidate": [
+          23.674240112304688,
+          23.675520420074463
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9996737534663696,
+        "public": 0.9969587896752834,
+        "pack": 1.0061173668254655,
+        "graph_replay": 1.0039241334205362
+      },
+      "aa_gpu_change_percent": -0.01892405993296764
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            118.697,
+            115.42
+          ],
+          "candidate": [
+            15.367,
+            14.899
+          ]
+        },
+        "public": {
+          "baseline": [
+            153.392,
+            151.75
+          ],
+          "candidate": [
+            47.538,
+            46.782
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.478,
+            17.612
+          ],
+          "candidate": [
+            17.445,
+            17.49
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.914,
+            2.882
+          ],
+          "candidate": [
+            2.894,
+            2.87
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          45.65631866455078,
+          45.65055847167969
+        ],
+        "candidate": [
+          45.66783905029297,
+          45.65055847167969
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9890430971512053,
+        "public": 1.002755696873344,
+        "pack": 1.0057281721923277,
+        "graph_replay": 1.0
+      },
+      "aa_gpu_change_percent": -0.008412417899239522
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            211.443,
+            214.142
+          ],
+          "candidate": [
+            25.922,
+            22.809
+          ]
+        },
+        "public": {
+          "baseline": [
+            255.666,
+            255.121
+          ],
+          "candidate": [
+            63.134,
+            61.315
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.67,
+            17.727
+          ],
+          "candidate": [
+            17.775,
+            17.661
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.125,
+            3.04
+          ],
+          "candidate": [
+            3.084,
+            3.04
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          42.42176055908203,
+          42.415361404418945
+        ],
+        "candidate": [
+          42.41471767425537,
+          42.41983890533447
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9953139643861293,
+        "public": 0.9968196734594661,
+        "pack": 0.9946160385378294,
+        "graph_replay": 1.008649367930805
+      },
+      "aa_gpu_change_percent": -0.007554226021766475
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.721,
+            213.235
+          ],
+          "candidate": [
+            26.729,
+            22.718
+          ]
+        },
+        "public": {
+          "baseline": [
+            263.833,
+            252.756
+          ],
+          "candidate": [
+            63.358,
+            57.983
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.813,
+            17.789
+          ],
+          "candidate": [
+            17.84,
+            17.7
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.128,
+            3.008
+          ],
+          "candidate": [
+            3.117,
+            3.067
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          45.33760070800781,
+          45.35999774932861
+        ],
+        "candidate": [
+          45.335679054260254,
+          45.35999774932861
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0048766971460237,
+        "public": 0.9968013365116233,
+        "pack": 0.9997156667614443,
+        "graph_replay": 1.0115740740740742
+      },
+      "aa_gpu_change_percent": -0.05079606965411321
+    },
+    {
+      "format": "mxfp8",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            118.463,
+            116.478
+          ],
+          "candidate": [
+            15.617,
+            14.947
+          ]
+        },
+        "public": {
+          "baseline": [
+            154.179,
+            151.964
+          ],
+          "candidate": [
+            48.15,
+            44.597
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.489,
+            17.831
+          ],
+          "candidate": [
+            17.399,
+            17.781
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.919,
+            2.89
+          ],
+          "candidate": [
+            2.912,
+            2.888
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          80.42112350463867,
+          80.41983604431152
+        ],
+        "candidate": [
+          80.42112350463867,
+          80.42048454284668
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9889908256880733,
+        "public": 1.0008182226093383,
+        "pack": 0.9985023041474654,
+        "graph_replay": 1.0052429220552253
+      },
+      "aa_gpu_change_percent": -0.024668440738695452
+    },
+    {
+      "format": "nvfp4",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.922,
+            124.844
+          ],
+          "candidate": [
+            16.389,
+            15.661
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.365,
+            159.49
+          ],
+          "candidate": [
+            50.366,
+            46.38
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.262,
+            17.166
+          ],
+          "candidate": [
+            17.204,
+            17.094
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.864,
+            2.894
+          ],
+          "candidate": [
+            2.863,
+            2.883
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          13.234560489654541,
+          13.233920335769653
+        ],
+        "candidate": [
+          13.233280181884766,
+          13.233280181884766
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9919402233229787,
+        "public": 1.003017140479101,
+        "pack": 1.0001169453865044,
+        "graph_replay": 1.0036088054853844
+      },
+      "aa_gpu_change_percent": 0.004848710306259996
+    },
+    {
+      "format": "nvfp4",
+      "activation": "swiglu",
+      "tokens": 1,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            127.609,
+            124.442
+          ],
+          "candidate": [
+            16.501,
+            15.473
+          ]
+        },
+        "public": {
+          "baseline": [
+            162.578,
+            159.842
+          ],
+          "candidate": [
+            49.929,
+            46.176
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.302,
+            17.11
+          ],
+          "candidate": [
+            17.137,
+            16.999
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.86,
+            2.823
+          ],
+          "candidate": [
+            2.871,
+            2.853
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          12.09920048713684,
+          12.127360105514526
+        ],
+        "candidate": [
+          12.101759910583496,
+          12.129919528961182
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.000990752972259,
+        "public": 1.0012966132462011,
+        "pack": 1.0062326869806095,
+        "graph_replay": 1.0180440274269218
+      },
+      "aa_gpu_change_percent": -0.01583494074527403
+    },
+    {
+      "format": "nvfp4",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.764,
+            125.149
+          ],
+          "candidate": [
+            16.745,
+            14.213
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.411,
+            159.495
+          ],
+          "candidate": [
+            50.113,
+            46.924
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.492,
+            17.24
+          ],
+          "candidate": [
+            17.394,
+            17.15
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.892,
+            2.851
+          ],
+          "candidate": [
+            2.886,
+            2.86
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          20.94399929046631,
+          20.947840213775635
+        ],
+        "candidate": [
+          20.951039791107178,
+          20.963199138641357
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9952646710637577,
+        "public": 1.0027230833682446,
+        "pack": 1.0024418604651164,
+        "graph_replay": 1.0095103909827405
+      },
+      "aa_gpu_change_percent": 0.024449031736395455
+    },
+    {
+      "format": "nvfp4",
+      "activation": "swiglu",
+      "tokens": 2,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.62,
+            125.228
+          ],
+          "candidate": [
+            16.191,
+            14.549
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.706,
+            161.526
+          ],
+          "candidate": [
+            50.006,
+            47.11
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.318,
+            17.081
+          ],
+          "candidate": [
+            17.275,
+            17.019
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.924,
+            2.895
+          ],
+          "candidate": [
+            2.921,
+            2.877
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          18.358399868011475,
+          18.353919982910156
+        ],
+        "candidate": [
+          18.3571195602417,
+          18.35520029067993
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9991661107404936,
+        "public": 1.0015710919088767,
+        "pack": 0.9991218826835265,
+        "graph_replay": 0.9926573426573427
+      },
+      "aa_gpu_change_percent": 0.0034873456435491335
+    },
+    {
+      "format": "nvfp4",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            128.492,
+            126.312
+          ],
+          "candidate": [
+            16.32,
+            15.709
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.25,
+            162.268
+          ],
+          "candidate": [
+            50.163,
+            46.188
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.364,
+            17.319
+          ],
+          "candidate": [
+            17.162,
+            17.185
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.916,
+            2.928
+          ],
+          "candidate": [
+            2.918,
+            2.928
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          40.33984184265137,
+          40.3436803817749
+        ],
+        "candidate": [
+          40.33984184265137,
+          40.34624099731445
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9972419557041371,
+        "public": 0.9994323020153278,
+        "pack": 1.0046636353037193,
+        "graph_replay": 1.0028188865398169
+      },
+      "aa_gpu_change_percent": 0.0047630579588453514
+    },
+    {
+      "format": "nvfp4",
+      "activation": "swiglu",
+      "tokens": 4,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            128.418,
+            126.711
+          ],
+          "candidate": [
+            16.179,
+            14.036
+          ]
+        },
+        "public": {
+          "baseline": [
+            166.071,
+            162.727
+          ],
+          "candidate": [
+            50.078,
+            46.495
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.139,
+            17.156
+          ],
+          "candidate": [
+            17.049,
+            17.061
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.912,
+            2.909
+          ],
+          "candidate": [
+            2.902,
+            2.921
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          36.74560070037842,
+          36.74688100814819
+        ],
+        "candidate": [
+          36.776320934295654,
+          36.74367904663086
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9954610405984702,
+        "public": 0.9986588605472879,
+        "pack": 1.00133550110324,
+        "graph_replay": 1.0100834492350486
+      },
+      "aa_gpu_change_percent": -0.006968252731387459
+    },
+    {
+      "format": "bf16",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            83.697,
+            83.713
+          ],
+          "candidate": [
+            15.173,
+            12.953
+          ]
+        },
+        "public": {
+          "baseline": [
+            109.548,
+            108.438
+          ],
+          "candidate": [
+            37.734,
+            36.268
+          ]
+        },
+        "pack": {
+          "baseline": [
+            10.089,
+            10.069
+          ],
+          "candidate": [
+            10.173,
+            10.048
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.868,
+            2.902
+          ],
+          "candidate": [
+            2.892,
+            2.897
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          27.126400470733643,
+          27.159039974212646
+        ],
+        "candidate": [
+          27.123839855194092,
+          27.153921127319336
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9964944649446494,
+        "public": 1.0022688803255664,
+        "pack": 0.999601593625498,
+        "graph_replay": 0.9919972164231037
+      },
+      "aa_gpu_change_percent": 0.002353110583896978
+    },
+    {
+      "format": "bf16",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            85.893,
+            83.184
+          ],
+          "candidate": [
+            15.671,
+            13.029
+          ]
+        },
+        "public": {
+          "baseline": [
+            112.685,
+            107.269
+          ],
+          "candidate": [
+            38.322,
+            35.419
+          ]
+        },
+        "pack": {
+          "baseline": [
+            10.355,
+            10.115
+          ],
+          "candidate": [
+            10.375,
+            10.135
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.927,
+            2.913
+          ],
+          "candidate": [
+            2.911,
+            2.899
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          43.19551944732666,
+          43.1935977935791
+        ],
+        "candidate": [
+          43.19488048553467,
+          43.19295883178711
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0015510948905109,
+        "public": 1.0003850731639012,
+        "pack": 1.0017702596380804,
+        "graph_replay": 0.9961818812912184
+      },
+      "aa_gpu_change_percent": 0.002958989182788585
+    },
+    {
+      "format": "bf16",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            84.528,
+            83.374
+          ],
+          "candidate": [
+            15.483,
+            13.83
+          ]
+        },
+        "public": {
+          "baseline": [
+            109.497,
+            106.36
+          ],
+          "candidate": [
+            37.611,
+            36.085
+          ]
+        },
+        "pack": {
+          "baseline": [
+            10.241,
+            9.798
+          ],
+          "candidate": [
+            10.266,
+            9.801
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.929,
+            2.909
+          ],
+          "candidate": [
+            2.918,
+            2.884
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          80.26111602783203,
+          80.25983810424805
+        ],
+        "candidate": [
+          80.26432037353516,
+          80.26111602783203
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9972916854744065,
+        "public": 1.0017048752176436,
+        "pack": 0.9925179569034318,
+        "graph_replay": 1.011938202247191
+      },
+      "aa_gpu_change_percent": -0.007176758329552335
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            218.946,
+            217.117
+          ],
+          "candidate": [
+            26.729,
+            25.623
+          ]
+        },
+        "public": {
+          "baseline": [
+            264.72,
+            256.065
+          ],
+          "candidate": [
+            63.36,
+            60.125
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.66,
+            17.883
+          ],
+          "candidate": [
+            17.621,
+            17.856
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.142,
+            2.982
+          ],
+          "candidate": [
+            3.096,
+            2.982
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.453120470046997,
+          10.451840162277222
+        ],
+        "candidate": [
+          10.45375943183899,
+          10.453120470046997
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9907874533889011,
+        "public": 0.995169983416252,
+        "pack": 0.9931077340263262,
+        "graph_replay": 0.9717662508207485
+      },
+      "aa_gpu_change_percent": 0.024487778294712825
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            215.788,
+            216.223
+          ],
+          "candidate": [
+            26.276,
+            25.828
+          ]
+        },
+        "public": {
+          "baseline": [
+            258.436,
+            257.815
+          ],
+          "candidate": [
+            62.197,
+            59.988
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.455,
+            17.744
+          ],
+          "candidate": [
+            17.419,
+            17.653
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.048,
+            2.984
+          ],
+          "candidate": [
+            3.044,
+            2.957
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.124800205230713,
+          10.120960474014282
+        ],
+        "candidate": [
+          10.092799663543701,
+          10.118399858474731
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9910679825770525,
+        "public": 0.9970352679582467,
+        "pack": 1.0071589400150107,
+        "graph_replay": 1.0013628620102215
+      },
+      "aa_gpu_change_percent": -0.2781779403786322
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            119.121,
+            116.733
+          ],
+          "candidate": [
+            15.497,
+            14.951
+          ]
+        },
+        "public": {
+          "baseline": [
+            156.772,
+            153.078
+          ],
+          "candidate": [
+            48.404,
+            46.352
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.764,
+            17.766
+          ],
+          "candidate": [
+            17.682,
+            17.558
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.915,
+            2.852
+          ],
+          "candidate": [
+            2.917,
+            2.853
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          17.33247995376587,
+          17.333120107650757
+        ],
+        "candidate": [
+          17.333760261535645,
+          17.33504056930542
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9981575310916628,
+        "public": 1.0,
+        "pack": 1.0004610685263098,
+        "graph_replay": 1.0083916083916085
+      },
+      "aa_gpu_change_percent": 0.014765540817673894
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            215.722,
+            215.505
+          ],
+          "candidate": [
+            26.065,
+            24.961
+          ]
+        },
+        "public": {
+          "baseline": [
+            262.657,
+            256.626
+          ],
+          "candidate": [
+            60.825,
+            57.451
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.675,
+            17.789
+          ],
+          "candidate": [
+            17.726,
+            17.634
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.067,
+            3.006
+          ],
+          "candidate": [
+            3.065,
+            2.986
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          13.08351993560791,
+          13.084800243377686
+        ],
+        "candidate": [
+          13.118079900741577,
+          13.115520477294922
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9938856450369065,
+        "public": 1.0013816427113191,
+        "pack": 0.9989225971080237,
+        "graph_replay": 0.980971128608924
+      },
+      "aa_gpu_change_percent": 0.2739612935019009
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            218.631,
+            215.978
+          ],
+          "candidate": [
+            26.894,
+            23.864
+          ]
+        },
+        "public": {
+          "baseline": [
+            262.562,
+            258.056
+          ],
+          "candidate": [
+            61.979,
+            58.359
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.459,
+            17.456
+          ],
+          "candidate": [
+            17.563,
+            17.499
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.007,
+            3.091
+          ],
+          "candidate": [
+            3.03,
+            3.077
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          14.922879934310913,
+          14.924800395965576
+        ],
+        "candidate": [
+          14.929920434951782,
+          14.925440549850464
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9920376002211777,
+        "public": 1.0014102324809722,
+        "pack": 1.0017280110592706,
+        "graph_replay": 1.0030343897505056
+      },
+      "aa_gpu_change_percent": 0.038594773251721115
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            119.531,
+            118.103
+          ],
+          "candidate": [
+            15.656,
+            15.068
+          ]
+        },
+        "public": {
+          "baseline": [
+            157.534,
+            153.059
+          ],
+          "candidate": [
+            48.723,
+            46.459
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.779,
+            17.545
+          ],
+          "candidate": [
+            17.808,
+            17.596
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.906,
+            2.916
+          ],
+          "candidate": [
+            2.907,
+            2.896
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          29.87071990966797,
+          29.904639720916748
+        ],
+        "candidate": [
+          29.870080947875977,
+          29.9072003364563
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9950626314345798,
+        "public": 0.9998685663214342,
+        "pack": 1.0085826954302946,
+        "graph_replay": 0.9934027777777779
+      },
+      "aa_gpu_change_percent": -0.1048697045343494
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.263,
+            214.261
+          ],
+          "candidate": [
+            26.494,
+            25.17
+          ]
+        },
+        "public": {
+          "baseline": [
+            263.701,
+            259.945
+          ],
+          "candidate": [
+            62.908,
+            60.637
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.977,
+            17.966
+          ],
+          "candidate": [
+            17.912,
+            17.985
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.135,
+            3.063
+          ],
+          "candidate": [
+            3.121,
+            3.093
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          27.686400413513184,
+          27.688961029052734
+        ],
+        "candidate": [
+          27.69023895263672,
+          27.684481143951416
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9919705587152893,
+        "public": 1.0008596516364083,
+        "pack": 0.9930231249648344,
+        "graph_replay": 1.0113446780113449
+      },
+      "aa_gpu_change_percent": 0.03699193472470608
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            214.93,
+            212.748
+          ],
+          "candidate": [
+            26.481,
+            23.681
+          ]
+        },
+        "public": {
+          "baseline": [
+            262.171,
+            256.882
+          ],
+          "candidate": [
+            63.561,
+            58.874
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.848,
+            17.825
+          ],
+          "candidate": [
+            17.789,
+            17.681
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.129,
+            3.087
+          ],
+          "candidate": [
+            3.126,
+            3.084
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          32.1945595741272,
+          32.1945595741272
+        ],
+        "candidate": [
+          32.201600074768066,
+          32.19840049743652
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9809285091543155,
+        "public": 0.9978674103389585,
+        "pack": 1.0056027262750535,
+        "graph_replay": 0.9742574257425743
+      },
+      "aa_gpu_change_percent": -0.003976703773189705
+    },
+    {
+      "format": "mxfp4",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            119.467,
+            117.815
+          ],
+          "candidate": [
+            15.648,
+            14.853
+          ]
+        },
+        "public": {
+          "baseline": [
+            158.129,
+            151.714
+          ],
+          "candidate": [
+            48.5,
+            46.822
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.958,
+            17.921
+          ],
+          "candidate": [
+            17.922,
+            17.763
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.952,
+            2.868
+          ],
+          "candidate": [
+            2.944,
+            2.88
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          54.413437843322754,
+          54.41664218902588
+        ],
+        "candidate": [
+          54.41792011260986,
+          54.413437843322754
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9903099003565226,
+        "public": 0.9961835054241276,
+        "pack": 1.0072996896194963,
+        "graph_replay": 1.0066503325166256
+      },
+      "aa_gpu_change_percent": -0.005879639142625237
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            214.145,
+            213.761
+          ],
+          "candidate": [
+            26.175,
+            25.166
+          ]
+        },
+        "public": {
+          "baseline": [
+            259.717,
+            254.956
+          ],
+          "candidate": [
+            62.449,
+            60.461
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.742,
+            17.77
+          ],
+          "candidate": [
+            17.692,
+            17.674
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.087,
+            3.006
+          ],
+          "candidate": [
+            3.051,
+            2.991
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.467840433120728,
+          10.46720027923584
+        ],
+        "candidate": [
+          10.465919971466064,
+          10.464639663696289
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.014334701219855,
+        "public": 1.0080577368626082,
+        "pack": 0.9962929166191401,
+        "graph_replay": 0.9983079526226735
+      },
+      "aa_gpu_change_percent": -0.048912084769714426
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            215.255,
+            216.096
+          ],
+          "candidate": [
+            26.267,
+            25.347
+          ]
+        },
+        "public": {
+          "baseline": [
+            263.228,
+            258.859
+          ],
+          "candidate": [
+            63.174,
+            61.399
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.715,
+            17.497
+          ],
+          "candidate": [
+            17.674,
+            17.481
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.086,
+            3.021
+          ],
+          "candidate": [
+            3.101,
+            3.039
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.917760133743286,
+          10.932480096817017
+        ],
+        "candidate": [
+          10.911999940872192,
+          10.905599594116211
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9980569588630434,
+        "public": 1.003190585700375,
+        "pack": 1.005658525319014,
+        "graph_replay": 0.9967180833606826
+      },
+      "aa_gpu_change_percent": -0.08792942847182239
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            118.283,
+            118.087
+          ],
+          "candidate": [
+            15.661,
+            14.946
+          ]
+        },
+        "public": {
+          "baseline": [
+            156.554,
+            151.951
+          ],
+          "candidate": [
+            47.94,
+            46.438
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.737,
+            17.645
+          ],
+          "candidate": [
+            17.624,
+            17.53
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.959,
+            2.854
+          ],
+          "candidate": [
+            2.94,
+            2.856
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          24.584319591522217,
+          24.584319591522217
+        ],
+        "candidate": [
+          24.584319591522217,
+          24.58240032196045
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9912450465394894,
+        "public": 1.0002883808724834,
+        "pack": 0.9997702469844916,
+        "graph_replay": 1.0028001400070004
+      },
+      "aa_gpu_change_percent": -0.00519983589046813
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            216.073,
+            217.844
+          ],
+          "candidate": [
+            26.35,
+            25.855
+          ]
+        },
+        "public": {
+          "baseline": [
+            262.898,
+            258.664
+          ],
+          "candidate": [
+            62.985,
+            59.922
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.756,
+            17.834
+          ],
+          "candidate": [
+            17.657,
+            17.762
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.094,
+            3.067
+          ],
+          "candidate": [
+            3.058,
+            3.08
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          20.975360870361328,
+          20.97343921661377
+        ],
+        "candidate": [
+          20.970239639282227,
+          20.96832036972046
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0101100374238954,
+        "public": 1.0070466450486406,
+        "pack": 0.9990155200370628,
+        "graph_replay": 1.0045706823375775
+      },
+      "aa_gpu_change_percent": -0.11287587313443259
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            212.849,
+            215.606
+          ],
+          "candidate": [
+            26.177,
+            25.408
+          ]
+        },
+        "public": {
+          "baseline": [
+            259.039,
+            257.66
+          ],
+          "candidate": [
+            62.878,
+            57.698
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.508,
+            17.562
+          ],
+          "candidate": [
+            17.6,
+            17.545
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.076,
+            3.041
+          ],
+          "candidate": [
+            3.057,
+            3.051
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          22.56704092025757,
+          22.563838958740234
+        ],
+        "candidate": [
+          22.56704092025757,
+          22.568960189819336
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.99573785010517,
+        "public": 1.0006158267474083,
+        "pack": 1.0132335016541878,
+        "graph_replay": 0.9886930495510474
+      },
+      "aa_gpu_change_percent": -0.002831313610129893
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            120.942,
+            116.066
+          ],
+          "candidate": [
+            15.71,
+            13.035
+          ]
+        },
+        "public": {
+          "baseline": [
+            157.827,
+            152.09
+          ],
+          "candidate": [
+            48.422,
+            45.404
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.509,
+            17.486
+          ],
+          "candidate": [
+            17.496,
+            17.417
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.964,
+            2.878
+          ],
+          "candidate": [
+            2.937,
+            2.861
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          45.764479637145996,
+          45.85472106933594
+        ],
+        "candidate": [
+          45.76576232910156,
+          45.81183910369873
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.002314171989262,
+        "public": 0.9965288818229995,
+        "pack": 0.9982884527612963,
+        "graph_replay": 1.0077383046078088
+      },
+      "aa_gpu_change_percent": -0.04883274866736009
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            212.936,
+            216.465
+          ],
+          "candidate": [
+            26.224,
+            25.901
+          ]
+        },
+        "public": {
+          "baseline": [
+            261.443,
+            260.355
+          ],
+          "candidate": [
+            63.001,
+            59.146
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.939,
+            17.788
+          ],
+          "candidate": [
+            17.908,
+            17.669
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.143,
+            3.056
+          ],
+          "candidate": [
+            3.108,
+            3.072
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          42.64256000518799,
+          42.62144088745117
+        ],
+        "candidate": [
+          42.64768123626709,
+          42.65727996826172
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9988328794531208,
+        "public": 0.9957811042148392,
+        "pack": 0.9968379446640315,
+        "graph_replay": 1.0069192751235585
+      },
+      "aa_gpu_change_percent": 0.0240218666086367
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.112,
+            217.055
+          ],
+          "candidate": [
+            26.5,
+            24.593
+          ]
+        },
+        "public": {
+          "baseline": [
+            265.228,
+            259.47
+          ],
+          "candidate": [
+            63.697,
+            57.912
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.616,
+            17.611
+          ],
+          "candidate": [
+            17.62,
+            17.586
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.126,
+            3.057
+          ],
+          "candidate": [
+            3.126,
+            3.069
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          45.1526403427124,
+          45.15200138092041
+        ],
+        "candidate": [
+          45.15967845916748,
+          45.16479969024658
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.993688947426188,
+        "public": 0.9995702181654456,
+        "pack": 0.9979866897824505,
+        "graph_replay": 1.006844850065189
+      },
+      "aa_gpu_change_percent": 0.0567245717236764
+    },
+    {
+      "format": "mxfp8",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            121.973,
+            117.521
+          ],
+          "candidate": [
+            15.279,
+            13.53
+          ]
+        },
+        "public": {
+          "baseline": [
+            160.142,
+            153.329
+          ],
+          "candidate": [
+            50.153,
+            47.63
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.774,
+            17.547
+          ],
+          "candidate": [
+            17.857,
+            17.556
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.946,
+            2.89
+          ],
+          "candidate": [
+            2.934,
+            2.898
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          80.79808235168457,
+          80.79104423522949
+        ],
+        "candidate": [
+          80.79296112060547,
+          80.7795238494873
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0085366985246358,
+        "public": 0.9999737319078514,
+        "pack": 1.0039977155910906,
+        "graph_replay": 0.997907949790795
+      },
+      "aa_gpu_change_percent": -0.0007908757024388535
+    },
+    {
+      "format": "nvfp4",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            125.21,
+            126.953
+          ],
+          "candidate": [
+            16.44,
+            14.231
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.266,
+            163.773
+          ],
+          "candidate": [
+            50.012,
+            47.441
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.174,
+            17.299
+          ],
+          "candidate": [
+            17.193,
+            17.22
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.932,
+            2.835
+          ],
+          "candidate": [
+            2.932,
+            2.86
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          13.523199558258057,
+          13.527040481567383
+        ],
+        "candidate": [
+          13.521280288696289,
+          13.52512001991272
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9820854755784061,
+        "public": 0.9969235463120693,
+        "pack": 0.999770904925544,
+        "graph_replay": 1.0121558813013942
+      },
+      "aa_gpu_change_percent": 0.009466147197878527
+    },
+    {
+      "format": "nvfp4",
+      "activation": "situ",
+      "tokens": 1,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            128.0,
+            127.657
+          ],
+          "candidate": [
+            16.38,
+            15.834
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.959,
+            162.859
+          ],
+          "candidate": [
+            49.756,
+            47.519
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.185,
+            17.277
+          ],
+          "candidate": [
+            17.137,
+            17.105
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.92,
+            2.867
+          ],
+          "candidate": [
+            2.915,
+            2.885
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          12.41919994354248,
+          12.383999824523926
+        ],
+        "candidate": [
+          12.418559789657593,
+          12.383999824523926
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9970930232558141,
+        "public": 1.0041145873767565,
+        "pack": 1.0000577300542663,
+        "graph_replay": 1.0021314387211369
+      },
+      "aa_gpu_change_percent": -0.010329310549805903
+    },
+    {
+      "format": "nvfp4",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            128.108,
+            128.882
+          ],
+          "candidate": [
+            16.394,
+            15.635
+          ]
+        },
+        "public": {
+          "baseline": [
+            167.384,
+            161.825
+          ],
+          "candidate": [
+            50.33,
+            47.463
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.296,
+            17.212
+          ],
+          "candidate": [
+            17.291,
+            17.103
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.886,
+            2.905
+          ],
+          "candidate": [
+            2.867,
+            2.91
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          21.49951934814453,
+          21.505920886993408
+        ],
+        "candidate": [
+          21.508479118347168,
+          21.510400772094727
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9801972129410805,
+        "public": 0.9890569192187858,
+        "pack": 1.0,
+        "graph_replay": 1.0126805213103205
+      },
+      "aa_gpu_change_percent": 0.0
+    },
+    {
+      "format": "nvfp4",
+      "activation": "situ",
+      "tokens": 2,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            125.657,
+            127.519
+          ],
+          "candidate": [
+            16.216,
+            16.004
+          ]
+        },
+        "public": {
+          "baseline": [
+            167.082,
+            164.07
+          ],
+          "candidate": [
+            50.056,
+            47.553
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.183,
+            17.236
+          ],
+          "candidate": [
+            17.165,
+            17.173
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.875,
+            2.902
+          ],
+          "candidate": [
+            2.889,
+            2.908
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          19.135359525680542,
+          19.139200448989868
+        ],
+        "candidate": [
+          19.136639833450317,
+          19.13599967956543
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9946387330913888,
+        "public": 1.0034621892489914,
+        "pack": 0.9940689412179224,
+        "graph_replay": 0.99822695035461
+      },
+      "aa_gpu_change_percent": -0.010035186065804336
+    },
+    {
+      "format": "nvfp4",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.702,
+            126.304
+          ],
+          "candidate": [
+            16.415,
+            14.242
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.518,
+            163.358
+          ],
+          "candidate": [
+            50.14,
+            47.532
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.306,
+            17.217
+          ],
+          "candidate": [
+            17.235,
+            17.231
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.944,
+            2.931
+          ],
+          "candidate": [
+            2.911,
+            2.919
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          41.45984172821045,
+          41.49375915527344
+        ],
+        "candidate": [
+          41.493120193481445,
+          41.49184226989746
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9980794923179691,
+        "public": 0.9983869289208035,
+        "pack": 1.004159587556389,
+        "graph_replay": 1.018374558303887
+      },
+      "aa_gpu_change_percent": 0.0046314732164765005
+    },
+    {
+      "format": "nvfp4",
+      "activation": "situ",
+      "tokens": 4,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            127.391,
+            126.604
+          ],
+          "candidate": [
+            16.437,
+            15.928
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.697,
+            162.029
+          ],
+          "candidate": [
+            50.192,
+            46.105
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.43,
+            17.318
+          ],
+          "candidate": [
+            17.369,
+            17.217
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.895,
+            2.898
+          ],
+          "candidate": [
+            2.922,
+            2.9
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          37.455360889434814,
+          37.47904062271118
+        ],
+        "candidate": [
+          37.47391939163208,
+          37.4783992767334
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.004153770972471,
+        "public": 1.0019520715074615,
+        "pack": 1.0027625899280574,
+        "graph_replay": 0.9993155373032169
+      },
+      "aa_gpu_change_percent": -0.0051191662410743355
+    },
+    {
+      "format": "bf16",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            81.724,
+            79.886
+          ],
+          "candidate": [
+            15.023,
+            12.998
+          ]
+        },
+        "public": {
+          "baseline": [
+            106.931,
+            104.713
+          ],
+          "candidate": [
+            37.506,
+            34.666
+          ]
+        },
+        "pack": {
+          "baseline": [
+            10.081,
+            10.152
+          ],
+          "candidate": [
+            10.071,
+            10.015
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.877,
+            2.851
+          ],
+          "candidate": [
+            2.867,
+            2.85
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          16.272640228271484,
+          16.269439458847046
+        ],
+        "candidate": [
+          16.27392053604126,
+          16.272640228271484
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9998182809376703,
+        "public": 1.0095720511005997,
+        "pack": 1.0039223574373932,
+        "graph_replay": 1.003485535029627
+      },
+      "aa_gpu_change_percent": -0.0039447879544241005
+    },
+    {
+      "format": "bf16",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            81.017,
+            81.452
+          ],
+          "candidate": [
+            14.981,
+            13.211
+          ]
+        },
+        "public": {
+          "baseline": [
+            107.224,
+            106.144
+          ],
+          "candidate": [
+            37.579,
+            36.073
+          ]
+        },
+        "pack": {
+          "baseline": [
+            10.08,
+            10.428
+          ],
+          "candidate": [
+            10.099,
+            10.336
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.898,
+            2.924
+          ],
+          "candidate": [
+            2.907,
+            2.912
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          31.008000373840332,
+          31.008000373840332
+        ],
+        "candidate": [
+          31.008639335632324,
+          31.037440299987793
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0011029411764705,
+        "public": 1.0,
+        "pack": 1.0042548980803483,
+        "graph_replay": 1.0121696801112656
+      },
+      "aa_gpu_change_percent": 0.010317915584234783
+    },
+    {
+      "format": "bf16",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1,
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            81.636,
+            81.453
+          ],
+          "candidate": [
+            14.784,
+            12.738
+          ]
+        },
+        "public": {
+          "baseline": [
+            106.764,
+            105.307
+          ],
+          "candidate": [
+            37.432,
+            35.18
+          ]
+        },
+        "pack": {
+          "baseline": [
+            10.168,
+            10.311
+          ],
+          "candidate": [
+            10.168,
+            10.08
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.946,
+            2.879
+          ],
+          "candidate": [
+            2.904,
+            2.875
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          55.355520248413086,
+          55.328640937805176
+        ],
+        "candidate": [
+          55.36384105682373,
+          55.34976005554199
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9993557886986932,
+        "public": 1.0100487660706368,
+        "pack": 0.9999001198561724,
+        "graph_replay": 1.0069637883008358
+      },
+      "aa_gpu_change_percent": 0.012723445278117751
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            211.549,
+            214.931
+          ],
+          "candidate": [
+            24.835,
+            24.166
+          ]
+        },
+        "public": {
+          "baseline": [
+            251.618,
+            255.515
+          ],
+          "candidate": [
+            59.178,
+            55.611
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.58,
+            17.605
+          ],
+          "candidate": [
+            17.663,
+            17.386
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.061,
+            2.999
+          ],
+          "candidate": [
+            3.032,
+            3.016
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.080640316009521,
+          10.081919431686401
+        ],
+        "candidate": [
+          10.081919431686401,
+          10.079360008239746
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0001725526285516,
+        "public": 0.9983444060025894,
+        "pack": 1.0034279837742102,
+        "graph_replay": 1.0136757838559038
+      },
+      "aa_gpu_change_percent": -0.012699852698261349
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            215.194,
+            215.145
+          ],
+          "candidate": [
+            25.389,
+            23.877
+          ]
+        },
+        "public": {
+          "baseline": [
+            257.374,
+            255.084
+          ],
+          "candidate": [
+            61.051,
+            57.479
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.391,
+            17.8
+          ],
+          "candidate": [
+            17.235,
+            17.547
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.027,
+            2.996
+          ],
+          "candidate": [
+            3.045,
+            2.981
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          9.880319833755493,
+          9.878399968147278
+        ],
+        "candidate": [
+          9.87712025642395,
+          9.876480102539062
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9943011743034769,
+        "public": 0.9967409476646985,
+        "pack": 1.006656633479972,
+        "graph_replay": 1.0023132848645075
+      },
+      "aa_gpu_change_percent": -0.05829210642603888
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            117.036,
+            114.958
+          ],
+          "candidate": [
+            15.193,
+            14.718
+          ]
+        },
+        "public": {
+          "baseline": [
+            150.563,
+            150.412
+          ],
+          "candidate": [
+            47.867,
+            44.489
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.397,
+            17.652
+          ],
+          "candidate": [
+            17.382,
+            17.446
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.89,
+            2.861
+          ],
+          "candidate": [
+            2.906,
+            2.858
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          13.112959861755371,
+          13.074560165405273
+        ],
+        "candidate": [
+          13.118079900741577,
+          13.084800243377686
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9837932950546396,
+        "public": 1.000587763825808,
+        "pack": 1.0029565217391303,
+        "graph_replay": 1.0115586690017513
+      },
+      "aa_gpu_change_percent": 0.03417547350490491
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            211.904,
+            212.294
+          ],
+          "candidate": [
+            25.235,
+            23.977
+          ]
+        },
+        "public": {
+          "baseline": [
+            249.089,
+            245.183
+          ],
+          "candidate": [
+            59.449,
+            58.192
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.876,
+            17.999
+          ],
+          "candidate": [
+            17.882,
+            17.769
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.058,
+            3.051
+          ],
+          "candidate": [
+            3.071,
+            3.013
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          11.682560443878174,
+          11.683199405670166
+        ],
+        "candidate": [
+          11.683839559555054,
+          11.683199405670166
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9925291649905178,
+        "public": 0.9999150959415859,
+        "pack": 0.9994383284655135,
+        "graph_replay": 1.0165125495376486
+      },
+      "aa_gpu_change_percent": 0.0
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            215.245,
+            215.868
+          ],
+          "candidate": [
+            25.124,
+            24.107
+          ]
+        },
+        "public": {
+          "baseline": [
+            260.297,
+            253.803
+          ],
+          "candidate": [
+            60.039,
+            54.602
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.385,
+            17.673
+          ],
+          "candidate": [
+            17.43,
+            17.505
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.122,
+            3.036
+          ],
+          "candidate": [
+            3.117,
+            3.033
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          11.478400230407715,
+          11.476479768753052
+        ],
+        "candidate": [
+          11.479040384292603,
+          11.475839614868164
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.991947630633762,
+        "public": 0.9974550898203592,
+        "pack": 1.0028169014084507,
+        "graph_replay": 0.9966147596479349
+      },
+      "aa_gpu_change_percent": 0.0
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            117.142,
+            115.196
+          ],
+          "candidate": [
+            15.323,
+            13.768
+          ]
+        },
+        "public": {
+          "baseline": [
+            164.803,
+            151.048
+          ],
+          "candidate": [
+            49.278,
+            45.441
+          ]
+        },
+        "pack": {
+          "baseline": [
+            19.023,
+            17.673
+          ],
+          "candidate": [
+            18.978,
+            17.52
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.925,
+            2.876
+          ],
+          "candidate": [
+            2.928,
+            2.867
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          20.870399475097656,
+          20.860159397125244
+        ],
+        "candidate": [
+          20.889599323272705,
+          20.8569598197937
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0005546311702718,
+        "public": 0.9977256916573018,
+        "pack": 1.004491017964072,
+        "graph_replay": 1.0063943161634104
+      },
+      "aa_gpu_change_percent": -0.018437496600232084
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            213.913,
+            214.365
+          ],
+          "candidate": [
+            25.011,
+            24.016
+          ]
+        },
+        "public": {
+          "baseline": [
+            256.725,
+            251.998
+          ],
+          "candidate": [
+            60.687,
+            57.434
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.679,
+            17.785
+          ],
+          "candidate": [
+            17.613,
+            17.626
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.062,
+            3.034
+          ],
+          "candidate": [
+            3.079,
+            3.04
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          16.431360244750977,
+          16.4300799369812
+        ],
+        "candidate": [
+          16.395519971847534,
+          16.39423966407776
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9950991697416973,
+        "public": 0.9978114938658699,
+        "pack": 1.006363329203739,
+        "graph_replay": 0.9971070395371262
+      },
+      "aa_gpu_change_percent": -0.21812115594563863
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            212.703,
+            213.494
+          ],
+          "candidate": [
+            25.111,
+            23.371
+          ]
+        },
+        "public": {
+          "baseline": [
+            254.522,
+            254.79
+          ],
+          "candidate": [
+            60.549,
+            57.78
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.876,
+            17.832
+          ],
+          "candidate": [
+            17.8,
+            17.65
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.041,
+            3.063
+          ],
+          "candidate": [
+            3.048,
+            3.066
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          18.28992009162903,
+          18.27712059020996
+        ],
+        "candidate": [
+          18.309119939804077,
+          18.30399990081787
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9953130424719362,
+        "public": 1.0025946734142472,
+        "pack": 1.0011533360244507,
+        "graph_replay": 0.9924416694051922
+      },
+      "aa_gpu_change_percent": 0.15055854572678662
+    },
+    {
+      "format": "mxfp4",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            118.826,
+            115.116
+          ],
+          "candidate": [
+            15.376,
+            14.409
+          ]
+        },
+        "public": {
+          "baseline": [
+            154.269,
+            152.953
+          ],
+          "candidate": [
+            48.141,
+            46.261
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.714,
+            17.86
+          ],
+          "candidate": [
+            17.643,
+            17.725
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.952,
+            2.944
+          ],
+          "candidate": [
+            2.904,
+            2.917
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          36.25920057296753,
+          36.277759075164795
+        ],
+        "candidate": [
+          36.2719988822937,
+          36.28799915313721
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9984304311697905,
+        "public": 0.9976246403969489,
+        "pack": 1.0028253376278466,
+        "graph_replay": 1.0055574852379299
+      },
+      "aa_gpu_change_percent": 0.003530488894476491
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.63,
+            214.001
+          ],
+          "candidate": [
+            24.952,
+            24.203
+          ]
+        },
+        "public": {
+          "baseline": [
+            262.63,
+            259.197
+          ],
+          "candidate": [
+            61.489,
+            56.991
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.491,
+            17.56
+          ],
+          "candidate": [
+            17.529,
+            17.39
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.045,
+            3.036
+          ],
+          "candidate": [
+            3.062,
+            3.021
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.239360332489014,
+          10.225280523300171
+        ],
+        "candidate": [
+          10.222079753875732,
+          10.219520330429077
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9970333313943344,
+        "public": 0.9982486865148862,
+        "pack": 1.0011481715368276,
+        "graph_replay": 1.0125423728813558
+      },
+      "aa_gpu_change_percent": 0.212877068449302
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.618,
+            217.021
+          ],
+          "candidate": [
+            25.175,
+            22.79
+          ]
+        },
+        "public": {
+          "baseline": [
+            261.338,
+            260.026
+          ],
+          "candidate": [
+            61.998,
+            58.751
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.961,
+            17.941
+          ],
+          "candidate": [
+            18.051,
+            17.819
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.07,
+            3.018
+          ],
+          "candidate": [
+            3.066,
+            3.042
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          9.838079810142517,
+          9.83680009841919
+        ],
+        "candidate": [
+          9.836159944534302,
+          9.838079810142517
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0006981208912678,
+        "public": 1.0069037746334373,
+        "pack": 0.9937135413716939,
+        "graph_replay": 1.0010245901639345
+      },
+      "aa_gpu_change_percent": -0.00650084011090124
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            118.585,
+            113.479
+          ],
+          "candidate": [
+            15.31,
+            14.441
+          ]
+        },
+        "public": {
+          "baseline": [
+            153.588,
+            149.498
+          ],
+          "candidate": [
+            47.858,
+            45.96
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.501,
+            17.622
+          ],
+          "candidate": [
+            17.542,
+            17.415
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.935,
+            2.843
+          ],
+          "candidate": [
+            2.907,
+            2.858
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          18.39743971824646,
+          18.359040021896362
+        ],
+        "candidate": [
+          18.396799564361572,
+          18.357759714126587
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.008117186042172,
+        "public": 1.0052131819028114,
+        "pack": 1.0026348951769963,
+        "graph_replay": 1.0070546737213404
+      },
+      "aa_gpu_change_percent": -0.010460577744653143
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            217.649,
+            215.247
+          ],
+          "candidate": [
+            24.885,
+            22.079
+          ]
+        },
+        "public": {
+          "baseline": [
+            262.163,
+            255.757
+          ],
+          "candidate": [
+            61.376,
+            58.696
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.545,
+            17.985
+          ],
+          "candidate": [
+            17.563,
+            17.886
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.071,
+            3.027
+          ],
+          "candidate": [
+            3.042,
+            3.044
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          12.380800247192383,
+          12.380160093307495
+        ],
+        "candidate": [
+          12.383999824523926,
+          12.383359670639038
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9953863898500578,
+        "public": 1.00128240166502,
+        "pack": 0.9962984054669706,
+        "graph_replay": 1.0163934426229508
+      },
+      "aa_gpu_change_percent": 0.025845730264184574
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            212.95,
+            215.553
+          ],
+          "candidate": [
+            25.107,
+            22.061
+          ]
+        },
+        "public": {
+          "baseline": [
+            259.3,
+            258.773
+          ],
+          "candidate": [
+            61.746,
+            58.679
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.84,
+            17.953
+          ],
+          "candidate": [
+            17.868,
+            17.735
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.057,
+            3.026
+          ],
+          "candidate": [
+            3.042,
+            2.999
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          12.215039730072021,
+          12.211840152740479
+        ],
+        "candidate": [
+          12.214399576187134,
+          12.213120460510254
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9957752184732912,
+        "public": 1.000363504180298,
+        "pack": 1.0018200432260267,
+        "graph_replay": 0.9885057471264367
+      },
+      "aa_gpu_change_percent": 0.010473291252766082
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            117.326,
+            115.552
+          ],
+          "candidate": [
+            15.438,
+            12.98
+          ]
+        },
+        "public": {
+          "baseline": [
+            152.996,
+            151.283
+          ],
+          "candidate": [
+            47.992,
+            45.692
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.633,
+            17.735
+          ],
+          "candidate": [
+            17.56,
+            17.543
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.905,
+            2.881
+          ],
+          "candidate": [
+            2.897,
+            2.868
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          31.86880111694336,
+          31.87839984893799
+        ],
+        "candidate": [
+          31.86624050140381,
+          31.877119541168213
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9990870914734343,
+        "public": 0.996635583342164,
+        "pack": 0.9977094428219663,
+        "graph_replay": 0.999287241625089
+      },
+      "aa_gpu_change_percent": -0.004016949281859805
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": 128,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            216.408,
+            214.634
+          ],
+          "candidate": [
+            25.105,
+            23.505
+          ]
+        },
+        "public": {
+          "baseline": [
+            258.797,
+            259.037
+          ],
+          "candidate": [
+            61.697,
+            56.887
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.673,
+            17.92
+          ],
+          "candidate": [
+            17.775,
+            17.726
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.069,
+            3.064
+          ],
+          "candidate": [
+            3.075,
+            3.029
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          30.536320209503174,
+          30.53567886352539
+        ],
+        "candidate": [
+          30.53760051727295,
+          30.55039882659912
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9982652943217301,
+        "public": 1.0006809235025003,
+        "pack": 1.0029355312182455,
+        "graph_replay": 1.007362784471218
+      },
+      "aa_gpu_change_percent": 0.060794451110446346
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": 256,
+      "host_us": {
+        "runner": {
+          "baseline": [
+            211.917,
+            211.899
+          ],
+          "candidate": [
+            25.133,
+            23.91
+          ]
+        },
+        "public": {
+          "baseline": [
+            256.857,
+            251.922
+          ],
+          "candidate": [
+            60.807,
+            58.645
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.855,
+            17.701
+          ],
+          "candidate": [
+            17.795,
+            17.603
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            3.055,
+            3.051
+          ],
+          "candidate": [
+            3.046,
+            3.06
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          32.23104000091553,
+          32.23360061645508
+        ],
+        "candidate": [
+          32.23423957824707,
+          32.230401039123535
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9975095563535272,
+        "public": 0.9973930509850848,
+        "pack": 0.9980491163644708,
+        "graph_replay": 0.9800995024875622
+      },
+      "aa_gpu_change_percent": 0.011908029480722782
+    },
+    {
+      "format": "mxfp8",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": [
+        "ffma",
+        1
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            118.616,
+            115.382
+          ],
+          "candidate": [
+            15.444,
+            13.73
+          ]
+        },
+        "public": {
+          "baseline": [
+            153.868,
+            149.981
+          ],
+          "candidate": [
+            47.731,
+            45.421
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.678,
+            17.819
+          ],
+          "candidate": [
+            17.666,
+            17.669
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.944,
+            2.882
+          ],
+          "candidate": [
+            2.934,
+            2.887
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          59.82399940490723,
+          59.774718284606934
+        ],
+        "candidate": [
+          59.81567859649658,
+          59.78303909301758
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9971235037580033,
+        "public": 0.9945766638584667,
+        "pack": 1.0013894517454989,
+        "graph_replay": 1.0021052631578946
+      },
+      "aa_gpu_change_percent": -0.0074844560043918484
+    },
+    {
+      "format": "nvfp4",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.488,
+            123.884
+          ],
+          "candidate": [
+            16.075,
+            15.341
+          ]
+        },
+        "public": {
+          "baseline": [
+            164.5,
+            160.894
+          ],
+          "candidate": [
+            50.223,
+            47.187
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.491,
+            17.497
+          ],
+          "candidate": [
+            17.382,
+            17.182
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.947,
+            2.844
+          ],
+          "candidate": [
+            2.933,
+            2.825
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          11.646720170974731,
+          11.640959978103638
+        ],
+        "candidate": [
+          11.652480363845825,
+          11.64415955543518
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.000836260244188,
+        "public": 1.011356202737002,
+        "pack": 1.004941573164351,
+        "graph_replay": 1.0053571428571428
+      },
+      "aa_gpu_change_percent": 0.005497639240004126
+    },
+    {
+      "format": "nvfp4",
+      "activation": "silu",
+      "tokens": 1,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.482,
+            124.463
+          ],
+          "candidate": [
+            16.032,
+            14.442
+          ]
+        },
+        "public": {
+          "baseline": [
+            165.282,
+            160.885
+          ],
+          "candidate": [
+            50.139,
+            44.99
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.332,
+            17.484
+          ],
+          "candidate": [
+            17.253,
+            17.342
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.872,
+            2.82
+          ],
+          "candidate": [
+            2.877,
+            2.851
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          10.53056001663208,
+          10.528639554977417
+        ],
+        "candidate": [
+          10.53056001663208,
+          10.526080131530762
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9972062309515747,
+        "public": 1.001437006845378,
+        "pack": 1.004516129032258,
+        "graph_replay": 0.9978746014877791
+      },
+      "aa_gpu_change_percent": 0.0
+    },
+    {
+      "format": "nvfp4",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            125.995,
+            125.493
+          ],
+          "candidate": [
+            16.182,
+            15.797
+          ]
+        },
+        "public": {
+          "baseline": [
+            163.537,
+            161.417
+          ],
+          "candidate": [
+            50.535,
+            47.794
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.276,
+            17.537
+          ],
+          "candidate": [
+            17.185,
+            17.314
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.896,
+            2.917
+          ],
+          "candidate": [
+            2.872,
+            2.893
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          17.631360292434692,
+          17.626240253448486
+        ],
+        "candidate": [
+          17.65504002571106,
+          17.654399871826172
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 0.9972940977507188,
+        "public": 1.0040985719441151,
+        "pack": 1.0053597436644335,
+        "graph_replay": 1.0087047353760445
+      },
+      "aa_gpu_change_percent": 0.03267490116551919
+    },
+    {
+      "format": "nvfp4",
+      "activation": "silu",
+      "tokens": 2,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.151,
+            124.466
+          ],
+          "candidate": [
+            16.365,
+            14.477
+          ]
+        },
+        "public": {
+          "baseline": [
+            164.017,
+            159.547
+          ],
+          "candidate": [
+            49.905,
+            46.812
+          ]
+        },
+        "pack": {
+          "baseline": [
+            16.88,
+            17.52
+          ],
+          "candidate": [
+            16.952,
+            17.332
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.889,
+            2.866
+          ],
+          "candidate": [
+            2.885,
+            2.859
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          14.835200309753418,
+          14.833279848098755
+        ],
+        "candidate": [
+          14.833920001983643,
+          14.833920001983643
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0037074486012807,
+        "public": 1.0002334448681036,
+        "pack": 0.9972758360864776,
+        "graph_replay": 0.999647266313933
+      },
+      "aa_gpu_change_percent": -0.008630202107440255
+    },
+    {
+      "format": "nvfp4",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": [
+        "nvfp4_ffma",
+        2
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            126.726,
+            126.237
+          ],
+          "candidate": [
+            16.287,
+            15.595
+          ]
+        },
+        "public": {
+          "baseline": [
+            163.944,
+            161.641
+          ],
+          "candidate": [
+            50.006,
+            47.262
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.473,
+            17.431
+          ],
+          "candidate": [
+            17.242,
+            17.196
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.936,
+            2.924
+          ],
+          "candidate": [
+            2.89,
+            2.898
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          29.872639179229736,
+          29.862399101257324
+        ],
+        "candidate": [
+          29.87584114074707,
+          29.872000217437744
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0089081191142784,
+        "public": 0.996332995240696,
+        "pack": 1.00063738556032,
+        "graph_replay": 1.0102401129943503
+      },
+      "aa_gpu_change_percent": 0.0192891162279496
+    },
+    {
+      "format": "nvfp4",
+      "activation": "silu",
+      "tokens": 4,
+      "tactic": [
+        "nvfp4_ffma",
+        4
+      ],
+      "host_us": {
+        "runner": {
+          "baseline": [
+            125.233,
+            124.457
+          ],
+          "candidate": [
+            16.309,
+            15.428
+          ]
+        },
+        "public": {
+          "baseline": [
+            163.331,
+            161.507
+          ],
+          "candidate": [
+            50.517,
+            46.161
+          ]
+        },
+        "pack": {
+          "baseline": [
+            17.364,
+            17.362
+          ],
+          "candidate": [
+            17.308,
+            17.171
+          ]
+        },
+        "graph_replay": {
+          "baseline": [
+            2.891,
+            2.873
+          ],
+          "candidate": [
+            2.888,
+            2.881
+          ]
+        }
+      },
+      "gpu_us": {
+        "baseline": [
+          24.822399616241455,
+          24.819839000701904
+        ],
+        "candidate": [
+          24.8140811920166,
+          24.819200038909912
+        ]
+      },
+      "aa_host_ratio": {
+        "runner": 1.0108932461873639,
+        "public": 0.9957724239800337,
+        "pack": 1.0059775985143056,
+        "graph_replay": 0.9884856943475228
+      },
+      "aa_gpu_change_percent": -0.0077314087471913595
+    }
+  ],
+  "tiny": {
+    "shape": {
+      "hidden": 512,
+      "physical_intermediate": 128,
+      "experts": 8,
+      "top_k": 2
+    },
+    "cases": [
+      {
+        "format": "bf16",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": [
+          "ffma",
+          1,
+          4
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 82.132,
+            "candidate": 14.541
+          },
+          "public": {
+            "baseline": 104.504,
+            "candidate": 35.507
+          },
+          "pack": {
+            "baseline": 10.14,
+            "candidate": 10.041
+          },
+          "graph_replay": {
+            "baseline": 2.834,
+            "candidate": 2.849
+          }
+        },
+        "gpu_us": {
+          "baseline": 3.935360014438629,
+          "candidate": 3.938559889793396
+        }
+      },
+      {
+        "format": "bf16",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": [
+          "ffma",
+          1,
+          4
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 83.272,
+            "candidate": 14.947
+          },
+          "public": {
+            "baseline": 105.546,
+            "candidate": 35.74
+          },
+          "pack": {
+            "baseline": 10.122,
+            "candidate": 10.114
+          },
+          "graph_replay": {
+            "baseline": 2.837,
+            "candidate": 2.878
+          }
+        },
+        "gpu_us": {
+          "baseline": 3.9820799231529236,
+          "candidate": 3.9827200770378113
+        }
+      },
+      {
+        "format": "bf16",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": [
+          "ffma",
+          1,
+          4
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 83.548,
+            "candidate": 14.792
+          },
+          "public": {
+            "baseline": 105.564,
+            "candidate": 35.977
+          },
+          "pack": {
+            "baseline": 10.315,
+            "candidate": 10.232
+          },
+          "graph_replay": {
+            "baseline": 2.866,
+            "candidate": 2.876
+          }
+        },
+        "gpu_us": {
+          "baseline": 4.15039986371994,
+          "candidate": 4.179840087890625
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": 128,
+        "host_us": {
+          "runner": {
+            "baseline": 216.38,
+            "candidate": 26.232
+          },
+          "public": {
+            "baseline": 256.71,
+            "candidate": 61.625
+          },
+          "pack": {
+            "baseline": 17.692,
+            "candidate": 17.742
+          },
+          "graph_replay": {
+            "baseline": 2.98,
+            "candidate": 2.985
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.314240097999573,
+          "candidate": 6.290559768676758
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": 256,
+        "host_us": {
+          "runner": {
+            "baseline": 213.938,
+            "candidate": 25.578
+          },
+          "public": {
+            "baseline": 256.713,
+            "candidate": 61.254
+          },
+          "pack": {
+            "baseline": 17.772,
+            "candidate": 17.854
+          },
+          "graph_replay": {
+            "baseline": 3.015,
+            "candidate": 2.996
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.156799793243408,
+          "candidate": 6.155520081520081
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": [
+          "ffma",
+          1
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 116.46,
+            "candidate": 15.004
+          },
+          "public": {
+            "baseline": 151.087,
+            "candidate": 46.786
+          },
+          "pack": {
+            "baseline": 17.93,
+            "candidate": 17.8
+          },
+          "graph_replay": {
+            "baseline": 2.865,
+            "candidate": 2.835
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.387199759483337,
+          "candidate": 6.362239718437195
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": 128,
+        "host_us": {
+          "runner": {
+            "baseline": 213.902,
+            "candidate": 26.05
+          },
+          "public": {
+            "baseline": 259.145,
+            "candidate": 61.739
+          },
+          "pack": {
+            "baseline": 17.746,
+            "candidate": 17.728
+          },
+          "graph_replay": {
+            "baseline": 3.029,
+            "candidate": 3.062
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.069120168685913,
+          "candidate": 6.067839860916138
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": 256,
+        "host_us": {
+          "runner": {
+            "baseline": 213.215,
+            "candidate": 25.808
+          },
+          "public": {
+            "baseline": 258.396,
+            "candidate": 61.617
+          },
+          "pack": {
+            "baseline": 17.726,
+            "candidate": 17.627
+          },
+          "graph_replay": {
+            "baseline": 3.011,
+            "candidate": 2.998
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.441599726676941,
+          "candidate": 6.439039707183838
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": [
+          "ffma",
+          1
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 114.011,
+            "candidate": 14.958
+          },
+          "public": {
+            "baseline": 150.476,
+            "candidate": 47.234
+          },
+          "pack": {
+            "baseline": 17.823,
+            "candidate": 17.85
+          },
+          "graph_replay": {
+            "baseline": 2.889,
+            "candidate": 2.902
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.312959790229797,
+          "candidate": 6.312320232391357
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": 128,
+        "host_us": {
+          "runner": {
+            "baseline": 210.941,
+            "candidate": 25.758
+          },
+          "public": {
+            "baseline": 252.075,
+            "candidate": 61.392
+          },
+          "pack": {
+            "baseline": 18.104,
+            "candidate": 17.996
+          },
+          "graph_replay": {
+            "baseline": 3.03,
+            "candidate": 3.02
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.6041600704193115,
+          "candidate": 6.604800224304199
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": 256,
+        "host_us": {
+          "runner": {
+            "baseline": 212.007,
+            "candidate": 25.707
+          },
+          "public": {
+            "baseline": 255.81,
+            "candidate": 62.614
+          },
+          "pack": {
+            "baseline": 17.848,
+            "candidate": 17.85
+          },
+          "graph_replay": {
+            "baseline": 3.01,
+            "candidate": 2.999
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.646400094032288,
+          "candidate": 6.642559766769409
+        }
+      },
+      {
+        "format": "mxfp4",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": [
+          "ffma",
+          1
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 115.106,
+            "candidate": 14.97
+          },
+          "public": {
+            "baseline": 150.782,
+            "candidate": 46.9
+          },
+          "pack": {
+            "baseline": 17.923,
+            "candidate": 17.85
+          },
+          "graph_replay": {
+            "baseline": 2.864,
+            "candidate": 2.854
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.642559766769409,
+          "candidate": 6.642559766769409
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": 128,
+        "host_us": {
+          "runner": {
+            "baseline": 213.67,
+            "candidate": 25.534
+          },
+          "public": {
+            "baseline": 254.133,
+            "candidate": 61.158
+          },
+          "pack": {
+            "baseline": 17.86,
+            "candidate": 17.839
+          },
+          "graph_replay": {
+            "baseline": 3.009,
+            "candidate": 2.99
+          }
+        },
+        "gpu_us": {
+          "baseline": 5.950080156326294,
+          "candidate": 5.9487998485565186
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": 256,
+        "host_us": {
+          "runner": {
+            "baseline": 213.206,
+            "candidate": 25.634
+          },
+          "public": {
+            "baseline": 256.591,
+            "candidate": 60.841
+          },
+          "pack": {
+            "baseline": 17.558,
+            "candidate": 17.645
+          },
+          "graph_replay": {
+            "baseline": 3.017,
+            "candidate": 3.018
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.235520243644714,
+          "candidate": 6.229119896888733
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": [
+          "ffma",
+          1
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 115.57,
+            "candidate": 14.969
+          },
+          "public": {
+            "baseline": 151.264,
+            "candidate": 46.957
+          },
+          "pack": {
+            "baseline": 17.716,
+            "candidate": 17.689
+          },
+          "graph_replay": {
+            "baseline": 2.863,
+            "candidate": 2.826
+          }
+        },
+        "gpu_us": {
+          "baseline": 7.54688024520874,
+          "candidate": 7.545599937438965
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": 128,
+        "host_us": {
+          "runner": {
+            "baseline": 210.018,
+            "candidate": 25.214
+          },
+          "public": {
+            "baseline": 252.513,
+            "candidate": 59.874
+          },
+          "pack": {
+            "baseline": 17.713,
+            "candidate": 17.665
+          },
+          "graph_replay": {
+            "baseline": 3.041,
+            "candidate": 2.991
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.369280219078064,
+          "candidate": 6.369919776916504
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": 256,
+        "host_us": {
+          "runner": {
+            "baseline": 212.758,
+            "candidate": 25.478
+          },
+          "public": {
+            "baseline": 257.742,
+            "candidate": 62.369
+          },
+          "pack": {
+            "baseline": 17.722,
+            "candidate": 17.752
+          },
+          "graph_replay": {
+            "baseline": 3.0,
+            "candidate": 3.034
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.313599944114685,
+          "candidate": 6.28928005695343
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": [
+          "ffma",
+          1
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 113.566,
+            "candidate": 14.787
+          },
+          "public": {
+            "baseline": 150.508,
+            "candidate": 47.095
+          },
+          "pack": {
+            "baseline": 17.736,
+            "candidate": 17.718
+          },
+          "graph_replay": {
+            "baseline": 2.901,
+            "candidate": 2.896
+          }
+        },
+        "gpu_us": {
+          "baseline": 7.626879811286926,
+          "candidate": 7.627519965171814
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": 128,
+        "host_us": {
+          "runner": {
+            "baseline": 214.177,
+            "candidate": 25.419
+          },
+          "public": {
+            "baseline": 255.68,
+            "candidate": 60.874
+          },
+          "pack": {
+            "baseline": 17.728,
+            "candidate": 17.716
+          },
+          "graph_replay": {
+            "baseline": 3.03,
+            "candidate": 3.038
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.565120220184326,
+          "candidate": 6.565120220184326
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": 256,
+        "host_us": {
+          "runner": {
+            "baseline": 214.05,
+            "candidate": 25.38
+          },
+          "public": {
+            "baseline": 256.619,
+            "candidate": 61.15
+          },
+          "pack": {
+            "baseline": 17.596,
+            "candidate": 17.606
+          },
+          "graph_replay": {
+            "baseline": 3.012,
+            "candidate": 2.994
+          }
+        },
+        "gpu_us": {
+          "baseline": 6.6387200355529785,
+          "candidate": 6.615039706230164
+        }
+      },
+      {
+        "format": "mxfp8",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": [
+          "ffma",
+          1
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 114.195,
+            "candidate": 14.565
+          },
+          "public": {
+            "baseline": 151.873,
+            "candidate": 47.278
+          },
+          "pack": {
+            "baseline": 17.937,
+            "candidate": 17.902
+          },
+          "graph_replay": {
+            "baseline": 3.104,
+            "candidate": 3.113
+          }
+        },
+        "gpu_us": {
+          "baseline": 7.760000228881836,
+          "candidate": 7.75488018989563
+        }
+      },
+      {
+        "format": "nvfp4",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": [
+          "nvfp4_ffma",
+          2
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 123.909,
+            "candidate": 15.336
+          },
+          "public": {
+            "baseline": 160.223,
+            "candidate": 47.039
+          },
+          "pack": {
+            "baseline": 17.312,
+            "candidate": 17.412
+          },
+          "graph_replay": {
+            "baseline": 2.852,
+            "candidate": 2.833
+          }
+        },
+        "gpu_us": {
+          "baseline": 4.885759949684143,
+          "candidate": 4.883840084075928
+        }
+      },
+      {
+        "format": "nvfp4",
+        "activation": "swiglu",
+        "tokens": 1,
+        "tactic": [
+          "nvfp4_ffma",
+          4
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 122.381,
+            "candidate": 15.483
+          },
+          "public": {
+            "baseline": 158.271,
+            "candidate": 46.493
+          },
+          "pack": {
+            "baseline": 17.16,
+            "candidate": 17.149
+          },
+          "graph_replay": {
+            "baseline": 2.903,
+            "candidate": 2.914
+          }
+        },
+        "gpu_us": {
+          "baseline": 5.425919890403748,
+          "candidate": 5.42527973651886
+        }
+      },
+      {
+        "format": "nvfp4",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": [
+          "nvfp4_ffma",
+          2
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 125.347,
+            "candidate": 15.431
+          },
+          "public": {
+            "baseline": 161.324,
+            "candidate": 47.19
+          },
+          "pack": {
+            "baseline": 17.124,
+            "candidate": 17.175
+          },
+          "graph_replay": {
+            "baseline": 2.965,
+            "candidate": 2.907
+          }
+        },
+        "gpu_us": {
+          "baseline": 4.9375998973846436,
+          "candidate": 4.959360063076019
+        }
+      },
+      {
+        "format": "nvfp4",
+        "activation": "swiglu",
+        "tokens": 2,
+        "tactic": [
+          "nvfp4_ffma",
+          4
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 125.671,
+            "candidate": 15.449
+          },
+          "public": {
+            "baseline": 161.499,
+            "candidate": 47.269
+          },
+          "pack": {
+            "baseline": 17.318,
+            "candidate": 17.362
+          },
+          "graph_replay": {
+            "baseline": 2.897,
+            "candidate": 2.888
+          }
+        },
+        "gpu_us": {
+          "baseline": 5.573760271072388,
+          "candidate": 5.575680136680603
+        }
+      },
+      {
+        "format": "nvfp4",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": [
+          "nvfp4_ffma",
+          2
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 124.102,
+            "candidate": 15.551
+          },
+          "public": {
+            "baseline": 161.087,
+            "candidate": 47.168
+          },
+          "pack": {
+            "baseline": 17.282,
+            "candidate": 17.17
+          },
+          "graph_replay": {
+            "baseline": 2.88,
+            "candidate": 2.931
+          }
+        },
+        "gpu_us": {
+          "baseline": 5.29151976108551,
+          "candidate": 5.29088020324707
+        }
+      },
+      {
+        "format": "nvfp4",
+        "activation": "swiglu",
+        "tokens": 4,
+        "tactic": [
+          "nvfp4_ffma",
+          4
+        ],
+        "host_us": {
+          "runner": {
+            "baseline": 124.256,
+            "candidate": 15.69
+          },
+          "public": {
+            "baseline": 159.557,
+            "candidate": 46.903
+          },
+          "pack": {
+            "baseline": 17.379,
+            "candidate": 17.331
+          },
+          "graph_replay": {
+            "baseline": 2.899,
+            "candidate": 2.88
+          }
+        },
+        "gpu_us": {
+          "baseline": 5.8291202783584595,
+          "candidate": 5.8291202783584595
+        }
+      }
+    ]
+  },
+  "validation": {
+    "b300": {
+      "passed": 166,
+      "skipped": 2,
+      "skip_reason": "Two noncurrent-device cases require two visible GPUs; this allocation exposes one.",
+      "description": "164 passed initially plus 2 native-fallback cases passed after excluding the older optional AOT wheel and using a writable cubin cache. No production changes between runs."
+    },
+    "sm107": {
+      "passed": 149,
+      "description": "Prior qualification before main rebase; identical production source hashes. No SM107 timing data in this report."
+    }
+  }
+}
