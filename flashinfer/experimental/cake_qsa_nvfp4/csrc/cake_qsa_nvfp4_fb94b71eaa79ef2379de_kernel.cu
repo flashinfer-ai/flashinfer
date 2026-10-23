@@ -568,8 +568,8 @@ kernel_cake_qsa_nvfp4_fb94b71eaa79ef2379de(float* __restrict__ partial_out, floa
             __nv_bfloat162 _bit_cast_src_46 = __float22bfloat162_rn(make_float2(result[6], result[7]));
             words[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_46)[0];
             long long out_offset = (long long)row * out_stride_row + (long long)head * out_stride_head + dim;
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(out + out_offset + (0)), "r"(words[(0) + 0]), "r"(words[(0) + 1]) : "memory");
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(out + (out_offset + 4) + (0)), "r"(words[(2) + 0]), "r"(words[(2) + 1]) : "memory");
+            reinterpret_cast<int2*>(out + out_offset)[0] = reinterpret_cast<int2*>(words)[0];
+            reinterpret_cast<int2*>(out + (out_offset + 4))[0] = reinterpret_cast<int2*>(words + (2))[0];
         }
     } else {
         int head_b = (int)blockIdx.y * 4 + warp_1;
@@ -824,8 +824,8 @@ kernel_cake_qsa_nvfp4_fb94b71eaa79ef2379de(float* __restrict__ partial_out, floa
             __nv_bfloat162 _bit_cast_src_81 = __float22bfloat162_rn(make_float2(result_b[6], result_b[7]));
             words_b[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_81)[0];
             long long out_offset_b = (long long)row * out_stride_row + (long long)head_b * out_stride_head + dim;
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(out + out_offset_b + (0)), "r"(words_b[(0) + 0]), "r"(words_b[(0) + 1]) : "memory");
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(out + (out_offset_b + 4) + (0)), "r"(words_b[(2) + 0]), "r"(words_b[(2) + 1]) : "memory");
+            reinterpret_cast<int2*>(out + out_offset_b)[0] = reinterpret_cast<int2*>(words_b)[0];
+            reinterpret_cast<int2*>(out + (out_offset_b + 4))[0] = reinterpret_cast<int2*>(words_b + (2))[0];
         }
     }
 }
