@@ -24,6 +24,11 @@ _ROOT = Path(__file__).resolve().parents[2]
 _BENCHMARK = _ROOT / "benchmarks/bench_deepseek_v41_decode.py"
 _EXAMPLE = _ROOT / "examples/deepseek_v41/decode.py"
 _GPU_TEST = Path(__file__).with_name("test_deepseek_v41_decode.py")
+_CACHE_FORMATS = (
+    ("main_kv_fp4", 288, "uint8"),
+    ("swa_mxfp8", 528, "uint8"),
+    ("swa_fp8", 512, "float8_e4m3fn"),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -189,14 +194,121 @@ def test_example_parser_defaults_and_explicit_backend(backend):
     assert not hasattr(opts, "prims_ts_mode")
 
 
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize(
-    "format,width,dtype",
+    "capability,available,backends",
     [
-        ("main_kv_fp4", 288, "uint8"),
-        ("swa_fp8", 512, "float8_e4m3fn"),
+        ((10, 0), True, ("cute-dsl", "prims-ts")),
+        ((10, 3), True, ("prims-ts",)),
+        ((10, 7), True, ("prims-ts",)),
+        ((9, 0), True, ()),
+        ((10, 1), True, ()),
+        ((11, 0), True, ()),
+        ((12, 0), True, ()),
+        (None, False, ()),
     ],
 )
+def test_example_architecture_gate_routes_by_backend(
+    backend, capability, available, backends
+):
+    cuda = SimpleNamespace(
+        is_available=Mock(return_value=available),
+        get_device_capability=Mock(return_value=capability),
+    )
+    parser = SimpleNamespace(
+        parse_args=Mock(return_value=SimpleNamespace(backend=backend))
+    )
+    native, legacy = Mock(), Mock()
+    main = extract(
+        _EXAMPLE,
+        "main",
+        build_parser=Mock(return_value=parser),
+        torch=SimpleNamespace(cuda=cuda),
+        fp8_case=native,
+        legacy_case=legacy,
+    )
+    if backend in backends:
+        main()
+        selected, other = (
+            (native, legacy) if backend == "prims-ts" else (legacy, native)
+        )
+        selected.assert_called_once_with()
+        other.assert_not_called()
+    else:
+        with pytest.raises(RuntimeError, match=f"DS4.1 {backend} decode requires"):
+            main()
+        native.assert_not_called()
+        legacy.assert_not_called()
+    parser.parse_args.assert_called_once_with()
+    cuda.is_available.assert_called_once_with()
+    if available:
+        cuda.get_device_capability.assert_called_once_with()
+    else:
+        cuda.get_device_capability.assert_not_called()
+
+
+@pytest.mark.parametrize("format,width,dtype", _CACHE_FORMATS)
+@pytest.mark.parametrize(
+    "device_type,capability,accepted",
+    [
+        ("cuda", (10, 0), True),
+        ("cuda", (10, 3), True),
+        ("cuda", (10, 7), True),
+        ("cuda", (9, 0), False),
+        ("cuda", (10, 1), False),
+        ("cuda", (11, 0), False),
+        ("cuda", (12, 0), False),
+        ("cpu", None, False),
+    ],
+)
+def test_cache_writer_common_architecture_gate(
+    format, width, dtype, device_type, capability, accepted
+):
+    """Empty caller-owned pools exercise the gate without launching kernels."""
+    torch = SimpleNamespace(
+        bfloat16="bfloat16",
+        float32="float32",
+        float8_e4m3fn="float8_e4m3fn",
+        uint8="uint8",
+        empty=Mock(),
+        cuda=SimpleNamespace(get_device_capability=Mock(return_value=capability)),
+    )
+    device = SimpleNamespace(type=device_type)
+    x = SimpleNamespace(
+        ndim=2,
+        shape=(0, 512),
+        dtype=torch.bfloat16,
+        device=device,
+        requires_grad=False,
+        is_contiguous=Mock(return_value=True),
+    )
+    out = SimpleNamespace(
+        ndim=4,
+        shape=(1, 64, 1, width),
+        dtype=dtype,
+        device=device,
+        requires_grad=False,
+        is_contiguous=Mock(return_value=True),
+    )
+    quantize = extract(
+        _ROOT / "flashinfer/experimental/deepseek_v41/cache.py",
+        "quantize_cache",
+        torch=torch,
+    )
+    if accepted:
+        assert quantize(x, format=format, out=out) is out
+    else:
+        with pytest.raises(ValueError, match="SM100, SM103 or SM107"):
+            quantize(x, format=format, out=out)
+    if device_type == "cuda":
+        torch.cuda.get_device_capability.assert_called_once_with(device)
+    else:
+        torch.cuda.get_device_capability.assert_not_called()
+    torch.empty.assert_not_called()
+
+
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("format,width,dtype", _CACHE_FORMATS)
 @pytest.mark.parametrize("invalid", ["rank", "shape", "dtype", "device", "strides"])
 def test_cache_invalid_output_names_format(kv_layout, format, width, dtype, invalid):
     torch = SimpleNamespace(

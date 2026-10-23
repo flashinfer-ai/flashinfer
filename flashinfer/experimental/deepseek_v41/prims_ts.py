@@ -91,6 +91,10 @@ def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
     if native_fp4 and compiler < (13, 2):
         raise RuntimeError("native FP4 conversion requires bundled CUDA >= 13.2")
 
+    from ...cute_dsl.availability import require_cute_dsl_arch
+
+    require_cute_dsl_arch(device_index)
+
     from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import kernel
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ...cute_dsl import fp4_common

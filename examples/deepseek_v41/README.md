@@ -32,9 +32,13 @@ WS wrapper; other MMA/TMEM operations use the typed primitives.
 
 The optional Triton cache writer was validated with **Triton 3.7.1** and its
 bundled Blackwell `ptxas` **CUDA 13.1.80**, separate from the CuTe compiler and
-system toolkit above. Its FP4 path emits `cvt.rn.satfinite.e2m1x2.f32` and is
-limited to SM100. These are tested toolchain versions, not a package-wide
-CUDA version requirement.
+system toolkit above. Its FP4 path emits `cvt.rn.satfinite.e2m1x2.f32`.
+The writer accepts SM100, SM103 and SM107; Frost attention remains SM100-only.
+These are tested toolchain versions, not a package-wide CUDA version requirement.
+SM107 also needs Triton's selected `ptxas` to recognize `sm_107a`; CuTe's bundled
+compiler does not satisfy this separate requirement. With Triton 3.8.0, set
+`TRITON_PTXAS_BLACKWELL_PATH` to a compatible installed assembler before importing
+Triton if its default assembler is too old.
 
 Frost keeps the measured split schedule for small batches and selects
 WS QK/PV with fused softmax/correction for K512/B128+. When that batch exceeds
@@ -127,9 +131,10 @@ does not replace main's generic prepared-list sparse MLA implementation.
 
 ### Scope and public API
 
-Native scope is **SM100 / H64 / Sq1 / D512**, batch size 1–65535, page size64,
-128 SWA positions and main width `K=0,64,...,512`. It requires CuTe-DSL >=4.8
-with its bundled CUDA13 compiler, independently of `CUDA_HOME`.
+Native scope is **SM100 / SM103 / SM107, H64 / Sq1 / D512**, batch size
+1–65535, page size64, 128 SWA positions and main width `K=0,64,...,512`.
+It requires CuTe-DSL >=4.8 with its bundled CUDA13 compiler and support for the
+device's compile target, independently of `CUDA_HOME`.
 
 - Q is contiguous `torch.float8_e4m3fn[B,1,64,512]`.
 - SWA is typed E4M3, width512, with no scale plane.
@@ -226,8 +231,8 @@ Keep addresses alive/fixed and update values in place. Changing Python scales
 requires recapture, not recompilation. Concurrent calls need separate writable
 buffers or synchronization. Output/workspace cannot overlap inputs or each other;
 read-only inputs may alias. Cached factories retain kernels and host facts, not
-caller buffers. Training, speculative/multi-token queries, other architectures,
-and V4 varlen/PDL/RopeQuant features are out of scope.
+caller buffers. Training, speculative/multi-token queries, architectures outside
+SM100/SM103/SM107, and V4 varlen/PDL/RopeQuant features are out of scope.
 
 Native tests retain the independent represented-input FP64 oracle, componentwise
 FP8 output bound, LSE `rtol=0, atol=1e-5`, exact-empty/nonfinite checks and bitwise
@@ -239,17 +244,54 @@ extreme BMM2/sink combinations, avoiding premature underflow before PV scaling.
 Regression tests cover strong sinks with large signed BMM2, signed zero,
 BF16-subnormal output, and live metadata/layout/replay parity. The independent
 oracle and numerical gates above are unchanged; true BF16 overflow is not removed.
-After backend-scope cleanup and finalizer changes, native-only frozen-source
-verification on **B200 (SM100) passed 197 host-contract and 100 GPU cases**, with
-no failures or skips. The run used PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0 and bundled
-CUDA 13.4. JSON/JUnit results agreed; source fingerprints, Slurm visibility and
-GC policies stayed unchanged during testing. These historical counts predate
-the rebase and host-test cleanup; tests were not rerun for those changes.
-The Frost decoder, examples and benchmarks were not run. The generic sparse MLA
-suite, complete integration, checkpoint/full-model equivalence, rare-path cost,
-performance and backend crossovers remain unqualified by this run.
+Historical native-only frozen-source verification on **B200 (SM100) passed
+197 host-contract and 100 GPU cases** without failures or skips, using PyTorch
+2.11.0+cu128, CuTe-DSL 4.8.0 and bundled CUDA 13.4. Those counts predate the
+rebase, host-test cleanup and architecture-guard changes.
 
-Native commands below are usage examples, not executed results:
+After the architecture-guard changes, **B200 (SM100) passed 330 CPU contract
+and 180 GPU cases** without failures or skips. The GPU run covered the complete
+DS4.1 decode/cache test files, including Frost and Prims-TS. A fresh process
+passed 16 native cache-reload cases, and the native mixed-cache/window-only
+example passed. This run used PyTorch 2.14.0+cu130, CuTe-DSL 4.8.0, bundled CUDA
+13.4 and Triton 3.8.0. These B200 results do not qualify SM103 or SM107.
+
+On **R100 (SM107)** with the same package versions, the complete DS4.1 decode/cache
+test files passed **133 cases**, with **47 expected SM100-only Frost skips** and
+no failures. The native mixed-cache/window-only example passed. A fresh process
+passed **16 native cache-reload cases** without skips; all **15 persisted CuTe
+objects** retained identical paths, sizes, mtimes and SHA256 hashes. CuTe selected
+`sm_107a` without an architecture override.
+
+This R100 validation used an existing CUDA **13.4.59 `ptxas`** for Triton and a
+matching **13.4.59 NVRTC/builtins pair** for the independent Torch references.
+The runtime's older assembler rejected `sm_107a`, and its older NVRTC could not
+compile the reference's `torch.exp2`. Process-scoped toolchain overrides fixed
+those toolchain failures without changing kernels, references or numerical gates.
+NVRTC symbol providers were verified in both global and Torch-bridge scopes,
+along with architecture 107 support and an exact CUDA `torch.exp2` smoke test.
+No packages were installed or images downloaded. CuTe, Triton's assembler and
+Torch's NVRTC are separate compiler routes.
+
+On **GB300 (SM103, aarch64)** with the same package versions, the complete DS4.1
+decode/cache test files passed **133 cases**, with **47 expected SM100-only Frost
+skips** and no failures. The native mixed-cache/window-only example passed. A
+fresh process passed **16 native cache-reload cases** without skips; all **15
+persisted CuTe objects** retained identical paths, sizes, mtimes and SHA256 hashes.
+CuTe selected `sm_103a` without an architecture override; the SM107-specific
+assembler/NVRTC overrides were not used.
+
+Cold compilation was slow in this ARM container. The successful run restored
+five CuTe objects from an earlier partial run and completed the GPU test phase
+in about **2 hours 20 minutes**, within a four-hour allocation. This is validation
+wall time, including JIT compilation, not GPU kernel latency. No kernels,
+references or numerical gates were changed to make this target pass.
+
+The generic sparse MLA suite, complete integration, checkpoint/full-model
+equivalence, rare-path cost, performance and backend crossovers remain unqualified
+by these runs.
+
+Native example and benchmark usage (the benchmark was not run):
 
 ```bash
 python examples/deepseek_v41/decode.py --backend prims-ts

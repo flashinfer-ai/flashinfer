@@ -93,8 +93,8 @@ def device_sm_count(device_index):
     if torch.cuda.is_current_stream_capturing():
         raise ValueError("warm DS4.1 decode before CUDA Graph capture")
     props = torch.cuda.get_device_properties(device_index)
-    if (props.major, props.minor) != (10, 0):
-        raise ValueError("CuTe DS4.1 decode currently requires SM100")
+    if (props.major, props.minor) not in ((10, 0), (10, 3), (10, 7)):
+        raise ValueError("Prims-TS DS4.1 decode requires SM100, SM103 or SM107")
     return props.multi_processor_count
 
 
@@ -147,7 +147,9 @@ def bind_inputs(
     ):
         raise ValueError("Q must be E4M3 [B,1,64,512], with 1 <= B <= 65535")
     if query.device.type != "cuda":
-        raise ValueError("CuTe DS4.1 decode requires a CUDA query on SM100")
+        raise ValueError(
+            "Prims-TS DS4.1 decode requires a CUDA query on SM100, SM103 or SM107"
+        )
     batch = query.shape[0]
     if sparse_indices is None or sparse_topk_lens is None or seq_lens is None:
         raise ValueError("sparse_indices, sparse_topk_lens and seq_lens are required")

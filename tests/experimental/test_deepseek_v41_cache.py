@@ -9,8 +9,12 @@ from flashinfer.deepseek_v41 import deepseek_v41_quantize_cache
 
 
 def gate():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("DS4.1 decode cache preparation requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip("DS4.1 decode cache preparation requires SM100, SM103 or SM107")
 
 
 def reference(x, fmt):
@@ -226,10 +230,10 @@ def test_empty_and_rejected_declarations(fmt):
 
 
 def test_prepared_cache_feeds_decode():
-    gate()
     from flashinfer.deepseek_v41 import deepseek_v41_decode
-    from .test_deepseek_v41_decode import check
+    from .test_deepseek_v41_decode import check, gate as decode_gate
 
+    decode_gate()
     x = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
     swa = deepseek_v41_quantize_cache(x, format="swa_mxfp8")
     main = deepseek_v41_quantize_cache(x, format="main_kv_fp4")

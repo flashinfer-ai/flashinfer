@@ -1,17 +1,19 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
 
-"""Experimental DS4.1 decode on SM100.
+"""Experimental DS4.1 decode with backend-specific GPU support.
 
-The default cute-dsl example keeps the original BF16 Q/MXFP8 SWA API and
-(out, lse, plan) return, reusing the plan after updating Q. Explicit prims-ts
-requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler and uses E4M3 Q and
-typed E4M3 SWA. Only that native path uses the V4-style caller workspace,
-supplied output, runtime BMM factors and HND caches shown below.
+The default cute-dsl example is SM100-only and keeps the original BF16 Q/MXFP8
+SWA API and (out, lse, plan) return, reusing the plan after updating Q. Explicit
+prims-ts accepts SM100/SM103/SM107 and requires CuTe-DSL >= 4.8 with its bundled
+CUDA 13 compiler. It uses E4M3 Q and typed E4M3 SWA. Only that native path uses
+the V4-style caller workspace, supplied output, runtime BMM factors and HND
+caches shown below.
 
-Historical GPU tests do not qualify the native joint/shared-scale/API revision.
-The native example has not run; performance is unmeasured. See README.md for
-cache contracts and experimental validation scope.
+The native example, decode/cache regressions and fresh-process cache reuse passed
+on B200 (SM100), GB300 (SM103) and R100 (SM107), with Frost tests skipped on the
+two newer targets. See README.md for the tested toolchains and cold-compilation
+limits. Performance is unmeasured.
 """
 
 import argparse
@@ -119,8 +121,15 @@ def fp8_case():
 
 def main():
     opts = build_parser().parse_args()
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        raise RuntimeError("DS4.1 decode requires SM100")
+    supported = (
+        ((10, 0), (10, 3), (10, 7)) if opts.backend == "prims-ts" else ((10, 0),)
+    )
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() not in supported
+    ):
+        required = "SM100, SM103 or SM107" if opts.backend == "prims-ts" else "SM100"
+        raise RuntimeError(f"DS4.1 {opts.backend} decode requires {required}")
     if opts.backend == "prims-ts":
         fp8_case()
     else:
