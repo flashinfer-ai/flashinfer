@@ -63,7 +63,9 @@ below the fused threshold) ``wy_fwd_rows`` and ``fwdh_o_v2_rows`` -- so the
 intra program writes no internal copies there; ``fwd_nosave`` (no saved set)
 launches the internal-row forms ``fwdh_wy`` / ``wy_fwd`` / ``fwdh_p3_o_ov`` /
 ``fwdh_p3_o_ov_id`` / ``fwdh_o_v2`` and the intra program writes the internal
-copies they read (the 64-column serial form keeps them on both paths).
+copies they read (the 64-column serial form keeps them on both paths on
+``sm_100a`` / ``sm_103a``; on ``sm_107a`` its saving forward reads the saved rows
+too: ``fwdh_o_v1_rows``).
 
 The state recurrences have two routes.  With more than ``SEGMENTS["max_heads"]``
 heads the serial walk over each document's chunk chain runs, in two forms
@@ -790,7 +792,22 @@ MODULES: dict[str, dict[str, Any]] = {
                     "rules": [
                         {"kind": "path_in", "paths": ["fwd_nosave"]},
                         {"kind": "heads_at_most", "max": 8},
-                        {"kind": "slots_above", "slices": 4, "ctas_per_sm": 4},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "slots_above", "slices": 4, "ctas_per_sm": 4},
+                                {
+                                    "kind": "any_of",
+                                    "rules": [
+                                        {"kind": "path_in", "paths": ["fwd_nosave"]},
+                                        {
+                                            "kind": "arch_in",
+                                            "arches": ["sm_100a", "sm_103a"],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
                     ],
                 },
             ],
@@ -877,6 +894,28 @@ MODULES: dict[str, dict[str, Any]] = {
                         {"kind": "path_in", "paths": ["fwd"]},
                         {"kind": "heads_above", "min": 8},
                         {"kind": "slots_at_most", "slices": 4, "ctas_per_sm": 4},
+                        {
+                            "kind": "any_of",
+                            "rules": [
+                                {"kind": "heads_below", "max": 32},
+                                {
+                                    "kind": "all_of",
+                                    "rules": [
+                                        {"kind": "arch_in", "arches": ["sm_107a"]},
+                                        {"kind": "heads_above", "min": 32},
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "path_in", "paths": ["fwd"]},
+                        {"kind": "heads_above", "min": 8},
+                        {"kind": "slots_above", "slices": 4, "ctas_per_sm": 4},
+                        {"kind": "arch_in", "arches": ["sm_107a"]},
                         {
                             "kind": "any_of",
                             "rules": [
@@ -1081,7 +1120,19 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "all_of",
             "rules": [
-                {"kind": "path_in", "paths": ["fwd", "fwd_nosave"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "path_in", "paths": ["fwd_nosave"]},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "path_in", "paths": ["fwd"]},
+                                {"kind": "arch_in", "arches": ["sm_100a", "sm_103a"]},
+                            ],
+                        },
+                    ],
+                },
                 {"kind": "heads_above", "min": 8},
                 {"kind": "slots_above", "slices": 4, "ctas_per_sm": 4},
                 {
@@ -1101,6 +1152,83 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "stage": "fwdh",
         "variant": "o_v1",
+    },
+    "fwdh_o_v1_rows": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "w_tma"],
+            ["buffer", "kg_tma"],
+            ["buffer", "u"],
+            ["buffer", "gk"],
+            ["buffer", "h_out"],
+            ["buffer", "v_new"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "seq_order"],
+            ["buffer", "qg_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["parameter", "write_tapes"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "per_doc_head", "slices": 2},
+        "kernel_symbol": "kernel_cake_kda_train_f011cd9add8f3c7c3eee",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_f011cd9add8f3c7c3eee",
+        "logical": {
+            "aqk_tma": "aqk_ext",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "gk": "gk",
+            "h_out": "h",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "o_out": "out",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "seq_order": "seq_order",
+            "u": "u",
+            "v_new": "v_new",
+            "w_tma": "w",
+            "write_tapes": "write_tapes",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["fwd"]},
+                {"kind": "heads_above", "min": 8},
+                {"kind": "slots_above", "slices": 4, "ctas_per_sm": 4},
+                {"kind": "arch_in", "arches": ["sm_107a"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "heads_below", "max": 32},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "arch_in", "arches": ["sm_107a"]},
+                                {"kind": "heads_above", "min": 32},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        "stage": "fwdh",
+        "variant": "o_v1_rows",
     },
     "fwdh_o_v2": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],

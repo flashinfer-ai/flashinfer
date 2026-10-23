@@ -78,13 +78,15 @@ PDL_RECORDS = (
 )
 # the saving forward's token-row records: where one runs, no program of the path reads the internal Aqk / Akk copies;
 # the forward without a saved set launches their internal-row twins instead (the paired serial rows -- the 32-column
-# form below the fused threshold -- launch wy_fwd_rows and fwdh_o_v2_rows; the 64-column form keeps the internal rows)
+# form below the fused threshold, and on sm_107a the 64-column form too -- launch wy_fwd_rows and fwdh_o_v2_rows /
+# fwdh_o_v1_rows; the 64-column form keeps the internal rows on the other architectures)
 TOKEN_ROW_RECORDS = (
     "fwdh_wy_rows",
     "wy_fwd_rows",
     "fwdh_p3_o_ov_rows",
     "fwdh_p3_o_ov_id_rows",
     "fwdh_o_v2_rows",
+    "fwdh_o_v1_rows",
 )
 INTERNAL_ROW_TWIN = {
     "fwdh_wy_rows": "fwdh_wy",
@@ -92,7 +94,10 @@ INTERNAL_ROW_TWIN = {
     "fwdh_p3_o_ov_rows": "fwdh_p3_o_ov",
     "fwdh_p3_o_ov_id_rows": "fwdh_p3_o_ov_id",
     "fwdh_o_v2_rows": "fwdh_o_v2",
+    "fwdh_o_v1_rows": "fwdh_o_v1",
 }
+# the architectures whose saving forward reads the saved token rows on the 64-column serial rows too (fwdh_o_v1_rows)
+PAIRED_V1_ARCHES = ("sm_107a",)
 DAVQ_MIN_H = 16  # the fused gradient hosts dAqk on the serial route from 16 heads
 # from this many heads the fused gradient runs with its L2 prefetch / evict-first hints off (the `_nohint` records:
 # the same kernel built with the hint thresholds beyond any head count); the other architectures keep the hints
@@ -286,8 +291,8 @@ TWO_PASS_RECORDS = (
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.MODULES) == 61
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 59
+    assert len(cake_jit.MODULES) == 62
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 60
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert cake_jit.SEGMENTS == {
@@ -519,8 +524,10 @@ def _expected_records(
     # the saving forward reads the saved token rows where a program for them ships
     save = path == "fwd"
     # the paired serial rows: the 32-column form below the fused threshold reads the saved token rows on the saving
-    # forward (wy_fwd_rows + fwdh_o_v2_rows); the 64-column form keeps the internal-row pair on both paths
+    # forward (wy_fwd_rows + fwdh_o_v2_rows); the 64-column form does so on sm_107a alone (wy_fwd_rows +
+    # fwdh_o_v1_rows) and keeps the internal-row pair on both paths elsewhere
     paired = save and not seg and v2 and not fused_fwd
+    paired_v1 = save and not seg and not v2 and not fused_fwd and arch in PAIRED_V1_ARCHES
     walk = nseg * h
     prefetch = walk < DHU_PREFETCH_WAVES_BY_ARCH.get(arch, 0.0) * sm
     tma = walk < DHU_TMA_WAVES * sm or (h <= 4 and walk <= DHU_TMA_WAVES * sm)
@@ -546,7 +553,7 @@ def _expected_records(
         "fwd_intra": "fwd_intra_v14" if intra_tables else "fwd_intra",
         "wy_fwd": None
         if fused_fwd
-        else ("wy_fwd_rows" if (ov1 and save) or paired else "wy_fwd"),
+        else ("wy_fwd_rows" if (ov1 and save) or paired or paired_v1 else "wy_fwd"),
         "seg_carry": None if not seg else ("seg_carry_ov" if ov1 else "seg_carry"),
         "glm_intra": "glm_intra",
         "gate_epilogue": "gate_epilogue",
@@ -569,7 +576,7 @@ def _expected_records(
         elif v2:
             out["fwdh"] = "fwdh_o_v2_rows" if paired else "fwdh_o_v2"
         else:
-            out["fwdh"] = "fwdh_o_v1"
+            out["fwdh"] = "fwdh_o_v1_rows" if paired_v1 else "fwdh_o_v1"
     elif path in ("light", "replay"):
         if seg:
             out["fwdh"] = "fwdh_v3"
@@ -744,7 +751,13 @@ def test_the_saving_forward_reads_the_token_rows_where_a_program_ships() -> None
                         and not fused
                         and n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
                     )
-                    assert bool(token) == (fused or ov1 or paired), (
+                    paired_v1 = (
+                        not seg
+                        and not fused
+                        and n * h * RECUR_SLICES["v2"] > sm * RECUR_CTAS_PER_SM
+                        and arch in PAIRED_V1_ARCHES
+                    )
+                    assert bool(token) == (fused or ov1 or paired or paired_v1), (
                         n,
                         h,
                         sm,
@@ -757,6 +770,8 @@ def test_the_saving_forward_reads_the_token_rows_where_a_program_ships() -> None
                         assert "wy_fwd_rows" in token and len(token) == 2
                     if paired:
                         assert token == {"wy_fwd_rows", "fwdh_o_v2_rows"}
+                    if paired_v1:
+                        assert token == {"wy_fwd_rows", "fwdh_o_v1_rows"}
                     assert p.internal_rows("fwd") is (not token), (n, h, sm, arch)
                     assert p.internal_rows("fwd_nosave") is True
                     assert p.internal_rows("replay") is True
@@ -1111,6 +1126,7 @@ def test_the_serial_walk_orders_the_documents_and_the_carry_splits_the_chain() -
         "fwdh_v2",
         "fwdh_v2h",
         "fwdh_o_v1",
+        "fwdh_o_v1_rows",
         "fwdh_o_v2",
         "fwdh_o_v2_rows",
         "fwdh_wy",
@@ -1989,10 +2005,10 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 59 programs of cake_jit.MODULES plus the KCP programs of cake_kcp_jit.MODULES (its test-only
+    # The 60 programs of cake_jit.MODULES plus the KCP programs of cake_kcp_jit.MODULES (its test-only
     # TEST_MODULES live in build.test.json, never here).
     kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
-    assert len(names) == len(set(names)) == (59 + len(kcp_libraries)) * len(ARCHES)
+    assert len(names) == len(set(names)) == (60 + len(kcp_libraries)) * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"

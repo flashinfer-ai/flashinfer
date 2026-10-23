@@ -359,7 +359,9 @@ representation and the recurrence, which also writes the output:
   on `fwd` the 32-column rows launch `wy_fwd_rows` (the backward's WY program
   on the saved `Akk`) and `fwdh_o_v2_rows` (`fwdh_v35`: the same recurrence
   reading the saved `Aqk`) and the intra program writes no internal `Aqk` /
-  `Akk` copies; the 64-column rows keep `wy_fwd` / `fwdh_o_v1` on both paths;
+  `Akk` copies; the 64-column rows do the same on `sm_107a` (`wy_fwd_rows` and
+  `fwdh_o_v1_rows`: `fwdh_v35`'s 64-column build) and keep `wy_fwd` / `fwdh_o_v1`
+  on both paths on `sm_100a` / `sm_103a`;
 * segmented: `wy_fwd`, `fwdh_v3` pass 1 (every segment walked from zero and
   from the identity: the segment offsets and transfers, FP32 `[128, 128]`
   each; grid `2 * NSEG * H`), `seg_carry` (chains them within each document
@@ -448,7 +450,7 @@ backward from the plan's own light saved set).
 
 ### Programs by stage
 
-61 records naming 59 programs from 35 kernels (`fwdh_v3` and `fwdh_p3` are
+62 records naming 60 programs from 35 kernels (`fwdh_v3` and `fwdh_p3` are
 one program, the two passes of the segmented walk; `wy_bwd` and `wy_fwd_rows`
 are one program, the WY representation from the saved `Akk` on the backward
 and on the saving forward's overlap and paired serial rows; `fwdh_p3_o_ov`,
@@ -462,9 +464,9 @@ the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`,
 | `table` | `table_v3`, `table_v2`, `table` | up to 256 documents one CTA per 256 chunks: `table_v2` on the serial route (forward, replay, and a saved-set path whose set carries no tables), `table_v3` on the segmented route (the block table too) on a saved-set path whose set carries no tables alone (the forward and the replay there launch no table program: `fwd_intra_v14` writes the tables); above, `table` (one CTA) on every path that builds the tables |
 | `seg_table` | `seg_table` | segmented route above 256 documents, after `table` (below, `fwd_intra_v14` or `table_v3` writes the block table) |
 | `fwd_intra` | `fwd_intra_v14`, `fwd_intra` | forward (the GLM prep's outputs too: `write_prep = 1`), and the replay (the intra-chunk rows alone); `fwd_intra_v14` on the segmented route up to 256 documents (the first launch of its call: it computes the chunk layout from `cu_seqlens` and writes the chunk tables and the block table), `fwd_intra` on the serial route and above 256 documents |
-| `wy_fwd` | `wy_fwd`, `wy_fwd_rows` | forward, unless the fused recurrence (`fwdh_wy*`) runs; `wy_fwd_rows` (the saved `Akk` token rows, the `wy_bwd` program) on the overlap rows and the 32-column serial rows of `fwd`, `wy_fwd` elsewhere |
+| `wy_fwd` | `wy_fwd`, `wy_fwd_rows` | forward, unless the fused recurrence (`fwdh_wy*`) runs; `wy_fwd_rows` (the saved `Akk` token rows, the `wy_bwd` program) on the overlap rows and the 32-column serial rows of `fwd` (on `sm_107a` its 64-column serial rows too), `wy_fwd` elsewhere |
 | `wy` | `wy_bwd`, `wy_bwd_replay` | backward (`_replay` on the replay), unless a fused recompute forms the WY representation (`fwdh_wy_bwd*`, `fwdh_p3_wy`) |
-| `fwdh` | `fwdh_wy`, `fwdh_wy_rows`, `fwdh_o_v1`, `fwdh_o_v2`, `fwdh_o_v2_rows`, `fwdh_v3`, `fwdh_wy_bwd`, `fwdh_wy_bwd_replay`, `fwdh_v1`, `fwdh_v1_sm107`, `fwdh_v2`, `fwdh_v2h` | forward: serial `fwdh_wy_rows` (`fwd`: the saved token rows) / `fwdh_wy` (`fwd_nosave`) from 32 heads (`sm_107a`: at 32 only), else by form `fwdh_o_v1` (64 columns, both forward paths), `fwdh_o_v2` (32 columns, `fwd_nosave`) / `fwdh_o_v2_rows` (32 columns on `fwd`: `fwdh_v35` reading the saved `Aqk` token rows); segmented `fwdh_v3` pass 1 (both forward paths, `light`, replay). Backward recompute (`light`, replay): `fwdh_wy_bwd*` on the 64-column form from 64 heads, `fwdh_v1` (`fwdh_v1_sm107` on `sm_107a`) below, `fwdh_v2` / `fwdh_v2h` (from 16 heads; `sm_107a`: at 16 only) on the 32-column form |
+| `fwdh` | `fwdh_wy`, `fwdh_wy_rows`, `fwdh_o_v1`, `fwdh_o_v1_rows`, `fwdh_o_v2`, `fwdh_o_v2_rows`, `fwdh_v3`, `fwdh_wy_bwd`, `fwdh_wy_bwd_replay`, `fwdh_v1`, `fwdh_v1_sm107`, `fwdh_v2`, `fwdh_v2h` | forward: serial `fwdh_wy_rows` (`fwd`: the saved token rows) / `fwdh_wy` (`fwd_nosave`) from 32 heads (`sm_107a`: at 32 only), else by form `fwdh_o_v1` (64 columns: `fwd_nosave`, and `fwd` on `sm_100a` / `sm_103a`) / `fwdh_o_v1_rows` (64 columns on `fwd` on `sm_107a`: `fwdh_v35` reading the saved `Aqk` token rows), `fwdh_o_v2` (32 columns, `fwd_nosave`) / `fwdh_o_v2_rows` (32 columns on `fwd`: `fwdh_v35` reading the saved `Aqk` token rows); segmented `fwdh_v3` pass 1 (both forward paths, `light`, replay). Backward recompute (`light`, replay): `fwdh_wy_bwd*` on the 64-column form from 64 heads, `fwdh_v1` (`fwdh_v1_sm107` on `sm_107a`) below, `fwdh_v2` / `fwdh_v2h` (from 16 heads; `sm_107a`: at 16 only) on the 32-column form |
 | `seg_carry` | `seg_carry`, `seg_carry_ov` | segmented route: between the forward passes (where pass 1 runs) and, in reverse, between the adjoint passes; `seg_carry_ov` (the release flags) on the forward paths of the rows with `NSEG * H >= 3.0 * sm_count` (`sm_100a` / `sm_103a`) or `>= 2.3 * sm_count` (`sm_107a`), at most 8192 segment-heads |
 | `fwdh_p3` | `fwdh_p3_o`, `fwdh_p3_o_ov`, `fwdh_p3_o_ov_id`, `fwdh_p3_o_ov_rows`, `fwdh_p3_o_ov_id_rows`, `fwdh_p3_wy`, `fwdh_p3` | segmented pass 2: `fwdh_p3_o` on the forward paths (the output fused), `fwdh_p3_o_ov` / `fwdh_p3_o_ov_id` (PDL launch; the release order up to 2 heads, the chain-major order above) where `seg_carry_ov` runs on `fwd_nosave` and their token-row twins `fwdh_p3_o_ov_rows` / `fwdh_p3_o_ov_id_rows` (the saved `Aqk`) on `fwd`, `fwdh_p3_wy` on `light_states` with at most 32 chains (the WY representation fused), `fwdh_p3` otherwise (`light`, replay, `light_states` above 32 chains) |
 | `bwd_prep` | `bwd_prep_g8`, `bwd_prep_g8_replay` | backward; one CTA per chunk and head; the replay form keeps the internal `dout` copy |
@@ -655,7 +657,7 @@ The KCP kernels live beside the single-rank programs:
   `run_module(name, values, grid=, device_index=)`.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_<arch>` (59 programs x 3
+  `cake-build/1`): one entry per `<library>_<arch>` (60 programs x 3
   architectures) with its two translation units, digests, nvcc flags
   (`--use_fast_math`), closure digest and `aot/<name>.so` path.
   `cake_build.load_library(name)` loads the prebuilt library when `aot/` holds
@@ -668,14 +670,14 @@ The KCP kernels live beside the single-rank programs:
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include,
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` -- the generated device
-  and binding translation units of the 59 programs, shared by the three
+  and binding translation units of the 60 programs, shared by the three
   architectures (per-architecture lines under `#if __CUDA_ARCH__`) and
   compiled once per architecture.  The sources are identity-checked by the
   digests in `build.json`.
 
 ## Status
 
-The registry holds the 61 records (59 programs) for `sm_100a`, `sm_103a` and
+The registry holds the 62 records (60 programs) for `sm_100a`, `sm_103a` and
 `sm_107a`,
 exported from the kernel snapshot named in the pull request.
 
