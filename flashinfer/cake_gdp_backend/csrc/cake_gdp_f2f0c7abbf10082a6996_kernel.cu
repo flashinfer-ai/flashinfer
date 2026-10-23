@@ -321,8 +321,136 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
     }
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
+    int row_a = warp_local;
+    int row_b = 4 + warp_local;
+    int v_row_a = split_v_base + row_a;
+    int v_row_b = split_v_base + row_b;
+    float2 ha_pair0 = make_float2(sState[row_a * 128 + k_col0], sState[row_a * 128 + k_col0 + 1]);
+    float2 ha_pair1 =
+        make_float2(sState[row_a * 128 + k_col0 + 2], sState[row_a * 128 + k_col0 + 3]);
+    float2 hb_pair0 = make_float2(sState[row_b * 128 + k_col0], sState[row_b * 128 + k_col0 + 1]);
+    float2 hb_pair1 =
+        make_float2(sState[row_b * 128 + k_col0 + 2], sState[row_b * 128 + k_col0 + 3]);
 #pragma unroll
-    for (int row_group = 0; row_group < 8; row_group += 4) {
+    for (int t = 0; t < 1; t++) {
+      float decay_val = sAlpha[t];
+      float2 decay_pair = make_float2(decay_val, decay_val);
+      ha_pair0 = mul_f32x2(ha_pair0, decay_pair);
+      ha_pair1 = mul_f32x2(ha_pair1, decay_pair);
+      hb_pair0 = mul_f32x2(hb_pair0, decay_pair);
+      hb_pair1 = mul_f32x2(hb_pair1, decay_pair);
+#pragma unroll
+      for (int j = 0; j < 3; j++) {
+        int m = t * 3 + j;
+        float2 k_pair0_1 = make_float2(sK[m * 128 + k_col0], sK[m * 128 + k_col0 + 1]);
+        float2 k_pair1_1 = make_float2(sK[m * 128 + k_col0 + 2], sK[m * 128 + k_col0 + 3]);
+        float2 sum_a_pair = fma_f32x2_rn_ftz(ha_pair0, k_pair0_1, make_float2(0.0f, 0.0f));
+        sum_a_pair = fma_f32x2_rn_ftz(ha_pair1, k_pair1_1, sum_a_pair);
+        float2 sum_b_pair = fma_f32x2_rn_ftz(hb_pair0, k_pair0_1, make_float2(0.0f, 0.0f));
+        sum_b_pair = fma_f32x2_rn_ftz(hb_pair1, k_pair1_1, sum_b_pair);
+        float sum_a = sum_a_pair.x + sum_a_pair.y;
+        float sum_b = sum_b_pair.x + sum_b_pair.y;
+        float _warp_reduce_11 = sum_a;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+          _warp_reduce_11 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_11, offset);
+        sum_a = _warp_reduce_11;
+        float _warp_reduce_12 = sum_b;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+          _warp_reduce_12 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_12, offset);
+        sum_b = _warp_reduce_12;
+        float v_a = sV[m * 8 + row_a];
+        float v_b = sV[m * 8 + row_b];
+        float beta_val = sBeta[m];
+        float vn_a = (v_a - sum_a) * beta_val;
+        float vn_b = (v_b - sum_b) * beta_val;
+        float2 vn_a_pair = make_float2(vn_a, vn_a);
+        float2 vn_b_pair = make_float2(vn_b, vn_b);
+        ha_pair0 = fma_f32x2_rn_ftz(k_pair0_1, vn_a_pair, ha_pair0);
+        ha_pair1 = fma_f32x2_rn_ftz(k_pair1_1, vn_a_pair, ha_pair1);
+        hb_pair0 = fma_f32x2_rn_ftz(k_pair0_1, vn_b_pair, hb_pair0);
+        hb_pair1 = fma_f32x2_rn_ftz(k_pair1_1, vn_b_pair, hb_pair1);
+      }
+      float2 q_pair0_1 = make_float2(sQ[t * 128 + k_col0], sQ[t * 128 + k_col0 + 1]);
+      float2 q_pair1_1 = make_float2(sQ[t * 128 + k_col0 + 2], sQ[t * 128 + k_col0 + 3]);
+      float2 sum_hq_a_pair = fma_f32x2_rn_ftz(ha_pair0, q_pair0_1, make_float2(0.0f, 0.0f));
+      sum_hq_a_pair = fma_f32x2_rn_ftz(ha_pair1, q_pair1_1, sum_hq_a_pair);
+      float2 sum_hq_b_pair = fma_f32x2_rn_ftz(hb_pair0, q_pair0_1, make_float2(0.0f, 0.0f));
+      sum_hq_b_pair = fma_f32x2_rn_ftz(hb_pair1, q_pair1_1, sum_hq_b_pair);
+      float sum_hq_a = sum_hq_a_pair.x + sum_hq_a_pair.y;
+      float sum_hq_b = sum_hq_b_pair.x + sum_hq_b_pair.y;
+      float _warp_reduce_13 = sum_hq_a;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_13 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_13, offset);
+      sum_hq_a = _warp_reduce_13;
+      float _warp_reduce_14 = sum_hq_b;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_14 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_14, offset);
+      sum_hq_b = _warp_reduce_14;
+      if (lane_local == 0) {
+        long long out_index = (long long)n * out_stride_p0 + (long long)t * out_stride_p1 +
+                              (long long)h * out_stride_p2;
+        out[out_index + (long long)v_row_a] = sum_hq_a;
+        out[out_index + (long long)v_row_b] = sum_hq_b;
+      }
+      if (use_ssm_state_indices != 0) {
+        int ssm_slot = ssm_state_indices[(long long)n * ssm_state_indices_stride_p0 +
+                                         (long long)t * ssm_state_indices_stride_p1];
+        if (ssm_slot >= 0 && state_pool_size > (long long)ssm_slot) {
+          long long snap_base = (long long)ssm_slot * state_stride_p0 +
+                                (long long)h * state_stride_p1 + (long long)k_col0;
+          r_h[0] = ha_pair0.x;
+          r_h[1] = ha_pair0.y;
+          r_h[2] = ha_pair1.x;
+          r_h[3] = ha_pair1.y;
+          {
+            float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+            *reinterpret_cast<float4*>(state + snap_base + (long long)v_row_a * state_stride_p2) =
+                _v4;
+          }
+          r_h[0] = hb_pair0.x;
+          r_h[1] = hb_pair0.y;
+          r_h[2] = hb_pair1.x;
+          r_h[3] = hb_pair1.y;
+          {
+            float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+            *reinterpret_cast<float4*>(state + snap_base + (long long)v_row_b * state_stride_p2) =
+                _v4;
+          }
+        }
+      }
+    }
+    if (write_state_slot_valid != 0) {
+      if (disable_state_update == 0) {
+        if (use_ssm_state_indices == 0) {
+          r_h[0] = ha_pair0.x;
+          r_h[1] = ha_pair0.y;
+          r_h[2] = ha_pair1.x;
+          r_h[3] = ha_pair1.y;
+          {
+            float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+            *reinterpret_cast<float4*>(state + write_state_head_base +
+                                       (long long)v_row_a * state_stride_p2 + (long long)k_col0) =
+                _v4;
+          }
+          r_h[0] = hb_pair0.x;
+          r_h[1] = hb_pair0.y;
+          r_h[2] = hb_pair1.x;
+          r_h[3] = hb_pair1.y;
+          {
+            float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+            *reinterpret_cast<float4*>(state + write_state_head_base +
+                                       (long long)v_row_b * state_stride_p2 + (long long)k_col0) =
+                _v4;
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int row_group = 0; row_group < 0; row_group += 4) {
       int local_row = row_group + warp_local;
       int v_row = split_v_base + local_row;
       float2 h_pair0 =
@@ -330,50 +458,50 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
       float2 h_pair1 =
           make_float2(sState[local_row * 128 + k_col0 + 2], sState[local_row * 128 + k_col0 + 3]);
 #pragma unroll
-      for (int t = 0; t < 1; t++) {
-        float decay_val = sAlpha[t];
-        float2 decay_pair = make_float2(decay_val, decay_val);
-        h_pair0 = mul_f32x2(h_pair0, decay_pair);
-        h_pair1 = mul_f32x2(h_pair1, decay_pair);
+      for (int t_1 = 0; t_1 < 1; t_1++) {
+        float decay_val_1 = sAlpha[t_1];
+        float2 decay_pair_1 = make_float2(decay_val_1, decay_val_1);
+        h_pair0 = mul_f32x2(h_pair0, decay_pair_1);
+        h_pair1 = mul_f32x2(h_pair1, decay_pair_1);
 #pragma unroll
-        for (int j = 0; j < 3; j++) {
-          int m = t * 3 + j;
-          float2 k_pair0_1 = make_float2(sK[m * 128 + k_col0], sK[m * 128 + k_col0 + 1]);
-          float2 k_pair1_1 = make_float2(sK[m * 128 + k_col0 + 2], sK[m * 128 + k_col0 + 3]);
-          float2 sum_hk_pair = fma_f32x2_rn_ftz(h_pair0, k_pair0_1, make_float2(0.0f, 0.0f));
-          sum_hk_pair = fma_f32x2_rn_ftz(h_pair1, k_pair1_1, sum_hk_pair);
+        for (int j_1 = 0; j_1 < 3; j_1++) {
+          int m_1 = t_1 * 3 + j_1;
+          float2 k_pair0_2 = make_float2(sK[m_1 * 128 + k_col0], sK[m_1 * 128 + k_col0 + 1]);
+          float2 k_pair1_2 = make_float2(sK[m_1 * 128 + k_col0 + 2], sK[m_1 * 128 + k_col0 + 3]);
+          float2 sum_hk_pair = fma_f32x2_rn_ftz(h_pair0, k_pair0_2, make_float2(0.0f, 0.0f));
+          sum_hk_pair = fma_f32x2_rn_ftz(h_pair1, k_pair1_2, sum_hk_pair);
           float sum_hk = sum_hk_pair.x + sum_hk_pair.y;
-          float _warp_reduce_11 = sum_hk;
+          float _warp_reduce_15 = sum_hk;
 #pragma unroll
           for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_11 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_11, offset);
-          sum_hk = _warp_reduce_11;
-          float v_val = sV[m * 8 + local_row];
-          float beta_val = sBeta[m];
-          float v_new = (v_val - sum_hk) * beta_val;
+            _warp_reduce_15 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_15, offset);
+          sum_hk = _warp_reduce_15;
+          float v_val = sV[m_1 * 8 + local_row];
+          float beta_val_1 = sBeta[m_1];
+          float v_new = (v_val - sum_hk) * beta_val_1;
           float2 v_new_pair = make_float2(v_new, v_new);
-          h_pair0 = fma_f32x2_rn_ftz(k_pair0_1, v_new_pair, h_pair0);
-          h_pair1 = fma_f32x2_rn_ftz(k_pair1_1, v_new_pair, h_pair1);
+          h_pair0 = fma_f32x2_rn_ftz(k_pair0_2, v_new_pair, h_pair0);
+          h_pair1 = fma_f32x2_rn_ftz(k_pair1_2, v_new_pair, h_pair1);
         }
-        float2 q_pair0_1 = make_float2(sQ[t * 128 + k_col0], sQ[t * 128 + k_col0 + 1]);
-        float2 q_pair1_1 = make_float2(sQ[t * 128 + k_col0 + 2], sQ[t * 128 + k_col0 + 3]);
-        float2 sum_hq_pair = fma_f32x2_rn_ftz(h_pair0, q_pair0_1, make_float2(0.0f, 0.0f));
-        sum_hq_pair = fma_f32x2_rn_ftz(h_pair1, q_pair1_1, sum_hq_pair);
+        float2 q_pair0_2 = make_float2(sQ[t_1 * 128 + k_col0], sQ[t_1 * 128 + k_col0 + 1]);
+        float2 q_pair1_2 = make_float2(sQ[t_1 * 128 + k_col0 + 2], sQ[t_1 * 128 + k_col0 + 3]);
+        float2 sum_hq_pair = fma_f32x2_rn_ftz(h_pair0, q_pair0_2, make_float2(0.0f, 0.0f));
+        sum_hq_pair = fma_f32x2_rn_ftz(h_pair1, q_pair1_2, sum_hq_pair);
         float sum_hq = sum_hq_pair.x + sum_hq_pair.y;
-        float _warp_reduce_12 = sum_hq;
+        float _warp_reduce_16 = sum_hq;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-          _warp_reduce_12 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_12, offset);
-        sum_hq = _warp_reduce_12;
+          _warp_reduce_16 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_16, offset);
+        sum_hq = _warp_reduce_16;
         if (lane_local == 0) {
-          long long out_index = (long long)n * out_stride_p0 + (long long)t * out_stride_p1 +
-                                (long long)h * out_stride_p2;
-          out[out_index + (long long)v_row] = sum_hq;
+          long long out_index_1 = (long long)n * out_stride_p0 + (long long)t_1 * out_stride_p1 +
+                                  (long long)h * out_stride_p2;
+          out[out_index_1 + (long long)v_row] = sum_hq;
         }
         if (use_ssm_state_indices != 0) {
-          int ssm_slot = ssm_state_indices[(long long)n * ssm_state_indices_stride_p0 +
-                                           (long long)t * ssm_state_indices_stride_p1];
-          if (ssm_slot >= 0 && state_pool_size > (long long)ssm_slot) {
+          int ssm_slot_1 = ssm_state_indices[(long long)n * ssm_state_indices_stride_p0 +
+                                             (long long)t_1 * ssm_state_indices_stride_p1];
+          if (ssm_slot_1 >= 0 && state_pool_size > (long long)ssm_slot_1) {
             r_h[0] = h_pair0.x;
             r_h[1] = h_pair0.y;
             r_h[2] = h_pair1.x;
@@ -381,7 +509,7 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
             {
               float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
               *reinterpret_cast<float4*>(
-                  state + (long long)ssm_slot * state_stride_p0 + (long long)h * state_stride_p1 +
+                  state + (long long)ssm_slot_1 * state_stride_p0 + (long long)h * state_stride_p1 +
                   (long long)v_row * state_stride_p2 + (long long)k_col0) = _v4;
             }
           }
