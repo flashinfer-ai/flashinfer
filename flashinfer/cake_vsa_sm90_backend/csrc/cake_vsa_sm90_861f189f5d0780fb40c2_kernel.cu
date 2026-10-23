@@ -47,7 +47,7 @@ struct CakeParamArray {
 };
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
+#define NUM_MAIN_1_STAGES 1
 #define SMEM_MSTATS_OFF 214016
 #define SMEM_MSTATS_STAGE_BYTES 1024
 #define SMEM_MSTATS_STRIDE 1024
@@ -260,7 +260,7 @@ kernel_cake_vsa_sm90_861f189f5d0780fb40c2(const __grid_constant__ CUtensorMap Q,
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Vt))) : "memory"); }
