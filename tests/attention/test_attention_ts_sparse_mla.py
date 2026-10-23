@@ -18,6 +18,7 @@ from flashinfer.attention.prims_ts import (
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
+from flashinfer.attention.prims_ts.mla_decode import _resolve_sparse_mla_plan
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -1148,22 +1149,24 @@ def test_softmax_score_jumps(heads, dtype):
     "dtype,rows,heads,capacity,threshold",
     [
         # Each case lands on a different measured schedule on 148-SM parts.
-        pytest.param(torch.bfloat16, 37, 32, 512, 32.0, id="bf16-2cta"),
-        pytest.param(torch.bfloat16, 74, 32, 512, 6.0, id="bf16-keep-deferred"),
-        pytest.param(torch.bfloat16, 74, 16, 512, 6.0, id="bf16-swap-deferred"),
-        pytest.param(torch.bfloat16, 16, 128, 512, 6.0, id="bf16-keep-bk64-split"),
-        pytest.param(torch.float8_e4m3fn, 16, 128, 512, 8.0, id="fp8-2cta"),
+        pytest.param(torch.bfloat16, 37, 32, 1024, 32.0, id="bf16-2cta"),
+        pytest.param(torch.bfloat16, 74, 32, 1024, 6.0, id="bf16-keep-deferred"),
+        pytest.param(torch.bfloat16, 74, 16, 1024, 6.0, id="bf16-swap-deferred"),
+        pytest.param(torch.bfloat16, 16, 128, 2048, 6.0, id="bf16-keep-bk64-split"),
+        pytest.param(torch.float8_e4m3fn, 16, 128, 1024, 8.0, id="fp8-2cta"),
         pytest.param(torch.float8_e4m3fn, 37, 32, 2048, 8.0, id="fp8-keep-split"),
-        pytest.param(torch.float8_e4m3fn, 1, 16, 512, 8.0, id="fp8-swap-split"),
+        pytest.param(torch.float8_e4m3fn, 74, 16, 2048, 8.0, id="fp8-swap-split"),
     ],
 )
 def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
     """An explicit threshold reaches every sparse schedule.
 
-    softmax_scale = ln 2 makes one logit unit one binade. Successive 128-slot
-    tiles raise the row maximum by threshold - 2 (kept anchor), threshold + 3
-    (rescale) and threshold - 2 again, so the dominant last tile is weighted
-    against a kept anchor. E4M3 bounds use the 1.75 probability scale.
+    softmax_scale = ln 2 makes one logit unit one binade. Successive 256-slot
+    groups, repeating every 1024 slots, raise the row maximum by threshold - 2
+    (kept anchor), by more than threshold (rescale) and by threshold - 2 again.
+    A 256-slot group spans one K tile of each of two interleaved KV streams,
+    and every split covers at least two groups, so each stream or split ends
+    on a kept anchor. E4M3 bounds use the 1.75 probability scale.
     """
     torch.manual_seed(7)
     fp8 = dtype == torch.float8_e4m3fn
@@ -1172,8 +1175,8 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
     kv = torch.randn(capacity, 1, 512, device="cuda") * 0.1
     jump = 10.0 if fp8 else threshold + 3  # E4M3 represents 6, 16 and 22
     levels = (0.0, threshold - 2, threshold - 2 + jump, 2 * threshold - 4 + jump)
-    for tile, level in enumerate(levels):
-        kv[tile * 128 : (tile + 1) * 128, :, 0] = level
+    for start in range(0, capacity, 256):
+        kv[start : start + 256, :, 0] = levels[start // 256 % 4]
     kv = kv.to(dtype)
     indices = torch.arange(capacity, device="cuda", dtype=torch.int32).repeat(
         rows, 1, 1
@@ -1185,6 +1188,9 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
     assert get_prims_ts_sparse_mla_decode_workspace_size(
         q.device, rows, heads, **args, skip_correction_threshold=threshold
     ) == get_prims_ts_sparse_mla_decode_workspace_size(q.device, rows, heads, **args)
+    _, profile, *_ = _resolve_sparse_mla_plan(
+        q.device, rows, heads, **args, skip_correction_threshold=None
+    )
     results = {}
     for value in (None, threshold):
         wrapper = BatchSparseMLADecodePagedTSWrapper()
@@ -1210,9 +1216,9 @@ def test_skip_correction_threshold(dtype, rows, heads, capacity, threshold):
         torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
     torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
     default_out, default_lse = results[None]
-    if not fp8 and threshold == 6.0:
-        # The deferred BF16 schedules already keep the anchor within six
-        # binades; the explicit threshold must reproduce them exactly.
+    if profile.defer_max_update and threshold == 6.0:
+        # Deferred schedules already keep the anchor within six binades by
+        # default; the explicit threshold must reproduce them exactly.
         assert torch.equal(out, default_out)
         assert torch.equal(lse, default_lse)
     else:
