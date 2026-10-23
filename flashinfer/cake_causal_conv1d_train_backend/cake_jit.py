@@ -1069,7 +1069,9 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # Route ``bwd_fp32g`` (hand-written fallback, sm_100a / sm_103a): the fallback body with
     # ``grad_pre="fp32"`` (SiLU' at the unrounded FP32 preactivation; its reduce program
-    # sums the partial rows in FP64 with one rounding) and ``dtype_flags=True``.
+    # sums the partial rows in FP64 with one rounding), ``fold_every=4, fold_kahan=True``
+    # and ``dtype_flags=True``, built ``min_blocks=2``: two CTAs per SM (the FP32-SiLU'
+    # body spills at the 168-register cap of three), so ``ctas_per_sm`` 2.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
@@ -1102,7 +1104,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "grid_rule": {
             "cooperative": False,
-            "ctas_per_sm": 3,
+            "ctas_per_sm": 2,
             "geometry": {
                 "threads": 128,
                 "vec": 8,
