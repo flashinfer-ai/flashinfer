@@ -1417,9 +1417,8 @@ class _CudnnPrefillPlan:
     @classmethod
     def prepare(cls, metadata, dtype, device, previous=None):
         inputs = tuple(getattr(metadata, name) for name in cls._tensor_fields)
-        exact = _prefill_descriptor_key(**metadata.graph_kwargs(None))
         enabled = _cudnn_supports_shape_override()
-        if (
+        same_descriptor = (
             previous is not None
             and previous.device == device
             and previous.dtype == dtype
@@ -1427,22 +1426,39 @@ class _CudnnPrefillPlan:
             and previous.override_enabled == enabled
             and previous.metadata._bounded_ragged == metadata._bounded_ragged
             and previous.metadata._bounded_paged == metadata._bounded_paged
-            and previous.exact_keys[True] == exact
-            and all(
-                a is b
-                or (
-                    a is not None
-                    and b is not None
-                    and a.dtype == b.dtype
-                    and a.is_set_to(b)
-                )
-                for a, b in zip(previous.inputs, inputs, strict=True)
+            and previous.exact_keys[True][0][0][1:]
+            == (
+                metadata.max_token_per_sequence,
+                metadata.max_sequence_kv,
+                metadata.max_total_num_rows,
             )
-        ):
-            # Fresh views over the same buffers can reuse the static bindings.
-            # Compare owned snapshots: set_() can rebind a caller's tensor
-            # without changing either its Python identity or descriptor.
-            return previous
+            and previous.exact_keys[True][0][1] == metadata.causal
+            and previous.exact_keys[True][1][0] == metadata.return_lse
+        )
+        if same_descriptor:
+            same_bindings = True
+            for old, new in zip(previous.inputs, inputs, strict=True):
+                if old is new:
+                    continue
+                if old is None or new is None or old.dtype != new.dtype:
+                    same_descriptor = False
+                    break
+                if old.is_set_to(new):
+                    continue
+                same_bindings = False
+                if old.shape != new.shape or old.stride() != new.stride():
+                    same_descriptor = False
+                    break
+            if same_descriptor and same_bindings:
+                return previous
+        # Pointer changes need fresh bindings, but equal descriptors can retain
+        # their immutable graph keys. Owned views also detect in-place metadata
+        # mutation without depending on the caller's Tensor identity.
+        exact = (
+            previous.exact_keys[True]
+            if same_descriptor
+            else _prefill_descriptor_key(**metadata.graph_kwargs(None))
+        )
         return cls(
             metadata,
             dtype,
@@ -1464,14 +1480,17 @@ class _CudnnPrefillPlan:
         inputs,
         override_enabled,
     ):
+        # Keep the snapshots private to this plan; the caller may reuse and
+        # mutate its metadata object after prepare() returns.
         views = {}
-        for name in self._tensor_fields:
-            tensor = getattr(metadata, name)
+        for tensor in inputs:
             if tensor is not None:
                 if id(tensor) not in views:
                     views[id(tensor)] = tensor.detach()
-                setattr(metadata, name, views[id(tensor)])
         self.inputs = tuple(None if t is None else views[id(t)] for t in inputs)
+        metadata = replace(
+            metadata, **dict(zip(self._tensor_fields, self.inputs, strict=True))
+        )
         self.metadata = metadata
         self.device = device
         self.override_enabled = override_enabled
