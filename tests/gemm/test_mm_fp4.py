@@ -194,6 +194,7 @@ def test_mm_fp4(
 
 @pytest.mark.parametrize("use_8x4_sf_layout", [False, True])
 def test_mm_fp4_autotune_profile_memory(use_8x4_sf_layout):
+    """Reject large FP32 temporaries when preparing FP4 output and workspace."""
     config = (
         _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
     )
