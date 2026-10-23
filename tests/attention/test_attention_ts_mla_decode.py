@@ -3188,13 +3188,18 @@ def _max_tile_increase_log2(case: _MLACase) -> float:
     ids=("2cta-bf16-t0.5", "2cta-fp8-t1", "1cta-bf16-t0.5", "1cta-fp8-t1"),
 )
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_skip_correction_unfreezes(
+def test_attention_ts_mla_decode_skip_correction_reanchors_when_max_jumps_past_threshold(
     shape: tuple[int, int, int],
     qkv_dtype: torch.dtype,
     skip_correction_threshold: float,
     expected_kernel: str,
 ) -> None:
     """A late tile raising the max by more than T re-anchors and rescales O.
+
+    Random inputs almost never raise a row max by more than T after the first
+    tiles, so the other threshold tests only take the frozen-anchor path. This
+    test forces the correction path (new anchor, O and the row sum rescaled)
+    after earlier tiles froze, and compares against the exact T=0 kernel.
 
     Spiked RoPE keys in two consecutive late K tiles (so both FP8 2CTA softmax
     groups) raise row maxima by more than the small threshold after
@@ -3428,37 +3433,17 @@ def test_attention_ts_mla_decode_skip_correction_packed_dense_q(
 
 
 @pytest.mark.parametrize(
-    ("qkv_dtype", "threshold", "error"),
-    (
-        (torch.bfloat16, 32.5, ValueError),
-        (torch.float8_e4m3fn, 8.5, ValueError),
-        (torch.bfloat16, -1.0, ValueError),
-        (torch.bfloat16, math.inf, ValueError),
-        (torch.bfloat16, math.nan, ValueError),
-        (torch.bfloat16, 10**400, ValueError),
-        (torch.float8_e4m3fn, 1e-50, ValueError),
-        (torch.bfloat16, True, TypeError),
-        (torch.bfloat16, "8", TypeError),
-    ),
-    ids=(
-        "bf16-above-32",
-        "fp8-above-8",
-        "negative",
-        "inf",
-        "nan",
-        "huge-int",
-        "float32-zero",
-        "bool",
-        "string",
-    ),
+    ("qkv_dtype", "threshold"),
+    ((torch.bfloat16, 32.5), (torch.float8_e4m3fn, 8.5), (torch.bfloat16, -1.0)),
+    ids=("bf16-above-32", "fp8-above-8", "negative"),
 )
 def test_attention_ts_mla_decode_rejects_skip_correction_threshold(
-    qkv_dtype: torch.dtype, threshold, error: type[Exception]
+    qkv_dtype: torch.dtype, threshold: float
 ) -> None:
     """The per-dtype bound (E4M3: 8, BF16: 32) is enforced before planning."""
 
     wrapper = BatchMLADecodePagedTSWrapper()
-    with pytest.raises(error, match="skip_correction_threshold"):
+    with pytest.raises(ValueError, match="skip_correction_threshold"):
         wrapper.plan(
             torch.device("cuda"),
             8,

@@ -691,10 +691,14 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
-def _validate_mla_skip_correction_threshold(
+def _check_skip_correction_threshold_range(
     threshold: object, *, q_dtype: torch.dtype
 ) -> float:
-    """Validate the skip-correction threshold against its per-dtype bound."""
+    """Return the threshold as float32-rounded ``float``; raise if out of range.
+
+    Values outside ``[0, bound]`` (E4M3: 8, BF16: 32) raise instead of being
+    clamped, as trtllm-gen's ``checkSkipCorrThreshold`` does.
+    """
 
     from .kernels.mla_decode.helpers.math import validate_skip_corr_threshold
 
@@ -1604,7 +1608,7 @@ class BatchMLADecodePagedTSWrapper:
             _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
         # Range-check the threshold even when validate is False: it selects a
         # compiled kernel, and a value past the per-dtype bound saturates FP8 P.
-        skip_correction_threshold = _validate_mla_skip_correction_threshold(
+        skip_correction_threshold = _check_skip_correction_threshold_range(
             skip_correction_threshold, q_dtype=q_data_type
         )
 
@@ -2215,7 +2219,7 @@ def _resolve_sparse_mla_plan(
     if kv_layout not in ("NHD", "HND"):
         raise ValueError("kv_layout must be NHD or HND")
     if skip_correction_threshold is not None:
-        skip_correction_threshold = _validate_mla_skip_correction_threshold(
+        skip_correction_threshold = _check_skip_correction_threshold_range(
             skip_correction_threshold, q_dtype=q_data_type
         )
     max_rows = batch_size * max_seq_len_q
