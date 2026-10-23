@@ -132,7 +132,7 @@ def test_blackwell_layer_graph_and_weight_formats(
                 intermediate_size=intermediate,
                 top_k=topk,
                 kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
-                apply_topk_in_fc1=early,
+                apply_routing_weights_before_fc2=early,
             )
         kwargs = (
             dict(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from .....config import FinalizeMode
 from .....core.kernel.base import MegaKernelBackend
 from .....core.kernel.registry import register_mega_kernel
 from .....core.runtime import (
@@ -38,9 +39,17 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "Parameterized SwiGLU is not in this provider snapshot."
             )
-        if not getattr(config, "do_finalize", True):
+        mode = config.finalize_mode
+        if mode is FinalizeMode.AUTO:
+            mode = (
+                FinalizeMode.DEFAULT
+                if config.num_valid_tokens_tensor is None
+                else FinalizeMode.PERSISTENT
+            )
+        if mode is not FinalizeMode.DEFAULT:
             raise MoEEpConfigError(
-                "Deferred finalization is not in this provider snapshot."
+                f"The standard backend does not support finalize_mode={mode.name}; "
+                "use DEFAULT or AUTO without num_valid_tokens_tensor."
             )
         if (
             getattr(config, "activation", "swiglu") == "situ"
@@ -155,7 +164,9 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             activation=getattr(k, "activation", "swiglu"),
             situ_beta=getattr(k, "situ_beta", None),
             situ_linear_beta=getattr(k, "situ_linear_beta", None),
-            apply_topk_at_fc1=getattr(k, "apply_topk_in_fc1", True),
+            apply_routing_weights_before_fc2=getattr(
+                k, "apply_routing_weights_before_fc2", True
+            ),
             combine_dtype=wire,
             reduce_topk_in_kernel=reduce,
             enable_fc1_activation_per_token_scale=getattr(

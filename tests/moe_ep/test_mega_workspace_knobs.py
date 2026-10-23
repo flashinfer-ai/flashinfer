@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from contextlib import nullcontext
 from unittest import mock
 
 import pytest
@@ -238,6 +239,7 @@ def test_blackwell_genphase_backend_weights_and_layout_validation(
 def make_layer(monkeypatch):
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        FinalizeMode,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -272,7 +274,10 @@ def make_layer(monkeypatch):
             MoEWeightPack(w13=torch.empty(0), w2=torch.empty(0)),
             MegaConfig(
                 megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                    intermediate_size=128, top_k=2, knobs=knobs
+                    intermediate_size=128,
+                    top_k=2,
+                    knobs=knobs,
+                    finalize_mode=FinalizeMode.DEFAULT,
                 ),
                 preprocess_weights=False,
                 transformed_weights=(mock.sentinel.w1, mock.sentinel.w2),
@@ -654,7 +659,6 @@ def test_blackwell_standard_and_genphase_share_epilogue(kind, monkeypatch):
     [
         {"knobs": "auto"},
         {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
-        {"do_finalize": False},
         {"activation": "situ", "situ_beta": 7.0},
     ],
 )
@@ -671,6 +675,92 @@ def test_blackwell_standard_rejects_missing_provider_features(kwargs):
     )
     with pytest.raises(MoEEpConfigError):
         create_mega_kernel(config)
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "mode,live_count,supported",
+    [
+        ("AUTO", False, True),
+        ("AUTO", True, False),
+        ("DEFAULT", False, True),
+        ("DEFAULT", True, True),
+        ("PERSISTENT", True, False),
+        ("NONE", False, False),
+    ],
+)
+def test_blackwell_standard_finalize_modes(kind, mode, live_count, supported):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.config import FinalizeMode
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    config_type = (
+        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        if kind == "nvfp4"
+        else moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    )
+    config = config_type(
+        intermediate_size=192,
+        top_k=3,
+        kernel_name=f"sm100_{kind}_{kind}_bf16_cutedsl_next",
+        finalize_mode=FinalizeMode[mode],
+        num_valid_tokens_tensor=torch.tensor([7], dtype=torch.int32)
+        if live_count
+        else None,
+    )
+    if supported:
+        create_mega_kernel(config)
+    else:
+        with pytest.raises(MoEEpConfigError, match="finalize_mode"):
+            create_mega_kernel(config)
+
+
+@pytest.mark.parametrize("kwargs", [{"finalize_mode": "CAKE"}, {"do_finalize": False}])
+def test_blackwell_standard_nvfp4_finalize_compat(kwargs):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.config import FinalizeMode
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    if "finalize_mode" in kwargs:
+        kwargs = {"finalize_mode": FinalizeMode[kwargs["finalize_mode"]]}
+    with (
+        pytest.warns(DeprecationWarning, match="do_finalize")
+        if "do_finalize" in kwargs
+        else nullcontext()
+    ):
+        config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=192,
+            top_k=3,
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+            **kwargs,
+        )
+    with pytest.raises(MoEEpConfigError, match="finalize_mode"):
+        create_mega_kernel(config)
+
+
+@pytest.mark.parametrize("early", [True, False])
+def test_blackwell_standard_forwards_routing_weights(early, monkeypatch):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=192,
+        top_k=3,
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+        apply_routing_weights_before_fc2=early,
+    )
+    backend = create_mega_kernel(config)
+    backend.bind_ep_bootstrap(
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    fleet = moe_ep.FleetParams(
+        num_experts=8, max_tokens_per_rank=129, token_hidden_size=384
+    )
+    cfg = backend._workspace_config(fleet)
+    assert cfg.apply_routing_weights_before_fc2 is early
 
 
 def test_blackwell_genphase_import_is_lazy():

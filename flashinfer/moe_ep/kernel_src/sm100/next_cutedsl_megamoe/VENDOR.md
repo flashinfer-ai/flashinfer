@@ -52,9 +52,11 @@ in the legacy package.
 The standard adapter accepts `knobs=None` or a dictionary. It supports early
 and late routing weights, BF16 or quantized combine, in-kernel BF16 reduction,
 and NVFP4 per-token FC1 activation scales. SiTU requires both bounds.
-Parameterized SwiGLU, deferred finalization, online autotuning and IKET capture
-are unavailable through these selectors. Legacy scheduler controls without an
-equivalent in the standard kernel are rejected before allocation.
+Finalization supports `FinalizeMode.DEFAULT` and `AUTO` without a live-token
+count. Persistent, deferred and CAKE finalization, parameterized SwiGLU, online
+autotuning and IKET capture are unavailable through these selectors. Legacy
+scheduler controls without an equivalent in the standard kernel are rejected
+before allocation.
 
 The GenPhase autotuner keeps its existing interface. Its cache revision changes
 with this export, and the shim preserves its previous default FC2 staging depth.

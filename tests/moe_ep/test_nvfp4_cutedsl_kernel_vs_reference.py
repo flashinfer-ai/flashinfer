@@ -68,7 +68,7 @@ def test_blackwell_standard_provider_graph(
         rank=0,
         world_size=1,
         quant_kind=kind,
-        apply_topk_at_fc1=early,
+        apply_routing_weights_before_fc2=early,
     )
     ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
     graph = None

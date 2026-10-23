@@ -9,6 +9,8 @@ import os
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 from .block_scaled import (
     BlockScaledMoeConfig,
     BlockScaledSymmBuffer,
@@ -17,6 +19,7 @@ from .block_scaled import (
 )
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
     """Standard block-scaled inference with native Blackwell instruction K."""
