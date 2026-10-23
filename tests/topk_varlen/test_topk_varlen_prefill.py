@@ -620,9 +620,15 @@ def test_prefill_max_window_len_validation():
                 flashinfer.top_k_varlen(lg, le, k, row_starts=rs, max_window_len=bad)
     # decode mode takes the bound too (on seq_lens, in tokens) and refuses a
     # bad value the same way, any backend
-    for bad in (0, "8", True):
+    for bad in (0, -1, "8", 2.5, True):
         with pytest.raises(ValueError, match="max_window_len"):
             flashinfer.top_k_varlen(lg, le, k, max_window_len=bad)
+    # ... while a positive bound is accepted: rows within it rank in full
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    flashinfer.top_k_varlen(lg, le, k, max_window_len=n, out_indices=out)
+    assert bool((out >= 0).all()) and bool((out < n).all())
+    got = lg.gather(1, out.long()).sort(dim=1).values
+    assert torch.equal(got, torch.topk(lg, k, dim=1).values.sort(dim=1).values)
 
 
 def test_prefill_api_validation_and_admission():

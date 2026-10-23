@@ -794,31 +794,35 @@ def test_gvr2_rows_far_shorter_than_envelope(
 
 
 _REPLAY_CASES = [
-    # rows, capacity (columns), top_k, family at the capacity
-    (100, 131072, 512, "main"),  # one-wave 1024-thread slab
-    (4, 262144, 1024, "main"),  # SPLIT slab, R=37
-    (64, 131072, 512, "clus"),  # 2-CTA cluster split
-    (8, 65536, 2048, "reg_clus"),  # clustered register-resident, K > 1024
-    (200, 65536, 512, "main"),  # two-CTA (512, 8, 2) slab
+    # rows, capacity (columns), top_k, decode bound (tokens), family of the launch
+    (100, 131072, 512, None, "main"),  # one-wave 1024-thread slab
+    (4, 262144, 1024, None, "main"),  # SPLIT slab, R=37
+    (64, 131072, 512, None, "clus"),  # 2-CTA cluster split
+    (8, 65536, 2048, None, "reg_clus"),  # clustered register-resident, K > 1024
+    (200, 65536, 512, None, "main"),  # two-CTA (512, 8, 2) slab
+    (64, 1048576, 512, 16384, "reg"),  # V4.1 c1 buffer, the <= 16K-token graphs
 ]
 
 
 @requires_gvr2
-@pytest.mark.parametrize("rows,cap_c,top_k,family", _REPLAY_CASES)
+@pytest.mark.parametrize("rows,cap_c,top_k,bound,family", _REPLAY_CASES)
 @pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
 def test_gvr2_graph_replay_lengths_change_after_capture(
-    rows, cap_c, top_k, family, hinted
+    rows, cap_c, top_k, bound, family, hinted
 ):
-    """One capture at the capacity, then replays whose lengths were rewritten
-    in place: all far below the capacity, full-width rows mixed with short
-    ones, every row short (identity path, empty rows included), and a random
-    draw. Scores are redrawn and the output poisoned before each replay."""
+    """One capture at the capacity (or under a decode bound, which plans the
+    launch for the bound and which every replay keeps to), then replays whose
+    lengths were rewritten in place: all far below the capacity, full-width
+    rows mixed with short ones, every row short (identity path, empty rows
+    included), and a random draw. Scores are redrawn and the output poisoned
+    before each replay."""
     gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
     hgen = torch.Generator().manual_seed(rows)
+    cap = cap_c if bound is None else bound  # the longest row a replay may hold
 
     def draw():
         return [
-            int(torch.randint(0, cap_c + 1, (1,), generator=hgen)) for _ in range(rows)
+            int(torch.randint(0, cap + 1, (1,), generator=hgen)) for _ in range(rows)
         ]
 
     cols = draw()
@@ -831,20 +835,23 @@ def test_gvr2_graph_replay_lengths_change_after_capture(
             0, 1000, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
         )
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    kw = dict(out_indices=out)
+    if bound is not None:
+        kw["max_window_len"] = bound
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
-    _forget_launcher(rows, cap_c, top_k, 1, 1, hint_free=not hinted)
+    _forget_launcher(rows, cap_c, top_k, 1, 1, hint_free=not hinted, n_env=bound)
     with torch.cuda.stream(s):  # eager warm-up on the capturing stream
-        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
     torch.cuda.synchronize()
-    _assert_family(rows, cap_c, top_k, 1, 1, family, hint_free=not hinted)
+    _assert_family(rows, cap_c, top_k, 1, 1, family, hint_free=not hinted, n_env=bound)
     _check_varlen_rows(logits, out, cols, top_k)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
-        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
     torch.cuda.current_stream().wait_stream(s)
-    short = _envelope_cols(rows, cap_c, top_k, seed=rows)
-    mixed = [cap_c if r % 3 == 0 else c for r, c in enumerate(short)]
+    short = [min(c, cap) for c in _envelope_cols(rows, cap, top_k, seed=rows)]
+    mixed = [cap if r % 3 == 0 else c for r, c in enumerate(short)]
     tiny = [(r * 37) % (top_k + 1) for r in range(rows)]
     for cols in (short, mixed, tiny, draw()):
         seq_lens.copy_(torch.tensor(cols, dtype=torch.int32, device=_DEV))
@@ -853,145 +860,6 @@ def test_gvr2_graph_replay_lengths_change_after_capture(
         g.replay()
         torch.cuda.synchronize()
         _check_varlen_rows(logits, out, cols, top_k)
-
-
-# ---------------------------------------------------------------------------
-# decode-mode length bound (max_window_len without row_starts)
-# ---------------------------------------------------------------------------
-
-_BOUND_CASES = [
-    # rows, capacity (columns), bound (tokens), top_k, cr, family at the
-    # capacity, family at the bound
-    (64, 1048576, 16384, 512, 1, "clus", "reg"),  # V4.1 c1, <= 16K-token graphs
-    (148, 524288, 8192, 512, 1, "main", "reg"),  # V4.1 c2 as compressed lengths
-    (4, 262144, 65536, 1024, 4, "main", "reg"),  # c4 1M-token buffer, SPLIT plan
-    (8, 262144, 131072, 512, 4, "main", "reg_clus"),
-]
-
-
-@requires_gvr2
-@pytest.mark.parametrize("rows,cap_c,bound,top_k,cr,fam_cap,fam_bound", _BOUND_CASES)
-def test_gvr2_decode_bound_launches_the_bound_plan(
-    rows, cap_c, bound, top_k, cr, fam_cap, fam_bound
-):
-    """In decode, a bound below what the buffer holds replaces the logits
-    width as the launch envelope: the capacity-sized buffer launches the plan
-    of the bound. Both launches rank every row exactly."""
-    n_b = bound // cr
-    hgen = torch.Generator().manual_seed(rows + bound)
-    cols = [n_b, n_b - 1, top_k + 1, top_k, 0, 2 * top_k + 1][:rows]
-    while len(cols) < rows:
-        cols.append(int(torch.randint(1, n_b + 1, (1,), generator=hgen)))
-    kv = [c * cr for c in cols]
-    logits, seq_lens, _, n_r, _ = _make_varlen_case(
-        kv, 1, cr, top_k, seed=rows, msl_c=cap_c
-    )
-    for kw, n_env, family in (
-        ({}, cap_c, fam_cap),
-        ({"max_window_len": bound}, n_b, fam_bound),
-    ):
-        _forget_launcher(rows, cap_c, top_k, 1, cr, hint_free=True, n_env=n_env)
-        indices, _ = _run_gvr2(logits, seq_lens, top_k, None, compress_ratio=cr, **kw)
-        _assert_family(rows, cap_c, top_k, 1, cr, family, hint_free=True, n_env=n_env)
-        _check_varlen_rows(logits, indices, n_r, top_k)
-
-
-@requires_gvr2
-@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
-def test_gvr2_decode_bound_graph_replay(hinted):
-    """The bound is fixed at capture: replays may rewrite lengths and scores in
-    place while every seq_lens entry stays within it."""
-    rows, cap_c, bound, top_k = 64, 1048576, 16384, 512
-    gen = torch.Generator(device=_DEV).manual_seed(41)
-    hgen = torch.Generator().manual_seed(41)
-
-    def draw():
-        return [
-            int(torch.randint(0, bound + 1, (1,), generator=hgen)) for _ in range(rows)
-        ]
-
-    cols = draw()
-    logits = torch.empty(rows, cap_c, device=_DEV)
-    _refill(logits, cols, gen)
-    seq_lens = torch.tensor(cols, dtype=torch.int32, device=_DEV)
-    pre_idx = None
-    if hinted:
-        pre_idx = torch.randint(
-            0, 1000, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
-        )
-    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    kw = dict(out_indices=out, max_window_len=bound)
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    _forget_launcher(rows, cap_c, top_k, 1, 1, hint_free=not hinted, n_env=bound)
-    with torch.cuda.stream(s):
-        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
-    torch.cuda.synchronize()
-    _assert_family(rows, cap_c, top_k, 1, 1, "reg", hint_free=not hinted, n_env=bound)
-    _check_varlen_rows(logits, out, cols, top_k)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
-        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
-    torch.cuda.current_stream().wait_stream(s)
-    tiny = [(r * 37) % (top_k + 1) for r in range(rows)]
-    for cols in (draw(), [bound] * rows, tiny, draw()):
-        seq_lens.copy_(torch.tensor(cols, dtype=torch.int32, device=_DEV))
-        _refill(logits, cols, gen)
-        out.fill_(-7)
-        g.replay()
-        torch.cuda.synchronize()
-        _check_varlen_rows(logits, out, cols, top_k)
-
-
-@requires_gvr2
-@pytest.mark.parametrize(
-    "rows,cap_c,bound_c,family",
-    [(8, 65536, 4096, "reg"), (100, 262144, 131072, "main")],
-)
-def test_gvr2_decode_bound_violation_truncates(rows, cap_c, bound_c, family):
-    """Outside the contract, as documented: gvr_2 ranks a request longer than
-    the bound over its first max_window_len // compress_ratio columns; the
-    other backends ignore the bound and rank the whole row."""
-    top_k, cr = 512, 4
-    hgen = torch.Generator().manual_seed(rows)
-    cols = [2 * bound_c, bound_c, bound_c + 1, 100, cap_c]
-    while len(cols) < rows:
-        cols.append(int(torch.randint(1, cap_c + 1, (1,), generator=hgen)))
-    kv = [c * cr for c in cols]
-    logits, seq_lens, _, n_r, _ = _make_varlen_case(
-        kv, 1, cr, top_k, seed=rows, msl_c=cap_c
-    )
-    _forget_launcher(rows, cap_c, top_k, 1, cr, hint_free=True, n_env=bound_c)
-    indices, _ = _run_gvr2(
-        logits, seq_lens, top_k, None, compress_ratio=cr, max_window_len=bound_c * cr
-    )
-    _assert_family(rows, cap_c, top_k, 1, cr, family, hint_free=True, n_env=bound_c)
-    _check_varlen_rows(logits, indices, [min(n, bound_c) for n in n_r], top_k)
-    full, _ = flashinfer.top_k_varlen(
-        logits,
-        seq_lens,
-        top_k,
-        compress_ratio=cr,
-        max_window_len=bound_c * cr,
-        backend="radix_cutlass",
-        out_indices=torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV),
-    )
-    _check_varlen_rows(logits, full, n_r, top_k)
-
-
-@requires_gvr2
-def test_gvr2_decode_bound_validation():
-    logits = torch.randn(4, 4096, device=_DEV)
-    seq_lens = torch.full((4,), 4096, dtype=torch.int32, device=_DEV)
-    for bad in (0, -1, "8", 2.5, True):
-        with pytest.raises(ValueError, match="max_window_len"):
-            _run_gvr2(logits, seq_lens, 512, None, max_window_len=bad)
-    # a bound at or above what the buffer holds is the default envelope
-    for bound in (4096, 1 << 30):
-        _forget_launcher(4, 4096, 512, 1, 1, hint_free=True)
-        indices, _ = _run_gvr2(logits, seq_lens, 512, None, max_window_len=bound)
-        _assert_family(4, 4096, 512, 1, 1, "reg", hint_free=True)
-        _check_varlen_rows(logits, indices, [4096] * 4, 512)
 
 
 # ---------------------------------------------------------------------------
@@ -1064,11 +932,13 @@ def _hard_logits(pattern, n_r, width, top_k, seed):
     return x
 
 
-def _injective_page_table(batch, width, page_size):
+def _injective_page_table(batch, width, page_size, which=0):
     """Page table q -> q * pages + (p * mult) % pages (injective per request,
-    so paged output maps back to columns) and the inverse map."""
+    so paged output maps back to columns) and the inverse map; ``which``
+    picks another multiplier coprime to the page count (another table)."""
     pages = (width + page_size - 1) // page_size
-    mult = next(m for m in (7, 5, 11, 13) if math.gcd(m, pages) == 1)
+    mults = [m for m in (7, 5, 11, 13, 17, 19) if math.gcd(m, pages) == 1]
+    mult = mults[which % len(mults)]
     p = torch.arange(pages, device=_DEV, dtype=torch.int64)
     base = torch.arange(batch, device=_DEV, dtype=torch.int64).unsqueeze(1) * pages
     pt = (base + (p * mult) % pages).to(torch.int32).contiguous()
@@ -1145,11 +1015,13 @@ _SAMPLE_GATE_CASES = [
     "rows,width,top_k,scap,page_size,pattern", _with_patterns(_SAMPLE_GATE_CASES)
 )
 def test_gvr2_small_row_sample_hard_rows(rows, width, top_k, scap, page_size, pattern):
-    """Hint-free rows on both edges of the small-row sample (2k < n <= SCAP)
-    and of SCAP itself on every one-CTA-per-row slab that samples them."""
+    """Hint-free rows on both edges of the small-row sample (2k < n <= SCAP),
+    of SCAP itself and on the 4k and 8k marks on every one-CTA-per-row slab
+    that samples them."""
     assert _main_reg_cap(rows, width, top_k) == 0  # streamed, not register rows
     edges = [2 * top_k + d for d in range(-1, 6)] + [scap + d for d in (-1, 0, 1, 3, 4)]
-    edges += [top_k, top_k + 1, 1, 0, scap // 2 + 3]
+    edges += [top_k, top_k + 1, 1, 0, scap // 2 + 3, 4 * top_k, 4 * top_k + 1]
+    edges += [8192, 8196]
     gen = torch.Generator().manual_seed(rows + width + top_k)
     n_r = [
         edges[r]
@@ -1158,7 +1030,9 @@ def test_gvr2_small_row_sample_hard_rows(rows, width, top_k, scap, page_size, pa
         for r in range(rows)
     ]
     logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + top_k)
-    _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+    lc = _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+    if _host._sm_count() == 148:  # the B200 plan samples these rows (sd_en > 0)
+        assert lc[3][3] > 0, lc[3]
 
 
 # Streaming rows whose crossing refine narrows a flood in key space: more than
@@ -1285,6 +1159,8 @@ _BOUND_EDGE_CASES = [
     (16, 1048576, 513, 512, 1, 1, "reg"),  # bound = top_k + 1
     (16, 262144, 16383, 512, 4, 1, "reg"),  # not a multiple of cr: 4095 columns
     (16, 262144, 16386, 1024, 4, 2, "reg"),  # ... with next_n rows
+    (4, 262144, 65536, 1024, 4, 1, "reg"),  # cr 4 on a 1M-token buffer: 16K columns
+    (8, 262144, 131072, 512, 4, 1, "reg_clus"),  # ... 32K columns
     (8, 1048576, 65536, 512, 1, 1, "reg_clus"),
     (32, 1048576, 262144, 512, 1, 1, "clus"),  # one-chunk and longer rows
     (48, 262144, 262147, 512, 4, 3, "clus"),  # 65536 columns, three rows per request
@@ -1302,7 +1178,8 @@ def test_gvr2_decode_bound_edges(
     """Rows at, just below and beyond a decode bound in every family the
     bound selects: requests within it rank in full, longer ones over their
     first ``bound // cr`` columns (the documented truncation), never past the
-    buffer, unpaged and paged."""
+    buffer, unpaged and paged. Only gvr_2 uses the bound: radix_cutlass ranks
+    every request in full."""
     nb = bound // cr
     kv = [bound, bound - 1, bound + 1, 2 * bound, width * cr, bound - cr, 0, 1]
     kv += [(top_k + 1) * cr + next_n - 1, top_k * cr, (2 * top_k + 1) * cr + next_n]
@@ -1326,6 +1203,17 @@ def test_gvr2_decode_bound_edges(
         page_size=page_size,
         max_window_len=bound,
     )
+    if page_size is None and next_n == 1 and cr == 4:
+        full, _ = flashinfer.top_k_varlen(
+            logits,
+            torch.tensor(kv, dtype=torch.int32, device=_DEV),
+            top_k,
+            compress_ratio=cr,
+            max_window_len=bound,
+            backend="radix_cutlass",
+            out_indices=torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV),
+        )
+        _check_varlen_rows(logits, full, n_full, top_k)
 
 
 _REPLAY_BOTH_CASES = [
@@ -1334,6 +1222,7 @@ _REPLAY_BOTH_CASES = [
     (148, 130944, 512, None, 128, (513, 1024), (1025, 16388), "main"),  # sample gate
     (296, 65472, 1024, None, 64, (1025, 2048), (2049, 4100), "main"),
     (64, 1048576, 512, 16384, 128, (0, 512), (513, 16384), "reg"),  # 16K graph variant
+    (32, 1048576, 512, None, 128, (0, 512), (513, 16384), "clus"),  # V4.1 c1 capacity
 ]
 
 
@@ -1347,7 +1236,8 @@ def test_gvr2_graph_replay_both_directions(
 ):
     """Paged output captured on short rows then replayed on long ones, and the
     other way round, then back again and on a mix: the per-row branches come
-    from seq_lens at replay time, never from the capture."""
+    from seq_lens at replay time, never from the capture. Each replay also
+    rewrites the page table in place."""
     gen = torch.Generator().manual_seed(rows + width)
 
     def draw(lo_hi):
@@ -1394,6 +1284,8 @@ def test_gvr2_graph_replay_both_directions(
         logits.copy_(
             _hard_logits(_HARD_PATTERNS[i % 3], cols, width, top_k, seed=i + 2)
         )
+        pt_i, unpage = _injective_page_table(rows, width, page_size, which=i + 1)
+        pt.copy_(pt_i)
         out.fill_(-7)
         g.replay()
         torch.cuda.synchronize()
@@ -1413,6 +1305,7 @@ def test_gvr2_graph_replay_both_directions(
 _MAIN_REG_SHAPES = [
     (1, 131136, 512, 1, 1),
     (9, 131136, 512, 1, 1),
+    (16, 131136, 512, 1, 1),  # every length kind of _band_lengths at K = 512
     (9, 131136, 2048, 1, 1),
     (16, 131136, 1024, 2, 4),
     (32, 131136, 2048, 1, 1),  # K = 2048 keeps SPLIT up to 32 rows
@@ -1439,24 +1332,12 @@ def _main_reg_cap(rows, msl_c, top_k):
 _NAR_CAP = 2048
 
 
-def test_gvr2_main_register_path_policy():
-    """The SPLIT main engines always compile the register path in; the
-    one-CTA-per-row engines (1024 and 512 threads) only for an envelope of at
-    least _MAIN_REG_ENV times their register rows; 256 threads never."""
-    env = _host._MAIN_REG_ENV
-    assert _host._main_reg_vpt(1024, True, 0) == 4
-    for blk in (1024, 512):
-        assert _host._main_reg_vpt(blk, False, env * blk * 16) == 4
-        assert _host._main_reg_vpt(blk, False, env * blk * 16 - 1) == 0
-    assert _host._main_reg_vpt(256, False, 1 << 20) == 0
-    assert _main_reg_cap(160, 65600, 512) == 8192
-    assert _main_reg_cap(160, 65472, 512) == 0  # below the envelope gate: streams
-
-
 def _band_lengths(n, top_k, cap, msl_c, gen):
     """n compressed row lengths cycling through the register band (top_k, cap],
-    its edges and the VPT 2 / VPT 4 boundary (cap / 2), short rows (including
-    0) and streaming rows; none is pinned to the envelope msl_c."""
+    its edges and the VPT 2 / VPT 4 boundary (cap / 2 and either side), short
+    rows (including 0), streaming rows, and k + 2 .. k + 4 (with k + 1, every
+    n % 4 of the VPT 2 body's scalar tail lane); none is pinned to the
+    envelope msl_c."""
 
     def rnd(lo, hi):
         return int(torch.randint(lo, hi + 1, (1,), generator=gen))
@@ -1472,6 +1353,10 @@ def _band_lengths(n, top_k, cap, msl_c, gen):
         lambda: rnd(0, top_k - 1),
         lambda: rnd(cap + 2, msl_c),
         lambda: 0,
+        lambda: top_k + 2,
+        lambda: top_k + 3,
+        lambda: top_k + 4,
+        lambda: cap // 2 - 1,
     ]
     return [kinds[i % len(kinds)]() for i in range(n)]
 
@@ -1482,7 +1367,8 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
     """Rows far shorter than the launch envelope on the main engines, hinted
     and hint-free: rows that fit the CTA's registers (short and empty rows
     included) take the in-kernel register path, the others stream. Every row is
-    exact, including the band edges (cap, cap + 1) and k + 1."""
+    exact, including the band edges (cap, cap + 1), the VPT 2 / VPT 4 edge
+    (cap / 2 - 1 .. cap / 2 + 1) and k + 1 .. k + 4."""
     cap = _main_reg_cap(rows, msl_c, top_k)
     assert cap > 0
     gen = torch.Generator().manual_seed(rows * 7 + top_k)
@@ -1504,44 +1390,6 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
         )
         _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
         _check_varlen_rows(logits, indices, n_r, top_k)
-
-
-@requires_gvr2
-@pytest.mark.parametrize(
-    "rows,msl_c,top_k,next_n,cr", [(16, 131136, 512, 1, 1), (8, 131136, 1024, 2, 4)]
-)
-def test_gvr2_main_register_path_narrow_rows(rows, msl_c, top_k, next_n, cr):
-    """Short register rows (top_k < n <= 2048, the VPT 2 body) and the VPT 2 /
-    VPT 4 edge of the SPLIT engines (BLK * 8 = 8192 columns: 8191, 8192, 8193),
-    hinted and hint-free, next to short and streaming rows of the same SPLIT
-    launch: k, k + 1 and every n % 4 above it, 2045 and 2047-2049, 3k, an empty
-    row and a streaming row."""
-    vpt2 = _main_reg_cap(rows, msl_c, top_k) // 2  # the VPT 2 body's rows: 8192
-    edges = [top_k, top_k + 1, top_k + 2, top_k + 3, top_k + 4, _NAR_CAP - 3]
-    edges += [_NAR_CAP - 1, _NAR_CAP, _NAR_CAP + 1, 3 * top_k, 0, msl_c - 5]
-    edges += [vpt2 - 1, vpt2, vpt2 + 1]
-    reqs = rows // next_n
-    gen = torch.Generator().manual_seed(rows + top_k)
-    # every edge, the last launch filled with random short register rows
-    fill = torch.randint(top_k + 1, _NAR_CAP + 1, (-len(edges) % reqs,), generator=gen)
-    targets = edges + fill.tolist()
-    for i in range(0, len(targets), reqs):
-        kv = [t * cr + next_n - 1 for t in targets[i : i + reqs]]
-        logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
-            kv, next_n, cr, top_k, seed=rows + i, msl_c=msl_c
-        )
-        for hint_free in (False, True):
-            _forget_launcher(rows, msl_c, top_k, next_n, cr, hint_free=hint_free)
-            indices, _ = _run_gvr2(
-                logits,
-                seq_lens,
-                top_k,
-                None if hint_free else pre_idx,
-                next_n=next_n,
-                compress_ratio=cr,
-            )
-            _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
-            _check_varlen_rows(logits, indices, n_r, top_k)
 
 
 @requires_gvr2
@@ -2070,6 +1918,11 @@ _INF_SHAPES = [
     pytest.param(64, 131104, 4101, 2048, "main", id="main_big_reg"),
     pytest.param(160, 131072, 4101, 2048, "main", id="main_b512"),
     pytest.param(160, 65472, 4101, 2048, "main", id="main_b512_stream"),
+    # ragged v41block rows at the serving width, cycled over the batch: register
+    # rows, a streaming row and rows of n <= K (identity path) in one launch
+    pytest.param(
+        160, 131104, (4101, 4100, 32773, 2049, 2048, 7), 2048, "main", id="v41_ragged"
+    ),
 ]
 
 _INF_PATTERNS = [
@@ -2137,48 +1990,31 @@ def test_gvr2_inf_scores_every_family(rows, width, n_valid, top_k, family, patte
     every output slot written, distinct in-row indices, and the selected values
     equal torch.topk's as a multiset (ties at the K-th value may pick other
     columns). The live length stays below the envelope and the columns past it
-    are poisoned, so an out-of-row read fails the value check. The family is
-    checked after the values, so a wrong value fails as such."""
+    are poisoned, so an out-of-row read fails the value check. A tuple of live
+    lengths gives ragged rows (rows of n <= top_k: identity + -1 tail). The
+    family is checked after the values, so a wrong value fails as such."""
     seed = rows * 7 + width + top_k + _INF_PATTERNS.index(pattern)
     gen = torch.Generator(device=_DEV).manual_seed(seed)
+    ragged = isinstance(n_valid, tuple)
+    n_r = [n_valid[r % len(n_valid)] if ragged else n_valid for r in range(rows)]
     logits = torch.randn(rows, width, generator=gen, device=_DEV) * 2.0
-    logits[:, n_valid:] = 3e38
-    for r in range(rows):
-        pos, neg = _inf_columns(pattern, n_valid, top_k, gen)
+    for r, n in enumerate(n_r):
+        logits[r, n:] = 3e38
+        pos, neg = _inf_columns(pattern, n, top_k, gen)
         logits[r, pos] = float("inf")
         logits[r, neg] = float("-inf")
-    seq_lens = torch.full((rows,), n_valid, dtype=torch.int32, device=_DEV)
-    ref_vals = torch.topk(logits[:, :n_valid], top_k, dim=1).values
+    seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     _forget_launcher(rows, width, top_k, 1, 1, hint_free=True)
     _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
-    _check_complete_exact(out, logits, n_valid, ref_vals, -7)
+    if ragged:
+        torch.cuda.synchronize()
+        assert int((out == -7).sum()) == 0, "unwritten output slots"
+        _check_varlen_rows(logits, out, n_r, top_k)
+    else:
+        ref_vals = torch.topk(logits[:, :n_valid], top_k, dim=1).values
+        _check_complete_exact(out, logits, n_valid, ref_vals, -7)
     _assert_family(rows, width, top_k, 1, 1, _b200_family(family), hint_free=True)
-
-
-@requires_gvr2
-@pytest.mark.parametrize(
-    "width", [4160, 32832, 131104], ids=["reg_width", "reg_clus_width", "serving_width"]
-)
-@pytest.mark.parametrize("rows", [1, 16, 64, 160])
-def test_gvr2_newest_block_posinf_varlen(rows, width):
-    """DeepSeek-V4.1 block top-k: each row's newest key (column n_r - 1) is +inf.
-    Ragged live lengths well below the envelope, short rows (n_r <= K) included,
-    at the tight register and reg_clus widths and the 1M-token serving width
-    (131,104 keys), across the batch bands."""
-    top_k = 2048
-    gen = torch.Generator(device=_DEV).manual_seed(rows * 131 + width)
-    fixed = [n for n in (4101, 4100, 32773, 2049, 2048, 7) if n <= width]
-    kv = torch.randint(1, width + 1, (rows,), generator=gen, device=_DEV).tolist()
-    kv[: len(fixed)] = fixed[:rows]
-    logits, seq_lens, _, n_r, _ = _make_varlen_case(
-        kv, 1, 1, top_k, seed=rows, msl_c=width
-    )
-    for r, n in enumerate(n_r):
-        if n > 0:
-            logits[r, n - 1] = float("inf")
-    indices, _ = _run_gvr2(logits, seq_lens, top_k, None)
-    _check_varlen_rows(logits, indices, n_r, top_k)
 
 
 @requires_gvr2
@@ -2856,89 +2692,6 @@ def test_gvr2_route_unsplit_slab_regime():
         and _host._big_regime(74, 2, 8192) is True
     )
     assert _host._big_regime(149, 1, 8192) is False  # b > 148: never big
-
-
-def test_gvr2_small_row_sample_gate():
-    """sd_en, the small-row pair sample of the streaming slab (rows of
-    max(2k, sd_en) < n <= SCAP; 0 = off): upstream's K > 1024 off the big regime,
-    and (FlashInfer-local) for hint-free launches the row length past which the
-    sample stages fewer survivors than the row holds (see _small_row_sample)."""
-    g = _host._small_row_sample
-    # hinted: upstream, every row above 2k for K > 1024 off the big regime
-    assert g(2048, False, 1, 2816, False) == 1
-    assert g(512, False, 1, 768, False) == 0 and g(2048, True, 1, 8192, False) == 0
-    # hint-free, one CTA per row: rows longer than aim (the kernel floors sd_en
-    # at 2k): the one-wave slab (aim 2k at K = 512, 7k/4 above) and the 256/512-
-    # thread slabs (aim 7k/4)
-    assert g(512, True, 1, 1024, True) == 1024
-    assert g(1024, True, 1, 1792, True) == 1792
-    assert g(2048, True, 1, 3584, True) == 3584
-    assert g(512, False, 1, 768, True) == 768
-    # hint-free SPLIT: off; its rows up to 16384 columns, above SCAP (8192),
-    # take the in-kernel register path
-    assert g(512, True, 37, 1024, True) == 0
-    assert g(2048, True, 4, 4096, True) == 0
-
-
-@requires_gvr2
-@pytest.mark.parametrize(
-    "rows,ncols,top_k,want_hint_free,want_hinted",
-    [
-        (128, 131072, 512, 1024, 0),  # one-wave slab, K=512 (aim 2k)
-        (128, 131072, 1024, 1792, 0),  # one-wave slab, K=1024 (aim 7k/4: floored at 2k)
-        (64, 131072, 2048, 3584, 0),  # one-wave slab, K=2048 (aim 7k/4: floored at 2k)
-        (160, 131072, 512, 896, 0),  # two-CTA slab (aim 7k/4: floored at 2k)
-        (160, 131072, 2048, 3584, 1),  # two-CTA slab, K > 1024 (aim 7k/4)
-        (4, 262144, 512, 0, 0),  # SPLIT slab: off (register path)
-        (4, 262144, 2048, 0, 0),  # SPLIT slab, K > 1024: off (register path)
-    ],
-)
-def test_gvr2_launcher_small_row_sample(
-    rows, ncols, top_k, want_hint_free, want_hinted
-):
-    """The varlen launcher passes _small_row_sample's sd_en in its tail scalars
-    (aim_base, sfac, amin, sd_en, tsh_en), paged engines like hint-free ones."""
-    for hint_free, page_shift, want in (
-        (True, None, want_hint_free),
-        (True, 6, want_hint_free),
-        (False, None, want_hinted),
-    ):
-        lc = _host._varlen_launcher(
-            rows, ncols, top_k, ncols, 1, 1, hint_free, page_shift
-        )
-        assert lc[0] == "main", lc[0]
-        assert lc[3][3] == want, (hint_free, page_shift, lc[3])
-
-
-@requires_gvr2
-@pytest.mark.parametrize(
-    "rows,cap_c,top_k",
-    [
-        # below the register-path envelope gate (_MAIN_REG_ENV), which would
-        # rank all of these rows with the register body
-        (128, 130944, 1024),  # one-wave slab: aim 1792, sampled above 2k
-        (64, 130944, 2048),  # one-wave slab, K=2048: aim 3584, sampled above 2k
-        (148, 130944, 512),  # one-wave slab, K=512: aim 2k
-    ],
-)
-def test_gvr2_small_row_sample_threshold_edges(rows, cap_c, top_k):
-    """Hint-free rows on both sides of the launch's small-row sample threshold
-    max(2k, sd_en) (sampled above it, unsampled at or below it) rank exactly,
-    mixed with rows on the 4k and 8k marks and the SCAP edge, at a capacity far
-    above every row. The one-wave slab's aim (sd_en) is at most 2k, so its
-    threshold is the 2k floor."""
-    lc = _host._varlen_launcher(rows, cap_c, top_k, cap_c, 1, 1, True, None)
-    assert 0 < lc[3][3] <= 2 * top_k, lc[3]
-    thr = 2 * top_k
-    assert _main_reg_cap(rows, cap_c, top_k) == 0  # streamed, not register rows
-    edges = [thr, thr + 1, thr - 1, thr + 4, 4 * top_k, 4 * top_k + 1, 8192, 8196]
-    edges += [16384, 16385]
-    cols = [edges[r % len(edges)] for r in range(rows)]
-    logits, seq_lens, _, n_r, _ = _make_varlen_case(
-        cols, 1, 1, top_k, seed=rows + top_k, msl_c=cap_c
-    )
-    indices, _ = _run_gvr2(logits, seq_lens, top_k, None)
-    _check_varlen_rows(logits, indices, n_r, top_k)
 
 
 def test_gvr2_route_reg_clus_sm_count_aware():
