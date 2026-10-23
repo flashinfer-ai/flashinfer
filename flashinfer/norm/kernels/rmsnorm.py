@@ -105,22 +105,31 @@ class RMSNormKernel:
 
     @staticmethod
     def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
-        """Compute optimal cluster size based on H and device shared memory."""
+        """Compute optimal cluster size based on H and device shared memory.
+
+        The budget is the half-limit that gates ``use_async_copy``, so a cluster
+        size that fits here also fits the cp.async budget.
+        """
         if sm_version < 90:
             return 1
 
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         max_smem_bytes = props.shared_memory_per_block_optin
+        occupancy_target = max_smem_bytes // 2
         elem_size = dtype.width // 8
 
+        best_fit = 1
         for cluster_n in [1, 2, 4, 8, 16]:
             if H % cluster_n != 0:
                 continue
             smem_needed = RMSNormKernel._estimate_smem_bytes(H, cluster_n, elem_size)
-            if smem_needed <= max_smem_bytes:
+            if smem_needed <= occupancy_target:
                 return cluster_n
+            if smem_needed <= max_smem_bytes and best_fit == 1:
+                best_fit = cluster_n
 
-        return 16
+        # Widest split, but only when it divides H; otherwise the best divisor.
+        return 16 if H % 16 == 0 else best_fit
 
     @staticmethod
     def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
