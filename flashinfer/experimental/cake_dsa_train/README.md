@@ -424,11 +424,10 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   torch twin `offset_gather_kv_indices(..., compact=True)`).  Both forward
   stages (`fwd`, `nope_fwd`) launch with the programmatic-dependent-launch
   attribute (`use_pdl` in their launch records, a fixed attribute of their
-  bindings): `index_prep` signals `launch_dependents` once a row is written and
-  the forward kernels execute `griddepcontrol.wait` after their barrier / TMEM
-  prologue, before any global read, so behind the stage the forward's prologue
-  overlaps the stage's tail; behind any other kernel the attribute changes
-  nothing.  The host prepares
+  bindings): `index_prep` signals `launch_dependents` at entry and the forward
+  kernels execute `griddepcontrol.wait` after their barrier / TMEM prologue,
+  before any global read, so behind the stage the forward's prologue overlaps
+  the stage; behind any other kernel the attribute changes nothing.  The host prepares
   the forward's plan, outputs and launch arguments and converts its operands
   before the first launch, then issues the forward from those pre-bound values
   inside the same stream context, so only the forward's binding call sits
