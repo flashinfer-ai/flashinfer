@@ -233,9 +233,9 @@ EXPECTED_TEMPLATES = {
     },
     ('q_a', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_v8_ef_pro7',
     ('q_b', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_pro7',
+        (1001, 148): 'dense_proj_gemm_kk_n256_cg_pro15',
         (1001, 212): 'dense_proj_gemm_kk_n256_pro15',
-        (2049, 148): 'dense_proj_gemm_kk_n256_pro7',
+        (2049, 148): 'dense_proj_gemm_kk_n256_cg_pro15',
         (2049, 212): 'dense_proj_gemm_kk_n256_pro15',
     },
     ('q_b', 'dgrad', 'bf16'): {
@@ -402,8 +402,18 @@ EXPECTED_TEMPLATES = {
         (2049, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_v8_ef_ht_pro7',
     },
-    ('indexer_q', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256_pro15',
-    ('indexer_q', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_pro15',
+    ('indexer_q', 'fwd', 'bf16'): {
+        (1001, 148): 'dense_proj_gemm_kk_n256_cg_pro15',
+        (1001, 212): 'dense_proj_gemm_kk_n256_pro15',
+        (2049, 148): 'dense_proj_gemm_kk_n256_cg_pro15',
+        (2049, 212): 'dense_proj_gemm_kk_n256_pro15',
+    },
+    ('indexer_q', 'dgrad', 'bf16'): {
+        (1001, 148): 'dense_proj_gemm_kn_n256_cg_pro15',
+        (1001, 212): 'dense_proj_gemm_kn_n256_pro15',
+        (2049, 148): 'dense_proj_gemm_kn_n256_cg_pro15',
+        (2049, 212): 'dense_proj_gemm_kn_n256_pro15',
+    },
     ('indexer_q', 'dgrad', 'f32'): {
         (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
         (1001, 212): 'dense_proj_gemm_kn_n256_f32_v8_ef_s9_pro15',
@@ -551,6 +561,9 @@ def _expected(table, key, T, sm_count):
 
 
 ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
+# the SM count of a device of each architecture the planner can target (the two export architectures and
+# compute capability 10.3, whose programs register when the export ships them)
+SM_COUNT_OF_ARCH = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
 
 
 _TRANSPOSED_STEM = re.compile(
@@ -2633,14 +2646,21 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         and old_gw.epi == "reg"
         and not old_gw.htail
     )  # the previous lock's program
-    # the sm_100a rows of the six keys carry no round-26 change and keep the previous lock's programs (controls)
+    # the sm_100a rows of the six keys carried no round-26 change (controls); the shapes tranche later re-valued the three sm_100a weight
+    # gradients to the synchronised stream-K tail (slab 2 on bf16, the fp32-output slab 3 on fp32-out), the other three keep the previous
+    # lock's programs
     for row, op, dt, tmpl in (
         ("dense_gate_up", "fwd", "bf16", "dense_proj_gemm_kk_n256"),
-        ("dense_down", "wgrad", "f32", "dense_proj_gemm_nn_n256_m256_f32_tma1"),
-        ("dense_down", "wgrad", "bf16", "dense_proj_gemm_nn_n256_m256"),
+        ("dense_down", "wgrad", "f32", "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3"),
+        ("dense_down", "wgrad", "bf16", "dense_proj_gemm_nn_n256_m256_sks_sb2"),
         ("dense_gate_up", "dgrad", "bf16", "dense_proj_gemm_kn_n256_m256_ov_ht"),
         ("q_b", "dgrad", "bf16", "dense_proj_gemm_kn_n256_m256_ov_ht"),
-        ("dense_gate_up", "wgrad", "f32", "dense_proj_gemm_nn_n256_m256_f32_tma1"),
+        (
+            "dense_gate_up",
+            "wgrad",
+            "f32",
+            "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3",
+        ),
     ):
         v = _views("proj", row, op, dt, T)
         p100, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
@@ -2890,16 +2910,17 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # indexer_q forward / input gradient bf16 on both architectures, the sm_107a indexer_k forward bf16 and q_b weight gradient bf16),
     # 18 existing rules re-valued with pro 15 (24 rules at pro 15 with the six inserted), the sm_100a shared_down input gradient bf16 pinned to pro 0 and the sm_107a kv_a weight
     # gradient fp32-out moved to the cheaper slab path of its synchronised stream-K fixup (sk_slab 2); no key removed
-    assert (
-        len(ROW_RULES) == 109
-    )  # 109 expected (six keys inserted, none removed) - the templates step's RULES print
-    assert (
-        sum(k[0] == "sm_100a" for k in ROW_RULES) == 51
-    )  # 51 expected - the RULES_100 print
-    assert (
-        sum(k[0] == "sm_107a" for k in ROW_RULES) == 58
-    )  # 58 expected - the RULES_107 print
-    assert ARCH_RULE_DEFAULTS == {"sm_107a": {"pro": 7}, "sm_100a": {"pro": 7}}
+    # round 33 left 109 keys (51 sm_100a, 58 sm_107a; six inserted, none removed); the shapes tranche adds 79 sm_100a and
+    # 86 sm_103a keys and re-values seven round-33 sm_100a keys (MEASURED_SHAPE_ROWS)
+    assert len(ROW_RULES) == 109 + 79 + 86
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58
+    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86
+    assert ARCH_RULE_DEFAULTS == {
+        "sm_107a": {"pro": 7},
+        "sm_100a": {"pro": 7},
+        "sm_103a": {"pro": 7},
+    }
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
     # ---- (a) the six inserted keys: pro 15 (the full pair sync form + the CTA-local exit), no other knob ----
@@ -2969,8 +2990,10 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
         None,
         16384,
     )  # q_b weight gradient bf16 (G.T @ X, 2048 x 16384 over T)
-    assert ROW_RULES[n1] == {"pro": 15}
-    assert ROW_RULES[n2] == {"pro": 15}
+    # n1 / n2 were re-measured in the shapes tranche: the column-grouped raster (16 column tiles per group) over the
+    # round-33 pro 15, the forward with the half-height tail wave
+    assert ROW_RULES[n1] == {"htail": True, "cgrp": True, "group_m": 16, "pro": 15}
+    assert ROW_RULES[n2] == {"cgrp": True, "group_m": 16, "pro": 15}
     assert ROW_RULES[n3] == {"pro": 15}
     assert ROW_RULES[n4] == {"pro": 15}
     assert ROW_RULES[n5] == {"pro": 15}
@@ -3051,21 +3074,29 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
         None,
     )  # indexer_hw input gradient fp32-out: a single-CTA row, no pro
     assert ROW_RULES[hw] == {"block_n": 128, "group_m": 2, "slots": 1, "cta1": True}
-    # ---- (c) the ARCH_RULE_DEFAULTS merge of row_rule: a key without a rule takes the architecture default (pro 7) on both architectures and
-    #      nothing on an architecture without defaults; a row rule overrides it (pro 0 / 15); a cta1 row carries the default in the merged rule
-    #      and the planner zeroes it on the single-CTA program (below) ----
+    # ---- (c) the ARCH_RULE_DEFAULTS merge of row_rule: a key without a rule takes the architecture default (pro 7) on every supported
+    #      architecture (sm_103a included: a pair template planned there without it names the round-27 form, which no measured sm_103a rule
+    #      selects) and nothing on an architecture without defaults; a row rule overrides it (pro 0 / 15); a cta1 row carries the default in
+    #      the merged rule and the planner zeroes it on the single-CTA program (below) ----
     assert row_rule("sm_100a", False, False, False, False, False, 12288, 6144, T) == {
         "pro": 7
     }  # dense_gate_up forward bf16: no sm_100a rule
     assert row_rule("sm_107a", False, False, False, False, False, 8, 8, 8) == {"pro": 7}
-    assert row_rule("sm_103a", False, False, False, False, False, 8, 8, 8) == {}
+    assert row_rule("sm_103a", False, False, False, False, False, 8, 8, 8) == {"pro": 7}
+    assert row_rule("sm_90a", False, False, False, False, False, 8, 8, 8) == {}
     assert row_rule("sm_100a", False, True, False, False, False, 2048, 6144, T) == {
         "group_m": 8,
         "pro": 0,
     }
-    assert row_rule("sm_100a", False, False, False, False, False, 4096, 2048, T) == {
-        "pro": 15
-    }
+    assert (
+        row_rule("sm_100a", False, False, False, False, False, 4096, 2048, T)
+        == {
+            "htail": True,
+            "cgrp": True,
+            "group_m": 16,
+            "pro": 15,
+        }
+    )  # re-valued in the shapes tranche: the row rule's pro 15 still overrides the default
     assert row_rule("sm_107a", False, True, True, False, False, 6144, 32, T) == {
         "block_n": 128,
         "group_m": 2,
@@ -5460,11 +5491,912 @@ def test_convenience_views_match_the_planner_views(sm_count):
                 assert plan.transposed_out and not plan.swap_fallback
             seen.add((swapped, plan.swap_fallback))
             ldo, out_l = cake_backend._out_strides(out3)
-            assert ldo == out3.stride(1) and out_l == (
-                out3.stride(0) if out3.shape[0] > 1 else 0
-            )
+            assert ldo == out3.stride(1)
+            # the kernel requires out_l >= rows * ldo for every batch size; a batch of one takes its view's batch
+            # stride when that spans the matrix (the unsqueezed 2-D outputs of every row here) and the span otherwise;
+            # a real batch passes its stride as is (the batched rows interleave their batches inside a row)
+            span = out3.shape[1] * ldo
+            if out3.shape[0] > 1 or out3.stride(0) >= span:
+                assert out_l == out3.stride(0)
+            else:
+                assert out_l == span
     # a swapped plan and a direct plan were both exercised
     assert (True, False) in seen and (False, False) in seen
+
+
+def test_out_strides_span_the_matrix_for_a_batch_of_one():
+    """The kernel requires ``out_l >= rows * ldo`` for every batch size (it declares its tile grid against the
+    output's extents); a batch of one never dereferences its batch stride, so the host passes the view's batch
+    stride when it spans the matrix and the matrix span otherwise.  A real batch passes its stride as is."""
+    M, N = 48, 64
+    plain = cake_backend.as_batched(torch.empty(M, N), "out")
+    assert cake_backend._out_strides(plain) == (N, M * N)
+    # a padded row stride: the span follows ldo, not the column count
+    padded = cake_backend.as_batched(torch.empty(M, 2 * N)[:, :N], "out")
+    assert cake_backend._out_strides(padded) == (2 * N, M * 2 * N)
+    # a batch axis of stride 0 (expand) or below the span (as_strided): the span
+    expanded = torch.empty(M, N).expand(1, M, N)
+    assert cake_backend._out_strides(expanded) == (N, M * N)
+    narrow = torch.empty(M * N + 8).as_strided((1, M, N), (8, N, 1))
+    assert cake_backend._out_strides(narrow) == (N, M * N)
+    # a batch axis above the span: as is
+    wide = torch.empty(2 * M * N).as_strided((1, M, N), (2 * M * N, N, 1))
+    assert cake_backend._out_strides(wide) == (N, 2 * M * N)
+    # the transposed store: rows = N
+    transposed = cake_backend.as_batched(torch.empty(N, M), "out")
+    assert cake_backend._out_strides(transposed) == (M, N * M)
+    # a real batch: its strides as is (dense and padded)
+    assert cake_backend._out_strides(torch.empty(3, M, N)) == (N, M * N)
+    assert cake_backend._out_strides(torch.empty(3, M, 2 * N)[..., :N]) == (
+        2 * N,
+        M * 2 * N,
+    )
+
+
+def test_template_knobs_invert_instance_symbol():
+    """``_template_knobs`` (the registry fallback's symbol decoder) names every generated program back through
+    ``instance_key`` / ``instance_symbol``; the batch-raster and tail tokens decode to the knobs that emit them."""
+    seen = 0
+    for arch, table in cake_jit.KERNELS.items():
+        for template in table:
+            tokens = cake_backend._template_tokens(template)
+            if tokens is None:
+                assert template.startswith("router_fp32_gemm_"), (arch, template)
+                continue
+            knobs = cake_backend._template_knobs(template)
+            assert knobs is not None, (arch, template)
+            layout, out_f32, out_t = cake_backend._template_class(tokens)
+            key_knobs = {k: v for k, v in knobs.items() if v is not None}
+            key_knobs["sk_exact"] = bool(knobs["sk_exact"])
+            key = cake_backend.instance_key(
+                a_mn=layout[0] == "n",
+                b_mn=layout[1] == "n",
+                out_f32=out_f32,
+                out_t=out_t,
+                **key_knobs,
+            )
+            assert cake_backend.instance_symbol(key) == template, (arch, template)
+            seen += 1
+    assert seen == sum(len(_registered(arch)) for arch in cake_jit.KERNELS)
+    # tokens the planner never emits, and names outside the family, decode to nothing
+    assert cake_backend._template_knobs("dense_proj_gemm_kk_n256_box64_pro7") is None
+    assert cake_backend._template_knobs("router_fp32_gemm_kk") is None
+    assert cake_backend._template_tokens("router_fp32_gemm_kk") is None
+    # the exact split carries no part count: the rule's parts, else the kernel tests' 3 (128 rows) / 2 (64 rows)
+    assert (
+        cake_backend._template_knobs("dense_proj_gemm_nn_n128_hen_t_skx_pro7")[
+            "sk_exact"
+        ]
+        == 3
+    )
+    assert (
+        cake_backend._template_knobs("dense_proj_gemm_nn_n128_m64_hen_t_skx_pro15")[
+            "sk_exact"
+        ]
+        == 2
+    )
+    assert (
+        cake_backend._template_knobs(
+            "dense_proj_gemm_nn_n128_hen_t_skx_pro7", sk_exact_parts=4
+        )["sk_exact"]
+        == 4
+    )
+    # a single-CTA program leaves pro to the planner (instance_key refuses a forced one)
+    assert cake_backend._template_knobs("dense_proj_gemm_kk_n128_hen_c1")["pro"] is None
+    # the hint tokens are the nearest edit; a batch-raster program is no variant of a batch of one
+    assert (
+        cake_backend._template_distance(
+            ("kk", "n256", "hen", "pro7"), ("kk", "n256", "pro7")
+        )
+        == 0.5
+    )
+    assert (
+        cake_backend._template_distance(("kk", "n256", "pro7"), ("kk", "n256", "pro15"))
+        == 2.0
+    )
+    for arch in cake_jit.KERNELS:
+        single = cake_backend._registry_variants(
+            "dense_proj_gemm_kn_n256_pro7", arch, False
+        )
+        assert single and all(not knobs["batch_group"] for knobs in single), arch
+        batched = cake_backend._registry_variants(
+            "dense_proj_gemm_kn_n256_pro7", arch, True
+        )
+        assert len(batched) >= len(single), arch
+    assert (
+        cake_backend._registry_variants("router_fp32_gemm_kk", "sm_100a", False) == ()
+    )
+
+
+def _class_views(layout, out_f32, out_t, M, N, K):
+    """Empty views of one (layout, output dtype, transposed store) class: ``kk`` = A rows contiguous along K and B
+    contiguous along K (the forward), ``kn`` = B contiguous along N (the input gradient), ``nn`` = both MN-major (the
+    weight gradient), ``nk`` = A MN-major only."""
+    dt = torch.float32 if out_f32 else torch.bfloat16
+    A = (
+        torch.empty(M, K, dtype=torch.bfloat16)
+        if layout[0] == "k"
+        else torch.empty(K, M, dtype=torch.bfloat16).t()
+    )
+    B = (
+        torch.empty(N, K, dtype=torch.bfloat16).t()
+        if layout[1] == "k"
+        else torch.empty(K, N, dtype=torch.bfloat16)
+    )
+    out = torch.empty(N, M, dtype=dt) if out_t else torch.empty(M, N, dtype=dt)
+    return dict(A=A, B=B, out=out, transposed=out_t)
+
+
+_CLASS_SWEEP_M = (4096, 16384)
+_CLASS_SWEEP_N = (32, 64, 128, 256, 512, 1024, 2048, 4096)
+_CLASS_SWEEP_K = (512, 2048, 4096, 5120, 8192, 16384)
+
+
+@pytest.mark.parametrize("arch", sorted(cake_jit.KERNELS))
+def test_registry_fallback_serves_every_registered_class(arch):
+    """Every (layout, output dtype, transposed store) class with a generated program on ``arch`` plans a
+    registered program for a synthetic row whose launcher plan is unregistered: the planner lands on the nearest
+    generated knob variant (``knob_fallback``) - the hand-ordered variants, then the registry's own symbols - instead
+    of raising when the launch is bound.  Rows with a measured rule are left out (the rule, not the fallback, names
+    their program)."""
+    registered = _registered(arch)
+    classes = sorted(
+        {
+            cake_backend._template_class(cake_backend._template_tokens(t))
+            for t in registered
+        }
+    )
+    assert classes
+    kw = dict(sm_count=SM_COUNT_OF_ARCH[arch], l2_bytes=L2_BYTES, arch=arch)
+    exercised = set()
+    for layout, out_f32, out_t in classes:
+        for M in _CLASS_SWEEP_M:
+            for N in _CLASS_SWEEP_N:
+                for K in _CLASS_SWEEP_K:
+                    v = _class_views(layout, out_f32, out_t, M, N, K)
+                    try:
+                        mirror, *_ = plan_dense_projection_gemm(
+                            v["A"],
+                            v["B"],
+                            v["out"],
+                            transposed_out=out_t,
+                            _fallback=False,
+                            **kw,
+                        )
+                    except ValueError:
+                        continue  # a shape the class refuses
+                    if mirror.template in registered:
+                        continue
+                    if cake_backend._measured_row_rule(
+                        arch, mirror.a_mn, mirror.b_mn, out_f32, out_t, False, N, K, M
+                    ):
+                        continue
+                    plan, *_ = plan_dense_projection_gemm(
+                        v["A"], v["B"], v["out"], transposed_out=out_t, **kw
+                    )
+                    where = (
+                        arch,
+                        layout,
+                        out_f32,
+                        out_t,
+                        M,
+                        N,
+                        K,
+                        mirror.template,
+                        plan.template,
+                    )
+                    assert plan.template in registered, where
+                    assert plan.knob_fallback, where
+                    assert not (plan.swap_fallback or plan.rule_fallback), where
+                    assert cake_backend._template_class(
+                        cake_backend._template_tokens(plan.template)
+                    ) == (layout, out_f32, out_t), where
+                    exercised.add((layout, out_f32, out_t))
+    # a class the sweep cannot push off the registry needs no fallback; the registries of today leave several off it
+    assert exercised, arch
+
+
+def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
+    """The rows whose launcher plan the sm_100a export does not carry (forward N <= 128 and N = 256 at K 4096 / 5120,
+    the swapped weight gradient at N <= 128 with M 4096 / 5120 / 8192): with the measured rules set aside, the
+    fallback lands on the neighbour its hand-ordered variants name first - the plain-hint twin when it is generated,
+    else the single-CTA form, else the 64-row pair family - and marks the plan ``knob_fallback``."""
+    monkeypatch.setattr(cake_backend, "ROW_RULES", {})
+    cases = (
+        # layout, fp32 out, transposed, M, N, K, launcher template -> registered neighbour
+        (
+            "kk",
+            False,
+            False,
+            16384,
+            128,
+            4096,
+            "dense_proj_gemm_kk_n128_hen_pro7",
+            "dense_proj_gemm_kk_n128_hen_c1",
+        ),
+        (
+            "kk",
+            False,
+            False,
+            16384,
+            64,
+            5120,
+            "dense_proj_gemm_kk_n128_hen_pro7",
+            "dense_proj_gemm_kk_n128_hen_c1",
+        ),
+        (
+            "kk",
+            False,
+            False,
+            16384,
+            256,
+            4096,
+            "dense_proj_gemm_kk_n256_hen_pro7",
+            "dense_proj_gemm_kk_n256_pro7",
+        ),
+        (
+            "nn",
+            False,
+            True,
+            4096,
+            128,
+            16384,
+            "dense_proj_gemm_nn_n128_hen_t_pro7",
+            "dense_proj_gemm_nn_n128_m64_hen_t_pro7",
+        ),
+        (
+            "nn",
+            True,
+            True,
+            4096,
+            128,
+            16384,
+            "dense_proj_gemm_nn_n128_hen_f32_t_pro7",
+            "dense_proj_gemm_nn_n128_m64_hen_f32_t_pro7",
+        ),
+        (
+            "nn",
+            False,
+            True,
+            8192,
+            32,
+            16231,
+            "dense_proj_gemm_nn_n128_hen_t_pro7",
+            "dense_proj_gemm_nn_n128_m64_hen_t_pro7",
+        ),
+    )
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a")
+    registered = _registered("sm_100a")
+    for layout, out_f32, out_t, M, N, K, launcher, neighbour in cases:
+        v = _class_views(layout, out_f32, out_t, M, N, K)
+        mirror, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], transposed_out=out_t, _fallback=False, **kw
+        )
+        assert mirror.template == launcher and launcher not in registered, (
+            M,
+            N,
+            K,
+            mirror.template,
+        )
+        plan, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], transposed_out=out_t, **kw
+        )
+        assert plan.template == neighbour and neighbour in registered, (
+            M,
+            N,
+            K,
+            plan.template,
+        )
+        assert plan.knob_fallback and not plan.rule_fallback and not plan.swap_fallback
+        # the single-CTA neighbour carries no tail policy and no pro; the 64-row neighbour keeps the hints
+        if neighbour.endswith("_c1"):
+            assert plan.cta1 and plan.sk_units == 0 and not plan.sk_sync
+        if "_m64_" in neighbour:
+            assert plan.cta_rows == 64 and plan.hints == ("evict_first", "none")
+    # a caller-forced tail policy does not keep the row off the single-CTA form: the cta1 variant clears it
+    v = _class_views("kk", False, False, 16384, 128, 4096)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk=True, **kw)
+    assert plan.template == "dense_proj_gemm_kk_n128_hen_c1" and plan.knob_fallback
+    # on sm_107a the same weight-gradient rows reach the plain-hint twin (generated there) in the first variant
+    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a")
+    v = _class_views("nn", False, True, 4096, 128, 16384)
+    mirror, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], transposed_out=True, _fallback=False, **kw107
+    )
+    plan, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], transposed_out=True, **kw107
+    )
+    assert mirror.template == "dense_proj_gemm_nn_n128_hen_t_pro7"
+    assert plan.template == "dense_proj_gemm_nn_n128_t_pro7" and plan.knob_fallback
+
+
+def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
+    """A class whose only generated programs carry knobs outside the hand-ordered variants (a narrow MN-major B
+    panel, the synchronised stream-K slab path) still plans: the second pass decodes the registry's symbols into
+    knobs (``_registry_variants``) and the plan carries the decoded program's knobs."""
+    fake = {
+        "sm_100a": {
+            "dense_proj_gemm_nn_n256_sks_sb2_pro7": "a",
+            "dense_proj_gemm_nn_n160_m256_bz64_pro15": "b",
+            "dense_proj_gemm_kk_n256_pro7": "c",
+        }
+    }
+    monkeypatch.setattr(cake_backend, "KERNELS", fake)
+    monkeypatch.setattr(cake_backend, "ROW_RULES", {})
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a")
+    v = _class_views("nn", False, False, 4096, 4096, 16384)
+    mirror, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], _fallback=False, **kw
+    )
+    assert mirror.template not in fake["sm_100a"]
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+    assert plan.template in (
+        "dense_proj_gemm_nn_n256_sks_sb2_pro7",
+        "dense_proj_gemm_nn_n160_m256_bz64_pro15",
+    )
+    assert plan.knob_fallback
+    knobs = cake_backend._template_knobs(plan.template)
+    assert (plan.block_n, plan.cta_rows, plan.b_swz, plan.sk_sync, plan.sk_slab) == (
+        knobs["block_n"],
+        knobs["cta_rows"],
+        knobs["b_swz"],
+        knobs["sk_sync"],
+        knobs["sk_slab"],
+    )
+    # a class without a program stays unregistered (the launch binding raises, not the planner) and unflagged
+    v = _class_views("kn", False, False, 4096, 4096, 16384)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+    assert plan.template not in fake["sm_100a"]
+    assert not (plan.knob_fallback or plan.rule_fallback or plan.swap_fallback)
+    # a caller-forced knob wins over a decoded one: the forced 256-row tile never reaches the 128-row sync program
+    v = _class_views("nn", False, False, 4096, 4096, 16384)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta_rows=256, **kw)
+    assert (
+        plan.template == "dense_proj_gemm_nn_n160_m256_bz64_pro15"
+        and plan.knob_fallback
+    )
+
+
+# ---------------------------------------------------------------------------
+# The measured rows of the shapes tranche: (ROW_RULES key, T, SM count of the measuring device, the program the
+# measurement selected).  Generated from the measurement records of the tranche; the rule of each key (or, for a row
+# whose choice is the planner's default, the default) must plan exactly this program.
+# ---------------------------------------------------------------------------
+# fmt: off
+MEASURED_SHAPE_ROWS = (
+    (('sm_100a', False, False, False, False, False, 32, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 32, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 32, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 32, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 48, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 48, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 48, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 48, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 64, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 64, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 64, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 64, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 128, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 128, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 128, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 128, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_100a', False, False, False, False, False, 128, 8192, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_pro15'),
+    (('sm_100a', False, False, False, False, False, 128, 8192, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_pro15'),
+    (('sm_100a', False, False, False, False, False, 512, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_100a', False, False, False, False, False, 512, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_100a', False, False, False, False, False, 512, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_100a', False, False, False, False, False, 512, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_100a', False, False, False, False, False, 1024, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 1024, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 1024, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 1024, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 4096, 2048, None), 16172, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 4096, 2048, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 5120, 17408, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 5120, 17408, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 12288, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 12288, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 16384, 2048, None), 16172, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 16384, 2048, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 17408, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 17408, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 2048, 4096, None), 16172, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 2048, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
+    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
+    (('sm_100a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 5120, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 5120, 17408, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ht_or_pro7'),
+    (('sm_100a', False, True, False, False, False, 5120, 17408, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ht_or_pro7'),
+    (('sm_100a', False, True, False, False, False, 8192, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 8192, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_100a', False, True, False, False, False, 12288, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 12288, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 17408, 5120, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, False, False, False, 17408, 5120, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_100a', False, True, True, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_100a', False, True, True, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_100a', False, True, True, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_100a', False, True, True, False, False, 8192, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', False, True, True, False, False, 8192, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 5120, None, 512), 16231, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
+    (('sm_100a', True, True, False, False, False, 5120, None, 512), 16384, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
+    (('sm_100a', True, True, False, False, False, 5120, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_cg_pro15'),
+    (('sm_100a', True, True, False, False, False, 5120, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_cg_pro15'),
+    (('sm_100a', True, True, False, False, False, 5120, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_100a', True, True, False, False, False, 5120, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_100a', True, True, False, False, False, 6144, None, 12288), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_100a', True, True, False, False, False, 6144, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_100a', True, True, False, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_100a', True, True, False, False, False, 12288, None, 6144), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_100a', True, True, False, False, False, 12288, None, 6144), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_100a', True, True, False, True, False, 32, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 32, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 32, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 32, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 48, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 48, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 48, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 48, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 64, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 64, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 64, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 64, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 128, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 128, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 128, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 128, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 128, None, 8192), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 128, None, 8192), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 512, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 512, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m64_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 1024, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_hen_t_pro15'),
+    (('sm_100a', True, True, False, True, False, 1024, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_hen_t_pro15'),
+    (('sm_100a', True, True, True, False, False, 4096, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n256_f32_tma1_cg_pro15'),
+    (('sm_100a', True, True, True, False, False, 4096, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n256_f32_tma1_cg_pro15'),
+    (('sm_100a', True, True, True, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, False, False, 4096, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_100a', True, True, True, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_100a', True, True, True, False, False, 5120, None, 512), 16231, 152, 'dense_proj_gemm_nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15'),
+    (('sm_100a', True, True, True, False, False, 5120, None, 512), 16384, 152, 'dense_proj_gemm_nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15'),
+    (('sm_100a', True, True, True, False, False, 5120, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_f32_v8_ef_cg_pro15'),
+    (('sm_100a', True, True, True, False, False, 5120, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_f32_v8_ef_cg_pro15'),
+    (('sm_100a', True, True, True, False, False, 5120, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, False, False, 5120, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, False, False, 6144, None, 12288), 16172, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, False, False, 6144, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_100a', True, True, True, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_100a', True, True, True, False, False, 12288, None, 6144), 16172, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, False, False, 12288, None, 6144), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_100a', True, True, True, True, False, 32, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 32, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 32, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 32, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 48, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 48, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 48, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 48, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 64, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 64, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 64, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 64, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 128, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 128, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 128, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 128, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 128, None, 8192), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 128, None, 8192), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 512, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15'),
+    (('sm_100a', True, True, True, True, False, 512, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15'),
+    (('sm_103a', False, False, False, False, False, 32, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 32, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 32, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 32, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 48, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 48, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 48, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 48, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 64, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 64, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 64, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 64, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 128, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 128, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 128, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 128, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_c1'),
+    (('sm_103a', False, False, False, False, False, 128, 8192, None), 16231, 152, 'dense_proj_gemm_kk_n128_hen_pro15'),
+    (('sm_103a', False, False, False, False, False, 128, 8192, None), 16384, 152, 'dense_proj_gemm_kk_n128_hen_pro15'),
+    (('sm_103a', False, False, False, False, False, 512, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_103a', False, False, False, False, False, 512, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_103a', False, False, False, False, False, 512, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_103a', False, False, False, False, False, 512, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_pro7'),
+    (('sm_103a', False, False, False, False, False, 1024, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 1024, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 1024, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 1024, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 4096, 2048, None), 16172, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 4096, 2048, None), 16231, 152, 'dense_proj_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 5120, 17408, None), 16231, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 5120, 17408, None), 16384, 152, 'dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, False, False, False, False, 12288, 4096, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 12288, 4096, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 16384, 2048, None), 16172, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 16384, 2048, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 17408, 5120, None), 16231, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 17408, 5120, None), 16384, 152, 'dense_proj_gemm_kk_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 2048, 4096, None), 16172, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 2048, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_103a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_103a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ov_cg_pro7'),
+    (('sm_103a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_103a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_103a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_103a', False, True, False, False, False, 5120, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_103a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 17408, None), 16231, 152, 'dense_proj_gemm_kn_n256_m256_ht_or_pro7'),
+    (('sm_103a', False, True, False, False, False, 5120, 17408, None), 16384, 152, 'dense_proj_gemm_kn_n256_m256_ht_or_pro7'),
+    (('sm_103a', False, True, False, False, False, 8192, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 8192, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 12288, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 12288, 4096, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 17408, 5120, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, False, False, False, 17408, 5120, None), 16384, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_103a', False, True, True, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_103a', False, True, True, False, False, 5120, 32, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 32, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 48, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 48, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 64, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_103a', False, True, True, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma1_pro7'),
+    (('sm_103a', False, True, True, False, False, 8192, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', False, True, True, False, False, 8192, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n224_hne_cg_pro15'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n224_hne_cg_pro15'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 5120, None, 512), 16231, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
+    (('sm_103a', True, True, False, False, False, 5120, None, 512), 16384, 152, 'dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
+    (('sm_103a', True, True, False, False, False, 5120, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_pro15'),
+    (('sm_103a', True, True, False, False, False, 5120, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_pro15'),
+    (('sm_103a', True, True, False, False, False, 5120, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_103a', True, True, False, False, False, 5120, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_103a', True, True, False, False, False, 6144, None, 12288), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_103a', True, True, False, False, False, 6144, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_103a', True, True, False, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n224_m256_pro7'),
+    (('sm_103a', True, True, False, False, False, 12288, None, 6144), 16172, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_103a', True, True, False, False, False, 12288, None, 6144), 16231, 152, 'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7'),
+    (('sm_103a', True, True, False, True, False, 32, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 32, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 32, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 32, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 48, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 48, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 48, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 48, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 64, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 64, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 64, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 64, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 128, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 128, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 128, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 128, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_t_sks_pro7'),
+    (('sm_103a', True, True, False, True, False, 128, None, 8192), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 128, None, 8192), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 512, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m64_hen_t_pro15'),
+    (('sm_103a', True, True, False, True, False, 512, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m64_hen_t_pro15'),
+    (('sm_103a', True, True, True, False, False, 4096, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n224_f32_v8_ef_pro15'),
+    (('sm_103a', True, True, True, False, False, 4096, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n224_f32_v8_ef_pro15'),
+    (('sm_103a', True, True, True, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, False, False, 4096, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_103a', True, True, True, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_103a', True, True, True, False, False, 5120, None, 512), 16231, 152, 'dense_proj_gemm_nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15'),
+    (('sm_103a', True, True, True, False, False, 5120, None, 512), 16384, 152, 'dense_proj_gemm_nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15'),
+    (('sm_103a', True, True, True, False, False, 5120, None, 1024), 16231, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_f32_v8_ef_pro15'),
+    (('sm_103a', True, True, True, False, False, 5120, None, 1024), 16384, 152, 'dense_proj_gemm_nn_n160_m256_bz64_hne_f32_v8_ef_pro15'),
+    (('sm_103a', True, True, True, False, False, 5120, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, False, False, 5120, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, False, False, 6144, None, 12288), 16172, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, False, False, 6144, None, 12288), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, False, False, 12288, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_103a', True, True, True, False, False, 12288, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7'),
+    (('sm_103a', True, True, True, False, False, 12288, None, 6144), 16172, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, False, False, 12288, None, 6144), 16231, 152, 'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7'),
+    (('sm_103a', True, True, True, True, False, 32, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 32, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 32, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 32, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 48, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 48, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 48, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 48, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 64, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 64, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 64, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 64, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 128, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 128, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 128, None, 5120), 16231, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 128, None, 5120), 16384, 152, 'dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7'),
+    (('sm_103a', True, True, True, True, False, 128, None, 8192), 16231, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 128, None, 8192), 16384, 152, 'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 512, None, 4096), 16231, 152, 'dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15'),
+    (('sm_103a', True, True, True, True, False, 512, None, 4096), 16384, 152, 'dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15'),
+)
+# fmt: on
+# Programs the measured rows name that the registry of this tree does not carry yet, per architecture: the consistency
+# test tolerates them until the export registers them and fails once one of them lands without leaving this set.  Empty
+# sets once the export ships the tranche: then every measured row runs its measured program.
+PENDING_PROGRAMS: dict[str, frozenset[str]] = {
+    "sm_100a": frozenset(
+        {
+            "dense_proj_gemm_kk_n128_hen_pro15",
+            "dense_proj_gemm_kk_n256_cg_pro15",
+            "dense_proj_gemm_kk_n256_ht_cg_pro15",
+            "dense_proj_gemm_kk_n256_m256_ov_cg_pro7",
+            "dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7",
+            "dense_proj_gemm_kn_n256_cg_pro15",
+            "dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15",
+            "dense_proj_gemm_kn_n256_m256_ht_or_pro7",
+            "dense_proj_gemm_kn_n256_m256_ov_cg_pro7",
+            "dense_proj_gemm_kn_n256_tma2_pd3_c1",
+            "dense_proj_gemm_nn_n128_hen_f32_t_pro15",
+            "dense_proj_gemm_nn_n128_hen_t_pro15",
+            "dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15",
+            "dense_proj_gemm_nn_n128_m64_hen_t_pro15",
+            "dense_proj_gemm_nn_n160_m256_bz64_hne_cg_pro15",
+            "dense_proj_gemm_nn_n160_m256_bz64_hne_f32_v8_ef_cg_pro15",
+            "dense_proj_gemm_nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+            "dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15",
+            "dense_proj_gemm_nn_n224_m256_pro7",
+            "dense_proj_gemm_nn_n256_f32_tma1_cg_pro15",
+            "dense_proj_gemm_nn_n256_hen_t_pro15",
+            "dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15",
+            "dense_proj_gemm_nn_n256_m64_hen_t_pro15",
+        }
+    ),
+    "sm_103a": frozenset(
+        {
+            "dense_proj_gemm_kk_n128_hen_c1",
+            "dense_proj_gemm_kk_n128_hen_pro15",
+            "dense_proj_gemm_kk_n256_cg_pro15",
+            "dense_proj_gemm_kk_n256_ht_cg_pro15",
+            "dense_proj_gemm_kk_n256_m256_ov_cg_pro7",
+            "dense_proj_gemm_kk_n256_m256_ov_ht_cg_pro7",
+            "dense_proj_gemm_kk_n256_pro7",
+            "dense_proj_gemm_kn_n256_cg_pro15",
+            "dense_proj_gemm_kn_n256_f32_tma1_pro7",
+            "dense_proj_gemm_kn_n256_f32_tma2_pd2_pro15",
+            "dense_proj_gemm_kn_n256_m256_ht_or_pro7",
+            "dense_proj_gemm_kn_n256_m256_ov_cg_pro7",
+            "dense_proj_gemm_kn_n256_tma1_pd2_pro15",
+            "dense_proj_gemm_kn_n256_tma2_pd2_pro15",
+            "dense_proj_gemm_kn_n256_tma2_pd3_c1",
+            "dense_proj_gemm_nn_n128_hen_f32_t_sks_pro7",
+            "dense_proj_gemm_nn_n128_hen_t_sks_pro7",
+            "dense_proj_gemm_nn_n128_m64_hen_f32_t_pro15",
+            "dense_proj_gemm_nn_n128_m64_hen_t_pro15",
+            "dense_proj_gemm_nn_n160_m256_bz64_hne_f32_v8_ef_pro15",
+            "dense_proj_gemm_nn_n160_m256_bz64_hne_pro15",
+            "dense_proj_gemm_nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+            "dense_proj_gemm_nn_n192_bz64_hne_sks_sb2_pro15",
+            "dense_proj_gemm_nn_n224_f32_v8_ef_pro15",
+            "dense_proj_gemm_nn_n224_hne_cg_pro15",
+            "dense_proj_gemm_nn_n224_m256_pro7",
+            "dense_proj_gemm_nn_n256_m256_f32_tma1_pro7",
+            "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7",
+            "dense_proj_gemm_nn_n256_m256_sks_sb2_pro7",
+            "dense_proj_gemm_nn_n256_m64_hen_f32_t_pro15",
+            "dense_proj_gemm_nn_n256_m64_hen_t_pro15",
+        }
+    ),
+}
+
+
+def _key_views(key, T):
+    """The views of a ROW_RULES key at sequence length ``T`` (M for the forward / input gradient keys, K for the
+    weight-gradient keys)."""
+    arch, a_mn, b_mn, out_f32, out_t, batched, N, K, M = key
+    assert not batched  # the tranche has no batched rows
+    layout = ("n" if a_mn else "k") + ("n" if b_mn else "k")
+    return _class_views(
+        layout, out_f32, out_t, T if M is None else M, N, T if K is None else K
+    )
+
+
+@pytest.mark.parametrize("arch", sorted({row[0][0] for row in MEASURED_SHAPE_ROWS}))
+def test_measured_shape_rules_plan_their_programs(arch):
+    """Every measured row of the shapes tranche plans the program its measurement selected (its rule reproduces the
+    measured knobs through the planner, at the measuring device's SM count); where this tree registers the
+    architecture, that program is registered or pending (``PENDING_PROGRAMS``), a registered one runs as is (no
+    fallback) and a pending one still runs a registered neighbour (the registry fallback)."""
+    rows = [row for row in MEASURED_SHAPE_ROWS if row[0][0] == arch]
+    assert rows
+    registered = _registered(arch)
+    for key, T, sm_count, template in rows:
+        v = _key_views(key, T)
+        kw = dict(
+            sm_count=sm_count, l2_bytes=L2_BYTES, transposed_out=key[4], arch=arch
+        )
+        mirror, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], _fallback=False, **kw
+        )
+        assert mirror.template == template, (key, T, mirror.template)
+        if arch not in cake_jit.KERNELS:
+            continue  # the registry of this architecture has not landed: the plans are checked, the programs cannot be
+        assert template in registered or template in PENDING_PROGRAMS[arch], (
+            key,
+            T,
+            template,
+        )
+        plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+        if template in registered:
+            assert plan.template == template, (key, T, plan.template)
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), (key, T)
+        else:
+            assert plan.template in registered, (key, T, plan.template)
+    # a program that lands leaves the pending set (the set stays honest; it is empty once the tranche ships)
+    assert not (PENDING_PROGRAMS.get(arch, frozenset()) & registered), sorted(
+        PENDING_PROGRAMS[arch] & registered
+    )
+
+
+def test_wgrad_swap_follows_the_measured_rule():
+    """The weight-gradient orientation: a measured rule keyed in exactly one orientation (the swapped ``_t`` key
+    ``(arch, nn, out_f32, True, False, N, None, K)`` or the direct key ``(arch, nn, out_f32, False, False, K, None, N)``)
+    decides; without one - or without an architecture (the planner tests' views) - the launcher's padded-tile-work
+    heuristic."""
+    # the heuristic: ties keep the direct route
+    assert not wgrad_swapped(512, 4096) and not wgrad_swapped(1024, 4096)
+    # measured: 4096 -> 512 swaps on both architectures for bf16 and fp32, 5120 -> 512 was measured direct ...
+    for arch in ("sm_100a", "sm_103a"):
+        for out_f32 in (False, True):
+            assert wgrad_swapped(512, 4096, arch=arch, out_f32=out_f32), (arch, out_f32)
+            assert not wgrad_swapped(512, 5120, arch=arch, out_f32=out_f32), (
+                arch,
+                out_f32,
+            )
+    # ... and 4096 -> 1024 bf16 swaps on sm_100a only
+    assert wgrad_swapped(1024, 4096, arch="sm_100a", out_f32=False)
+    assert not wgrad_swapped(1024, 4096, arch="sm_103a", out_f32=False)
+    assert not wgrad_swapped(1024, 4096, arch="sm_100a", out_f32=True)
+    # rows with a rule in the heuristic's orientation and rows without a rule agree with the heuristic everywhere
+    for arch in ("sm_100a", "sm_103a", "sm_107a", "sm_90a"):
+        assert wgrad_swapped(32, 6144, arch=arch) and wgrad_swapped(
+            576, 6144, arch=arch
+        ), arch
+        assert not wgrad_swapped(256, 6144, arch=arch) and not wgrad_swapped(
+            6144, 2048, arch=arch
+        ), arch
+    # the views follow the decision and the swapped plan takes the measured program
+    T = 16384
+    G = torch.empty(T, 512, dtype=torch.bfloat16)
+    X = torch.empty(T, 4096, dtype=torch.bfloat16)
+    A, B, transposed = wgrad_views(G, X)
+    assert not transposed and A.shape == (512, T) and B is X
+    A, B, transposed = wgrad_views(G, X, arch="sm_100a")
+    assert transposed and A.shape == (4096, T) and B is G
+    plan, *_ = plan_dense_projection_gemm(
+        A,
+        B,
+        torch.empty(512, 4096, dtype=torch.bfloat16),
+        sm_count=152,
+        l2_bytes=L2_BYTES,
+        transposed_out=True,
+        arch="sm_100a",
+        _fallback=False,
+    )
+    assert plan.template == "dense_proj_gemm_nn_n256_m64_hen_t_pro15"
+    # the measured rules never key one weight-gradient row in both orientations (the decision would be undefined)
+    for key in ROW_RULES:
+        arch, a_mn, b_mn, out_f32, out_t, batched, N, K, M = key
+        if a_mn and b_mn and not batched and K is None:
+            mirror = (arch, True, True, out_f32, not out_t, False, M, None, N)
+            assert mirror not in ROW_RULES, (key, mirror)
 
 
 def test_router_convenience_views_match_the_planner():
