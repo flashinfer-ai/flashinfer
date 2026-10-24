@@ -1374,7 +1374,6 @@ def _static_kernel_cache_key(
     quant_mode: str,
     state_E: int,
     weight_E: int,
-    m: int,
     k: int,
     n: int,
     weight_n: int,
@@ -1405,7 +1404,6 @@ def _static_kernel_cache_key(
         quant_mode,
         state_E,
         weight_E,
-        m,
         k,
         n,
         weight_n,
@@ -1593,7 +1591,6 @@ def _get_static_kernel(
         quant_mode=quant_mode,
         state_E=state_E,
         weight_E=weight_E,
-        m=m,
         k=k,
         n=n,
         weight_n=weight_n,
@@ -1648,9 +1645,11 @@ def _get_static_kernel(
     cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     # Build fake tensors for compilation
+    sym_tokens = cute.sym_int()
+    sym_pairs = cute.sym_int()
     a_input_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -1660,12 +1659,12 @@ def _get_static_kernel(
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
     topk_ids_fake = cute.runtime.make_fake_compact_tensor(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=topk_ids_align,
     )
     topk_weights_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=4,
     )
     packed_a_fake = cute.runtime.make_fake_compact_tensor(
@@ -1761,7 +1760,7 @@ def _get_static_kernel(
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -1788,7 +1787,7 @@ def _get_static_kernel(
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         _disk_kernel_name(
-            f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}_c{route_rows}"
+            f"static_k{k}_n{n}_t{num_topk}_r{max_rows}_c{route_rows}"
             f"{'_mg' if merged_groups else ''}{'_di' if deferred_init else ''}{'_ss' if source_scales else ''}",
             cache_key,
         ),
