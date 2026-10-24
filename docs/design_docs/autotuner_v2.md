@@ -111,6 +111,51 @@ concurrent tuning/serving and distributed scoped-store use require separate
 qualification. Scoped ownership does not make the process-global tuning mode
 thread-local.
 
+**Replay coverage.** An optional `ReplayCoverage` report observes Python cache
+lookups without profiling. Pass `replay_report=report` to `mode="replay"`; the
+context yields the same report. Counters cover all observed decisions, while
+`records` keeps only the first `max_records` (64 by default). Reusing a report
+accumulates counts. Each record includes the op, input shapes, cache identity,
+source, selected runner/tactic and known profiling-policy provenance. An unknown
+stored policy is `None`. Tactic representations are truncated to 256 characters.
+
+A cached default tactic `-1` is a hit. An absent or rejected winner is a miss;
+explicit `skip_ops` exclusions are counted separately. Ordinary observation
+preserves source precedence and compatibility behavior, including legacy-file
+hits and replay of entries whose profiling policy is unknown. A report describes
+tuner choices, not backend-internal fallback or the kernels actually executed.
+Delegated protocols report their own `TuningResult.cache_hit`; protocols remain
+responsible for honoring disabled tuning and validating their records.
+
+For single-rank preflight, `strict_replay=True` additionally requires a compatible
+cached winner for every non-skipped lookup, including known matching profiling
+policy for ordinary winners. It requires an identified `cache_scope="context"`
+and raises on a miss without profiling or publishing a replacement. It creates
+and yields a report when none is supplied:
+
+```python
+with autotune_v2(
+    mode="replay", cache_scope="context", measurement_policy=graph_policy,
+    strict_replay=True,
+) as coverage:
+    for inputs in planned_capture_inputs:
+        graph_region(inputs)  # preflight every intended capture profile
+```
+
+Run preflight before capture, then use the same identity and profiling controls
+for capture-time lookup. Strict lookup also works during capture, but a miss then
+aborts that capture; it cannot prove coverage for shapes never exercised. CUDA
+graph replay executes no Python and adds no records. Shortlist calls in replay
+return and report the single cached winner, as before. Diagnostics reject nested
+tuning, forced protocol tuning and direct library profiling. The default path
+allocates no report and retains fallback behavior.
+
+Strict replay rejects configured tuning groups or a distributed world larger
+than one: a unilateral exception during a model forward could strand peers in a
+collective. Distributed callers can collect non-strict reports, then coordinate
+coverage checks at a framework-owned boundary before capture. This API adds no
+serving collectives and does not provide concurrent tuning/serving support.
+
 ### 2.2 Store layout on disk
 
 ```text
@@ -244,7 +289,8 @@ overrides. These inherited settings are not fully represented by the manifest.
 When `choose_one` can profile, it reuses a managed winner only when this provenance matches,
 including after preload, reload, and promotion to the root/environment-partitioned memory
 cache. A missing or different policy is a profiling miss, not deletion; replay, bare inference,
-and direct `search_cache` lookups still accept the winner, even inside a tuning context.
+and direct `search_cache` lookups still accept the winner, even inside a tuning context,
+unless strict replay explicitly requires matching provenance.
 Entries without provenance are retuned by `choose_one` even under the default policy, including
 after a same-version build upgrade that leaves the environment directory unchanged.
 Successful retuning retires the previous candidates before publishing the new winner, including

@@ -1630,6 +1630,8 @@ class _V2Local(threading.local):
     store: Any = None
     measure: Any = None
     cache_scope: str = "process"
+    replay_report: Any = None
+    strict_replay: bool = False
 
 
 class AutoTuner:
@@ -2105,6 +2107,9 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
+            report = self._v2_local.replay_report
+            require_profiling_policy |= self._v2_local.strict_replay
+            rejections: list[str] | None = [] if report is not None else None
             requested_policy = self._profiling_policy(tuning_config)
             default_policy = self._default_profiling_policy(tuning_config)
             # 1. In-memory winners and provenance share the same partition.
@@ -2130,14 +2135,36 @@ class AutoTuner:
                         default_policy if winner_identity is None else None,
                     )
                     if check_memory_policy and cached_policy != requested_policy:
+                        if (
+                            rejections is not None
+                            and "policy_mismatch" not in rejections
+                        ):
+                            rejections.append("policy_mismatch")
                         continue
                     tactic, stored_profile = winners[cache_key]
                     if not self._tactic_still_valid(
                         r, inputs, tactic, custom_op, "memory"
                     ):
+                        if (
+                            rejections is not None
+                            and "invalid_tactic" not in rejections
+                        ):
+                            rejections.append("invalid_tactic")
                         # Fall through: another runner, a disk source, or
                         # (in tuning mode) a re-profile may still serve.
                         continue
+                    if report is not None:
+                        report._record(
+                            custom_op,
+                            input_shapes,
+                            winner_identity,
+                            status="hit",
+                            source="memory",
+                            requested_policy=requested_policy,
+                            stored_policy=cached_policy,
+                            runner=type(r).__name__,
+                            tactic=tactic,
+                        )
                     return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
@@ -2157,10 +2184,20 @@ class AutoTuner:
                             continue
                         runner_name, tactic = self._file_configs[file_key]
                         if runner_name != runners[r_id].__class__.__name__:
+                            if (
+                                rejections is not None
+                                and "runner_mismatch" not in rejections
+                            ):
+                                rejections.append("runner_mismatch")
                             continue
                         if not self._tactic_still_valid(
                             runners[r_id], inputs, tactic, custom_op, "config file"
                         ):
+                            if (
+                                rejections is not None
+                                and "invalid_tactic" not in rejections
+                            ):
+                                rejections.append("invalid_tactic")
                             continue
                         log_key = (custom_op, runner_name)
                         if log_key not in self._logged_file_hits:
@@ -2168,6 +2205,18 @@ class AutoTuner:
                             logger.info(
                                 f"[Autotuner]: Config cache hit for {custom_op} "
                                 f"(runner={runner_name}, source=config file)"
+                            )
+                        if report is not None:
+                            report._record(
+                                custom_op,
+                                input_shapes,
+                                winner_identity,
+                                status="hit",
+                                source="legacy",
+                                requested_policy=requested_policy,
+                                stored_policy=self._file_config_policies.get(file_key),
+                                runner=runner_name,
+                                tactic=tactic,
                             )
                         return True, r_id, tactic, None
 
@@ -2199,13 +2248,28 @@ class AutoTuner:
                         require_profiling_policy
                         and hit.profiling_policy != requested_policy
                     ):
+                        if (
+                            rejections is not None
+                            and "policy_mismatch" not in rejections
+                        ):
+                            rejections.append("policy_mismatch")
                         continue
                     runner_name, tactic = hit.runner, hit.tactic
                     if runner_name != runners[r_id].__class__.__name__:
+                        if (
+                            rejections is not None
+                            and "runner_mismatch" not in rejections
+                        ):
+                            rejections.append("runner_mismatch")
                         continue
                     if not self._tactic_still_valid(
                         runners[r_id], inputs, tactic, custom_op, "managed cache"
                     ):
+                        if (
+                            rejections is not None
+                            and "invalid_tactic" not in rejections
+                        ):
+                            rejections.append("invalid_tactic")
                         continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
@@ -2220,6 +2284,18 @@ class AutoTuner:
                     self._profiling_cache_policies[(winner_identity, cache_key)] = (
                         hit.profiling_policy
                     )
+                    if report is not None:
+                        report._record(
+                            custom_op,
+                            input_shapes,
+                            winner_identity,
+                            status="hit",
+                            source="managed",
+                            requested_policy=requested_policy,
+                            stored_policy=hit.profiling_policy,
+                            runner=runner_name,
+                            tactic=tactic,
+                        )
                     return True, r_id, tactic, None
 
             # 3. Bundled package configs (legacy .py files)
@@ -2236,9 +2312,38 @@ class AutoTuner:
                         continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
+                        if report is not None:
+                            report._record(
+                                custom_op,
+                                input_shapes,
+                                winner_identity,
+                                status="hit",
+                                source="bundled",
+                                requested_policy=requested_policy,
+                                runner=type(runners[r_id]).__name__,
+                                tactic=file_tactic,
+                            )
                         return True, r_id, file_tactic, None
 
             # 4. Fallback
+            if report is not None:
+                reasons = tuple(rejections or ("not_found",))
+                report._record(
+                    custom_op,
+                    input_shapes,
+                    winner_identity,
+                    status="miss",
+                    source="fallback",
+                    requested_policy=requested_policy,
+                    runner=type(runners[0]).__name__ if runners else None,
+                    tactic=-1,
+                    reasons=reasons,
+                )
+                if self._v2_local.strict_replay:
+                    raise RuntimeError(
+                        f"autotune strict replay miss for {custom_op}: "
+                        f"input_shapes={input_shapes}, reasons={reasons}"
+                    )
             return False, 0, -1, None
 
     def _apply_tuning_overrides(self, tuning_config: TuningConfig) -> TuningConfig:
@@ -2348,8 +2453,37 @@ class AutoTuner:
         by the protocol, and are not imported or exported by the v1 JSON API.
         """
         with self._lock:
+            if self._v2_local.replay_report is not None and (
+                force_tune or self.is_tuning_mode
+            ):
+                raise RuntimeError("replay diagnostics forbid protocol tuning")
             context = self.protocol_context(custom_op, force_tune=force_tune)
             result = protocol.run(context)
+            report = self._v2_local.replay_report
+            if report is not None:
+                status = (
+                    "skipped"
+                    if context.skipped
+                    else "hit"
+                    if result.cache_hit
+                    else "miss"
+                )
+                report._record(
+                    custom_op,
+                    (),
+                    self._winner_cache_identity(),
+                    status=status,
+                    source="protocol",
+                    runner=None,
+                    tactic=None,
+                    reasons=()
+                    if result.cache_hit
+                    else ("skip_ops" if context.skipped else "protocol_miss",),
+                )
+                if status == "miss" and self._v2_local.strict_replay:
+                    raise RuntimeError(
+                        f"autotune strict replay miss for protocol {custom_op}"
+                    )
             if result.candidates:
                 self.stats.tuned_op_total_configs[custom_op] = (
                     self.stats.tuned_op_total_configs.get(custom_op, 0)
@@ -2410,10 +2544,25 @@ class AutoTuner:
             )
             if not runners:
                 raise ValueError(f"No runners provided for op '{custom_op}'")
+            report = self._v2_local.replay_report
+            if report is not None:
+                with self._lock:
+                    report._record(
+                        custom_op,
+                        self._get_input_sizes(inputs),
+                        self._winner_cache_identity(),
+                        status="skipped",
+                        source="skip_ops",
+                        runner=type(runners[0]).__name__,
+                        tactic=-1,
+                        reasons=("skip_ops",),
+                    )
             return runners[0], -1
 
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
+            if self._v2_local.replay_report is not None and self.is_tuning_mode:
+                raise RuntimeError("replay diagnostics forbid tuning")
             if (
                 self._override_tuning_buckets is not None
                 or self._override_round_up
@@ -2923,6 +3072,9 @@ class AutoTuner:
                 f"for op '{custom_op}'"
             )
 
+        if self._v2_local.replay_report is not None and self.is_tuning_mode:
+            raise RuntimeError("replay diagnostics forbid tuning")
+
         if k == 1 or not self.is_tuning_mode:
             _, tactic = self.choose_one(
                 custom_op, runners, tuning_config, inputs, **kwargs
@@ -3133,6 +3285,8 @@ class AutoTuner:
             sees the same per-call allocation overhead, and the autotuner
             picks based on intrinsic kernel time.
         """
+        if self._v2_local.replay_report is not None:
+            raise RuntimeError("replay diagnostics forbid profiling")
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "autotune measurement cannot run inside a CUDA graph "
