@@ -104,6 +104,7 @@ _COMMON = dict(
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
+    sample_fit_kinds=["l6", "narrow", "pair_l6", "pair_narrow", "pair_wide", "wide"],
     sample_tiles_max=32,
     sample_tiles_short_units=16,
     sample_dispatch_mean_tiles_max=640,
@@ -625,6 +626,11 @@ def test_policy_record_round_trip_and_validation():
         dict(candidate_multiplier_unsampled=0),  # the unsampled capacity values
         dict(cand_mult_rule_unsampled=384),
         dict(cand_cap_floor_unsampled=8192.5),
+        # the kinds with a sampled-fit program: an ascending list of physical kinds
+        dict(sample_fit_kinds="l6"),
+        dict(sample_fit_kinds=["split"]),
+        dict(sample_fit_kinds=["wide", "l6"]),
+        dict(sample_fit_kinds=["l6", "l6"]),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
@@ -1255,6 +1261,39 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                             bound,
                             key,
                         )
+
+
+def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
+    """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
+    the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
+    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        registered = sorted(
+            {
+                key.split(":")[1]
+                for key in keys
+                if key.startswith("scan:") and key.endswith(":f1")
+            }
+        )
+        assert policy_for(arch).sample_fit_kinds == registered, arch
+    # a split unit that fits a 32768-slot buffer keeps the plain split program; the gate, not the geometry, decides
+    p = policy_for("sm_103a")
+    geometry = dict(
+        num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    c = select_program(p, candidate_multiplier=16, **geometry)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 2, 32768)
+    assert c.physical_kind == "split_l6" and not c.sample_fit
+    wider = DispatchPolicy.from_record(
+        dict(p.record(), sample_fit_kinds=sorted(p.sample_fit_kinds + ["split_l6"]))
+    )
+    c = select_program(wider, candidate_multiplier=16, **geometry)
+    assert c.scan_key == "scan:split_l6:u1:s0:f1" and c.sample_fit
+    assert p.sample_fit_for(4, 22018, 1, 1, 32768) and not p.sample_fit_for(
+        4, 22018, 1, 1, 32768, "split_l6"
+    )
 
 
 def test_program_keys_and_slugs():

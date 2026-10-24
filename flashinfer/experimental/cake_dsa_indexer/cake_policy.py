@@ -65,6 +65,7 @@ POLICY_FIELDS = (
     "tile_unroll_factor",  # tile-loop unroll when the rule applies
     "tile_unroll_rule",  # [program kinds, min top_k, yields to the snake order], or None
     "sample_fit_max_mean_tiles",  # sampled first threshold on buffer-fitting units up to this mean tile count
+    "sample_fit_kinds",  # physical scan kinds whose sampled-fit program the architecture registers; every other kind runs its plain program
     "sample_tiles_max",  # sample-tile cap of long units (0 = no sampling)
     "sample_tiles_short_units",  # sample-tile cap of short units
     "sample_dispatch_mean_tiles_max",  # mean unit tiles up to which the short-unit cap applies
@@ -106,6 +107,10 @@ POLICY_FIELDS = (
 
 KINDS = ("narrow", "wide", "l6", "split", "pair_narrow", "pair_wide", "pair_l6")
 UNITS = ("narrow", "wide", "l6")
+# Names of the compiled scan program kinds (the split program is one per unit geometry).
+PHYSICAL_KINDS = tuple(
+    sorted(set(KINDS) - {"split"} | {f"split_{unit}" for unit in UNITS})
+)
 MERGE_KEY = "merge"
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
@@ -186,6 +191,7 @@ class DispatchPolicy:
     tile_unroll_factor: int
     tile_unroll_rule: Optional[list]
     sample_fit_max_mean_tiles: float
+    sample_fit_kinds: list
     sample_tiles_max: int
     sample_tiles_short_units: int
     sample_dispatch_mean_tiles_max: float
@@ -332,6 +338,15 @@ class DispatchPolicy:
             raise ValueError(
                 "policy['rank_t16_slots'] must be an ascending list of positive sort-slot counts divisible by 16"
             )
+        fit_kinds = raw["sample_fit_kinds"]
+        if (
+            not isinstance(fit_kinds, (list, tuple))
+            or not all(isinstance(k, str) and k in PHYSICAL_KINDS for k in fit_kinds)
+            or list(fit_kinds) != sorted(set(fit_kinds))
+        ):
+            raise ValueError(
+                f"policy['sample_fit_kinds'] must be an ascending list of physical scan kinds {PHYSICAL_KINDS}, got {fit_kinds!r}"
+            )
         if raw["rank_bulk_align_bytes"] % 4:
             raise ValueError(
                 "policy['rank_bulk_align_bytes'] must be a multiple of the 4-byte output element"
@@ -377,6 +392,7 @@ class DispatchPolicy:
             int(v) for v in values["rank_two_level_window_variants"]
         ]
         values["rank_t16_slots"] = [int(v) for v in values["rank_t16_slots"]]
+        values["sample_fit_kinds"] = [str(k) for k in values["sample_fit_kinds"]]
         values["check_period_kind_overrides"] = {
             str(k): int(v) for k, v in values["check_period_kind_overrides"].items()
         }
@@ -641,7 +657,13 @@ class DispatchPolicy:
         num_segments: int,
         ratio: int,
         cand_cap: int,
+        physical_kind: Optional[str] = None,
     ) -> bool:
+        """Sampled first threshold on buffer-fitting units: the mean unit is at most ``sample_fit_max_mean_tiles`` and
+        the mean segment offset leaves units that fit the capacity.  A program kind outside ``sample_fit_kinds`` has no
+        sampled-fit program registered and runs its plain program on every call (``physical_kind`` None: no kind gate)."""
+        if physical_kind is not None and physical_kind not in self.sample_fit_kinds:
+            return False
         mean_tiles = self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
         offset_tiles = self.offset_tiles(num_queries, num_keys, num_segments, ratio)
         fit_tiles = int(cand_cap) // self.tile_keys - 1
@@ -1067,8 +1089,9 @@ def select_program(
     snake = policy.snake_for(kind, T, Tkv, S, r)
     unroll = policy.tile_unroll_for(kind, K, snake, block_q)
     grid_ctas = grid - grid % 2 if pair else grid
+    physical = physical_kind(kind, unit)
     cap = policy.candidate_capacity(K, mult)
-    fit = policy.sample_fit_for(T, Tkv, S, r, cap)
+    fit = policy.sample_fit_for(T, Tkv, S, r, cap, physical)
     if check_period is None:
         period = policy.check_period_for(K, cap, kind)
     else:
@@ -1126,7 +1149,7 @@ def select_program(
         split=split,
         pair=pair,
         kind=kind,
-        physical_kind=physical_kind(kind, unit),
+        physical_kind=physical,
         snake=snake,
         tile_unroll=unroll,
         sample_fit=fit,
