@@ -27,6 +27,7 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 
+from ...task_compat import task_context_kwargs
 from ..helpers.constants import (
     WARP_LANES,
     WARP_LANE_MASK,
@@ -67,8 +68,17 @@ class MlaDecodeTask(Task):
         self._local_warp_idx = Int32(0)
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
+        self._runtime_body_active = None
 
     @cute.jit
+    def run_body(self, context=None):
+        """Guard data work only, after TaskManager initializes every task."""
+        if cutlass.const_expr(self._runtime_body_active is not None):
+            if self._runtime_body_active:
+                super().run_body(**task_context_kwargs(context))
+        else:
+            super().run_body(**task_context_kwargs(context))
+
     def init_variables(self, context=None):
         """Initialize per-task thread cache and TMEM base state."""
         super().init_variables(context)
@@ -107,9 +117,10 @@ class MlaDecodeTask(Task):
         else:
             return Int32(pointer.load())
 
-    @cute.jit
     def make_task_cache(self):
-        """Return the compact tuple of cached per-task thread values."""
+        """Snapshot the compact task state at the tracing call site."""
+        # get_domain updates _seq_len_kv in Python; under FrontendNext a jitted
+        # getter can read the old staged slot before that mutation is committed.
         return (
             self._tmem_base_offset,
             self._warp_grp_thread_idx,
@@ -121,22 +132,21 @@ class MlaDecodeTask(Task):
             Int32(0),
         )
 
-    @cute.jit
     def get_domain(self, tile_coord):
         """Return the runtime loop domain for the current 1CTA work tile."""
-        if cutlass.const_expr(self.cfg is None):
+        if self.cfg is None:
             return self.domain
 
         # Persistent 1CTA coordinates combine batch and head tile in z;
         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
-        if cutlass.const_expr(isinstance(tile_coord[2], int)):
-            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
+        if isinstance(tile_coord[2], int):
+            if self.cfg.use_persistent_scheduler == 1:
                 batch_idx = tile_coord[2] // self.cfg.num_ctas_for_all_heads
             else:
                 batch_idx = tile_coord[2]
         else:
             batch_idx = Int32(tile_coord[2])
-            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
+            if self.cfg.use_persistent_scheduler == 1:
                 batch_idx = batch_idx // Int32(self.cfg.num_ctas_for_all_heads)
 
         # Task-domain ownership must match K/V, softmax, and reduction: dense
@@ -145,7 +155,7 @@ class MlaDecodeTask(Task):
         # raw batch length for causal can move an all-masked tile into tail and
         # replace a real loop accumulator at a tile boundary.
         cta_idx_q = tile_coord[0]
-        if cutlass.const_expr(self.cfg.use_persistent_scheduler != 1):
+        if self.cfg.use_persistent_scheduler != 1:
             # Nonpersistent grid X combines (head tile, Q tile, KV split), with
             # KV split innermost. Persistent work queues already expose Q as
             # tile coordinate 0 and must not be decoded a second time.
@@ -167,7 +177,7 @@ class MlaDecodeTask(Task):
             self.cu_seqlens_q,
             batch_idx,
         )
-        if cutlass.const_expr(self.cfg.fixed_sparse_kv_tiles > 0):
+        if self.cfg.fixed_sparse_kv_tiles > 0:
             return Int32(self.domain_bias)
         total_kv_tiles = runtime_local_kv_tiles(self.cfg, seq_len_kv)
         remaining_kv_tiles = cute.math.max(

@@ -1445,8 +1445,7 @@ class TmemCorrResource(MlaResource):
             if reduced_sum[scale_idx] != Float32(0.0):
                 norm_scale = self.output_scale / reduced_sum[scale_idx]
             if cutlass.const_expr(cfg.fuse_sparse_epilogue):
-                # Four lanes compute the distinct row factors. Broadcast to
-                # their peers instead of repeating sink SFU work eight times.
+                # Only row-owning lanes compute sink factors; broadcast to peers.
                 norm_lane = (
                     lane_idx & Int32(15)
                     if cfg.kernel_variant == "keeps_mma_ab"
@@ -1469,7 +1468,9 @@ class TmemCorrResource(MlaResource):
                     count = Float32(final_max[scale_idx] != neg_max_f32())
                     norm_scale = Float32(0)
                     if logical_head < cfg.logical_num_heads_q and count > Float32(0):
-                        sink = Float32(self.atten_sinks[logical_head])
+                        sink = Float32(-Float32.inf)
+                        if cutlass.const_expr(self.atten_sinks is not None):
+                            sink = Float32(self.atten_sinks[logical_head])
                         if sink == Float32(-Float32.inf):
                             norm_scale = self.output_scale / reduced_sum[scale_idx]
                         elif sink != Float32(Float32.inf):
