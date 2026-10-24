@@ -901,6 +901,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                     asm volatile("tcgen05.fence::before_thread_sync;");
                                     mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
+#if __CUDA_ARCH__ == 1000
+                                    math_tmem_stage += 1;
+                                    if (math_tmem_stage >= 2) {
+                                        math_tmem_stage -= 2;
+                                        math_tmem_phase ^= 1;
+                                    }
+                                    uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
+                                    acc_tok = _mbar_token_0;
+#endif
                                     float2 sum0_14 = make_float2(0.0f, 0.0f);
                                     float2 sum1_15 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
@@ -1006,6 +1015,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         unsigned long long entry_3 = (unsigned long long)bits2[3] << 32 | (unsigned long long)(unsigned int)kid;
                                         Cand[slot_3] = (long long)entry_3;
                                     }
+#if __CUDA_ARCH__ == 1000
+#else
                                     math_tmem_stage += 1;
                                     if (math_tmem_stage >= 2) {
                                         math_tmem_stage -= 2;
@@ -1013,6 +1024,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     }
                                     uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
                                     acc_tok = _mbar_token_0;
+#endif
                                 }
                                 ti0 = ti0 + run_c;
                                 int sample_c = ((ti0 == n_s) ? 1 : 0);
