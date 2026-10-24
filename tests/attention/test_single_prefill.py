@@ -281,3 +281,49 @@ def test_single_prefill_masked_key_never_dominates(dtype):
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, backend="fa2")
     o_ref, _ = ref_single_prefill(q, k, v, causal=True)
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_single_prefill_unchanged_running_max(dtype):
+    # Regression test for issue #6907: an early dominant key keeps the
+    # online-softmax running max unchanged across all subsequent KV tiles. The
+    # rescale factor exp2(m_prev * sm_scale - m_scaled) must be exactly 1 in
+    # that case; an FMA-contracted exponent left the rounding error of
+    # m_scaled in it, decaying the softmax denominator geometrically per tile
+    # until it underflowed to 0 (NaN output, LSE = -inf).
+    torch.manual_seed(0)
+    num_heads, head_dim, kv_len = 1, 128, 4096
+    q = torch.full((1, num_heads, head_dim), 32768.0, dtype=dtype, device="cuda")
+    k = torch.zeros(kv_len, 1, head_dim, dtype=dtype, device="cuda")
+    v = torch.zeros_like(k)
+    k[0] = 160.0
+    v[0] = 1.0
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="fa2",
+    )
+    wrapper.plan(
+        torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        torch.tensor([0, kv_len], dtype=torch.int32, device="cuda"),
+        1,
+        1,
+        head_dim,
+        q_data_type=q.dtype,
+        kv_data_type=k.dtype,
+        disable_split_kv=True,
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    assert not torch.isnan(o.float()).any()
+    assert torch.isfinite(lse).all()
+    o_ref, _ = ref_single_prefill(q, k, v)
+    torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    # log2-domain LSE (the kernel's convention).
+    scores = (q[0, 0].double() @ k[:, 0].double().T) * head_dim**-0.5
+    lse_ref = (
+        scores.max() + torch.log(torch.exp(scores - scores.max()).sum())
+    ) * math.log2(math.e)
+    torch.testing.assert_close(
+        lse.flatten().float(), lse_ref.flatten().float(), rtol=1e-3, atol=1e-3
+    )
