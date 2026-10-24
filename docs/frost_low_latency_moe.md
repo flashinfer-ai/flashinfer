@@ -1104,3 +1104,21 @@ python benchmarks/bench_frost_low_latency_deepseek_fp8.py \
 
 The reproducer requires SM120 and CUPTI; profiling errors remain errors.
 H100/SM90 correctness qualification does not establish a Hopper performance gain.
+
+
+## FP16 weight-only activation and output coverage
+
+The explicit Frost FMA path accepts BF16 or FP16 inputs for NVFP4, MXFP4,
+MXINT4, and per-tensor E4M3 weight-only checkpoints. Output can independently
+be BF16 or FP16. The checkpoint payloads, scale interpretation and route
+contracts are unchanged. FP4/E4M3 preactivation rounds to the input dtype;
+MXINT4 retains FP32 preactivation. Intermediate activations use the input
+dtype, and expert values use the output dtype before ordered FP32 combine.
+
+Static FP8 activation/requantization remains a separate quantized contract.
+The weight-only path ignores its intermediate quantization multiplier.
+Compiled bindings key on input, intermediate and output dtype to separate
+BF16/FP16 variants while binding fresh tensors per call.
+
+Performance qualification is in progress; BF16 measurements above do not
+claim FP16 performance. The new coverage uses explicit backend selection.

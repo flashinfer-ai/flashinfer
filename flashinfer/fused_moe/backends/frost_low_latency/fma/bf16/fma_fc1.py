@@ -194,19 +194,23 @@ def _single_route_body(
                     u = u * dequant[expert, 0]
                     if cutlass.const_expr(gated):
                         g = g * dequant[expert, 1]
-                    # MXINT4 retains FP32 preactivation; FP4 formats retain
-                    # their established BF16 boundary before activation.
+                    # MXINT4 retains FP32 preactivation; FP4 formats round
+                    # to the activation dtype before applying the nonlinearity.
                     if cutlass.const_expr(not integer_weights):
-                        u = u.to(cutlass.BFloat16).to(cutlass.Float32)
-                        g = g.to(cutlass.BFloat16).to(cutlass.Float32)
+                        u = u.to(x.element_type).to(cutlass.Float32)
+                        g = g.to(x.element_type).to(cutlass.Float32)
             if cutlass.const_expr(weights.element_type == cutlass.Float8E4M3FN):
                 if expert >= 0 and expert < cute.size(weights, mode=[0]):
                     u = u * dequant[expert]
                     g = g * dequant[expert]
-                    # Match the per-tensor FP8 backbone's BF16 FC1 boundary
-                    # before activation and static FP8 requantization.
-                    u = u.to(cutlass.BFloat16).to(cutlass.Float32)
-                    g = g.to(cutlass.BFloat16).to(cutlass.Float32)
+                    # Quantized FP8 retains its BF16 FC1 boundary. Weight-only
+                    # inputs round to their activation dtype before nonlinearity.
+                    if cutlass.const_expr(x.element_type == cutlass.Float16):
+                        u = u.to(cutlass.Float16).to(cutlass.Float32)
+                        g = g.to(cutlass.Float16).to(cutlass.Float32)
+                    else:
+                        u = u.to(cutlass.BFloat16).to(cutlass.Float32)
+                        g = g.to(cutlass.BFloat16).to(cutlass.Float32)
             value = apply_activation(u, g, activation, parameters=parameters)
             if cutlass.const_expr(mid.element_type == cutlass.Float8E4M3FN):
                 # Preserve the checkpoint's static intermediate multiplier.

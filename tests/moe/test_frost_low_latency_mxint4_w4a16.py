@@ -176,8 +176,17 @@ def test_mxint4_w4a16_activations_and_live_graph_scales(index, activation):
             ids[0, 0] = -1
             ids[-1, -1] = cfg.routing.num_experts
         scores.copy_(torch.randn_like(scores) * 0.2)
+        # Updating one matrix's live scale must not change the other matrix.
+        fc2_before = view["fc2_dequant_scale"].clone()
         view["fc1_dequant_scale"].mul_(1.2)
+        torch.testing.assert_close(
+            view["fc2_dequant_scale"], fc2_before, atol=0, rtol=0
+        )
+        fc1_before = view["fc1_dequant_scale"].clone()
         view["fc2_dequant_scale"].mul_(0.85)
+        torch.testing.assert_close(
+            view["fc1_dequant_scale"], fc1_before, atol=0, rtol=0
+        )
         for name in ("fc1_block_scales", "fc2_block_scales"):
             sf = view[name].view(torch.bfloat16)
             sf.copy_((sf.float() * 2.0).to(torch.bfloat16))

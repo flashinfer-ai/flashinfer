@@ -26,11 +26,15 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.FP16, QuantFormat.FP16),
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
         (QuantFormat.FP8PerTensor, QuantFormat.BF16),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP16),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.NVFP4, QuantFormat.BF16),
+        (QuantFormat.NVFP4, QuantFormat.FP16),
         (QuantFormat.MXFP4, QuantFormat.BF16),
+        (QuantFormat.MXFP4, QuantFormat.FP16),
         (QuantFormat.MXINT4, QuantFormat.BF16),
+        (QuantFormat.MXINT4, QuantFormat.FP16),
     )
     supported_output_formats = (QuantFormat.BF16, QuantFormat.FP16)
     supported_activation_classes = tuple(ACTIVATIONS)
@@ -41,11 +45,15 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.FP16, QuantFormat.FP16): tuple(ACTIVATIONS),
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): tuple(ACTIVATIONS),
         (QuantFormat.FP8PerTensor, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP16): tuple(ACTIVATIONS),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): tuple(ACTIVATIONS),
         (QuantFormat.NVFP4, QuantFormat.NVFP4): tuple(ACTIVATIONS),
         (QuantFormat.NVFP4, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.NVFP4, QuantFormat.FP16): tuple(ACTIVATIONS),
         (QuantFormat.MXFP4, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.MXFP4, QuantFormat.FP16): tuple(ACTIVATIONS),
         (QuantFormat.MXINT4, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.MXINT4, QuantFormat.FP16): tuple(ACTIVATIONS),
     }
     supports_expert_parallelism = False
     # This path honors an explicit disabled recipe; 4over6 is rejected below.
@@ -56,15 +64,28 @@ class FrostLowLatencyRunner(MoERunner):
         return super().supports_quant(quant) and (
             quant.output is QuantFormat.BF16
             or quant.weight in (QuantFormat.BF16, QuantFormat.FP16)
+            or (
+                quant.weight
+                in (
+                    QuantFormat.NVFP4,
+                    QuantFormat.MXFP4,
+                    QuantFormat.MXINT4,
+                    QuantFormat.FP8PerTensor,
+                )
+                and quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
+            )
         )
 
     def __init__(self, config, device):
         super().__init__()
         self.config = config
-        self._fp4_weight_only = (
-            config.quant.activation is QuantFormat.BF16
-            and config.quant.weight
-            in (QuantFormat.NVFP4, QuantFormat.MXFP4, QuantFormat.MXINT4)
+        self._fp4_weight_only = config.quant.activation in (
+            QuantFormat.BF16,
+            QuantFormat.FP16,
+        ) and config.quant.weight in (
+            QuantFormat.NVFP4,
+            QuantFormat.MXFP4,
+            QuantFormat.MXINT4,
         )
         self.device = torch.device(device)
         if self.device.index is None and self.device.type == "cuda":
@@ -79,7 +100,9 @@ class FrostLowLatencyRunner(MoERunner):
     def _check_support(self):
         super()._check_support()
         if not self.supports_quant(self.config.quant):
-            raise NotImplementedError("Frost quantized paths require BF16 output")
+            raise NotImplementedError(
+                "Frost quantized-activation paths require BF16 output"
+            )
         try:
             installed = Version(version("nvidia-cutlass-dsl"))
         except PackageNotFoundError:
@@ -110,7 +133,7 @@ class FrostLowLatencyRunner(MoERunner):
             )
         ):
             raise NotImplementedError(
-                "Frost SM90 supports BF16, FP16, per-tensor FP8, DeepSeek FP8 and packed-four-bit-weight/BF16-activation FMA only"
+                "Frost SM90 supports BF16, FP16, per-tensor FP8, DeepSeek FP8 and packed-four-bit-weight/16-bit-activation FMA only"
             )
         name, _ = lower_activation(self.config.activation)
         if self.config.quant.weight in (
@@ -189,7 +212,7 @@ class FrostLowLatencyRunner(MoERunner):
             "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
-                "fp4-route-reuse-load-width-lut-v4"
+                "fp4-route-reuse-load-width-lut-fp16-v7"
                 if self._fp4_weight_only
                 else "unified-fma-tc-standard-timing-v5"
             ),
@@ -209,7 +232,14 @@ class FrostLowLatencyRunner(MoERunner):
             and self.config.quant.weight in (QuantFormat.NVFP4, QuantFormat.MXFP4)
             and capability == (9, 0)
         )
-        if self._fp4_weight_only and (capability in ((10, 3), (12, 0)) or hopper_fp4):
+        if (
+            self._fp4_weight_only
+            and (
+                self.config.quant.activation is QuantFormat.BF16
+                or self.config.quant.weight in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+            )
+            and (capability in ((10, 3), (12, 0)) or hopper_fp4)
+        ):
             columns = (1, 2, 4, 8)
             tactics = [("ffma", a, b) for a in columns for b in columns] + [
                 ("ffma", a, b, v1, v2)
@@ -217,7 +247,11 @@ class FrostLowLatencyRunner(MoERunner):
                 for b in columns
                 for v1, v2 in ((4, 8), (8, 4), (8, 8))
             ]
-            if hopper_fp4 and inputs[0].shape[0] >= 2:
+            if (
+                hopper_fp4
+                and self.config.quant.activation is QuantFormat.BF16
+                and inputs[0].shape[0] >= 2
+            ):
                 tactics += [
                     ("ffma", a, b, group)
                     for group in (2, 4)

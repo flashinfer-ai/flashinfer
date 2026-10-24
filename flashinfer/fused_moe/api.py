@@ -2949,7 +2949,7 @@ class FrostLowLatencyConfig:
     """Low-token routed MoE on SM100/SM103/SM107, with FMA-only SM120 support.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
-    NVFP4/MXFP4/MXINT4-weight with BF16-activation FMA.
+    NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
     prepared weights and numerical contract. Both are multi-kernel pipelines,
@@ -2974,24 +2974,26 @@ class FrostLowLatencyConfig:
     The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
     contract differs even with identical quantized weights and scales.
 
-    E4M3 weight-only mode uses BF16 inputs and intermediates, with per-expert
-    FP32 weight scales. It shares the same FMA bodies, BF16 FC1 preactivation
-    and ordered output combine; no activation quantization is required.
+    E4M3 weight-only mode uses BF16/FP16 inputs and intermediates, with
+    per-expert FP32 weight scales. FC1 preactivation rounds to the input dtype;
+    expert outputs round to the independently configured BF16/FP16 dtype.
+    No activation quantization is required.
 
     DeepSeek FP8 preserves FP32 preactivation and 128x128 weight block scales.
     BF16 input is quantized per 128 values; prequantized E4M3 input retains
     its supplied FP32 scales. The intermediate is dynamically quantized to
     E4M3 before FC2; expert outputs and ordered combine follow BF16 rounding.
 
-    FP4 weight-only modes keep BF16 input/preactivation/intermediate/expert
-    rounding and canonical E2M1 payloads. NVFP4 uses linear E4M3 K16 scales;
+    FP4 weight-only modes preserve canonical E2M1 payloads with BF16/FP16
+    input, preactivation and intermediate rounding. Expert outputs use the
+    configured BF16/FP16 output dtype. NVFP4 uses linear E4M3 K16 scales;
     MXFP4 uses E8M0 K32 scales and FP32 dequantization to retain its wider
     range. It uses software decoding on SM90 and native FP4 conversion on Blackwell/Rubin, sharing
     the BF16 FMA schedule and typed activation/combine implementation.
     H must be divisible by 128; logical I is padded to 128 from multiples of 32.
 
     MXINT4 weight-only mode preserves signed INT4 payloads and BF16 K32
-    scales. It retains FP32 preactivation, then BF16 intermediate/expert
+    scales. It retains FP32 preactivation, then BF16/FP16 intermediate/expert
     rounding and ordered FP32 combine through the same two FMA kernels.
 
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
@@ -3070,12 +3072,14 @@ class FrostLowLatencyConfig:
 
     @staticmethod
     def prepare_fp8_weight_only_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
-        """Prepare E4M3 weights for BF16 inputs without requantizing the payload.
+        """Prepare E4M3 weights for BF16/FP16 inputs without requantizing the payload.
 
         Canonical weights are [E, 2*I, H] in [up, gate] order, or [E, I, H]
         for non-gated activation, and [E, H, I]. Each FP32 scale is [E] and
         dequantizes that expert's weight matrix. Logical I is padded to 128.
-        Configure FP8PerTensor weights with BF16 activations and BF16 output.
+        Configure FP8PerTensor weights with BF16/FP16 activations and BF16/FP16 output.
+        Preactivation and intermediate round to the activation dtype; expert
+        values round to the output dtype before ordered FP32 combine.
         """
         from .backends.frost_low_latency.prepare import prepare_fp8_weight_only_weights
 
@@ -3092,8 +3096,8 @@ class FrostLowLatencyConfig:
         Weights are uint8 [E,branches*I,H/2] in [up,gate] order and [E,H,I/2].
         Each byte stores the even K value in its low nibble, signed [-8,7].
         H is divisible by 128; logical I is divisible by 32 and padded to 128.
-        Configure MXINT4 weights with BF16 inputs/output. FC1 preactivation
-        remains FP32; activation and expert outputs round to BF16. Preparation
+        Configure MXINT4 weights with BF16/FP16 inputs/output. FC1 preactivation
+        remains FP32; intermediate/expert values use the input/output dtype. Preparation
         never requantizes the weights or reads values back to the host.
         """
         import torch
@@ -3106,7 +3110,7 @@ class FrostLowLatencyConfig:
             one,
             w2,
             w2_block_scale,
-            one,
+            one.clone(),
             SwiGLU() if activation is None else activation,
             scale_block_size=32,
             integer_weights=True,
@@ -3132,7 +3136,7 @@ class FrostLowLatencyConfig:
             one,
             w2,
             w2_block_scale,
-            one,
+            one.clone(),
             SwiGLU() if activation is None else activation,
             scale_block_size=32,
         )
