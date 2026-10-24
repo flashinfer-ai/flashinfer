@@ -8,16 +8,20 @@ Modes (one process per GPU under torchrun):
 * ``--mode intranode``: the same EP world inside one NVLink domain (NVSHMEM
   symmetric heap), the all-NVLink reference for the same per-rank problem.
 * ``--mode nccl_ep_ll | nccl_ep_ht | deepep``: split (non-fused) baselines --
-  EP dispatch, the SM90 CUTLASS FP8 fused MoE over the received rows, EP
-  combine -- as serial stages, ported from the Blackwell wide-EP harness
-  (NCCL-EP LL rank-major, NCCL-EP HT flat, DeepEP).  Tokens travel as the same
-  E4M3 rows (and 1x128 block scales under blockwise) the mega kernel
-  dispatches and come back BF16.  per_tensor computes with the per-tensor FP8
-  runner; blockwise with the DeepSeek block-scale runner, which takes BF16
-  activations, so the received rows are dequantized in a timed handoff stage.
+  EP dispatch, the experts over the received rows, EP combine -- as serial
+  stages, ported from the Blackwell wide-EP harness (NCCL-EP LL rank-major,
+  NCCL-EP HT flat, DeepEP).  Tokens travel as the same E4M3 rows (and 1x128
+  block scales under blockwise) the mega kernel dispatches and come back BF16.
+  The experts (``--baseline-gemm``) default to the mega kernel's own
+  standalone fused FC12 -- FP8 in, BF16 out, like the Blackwell harness' FC12
+  baseline -- behind a Triton pack / pre-reduce handoff; ``cutlass`` uses
+  flashinfer's CUTLASS fused MoE instead (blockwise takes BF16 there, so the
+  received rows are dequantized in the timed handoff).
   ``nccl_ep_*`` need ``nccl.ep`` (nccl-extensions 0.1.0, whose kernels are
   built against the NCCL 2.30 device API: run it on NCCL 2.30.x, it faults on
   2.32); ``deepep`` needs DeepEP V2 (``deep_ep.ElasticBuffer``, NCCL GIN).
+  With a home directory shared by the nodes, point ``TRITON_CACHE_DIR`` at
+  node-local storage (concurrent ranks race on the shared Triton cache).
 
 Each point stages fresh routed inputs, runs warmup launches, then times
 ``iters`` launches of ``hopper_fp8_mega_moe`` (dispatch + FC1 + FC2 + combine +
@@ -38,6 +42,7 @@ stage columns are per-rank medians, maxed over ranks.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import statistics
 
@@ -71,6 +76,14 @@ def _args():
         action="store_true",
         help="internode only: record a per-phase %%globaltimer timeline of one "
         "extra launch (developer stamps compiled into the kernel)",
+    )
+    p.add_argument(
+        "--baseline-gemm",
+        choices=["fc12", "cutlass"],
+        default="fc12",
+        help="baselines' expert compute: the mega kernel's standalone fused FC12 "
+        "(FP8 in, as the Blackwell harness' FC12 baseline) or flashinfer's CUTLASS "
+        "fused MoE (blockwise takes BF16 input there)",
     )
     p.add_argument(
         "--check",
@@ -175,7 +188,7 @@ def _print_timeline(stamps, rank, tokens):
 
 
 # ---------------------------------------------------------------------------
-# Split baselines: EP dispatch -> CUTLASS FP8 fused MoE -> EP combine.
+# Split baselines: EP dispatch -> expert compute -> EP combine.
 #
 # Every engine dispatches the E4M3 rows [T, H] the mega kernel stages for the
 # same --scale-mode, plus a per-token scale row: the [T, H/128] fp32 1x128
@@ -183,8 +196,8 @@ def _print_timeline(stamps, rank, tokens):
 # scale is static, but NCCL-EP carries FP8 tokens only under its
 # scale-forwarding recipe).  It returns the received rows with LOCAL expert
 # ids (-1 = not routed here) and their routing weights, and combines BF16 rows
-# of the same shape.  The compute stage applies the routing weights and sums
-# this rank's experts per row (CUTLASS finalize), so combine only sums ranks.
+# of the same shape.  The experts apply the routing weights and sum this
+# rank's experts per row, so combine only sums ranks.
 # ---------------------------------------------------------------------------
 
 
@@ -377,11 +390,11 @@ def _dequant(x, sf):
     return blocks.mul_(sf.to(torch.bfloat16).unsqueeze(-1)).view(m, h)
 
 
-class _Fp8Experts:
+class _CutlassExperts:
     """This rank's experts as the SM90 CUTLASS FP8 fused MoE: per-tensor, or
     DeepSeek 128x128 block scales under blockwise.  The block runner takes
     BF16 activations and quantizes them 1x128 itself, so the received rows are
-    dequantized first (the handoff stage)."""
+    dequantized in the handoff stage."""
 
     def __init__(self, rank, experts, args):
         from flashinfer.fused_moe.api import (
@@ -422,7 +435,7 @@ class _Fp8Experts:
         self.experts, self.args = experts, args
         self.layer = None
 
-    def build(self, max_rows):
+    def build(self, tokens, rows):
         from flashinfer.fused_moe.api import (
             BackendOptions,
             ExecutionConfig,
@@ -444,25 +457,339 @@ class _Fp8Experts:
                 ),
                 activation=self.activation,
                 backend=BackendOptions(candidates=(self.config_cls(),)),
-                execution=ExecutionConfig(tune_max_num_tokens=max_rows),
+                execution=ExecutionConfig(tune_max_num_tokens=rows),
             )
         )
 
-    def activations(self, x, sf):
-        return _dequant(x, sf) if self.blockwise else x
+    def handoff(self, recv_x, recv_sf, recv_idx, recv_w, valid):
+        self._ids, self._ws = _local_routing(recv_idx, recv_w, valid)
+        self._act = _dequant(recv_x, recv_sf) if self.blockwise else recv_x
 
-    def __call__(self, x, ids, w):
+    def compute(self):
         from flashinfer.fused_moe.api import MoEActivationPack
 
-        return self.layer(
+        self._y = self.layer(
             MoEActivationPack(
-                hidden_states_q=x,
+                hidden_states_q=self._act,
                 hidden_states_scale=None,
-                topk_ids=ids,
-                topk_weights=w,
+                topk_ids=self._ids,
+                topk_weights=self._ws,
             ),
             self.pack,
         )
+
+    def reduce(self):
+        return self._y  # finalize already summed this rank's experts per row
+
+
+@functools.cache
+def _fc12_triton_kernels():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def count(
+        idx,
+        valid,
+        counts,
+        n,
+        K: tl.constexpr,
+        BLOCK: tl.constexpr,
+        HAS_VALID: tl.constexpr,
+    ):
+        # Per-expert counts of the local picks (LOCAL id >= 0) of received rows.
+        p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        pm = p < n
+        e = tl.load(idx + p, mask=pm, other=-1).to(tl.int32)
+        ok = pm & (e >= 0)
+        if HAS_VALID:
+            ok = ok & (tl.load(valid + p // K, mask=pm, other=0) != 0)
+        tl.atomic_add(counts + tl.where(ok, e, 0), 1, mask=ok)
+
+    @triton.jit
+    def pack(
+        idx,
+        valid,
+        counts,
+        cursor,
+        offs,
+        slots,
+        x,
+        sf,
+        pool_x,
+        pool_sf,
+        SF_STRIDE,
+        E,
+        K: tl.constexpr,
+        TILE: tl.constexpr,
+        E_BLOCK: tl.constexpr,
+        WORDS: tl.constexpr,
+        WBLOCK: tl.constexpr,
+        SF_COLS: tl.constexpr,
+        SF_BLOCK: tl.constexpr,
+        HAS_VALID: tl.constexpr,
+    ):
+        # One program per received (row, pick): claim a slot in the pick's
+        # expert segment (segments padded to the GEMM token tile; starts
+        # recomputed in registers from the E counts) and copy the row (+ its
+        # block scales) there.
+        pick = tl.program_id(0)
+        row = pick // K
+        e = tl.load(idx + pick).to(tl.int32)
+        ok = e >= 0
+        if HAS_VALID:
+            ok = ok & (tl.load(valid + row) != 0)
+        es = tl.where(ok, e, 0)
+        r = tl.arange(0, E_BLOCK)
+        rm = r < E
+        c = tl.load(counts + r, mask=rm, other=0)
+        padded = (c + TILE - 1) // TILE * TILE
+        start = tl.sum(tl.where(r == es, tl.cumsum(padded, 0) - padded, 0), 0)
+        if pick == 0:
+            tl.store(offs + r, tl.cumsum(c, 0), mask=rm)
+        claim = tl.atomic_add(cursor + es, 1, mask=ok)
+        slot = tl.where(ok, start + claim, -1)
+        tl.store(slots + pick, slot)
+        src = row.to(tl.int64)
+        dst = tl.maximum(slot, 0).to(tl.int64)
+        w = tl.arange(0, WBLOCK)
+        wm = (w < WORDS) & ok
+        tl.store(
+            pool_x + dst * WORDS + w, tl.load(x + src * WORDS + w, mask=wm), mask=wm
+        )
+        if SF_COLS > 0:
+            s = tl.arange(0, SF_BLOCK)
+            sm = (s < SF_COLS) & ok
+            v = tl.load(sf + src * SF_STRIDE + s, mask=sm)
+            tl.store(pool_sf + dst * SF_COLS + s, v, mask=sm)
+
+    @triton.jit
+    def reduce(
+        slots,
+        w,
+        y,
+        out,
+        K: tl.constexpr,
+        H: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # out[row] = sum_k w[row, k] * y[slot[row, k]] in FP32 over the packed
+        # picks; rows without a local pick come out zero.
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        cm = cols < H
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        for k in tl.static_range(K):
+            s = tl.load(slots + row * K + k)
+            wk = tl.load(w + row * K + k)
+            src = tl.maximum(s, 0).to(tl.int64) * H + cols
+            v = tl.load(y + src, mask=cm & (s >= 0), other=0.0).to(tl.float32)
+            acc += v * tl.where(s >= 0, wk, 0.0)
+        tl.store(out + row * H + cols, acc.to(tl.bfloat16), mask=cm)
+
+    return count, pack, reduce
+
+
+class _Fc12Experts:
+    """This rank's experts as the mega kernel's own standalone fused
+    FC1 + SwiGLU + FC2 (``kernel_fp8_glu_fc12``): E4M3 rows (+ 1x128 scales)
+    in, BF16 out -- the Hopper counterpart of the Blackwell harness' NVFP4
+    ``BlockScaledSwapAbFc12Kernel`` baseline.  Same weights, scale recipe and
+    per-T tile heuristic as the mega kernel.
+
+    handoff (one memset + two Triton launches, nothing leaves the device):
+    per-expert counts of the received local picks, then a pack that places
+    each pick's row in its expert's token-tile-padded segment (slot claimed by
+    an atomic, as in the Blackwell handoff).  reduce: a Triton pre-reduce sums
+    each received row's picks with their routing weights."""
+
+    def __init__(self, rank, experts, args):
+        (self.l1, self.l2), _ = _weights(
+            rank, experts, args.hidden, args.intermediate, args.scale_mode
+        )
+        self.blockwise = args.scale_mode == "blockwise"
+        self.experts, self.args = experts, args
+
+    def build(self, tokens, rows):
+        import cuda.bindings.driver as cuda
+        import cutlass
+        import cutlass.cute as cute
+        import cutlass.torch as cutlass_torch
+        import cutlass.utils as cutlass_utils
+
+        import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel  # noqa: F401  (src/ on sys.path)
+        from common.megamoe_constants import (
+            Fp8E8M0SfVecSize,
+            Fp8Fc2ActivationScaleK,
+            SfPaddingBlock,
+        )
+        from moe_hopper_fp8.heuristic_config import select_heuristic_config
+
+        args, e = self.args, self.experts
+        h, k, inter = args.hidden, args.top_k, args.intermediate
+        c = select_heuristic_config(args.scale_mode, tokens).config
+        if c.swap_ab:
+            from moe_hopper_fp8.kernel_fp8_glu_fc12_swapab import (
+                Sm90SwapABSwigluFp8Fc12Kernel as Kernel,
+            )
+        else:
+            from moe_hopper_fp8.kernel_fp8_glu_fc12 import (
+                Sm90SwigluFp8Fc12Kernel as Kernel,
+            )
+        self.tile = c.mma_tiler_mnk[1] if c.swap_ab else c.mma_tiler_mnk[0]
+        clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
+            c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
+        )
+        kernel = Kernel(
+            mma_tiler_mnk=c.mma_tiler_mnk,
+            cluster_shape_mnk=c.cluster_shape_mnk,
+            use_2cta_instrs=False,
+            group_hint=c.group_hint if c.group_hint is not None else clusters,
+            token_padding_block=self.tile,
+            sf_padding_block=SfPaddingBlock,
+            static_expert_shape=(e, 2 * inter, h),
+            sf_vec_size=Fp8E8M0SfVecSize,
+            ab_dtype=cutlass.Float8E4M3FN,
+            fp8_scale_mode=args.scale_mode,
+            fp8_accum_mode=c.accum_mode,
+            pingpong=c.pingpong,
+            gate_up_clamp=10.0,
+            tail_split_pairs=c.tail_split_pairs,
+        )
+        self.config = c
+        # Expert pool sized for the worst case (every received pick local).
+        pool = rows * k + e * self.tile
+        dev = "cuda"
+        self.pool_x = torch.empty(pool, h, dtype=torch.float8_e4m3fn, device=dev)
+        if self.blockwise:
+            self.pool_sf = torch.empty(pool, h // 128, dtype=torch.float32, device=dev)
+        else:
+            # Per-tensor: the unit E8M0 SF plane (layout-free: every byte 127).
+            cols = (h // Fp8E8M0SfVecSize + 3) // 4 * 4
+            self.pool_sf = torch.full(
+                (pool + e * SfPaddingBlock, cols), 127, dtype=torch.uint8, device=dev
+            ).view(torch.float8_e8m0fnu)
+        fc1_w, fc1_sf, fc1_act, fc1_wdq = self.l1
+        fc2_w, fc2_sf, fc2_act, fc2_wdq = self.l2
+        ones_e = torch.ones(e, dtype=torch.float32, device=dev)
+        ones_1 = torch.ones(1, dtype=torch.float32, device=dev)
+        ws = torch.zeros(
+            kernel.get_workspace_size_in_bytes(self.pool_x, fc1_w),
+            dtype=torch.uint8,
+            device=dev,
+        )
+        # Workspace partition, in get_workspace_size_in_bytes order.
+        o = pool * inter
+        fc1_out = ws[:o].view(torch.float8_e4m3fn).reshape(pool, inter)
+        if self.blockwise:
+            sf_cols = inter // Fp8Fc2ActivationScaleK
+            stride = (sf_cols + 3) // 4 * 4
+            n = pool * stride * 4
+            fc1_out_sf = ws[o : o + n].view(torch.float32).reshape(pool, stride)
+            fc1_out_sf = fc1_out_sf[:, :sf_cols]
+        else:
+            sf_rows = pool + e * SfPaddingBlock
+            stride = (inter // Fp8E8M0SfVecSize + 3) // 4 * 4
+            n = sf_rows * stride
+            fc1_out_sf = (
+                ws[o : o + n].view(torch.float8_e8m0fnu).reshape(sf_rows, stride)
+            )
+        o += n
+        slots_n = (pool + self.tile - 1) // self.tile + e
+        self.done_counter = ws[o : o + slots_n * 4].view(torch.int32)
+        self.fc2_out = torch.empty(pool, h, dtype=torch.bfloat16, device=dev)
+        self.topk_scores = torch.ones(pool, dtype=torch.float32, device=dev)
+        self.offs = torch.zeros(e, dtype=torch.int32, device=dev)
+        self.counters = torch.zeros(2 * e, dtype=torch.int32, device=dev)
+        self.slots = torch.empty(rows * k, dtype=torch.int32, device=dev)
+        self.out = torch.empty(rows, h, dtype=torch.bfloat16, device=dev)
+        self._ws = ws  # backs the partition views
+
+        def to_cute(t, align=16):
+            ct = cutlass_torch.from_dlpack(t, assumed_align=align)
+            return ct.mark_layout_dynamic(leading_dim=cutlass_torch.get_leading_dim(t))
+
+        self.kw = dict(
+            activation=to_cute(self.pool_x),
+            fc1_weight=to_cute(fc1_w),
+            activation_sf=to_cute(self.pool_sf),
+            fc1_weight_sf=to_cute(fc1_sf),
+            fc1_activation_dequant_scale=to_cute(
+                ones_1 if self.blockwise else fc1_act, 4
+            ),
+            fc1_weight_dequant_scale=to_cute(ones_e if self.blockwise else fc1_wdq, 4),
+            fc1_output=to_cute(fc1_out),
+            fc1_output_sf=to_cute(fc1_out_sf),
+            fc2_weight=to_cute(fc2_w),
+            fc2_weight_sf=to_cute(fc2_sf),
+            fc2_activation_dequant_scale=to_cute(
+                ones_1 if self.blockwise else fc2_act, 4
+            ),
+            fc2_weight_dequant_scale=to_cute(ones_e if self.blockwise else fc2_wdq, 4),
+            fc2_output=to_cute(self.fc2_out),
+            topk_scores=to_cute(self.topk_scores, 4),
+            fc1_done_counter=to_cute(self.done_counter, 4),
+            offs=to_cute(self.offs, 4),
+            stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+        self._keep = (ones_e, ones_1)
+        self.compiled = cute.compile(kernel, max_active_clusters=clusters, **self.kw)
+
+    def handoff(self, recv_x, recv_sf, recv_idx, recv_w, valid):
+        import triton
+
+        count, pack, _ = _fc12_triton_kernels()
+        e, k, h = self.experts, recv_idx.shape[1], recv_x.shape[1]
+        idx = recv_idx.reshape(-1)
+        n = idx.numel()
+        has_valid = valid is not None
+        valid = valid if has_valid else idx  # unread when HAS_VALID is False
+        counts, cursor = self.counters[:e], self.counters[e:]
+        self.counters.zero_()
+        count[(triton.cdiv(n, 1024),)](
+            idx, valid, counts, n, K=k, BLOCK=1024, HAS_VALID=has_valid
+        )
+        # Per-tensor rows carry no scales (SF_COLS=0): any int pointer will do.
+        sf = recv_sf if self.blockwise else self.slots
+        pool_sf = self.pool_sf if self.blockwise else self.slots
+        pack[(n,)](
+            idx,
+            valid,
+            counts,
+            cursor,
+            self.offs,
+            self.slots,
+            recv_x.view(torch.int32),
+            sf,
+            self.pool_x.view(torch.int32),
+            pool_sf,
+            sf.stride(0),
+            e,
+            K=k,
+            TILE=self.tile,
+            E_BLOCK=triton.next_power_of_2(e),
+            WORDS=h // 4,
+            WBLOCK=triton.next_power_of_2(h // 4),
+            SF_COLS=h // 128 if self.blockwise else 0,
+            SF_BLOCK=triton.next_power_of_2(h // 128),
+            HAS_VALID=has_valid,
+        )
+        self._w, self._rows = recv_w, recv_x.shape[0]
+
+    def compute(self):
+        self.done_counter.zero_()
+        self.compiled(**self.kw)
+
+    def reduce(self):
+        import triton
+
+        _, _, reduce = _fc12_triton_kernels()
+        h, k = self.args.hidden, self.args.top_k
+        rows, block = self._rows, 1024
+        reduce[(rows, triton.cdiv(h, block))](
+            self.slots, self._w, self.fc2_out, self.out, K=k, H=h, BLOCK=block
+        )
+        return self.out[:rows]
 
 
 def _local_routing(recv_idx, recv_w, valid):
@@ -492,7 +819,7 @@ def _identity_check(engine, x, sf, rank, tokens, local_experts):
 
 
 _BASELINES = ("nccl_ep_ll", "nccl_ep_ht", "deepep")
-_STAGES = ("dispatch", "handoff", "compute", "combine")
+_STAGES = ("dispatch", "handoff", "compute", "reduce", "combine")
 
 
 def _run_baselines(args, rank, world, per_node):
@@ -507,8 +834,9 @@ def _run_baselines(args, rank, world, per_node):
 
     # One rank at a time: the JIT file lock races across nodes sharing an NFS
     # cache.  The module is cached per process for the runners built below.
+    cutlass_gemm = args.baseline_gemm == "cutlass"
     for r in range(world):
-        if r == rank:
+        if r == rank and cutlass_gemm:
             get_cutlass_fused_moe_module("90")
         dist.barrier()
     # Average the tactic timings across ranks: tuned independently, timing
@@ -516,7 +844,9 @@ def _run_baselines(args, rank, world, per_node):
     # every other rank then waits for in combine.  All ranks tune the same
     # shapes (T * world rows), as the reduction requires.
     set_autotune_process_group(dist.group.WORLD)
-    experts = _Fp8Experts(rank, args.num_experts // world, args)
+    experts_cls = _CutlassExperts if cutlass_gemm else _Fc12Experts
+    experts = experts_cls(rank, args.num_experts // world, args)
+    mode = args.mode if not cutlass_gemm else f"{args.mode}+cutlass"
     rows = []
     for tokens in [int(t) for t in args.tokens.split(",")]:
         hs, w, idx = _inputs(rank, tokens, args.hidden, args.num_experts, args.top_k)
@@ -532,7 +862,7 @@ def _run_baselines(args, rank, world, per_node):
             engine = _DeepEp(tokens, x, sf, idx, w, args, world)
         else:
             engine = _NcclEp(args.mode[-2:], tokens, x, sf, idx, w, args, world)
-        experts.build(tokens * world)
+        experts.build(tokens, tokens * world)
         check_err = (
             _identity_check(engine, x, sf, rank, tokens, experts.experts)
             if args.check
@@ -543,18 +873,20 @@ def _run_baselines(args, rank, world, per_node):
             recv_x, recv_sf, recv_idx, recv_w, valid = engine.dispatch()
             if ev is not None:
                 ev[1].record()
-            ids, ws = _local_routing(recv_idx, recv_w, valid)
-            act = experts.activations(recv_x, recv_sf)
+            experts.handoff(recv_x, recv_sf, recv_idx, recv_w, valid)
             if ev is not None:
                 ev[2].record()
-            y = experts(act, ids, ws)
+            experts.compute()
             if ev is not None:
                 ev[3].record()
+            y = experts.reduce()
+            if ev is not None:
+                ev[4].record()
             return engine.combine(y)
 
         # Tune the CUTLASS tactics for this row count first: untuned, the
         # fallback tactic is several times slower.
-        with autotune(True):
+        with autotune(cutlass_gemm):
             call()
         for _ in range(args.warmup):
             call()
@@ -574,7 +906,7 @@ def _run_baselines(args, rank, world, per_node):
                 samples[s].append(ev[i].elapsed_time(ev[i + 1]) * 1e3)
             samples["total"].append(ev[0].elapsed_time(ev[-1]) * 1e3)
             samples["excl_handoff"].append(
-                samples["total"][-1] - samples["handoff"][-1]
+                samples["total"][-1] - samples["handoff"][-1] - samples["reduce"][-1]
             )
         meds = torch.tensor(
             [statistics.median(samples[s]) for s in samples], dtype=torch.float64
@@ -583,15 +915,16 @@ def _run_baselines(args, rank, world, per_node):
         dist.all_gather(gathered, meds)
         per_rank = torch.stack(gathered)
         row = dict(
-            mode=args.mode,
+            mode=mode,
             world=world,
             per_node=per_node,
             tokens=tokens,
             scale_mode=args.scale_mode,
             max_rank_us=float(per_rank[:, 0].max()),
             min_rank_us=float(per_rank[:, 0].min()),
-            # The same slowest-rank median with the handoff stage (routing
-            # masks + the blockwise dequant the BF16-input runner forces) out.
+            # The same slowest-rank median without the handoff / reduce glue
+            # around the GEMM (routing masks, expert packing or the blockwise
+            # dequant the CUTLASS block runner forces, pre-reduce).
             excl_handoff_us=float(per_rank[:, 1].max()),
         )
         for i, s in enumerate(_STAGES):
@@ -601,7 +934,7 @@ def _run_baselines(args, rank, world, per_node):
             chk = "" if check_err is None else f" [check rel_l2 {check_err:.1e}]"
             stages = " ".join(f"{s} {row[s + '_us']:.1f}" for s in _STAGES)
             print(
-                f"BENCH {args.mode} W={world} R={per_node} T={tokens} {args.scale_mode}: "
+                f"BENCH {mode} W={world} R={per_node} T={tokens} {args.scale_mode}: "
                 f"max-rank median {row['max_rank_us']:.1f} us (min-rank "
                 f"{row['min_rank_us']:.1f} us, excl. handoff "
                 f"{row['excl_handoff_us']:.1f} us) | {stages}{chk}",
@@ -793,8 +1126,9 @@ def _summarize(inputs, output):
             for r in csv.DictReader(f):
                 key = (int(r["world"]), int(r["per_node"]), r["scale_mode"])
                 runs.setdefault(key + (int(r["tokens"]),), {})[r["mode"]] = r
-    order = ["internode", "intranode", *_BASELINES]
-    modes = [m for m in order if any(m in v for v in runs.values())]
+    seen = {m for v in runs.values() for m in v}
+    modes = [m for m in _FUSED if m in seen] + sorted(seen - set(_FUSED))
+    baselines = [m for m in modes if m not in _FUSED]
     fused = [m for m in modes if m in _FUSED]
     rows = []
     for (world, per_node, scale_mode, tokens), by_mode in sorted(runs.items()):
@@ -803,7 +1137,7 @@ def _summarize(inputs, output):
             r = by_mode.get(m)
             row[f"{m}_us"] = f"{float(r['max_rank_us']):.1f}" if r else ""
         for m in modes:
-            if m in _BASELINES:
+            if m in baselines:
                 r = by_mode.get(m) or {}
                 for col in ("excl_handoff", *_STAGES):
                     v = r.get(f"{col}_us", "")
@@ -814,7 +1148,7 @@ def _summarize(inputs, output):
         ):
             timed = {
                 m: float(by_mode[m][metric])
-                for m in _BASELINES
+                for m in baselines
                 if by_mode.get(m, {}).get(metric)
             }
             best = min(timed, key=timed.get) if timed else ""
