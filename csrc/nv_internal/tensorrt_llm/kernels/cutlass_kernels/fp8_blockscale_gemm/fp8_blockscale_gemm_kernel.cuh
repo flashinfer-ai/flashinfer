@@ -949,13 +949,29 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
       }
     } else {
       if (boundary_right <= scales_idx_y) {
-        while (problem_idx < num_problems - 1) {
-          boundary_left = boundary_right;
-          boundary_right = smem_problem_m_boundaries[++problem_idx];
-          if (scales_idx_y < boundary_right) {
-            break;
+        // Find the first problem whose right boundary exceeds scales_idx_y by probing
+        // +1, +2, +4, ... and then bisecting. Moving to the next problem costs one probe, as a
+        // linear walk would, but a long jump (a warp's first row, or a large grid stride over
+        // sparse rows) costs O(log distance) instead of O(distance).
+        int lo = problem_idx + 1;
+        int hi = lo;
+        int step = 1;
+        while (hi < num_problems - 1 && smem_problem_m_boundaries[hi] <= scales_idx_y) {
+          lo = hi + 1;
+          step <<= 1;
+          hi = min(problem_idx + step, num_problems - 1);
+        }
+        while (lo < hi) {
+          int mid = (lo + hi) >> 1;
+          if (scales_idx_y < smem_problem_m_boundaries[mid]) {
+            hi = mid;
+          } else {
+            lo = mid + 1;
           }
         }
+        problem_idx = lo;
+        boundary_left = smem_problem_m_boundaries[lo - 1];
+        boundary_right = smem_problem_m_boundaries[lo];
         padded_offset =
             deep_gemm::compute_padded_offset(boundary_left, problem_idx) - boundary_left;
       }
@@ -1518,15 +1534,12 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
     kernel_utils::find_divisor(scale_dim_x_mul, scale_dim_x_shr, scales_dim_x);
 
     int smem_size = num_problems * sizeof(int64_t);
-    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs),
+    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs) * 8,
                               div_up(max_shape_m * scales_dim_x, NumThreads / 32));
-    // Binary search is expected to have lower complexity when max_shape_m is small
-    bool use_binary_search =
-        static_cast<double>(max_shape_m) * scales_dim_x /
-            static_cast<double>(NumThreads * num_blocks / 32) <=
-        static_cast<double>(num_problems) / std::log2(static_cast<double>(num_problems));
-    auto kernel = use_binary_search ? scale_1x128_kernel<true, __nv_bfloat16, __nv_fp8_e4m3>
-                                    : scale_1x128_kernel<false, __nv_bfloat16, __nv_fp8_e4m3>;
+    // No host-side choice of search: max_shape_m is the runner's high-water mark, not this
+    // call's row count, so it cannot identify small batches. The galloping search in the
+    // non-binary variant is cheap for both dense and sparse rows.
+    auto kernel = scale_1x128_kernel<false, __nv_bfloat16, __nv_fp8_e4m3>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<num_blocks, NumThreads, smem_size, stream>>>(
         fp8_mat_a, scales_a, mat_a, problem_m_offsets, num_problems, shape_k, max_shape_m_padded,
