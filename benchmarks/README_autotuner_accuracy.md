@@ -39,6 +39,13 @@ not qualify the framework's production bucket mapping or synthesized probes.
 `--profile-inputs synthesized` preserves the operation's original configuration
 instead; record that distinction when comparing results.
 
+Each trial records the actual `input_shapes` and mapped `cache_profile`;
+each candidate measurement records these for its profiling tensors too. A
+bucket label can exceed the measured shape (for example, an endpoint at 144
+can map to bucket 256). Do not interpret the cache label as a measured shape,
+or assume a backend's tactic index identifies the same native algorithm at
+every shape in that bucket.
+
 Each trial uses a fresh tuner/cache; trials share a process, runner objects and
 retained inputs. Policy order rotates across trials. Repeat the command in fresh
 processes as well when studying startup history, keeping fixture inputs and

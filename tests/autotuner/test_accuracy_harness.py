@@ -67,9 +67,10 @@ def test_retained_inputs_require_matching_metadata():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_graph_study_real_selection_and_numerics(monkeypatch):
+@pytest.mark.parametrize("profile_inputs", ["retained", "synthesized"])
+def test_graph_study_real_selection_and_numerics(monkeypatch, profile_inputs):
     from types import SimpleNamespace
-    from flashinfer.autotuner import TunableRunner
+    from flashinfer.autotuner import DynamicTensorSpec, TunableRunner
 
     module = _harness()
     original = AutoTuner._instance
@@ -84,7 +85,7 @@ def test_graph_study_real_selection_and_numerics(monkeypatch):
 
     args = SimpleNamespace(
         cold_l2=False,
-        profile_inputs="retained",
+        profile_inputs=profile_inputs,
         seeds=1,
         graph_policies=["auto", "eager", "cuda_graph"],
         seed=42,
@@ -99,8 +100,17 @@ def test_graph_study_real_selection_and_numerics(monkeypatch):
     report = module.graph_selection_study(
         "test.accuracy",
         [Runner()],
-        TuningConfig(),
-        [torch.ones(32, device="cuda")],
+        TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0,),
+                    dim_idx=(0,),
+                    gen_tuning_buckets=(1, 3),
+                    map_to_tuning_buckets=lambda n: 1 if n == 1 else 4,
+                ),
+            ),
+        ),
+        [torch.ones(3, device="cuda")],
         {},
         args,
     )
@@ -108,7 +118,15 @@ def test_graph_study_real_selection_and_numerics(monkeypatch):
     assert len(report["trials"]) == 3
     for row in report["trials"]:
         assert row["cache_hit"]
-        assert row["profile_count"] == 3
+        assert row["profile_count"] == (3 if profile_inputs == "retained" else 6)
+        assert row["input_shapes"] == ((3,),)
+        assert row["cache_profile"] == ((3 if profile_inputs == "retained" else 4,),)
+        assert {m["input_shapes"] for m in row["measurements"]} == (
+            {((3,),)} if profile_inputs == "retained" else {((1,),), ((3,),)}
+        )
+        assert {m["cache_profile"] for m in row["measurements"]} == (
+            {((3,),)} if profile_inputs == "retained" else {((1,),), ((4,),)}
+        )
         assert row["numerics"] == "passed"
         assert all(
             m["use_cuda_graph"] == (row["policy"] == "cuda_graph")

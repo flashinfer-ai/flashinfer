@@ -75,6 +75,12 @@ def static_profile(inputs):
     )
 
 
+def input_shapes(inputs):
+    return tuple(
+        tuple(t.shape) if isinstance(t, torch.Tensor) else (0,) for t in inputs
+    )
+
+
 def capture_choose_one_calls(make_call, *, require_single=False):
     """Run *make_call* once and capture EVERY choose_one invocation as
     {custom_op: (runners, config, inputs, kwargs)}.  Composite APIs (MoE)
@@ -487,6 +493,10 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
                 measurement = {
                     "runner": type(runner).__name__,
                     "tactic": repr(tactic),
+                    "input_shapes": input_shapes(profile_inputs),
+                    "cache_profile": tuner._find_nearest_profile(
+                        input_shapes(profile_inputs), effective_config
+                    ),
                     "ms": None,
                     "use_cuda_graph": effective_config.use_cuda_graph,
                     "cold_l2": effective_config.use_cold_l2_cache,
@@ -523,9 +533,7 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
                     selected, tactic = tuner.choose_one(
                         op, runners, tuning_config, inputs, **kwargs
                     )
-                    shapes = tuple(
-                        t.shape if isinstance(t, torch.Tensor) else (0,) for t in inputs
-                    )
+                    shapes = input_shapes(inputs)
                     hit, _, _, _ = tuner.search_cache(
                         op, runners, shapes, observed_config or tuning_config, inputs
                     )
@@ -576,6 +584,10 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
                     "runner": type(selected).__name__,
                     "tactic": repr(tactic),
                     "cache_hit": hit,
+                    "input_shapes": shapes,
+                    "cache_profile": tuner._find_nearest_profile(
+                        shapes, observed_config or tuning_config
+                    ),
                     "profile_count": len(measurements),
                     "measurements": measurements,
                     "validation_ms": samples,
