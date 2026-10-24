@@ -29,7 +29,7 @@ from typing import (
 import torch
 
 from flashinfer.autotune_cache import ManagedCacheEntry
-from flashinfer.tllm_utils import delay_kernel
+from flashinfer.tllm_utils import delay_kernel, get_trtllm_utils_module
 from flashinfer.utils import (
     next_positive_power_of_2,
     is_confidential_compute,
@@ -3623,6 +3623,25 @@ class AutoTuner:
                         f"profiler for faithful measurements."
                     )
             if not use_cupti:
+                delayed_events = tuning_config.use_cold_l2_cache or not (
+                    (
+                        tuning_config.use_cuda_graph
+                        and tuning_config.use_cuda_graph_individual_timing
+                    )
+                    or (
+                        measure_policy is not None
+                        and measure_policy.timer == "events_no_delay"
+                    )
+                )
+                delay_micro_secs = (
+                    self._CUDA_GRAPH_DELAY_MICRO_SECS
+                    if tuning_config.use_cuda_graph
+                    else self.stream_delay_micro_secs
+                )
+                if delayed_events and delay_micro_secs > 0:
+                    # Loading the delay helper after candidate warmup can skew
+                    # the first candidate. Initialize it before warming inputs.
+                    get_trtllm_utils_module()
                 # Rotating input batches (up to ~3x L2 of clones under
                 # cold_l2) are only used by the event path; allocating them
                 # before the routing decision would double the transient

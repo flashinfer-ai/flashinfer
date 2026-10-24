@@ -261,6 +261,10 @@ CUPTI also overrides an inherited per-op individual-timing flag.
 before preparing the input schedule used by `profile_tactic`. Delegated tuning
 contexts also preserve the attached store's graph-timing objective after warmup.
 
+Event timing initializes its delay-kernel module before candidate warmup. Lazy
+module loading between warmup and timing can bias the first candidate in a fresh
+process. Timing paths that do not use the delay kernel do not initialize it.
+
 Each newly tuned entry also records an optional `profiling_policy` payload: the effective
 CUDA-graph replay count (or `null` without graphs), L2 policy (`hot`, `cold`, or
 `cold-chain:<n>`, see `TuningConfig.cold_chain_launches`), and active individual-call
