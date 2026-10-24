@@ -98,9 +98,9 @@ CUtensorMap EncodeTma_Q(const TensorView& t) {
   int64_t outer1 = NumelAbove(t, 1);
   check_dense_leading_dims(t, 1, "Q");
   int64_t s2 = t.stride(-2) * 1;
-  TVM_FFI_CHECK((d1 == 128), ValueError)
+  TVM_FFI_CHECK((d1 == 128LL), ValueError)
       << KERNEL_NAME << ": descriptor 'Q' requires (d1 == 128)";
-  cuuint64_t global_dim[2] = {Extent(128, "Q"), Extent(outer1, "Q")};
+  cuuint64_t global_dim[2] = {Extent(128LL, "Q"), Extent(outer1, "Q")};
   cuuint64_t global_strides[1] = {Stride(s2, "Q")};
   cuuint32_t box_dim[2] = {128u, 64u};
   cuuint32_t elem_strides[2] = {1u, 1u};
@@ -127,9 +127,9 @@ CUtensorMap EncodeTma_K(const TensorView& t) {
   int64_t outer1 = NumelAbove(t, 1);
   check_dense_leading_dims(t, 1, "K");
   int64_t s2 = t.stride(-2) * 1;
-  TVM_FFI_CHECK((d1 == 128), ValueError)
+  TVM_FFI_CHECK((d1 == 128LL), ValueError)
       << KERNEL_NAME << ": descriptor 'K' requires (d1 == 128)";
-  cuuint64_t global_dim[2] = {Extent(128, "K"), Extent(outer1, "K")};
+  cuuint64_t global_dim[2] = {Extent(128LL, "K"), Extent(outer1, "K")};
   cuuint64_t global_strides[1] = {Stride(s2, "K")};
   cuuint32_t box_dim[2] = {128u, 64u};
   cuuint32_t elem_strides[2] = {1u, 1u};
@@ -156,9 +156,9 @@ CUtensorMap EncodeTma_V(const TensorView& t) {
   int64_t outer1 = NumelAbove(t, 1);
   check_dense_leading_dims(t, 1, "V");
   int64_t s2 = t.stride(-2) * 1;
-  TVM_FFI_CHECK((d1 == 128), ValueError)
+  TVM_FFI_CHECK((d1 == 128LL), ValueError)
       << KERNEL_NAME << ": descriptor 'V' requires (d1 == 128)";
-  cuuint64_t global_dim[2] = {Extent(128, "V"), Extent(outer1, "V")};
+  cuuint64_t global_dim[2] = {Extent(128LL, "V"), Extent(outer1, "V")};
   cuuint64_t global_strides[1] = {Stride(s2, "V")};
   cuuint32_t box_dim[2] = {128u, 64u};
   cuuint32_t elem_strides[2] = {1u, 1u};
