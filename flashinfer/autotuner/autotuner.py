@@ -1206,17 +1206,21 @@ def set_autotune_process_group(
     Prefer a CPU (``gloo``) subgroup; a NCCL group also works. ``None``
     disables (default); not thread-safe.
 
-    Caller contract: every rank must enter ``_profile_single_kernel`` the same
-    number of times in the same order, or the reduction itself deadlocks. Across
-    ranks that requires identical: ``get_valid_tactics`` and shape buckets;
-    ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
-    reduces). Cache hits are coordinated per profile: if any rank misses,
-    every rank profiles again. Cached runner/tactic selections must also agree;
-    disagreement triggers the same coordinated re-profile. Set the group from
-    the first ``choose_one``;
-    distributed tuning must run outside CUDA Graph capture. Input
-    synthesis and ``do_preparation`` OOMs are reduced across the group before
-    tactic profiling, giving every rank the same fallback decision.
+    All participants must enable tuning and enter the same operations in order,
+    outside CUDA Graph capture. Startup gates check operation/runner order,
+    skip decisions, profile count, measurement policy and ordered candidates.
+    Rank-local shapes and cache roots may differ. A mismatch raises on every
+    participating rank before tactic measurement. Cached selections must agree;
+    any miss or disagreement makes every rank re-profile.
+
+    Input/candidate/runner preparation OOMs keep coordinated fallback. Other
+    caught Python preparation errors raise across the group. Matching nested
+    shortlist preparation is supported; mismatched nesting is rejected. These
+    checks do not recover missing ranks, failed CUDA contexts or arbitrary
+    runner-internal collectives. A rank that never reaches a gate still needs
+    the process-group timeout. Delegated protocols own their coordination.
+    Serving with tuning disabled performs no collectives. Set the group before
+    the first tuning call and clear it after the coordinated warmup.
 
     Example::
 
@@ -1236,57 +1240,105 @@ def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     return _tune_process_group
 
 
-def _sync_oom_across_tune_group(local_oom: bool) -> bool:
-    """Return whether any rank in the tuning group observed an OOM."""
-    if _tune_process_group is None:
-        return local_oom
+class _TuningGroupError(RuntimeError):
+    """A group-wide failure; do not retry it as a rank-local tactic error."""
 
+
+def _tuning_group_agreement(phase, selection, status=0, error=None):
+    """Exchange a fixed-size phase/selection fingerprint and failure status.
+
+    All startup gates use this envelope so a nested operation meeting its
+    parent's preparation gate fails coherently rather than reducing different
+    tensor sizes. Rank-local shapes and cache roots are deliberately excluded
+    by callers; they need not match in an expert-parallel deployment.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise _TuningGroupError(
+            "Distributed autotuning cannot synchronize during an active CUDA Graph capture"
+        )
     import torch.distributed as dist
 
+    def digest(value):
+        encoded = json.dumps(
+            _tactic_to_json(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+        return hashlib.sha256(encoded).digest()
+
+    phase_digest = digest(phase)
+    try:
+        selection_digest = digest(selection)
+    except Exception as exc:
+        selection_digest = bytes(32)
+        status = 2
+        error = f"unrepresentable selection: {exc}"
     backend = str(dist.get_backend(_tune_process_group)).lower()
     device = "cuda" if backend == "nccl" else "cpu"
-    oom_flag = torch.tensor([int(local_oom)], dtype=torch.int32, device=device)
-    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX, group=_tune_process_group)
-    return bool(oom_flag.item())
+    agreement = torch.tensor(
+        [
+            status,
+            *phase_digest,
+            *(-v for v in phase_digest),
+            *selection_digest,
+            *(-v for v in selection_digest),
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(agreement, op=dist.ReduceOp.MAX, group=_tune_process_group)
+    if not torch.equal(agreement[1:33], -agreement[33:65]):
+        raise _TuningGroupError(f"Autotune group phase mismatch at {phase!r}")
+    group_status = int(agreement[0].item())
+    if group_status >= 2:
+        detail = error or "another rank failed preparation"
+        raise _TuningGroupError(f"Autotune group failure at {phase!r}: {detail}")
+    return group_status, torch.equal(agreement[65:97], -agreement[97:129])
+
+
+def _check_tuning_group_phase(phase, selection=(), error=None):
+    if _tune_process_group is None:
+        return
+    _, agreed = _tuning_group_agreement(phase, selection, 2 if error else 0, error)
+    if not agreed:
+        raise _TuningGroupError(
+            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}"
+        )
+
+
+def _sync_oom_across_tune_group(
+    local_oom: bool, *, phase="preparation", selection=(), error=None
+) -> bool:
+    """Coordinate preparation errors and its plan before profiling starts."""
+    if _tune_process_group is None:
+        return local_oom
+    status, agreed = _tuning_group_agreement(
+        phase, selection, 2 if error else int(local_oom), error
+    )
+    if status:
+        return True
+    if not agreed:
+        raise _TuningGroupError(
+            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}"
+        )
+    return False
 
 
 def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
     """Reuse cached results only when every rank has the same selection."""
     if _tune_process_group is None:
         return local_hit
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "Distributed autotuning cannot synchronize cache hits during "
-            "an active CUDA Graph capture"
-        )
-
-    import torch.distributed as dist
-
-    backend = str(dist.get_backend(_tune_process_group)).lower()
-    device = "cuda" if backend == "nccl" else "cpu"
-    digest = bytes(32)
     if local_hit:
         try:
-            encoded = json.dumps(
-                _tactic_to_json(selection),
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode()
-            digest = hashlib.sha256(encoded).digest()
-        except (TypeError, ValueError):
-            # An unrepresentable selection cannot establish agreement. Every
-            # rank still joins the collective and takes the re-profile path.
+            # Invalid persisted selections remain cache misses, not fatal plans.
+            json.dumps(_tactic_to_json(selection), allow_nan=False)
+        except Exception:
             local_hit = False
-    # Packing the digest and its negation checks both min and max using the
-    # existing single collective, including when some ranks miss the cache.
-    agreement = torch.tensor(
-        [int(local_hit), *digest, *(-value for value in digest)],
-        dtype=torch.int32,
-        device=device,
+    status, agreed = _tuning_group_agreement(
+        "cache", selection if local_hit else None, int(not local_hit)
     )
-    dist.all_reduce(agreement, op=dist.ReduceOp.MIN, group=_tune_process_group)
-    return bool(agreement[0].item()) and torch.equal(agreement[1:33], -agreement[33:])
+    return not status and agreed
 
 
 @dataclass(frozen=True)
@@ -2391,6 +2443,17 @@ class AutoTuner:
         # the op's built-in heuristic, avoiding kernel compilation.
         # Checked before acquiring the lock since _effective_skip_ops is
         # thread-local and does not touch shared state.
+        if self.is_tuning_mode and _tune_process_group is not None:
+            _check_tuning_group_phase(
+                "operation",
+                (
+                    "choose_one",
+                    custom_op,
+                    [type(r).__name__ for r in runners],
+                    custom_op in self._effective_skip_ops,
+                    self._in_v2_context,
+                ),
+            )
         if custom_op in self._effective_skip_ops:
             logger.debug(
                 f"[AutoTuner]: Skipping autotuning for '{custom_op}' "
@@ -2495,7 +2558,21 @@ class AutoTuner:
                 "All Given runners must be subclass of TunableRunner"
             )
 
-            profiles = self._generate_optimization_profiles(tuning_config, inputs)
+            plan_error = None
+            profiles = []
+            try:
+                profiles = self._generate_optimization_profiles(tuning_config, inputs)
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                plan_error = f"{type(exc).__name__}: {exc}"
+            _check_tuning_group_phase(
+                ("profiles", custom_op),
+                (len(profiles), self._profiling_policy(tuning_config)),
+                plan_error,
+            )
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
@@ -2563,6 +2640,7 @@ class AutoTuner:
                                 inputs,
                             )
                         input_preparation_oom = False
+                        input_error = None
                         try:
                             # Active capture is safe for skipped operations and warm cache hits, but
                             # input synthesis or profiling would mutate the caller's outer graph.
@@ -2586,8 +2664,20 @@ class AutoTuner:
                             input_preparation_oom = True
                             tensors = None
                             prepared_input_batches = None
+                        except _TuningGroupError:
+                            raise
+                        except Exception as exc:
+                            if _tune_process_group is None:
+                                raise
+                            input_error = f"{type(exc).__name__}: {exc}"
+                            tensors = None
+                            prepared_input_batches = None
 
-                        if _sync_oom_across_tune_group(input_preparation_oom):
+                        if _sync_oom_across_tune_group(
+                            input_preparation_oom,
+                            phase=("inputs", custom_op, _step),
+                            error=input_error,
+                        ):
                             tensors = None
                             prepared_input_batches = None
                             torch.cuda.empty_cache()
@@ -2621,6 +2711,8 @@ class AutoTuner:
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
+                            runner_error = None
+                            valid_tactics = []
                             try:
                                 valid_tactics = r.get_valid_tactics(tensors, p)
                                 valid_tactics = self._blocklist.filter(
@@ -2632,10 +2724,38 @@ class AutoTuner:
                                     and -1 not in valid_tactics
                                 ):
                                     valid_tactics = [-1, *valid_tactics]
+                            except (torch.cuda.OutOfMemoryError, MemoryError):
+                                runner_preparation_oom = True
+                                tensors = None
+                                prepared_input_batches = None
+                            except _TuningGroupError:
+                                raise
+                            except Exception as exc:
+                                if _tune_process_group is None:
+                                    raise
+                                runner_error = f"{type(exc).__name__}: {exc}"
+                                tensors = None
+                                prepared_input_batches = None
+
+                            if _sync_oom_across_tune_group(
+                                runner_preparation_oom,
+                                phase=("candidates", custom_op, _step, r_id),
+                                selection=valid_tactics,
+                                error=runner_error,
+                            ):
+                                tensors = None
+                                prepared_input_batches = None
+                                torch.cuda.empty_cache()
+                                logger.warning(
+                                    "[Autotuner]: OOM detected, falling back to default tactic"
+                                )
+                                return runners[0], -1
+
+                            try:
                                 runner_arg_names = runner_arg_names_map[r]
                                 if (
                                     "do_preparation" in runner_arg_names
-                                    and len(valid_tactics) > 0
+                                    and valid_tactics
                                 ):
                                     handled = r.precompile_tactics(
                                         tensors, valid_tactics, p, **kwargs
@@ -2651,8 +2771,20 @@ class AutoTuner:
                                 runner_preparation_oom = True
                                 tensors = None
                                 prepared_input_batches = None
+                            except _TuningGroupError:
+                                raise
+                            except Exception as exc:
+                                if _tune_process_group is None:
+                                    raise
+                                runner_error = f"{type(exc).__name__}: {exc}"
+                                tensors = None
+                                prepared_input_batches = None
 
-                            if _sync_oom_across_tune_group(runner_preparation_oom):
+                            if _sync_oom_across_tune_group(
+                                runner_preparation_oom,
+                                phase=("runner_prepared", custom_op, _step, r_id),
+                                error=runner_error,
+                            ):
                                 tensors = None
                                 prepared_input_batches = None
                                 torch.cuda.empty_cache()
@@ -2903,6 +3035,17 @@ class AutoTuner:
         time are returned for callers that need a shortlist (e.g. multi-stage
         compound-tactic refinement).
         """
+        if self.is_tuning_mode and _tune_process_group is not None:
+            _check_tuning_group_phase(
+                "operation",
+                (
+                    "rank_tactics",
+                    custom_op,
+                    [type(r).__name__ for r in runners],
+                    custom_op in self._effective_skip_ops,
+                    k,
+                ),
+            )
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
         if len(runners) != 1:
@@ -2936,30 +3079,46 @@ class AutoTuner:
                     tuning_config, self._effective_measure_policy
                 )
 
-            input_shapes = tuple(self._get_input_sizes(inputs))
-            profiles = self._generate_optimization_profiles(tuning_config, inputs)
-            runner = runners[0]
-            runner_arg_names = {
-                param.name
-                for param in inspect.signature(runner.forward).parameters.values()
-            }
-
-            nearest_profile = self._find_nearest_profile(input_shapes, tuning_config)
+            plan_error = None
             try:
-                profile = next(
-                    candidate
-                    for candidate in profiles
-                    if self._find_nearest_profile(
-                        candidate.get_opt_shapes(), tuning_config
-                    )
-                    == nearest_profile
-                )
-            except StopIteration as e:
-                raise RuntimeError(
-                    f"No optimization profile for mapped shapes {nearest_profile} "
-                    f"while ranking '{custom_op}'"
-                ) from e
+                input_shapes = tuple(self._get_input_sizes(inputs))
+                profiles = self._generate_optimization_profiles(tuning_config, inputs)
+                runner = runners[0]
+                runner_arg_names = {
+                    param.name
+                    for param in inspect.signature(runner.forward).parameters.values()
+                }
 
+                nearest_profile = self._find_nearest_profile(
+                    input_shapes, tuning_config
+                )
+                try:
+                    profile = next(
+                        candidate
+                        for candidate in profiles
+                        if self._find_nearest_profile(
+                            candidate.get_opt_shapes(), tuning_config
+                        )
+                        == nearest_profile
+                    )
+                except StopIteration as e:
+                    raise RuntimeError(
+                        f"No optimization profile for mapped shapes {nearest_profile} "
+                        f"while ranking '{custom_op}'"
+                    ) from e
+
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                plan_error = f"{type(exc).__name__}: {exc}"
+
+            _check_tuning_group_phase(
+                ("ranking_profile", custom_op),
+                self._profiling_policy(tuning_config),
+                plan_error,
+            )
             cache_key = AutoTuner._get_cache_key(
                 custom_op,
                 runner,
@@ -2984,6 +3143,7 @@ class AutoTuner:
 
             tensors = None
             input_preparation_oom = False
+            input_error = None
             try:
                 tensors = self._prepare_input_tensors(profile, inputs)
                 if tuning_config.inputs_pre_hook is not None:
@@ -2993,10 +3153,21 @@ class AutoTuner:
                     raise
                 input_preparation_oom = True
                 tensors = None
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                input_error = f"{type(exc).__name__}: {exc}"
+                tensors = None
 
             # Ranking can run inside another runner's get_valid_tactics().
             # Every rank must leave preparation before nested timing reduces.
-            if _sync_oom_across_tune_group(input_preparation_oom):
+            if _sync_oom_across_tune_group(
+                input_preparation_oom,
+                phase=("ranking_inputs", custom_op),
+                error=input_error,
+            ):
                 tensors = None
                 raise MemoryError("OOM during tactic-ranking input preparation")
 
@@ -3011,9 +3182,34 @@ class AutoTuner:
                     profile_inputs=tensors,
                 )
             runner_preparation_oom = False
+            runner_error = None
+            valid_tactics = []
             try:
                 valid_tactics = runner.get_valid_tactics(tensors, profile)
                 valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+            except (torch.cuda.OutOfMemoryError, MemoryError):
+                if _tune_process_group is None:
+                    raise
+                runner_preparation_oom = True
+                tensors = None
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                runner_error = f"{type(exc).__name__}: {exc}"
+                tensors = None
+
+            if _sync_oom_across_tune_group(
+                runner_preparation_oom,
+                phase=("ranking_candidates", custom_op),
+                selection=valid_tactics,
+                error=runner_error,
+            ):
+                tensors = None
+                raise MemoryError("OOM during tactic-ranking candidate preparation")
+
+            try:
                 if valid_tactics and "do_preparation" in runner_arg_names:
                     runner(tensors, tactic=-1, do_preparation=True, **kwargs)
             except (torch.cuda.OutOfMemoryError, MemoryError):
@@ -3021,8 +3217,19 @@ class AutoTuner:
                     raise
                 runner_preparation_oom = True
                 tensors = None
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                runner_error = f"{type(exc).__name__}: {exc}"
+                tensors = None
 
-            if _sync_oom_across_tune_group(runner_preparation_oom):
+            if _sync_oom_across_tune_group(
+                runner_preparation_oom,
+                phase=("ranking_prepared", custom_op),
+                error=runner_error,
+            ):
                 tensors = None
                 raise MemoryError("OOM during tactic-ranking runner preparation")
 
