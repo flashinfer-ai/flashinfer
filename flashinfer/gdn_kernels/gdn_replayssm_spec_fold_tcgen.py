@@ -151,6 +151,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
     beta: cute.Tensor,
     state_indices: cute.Tensor,
     accept_lens: cute.Tensor,
+    accept_paths: cute.Tensor,
     state_smem_layout: cute.ComposedLayout,
     operand_smem_layout: cute.ComposedLayout,
     NUM_LAYERS: cutlass.Constexpr[int],
@@ -158,6 +159,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
     HV: cutlass.Constexpr[int],
     NULL_BLOCK_ID: cutlass.Constexpr[int],
     USE_PACKED: cutlass.Constexpr[bool],
+    HAS_PATHS: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     layer_head, i_n, _ = cute.arch.block_idx()
@@ -260,6 +262,17 @@ def _gdn_replayssm_fold_tcgen_kernel(
     # One warp prepares each normalized key while the checkpoint TMA runs.
     key = cute.make_rmem_tensor(cute.make_layout((4,)), _F32)
     i_t = warp
+    cache_len = rawk.shape[2]
+    # Staged positions carry the recurrence; a tree accept only moves the row.
+    row_t = i_t
+    if cutlass.const_expr(HAS_PATHS):
+        row_t = cutlass.Int32(0)
+        if i_t < cache_len:
+            row_t = accept_paths[i_n * cache_len + i_t]
+            if row_t < 0:
+                row_t = cutlass.Int32(0)
+            if row_t >= cache_len:
+                row_t = cutlass.Int32(cache_len - 1)
     if i_t < _T:
         key_norm = _F32(0.0)
         for elem in cutlass.range_constexpr(4):
@@ -267,7 +280,7 @@ def _gdn_replayssm_fold_tcgen_kernel(
             # Rejected keys must not enter the rank update, even as 0 * NaN.
             key[elem] = _F32(0.0)
             if is_live and i_t < n_commit:
-                key[elem] = rawk[(flat_slot, i_h, i_t, k_idx)].to(_F32)
+                key[elem] = rawk[(flat_slot, i_h, row_t, k_idx)].to(_F32)
             key_norm += key[elem] * key[elem]
         key_norm = cute.arch.warp_reduction_sum(key_norm)
         inv_norm = cute.rsqrt(key_norm + 1.0e-6)
@@ -283,9 +296,9 @@ def _gdn_replayssm_fold_tcgen_kernel(
             # The rank-eight MMA tile may be wider than the logical cache.
             s_decay[i_t] = 1.0
             s_beta[i_t] = 0.0
-            if i_t < rawk.shape[2]:
-                s_decay[i_t] = cute.exp(log_g[(flat_slot, i_hv, i_t)], fastmath=True)
-                s_beta[i_t] = beta[(flat_slot, i_hv, i_t)]
+            if i_t < cache_len:
+                s_decay[i_t] = cute.exp(log_g[(flat_slot, i_hv, row_t)], fastmath=True)
+                s_beta[i_t] = beta[(flat_slot, i_hv, row_t)]
 
     # Publish scalar SMEM stores to the asynchronous MMA proxy.
     cute.arch.fence_view_async_shared()
@@ -351,7 +364,14 @@ def _gdn_replayssm_fold_tcgen_kernel(
     raw_values = cute.make_rmem_tensor(cute.make_layout((_T,)), _F32)
     for step in cutlass.range_constexpr(_T):
         if step < n_commit:
-            raw_values[step] = rawv[(flat_slot, i_hv, step, row)].to(_F32)
+            row_step = step
+            if cutlass.const_expr(HAS_PATHS and step < cache_len):
+                row_step = accept_paths[i_n * cache_len + step]
+                if row_step < 0:
+                    row_step = cutlass.Int32(0)
+                if row_step >= cache_len:
+                    row_step = cutlass.Int32(cache_len - 1)
+            raw_values[step] = rawv[(flat_slot, i_hv, row_step, row)].to(_F32)
 
     tmem.relinquish_alloc_permit()
     dot_consumer.wait_and_advance()
@@ -418,11 +438,13 @@ def _launch_gdn_replayssm_fold_tcgen(
     beta: cute.Tensor,
     state_indices: cute.Tensor,
     accept_lens: cute.Tensor,
+    accept_paths: cute.Tensor,
     NUM_LAYERS: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
     NULL_BLOCK_ID: cutlass.Constexpr[int],
     USE_PACKED: cutlass.Constexpr[bool],
+    HAS_PATHS: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     op = tcgen05.MmaTF32Op(
@@ -466,6 +488,7 @@ def _launch_gdn_replayssm_fold_tcgen(
         beta,
         state_indices,
         accept_lens,
+        accept_paths,
         state_layout,
         operand_layout,
         NUM_LAYERS,
@@ -473,6 +496,7 @@ def _launch_gdn_replayssm_fold_tcgen(
         HV,
         NULL_BLOCK_ID,
         USE_PACKED,
+        HAS_PATHS,
     ).launch(
         grid=(NUM_LAYERS * HV, state_indices.shape[0], 1),
         block=(_THREADS, 1, 1),
@@ -501,8 +525,12 @@ def run_replayssm_fold_tcgen(
     accept_lens: torch.Tensor,
     *,
     null_block_id: int = -1,
+    accept_paths: torch.Tensor | None = None,
 ) -> None:
-    """Launch normalized T=4..8 commit after the common entry validates inputs."""
+    """Launch normalized T=4..8 commit after the common entry validates inputs.
+
+    ``accept_paths`` is a flat int32 ``[B * T]`` view of per-request cache rows.
+    """
     num_layers, num_slots, HV, _, _ = checkpoint_state.shape
     H = rawk_cache.shape[2]
     cache_len = rawk_cache.shape[3]
@@ -515,6 +543,8 @@ def run_replayssm_fold_tcgen(
     log_g = g_cache.view(flat_slots, HV, cache_len)
     beta = beta_cache.view(flat_slots, HV, cache_len)
     use_packed = B > 1
+    has_paths = accept_paths is not None
+    paths_flat = accept_paths if accept_paths is not None else accept_lens
     key = (
         target.compile_key,
         num_layers,
@@ -523,6 +553,7 @@ def run_replayssm_fold_tcgen(
         int(null_block_id),
         use_packed,
         cache_len,
+        has_paths,
     )
     cache = _CACHE.setdefault(key, {})
     stream = cuda.CUstream(
@@ -544,11 +575,13 @@ def run_replayssm_fold_tcgen(
                 _mark_leading_dynamic(beta),
                 _mark_leading_dynamic(ssm_state_indices),
                 _mark_leading_dynamic(accept_lens),
+                _mark_leading_dynamic(paths_flat),
                 NUM_LAYERS=num_layers,
                 H=H,
                 HV=HV,
                 NULL_BLOCK_ID=int(null_block_id),
                 USE_PACKED=use_packed,
+                HAS_PATHS=has_paths,
                 stream=stream,
             ),
             extra_key_files=(__file__,),
@@ -561,6 +594,7 @@ def run_replayssm_fold_tcgen(
         beta,
         ssm_state_indices,
         accept_lens,
+        paths_flat,
         stream,
     )
 

@@ -1318,6 +1318,7 @@ def _gdn_replayssm_commit_reference(
     beta_cache,
     state_indices,
     accept_lens,
+    accept_paths=None,
     *,
     track_state_indices=None,
     track_steps=None,
@@ -1332,7 +1333,10 @@ def _gdn_replayssm_commit_reference(
         if slot <= null_block_id or count <= 0:
             continue
         state = checkpoint_state[:, slot].double()
-        for step in range(count):
+        for position in range(count):
+            step = (
+                position if accept_paths is None else int(accept_paths[row, position])
+            )
             key = (
                 rawk_cache[:, slot, :, step].double().repeat_interleave(hv // h, dim=1)
             )
@@ -1346,7 +1350,7 @@ def _gdn_replayssm_commit_reference(
             state += delta[..., None] * key[..., None, :]
             if track_state_indices is not None and track_steps is not None:
                 track = int(track_state_indices[row])
-                if track > null_block_id and int(track_steps[row]) == step:
+                if track > null_block_id and int(track_steps[row]) == position:
                     checkpoint_state[:, track] = state.float()
         checkpoint_state[:, slot] = state.float()
     return checkpoint_state
@@ -1435,6 +1439,7 @@ gdn_replayssm_commit_trace = TraceTemplate(
         ),
         "state_indices": Tensor(["batch_size"], dtype="int32"),
         "accept_lens": Tensor(["batch_size"], dtype="int32"),
+        "accept_paths": Tensor(["batch_size", "seq_len"], dtype="int32", optional=True),
         "track_state_indices": Tensor(["batch_size"], dtype="int32", optional=True),
         "track_steps": Tensor(["batch_size"], dtype="int32", optional=True),
         "use_qk_l2norm": Scalar("bool", optional=True),
