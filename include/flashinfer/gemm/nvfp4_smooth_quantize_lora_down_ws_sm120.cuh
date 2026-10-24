@@ -112,9 +112,12 @@ __device__ __forceinline__ std::uint64_t make_l2_policy_evict_first() {
   return policy;
 }
 
-__device__ __forceinline__ std::uint64_t make_l2_policy_evict_last() {
+// L2T and the smoothing scale are re-read by every CTA, but evict_normal already keeps
+// them resident against the evict_first X stream. evict_last would outlive the kernel:
+// those lines survive later cold-L2 flushes and pin each layer's L2T in L2.
+__device__ __forceinline__ std::uint64_t make_l2_policy_evict_normal() {
   std::uint64_t policy;
-  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(policy));
+  asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;\n" : "=l"(policy));
   return policy;
 }
 
@@ -255,7 +258,7 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
   if (warp == 0) {
     // ---------------------------------------------------------------- producer
     std::uint64_t const x_policy = make_l2_policy_evict_first();
-    std::uint64_t const keep_policy = make_l2_policy_evict_last();
+    std::uint64_t const keep_policy = make_l2_policy_evict_normal();
     if (lane == 0) {
       asm volatile("prefetch.tensormap [%0];\n" : : "l"(reinterpret_cast<std::uint64_t>(&x_map)));
       asm volatile("prefetch.tensormap [%0];\n" : : "l"(reinterpret_cast<std::uint64_t>(&b_map)));
