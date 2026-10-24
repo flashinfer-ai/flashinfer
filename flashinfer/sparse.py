@@ -1698,12 +1698,15 @@ class VariableBlockSparseAttentionWrapper:
             The implementation backend, could be ``auto``/``fa2``/``fa3`` or the explicit
             ``cake`` (generated Cake kernels; Hopper SM90 only: BF16 HND or Sage FP8
             ``float8_e4m3fn`` HND with ``q_scale``/``k_scale``/``v_scale`` given to
-            :meth:`plan`, head_dim 128, equal Q/KV head counts, noncausal 64-token blocks,
-            1..64 selected KV blocks per query block; small selections (at most 6 blocks
-            per query block and a grid that fits one wave) route to a
-            one-CTA-per-query-block kernel with the plan passed in the kernel parameter
-            bank, everything else to the persistent kernel; the FP8 kernels are twins of
-            the BF16 ones on the same plan).  ``cake_cute`` is accepted as an alias of ``cake`` (the name of
+            :meth:`plan`, head_dim 128, ``num_qo_heads = g x num_kv_heads`` with ``g`` in
+            {1, 2, 4, 8} (``g > 1``: grouped-query attention on the kv-head-shaped block
+            mask, ``k``/``v`` and their scales per kv head; other ratios raise
+            ``ValueError``), noncausal 64-token blocks, 1..64 selected KV blocks per query
+            block; small selections (at most 6 blocks per query block and a grid that
+            fits one wave) route to a one-CTA-per-query-block kernel with the plan passed
+            in the kernel parameter bank, everything else to the persistent kernel; the
+            FP8 and GQA kernels are twins of the BF16 MHA ones on their plans).
+            ``cake_cute`` is accepted as an alias of ``cake`` (the name of
             its former CuTe DSL build).  Defaults to ``auto``. Automatic selection
             never selects ``cake``.  If set to ``auto``, the function will
             automatically choose the backend based on the device architecture and
@@ -1859,7 +1862,13 @@ class VariableBlockSparseAttentionWrapper:
             and read by every :meth:`run` (a caller that re-quantizes per forward writes
             the same tensors in place), and :meth:`run` takes E4M3 ``q/k/v`` and
             returns BF16.  :func:`flashinfer.cake_vsa_sm90.sage_fp8_quantize_sm90`
-            produces the four from BF16 HND tensors.
+            produces the four from BF16 HND tensors (``k``/``v`` with ``num_kv_heads``
+            heads).  ``backend="cake"`` accepts ``num_qo_heads = g x num_kv_heads`` with
+            ``g`` in {1, 2, 4, 8}: the block mask and the K/V scales are shaped by the kv
+            heads (above), ``q``/``q_scale`` and the output by the query heads, and query
+            head ``h`` attends kv head ``h // g``; another ratio raises ``ValueError``
+            and a ``num_qo_heads`` that is not a multiple of ``num_kv_heads`` is rejected
+            as for every backend.
 
 
         The :meth:`plan` method should be called before any :meth:`run` or

@@ -726,7 +726,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, send, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_0);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_0 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + row_off + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + row_off)[0] = reinterpret_cast<int2*>(o_vec)[0];
             __nv_bfloat162 _bit_cast_src_59 = __float22bfloat162_rn(make_float2(d_o_lo[8], d_o_lo[9]));
             o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_59)[0];
             __nv_bfloat162 _bit_cast_src_60 = __float22bfloat162_rn(make_float2(d_o_lo[12], d_o_lo[13]));
@@ -735,7 +735,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, send_14, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_1);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_1 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 16) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off + 16))[0] = reinterpret_cast<int2*>(o_vec)[0];
             __nv_bfloat162 _bit_cast_src_61 = __float22bfloat162_rn(make_float2(d_o_lo[16], d_o_lo[17]));
             o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_61)[0];
             __nv_bfloat162 _bit_cast_src_62 = __float22bfloat162_rn(make_float2(d_o_lo[20], d_o_lo[21]));
@@ -744,7 +744,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, send_15, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_2);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_2 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 32) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off + 32))[0] = reinterpret_cast<int2*>(o_vec)[0];
             __nv_bfloat162 _bit_cast_src_63 = __float22bfloat162_rn(make_float2(d_o_lo[24], d_o_lo[25]));
             o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_63)[0];
             __nv_bfloat162 _bit_cast_src_64 = __float22bfloat162_rn(make_float2(d_o_lo[28], d_o_lo[29]));
@@ -753,7 +753,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, send_16, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_3);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_3 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 48) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off + 48))[0] = reinterpret_cast<int2*>(o_vec)[0];
             int m_local_r_17 = m1_local;
             int row_off_18 = o_row_base + m_local_r_17 * 128;
             __nv_bfloat162 _bit_cast_src_65 = __float22bfloat162_rn(make_float2(d_o_lo[2], d_o_lo[3]));
@@ -764,7 +764,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, send_19, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_4);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_4 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + row_off_18 + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + row_off_18)[0] = reinterpret_cast<int2*>(o_vec)[0];
             __nv_bfloat162 _bit_cast_src_67 = __float22bfloat162_rn(make_float2(d_o_lo[10], d_o_lo[11]));
             o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_67)[0];
             __nv_bfloat162 _bit_cast_src_68 = __float22bfloat162_rn(make_float2(d_o_lo[14], d_o_lo[15]));
@@ -773,7 +773,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, send_20, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_5);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_5 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_18 + 16) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_18 + 16))[0] = reinterpret_cast<int2*>(o_vec)[0];
             __nv_bfloat162 _bit_cast_src_69 = __float22bfloat162_rn(make_float2(d_o_lo[18], d_o_lo[19]));
             o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_69)[0];
             __nv_bfloat162 _bit_cast_src_70 = __float22bfloat162_rn(make_float2(d_o_lo[22], d_o_lo[23]));
@@ -782,7 +782,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, send_21, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_6);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_6 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_18 + 32) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_18 + 32))[0] = reinterpret_cast<int2*>(o_vec)[0];
             __nv_bfloat162 _bit_cast_src_71 = __float22bfloat162_rn(make_float2(d_o_lo[26], d_o_lo[27]));
             o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_71)[0];
             __nv_bfloat162 _bit_cast_src_72 = __float22bfloat162_rn(make_float2(d_o_lo[30], d_o_lo[31]));
@@ -791,7 +791,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, send_22, 1);
             o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_7);
             o_vec[1] = ((qodd == 0) ? _shfl_xor_7 : o_pk[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_18 + 48) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_18 + 48))[0] = reinterpret_cast<int2*>(o_vec)[0];
             asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
             float vs0_23 = vs_smem[vs_base + 64];
             float vs1_24 = vs_smem[vs_base + 64 + 1];
@@ -856,7 +856,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, send_46, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_8);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_8 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + row_off_45 + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + row_off_45)[0] = reinterpret_cast<int2*>(o_vec_42)[0];
             __nv_bfloat162 _bit_cast_src_75 = __float22bfloat162_rn(make_float2(d_o_hi[8], d_o_hi[9]));
             o_pk_41[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_75)[0];
             __nv_bfloat162 _bit_cast_src_76 = __float22bfloat162_rn(make_float2(d_o_hi[12], d_o_hi[13]));
@@ -865,7 +865,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, send_47, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_9);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_9 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_45 + 16) + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_45 + 16))[0] = reinterpret_cast<int2*>(o_vec_42)[0];
             __nv_bfloat162 _bit_cast_src_77 = __float22bfloat162_rn(make_float2(d_o_hi[16], d_o_hi[17]));
             o_pk_41[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_77)[0];
             __nv_bfloat162 _bit_cast_src_78 = __float22bfloat162_rn(make_float2(d_o_hi[20], d_o_hi[21]));
@@ -874,7 +874,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, send_48, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_10);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_10 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_45 + 32) + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_45 + 32))[0] = reinterpret_cast<int2*>(o_vec_42)[0];
             __nv_bfloat162 _bit_cast_src_79 = __float22bfloat162_rn(make_float2(d_o_hi[24], d_o_hi[25]));
             o_pk_41[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_79)[0];
             __nv_bfloat162 _bit_cast_src_80 = __float22bfloat162_rn(make_float2(d_o_hi[28], d_o_hi[29]));
@@ -883,7 +883,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, send_49, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_11);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_11 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_45 + 48) + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_45 + 48))[0] = reinterpret_cast<int2*>(o_vec_42)[0];
             int m_local_r_50 = m1_local;
             int row_off_51 = o_row_base_43 + m_local_r_50 * 128;
             __nv_bfloat162 _bit_cast_src_81 = __float22bfloat162_rn(make_float2(d_o_hi[2], d_o_hi[3]));
@@ -894,7 +894,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, send_52, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_12);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_12 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + row_off_51 + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + row_off_51)[0] = reinterpret_cast<int2*>(o_vec_42)[0];
             __nv_bfloat162 _bit_cast_src_83 = __float22bfloat162_rn(make_float2(d_o_hi[10], d_o_hi[11]));
             o_pk_41[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_83)[0];
             __nv_bfloat162 _bit_cast_src_84 = __float22bfloat162_rn(make_float2(d_o_hi[14], d_o_hi[15]));
@@ -903,7 +903,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, send_53, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_13);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_13 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_51 + 16) + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_51 + 16))[0] = reinterpret_cast<int2*>(o_vec_42)[0];
             __nv_bfloat162 _bit_cast_src_85 = __float22bfloat162_rn(make_float2(d_o_hi[18], d_o_hi[19]));
             o_pk_41[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_85)[0];
             __nv_bfloat162 _bit_cast_src_86 = __float22bfloat162_rn(make_float2(d_o_hi[22], d_o_hi[23]));
@@ -912,7 +912,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, send_54, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_14);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_14 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_51 + 32) + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_51 + 32))[0] = reinterpret_cast<int2*>(o_vec_42)[0];
             __nv_bfloat162 _bit_cast_src_87 = __float22bfloat162_rn(make_float2(d_o_hi[26], d_o_hi[27]));
             o_pk_41[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_87)[0];
             __nv_bfloat162 _bit_cast_src_88 = __float22bfloat162_rn(make_float2(d_o_hi[30], d_o_hi[31]));
@@ -921,7 +921,7 @@ kernel_cake_vsa_sm90_355b9eaa1f9bc36a2dc4(const __grid_constant__ CUtensorMap Q,
             unsigned int _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, send_55, 1);
             o_vec_42[0] = ((qodd_40 == 0) ? o_pk_41[0] : _shfl_xor_15);
             o_vec_42[1] = ((qodd_40 == 0) ? _shfl_xor_15 : o_pk_41[1]);
-            asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_51 + 48) + (0)), "r"(o_vec_42[(0) + 0]), "r"(o_vec_42[(0) + 1]) : "memory");
+            reinterpret_cast<int2*>(O + (row_off_51 + 48))[0] = reinterpret_cast<int2*>(o_vec_42)[0];
         } else {
             asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
             asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 0, 1, 1;\n}\n"
