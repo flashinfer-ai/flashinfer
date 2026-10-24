@@ -151,6 +151,11 @@
       "shape": null,
       "dtype": "dtype",
       "optional": true
+    },
+    "softmax_rescale_threshold_log2": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
     }
   },
   "outputs": {
