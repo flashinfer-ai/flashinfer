@@ -197,6 +197,7 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_266d24
   int tid_0 = tid;
   int lane_local = lane;
   int warp_local = warp;
+  int q_warp_local = (warp_local + 1) % 4;
   int u = tid_0 - tid_0 / 8 * 8;
   int g = tid_0 / 8;
   int row0 = g * 4;
@@ -517,7 +518,7 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_266d24
       sBeta1[xm0] = _rcp_22;
     }
   }
-  int xt0 = warp_local;
+  int xt0 = q_warp_local;
   int xtl0 = ((xt0) < (num_tokens - 1) ? (xt0) : (num_tokens - 1));
   float bqxa0[4];
   float baxa0[3];
@@ -587,17 +588,17 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_266d24
     sQ[xt0 * 128 + k_col0 + 2] = q_pair1.x;
     sQ[xt0 * 128 + k_col0 + 3] = q_pair1.y;
     if (lane_local == 0) {
-      float x = baxa0[0] + baxa0[1];
-      float softplus_x = x;
-      if (x <= 20.0f) {
-        float _exp_28 = __expf(x);
+      float xa = baxa0[0] + baxa0[1];
+      float softplus_xa = xa;
+      if (xa <= 20.0f) {
+        float _exp_28 = __expf(xa);
         float _log2_27;
         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_27) : "f"(1.0f + _exp_28));
-        softplus_x = _log2_27 * 0.6931472f;
+        softplus_xa = _log2_27 * 0.6931472f;
       }
       float _exp_29 = __expf(baxa0[2]);
-      float g_log = (-_exp_29) * softplus_x;
-      float _exp_30 = __expf(g_log);
+      float g_log_a = (-_exp_29) * softplus_xa;
+      float _exp_30 = __expf(g_log_a);
       sAlpha[xt0] = _exp_30;
       if (use_ssm_state_indices != 0) {
         sSsm[xt0] = ssm_state_indices[(long long)nA * ssm_state_indices_stride_p0 +
@@ -607,46 +608,44 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_266d24
         sSsm[xt0] = -1;
       }
     }
-  }
-  if (xt0 < num_tokens) {
-    float2 q_raw_pair0_1 = make_float2(bqxb0[0], bqxb0[1]);
+    float2 q_raw_pair0_0 = make_float2(bqxb0[0], bqxb0[1]);
     float2 q_raw_pair1_1 = make_float2(bqxb0[2], bqxb0[3]);
-    float q_norm_1 = scale;
-    float2 sum_q_pair_1 = fma_f32x2_rn_ftz(q_raw_pair0_1, q_raw_pair0_1, make_float2(0.0f, 0.0f));
-    sum_q_pair_1 = fma_f32x2_rn_ftz(q_raw_pair1_1, q_raw_pair1_1, sum_q_pair_1);
-    float sum_q_1 = sum_q_pair_1.x + sum_q_pair_1.y;
-    float _warp_reduce_31 = sum_q_1;
+    float q_norm_2 = scale;
+    float2 sum_q_pair_3 = fma_f32x2_rn_ftz(q_raw_pair0_0, q_raw_pair0_0, make_float2(0.0f, 0.0f));
+    sum_q_pair_3 = fma_f32x2_rn_ftz(q_raw_pair1_1, q_raw_pair1_1, sum_q_pair_3);
+    float sum_q_4 = sum_q_pair_3.x + sum_q_pair_3.y;
+    float _warp_reduce_31 = sum_q_4;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
       _warp_reduce_31 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_31, offset);
     float _rsqrt_1 = rsqrtf(_warp_reduce_31 + 1e-06f);
-    float2 q_norm_pair_1 = make_float2(_rsqrt_1 * scale, _rsqrt_1 * scale);
-    float2 q_pair0_1;
+    float2 q_norm_pair_5 = make_float2(_rsqrt_1 * scale, _rsqrt_1 * scale);
+    float2 q_pair0_6;
     asm("mul.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&q_pair0_1)
-        : "l"(*(const unsigned long long*)&q_raw_pair0_1),
-          "l"(*(const unsigned long long*)&q_norm_pair_1));
-    float2 q_pair1_1;
+        : "=l"(*(unsigned long long*)&q_pair0_6)
+        : "l"(*(const unsigned long long*)&q_raw_pair0_0),
+          "l"(*(const unsigned long long*)&q_norm_pair_5));
+    float2 q_pair1_7;
     asm("mul.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&q_pair1_1)
+        : "=l"(*(unsigned long long*)&q_pair1_7)
         : "l"(*(const unsigned long long*)&q_raw_pair1_1),
-          "l"(*(const unsigned long long*)&q_norm_pair_1));
-    sQ1[xt0 * 128 + k_col0] = q_pair0_1.x;
-    sQ1[xt0 * 128 + k_col0 + 1] = q_pair0_1.y;
-    sQ1[xt0 * 128 + k_col0 + 2] = q_pair1_1.x;
-    sQ1[xt0 * 128 + k_col0 + 3] = q_pair1_1.y;
+          "l"(*(const unsigned long long*)&q_norm_pair_5));
+    sQ1[xt0 * 128 + k_col0] = q_pair0_6.x;
+    sQ1[xt0 * 128 + k_col0 + 1] = q_pair0_6.y;
+    sQ1[xt0 * 128 + k_col0 + 2] = q_pair1_7.x;
+    sQ1[xt0 * 128 + k_col0 + 3] = q_pair1_7.y;
     if (lane_local == 0) {
-      float x_1 = baxb0[0] + baxb0[1];
-      float softplus_x_1 = x_1;
-      if (x_1 <= 20.0f) {
-        float _exp_33 = __expf(x_1);
+      float xb = baxb0[0] + baxb0[1];
+      float softplus_xb = xb;
+      if (xb <= 20.0f) {
+        float _exp_33 = __expf(xb);
         float _log2_32;
         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_32) : "f"(1.0f + _exp_33));
-        softplus_x_1 = _log2_32 * 0.6931472f;
+        softplus_xb = _log2_32 * 0.6931472f;
       }
       float _exp_34 = __expf(baxb0[2]);
-      float g_log_1 = (-_exp_34) * softplus_x_1;
-      float _exp_35 = __expf(g_log_1);
+      float g_log_b = (-_exp_34) * softplus_xb;
+      float _exp_35 = __expf(g_log_b);
       sAlpha1[xt0] = _exp_35;
       if (use_ssm_state_indices != 0) {
         sSsm1[xt0] = ssm_state_indices[(long long)nB * ssm_state_indices_stride_p0 +
