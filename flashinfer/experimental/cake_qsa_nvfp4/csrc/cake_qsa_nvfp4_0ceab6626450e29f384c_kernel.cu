@@ -1594,9 +1594,13 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                         float lse[16];
                         float p0[16];
                         float p1[16];
-                        float acc0[1];
-                        float acc1[1];
-                        float den[1];
+                        float acc0[4];
+                        float acc1[4];
+                        float den[4];
+                        int chunk_w = (num_splits + 3) / 4;
+                        if (num_splits <= 4) {
+                            chunk_w = num_splits;
+                        }
                         float lse_max[1];
                         int valid[1];
                         int tab[1];
@@ -1618,6 +1622,15 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                             acc0[0] = 0.0f;
                             acc1[0] = 0.0f;
                             den[0] = 0.0f;
+                            acc0[1] = 0.0f;
+                            acc1[1] = 0.0f;
+                            den[1] = 0.0f;
+                            acc0[2] = 0.0f;
+                            acc1[2] = 0.0f;
+                            den[2] = 0.0f;
+                            acc0[3] = 0.0f;
+                            acc1[3] = 0.0f;
+                            den[3] = 0.0f;
                             tab[0] = (head_0 - head_first) * num_splits;
                             lse_max[0] = max_tab[head_0 - head_first];
                             float _vec_load_12[2];
@@ -1810,124 +1823,424 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 bool live = base < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live) {
                                     float weight = approx_exp2(lse_tab[tab[0] + base] - lse_max[0]);
-                                    den[0] = den[0] + weight;
-                                    acc0[0] = __fmaf_rn(weight, p0[0], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight, p1[0], acc1[0]);
+                                    int cidx_1 = base / chunk_w;
+                                    if (cidx_1 == 0) {
+                                        den[0] = den[0] + weight;
+                                        acc0[0] = __fmaf_rn(weight, p0[0], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight, p1[0], acc1[0]);
+                                    }
+                                    if (cidx_1 == 1) {
+                                        den[1] = den[1] + weight;
+                                        acc0[1] = __fmaf_rn(weight, p0[0], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight, p1[0], acc1[1]);
+                                    }
+                                    if (cidx_1 == 2) {
+                                        den[2] = den[2] + weight;
+                                        acc0[2] = __fmaf_rn(weight, p0[0], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight, p1[0], acc1[2]);
+                                    }
+                                    if (cidx_1 == 3) {
+                                        den[3] = den[3] + weight;
+                                        acc0[3] = __fmaf_rn(weight, p0[0], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight, p1[0], acc1[3]);
+                                    }
                                 }
                                 bool live_0 = base + 1 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_0) {
                                     float weight_1 = approx_exp2(lse_tab[tab[0] + base + 1] - lse_max[0]);
-                                    den[0] = den[0] + weight_1;
-                                    acc0[0] = __fmaf_rn(weight_1, p0[1], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_1, p1[1], acc1[0]);
+                                    int cidx_2 = (base + 1) / chunk_w;
+                                    if (cidx_2 == 0) {
+                                        den[0] = den[0] + weight_1;
+                                        acc0[0] = __fmaf_rn(weight_1, p0[1], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_1, p1[1], acc1[0]);
+                                    }
+                                    if (cidx_2 == 1) {
+                                        den[1] = den[1] + weight_1;
+                                        acc0[1] = __fmaf_rn(weight_1, p0[1], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_1, p1[1], acc1[1]);
+                                    }
+                                    if (cidx_2 == 2) {
+                                        den[2] = den[2] + weight_1;
+                                        acc0[2] = __fmaf_rn(weight_1, p0[1], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_1, p1[1], acc1[2]);
+                                    }
+                                    if (cidx_2 == 3) {
+                                        den[3] = den[3] + weight_1;
+                                        acc0[3] = __fmaf_rn(weight_1, p0[1], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_1, p1[1], acc1[3]);
+                                    }
                                 }
                                 bool live_1 = base + 2 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_1) {
                                     float weight_2 = approx_exp2(lse_tab[tab[0] + base + 2] - lse_max[0]);
-                                    den[0] = den[0] + weight_2;
-                                    acc0[0] = __fmaf_rn(weight_2, p0[2], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_2, p1[2], acc1[0]);
+                                    int cidx_3 = (base + 2) / chunk_w;
+                                    if (cidx_3 == 0) {
+                                        den[0] = den[0] + weight_2;
+                                        acc0[0] = __fmaf_rn(weight_2, p0[2], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_2, p1[2], acc1[0]);
+                                    }
+                                    if (cidx_3 == 1) {
+                                        den[1] = den[1] + weight_2;
+                                        acc0[1] = __fmaf_rn(weight_2, p0[2], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_2, p1[2], acc1[1]);
+                                    }
+                                    if (cidx_3 == 2) {
+                                        den[2] = den[2] + weight_2;
+                                        acc0[2] = __fmaf_rn(weight_2, p0[2], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_2, p1[2], acc1[2]);
+                                    }
+                                    if (cidx_3 == 3) {
+                                        den[3] = den[3] + weight_2;
+                                        acc0[3] = __fmaf_rn(weight_2, p0[2], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_2, p1[2], acc1[3]);
+                                    }
                                 }
                                 bool live_2 = base + 3 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_2) {
                                     float weight_3 = approx_exp2(lse_tab[tab[0] + base + 3] - lse_max[0]);
-                                    den[0] = den[0] + weight_3;
-                                    acc0[0] = __fmaf_rn(weight_3, p0[3], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_3, p1[3], acc1[0]);
+                                    int cidx_4 = (base + 3) / chunk_w;
+                                    if (cidx_4 == 0) {
+                                        den[0] = den[0] + weight_3;
+                                        acc0[0] = __fmaf_rn(weight_3, p0[3], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_3, p1[3], acc1[0]);
+                                    }
+                                    if (cidx_4 == 1) {
+                                        den[1] = den[1] + weight_3;
+                                        acc0[1] = __fmaf_rn(weight_3, p0[3], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_3, p1[3], acc1[1]);
+                                    }
+                                    if (cidx_4 == 2) {
+                                        den[2] = den[2] + weight_3;
+                                        acc0[2] = __fmaf_rn(weight_3, p0[3], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_3, p1[3], acc1[2]);
+                                    }
+                                    if (cidx_4 == 3) {
+                                        den[3] = den[3] + weight_3;
+                                        acc0[3] = __fmaf_rn(weight_3, p0[3], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_3, p1[3], acc1[3]);
+                                    }
                                 }
                                 bool live_3 = base + 4 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_3) {
                                     float weight_4 = approx_exp2(lse_tab[tab[0] + base + 4] - lse_max[0]);
-                                    den[0] = den[0] + weight_4;
-                                    acc0[0] = __fmaf_rn(weight_4, p0[4], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_4, p1[4], acc1[0]);
+                                    int cidx_5 = (base + 4) / chunk_w;
+                                    if (cidx_5 == 0) {
+                                        den[0] = den[0] + weight_4;
+                                        acc0[0] = __fmaf_rn(weight_4, p0[4], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_4, p1[4], acc1[0]);
+                                    }
+                                    if (cidx_5 == 1) {
+                                        den[1] = den[1] + weight_4;
+                                        acc0[1] = __fmaf_rn(weight_4, p0[4], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_4, p1[4], acc1[1]);
+                                    }
+                                    if (cidx_5 == 2) {
+                                        den[2] = den[2] + weight_4;
+                                        acc0[2] = __fmaf_rn(weight_4, p0[4], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_4, p1[4], acc1[2]);
+                                    }
+                                    if (cidx_5 == 3) {
+                                        den[3] = den[3] + weight_4;
+                                        acc0[3] = __fmaf_rn(weight_4, p0[4], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_4, p1[4], acc1[3]);
+                                    }
                                 }
                                 bool live_4 = base + 5 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_4) {
                                     float weight_5 = approx_exp2(lse_tab[tab[0] + base + 5] - lse_max[0]);
-                                    den[0] = den[0] + weight_5;
-                                    acc0[0] = __fmaf_rn(weight_5, p0[5], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_5, p1[5], acc1[0]);
+                                    int cidx_6 = (base + 5) / chunk_w;
+                                    if (cidx_6 == 0) {
+                                        den[0] = den[0] + weight_5;
+                                        acc0[0] = __fmaf_rn(weight_5, p0[5], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_5, p1[5], acc1[0]);
+                                    }
+                                    if (cidx_6 == 1) {
+                                        den[1] = den[1] + weight_5;
+                                        acc0[1] = __fmaf_rn(weight_5, p0[5], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_5, p1[5], acc1[1]);
+                                    }
+                                    if (cidx_6 == 2) {
+                                        den[2] = den[2] + weight_5;
+                                        acc0[2] = __fmaf_rn(weight_5, p0[5], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_5, p1[5], acc1[2]);
+                                    }
+                                    if (cidx_6 == 3) {
+                                        den[3] = den[3] + weight_5;
+                                        acc0[3] = __fmaf_rn(weight_5, p0[5], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_5, p1[5], acc1[3]);
+                                    }
                                 }
                                 bool live_5 = base + 6 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_5) {
                                     float weight_6 = approx_exp2(lse_tab[tab[0] + base + 6] - lse_max[0]);
-                                    den[0] = den[0] + weight_6;
-                                    acc0[0] = __fmaf_rn(weight_6, p0[6], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_6, p1[6], acc1[0]);
+                                    int cidx_7 = (base + 6) / chunk_w;
+                                    if (cidx_7 == 0) {
+                                        den[0] = den[0] + weight_6;
+                                        acc0[0] = __fmaf_rn(weight_6, p0[6], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_6, p1[6], acc1[0]);
+                                    }
+                                    if (cidx_7 == 1) {
+                                        den[1] = den[1] + weight_6;
+                                        acc0[1] = __fmaf_rn(weight_6, p0[6], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_6, p1[6], acc1[1]);
+                                    }
+                                    if (cidx_7 == 2) {
+                                        den[2] = den[2] + weight_6;
+                                        acc0[2] = __fmaf_rn(weight_6, p0[6], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_6, p1[6], acc1[2]);
+                                    }
+                                    if (cidx_7 == 3) {
+                                        den[3] = den[3] + weight_6;
+                                        acc0[3] = __fmaf_rn(weight_6, p0[6], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_6, p1[6], acc1[3]);
+                                    }
                                 }
                                 bool live_6 = base + 7 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_6) {
                                     float weight_7 = approx_exp2(lse_tab[tab[0] + base + 7] - lse_max[0]);
-                                    den[0] = den[0] + weight_7;
-                                    acc0[0] = __fmaf_rn(weight_7, p0[7], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_7, p1[7], acc1[0]);
+                                    int cidx_8 = (base + 7) / chunk_w;
+                                    if (cidx_8 == 0) {
+                                        den[0] = den[0] + weight_7;
+                                        acc0[0] = __fmaf_rn(weight_7, p0[7], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_7, p1[7], acc1[0]);
+                                    }
+                                    if (cidx_8 == 1) {
+                                        den[1] = den[1] + weight_7;
+                                        acc0[1] = __fmaf_rn(weight_7, p0[7], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_7, p1[7], acc1[1]);
+                                    }
+                                    if (cidx_8 == 2) {
+                                        den[2] = den[2] + weight_7;
+                                        acc0[2] = __fmaf_rn(weight_7, p0[7], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_7, p1[7], acc1[2]);
+                                    }
+                                    if (cidx_8 == 3) {
+                                        den[3] = den[3] + weight_7;
+                                        acc0[3] = __fmaf_rn(weight_7, p0[7], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_7, p1[7], acc1[3]);
+                                    }
                                 }
                                 bool live_7 = base + 8 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_7) {
                                     float weight_8 = approx_exp2(lse_tab[tab[0] + base + 8] - lse_max[0]);
-                                    den[0] = den[0] + weight_8;
-                                    acc0[0] = __fmaf_rn(weight_8, p0[8], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_8, p1[8], acc1[0]);
+                                    int cidx_9 = (base + 8) / chunk_w;
+                                    if (cidx_9 == 0) {
+                                        den[0] = den[0] + weight_8;
+                                        acc0[0] = __fmaf_rn(weight_8, p0[8], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_8, p1[8], acc1[0]);
+                                    }
+                                    if (cidx_9 == 1) {
+                                        den[1] = den[1] + weight_8;
+                                        acc0[1] = __fmaf_rn(weight_8, p0[8], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_8, p1[8], acc1[1]);
+                                    }
+                                    if (cidx_9 == 2) {
+                                        den[2] = den[2] + weight_8;
+                                        acc0[2] = __fmaf_rn(weight_8, p0[8], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_8, p1[8], acc1[2]);
+                                    }
+                                    if (cidx_9 == 3) {
+                                        den[3] = den[3] + weight_8;
+                                        acc0[3] = __fmaf_rn(weight_8, p0[8], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_8, p1[8], acc1[3]);
+                                    }
                                 }
                                 bool live_8 = base + 9 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_8) {
                                     float weight_9 = approx_exp2(lse_tab[tab[0] + base + 9] - lse_max[0]);
-                                    den[0] = den[0] + weight_9;
-                                    acc0[0] = __fmaf_rn(weight_9, p0[9], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_9, p1[9], acc1[0]);
+                                    int cidx_10 = (base + 9) / chunk_w;
+                                    if (cidx_10 == 0) {
+                                        den[0] = den[0] + weight_9;
+                                        acc0[0] = __fmaf_rn(weight_9, p0[9], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_9, p1[9], acc1[0]);
+                                    }
+                                    if (cidx_10 == 1) {
+                                        den[1] = den[1] + weight_9;
+                                        acc0[1] = __fmaf_rn(weight_9, p0[9], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_9, p1[9], acc1[1]);
+                                    }
+                                    if (cidx_10 == 2) {
+                                        den[2] = den[2] + weight_9;
+                                        acc0[2] = __fmaf_rn(weight_9, p0[9], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_9, p1[9], acc1[2]);
+                                    }
+                                    if (cidx_10 == 3) {
+                                        den[3] = den[3] + weight_9;
+                                        acc0[3] = __fmaf_rn(weight_9, p0[9], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_9, p1[9], acc1[3]);
+                                    }
                                 }
                                 bool live_9 = base + 10 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_9) {
                                     float weight_10 = approx_exp2(lse_tab[tab[0] + base + 10] - lse_max[0]);
-                                    den[0] = den[0] + weight_10;
-                                    acc0[0] = __fmaf_rn(weight_10, p0[10], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_10, p1[10], acc1[0]);
+                                    int cidx_11 = (base + 10) / chunk_w;
+                                    if (cidx_11 == 0) {
+                                        den[0] = den[0] + weight_10;
+                                        acc0[0] = __fmaf_rn(weight_10, p0[10], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_10, p1[10], acc1[0]);
+                                    }
+                                    if (cidx_11 == 1) {
+                                        den[1] = den[1] + weight_10;
+                                        acc0[1] = __fmaf_rn(weight_10, p0[10], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_10, p1[10], acc1[1]);
+                                    }
+                                    if (cidx_11 == 2) {
+                                        den[2] = den[2] + weight_10;
+                                        acc0[2] = __fmaf_rn(weight_10, p0[10], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_10, p1[10], acc1[2]);
+                                    }
+                                    if (cidx_11 == 3) {
+                                        den[3] = den[3] + weight_10;
+                                        acc0[3] = __fmaf_rn(weight_10, p0[10], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_10, p1[10], acc1[3]);
+                                    }
                                 }
                                 bool live_10 = base + 11 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_10) {
                                     float weight_11 = approx_exp2(lse_tab[tab[0] + base + 11] - lse_max[0]);
-                                    den[0] = den[0] + weight_11;
-                                    acc0[0] = __fmaf_rn(weight_11, p0[11], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_11, p1[11], acc1[0]);
+                                    int cidx_12 = (base + 11) / chunk_w;
+                                    if (cidx_12 == 0) {
+                                        den[0] = den[0] + weight_11;
+                                        acc0[0] = __fmaf_rn(weight_11, p0[11], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_11, p1[11], acc1[0]);
+                                    }
+                                    if (cidx_12 == 1) {
+                                        den[1] = den[1] + weight_11;
+                                        acc0[1] = __fmaf_rn(weight_11, p0[11], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_11, p1[11], acc1[1]);
+                                    }
+                                    if (cidx_12 == 2) {
+                                        den[2] = den[2] + weight_11;
+                                        acc0[2] = __fmaf_rn(weight_11, p0[11], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_11, p1[11], acc1[2]);
+                                    }
+                                    if (cidx_12 == 3) {
+                                        den[3] = den[3] + weight_11;
+                                        acc0[3] = __fmaf_rn(weight_11, p0[11], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_11, p1[11], acc1[3]);
+                                    }
                                 }
                                 bool live_11 = base + 12 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_11) {
                                     float weight_12 = approx_exp2(lse_tab[tab[0] + base + 12] - lse_max[0]);
-                                    den[0] = den[0] + weight_12;
-                                    acc0[0] = __fmaf_rn(weight_12, p0[12], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_12, p1[12], acc1[0]);
+                                    int cidx_13 = (base + 12) / chunk_w;
+                                    if (cidx_13 == 0) {
+                                        den[0] = den[0] + weight_12;
+                                        acc0[0] = __fmaf_rn(weight_12, p0[12], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_12, p1[12], acc1[0]);
+                                    }
+                                    if (cidx_13 == 1) {
+                                        den[1] = den[1] + weight_12;
+                                        acc0[1] = __fmaf_rn(weight_12, p0[12], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_12, p1[12], acc1[1]);
+                                    }
+                                    if (cidx_13 == 2) {
+                                        den[2] = den[2] + weight_12;
+                                        acc0[2] = __fmaf_rn(weight_12, p0[12], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_12, p1[12], acc1[2]);
+                                    }
+                                    if (cidx_13 == 3) {
+                                        den[3] = den[3] + weight_12;
+                                        acc0[3] = __fmaf_rn(weight_12, p0[12], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_12, p1[12], acc1[3]);
+                                    }
                                 }
                                 bool live_12 = base + 13 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_12) {
                                     float weight_13 = approx_exp2(lse_tab[tab[0] + base + 13] - lse_max[0]);
-                                    den[0] = den[0] + weight_13;
-                                    acc0[0] = __fmaf_rn(weight_13, p0[13], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_13, p1[13], acc1[0]);
+                                    int cidx_14 = (base + 13) / chunk_w;
+                                    if (cidx_14 == 0) {
+                                        den[0] = den[0] + weight_13;
+                                        acc0[0] = __fmaf_rn(weight_13, p0[13], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_13, p1[13], acc1[0]);
+                                    }
+                                    if (cidx_14 == 1) {
+                                        den[1] = den[1] + weight_13;
+                                        acc0[1] = __fmaf_rn(weight_13, p0[13], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_13, p1[13], acc1[1]);
+                                    }
+                                    if (cidx_14 == 2) {
+                                        den[2] = den[2] + weight_13;
+                                        acc0[2] = __fmaf_rn(weight_13, p0[13], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_13, p1[13], acc1[2]);
+                                    }
+                                    if (cidx_14 == 3) {
+                                        den[3] = den[3] + weight_13;
+                                        acc0[3] = __fmaf_rn(weight_13, p0[13], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_13, p1[13], acc1[3]);
+                                    }
                                 }
                                 bool live_13 = base + 14 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_13) {
                                     float weight_14 = approx_exp2(lse_tab[tab[0] + base + 14] - lse_max[0]);
-                                    den[0] = den[0] + weight_14;
-                                    acc0[0] = __fmaf_rn(weight_14, p0[14], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_14, p1[14], acc1[0]);
+                                    int cidx_15 = (base + 14) / chunk_w;
+                                    if (cidx_15 == 0) {
+                                        den[0] = den[0] + weight_14;
+                                        acc0[0] = __fmaf_rn(weight_14, p0[14], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_14, p1[14], acc1[0]);
+                                    }
+                                    if (cidx_15 == 1) {
+                                        den[1] = den[1] + weight_14;
+                                        acc0[1] = __fmaf_rn(weight_14, p0[14], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_14, p1[14], acc1[1]);
+                                    }
+                                    if (cidx_15 == 2) {
+                                        den[2] = den[2] + weight_14;
+                                        acc0[2] = __fmaf_rn(weight_14, p0[14], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_14, p1[14], acc1[2]);
+                                    }
+                                    if (cidx_15 == 3) {
+                                        den[3] = den[3] + weight_14;
+                                        acc0[3] = __fmaf_rn(weight_14, p0[14], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_14, p1[14], acc1[3]);
+                                    }
                                 }
                                 bool live_14 = base + 15 < num_splits && lse_max[0] > -CUDART_INF_F;
                                 if (live_14) {
                                     float weight_15 = approx_exp2(lse_tab[tab[0] + base + 15] - lse_max[0]);
-                                    den[0] = den[0] + weight_15;
-                                    acc0[0] = __fmaf_rn(weight_15, p0[15], acc0[0]);
-                                    acc1[0] = __fmaf_rn(weight_15, p1[15], acc1[0]);
+                                    int cidx_16 = (base + 15) / chunk_w;
+                                    if (cidx_16 == 0) {
+                                        den[0] = den[0] + weight_15;
+                                        acc0[0] = __fmaf_rn(weight_15, p0[15], acc0[0]);
+                                        acc1[0] = __fmaf_rn(weight_15, p1[15], acc1[0]);
+                                    }
+                                    if (cidx_16 == 1) {
+                                        den[1] = den[1] + weight_15;
+                                        acc0[1] = __fmaf_rn(weight_15, p0[15], acc0[1]);
+                                        acc1[1] = __fmaf_rn(weight_15, p1[15], acc1[1]);
+                                    }
+                                    if (cidx_16 == 2) {
+                                        den[2] = den[2] + weight_15;
+                                        acc0[2] = __fmaf_rn(weight_15, p0[15], acc0[2]);
+                                        acc1[2] = __fmaf_rn(weight_15, p1[15], acc1[2]);
+                                    }
+                                    if (cidx_16 == 3) {
+                                        den[3] = den[3] + weight_15;
+                                        acc0[3] = __fmaf_rn(weight_15, p0[15], acc0[3]);
+                                        acc1[3] = __fmaf_rn(weight_15, p1[15], acc1[3]);
+                                    }
                                 }
                             }
                             if (valid[0] != 0) {
+                                float den_k = den[0];
+                                float acc0_k = acc0[0];
+                                float acc1_k = acc1[0];
+                                den_k = den_k + den[1];
+                                acc0_k = acc0_k + acc0[1];
+                                acc1_k = acc1_k + acc1[1];
+                                den_k = den_k + den[2];
+                                acc0_k = acc0_k + acc0[2];
+                                acc1_k = acc1_k + acc1[2];
+                                den_k = den_k + den[3];
+                                acc0_k = acc0_k + acc0[3];
+                                acc1_k = acc1_k + acc1[3];
                                 float inv_2 = 0.0f;
-                                if (den[0] > 0.0f) {
-                                    float _rcp_129 = approx_rcp(den[0]);
+                                if (den_k > 0.0f) {
+                                    float _rcp_129 = approx_rcp(den_k);
                                     inv_2 = _rcp_129;
                                 }
-                                float attn0 = (float)(__nv_bfloat16)(acc0[0] * inv_2);
-                                float attn1 = (float)(__nv_bfloat16)(acc1[0] * inv_2);
+                                float attn0 = (float)(__nv_bfloat16)(acc0_k * inv_2);
+                                float attn1 = (float)(__nv_bfloat16)(acc1_k * inv_2);
                                 float _exp2_131 = approx_exp2((-gate0[0]) * 1.442695f);
                                 float _rcp_130 = approx_rcp(1.0f + _exp2_131);
                                 float result0 = attn0 * _rcp_130;
@@ -1944,9 +2257,13 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                         float lse_1[16];
                         float p0_1[16];
                         float p1_1[16];
-                        float acc0_1[1];
-                        float acc1_1[1];
-                        float den_1[1];
+                        float acc0_1[4];
+                        float acc1_1[4];
+                        float den_1[4];
+                        int chunk_w_1 = (num_splits + 3) / 4;
+                        if (num_splits <= 4) {
+                            chunk_w_1 = num_splits;
+                        }
                         float lse_max_1[1];
                         int valid_1[1];
                         int tab_1[1];
@@ -1968,6 +2285,15 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                             acc0_1[0] = 0.0f;
                             acc1_1[0] = 0.0f;
                             den_1[0] = 0.0f;
+                            acc0_1[1] = 0.0f;
+                            acc1_1[1] = 0.0f;
+                            den_1[1] = 0.0f;
+                            acc0_1[2] = 0.0f;
+                            acc1_1[2] = 0.0f;
+                            den_1[2] = 0.0f;
+                            acc0_1[3] = 0.0f;
+                            acc1_1[3] = 0.0f;
+                            den_1[3] = 0.0f;
                             lse_max_1[0] = -CUDART_INF_F;
                             float _vec_load_29[2];
                             {
@@ -2207,124 +2533,424 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 bool live_15 = base_1 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_15) {
                                     float weight_16 = approx_exp2(lse_1[0] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_16;
-                                    acc0_1[0] = __fmaf_rn(weight_16, p0_1[0], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_16, p1_1[0], acc1_1[0]);
+                                    int cidx_17 = base_1 / chunk_w_1;
+                                    if (cidx_17 == 0) {
+                                        den_1[0] = den_1[0] + weight_16;
+                                        acc0_1[0] = __fmaf_rn(weight_16, p0_1[0], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_16, p1_1[0], acc1_1[0]);
+                                    }
+                                    if (cidx_17 == 1) {
+                                        den_1[1] = den_1[1] + weight_16;
+                                        acc0_1[1] = __fmaf_rn(weight_16, p0_1[0], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_16, p1_1[0], acc1_1[1]);
+                                    }
+                                    if (cidx_17 == 2) {
+                                        den_1[2] = den_1[2] + weight_16;
+                                        acc0_1[2] = __fmaf_rn(weight_16, p0_1[0], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_16, p1_1[0], acc1_1[2]);
+                                    }
+                                    if (cidx_17 == 3) {
+                                        den_1[3] = den_1[3] + weight_16;
+                                        acc0_1[3] = __fmaf_rn(weight_16, p0_1[0], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_16, p1_1[0], acc1_1[3]);
+                                    }
                                 }
                                 bool live_0_1 = base_1 + 1 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_0_1) {
                                     float weight_17 = approx_exp2(lse_1[1] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_17;
-                                    acc0_1[0] = __fmaf_rn(weight_17, p0_1[1], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_17, p1_1[1], acc1_1[0]);
+                                    int cidx_18 = (base_1 + 1) / chunk_w_1;
+                                    if (cidx_18 == 0) {
+                                        den_1[0] = den_1[0] + weight_17;
+                                        acc0_1[0] = __fmaf_rn(weight_17, p0_1[1], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_17, p1_1[1], acc1_1[0]);
+                                    }
+                                    if (cidx_18 == 1) {
+                                        den_1[1] = den_1[1] + weight_17;
+                                        acc0_1[1] = __fmaf_rn(weight_17, p0_1[1], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_17, p1_1[1], acc1_1[1]);
+                                    }
+                                    if (cidx_18 == 2) {
+                                        den_1[2] = den_1[2] + weight_17;
+                                        acc0_1[2] = __fmaf_rn(weight_17, p0_1[1], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_17, p1_1[1], acc1_1[2]);
+                                    }
+                                    if (cidx_18 == 3) {
+                                        den_1[3] = den_1[3] + weight_17;
+                                        acc0_1[3] = __fmaf_rn(weight_17, p0_1[1], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_17, p1_1[1], acc1_1[3]);
+                                    }
                                 }
                                 bool live_1_1 = base_1 + 2 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_1_1) {
                                     float weight_18 = approx_exp2(lse_1[2] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_18;
-                                    acc0_1[0] = __fmaf_rn(weight_18, p0_1[2], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_18, p1_1[2], acc1_1[0]);
+                                    int cidx_19 = (base_1 + 2) / chunk_w_1;
+                                    if (cidx_19 == 0) {
+                                        den_1[0] = den_1[0] + weight_18;
+                                        acc0_1[0] = __fmaf_rn(weight_18, p0_1[2], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_18, p1_1[2], acc1_1[0]);
+                                    }
+                                    if (cidx_19 == 1) {
+                                        den_1[1] = den_1[1] + weight_18;
+                                        acc0_1[1] = __fmaf_rn(weight_18, p0_1[2], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_18, p1_1[2], acc1_1[1]);
+                                    }
+                                    if (cidx_19 == 2) {
+                                        den_1[2] = den_1[2] + weight_18;
+                                        acc0_1[2] = __fmaf_rn(weight_18, p0_1[2], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_18, p1_1[2], acc1_1[2]);
+                                    }
+                                    if (cidx_19 == 3) {
+                                        den_1[3] = den_1[3] + weight_18;
+                                        acc0_1[3] = __fmaf_rn(weight_18, p0_1[2], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_18, p1_1[2], acc1_1[3]);
+                                    }
                                 }
                                 bool live_2_1 = base_1 + 3 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_2_1) {
                                     float weight_19 = approx_exp2(lse_1[3] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_19;
-                                    acc0_1[0] = __fmaf_rn(weight_19, p0_1[3], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_19, p1_1[3], acc1_1[0]);
+                                    int cidx_20 = (base_1 + 3) / chunk_w_1;
+                                    if (cidx_20 == 0) {
+                                        den_1[0] = den_1[0] + weight_19;
+                                        acc0_1[0] = __fmaf_rn(weight_19, p0_1[3], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_19, p1_1[3], acc1_1[0]);
+                                    }
+                                    if (cidx_20 == 1) {
+                                        den_1[1] = den_1[1] + weight_19;
+                                        acc0_1[1] = __fmaf_rn(weight_19, p0_1[3], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_19, p1_1[3], acc1_1[1]);
+                                    }
+                                    if (cidx_20 == 2) {
+                                        den_1[2] = den_1[2] + weight_19;
+                                        acc0_1[2] = __fmaf_rn(weight_19, p0_1[3], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_19, p1_1[3], acc1_1[2]);
+                                    }
+                                    if (cidx_20 == 3) {
+                                        den_1[3] = den_1[3] + weight_19;
+                                        acc0_1[3] = __fmaf_rn(weight_19, p0_1[3], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_19, p1_1[3], acc1_1[3]);
+                                    }
                                 }
                                 bool live_3_1 = base_1 + 4 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_3_1) {
                                     float weight_20 = approx_exp2(lse_1[4] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_20;
-                                    acc0_1[0] = __fmaf_rn(weight_20, p0_1[4], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_20, p1_1[4], acc1_1[0]);
+                                    int cidx_21 = (base_1 + 4) / chunk_w_1;
+                                    if (cidx_21 == 0) {
+                                        den_1[0] = den_1[0] + weight_20;
+                                        acc0_1[0] = __fmaf_rn(weight_20, p0_1[4], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_20, p1_1[4], acc1_1[0]);
+                                    }
+                                    if (cidx_21 == 1) {
+                                        den_1[1] = den_1[1] + weight_20;
+                                        acc0_1[1] = __fmaf_rn(weight_20, p0_1[4], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_20, p1_1[4], acc1_1[1]);
+                                    }
+                                    if (cidx_21 == 2) {
+                                        den_1[2] = den_1[2] + weight_20;
+                                        acc0_1[2] = __fmaf_rn(weight_20, p0_1[4], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_20, p1_1[4], acc1_1[2]);
+                                    }
+                                    if (cidx_21 == 3) {
+                                        den_1[3] = den_1[3] + weight_20;
+                                        acc0_1[3] = __fmaf_rn(weight_20, p0_1[4], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_20, p1_1[4], acc1_1[3]);
+                                    }
                                 }
                                 bool live_4_1 = base_1 + 5 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_4_1) {
                                     float weight_21 = approx_exp2(lse_1[5] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_21;
-                                    acc0_1[0] = __fmaf_rn(weight_21, p0_1[5], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_21, p1_1[5], acc1_1[0]);
+                                    int cidx_22 = (base_1 + 5) / chunk_w_1;
+                                    if (cidx_22 == 0) {
+                                        den_1[0] = den_1[0] + weight_21;
+                                        acc0_1[0] = __fmaf_rn(weight_21, p0_1[5], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_21, p1_1[5], acc1_1[0]);
+                                    }
+                                    if (cidx_22 == 1) {
+                                        den_1[1] = den_1[1] + weight_21;
+                                        acc0_1[1] = __fmaf_rn(weight_21, p0_1[5], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_21, p1_1[5], acc1_1[1]);
+                                    }
+                                    if (cidx_22 == 2) {
+                                        den_1[2] = den_1[2] + weight_21;
+                                        acc0_1[2] = __fmaf_rn(weight_21, p0_1[5], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_21, p1_1[5], acc1_1[2]);
+                                    }
+                                    if (cidx_22 == 3) {
+                                        den_1[3] = den_1[3] + weight_21;
+                                        acc0_1[3] = __fmaf_rn(weight_21, p0_1[5], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_21, p1_1[5], acc1_1[3]);
+                                    }
                                 }
                                 bool live_5_1 = base_1 + 6 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_5_1) {
                                     float weight_22 = approx_exp2(lse_1[6] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_22;
-                                    acc0_1[0] = __fmaf_rn(weight_22, p0_1[6], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_22, p1_1[6], acc1_1[0]);
+                                    int cidx_23 = (base_1 + 6) / chunk_w_1;
+                                    if (cidx_23 == 0) {
+                                        den_1[0] = den_1[0] + weight_22;
+                                        acc0_1[0] = __fmaf_rn(weight_22, p0_1[6], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_22, p1_1[6], acc1_1[0]);
+                                    }
+                                    if (cidx_23 == 1) {
+                                        den_1[1] = den_1[1] + weight_22;
+                                        acc0_1[1] = __fmaf_rn(weight_22, p0_1[6], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_22, p1_1[6], acc1_1[1]);
+                                    }
+                                    if (cidx_23 == 2) {
+                                        den_1[2] = den_1[2] + weight_22;
+                                        acc0_1[2] = __fmaf_rn(weight_22, p0_1[6], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_22, p1_1[6], acc1_1[2]);
+                                    }
+                                    if (cidx_23 == 3) {
+                                        den_1[3] = den_1[3] + weight_22;
+                                        acc0_1[3] = __fmaf_rn(weight_22, p0_1[6], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_22, p1_1[6], acc1_1[3]);
+                                    }
                                 }
                                 bool live_6_1 = base_1 + 7 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_6_1) {
                                     float weight_23 = approx_exp2(lse_1[7] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_23;
-                                    acc0_1[0] = __fmaf_rn(weight_23, p0_1[7], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_23, p1_1[7], acc1_1[0]);
+                                    int cidx_24 = (base_1 + 7) / chunk_w_1;
+                                    if (cidx_24 == 0) {
+                                        den_1[0] = den_1[0] + weight_23;
+                                        acc0_1[0] = __fmaf_rn(weight_23, p0_1[7], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_23, p1_1[7], acc1_1[0]);
+                                    }
+                                    if (cidx_24 == 1) {
+                                        den_1[1] = den_1[1] + weight_23;
+                                        acc0_1[1] = __fmaf_rn(weight_23, p0_1[7], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_23, p1_1[7], acc1_1[1]);
+                                    }
+                                    if (cidx_24 == 2) {
+                                        den_1[2] = den_1[2] + weight_23;
+                                        acc0_1[2] = __fmaf_rn(weight_23, p0_1[7], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_23, p1_1[7], acc1_1[2]);
+                                    }
+                                    if (cidx_24 == 3) {
+                                        den_1[3] = den_1[3] + weight_23;
+                                        acc0_1[3] = __fmaf_rn(weight_23, p0_1[7], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_23, p1_1[7], acc1_1[3]);
+                                    }
                                 }
                                 bool live_7_1 = base_1 + 8 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_7_1) {
                                     float weight_24 = approx_exp2(lse_1[8] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_24;
-                                    acc0_1[0] = __fmaf_rn(weight_24, p0_1[8], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_24, p1_1[8], acc1_1[0]);
+                                    int cidx_25 = (base_1 + 8) / chunk_w_1;
+                                    if (cidx_25 == 0) {
+                                        den_1[0] = den_1[0] + weight_24;
+                                        acc0_1[0] = __fmaf_rn(weight_24, p0_1[8], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_24, p1_1[8], acc1_1[0]);
+                                    }
+                                    if (cidx_25 == 1) {
+                                        den_1[1] = den_1[1] + weight_24;
+                                        acc0_1[1] = __fmaf_rn(weight_24, p0_1[8], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_24, p1_1[8], acc1_1[1]);
+                                    }
+                                    if (cidx_25 == 2) {
+                                        den_1[2] = den_1[2] + weight_24;
+                                        acc0_1[2] = __fmaf_rn(weight_24, p0_1[8], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_24, p1_1[8], acc1_1[2]);
+                                    }
+                                    if (cidx_25 == 3) {
+                                        den_1[3] = den_1[3] + weight_24;
+                                        acc0_1[3] = __fmaf_rn(weight_24, p0_1[8], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_24, p1_1[8], acc1_1[3]);
+                                    }
                                 }
                                 bool live_8_1 = base_1 + 9 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_8_1) {
                                     float weight_25 = approx_exp2(lse_1[9] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_25;
-                                    acc0_1[0] = __fmaf_rn(weight_25, p0_1[9], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_25, p1_1[9], acc1_1[0]);
+                                    int cidx_26 = (base_1 + 9) / chunk_w_1;
+                                    if (cidx_26 == 0) {
+                                        den_1[0] = den_1[0] + weight_25;
+                                        acc0_1[0] = __fmaf_rn(weight_25, p0_1[9], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_25, p1_1[9], acc1_1[0]);
+                                    }
+                                    if (cidx_26 == 1) {
+                                        den_1[1] = den_1[1] + weight_25;
+                                        acc0_1[1] = __fmaf_rn(weight_25, p0_1[9], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_25, p1_1[9], acc1_1[1]);
+                                    }
+                                    if (cidx_26 == 2) {
+                                        den_1[2] = den_1[2] + weight_25;
+                                        acc0_1[2] = __fmaf_rn(weight_25, p0_1[9], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_25, p1_1[9], acc1_1[2]);
+                                    }
+                                    if (cidx_26 == 3) {
+                                        den_1[3] = den_1[3] + weight_25;
+                                        acc0_1[3] = __fmaf_rn(weight_25, p0_1[9], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_25, p1_1[9], acc1_1[3]);
+                                    }
                                 }
                                 bool live_9_1 = base_1 + 10 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_9_1) {
                                     float weight_26 = approx_exp2(lse_1[10] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_26;
-                                    acc0_1[0] = __fmaf_rn(weight_26, p0_1[10], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_26, p1_1[10], acc1_1[0]);
+                                    int cidx_27 = (base_1 + 10) / chunk_w_1;
+                                    if (cidx_27 == 0) {
+                                        den_1[0] = den_1[0] + weight_26;
+                                        acc0_1[0] = __fmaf_rn(weight_26, p0_1[10], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_26, p1_1[10], acc1_1[0]);
+                                    }
+                                    if (cidx_27 == 1) {
+                                        den_1[1] = den_1[1] + weight_26;
+                                        acc0_1[1] = __fmaf_rn(weight_26, p0_1[10], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_26, p1_1[10], acc1_1[1]);
+                                    }
+                                    if (cidx_27 == 2) {
+                                        den_1[2] = den_1[2] + weight_26;
+                                        acc0_1[2] = __fmaf_rn(weight_26, p0_1[10], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_26, p1_1[10], acc1_1[2]);
+                                    }
+                                    if (cidx_27 == 3) {
+                                        den_1[3] = den_1[3] + weight_26;
+                                        acc0_1[3] = __fmaf_rn(weight_26, p0_1[10], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_26, p1_1[10], acc1_1[3]);
+                                    }
                                 }
                                 bool live_10_1 = base_1 + 11 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_10_1) {
                                     float weight_27 = approx_exp2(lse_1[11] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_27;
-                                    acc0_1[0] = __fmaf_rn(weight_27, p0_1[11], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_27, p1_1[11], acc1_1[0]);
+                                    int cidx_28 = (base_1 + 11) / chunk_w_1;
+                                    if (cidx_28 == 0) {
+                                        den_1[0] = den_1[0] + weight_27;
+                                        acc0_1[0] = __fmaf_rn(weight_27, p0_1[11], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_27, p1_1[11], acc1_1[0]);
+                                    }
+                                    if (cidx_28 == 1) {
+                                        den_1[1] = den_1[1] + weight_27;
+                                        acc0_1[1] = __fmaf_rn(weight_27, p0_1[11], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_27, p1_1[11], acc1_1[1]);
+                                    }
+                                    if (cidx_28 == 2) {
+                                        den_1[2] = den_1[2] + weight_27;
+                                        acc0_1[2] = __fmaf_rn(weight_27, p0_1[11], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_27, p1_1[11], acc1_1[2]);
+                                    }
+                                    if (cidx_28 == 3) {
+                                        den_1[3] = den_1[3] + weight_27;
+                                        acc0_1[3] = __fmaf_rn(weight_27, p0_1[11], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_27, p1_1[11], acc1_1[3]);
+                                    }
                                 }
                                 bool live_11_1 = base_1 + 12 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_11_1) {
                                     float weight_28 = approx_exp2(lse_1[12] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_28;
-                                    acc0_1[0] = __fmaf_rn(weight_28, p0_1[12], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_28, p1_1[12], acc1_1[0]);
+                                    int cidx_29 = (base_1 + 12) / chunk_w_1;
+                                    if (cidx_29 == 0) {
+                                        den_1[0] = den_1[0] + weight_28;
+                                        acc0_1[0] = __fmaf_rn(weight_28, p0_1[12], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_28, p1_1[12], acc1_1[0]);
+                                    }
+                                    if (cidx_29 == 1) {
+                                        den_1[1] = den_1[1] + weight_28;
+                                        acc0_1[1] = __fmaf_rn(weight_28, p0_1[12], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_28, p1_1[12], acc1_1[1]);
+                                    }
+                                    if (cidx_29 == 2) {
+                                        den_1[2] = den_1[2] + weight_28;
+                                        acc0_1[2] = __fmaf_rn(weight_28, p0_1[12], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_28, p1_1[12], acc1_1[2]);
+                                    }
+                                    if (cidx_29 == 3) {
+                                        den_1[3] = den_1[3] + weight_28;
+                                        acc0_1[3] = __fmaf_rn(weight_28, p0_1[12], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_28, p1_1[12], acc1_1[3]);
+                                    }
                                 }
                                 bool live_12_1 = base_1 + 13 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_12_1) {
                                     float weight_29 = approx_exp2(lse_1[13] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_29;
-                                    acc0_1[0] = __fmaf_rn(weight_29, p0_1[13], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_29, p1_1[13], acc1_1[0]);
+                                    int cidx_30 = (base_1 + 13) / chunk_w_1;
+                                    if (cidx_30 == 0) {
+                                        den_1[0] = den_1[0] + weight_29;
+                                        acc0_1[0] = __fmaf_rn(weight_29, p0_1[13], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_29, p1_1[13], acc1_1[0]);
+                                    }
+                                    if (cidx_30 == 1) {
+                                        den_1[1] = den_1[1] + weight_29;
+                                        acc0_1[1] = __fmaf_rn(weight_29, p0_1[13], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_29, p1_1[13], acc1_1[1]);
+                                    }
+                                    if (cidx_30 == 2) {
+                                        den_1[2] = den_1[2] + weight_29;
+                                        acc0_1[2] = __fmaf_rn(weight_29, p0_1[13], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_29, p1_1[13], acc1_1[2]);
+                                    }
+                                    if (cidx_30 == 3) {
+                                        den_1[3] = den_1[3] + weight_29;
+                                        acc0_1[3] = __fmaf_rn(weight_29, p0_1[13], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_29, p1_1[13], acc1_1[3]);
+                                    }
                                 }
                                 bool live_13_1 = base_1 + 14 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_13_1) {
                                     float weight_30 = approx_exp2(lse_1[14] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_30;
-                                    acc0_1[0] = __fmaf_rn(weight_30, p0_1[14], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_30, p1_1[14], acc1_1[0]);
+                                    int cidx_31 = (base_1 + 14) / chunk_w_1;
+                                    if (cidx_31 == 0) {
+                                        den_1[0] = den_1[0] + weight_30;
+                                        acc0_1[0] = __fmaf_rn(weight_30, p0_1[14], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_30, p1_1[14], acc1_1[0]);
+                                    }
+                                    if (cidx_31 == 1) {
+                                        den_1[1] = den_1[1] + weight_30;
+                                        acc0_1[1] = __fmaf_rn(weight_30, p0_1[14], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_30, p1_1[14], acc1_1[1]);
+                                    }
+                                    if (cidx_31 == 2) {
+                                        den_1[2] = den_1[2] + weight_30;
+                                        acc0_1[2] = __fmaf_rn(weight_30, p0_1[14], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_30, p1_1[14], acc1_1[2]);
+                                    }
+                                    if (cidx_31 == 3) {
+                                        den_1[3] = den_1[3] + weight_30;
+                                        acc0_1[3] = __fmaf_rn(weight_30, p0_1[14], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_30, p1_1[14], acc1_1[3]);
+                                    }
                                 }
                                 bool live_14_1 = base_1 + 15 < num_splits && lse_max_1[0] > -CUDART_INF_F;
                                 if (live_14_1) {
                                     float weight_31 = approx_exp2(lse_1[15] - lse_max_1[0]);
-                                    den_1[0] = den_1[0] + weight_31;
-                                    acc0_1[0] = __fmaf_rn(weight_31, p0_1[15], acc0_1[0]);
-                                    acc1_1[0] = __fmaf_rn(weight_31, p1_1[15], acc1_1[0]);
+                                    int cidx_32 = (base_1 + 15) / chunk_w_1;
+                                    if (cidx_32 == 0) {
+                                        den_1[0] = den_1[0] + weight_31;
+                                        acc0_1[0] = __fmaf_rn(weight_31, p0_1[15], acc0_1[0]);
+                                        acc1_1[0] = __fmaf_rn(weight_31, p1_1[15], acc1_1[0]);
+                                    }
+                                    if (cidx_32 == 1) {
+                                        den_1[1] = den_1[1] + weight_31;
+                                        acc0_1[1] = __fmaf_rn(weight_31, p0_1[15], acc0_1[1]);
+                                        acc1_1[1] = __fmaf_rn(weight_31, p1_1[15], acc1_1[1]);
+                                    }
+                                    if (cidx_32 == 2) {
+                                        den_1[2] = den_1[2] + weight_31;
+                                        acc0_1[2] = __fmaf_rn(weight_31, p0_1[15], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_31, p1_1[15], acc1_1[2]);
+                                    }
+                                    if (cidx_32 == 3) {
+                                        den_1[3] = den_1[3] + weight_31;
+                                        acc0_1[3] = __fmaf_rn(weight_31, p0_1[15], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_31, p1_1[15], acc1_1[3]);
+                                    }
                                 }
                             }
                             if (valid_1[0] != 0) {
+                                float den_k_1 = den_1[0];
+                                float acc0_k_1 = acc0_1[0];
+                                float acc1_k_1 = acc1_1[0];
+                                den_k_1 = den_k_1 + den_1[1];
+                                acc0_k_1 = acc0_k_1 + acc0_1[1];
+                                acc1_k_1 = acc1_k_1 + acc1_1[1];
+                                den_k_1 = den_k_1 + den_1[2];
+                                acc0_k_1 = acc0_k_1 + acc0_1[2];
+                                acc1_k_1 = acc1_k_1 + acc1_1[2];
+                                den_k_1 = den_k_1 + den_1[3];
+                                acc0_k_1 = acc0_k_1 + acc0_1[3];
+                                acc1_k_1 = acc1_k_1 + acc1_1[3];
                                 float inv_3 = 0.0f;
-                                if (den_1[0] > 0.0f) {
-                                    float _rcp_152 = approx_rcp(den_1[0]);
+                                if (den_k_1 > 0.0f) {
+                                    float _rcp_152 = approx_rcp(den_k_1);
                                     inv_3 = _rcp_152;
                                 }
-                                float attn0_1 = (float)(__nv_bfloat16)(acc0_1[0] * inv_3);
-                                float attn1_1 = (float)(__nv_bfloat16)(acc1_1[0] * inv_3);
+                                float attn0_1 = (float)(__nv_bfloat16)(acc0_k_1 * inv_3);
+                                float attn1_1 = (float)(__nv_bfloat16)(acc1_k_1 * inv_3);
                                 float _exp2_154 = approx_exp2((-gate0_1[0]) * 1.442695f);
                                 float _rcp_153 = approx_rcp(1.0f + _exp2_154);
                                 float result0_1 = attn0_1 * _rcp_153;
@@ -2342,9 +2968,13 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                             float lse_2[16];
                             float p0_2[16];
                             float p1_2[16];
-                            float acc0_2[2];
-                            float acc1_2[2];
-                            float den_2[2];
+                            float acc0_2[8];
+                            float acc1_2[8];
+                            float den_2[8];
+                            int chunk_w_2 = (num_splits + 3) / 4;
+                            if (num_splits <= 4) {
+                                chunk_w_2 = num_splits;
+                            }
                             float lse_max_2[2];
                             int valid_2[2];
                             int tab_2[2];
@@ -2366,6 +2996,15 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 acc0_2[0] = 0.0f;
                                 acc1_2[0] = 0.0f;
                                 den_2[0] = 0.0f;
+                                acc0_2[1] = 0.0f;
+                                acc1_2[1] = 0.0f;
+                                den_2[1] = 0.0f;
+                                acc0_2[2] = 0.0f;
+                                acc1_2[2] = 0.0f;
+                                den_2[2] = 0.0f;
+                                acc0_2[3] = 0.0f;
+                                acc1_2[3] = 0.0f;
+                                den_2[3] = 0.0f;
                                 lse_max_2[0] = -CUDART_INF_F;
                                 float _vec_load_46[2];
                                 {
@@ -2382,9 +3021,18 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 dim_2[1] = (long long)((pk_1_1 & 127) * 2);
                                 qo_head_4[1] = (long long)(first_head + head_2);
                                 row_head_2[1] = row_i64 * nqo_2 + qo_head_4[1];
-                                acc0_2[1] = 0.0f;
-                                acc1_2[1] = 0.0f;
-                                den_2[1] = 0.0f;
+                                acc0_2[4] = 0.0f;
+                                acc1_2[4] = 0.0f;
+                                den_2[4] = 0.0f;
+                                acc0_2[5] = 0.0f;
+                                acc1_2[5] = 0.0f;
+                                den_2[5] = 0.0f;
+                                acc0_2[6] = 0.0f;
+                                acc1_2[6] = 0.0f;
+                                den_2[6] = 0.0f;
+                                acc0_2[7] = 0.0f;
+                                acc1_2[7] = 0.0f;
+                                den_2[7] = 0.0f;
                                 lse_max_2[1] = -CUDART_INF_F;
                                 float _vec_load_47[2];
                                 {
@@ -2624,124 +3272,424 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                     bool live_16 = base_2 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_16) {
                                         float weight_32 = approx_exp2(lse_2[0] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_32;
-                                        acc0_2[0] = __fmaf_rn(weight_32, p0_2[0], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_32, p1_2[0], acc1_2[0]);
+                                        int cidx_33 = base_2 / chunk_w_2;
+                                        if (cidx_33 == 0) {
+                                            den_2[0] = den_2[0] + weight_32;
+                                            acc0_2[0] = __fmaf_rn(weight_32, p0_2[0], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_32, p1_2[0], acc1_2[0]);
+                                        }
+                                        if (cidx_33 == 1) {
+                                            den_2[1] = den_2[1] + weight_32;
+                                            acc0_2[1] = __fmaf_rn(weight_32, p0_2[0], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_32, p1_2[0], acc1_2[1]);
+                                        }
+                                        if (cidx_33 == 2) {
+                                            den_2[2] = den_2[2] + weight_32;
+                                            acc0_2[2] = __fmaf_rn(weight_32, p0_2[0], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_32, p1_2[0], acc1_2[2]);
+                                        }
+                                        if (cidx_33 == 3) {
+                                            den_2[3] = den_2[3] + weight_32;
+                                            acc0_2[3] = __fmaf_rn(weight_32, p0_2[0], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_32, p1_2[0], acc1_2[3]);
+                                        }
                                     }
                                     bool live_0_2 = base_2 + 1 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_0_2) {
                                         float weight_33 = approx_exp2(lse_2[1] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_33;
-                                        acc0_2[0] = __fmaf_rn(weight_33, p0_2[1], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_33, p1_2[1], acc1_2[0]);
+                                        int cidx_34 = (base_2 + 1) / chunk_w_2;
+                                        if (cidx_34 == 0) {
+                                            den_2[0] = den_2[0] + weight_33;
+                                            acc0_2[0] = __fmaf_rn(weight_33, p0_2[1], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_33, p1_2[1], acc1_2[0]);
+                                        }
+                                        if (cidx_34 == 1) {
+                                            den_2[1] = den_2[1] + weight_33;
+                                            acc0_2[1] = __fmaf_rn(weight_33, p0_2[1], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_33, p1_2[1], acc1_2[1]);
+                                        }
+                                        if (cidx_34 == 2) {
+                                            den_2[2] = den_2[2] + weight_33;
+                                            acc0_2[2] = __fmaf_rn(weight_33, p0_2[1], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_33, p1_2[1], acc1_2[2]);
+                                        }
+                                        if (cidx_34 == 3) {
+                                            den_2[3] = den_2[3] + weight_33;
+                                            acc0_2[3] = __fmaf_rn(weight_33, p0_2[1], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_33, p1_2[1], acc1_2[3]);
+                                        }
                                     }
                                     bool live_1_2 = base_2 + 2 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_1_2) {
                                         float weight_34 = approx_exp2(lse_2[2] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_34;
-                                        acc0_2[0] = __fmaf_rn(weight_34, p0_2[2], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_34, p1_2[2], acc1_2[0]);
+                                        int cidx_35 = (base_2 + 2) / chunk_w_2;
+                                        if (cidx_35 == 0) {
+                                            den_2[0] = den_2[0] + weight_34;
+                                            acc0_2[0] = __fmaf_rn(weight_34, p0_2[2], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_34, p1_2[2], acc1_2[0]);
+                                        }
+                                        if (cidx_35 == 1) {
+                                            den_2[1] = den_2[1] + weight_34;
+                                            acc0_2[1] = __fmaf_rn(weight_34, p0_2[2], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_34, p1_2[2], acc1_2[1]);
+                                        }
+                                        if (cidx_35 == 2) {
+                                            den_2[2] = den_2[2] + weight_34;
+                                            acc0_2[2] = __fmaf_rn(weight_34, p0_2[2], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_34, p1_2[2], acc1_2[2]);
+                                        }
+                                        if (cidx_35 == 3) {
+                                            den_2[3] = den_2[3] + weight_34;
+                                            acc0_2[3] = __fmaf_rn(weight_34, p0_2[2], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_34, p1_2[2], acc1_2[3]);
+                                        }
                                     }
                                     bool live_2_2 = base_2 + 3 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_2_2) {
                                         float weight_35 = approx_exp2(lse_2[3] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_35;
-                                        acc0_2[0] = __fmaf_rn(weight_35, p0_2[3], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_35, p1_2[3], acc1_2[0]);
+                                        int cidx_36 = (base_2 + 3) / chunk_w_2;
+                                        if (cidx_36 == 0) {
+                                            den_2[0] = den_2[0] + weight_35;
+                                            acc0_2[0] = __fmaf_rn(weight_35, p0_2[3], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_35, p1_2[3], acc1_2[0]);
+                                        }
+                                        if (cidx_36 == 1) {
+                                            den_2[1] = den_2[1] + weight_35;
+                                            acc0_2[1] = __fmaf_rn(weight_35, p0_2[3], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_35, p1_2[3], acc1_2[1]);
+                                        }
+                                        if (cidx_36 == 2) {
+                                            den_2[2] = den_2[2] + weight_35;
+                                            acc0_2[2] = __fmaf_rn(weight_35, p0_2[3], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_35, p1_2[3], acc1_2[2]);
+                                        }
+                                        if (cidx_36 == 3) {
+                                            den_2[3] = den_2[3] + weight_35;
+                                            acc0_2[3] = __fmaf_rn(weight_35, p0_2[3], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_35, p1_2[3], acc1_2[3]);
+                                        }
                                     }
                                     bool live_3_2 = base_2 + 4 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_3_2) {
                                         float weight_36 = approx_exp2(lse_2[4] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_36;
-                                        acc0_2[0] = __fmaf_rn(weight_36, p0_2[4], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_36, p1_2[4], acc1_2[0]);
+                                        int cidx_37 = (base_2 + 4) / chunk_w_2;
+                                        if (cidx_37 == 0) {
+                                            den_2[0] = den_2[0] + weight_36;
+                                            acc0_2[0] = __fmaf_rn(weight_36, p0_2[4], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_36, p1_2[4], acc1_2[0]);
+                                        }
+                                        if (cidx_37 == 1) {
+                                            den_2[1] = den_2[1] + weight_36;
+                                            acc0_2[1] = __fmaf_rn(weight_36, p0_2[4], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_36, p1_2[4], acc1_2[1]);
+                                        }
+                                        if (cidx_37 == 2) {
+                                            den_2[2] = den_2[2] + weight_36;
+                                            acc0_2[2] = __fmaf_rn(weight_36, p0_2[4], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_36, p1_2[4], acc1_2[2]);
+                                        }
+                                        if (cidx_37 == 3) {
+                                            den_2[3] = den_2[3] + weight_36;
+                                            acc0_2[3] = __fmaf_rn(weight_36, p0_2[4], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_36, p1_2[4], acc1_2[3]);
+                                        }
                                     }
                                     bool live_4_2 = base_2 + 5 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_4_2) {
                                         float weight_37 = approx_exp2(lse_2[5] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_37;
-                                        acc0_2[0] = __fmaf_rn(weight_37, p0_2[5], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_37, p1_2[5], acc1_2[0]);
+                                        int cidx_38 = (base_2 + 5) / chunk_w_2;
+                                        if (cidx_38 == 0) {
+                                            den_2[0] = den_2[0] + weight_37;
+                                            acc0_2[0] = __fmaf_rn(weight_37, p0_2[5], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_37, p1_2[5], acc1_2[0]);
+                                        }
+                                        if (cidx_38 == 1) {
+                                            den_2[1] = den_2[1] + weight_37;
+                                            acc0_2[1] = __fmaf_rn(weight_37, p0_2[5], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_37, p1_2[5], acc1_2[1]);
+                                        }
+                                        if (cidx_38 == 2) {
+                                            den_2[2] = den_2[2] + weight_37;
+                                            acc0_2[2] = __fmaf_rn(weight_37, p0_2[5], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_37, p1_2[5], acc1_2[2]);
+                                        }
+                                        if (cidx_38 == 3) {
+                                            den_2[3] = den_2[3] + weight_37;
+                                            acc0_2[3] = __fmaf_rn(weight_37, p0_2[5], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_37, p1_2[5], acc1_2[3]);
+                                        }
                                     }
                                     bool live_5_2 = base_2 + 6 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_5_2) {
                                         float weight_38 = approx_exp2(lse_2[6] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_38;
-                                        acc0_2[0] = __fmaf_rn(weight_38, p0_2[6], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_38, p1_2[6], acc1_2[0]);
+                                        int cidx_39 = (base_2 + 6) / chunk_w_2;
+                                        if (cidx_39 == 0) {
+                                            den_2[0] = den_2[0] + weight_38;
+                                            acc0_2[0] = __fmaf_rn(weight_38, p0_2[6], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_38, p1_2[6], acc1_2[0]);
+                                        }
+                                        if (cidx_39 == 1) {
+                                            den_2[1] = den_2[1] + weight_38;
+                                            acc0_2[1] = __fmaf_rn(weight_38, p0_2[6], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_38, p1_2[6], acc1_2[1]);
+                                        }
+                                        if (cidx_39 == 2) {
+                                            den_2[2] = den_2[2] + weight_38;
+                                            acc0_2[2] = __fmaf_rn(weight_38, p0_2[6], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_38, p1_2[6], acc1_2[2]);
+                                        }
+                                        if (cidx_39 == 3) {
+                                            den_2[3] = den_2[3] + weight_38;
+                                            acc0_2[3] = __fmaf_rn(weight_38, p0_2[6], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_38, p1_2[6], acc1_2[3]);
+                                        }
                                     }
                                     bool live_6_2 = base_2 + 7 < num_splits && lse_max_2[0] > -CUDART_INF_F;
                                     if (live_6_2) {
                                         float weight_39 = approx_exp2(lse_2[7] - lse_max_2[0]);
-                                        den_2[0] = den_2[0] + weight_39;
-                                        acc0_2[0] = __fmaf_rn(weight_39, p0_2[7], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_39, p1_2[7], acc1_2[0]);
+                                        int cidx_40 = (base_2 + 7) / chunk_w_2;
+                                        if (cidx_40 == 0) {
+                                            den_2[0] = den_2[0] + weight_39;
+                                            acc0_2[0] = __fmaf_rn(weight_39, p0_2[7], acc0_2[0]);
+                                            acc1_2[0] = __fmaf_rn(weight_39, p1_2[7], acc1_2[0]);
+                                        }
+                                        if (cidx_40 == 1) {
+                                            den_2[1] = den_2[1] + weight_39;
+                                            acc0_2[1] = __fmaf_rn(weight_39, p0_2[7], acc0_2[1]);
+                                            acc1_2[1] = __fmaf_rn(weight_39, p1_2[7], acc1_2[1]);
+                                        }
+                                        if (cidx_40 == 2) {
+                                            den_2[2] = den_2[2] + weight_39;
+                                            acc0_2[2] = __fmaf_rn(weight_39, p0_2[7], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_39, p1_2[7], acc1_2[2]);
+                                        }
+                                        if (cidx_40 == 3) {
+                                            den_2[3] = den_2[3] + weight_39;
+                                            acc0_2[3] = __fmaf_rn(weight_39, p0_2[7], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_39, p1_2[7], acc1_2[3]);
+                                        }
                                     }
                                     bool live_7_2 = base_2 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_7_2) {
                                         float weight_40 = approx_exp2(lse_2[8] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_40;
-                                        acc0_2[1] = __fmaf_rn(weight_40, p0_2[8], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_40, p1_2[8], acc1_2[1]);
+                                        int cidx_41 = base_2 / chunk_w_2;
+                                        if (cidx_41 == 0) {
+                                            den_2[4] = den_2[4] + weight_40;
+                                            acc0_2[4] = __fmaf_rn(weight_40, p0_2[8], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_40, p1_2[8], acc1_2[4]);
+                                        }
+                                        if (cidx_41 == 1) {
+                                            den_2[5] = den_2[5] + weight_40;
+                                            acc0_2[5] = __fmaf_rn(weight_40, p0_2[8], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_40, p1_2[8], acc1_2[5]);
+                                        }
+                                        if (cidx_41 == 2) {
+                                            den_2[6] = den_2[6] + weight_40;
+                                            acc0_2[6] = __fmaf_rn(weight_40, p0_2[8], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_40, p1_2[8], acc1_2[6]);
+                                        }
+                                        if (cidx_41 == 3) {
+                                            den_2[7] = den_2[7] + weight_40;
+                                            acc0_2[7] = __fmaf_rn(weight_40, p0_2[8], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_40, p1_2[8], acc1_2[7]);
+                                        }
                                     }
                                     bool live_8_2 = base_2 + 1 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_8_2) {
                                         float weight_41 = approx_exp2(lse_2[9] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_41;
-                                        acc0_2[1] = __fmaf_rn(weight_41, p0_2[9], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_41, p1_2[9], acc1_2[1]);
+                                        int cidx_42 = (base_2 + 1) / chunk_w_2;
+                                        if (cidx_42 == 0) {
+                                            den_2[4] = den_2[4] + weight_41;
+                                            acc0_2[4] = __fmaf_rn(weight_41, p0_2[9], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_41, p1_2[9], acc1_2[4]);
+                                        }
+                                        if (cidx_42 == 1) {
+                                            den_2[5] = den_2[5] + weight_41;
+                                            acc0_2[5] = __fmaf_rn(weight_41, p0_2[9], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_41, p1_2[9], acc1_2[5]);
+                                        }
+                                        if (cidx_42 == 2) {
+                                            den_2[6] = den_2[6] + weight_41;
+                                            acc0_2[6] = __fmaf_rn(weight_41, p0_2[9], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_41, p1_2[9], acc1_2[6]);
+                                        }
+                                        if (cidx_42 == 3) {
+                                            den_2[7] = den_2[7] + weight_41;
+                                            acc0_2[7] = __fmaf_rn(weight_41, p0_2[9], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_41, p1_2[9], acc1_2[7]);
+                                        }
                                     }
                                     bool live_9_2 = base_2 + 2 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_9_2) {
                                         float weight_42 = approx_exp2(lse_2[10] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_42;
-                                        acc0_2[1] = __fmaf_rn(weight_42, p0_2[10], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_42, p1_2[10], acc1_2[1]);
+                                        int cidx_43 = (base_2 + 2) / chunk_w_2;
+                                        if (cidx_43 == 0) {
+                                            den_2[4] = den_2[4] + weight_42;
+                                            acc0_2[4] = __fmaf_rn(weight_42, p0_2[10], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_42, p1_2[10], acc1_2[4]);
+                                        }
+                                        if (cidx_43 == 1) {
+                                            den_2[5] = den_2[5] + weight_42;
+                                            acc0_2[5] = __fmaf_rn(weight_42, p0_2[10], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_42, p1_2[10], acc1_2[5]);
+                                        }
+                                        if (cidx_43 == 2) {
+                                            den_2[6] = den_2[6] + weight_42;
+                                            acc0_2[6] = __fmaf_rn(weight_42, p0_2[10], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_42, p1_2[10], acc1_2[6]);
+                                        }
+                                        if (cidx_43 == 3) {
+                                            den_2[7] = den_2[7] + weight_42;
+                                            acc0_2[7] = __fmaf_rn(weight_42, p0_2[10], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_42, p1_2[10], acc1_2[7]);
+                                        }
                                     }
                                     bool live_10_2 = base_2 + 3 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_10_2) {
                                         float weight_43 = approx_exp2(lse_2[11] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_43;
-                                        acc0_2[1] = __fmaf_rn(weight_43, p0_2[11], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_43, p1_2[11], acc1_2[1]);
+                                        int cidx_44 = (base_2 + 3) / chunk_w_2;
+                                        if (cidx_44 == 0) {
+                                            den_2[4] = den_2[4] + weight_43;
+                                            acc0_2[4] = __fmaf_rn(weight_43, p0_2[11], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_43, p1_2[11], acc1_2[4]);
+                                        }
+                                        if (cidx_44 == 1) {
+                                            den_2[5] = den_2[5] + weight_43;
+                                            acc0_2[5] = __fmaf_rn(weight_43, p0_2[11], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_43, p1_2[11], acc1_2[5]);
+                                        }
+                                        if (cidx_44 == 2) {
+                                            den_2[6] = den_2[6] + weight_43;
+                                            acc0_2[6] = __fmaf_rn(weight_43, p0_2[11], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_43, p1_2[11], acc1_2[6]);
+                                        }
+                                        if (cidx_44 == 3) {
+                                            den_2[7] = den_2[7] + weight_43;
+                                            acc0_2[7] = __fmaf_rn(weight_43, p0_2[11], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_43, p1_2[11], acc1_2[7]);
+                                        }
                                     }
                                     bool live_11_2 = base_2 + 4 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_11_2) {
                                         float weight_44 = approx_exp2(lse_2[12] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_44;
-                                        acc0_2[1] = __fmaf_rn(weight_44, p0_2[12], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_44, p1_2[12], acc1_2[1]);
+                                        int cidx_45 = (base_2 + 4) / chunk_w_2;
+                                        if (cidx_45 == 0) {
+                                            den_2[4] = den_2[4] + weight_44;
+                                            acc0_2[4] = __fmaf_rn(weight_44, p0_2[12], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_44, p1_2[12], acc1_2[4]);
+                                        }
+                                        if (cidx_45 == 1) {
+                                            den_2[5] = den_2[5] + weight_44;
+                                            acc0_2[5] = __fmaf_rn(weight_44, p0_2[12], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_44, p1_2[12], acc1_2[5]);
+                                        }
+                                        if (cidx_45 == 2) {
+                                            den_2[6] = den_2[6] + weight_44;
+                                            acc0_2[6] = __fmaf_rn(weight_44, p0_2[12], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_44, p1_2[12], acc1_2[6]);
+                                        }
+                                        if (cidx_45 == 3) {
+                                            den_2[7] = den_2[7] + weight_44;
+                                            acc0_2[7] = __fmaf_rn(weight_44, p0_2[12], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_44, p1_2[12], acc1_2[7]);
+                                        }
                                     }
                                     bool live_12_2 = base_2 + 5 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_12_2) {
                                         float weight_45 = approx_exp2(lse_2[13] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_45;
-                                        acc0_2[1] = __fmaf_rn(weight_45, p0_2[13], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_45, p1_2[13], acc1_2[1]);
+                                        int cidx_46 = (base_2 + 5) / chunk_w_2;
+                                        if (cidx_46 == 0) {
+                                            den_2[4] = den_2[4] + weight_45;
+                                            acc0_2[4] = __fmaf_rn(weight_45, p0_2[13], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_45, p1_2[13], acc1_2[4]);
+                                        }
+                                        if (cidx_46 == 1) {
+                                            den_2[5] = den_2[5] + weight_45;
+                                            acc0_2[5] = __fmaf_rn(weight_45, p0_2[13], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_45, p1_2[13], acc1_2[5]);
+                                        }
+                                        if (cidx_46 == 2) {
+                                            den_2[6] = den_2[6] + weight_45;
+                                            acc0_2[6] = __fmaf_rn(weight_45, p0_2[13], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_45, p1_2[13], acc1_2[6]);
+                                        }
+                                        if (cidx_46 == 3) {
+                                            den_2[7] = den_2[7] + weight_45;
+                                            acc0_2[7] = __fmaf_rn(weight_45, p0_2[13], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_45, p1_2[13], acc1_2[7]);
+                                        }
                                     }
                                     bool live_13_2 = base_2 + 6 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_13_2) {
                                         float weight_46 = approx_exp2(lse_2[14] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_46;
-                                        acc0_2[1] = __fmaf_rn(weight_46, p0_2[14], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_46, p1_2[14], acc1_2[1]);
+                                        int cidx_47 = (base_2 + 6) / chunk_w_2;
+                                        if (cidx_47 == 0) {
+                                            den_2[4] = den_2[4] + weight_46;
+                                            acc0_2[4] = __fmaf_rn(weight_46, p0_2[14], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_46, p1_2[14], acc1_2[4]);
+                                        }
+                                        if (cidx_47 == 1) {
+                                            den_2[5] = den_2[5] + weight_46;
+                                            acc0_2[5] = __fmaf_rn(weight_46, p0_2[14], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_46, p1_2[14], acc1_2[5]);
+                                        }
+                                        if (cidx_47 == 2) {
+                                            den_2[6] = den_2[6] + weight_46;
+                                            acc0_2[6] = __fmaf_rn(weight_46, p0_2[14], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_46, p1_2[14], acc1_2[6]);
+                                        }
+                                        if (cidx_47 == 3) {
+                                            den_2[7] = den_2[7] + weight_46;
+                                            acc0_2[7] = __fmaf_rn(weight_46, p0_2[14], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_46, p1_2[14], acc1_2[7]);
+                                        }
                                     }
                                     bool live_14_2 = base_2 + 7 < num_splits && lse_max_2[1] > -CUDART_INF_F;
                                     if (live_14_2) {
                                         float weight_47 = approx_exp2(lse_2[15] - lse_max_2[1]);
-                                        den_2[1] = den_2[1] + weight_47;
-                                        acc0_2[1] = __fmaf_rn(weight_47, p0_2[15], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_47, p1_2[15], acc1_2[1]);
+                                        int cidx_48 = (base_2 + 7) / chunk_w_2;
+                                        if (cidx_48 == 0) {
+                                            den_2[4] = den_2[4] + weight_47;
+                                            acc0_2[4] = __fmaf_rn(weight_47, p0_2[15], acc0_2[4]);
+                                            acc1_2[4] = __fmaf_rn(weight_47, p1_2[15], acc1_2[4]);
+                                        }
+                                        if (cidx_48 == 1) {
+                                            den_2[5] = den_2[5] + weight_47;
+                                            acc0_2[5] = __fmaf_rn(weight_47, p0_2[15], acc0_2[5]);
+                                            acc1_2[5] = __fmaf_rn(weight_47, p1_2[15], acc1_2[5]);
+                                        }
+                                        if (cidx_48 == 2) {
+                                            den_2[6] = den_2[6] + weight_47;
+                                            acc0_2[6] = __fmaf_rn(weight_47, p0_2[15], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_47, p1_2[15], acc1_2[6]);
+                                        }
+                                        if (cidx_48 == 3) {
+                                            den_2[7] = den_2[7] + weight_47;
+                                            acc0_2[7] = __fmaf_rn(weight_47, p0_2[15], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_47, p1_2[15], acc1_2[7]);
+                                        }
                                     }
                                 }
                                 if (valid_2[0] != 0) {
+                                    float den_k_2 = den_2[0];
+                                    float acc0_k_2 = acc0_2[0];
+                                    float acc1_k_2 = acc1_2[0];
+                                    den_k_2 = den_k_2 + den_2[1];
+                                    acc0_k_2 = acc0_k_2 + acc0_2[1];
+                                    acc1_k_2 = acc1_k_2 + acc1_2[1];
+                                    den_k_2 = den_k_2 + den_2[2];
+                                    acc0_k_2 = acc0_k_2 + acc0_2[2];
+                                    acc1_k_2 = acc1_k_2 + acc1_2[2];
+                                    den_k_2 = den_k_2 + den_2[3];
+                                    acc0_k_2 = acc0_k_2 + acc0_2[3];
+                                    acc1_k_2 = acc1_k_2 + acc1_2[3];
                                     float inv_4 = 0.0f;
-                                    if (den_2[0] > 0.0f) {
-                                        float _rcp_176 = approx_rcp(den_2[0]);
+                                    if (den_k_2 > 0.0f) {
+                                        float _rcp_176 = approx_rcp(den_k_2);
                                         inv_4 = _rcp_176;
                                     }
-                                    float attn0_2 = (float)(__nv_bfloat16)(acc0_2[0] * inv_4);
-                                    float attn1_2 = (float)(__nv_bfloat16)(acc1_2[0] * inv_4);
+                                    float attn0_2 = (float)(__nv_bfloat16)(acc0_k_2 * inv_4);
+                                    float attn1_2 = (float)(__nv_bfloat16)(acc1_k_2 * inv_4);
                                     float _exp2_178 = approx_exp2((-gate0_2[0]) * 1.442695f);
                                     float _rcp_177 = approx_rcp(1.0f + _exp2_178);
                                     float result0_2 = attn0_2 * _rcp_177;
@@ -2754,13 +3702,25 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_2) + (0)) = word_2[0];
                                 }
                                 if (valid_2[1] != 0) {
+                                    float den_k_3 = den_2[4];
+                                    float acc0_k_3 = acc0_2[4];
+                                    float acc1_k_3 = acc1_2[4];
+                                    den_k_3 = den_k_3 + den_2[5];
+                                    acc0_k_3 = acc0_k_3 + acc0_2[5];
+                                    acc1_k_3 = acc1_k_3 + acc1_2[5];
+                                    den_k_3 = den_k_3 + den_2[6];
+                                    acc0_k_3 = acc0_k_3 + acc0_2[6];
+                                    acc1_k_3 = acc1_k_3 + acc1_2[6];
+                                    den_k_3 = den_k_3 + den_2[7];
+                                    acc0_k_3 = acc0_k_3 + acc0_2[7];
+                                    acc1_k_3 = acc1_k_3 + acc1_2[7];
                                     float inv_5 = 0.0f;
-                                    if (den_2[1] > 0.0f) {
-                                        float _rcp_182 = approx_rcp(den_2[1]);
+                                    if (den_k_3 > 0.0f) {
+                                        float _rcp_182 = approx_rcp(den_k_3);
                                         inv_5 = _rcp_182;
                                     }
-                                    float attn0_3 = (float)(__nv_bfloat16)(acc0_2[1] * inv_5);
-                                    float attn1_3 = (float)(__nv_bfloat16)(acc1_2[1] * inv_5);
+                                    float attn0_3 = (float)(__nv_bfloat16)(acc0_k_3 * inv_5);
+                                    float attn1_3 = (float)(__nv_bfloat16)(acc1_k_3 * inv_5);
                                     float _exp2_184 = approx_exp2((-gate0_2[1]) * 1.442695f);
                                     float _rcp_183 = approx_rcp(1.0f + _exp2_184);
                                     float result0_3 = attn0_3 * _rcp_183;
@@ -2777,9 +3737,13 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                             float lse_3[16];
                             float p0_3[16];
                             float p1_3[16];
-                            float acc0_3[4];
-                            float acc1_3[4];
-                            float den_3[4];
+                            float acc0_3[16];
+                            float acc1_3[16];
+                            float den_3[16];
+                            int chunk_w_3 = (num_splits + 3) / 4;
+                            if (num_splits <= 4) {
+                                chunk_w_3 = num_splits;
+                            }
                             float lse_max_3[4];
                             int valid_3[4];
                             int tab_3[4];
@@ -2801,6 +3765,15 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 acc0_3[0] = 0.0f;
                                 acc1_3[0] = 0.0f;
                                 den_3[0] = 0.0f;
+                                acc0_3[1] = 0.0f;
+                                acc1_3[1] = 0.0f;
+                                den_3[1] = 0.0f;
+                                acc0_3[2] = 0.0f;
+                                acc1_3[2] = 0.0f;
+                                den_3[2] = 0.0f;
+                                acc0_3[3] = 0.0f;
+                                acc1_3[3] = 0.0f;
+                                den_3[3] = 0.0f;
                                 lse_max_3[0] = -CUDART_INF_F;
                                 float _vec_load_64[2];
                                 {
@@ -2817,9 +3790,18 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 dim_3[1] = (long long)((pk_1_2 & 127) * 2);
                                 qo_head_5[1] = (long long)(first_head + head_2_1);
                                 row_head_3[1] = row_i64 * nqo_3 + qo_head_5[1];
-                                acc0_3[1] = 0.0f;
-                                acc1_3[1] = 0.0f;
-                                den_3[1] = 0.0f;
+                                acc0_3[4] = 0.0f;
+                                acc1_3[4] = 0.0f;
+                                den_3[4] = 0.0f;
+                                acc0_3[5] = 0.0f;
+                                acc1_3[5] = 0.0f;
+                                den_3[5] = 0.0f;
+                                acc0_3[6] = 0.0f;
+                                acc1_3[6] = 0.0f;
+                                den_3[6] = 0.0f;
+                                acc0_3[7] = 0.0f;
+                                acc1_3[7] = 0.0f;
+                                den_3[7] = 0.0f;
                                 lse_max_3[1] = -CUDART_INF_F;
                                 float _vec_load_65[2];
                                 {
@@ -2836,9 +3818,18 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 dim_3[2] = (long long)((pk_3_1 & 127) * 2);
                                 qo_head_5[2] = (long long)(first_head + head_4);
                                 row_head_3[2] = row_i64 * nqo_3 + qo_head_5[2];
-                                acc0_3[2] = 0.0f;
-                                acc1_3[2] = 0.0f;
-                                den_3[2] = 0.0f;
+                                acc0_3[8] = 0.0f;
+                                acc1_3[8] = 0.0f;
+                                den_3[8] = 0.0f;
+                                acc0_3[9] = 0.0f;
+                                acc1_3[9] = 0.0f;
+                                den_3[9] = 0.0f;
+                                acc0_3[10] = 0.0f;
+                                acc1_3[10] = 0.0f;
+                                den_3[10] = 0.0f;
+                                acc0_3[11] = 0.0f;
+                                acc1_3[11] = 0.0f;
+                                den_3[11] = 0.0f;
                                 lse_max_3[2] = -CUDART_INF_F;
                                 float _vec_load_66[2];
                                 {
@@ -2855,9 +3846,18 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                 dim_3[3] = (long long)((pk_5 & 127) * 2);
                                 qo_head_5[3] = (long long)(first_head + head_6);
                                 row_head_3[3] = row_i64 * nqo_3 + qo_head_5[3];
-                                acc0_3[3] = 0.0f;
-                                acc1_3[3] = 0.0f;
-                                den_3[3] = 0.0f;
+                                acc0_3[12] = 0.0f;
+                                acc1_3[12] = 0.0f;
+                                den_3[12] = 0.0f;
+                                acc0_3[13] = 0.0f;
+                                acc1_3[13] = 0.0f;
+                                den_3[13] = 0.0f;
+                                acc0_3[14] = 0.0f;
+                                acc1_3[14] = 0.0f;
+                                den_3[14] = 0.0f;
+                                acc0_3[15] = 0.0f;
+                                acc1_3[15] = 0.0f;
+                                den_3[15] = 0.0f;
                                 lse_max_3[3] = -CUDART_INF_F;
                                 float _vec_load_67[2];
                                 {
@@ -3097,124 +4097,424 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                     bool live_17 = base_3 < num_splits && lse_max_3[0] > -CUDART_INF_F;
                                     if (live_17) {
                                         float weight_48 = approx_exp2(lse_3[0] - lse_max_3[0]);
-                                        den_3[0] = den_3[0] + weight_48;
-                                        acc0_3[0] = __fmaf_rn(weight_48, p0_3[0], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_48, p1_3[0], acc1_3[0]);
+                                        int cidx_49 = base_3 / chunk_w_3;
+                                        if (cidx_49 == 0) {
+                                            den_3[0] = den_3[0] + weight_48;
+                                            acc0_3[0] = __fmaf_rn(weight_48, p0_3[0], acc0_3[0]);
+                                            acc1_3[0] = __fmaf_rn(weight_48, p1_3[0], acc1_3[0]);
+                                        }
+                                        if (cidx_49 == 1) {
+                                            den_3[1] = den_3[1] + weight_48;
+                                            acc0_3[1] = __fmaf_rn(weight_48, p0_3[0], acc0_3[1]);
+                                            acc1_3[1] = __fmaf_rn(weight_48, p1_3[0], acc1_3[1]);
+                                        }
+                                        if (cidx_49 == 2) {
+                                            den_3[2] = den_3[2] + weight_48;
+                                            acc0_3[2] = __fmaf_rn(weight_48, p0_3[0], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_48, p1_3[0], acc1_3[2]);
+                                        }
+                                        if (cidx_49 == 3) {
+                                            den_3[3] = den_3[3] + weight_48;
+                                            acc0_3[3] = __fmaf_rn(weight_48, p0_3[0], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_48, p1_3[0], acc1_3[3]);
+                                        }
                                     }
                                     bool live_0_3 = base_3 + 1 < num_splits && lse_max_3[0] > -CUDART_INF_F;
                                     if (live_0_3) {
                                         float weight_49 = approx_exp2(lse_3[1] - lse_max_3[0]);
-                                        den_3[0] = den_3[0] + weight_49;
-                                        acc0_3[0] = __fmaf_rn(weight_49, p0_3[1], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_49, p1_3[1], acc1_3[0]);
+                                        int cidx_50 = (base_3 + 1) / chunk_w_3;
+                                        if (cidx_50 == 0) {
+                                            den_3[0] = den_3[0] + weight_49;
+                                            acc0_3[0] = __fmaf_rn(weight_49, p0_3[1], acc0_3[0]);
+                                            acc1_3[0] = __fmaf_rn(weight_49, p1_3[1], acc1_3[0]);
+                                        }
+                                        if (cidx_50 == 1) {
+                                            den_3[1] = den_3[1] + weight_49;
+                                            acc0_3[1] = __fmaf_rn(weight_49, p0_3[1], acc0_3[1]);
+                                            acc1_3[1] = __fmaf_rn(weight_49, p1_3[1], acc1_3[1]);
+                                        }
+                                        if (cidx_50 == 2) {
+                                            den_3[2] = den_3[2] + weight_49;
+                                            acc0_3[2] = __fmaf_rn(weight_49, p0_3[1], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_49, p1_3[1], acc1_3[2]);
+                                        }
+                                        if (cidx_50 == 3) {
+                                            den_3[3] = den_3[3] + weight_49;
+                                            acc0_3[3] = __fmaf_rn(weight_49, p0_3[1], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_49, p1_3[1], acc1_3[3]);
+                                        }
                                     }
                                     bool live_1_3 = base_3 + 2 < num_splits && lse_max_3[0] > -CUDART_INF_F;
                                     if (live_1_3) {
                                         float weight_50 = approx_exp2(lse_3[2] - lse_max_3[0]);
-                                        den_3[0] = den_3[0] + weight_50;
-                                        acc0_3[0] = __fmaf_rn(weight_50, p0_3[2], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_50, p1_3[2], acc1_3[0]);
+                                        int cidx_51 = (base_3 + 2) / chunk_w_3;
+                                        if (cidx_51 == 0) {
+                                            den_3[0] = den_3[0] + weight_50;
+                                            acc0_3[0] = __fmaf_rn(weight_50, p0_3[2], acc0_3[0]);
+                                            acc1_3[0] = __fmaf_rn(weight_50, p1_3[2], acc1_3[0]);
+                                        }
+                                        if (cidx_51 == 1) {
+                                            den_3[1] = den_3[1] + weight_50;
+                                            acc0_3[1] = __fmaf_rn(weight_50, p0_3[2], acc0_3[1]);
+                                            acc1_3[1] = __fmaf_rn(weight_50, p1_3[2], acc1_3[1]);
+                                        }
+                                        if (cidx_51 == 2) {
+                                            den_3[2] = den_3[2] + weight_50;
+                                            acc0_3[2] = __fmaf_rn(weight_50, p0_3[2], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_50, p1_3[2], acc1_3[2]);
+                                        }
+                                        if (cidx_51 == 3) {
+                                            den_3[3] = den_3[3] + weight_50;
+                                            acc0_3[3] = __fmaf_rn(weight_50, p0_3[2], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_50, p1_3[2], acc1_3[3]);
+                                        }
                                     }
                                     bool live_2_3 = base_3 + 3 < num_splits && lse_max_3[0] > -CUDART_INF_F;
                                     if (live_2_3) {
                                         float weight_51 = approx_exp2(lse_3[3] - lse_max_3[0]);
-                                        den_3[0] = den_3[0] + weight_51;
-                                        acc0_3[0] = __fmaf_rn(weight_51, p0_3[3], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_51, p1_3[3], acc1_3[0]);
+                                        int cidx_52 = (base_3 + 3) / chunk_w_3;
+                                        if (cidx_52 == 0) {
+                                            den_3[0] = den_3[0] + weight_51;
+                                            acc0_3[0] = __fmaf_rn(weight_51, p0_3[3], acc0_3[0]);
+                                            acc1_3[0] = __fmaf_rn(weight_51, p1_3[3], acc1_3[0]);
+                                        }
+                                        if (cidx_52 == 1) {
+                                            den_3[1] = den_3[1] + weight_51;
+                                            acc0_3[1] = __fmaf_rn(weight_51, p0_3[3], acc0_3[1]);
+                                            acc1_3[1] = __fmaf_rn(weight_51, p1_3[3], acc1_3[1]);
+                                        }
+                                        if (cidx_52 == 2) {
+                                            den_3[2] = den_3[2] + weight_51;
+                                            acc0_3[2] = __fmaf_rn(weight_51, p0_3[3], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_51, p1_3[3], acc1_3[2]);
+                                        }
+                                        if (cidx_52 == 3) {
+                                            den_3[3] = den_3[3] + weight_51;
+                                            acc0_3[3] = __fmaf_rn(weight_51, p0_3[3], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_51, p1_3[3], acc1_3[3]);
+                                        }
                                     }
                                     bool live_3_3 = base_3 < num_splits && lse_max_3[1] > -CUDART_INF_F;
                                     if (live_3_3) {
                                         float weight_52 = approx_exp2(lse_3[4] - lse_max_3[1]);
-                                        den_3[1] = den_3[1] + weight_52;
-                                        acc0_3[1] = __fmaf_rn(weight_52, p0_3[4], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_52, p1_3[4], acc1_3[1]);
+                                        int cidx_53 = base_3 / chunk_w_3;
+                                        if (cidx_53 == 0) {
+                                            den_3[4] = den_3[4] + weight_52;
+                                            acc0_3[4] = __fmaf_rn(weight_52, p0_3[4], acc0_3[4]);
+                                            acc1_3[4] = __fmaf_rn(weight_52, p1_3[4], acc1_3[4]);
+                                        }
+                                        if (cidx_53 == 1) {
+                                            den_3[5] = den_3[5] + weight_52;
+                                            acc0_3[5] = __fmaf_rn(weight_52, p0_3[4], acc0_3[5]);
+                                            acc1_3[5] = __fmaf_rn(weight_52, p1_3[4], acc1_3[5]);
+                                        }
+                                        if (cidx_53 == 2) {
+                                            den_3[6] = den_3[6] + weight_52;
+                                            acc0_3[6] = __fmaf_rn(weight_52, p0_3[4], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_52, p1_3[4], acc1_3[6]);
+                                        }
+                                        if (cidx_53 == 3) {
+                                            den_3[7] = den_3[7] + weight_52;
+                                            acc0_3[7] = __fmaf_rn(weight_52, p0_3[4], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_52, p1_3[4], acc1_3[7]);
+                                        }
                                     }
                                     bool live_4_3 = base_3 + 1 < num_splits && lse_max_3[1] > -CUDART_INF_F;
                                     if (live_4_3) {
                                         float weight_53 = approx_exp2(lse_3[5] - lse_max_3[1]);
-                                        den_3[1] = den_3[1] + weight_53;
-                                        acc0_3[1] = __fmaf_rn(weight_53, p0_3[5], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_53, p1_3[5], acc1_3[1]);
+                                        int cidx_54 = (base_3 + 1) / chunk_w_3;
+                                        if (cidx_54 == 0) {
+                                            den_3[4] = den_3[4] + weight_53;
+                                            acc0_3[4] = __fmaf_rn(weight_53, p0_3[5], acc0_3[4]);
+                                            acc1_3[4] = __fmaf_rn(weight_53, p1_3[5], acc1_3[4]);
+                                        }
+                                        if (cidx_54 == 1) {
+                                            den_3[5] = den_3[5] + weight_53;
+                                            acc0_3[5] = __fmaf_rn(weight_53, p0_3[5], acc0_3[5]);
+                                            acc1_3[5] = __fmaf_rn(weight_53, p1_3[5], acc1_3[5]);
+                                        }
+                                        if (cidx_54 == 2) {
+                                            den_3[6] = den_3[6] + weight_53;
+                                            acc0_3[6] = __fmaf_rn(weight_53, p0_3[5], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_53, p1_3[5], acc1_3[6]);
+                                        }
+                                        if (cidx_54 == 3) {
+                                            den_3[7] = den_3[7] + weight_53;
+                                            acc0_3[7] = __fmaf_rn(weight_53, p0_3[5], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_53, p1_3[5], acc1_3[7]);
+                                        }
                                     }
                                     bool live_5_3 = base_3 + 2 < num_splits && lse_max_3[1] > -CUDART_INF_F;
                                     if (live_5_3) {
                                         float weight_54 = approx_exp2(lse_3[6] - lse_max_3[1]);
-                                        den_3[1] = den_3[1] + weight_54;
-                                        acc0_3[1] = __fmaf_rn(weight_54, p0_3[6], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_54, p1_3[6], acc1_3[1]);
+                                        int cidx_55 = (base_3 + 2) / chunk_w_3;
+                                        if (cidx_55 == 0) {
+                                            den_3[4] = den_3[4] + weight_54;
+                                            acc0_3[4] = __fmaf_rn(weight_54, p0_3[6], acc0_3[4]);
+                                            acc1_3[4] = __fmaf_rn(weight_54, p1_3[6], acc1_3[4]);
+                                        }
+                                        if (cidx_55 == 1) {
+                                            den_3[5] = den_3[5] + weight_54;
+                                            acc0_3[5] = __fmaf_rn(weight_54, p0_3[6], acc0_3[5]);
+                                            acc1_3[5] = __fmaf_rn(weight_54, p1_3[6], acc1_3[5]);
+                                        }
+                                        if (cidx_55 == 2) {
+                                            den_3[6] = den_3[6] + weight_54;
+                                            acc0_3[6] = __fmaf_rn(weight_54, p0_3[6], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_54, p1_3[6], acc1_3[6]);
+                                        }
+                                        if (cidx_55 == 3) {
+                                            den_3[7] = den_3[7] + weight_54;
+                                            acc0_3[7] = __fmaf_rn(weight_54, p0_3[6], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_54, p1_3[6], acc1_3[7]);
+                                        }
                                     }
                                     bool live_6_3 = base_3 + 3 < num_splits && lse_max_3[1] > -CUDART_INF_F;
                                     if (live_6_3) {
                                         float weight_55 = approx_exp2(lse_3[7] - lse_max_3[1]);
-                                        den_3[1] = den_3[1] + weight_55;
-                                        acc0_3[1] = __fmaf_rn(weight_55, p0_3[7], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_55, p1_3[7], acc1_3[1]);
+                                        int cidx_56 = (base_3 + 3) / chunk_w_3;
+                                        if (cidx_56 == 0) {
+                                            den_3[4] = den_3[4] + weight_55;
+                                            acc0_3[4] = __fmaf_rn(weight_55, p0_3[7], acc0_3[4]);
+                                            acc1_3[4] = __fmaf_rn(weight_55, p1_3[7], acc1_3[4]);
+                                        }
+                                        if (cidx_56 == 1) {
+                                            den_3[5] = den_3[5] + weight_55;
+                                            acc0_3[5] = __fmaf_rn(weight_55, p0_3[7], acc0_3[5]);
+                                            acc1_3[5] = __fmaf_rn(weight_55, p1_3[7], acc1_3[5]);
+                                        }
+                                        if (cidx_56 == 2) {
+                                            den_3[6] = den_3[6] + weight_55;
+                                            acc0_3[6] = __fmaf_rn(weight_55, p0_3[7], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_55, p1_3[7], acc1_3[6]);
+                                        }
+                                        if (cidx_56 == 3) {
+                                            den_3[7] = den_3[7] + weight_55;
+                                            acc0_3[7] = __fmaf_rn(weight_55, p0_3[7], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_55, p1_3[7], acc1_3[7]);
+                                        }
                                     }
                                     bool live_7_3 = base_3 < num_splits && lse_max_3[2] > -CUDART_INF_F;
                                     if (live_7_3) {
                                         float weight_56 = approx_exp2(lse_3[8] - lse_max_3[2]);
-                                        den_3[2] = den_3[2] + weight_56;
-                                        acc0_3[2] = __fmaf_rn(weight_56, p0_3[8], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_56, p1_3[8], acc1_3[2]);
+                                        int cidx_57 = base_3 / chunk_w_3;
+                                        if (cidx_57 == 0) {
+                                            den_3[8] = den_3[8] + weight_56;
+                                            acc0_3[8] = __fmaf_rn(weight_56, p0_3[8], acc0_3[8]);
+                                            acc1_3[8] = __fmaf_rn(weight_56, p1_3[8], acc1_3[8]);
+                                        }
+                                        if (cidx_57 == 1) {
+                                            den_3[9] = den_3[9] + weight_56;
+                                            acc0_3[9] = __fmaf_rn(weight_56, p0_3[8], acc0_3[9]);
+                                            acc1_3[9] = __fmaf_rn(weight_56, p1_3[8], acc1_3[9]);
+                                        }
+                                        if (cidx_57 == 2) {
+                                            den_3[10] = den_3[10] + weight_56;
+                                            acc0_3[10] = __fmaf_rn(weight_56, p0_3[8], acc0_3[10]);
+                                            acc1_3[10] = __fmaf_rn(weight_56, p1_3[8], acc1_3[10]);
+                                        }
+                                        if (cidx_57 == 3) {
+                                            den_3[11] = den_3[11] + weight_56;
+                                            acc0_3[11] = __fmaf_rn(weight_56, p0_3[8], acc0_3[11]);
+                                            acc1_3[11] = __fmaf_rn(weight_56, p1_3[8], acc1_3[11]);
+                                        }
                                     }
                                     bool live_8_3 = base_3 + 1 < num_splits && lse_max_3[2] > -CUDART_INF_F;
                                     if (live_8_3) {
                                         float weight_57 = approx_exp2(lse_3[9] - lse_max_3[2]);
-                                        den_3[2] = den_3[2] + weight_57;
-                                        acc0_3[2] = __fmaf_rn(weight_57, p0_3[9], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_57, p1_3[9], acc1_3[2]);
+                                        int cidx_58 = (base_3 + 1) / chunk_w_3;
+                                        if (cidx_58 == 0) {
+                                            den_3[8] = den_3[8] + weight_57;
+                                            acc0_3[8] = __fmaf_rn(weight_57, p0_3[9], acc0_3[8]);
+                                            acc1_3[8] = __fmaf_rn(weight_57, p1_3[9], acc1_3[8]);
+                                        }
+                                        if (cidx_58 == 1) {
+                                            den_3[9] = den_3[9] + weight_57;
+                                            acc0_3[9] = __fmaf_rn(weight_57, p0_3[9], acc0_3[9]);
+                                            acc1_3[9] = __fmaf_rn(weight_57, p1_3[9], acc1_3[9]);
+                                        }
+                                        if (cidx_58 == 2) {
+                                            den_3[10] = den_3[10] + weight_57;
+                                            acc0_3[10] = __fmaf_rn(weight_57, p0_3[9], acc0_3[10]);
+                                            acc1_3[10] = __fmaf_rn(weight_57, p1_3[9], acc1_3[10]);
+                                        }
+                                        if (cidx_58 == 3) {
+                                            den_3[11] = den_3[11] + weight_57;
+                                            acc0_3[11] = __fmaf_rn(weight_57, p0_3[9], acc0_3[11]);
+                                            acc1_3[11] = __fmaf_rn(weight_57, p1_3[9], acc1_3[11]);
+                                        }
                                     }
                                     bool live_9_3 = base_3 + 2 < num_splits && lse_max_3[2] > -CUDART_INF_F;
                                     if (live_9_3) {
                                         float weight_58 = approx_exp2(lse_3[10] - lse_max_3[2]);
-                                        den_3[2] = den_3[2] + weight_58;
-                                        acc0_3[2] = __fmaf_rn(weight_58, p0_3[10], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_58, p1_3[10], acc1_3[2]);
+                                        int cidx_59 = (base_3 + 2) / chunk_w_3;
+                                        if (cidx_59 == 0) {
+                                            den_3[8] = den_3[8] + weight_58;
+                                            acc0_3[8] = __fmaf_rn(weight_58, p0_3[10], acc0_3[8]);
+                                            acc1_3[8] = __fmaf_rn(weight_58, p1_3[10], acc1_3[8]);
+                                        }
+                                        if (cidx_59 == 1) {
+                                            den_3[9] = den_3[9] + weight_58;
+                                            acc0_3[9] = __fmaf_rn(weight_58, p0_3[10], acc0_3[9]);
+                                            acc1_3[9] = __fmaf_rn(weight_58, p1_3[10], acc1_3[9]);
+                                        }
+                                        if (cidx_59 == 2) {
+                                            den_3[10] = den_3[10] + weight_58;
+                                            acc0_3[10] = __fmaf_rn(weight_58, p0_3[10], acc0_3[10]);
+                                            acc1_3[10] = __fmaf_rn(weight_58, p1_3[10], acc1_3[10]);
+                                        }
+                                        if (cidx_59 == 3) {
+                                            den_3[11] = den_3[11] + weight_58;
+                                            acc0_3[11] = __fmaf_rn(weight_58, p0_3[10], acc0_3[11]);
+                                            acc1_3[11] = __fmaf_rn(weight_58, p1_3[10], acc1_3[11]);
+                                        }
                                     }
                                     bool live_10_3 = base_3 + 3 < num_splits && lse_max_3[2] > -CUDART_INF_F;
                                     if (live_10_3) {
                                         float weight_59 = approx_exp2(lse_3[11] - lse_max_3[2]);
-                                        den_3[2] = den_3[2] + weight_59;
-                                        acc0_3[2] = __fmaf_rn(weight_59, p0_3[11], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_59, p1_3[11], acc1_3[2]);
+                                        int cidx_60 = (base_3 + 3) / chunk_w_3;
+                                        if (cidx_60 == 0) {
+                                            den_3[8] = den_3[8] + weight_59;
+                                            acc0_3[8] = __fmaf_rn(weight_59, p0_3[11], acc0_3[8]);
+                                            acc1_3[8] = __fmaf_rn(weight_59, p1_3[11], acc1_3[8]);
+                                        }
+                                        if (cidx_60 == 1) {
+                                            den_3[9] = den_3[9] + weight_59;
+                                            acc0_3[9] = __fmaf_rn(weight_59, p0_3[11], acc0_3[9]);
+                                            acc1_3[9] = __fmaf_rn(weight_59, p1_3[11], acc1_3[9]);
+                                        }
+                                        if (cidx_60 == 2) {
+                                            den_3[10] = den_3[10] + weight_59;
+                                            acc0_3[10] = __fmaf_rn(weight_59, p0_3[11], acc0_3[10]);
+                                            acc1_3[10] = __fmaf_rn(weight_59, p1_3[11], acc1_3[10]);
+                                        }
+                                        if (cidx_60 == 3) {
+                                            den_3[11] = den_3[11] + weight_59;
+                                            acc0_3[11] = __fmaf_rn(weight_59, p0_3[11], acc0_3[11]);
+                                            acc1_3[11] = __fmaf_rn(weight_59, p1_3[11], acc1_3[11]);
+                                        }
                                     }
                                     bool live_11_3 = base_3 < num_splits && lse_max_3[3] > -CUDART_INF_F;
                                     if (live_11_3) {
                                         float weight_60 = approx_exp2(lse_3[12] - lse_max_3[3]);
-                                        den_3[3] = den_3[3] + weight_60;
-                                        acc0_3[3] = __fmaf_rn(weight_60, p0_3[12], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_60, p1_3[12], acc1_3[3]);
+                                        int cidx_61 = base_3 / chunk_w_3;
+                                        if (cidx_61 == 0) {
+                                            den_3[12] = den_3[12] + weight_60;
+                                            acc0_3[12] = __fmaf_rn(weight_60, p0_3[12], acc0_3[12]);
+                                            acc1_3[12] = __fmaf_rn(weight_60, p1_3[12], acc1_3[12]);
+                                        }
+                                        if (cidx_61 == 1) {
+                                            den_3[13] = den_3[13] + weight_60;
+                                            acc0_3[13] = __fmaf_rn(weight_60, p0_3[12], acc0_3[13]);
+                                            acc1_3[13] = __fmaf_rn(weight_60, p1_3[12], acc1_3[13]);
+                                        }
+                                        if (cidx_61 == 2) {
+                                            den_3[14] = den_3[14] + weight_60;
+                                            acc0_3[14] = __fmaf_rn(weight_60, p0_3[12], acc0_3[14]);
+                                            acc1_3[14] = __fmaf_rn(weight_60, p1_3[12], acc1_3[14]);
+                                        }
+                                        if (cidx_61 == 3) {
+                                            den_3[15] = den_3[15] + weight_60;
+                                            acc0_3[15] = __fmaf_rn(weight_60, p0_3[12], acc0_3[15]);
+                                            acc1_3[15] = __fmaf_rn(weight_60, p1_3[12], acc1_3[15]);
+                                        }
                                     }
                                     bool live_12_3 = base_3 + 1 < num_splits && lse_max_3[3] > -CUDART_INF_F;
                                     if (live_12_3) {
                                         float weight_61 = approx_exp2(lse_3[13] - lse_max_3[3]);
-                                        den_3[3] = den_3[3] + weight_61;
-                                        acc0_3[3] = __fmaf_rn(weight_61, p0_3[13], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_61, p1_3[13], acc1_3[3]);
+                                        int cidx_62 = (base_3 + 1) / chunk_w_3;
+                                        if (cidx_62 == 0) {
+                                            den_3[12] = den_3[12] + weight_61;
+                                            acc0_3[12] = __fmaf_rn(weight_61, p0_3[13], acc0_3[12]);
+                                            acc1_3[12] = __fmaf_rn(weight_61, p1_3[13], acc1_3[12]);
+                                        }
+                                        if (cidx_62 == 1) {
+                                            den_3[13] = den_3[13] + weight_61;
+                                            acc0_3[13] = __fmaf_rn(weight_61, p0_3[13], acc0_3[13]);
+                                            acc1_3[13] = __fmaf_rn(weight_61, p1_3[13], acc1_3[13]);
+                                        }
+                                        if (cidx_62 == 2) {
+                                            den_3[14] = den_3[14] + weight_61;
+                                            acc0_3[14] = __fmaf_rn(weight_61, p0_3[13], acc0_3[14]);
+                                            acc1_3[14] = __fmaf_rn(weight_61, p1_3[13], acc1_3[14]);
+                                        }
+                                        if (cidx_62 == 3) {
+                                            den_3[15] = den_3[15] + weight_61;
+                                            acc0_3[15] = __fmaf_rn(weight_61, p0_3[13], acc0_3[15]);
+                                            acc1_3[15] = __fmaf_rn(weight_61, p1_3[13], acc1_3[15]);
+                                        }
                                     }
                                     bool live_13_3 = base_3 + 2 < num_splits && lse_max_3[3] > -CUDART_INF_F;
                                     if (live_13_3) {
                                         float weight_62 = approx_exp2(lse_3[14] - lse_max_3[3]);
-                                        den_3[3] = den_3[3] + weight_62;
-                                        acc0_3[3] = __fmaf_rn(weight_62, p0_3[14], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_62, p1_3[14], acc1_3[3]);
+                                        int cidx_63 = (base_3 + 2) / chunk_w_3;
+                                        if (cidx_63 == 0) {
+                                            den_3[12] = den_3[12] + weight_62;
+                                            acc0_3[12] = __fmaf_rn(weight_62, p0_3[14], acc0_3[12]);
+                                            acc1_3[12] = __fmaf_rn(weight_62, p1_3[14], acc1_3[12]);
+                                        }
+                                        if (cidx_63 == 1) {
+                                            den_3[13] = den_3[13] + weight_62;
+                                            acc0_3[13] = __fmaf_rn(weight_62, p0_3[14], acc0_3[13]);
+                                            acc1_3[13] = __fmaf_rn(weight_62, p1_3[14], acc1_3[13]);
+                                        }
+                                        if (cidx_63 == 2) {
+                                            den_3[14] = den_3[14] + weight_62;
+                                            acc0_3[14] = __fmaf_rn(weight_62, p0_3[14], acc0_3[14]);
+                                            acc1_3[14] = __fmaf_rn(weight_62, p1_3[14], acc1_3[14]);
+                                        }
+                                        if (cidx_63 == 3) {
+                                            den_3[15] = den_3[15] + weight_62;
+                                            acc0_3[15] = __fmaf_rn(weight_62, p0_3[14], acc0_3[15]);
+                                            acc1_3[15] = __fmaf_rn(weight_62, p1_3[14], acc1_3[15]);
+                                        }
                                     }
                                     bool live_14_3 = base_3 + 3 < num_splits && lse_max_3[3] > -CUDART_INF_F;
                                     if (live_14_3) {
                                         float weight_63 = approx_exp2(lse_3[15] - lse_max_3[3]);
-                                        den_3[3] = den_3[3] + weight_63;
-                                        acc0_3[3] = __fmaf_rn(weight_63, p0_3[15], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_63, p1_3[15], acc1_3[3]);
+                                        int cidx_64 = (base_3 + 3) / chunk_w_3;
+                                        if (cidx_64 == 0) {
+                                            den_3[12] = den_3[12] + weight_63;
+                                            acc0_3[12] = __fmaf_rn(weight_63, p0_3[15], acc0_3[12]);
+                                            acc1_3[12] = __fmaf_rn(weight_63, p1_3[15], acc1_3[12]);
+                                        }
+                                        if (cidx_64 == 1) {
+                                            den_3[13] = den_3[13] + weight_63;
+                                            acc0_3[13] = __fmaf_rn(weight_63, p0_3[15], acc0_3[13]);
+                                            acc1_3[13] = __fmaf_rn(weight_63, p1_3[15], acc1_3[13]);
+                                        }
+                                        if (cidx_64 == 2) {
+                                            den_3[14] = den_3[14] + weight_63;
+                                            acc0_3[14] = __fmaf_rn(weight_63, p0_3[15], acc0_3[14]);
+                                            acc1_3[14] = __fmaf_rn(weight_63, p1_3[15], acc1_3[14]);
+                                        }
+                                        if (cidx_64 == 3) {
+                                            den_3[15] = den_3[15] + weight_63;
+                                            acc0_3[15] = __fmaf_rn(weight_63, p0_3[15], acc0_3[15]);
+                                            acc1_3[15] = __fmaf_rn(weight_63, p1_3[15], acc1_3[15]);
+                                        }
                                     }
                                 }
                                 if (valid_3[0] != 0) {
+                                    float den_k_4 = den_3[0];
+                                    float acc0_k_4 = acc0_3[0];
+                                    float acc1_k_4 = acc1_3[0];
+                                    den_k_4 = den_k_4 + den_3[1];
+                                    acc0_k_4 = acc0_k_4 + acc0_3[1];
+                                    acc1_k_4 = acc1_k_4 + acc1_3[1];
+                                    den_k_4 = den_k_4 + den_3[2];
+                                    acc0_k_4 = acc0_k_4 + acc0_3[2];
+                                    acc1_k_4 = acc1_k_4 + acc1_3[2];
+                                    den_k_4 = den_k_4 + den_3[3];
+                                    acc0_k_4 = acc0_k_4 + acc0_3[3];
+                                    acc1_k_4 = acc1_k_4 + acc1_3[3];
                                     float inv_6 = 0.0f;
-                                    if (den_3[0] > 0.0f) {
-                                        float _rcp_208 = approx_rcp(den_3[0]);
+                                    if (den_k_4 > 0.0f) {
+                                        float _rcp_208 = approx_rcp(den_k_4);
                                         inv_6 = _rcp_208;
                                     }
-                                    float attn0_4 = (float)(__nv_bfloat16)(acc0_3[0] * inv_6);
-                                    float attn1_4 = (float)(__nv_bfloat16)(acc1_3[0] * inv_6);
+                                    float attn0_4 = (float)(__nv_bfloat16)(acc0_k_4 * inv_6);
+                                    float attn1_4 = (float)(__nv_bfloat16)(acc1_k_4 * inv_6);
                                     float _exp2_210 = approx_exp2((-gate0_3[0]) * 1.442695f);
                                     float _rcp_209 = approx_rcp(1.0f + _exp2_210);
                                     float result0_4 = attn0_4 * _rcp_209;
@@ -3227,13 +4527,25 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_4) + (0)) = word_3[0];
                                 }
                                 if (valid_3[1] != 0) {
+                                    float den_k_5 = den_3[4];
+                                    float acc0_k_5 = acc0_3[4];
+                                    float acc1_k_5 = acc1_3[4];
+                                    den_k_5 = den_k_5 + den_3[5];
+                                    acc0_k_5 = acc0_k_5 + acc0_3[5];
+                                    acc1_k_5 = acc1_k_5 + acc1_3[5];
+                                    den_k_5 = den_k_5 + den_3[6];
+                                    acc0_k_5 = acc0_k_5 + acc0_3[6];
+                                    acc1_k_5 = acc1_k_5 + acc1_3[6];
+                                    den_k_5 = den_k_5 + den_3[7];
+                                    acc0_k_5 = acc0_k_5 + acc0_3[7];
+                                    acc1_k_5 = acc1_k_5 + acc1_3[7];
                                     float inv_7 = 0.0f;
-                                    if (den_3[1] > 0.0f) {
-                                        float _rcp_214 = approx_rcp(den_3[1]);
+                                    if (den_k_5 > 0.0f) {
+                                        float _rcp_214 = approx_rcp(den_k_5);
                                         inv_7 = _rcp_214;
                                     }
-                                    float attn0_5 = (float)(__nv_bfloat16)(acc0_3[1] * inv_7);
-                                    float attn1_5 = (float)(__nv_bfloat16)(acc1_3[1] * inv_7);
+                                    float attn0_5 = (float)(__nv_bfloat16)(acc0_k_5 * inv_7);
+                                    float attn1_5 = (float)(__nv_bfloat16)(acc1_k_5 * inv_7);
                                     float _exp2_216 = approx_exp2((-gate0_3[1]) * 1.442695f);
                                     float _rcp_215 = approx_rcp(1.0f + _exp2_216);
                                     float result0_5 = attn0_5 * _rcp_215;
@@ -3246,13 +4558,25 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_5) + (0)) = word_3[0];
                                 }
                                 if (valid_3[2] != 0) {
+                                    float den_k_6 = den_3[8];
+                                    float acc0_k_6 = acc0_3[8];
+                                    float acc1_k_6 = acc1_3[8];
+                                    den_k_6 = den_k_6 + den_3[9];
+                                    acc0_k_6 = acc0_k_6 + acc0_3[9];
+                                    acc1_k_6 = acc1_k_6 + acc1_3[9];
+                                    den_k_6 = den_k_6 + den_3[10];
+                                    acc0_k_6 = acc0_k_6 + acc0_3[10];
+                                    acc1_k_6 = acc1_k_6 + acc1_3[10];
+                                    den_k_6 = den_k_6 + den_3[11];
+                                    acc0_k_6 = acc0_k_6 + acc0_3[11];
+                                    acc1_k_6 = acc1_k_6 + acc1_3[11];
                                     float inv_8 = 0.0f;
-                                    if (den_3[2] > 0.0f) {
-                                        float _rcp_220 = approx_rcp(den_3[2]);
+                                    if (den_k_6 > 0.0f) {
+                                        float _rcp_220 = approx_rcp(den_k_6);
                                         inv_8 = _rcp_220;
                                     }
-                                    float attn0_6 = (float)(__nv_bfloat16)(acc0_3[2] * inv_8);
-                                    float attn1_6 = (float)(__nv_bfloat16)(acc1_3[2] * inv_8);
+                                    float attn0_6 = (float)(__nv_bfloat16)(acc0_k_6 * inv_8);
+                                    float attn1_6 = (float)(__nv_bfloat16)(acc1_k_6 * inv_8);
                                     float _exp2_222 = approx_exp2((-gate0_3[2]) * 1.442695f);
                                     float _rcp_221 = approx_rcp(1.0f + _exp2_222);
                                     float result0_6 = attn0_6 * _rcp_221;
@@ -3265,13 +4589,25 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_6) + (0)) = word_3[0];
                                 }
                                 if (valid_3[3] != 0) {
+                                    float den_k_7 = den_3[12];
+                                    float acc0_k_7 = acc0_3[12];
+                                    float acc1_k_7 = acc1_3[12];
+                                    den_k_7 = den_k_7 + den_3[13];
+                                    acc0_k_7 = acc0_k_7 + acc0_3[13];
+                                    acc1_k_7 = acc1_k_7 + acc1_3[13];
+                                    den_k_7 = den_k_7 + den_3[14];
+                                    acc0_k_7 = acc0_k_7 + acc0_3[14];
+                                    acc1_k_7 = acc1_k_7 + acc1_3[14];
+                                    den_k_7 = den_k_7 + den_3[15];
+                                    acc0_k_7 = acc0_k_7 + acc0_3[15];
+                                    acc1_k_7 = acc1_k_7 + acc1_3[15];
                                     float inv_9 = 0.0f;
-                                    if (den_3[3] > 0.0f) {
-                                        float _rcp_226 = approx_rcp(den_3[3]);
+                                    if (den_k_7 > 0.0f) {
+                                        float _rcp_226 = approx_rcp(den_k_7);
                                         inv_9 = _rcp_226;
                                     }
-                                    float attn0_7 = (float)(__nv_bfloat16)(acc0_3[3] * inv_9);
-                                    float attn1_7 = (float)(__nv_bfloat16)(acc1_3[3] * inv_9);
+                                    float attn0_7 = (float)(__nv_bfloat16)(acc0_k_7 * inv_9);
+                                    float attn1_7 = (float)(__nv_bfloat16)(acc1_k_7 * inv_9);
                                     float _exp2_228 = approx_exp2((-gate0_3[3]) * 1.442695f);
                                     float _rcp_227 = approx_rcp(1.0f + _exp2_228);
                                     float result0_7 = attn0_7 * _rcp_227;
