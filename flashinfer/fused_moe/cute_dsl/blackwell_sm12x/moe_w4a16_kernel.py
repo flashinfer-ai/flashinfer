@@ -130,6 +130,30 @@ _TC_DECODE_MAX_M = 4
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
 
+def _tc_decode_m_cap(
+    device_arch: int,
+    element_dtype: str,
+    weight_layout: str,
+    scale_format: str,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+) -> int:
+    # Small SM120 NVFP4 experts benefit from the fused sum through T=8.
+    # Larger shared experts need packed-route weight reuse; keep their cap.
+    if (
+        device_arch == 120
+        and element_dtype == "bf16"
+        and weight_layout == "packed"
+        and scale_format == "e4m3_k16"
+        and hidden_size <= 2048
+        and intermediate_size <= 512
+        and top_k <= 10
+    ):
+        return 8
+    return _TC_DECODE_MAX_M
+
+
 def _direct_topk_route_m_cap(
     element_dtype: str,
     weight_layout: str,
@@ -6854,6 +6878,16 @@ def run_w4a16_moe(
     # A preplanned launch built with the TC-decode fused-sum epilogue carries
     # ``tc_decode_fused_sum``; accept it through the binding path. A runtime
     # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
+    props = torch.cuda.get_device_properties(a_input.device)
+    tc_decode_m_cap = _tc_decode_m_cap(
+        int(props.major) * 10 + int(props.minor),
+        element_dtype,
+        weight_layout,
+        scale_format,
+        int(a_input.shape[1]),
+        int(prepared.intermediate_size),
+        topk,
+    )
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
     use_tc_decode = bool(
         (not collect_activation_amax)
@@ -6864,7 +6898,7 @@ def run_w4a16_moe(
         and element_dtype == "bf16"
         and topk_ids.dtype in (torch.int32, torch.int64)
         and topk_ids.is_cuda
-        and int(m) <= _TC_DECODE_MAX_M
+        and int(m) <= tc_decode_m_cap
     )
     if use_tc_decode and topk_ids.dtype != torch.int32:
         # The inline direct-topk route path needs int32 route indices.
@@ -6914,7 +6948,7 @@ def run_w4a16_moe(
     if preplanned_tc_decode and not use_tc_decode:
         raise RuntimeError(
             "preplanned TC-decode W4A16 launch requires small-M packed bf16 "
-            f"decode (m <= {_TC_DECODE_MAX_M}, cuda int32/int64 topk_ids, "
+            f"decode (m <= {tc_decode_m_cap}, cuda int32/int64 topk_ids, "
             "no expert_map)"
         )
 
@@ -6964,7 +6998,6 @@ def run_w4a16_moe(
         route_slots_for_scratch = int(packed_route_indices.numel())
         required_m_blocks = int(block_expert_ids.numel())
 
-    props = torch.cuda.get_device_properties(a_input.device)
     sms = int(props.multi_processor_count)
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
