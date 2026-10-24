@@ -415,8 +415,60 @@ def test_small_b_launch_bound(monkeypatch):
         )  # register split
 
 
+def test_small_b_build_options():
+    """GdnReplayMtpUmmaRubin(small_b=True) (compile passes it on _SMALL_B_BUILD_CC, sm_107a): the
+    RMW loop in the round-to-nearest builds with 1-2 heads per CTA, the prologue reorder (no
+    vsmem / D-build masks) at T >= 5 with 1 head per CTA, no rolled head loop in the
+    round-to-nearest 2-head builds; 4 heads per CTA, stochastic rounding's roll and the
+    persistent build unchanged. CPU-only."""
+    M = _rubin_mod()
+    keys = ("rmw_loop", "pro_reorder", "vsmem", "d_mask", "roll", "roll_f", "mixed_fma")
+
+    def flags(T, hpc, sr="", small_b=False, persistent=False):
+        o = M.GdnReplayMtpUmmaRubin(
+            T, 8, 32, True, False, hpc, sr, 5 if sr == "philox" else 0, True,
+            persistent, small_b=small_b,
+        )  # fmt: skip
+        return {k: getattr(o, k) for k in keys}
+
+    for T in range(1, 9):
+        for sr in ("", "philox", "lcg"):
+            for hpc in (1, 2, 4):
+                old, new = flags(T, hpc, sr), flags(T, hpc, sr, True)
+                want = dict(old)
+                if sr == "" and hpc < 4:
+                    want.update(rmw_loop=True, mixed_fma=True)
+                if T >= 5 and hpc == 1:
+                    want.update(pro_reorder=True, vsmem=False, d_mask=False)
+                if sr == "" and hpc == 2:
+                    want.update(roll=False)
+                want["roll_f"] = want["roll"] or (
+                    want["rmw_loop"]
+                    and _rubin_mod()._use_regsplit(T, hpc, sr)
+                    and hpc == 4
+                )
+                assert new == want, (T, sr, hpc, old, new)
+        assert flags(T, 4, "", True, True) == flags(T, 4, "", False, True)
+    # compile passes small_b on sm_107a with 4 value heads per key head only: with 2 or 3 the
+    # hpc = 2 / 3 builds serve every batch size
+    rubin, b200 = _targets()
+    sb = M._small_b_build
+    assert [
+        sb(rubin, 8, 32),
+        sb(rubin, 16, 64),
+        sb(rubin, 8, 16),
+        sb(rubin, 8, 24),
+    ] == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert not sb(b200, 8, 32)
+
+
 # the sm_107a small-batch switches: each () gives the code without it (same bits)
-_SMALL_B_SWITCHES = ("_SMALL_B_DISPATCH_CC", "_SMALL_GRID_LB_CC")
+_SMALL_B_SWITCHES = ("_SMALL_B_DISPATCH_CC", "_SMALL_GRID_LB_CC", "_SMALL_B_BUILD_CC")
 
 
 @pytest.mark.parametrize("mode", ["none", "philox5", "lcg"])

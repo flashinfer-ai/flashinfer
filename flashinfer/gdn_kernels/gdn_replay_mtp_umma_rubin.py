@@ -236,6 +236,7 @@ class GdnReplayMtpUmmaRubin:
         h_io: Optional[int] = None,
         hv_io: Optional[int] = None,
         min_blocks: int = _MIN_BLOCKS_PER_SM,
+        small_b: bool = False,
     ):
         assert 1 <= T <= 8
         assert hv % h == 0 and 1 <= hv // h <= HPK, (h, hv)
@@ -286,8 +287,12 @@ class GdnReplayMtpUmmaRubin:
         #   stays in use until the head's epilogue has read its v rows, so u_free is arrived
         #   there and head h + 2's window goes behind its own state's second half (see
         #   _u_window_head). Flush rows keep 16-slot windows and v from global memory.
-        self.pro_reorder = T <= 4 and not persistent
-        self.vsmem = T >= 5 or persistent
+        # * small_b (the build options of _SMALL_B_BUILD_CC, see compile): the prologue reorder at
+        #   T >= 5 too with 1 head per CTA (latency-bound CTAs, B <= 13 per die: T = 6 / 8
+        #   1.03-1.15x vs vsmem).
+        self.small_b = small_b
+        self.pro_reorder = (T <= 4 or (small_b and hpc == 1)) and not persistent
+        self.vsmem = (T >= 5 or persistent) and not self.pro_reorder
         self.wv = W_RING - T  # u slots copied on verify rows (vsmem)
         # D build: clear the slots j >= P with uniform word masks instead of per-value selects
         # (_d_build). Not in the 2- and 3-head builds (192 threads, 80 registers at their limit),
@@ -305,12 +310,21 @@ class GdnReplayMtpUmmaRubin:
         #   with the loop; the RNG itself was not the cost), the round-to-nearest builds with 4
         #   heads per CTA at _RN_RMW_LOOP_T on sm_107a (20-30 % flush 1.02-1.08x; at T = 4 / 7
         #   the verify-only step measured 1-4 % slower) and the persistent kernel. Same bits.
+        #   small_b: also the round-to-nearest builds with 1 or 2 heads per CTA at every T (few
+        #   CTAs: the shorter flush code wins over the unrolled RMW, flush rows 1.01-1.09x).
+        # * small_b: no ``roll`` in the round-to-nearest builds with 2 heads per CTA (few CTAs
+        #   per SM, so less i-cache pressure than the rolled loop's dynamic head index costs:
+        #   up to 1.06x unrolled at T <= 4; the stochastic-rounding builds measured 0.96-1.02x,
+        #   so they keep it).
         self.rmw_loop = (
             persistent
             or sr != ""
             or (mixed_fma and self.hpc == HPK and T in _RN_RMW_LOOP_T)
+            or (mixed_fma and small_b and self.hpc < HPK)
         )
-        self.roll = T <= 4 and self.hpc > 1
+        self.roll = (
+            T <= 4 and self.hpc > 1 and not (small_b and self.hpc == 2 and sr == "")
+        )
         # the flush head loop rolled as well in the register-split RMW-loop builds with 4 heads
         # per CTA (T >= 5: Philox and round to nearest, 30 % flush 1.03-1.07x vs 1.00-1.03x with
         # one RMW loop per head); not in the 80-register LCG builds (spills)
@@ -4254,6 +4268,7 @@ class GdnReplayMtpUmmaRubin:
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         tgt = gdn_device_target(device)
         mixed_fma = (tgt.major, tgt.minor) in _FHFMA2_CC
+        small_b = _small_b_build(tgt, h, hv)
         obj = GdnReplayMtpUmmaRubin(
             T,
             h,
@@ -4268,6 +4283,7 @@ class GdnReplayMtpUmmaRubin:
             h_io,
             hv_io,
             min_blocks,
+            small_b,
         )
         opts = gdn_compile_options(device, cute.EnableTVMFFI(True))
         if persistent:
@@ -4303,11 +4319,13 @@ def _get_kernel(
     min_blocks: int = _MIN_BLOCKS_PER_SM,
 ):
     """The compiled kernel for this specialisation on ``device``'s architecture: one per
-    (compile target, parameters); batch and pool sizes are dynamic."""
+    (compile target, parameters, _SMALL_B_BUILD_CC); batch and pool sizes are dynamic."""
     h_io = h if h_io is None else h_io
     hv_io = hv if hv_io is None else hv_io
+    tgt = gdn_device_target(device)
     key = (
-        gdn_device_target(device).compile_key,
+        tgt.compile_key,
+        (tgt.major, tgt.minor) in _SMALL_B_BUILD_CC,
         T,
         h,
         hv,
@@ -4452,6 +4470,19 @@ _SMALL_GRID_CTAS_PER_SM = 2
 # round to nearest 1.01-1.05x, LCG 1.01-1.04x; Philox 0.98-1.03x (within noise), so not the
 # Philox builds.
 _SMALL_GRID_LB_CC = ((10, 7),)
+# Build options for the 1- and 2-heads-per-CTA kernels on these archs with 4 value heads per key
+# head (GdnReplayMtpUmmaRubin's small_b: those heads per CTA run only at small B there,
+# latency-bound CTAs; with 2 or 3 value heads per key head the hpc = 2 / 3 builds serve every
+# batch size, so they keep the default build): the flush RMW loop in the round-to-nearest
+# builds, the prologue reorder at T >= 5 with 1 head per CTA, no rolled head loop in the
+# round-to-nearest 2-head builds. Same bits.
+_SMALL_B_BUILD_CC = ((10, 7),)
+
+
+def _small_b_build(target, h: int, hv: int) -> bool:
+    """GdnReplayMtpUmmaRubin's small_b build options (_SMALL_B_BUILD_CC): on those archs, with 4
+    value heads per key head only."""
+    return (target.major, target.minor) in _SMALL_B_BUILD_CC and hv == h * HPK
 
 
 def _small_grid(n_key_heads: int, hpk: int, hpc: int, batch: int, num_sms: int) -> bool:
