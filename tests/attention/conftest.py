@@ -355,8 +355,6 @@ def _batch_prefill_specs(items):
 
     if "test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256" in fns and hd512_ok:
         bp("fa2", H, H, H, I, 448, 256, 0, False, False, False)
-        if cc_major >= 10:
-            bp("fa2", H, torch.float8_e4m3fn, H, I, 448, 256, 0, False, False, False)
 
     return list(specs.values())
 

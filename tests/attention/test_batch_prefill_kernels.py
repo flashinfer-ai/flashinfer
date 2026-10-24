@@ -2023,44 +2023,28 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric(
 _PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
 
 
-@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
-def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
-    """Pin the FA2DetermineCtaTileQ shared-memory probe at unvalidated head
-    dims: neither ``plan()`` nor the JIT path validates head dims, so under
-    ``pos_encoding_mode="NONE"`` a config like (qk, vo) = (448, 256) reaches
-    the probe's short-q branch today.
+def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256():
+    """Pin the FA2DetermineCtaTileQ shared-memory probe at (qk, vo) = (448, 256):
+    under ``pos_encoding_mode="NONE"`` this config reaches the probe's short-q
+    branch.
 
     At 2-byte KV the 1x4-layout cost is 16*448*2 + (448+256)*16*4*2 = 104448
     bytes: on 99KB-opt-in parts (SM86/89/120/121) the probe must fire and fall
     back to CTA_TILE_Q=64 -- which keeps the config dispatchable where the
     CTA16 dispatch would exceed the per-block limit -- while on larger-smem
-    parts (e.g. SM90) CTA16 is kept. At 1-byte KV the true cost is 59392
-    bytes, so the probe selects CTA16 everywhere, pinning that the
-    kv_dtype_bytes accuracy changes tile selection at such dims (the previous
-    2-byte assumption forced CTA64 on 99KB parts).
+    parts (e.g. SM90) CTA16 is kept.
 
     The expected tile is computed from the device's actual per-block opt-in
-    limit, so the assertion is exact on every supported architecture. The 2-byte case
-    then runs the kernel against an exact float32 reference. The 1-byte case
-    stops at the plan-level assertion: the FA2 1-byte KV producers require
-    head_dim to be a multiple of 128 elements (the 128-bit-per-lane load loop
-    steps NUM_MMA_D by 8, and the k128B swizzle needs an 8-aligned upcast
-    stride), a pre-existing constraint -- so no currently-runnable 1-byte
-    config reaches the flipped CTA64->CTA16 region, and the pin locks the
-    documented planner behavior for when one does.
+    limit, so the assertion is exact on every supported architecture. The
+    kernel then runs against an exact float32 reference. 1-byte KV is not
+    covered: the FA2 1-byte KV producers require head dims that are multiples
+    of 128 elements (the 128-bit-per-lane load loop steps NUM_MMA_D by 8, and
+    the k128B swizzle needs an 8-aligned upcast stride), so ``plan()`` rejects
+    (448, 256) at 1-byte KV (see test_prefill_head_dim_validation.py).
     """
     head_dim_qk = 448
     head_dim_vo = 256
     skip_if_head_dim_unsupported(head_dim_qk)
-    # Mirror the module gate: _fa2_head_dim_nvcc_flags restricts non-NVFP4 1-byte
-    # large-head modules to major [10, 11, 12], so on pre-SM100 the JIT spec-gen in
-    # plan() raises before the tile assertion. skip_if_head_dim_unsupported only gates
-    # the 16-bit path, so gate the 1-byte (FP8) parametrization here explicitly.
-    if (
-        kv_dtype.itemsize == 1
-        and get_compute_capability(torch.device("cuda:0"))[0] < 10
-    ):
-        pytest.skip("FP8 KV with head_dim > 256 requires SM100 or newer")
     props = torch.cuda.get_device_properties(0)
     optin = getattr(props, "shared_memory_per_block_optin", None)
     if optin is None:
@@ -2074,10 +2058,9 @@ def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
     num_kv_heads = 2
     num_qo_heads = 2
 
-    # Mirror FA2DetermineCtaTileQ's accounting exactly (utils.cuh).
-    kv_dtype_bytes = 1 if kv_dtype == torch.float8_e4m3fn else 2
+    # Mirror FA2DetermineCtaTileQ's accounting exactly (utils.cuh), 2-byte KV.
     q_tile_smem = 16 * head_dim_qk * 2
-    kv_step_smem_1x4 = (head_dim_qk + head_dim_vo) * 16 * 4 * kv_dtype_bytes
+    kv_step_smem_1x4 = (head_dim_qk + head_dim_vo) * 16 * 4 * 2
     expected_cta_tile_q = 64 if q_tile_smem + kv_step_smem_1x4 > optin else 16
 
     q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
@@ -2108,14 +2091,9 @@ def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
         causal=False,
         pos_encoding_mode="NONE",
         q_data_type=torch.float16,
-        kv_data_type=kv_dtype,
+        kv_data_type=torch.float16,
     )
     assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == expected_cta_tile_q
-
-    if kv_dtype != torch.float16:
-        # Plan-level pin only; see docstring for why (448, 256) is not
-        # runnable at 1-byte KV today.
-        return
 
     q = torch.randn(
         batch_size * qo_len,
