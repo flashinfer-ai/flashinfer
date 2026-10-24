@@ -57,6 +57,7 @@ from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    rubin_moe_cluster_covers_one_tile,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -188,9 +189,11 @@ def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
 
     # (mma_tiler_m, mma_inst_m) candidates — B-reuse when tiler_m = 2 * inst_m
     #
-    # The mma_tiler_m == tile_size and cluster_shape_m * mma_tiler_m <= tile_size
-    # constraints below decide which of these are reachable at a given tile_size;
-    # entries unreachable at one tile_size are reachable at another.
+    # rubin_moe_cluster_covers_one_tile decides which of these are reachable at
+    # a given tile_size: tile_size=128 keeps the 1-CTA 128x128 MMA, while
+    # tile_size=256 offers both the 1-CTA B-reuse MMA (cluster (1, 1)) and the
+    # 2-CTA 256xN MMA with cluster (2, 1), whose two CTAs share one routing
+    # tile. (512, 256) needs tile_size=512, which is not enumerated.
     mma_m_candidates = [
         (128, 128),  # no B-reuse, 1CTA
         (256, 256),  # no B-reuse, 2CTA
@@ -211,20 +214,18 @@ def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
         cluster_shape_mn_candidates,
         raster_along_m_candidates,
     ):
-        # GEMM1 is a gather GEMM: mma_tiler_m must equal tile_size so that
-        # each CTA's tile exactly covers one moe_sort tile in the M dimension.
-        # Smaller mma_tiler_m causes incorrect gather indexing.  (This also
-        # subsumes the mma_tiler_m > tile_size case.)
-        if mma_tiler_m != tile_size:
-            continue
-        if cluster_shape_mn[0] * mma_tiler_m > tile_size:
-            continue
-        # 2CTA (mma_inst_m=256) requires even cluster_shape_m
-        if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
-            continue
-
         mma_tiler = (mma_tiler_m, mma_n, mma_tiler_k)
         mma_inst_shape = (mma_inst_m, mma_n, mma_inst_k)
+        # GEMM1 is a gather GEMM: one cluster must cover exactly one moe_sort
+        # tile in the M dimension (mma_tiler_m == tile_size, cluster_shape_m
+        # equal to the MMA CTA group size). Smaller mma_tiler_m causes
+        # incorrect gather indexing; a cluster over several routing tiles
+        # would need rounded/padded routing metadata.
+        if not rubin_moe_cluster_covers_one_tile(
+            tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
+        ):
+            continue
+
         valid_tactics.append(
             (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
         )
@@ -240,9 +241,9 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     mma_tiler_k = 256
     mma_inst_k = 128
 
-    # As in get_rubin_gemm1_valid_tactics, the mma_tiler_m == tile_size and
-    # cluster_shape_m * mma_tiler_m <= tile_size constraints below decide which
-    # of these are reachable at a given tile_size.
+    # As in get_rubin_gemm1_valid_tactics, rubin_moe_cluster_covers_one_tile
+    # decides which of these are reachable at a given tile_size: tile_size=256
+    # offers the 1-CTA B-reuse MMA and the 2-CTA 256xN MMA with cluster (2, 1).
     mma_m_candidates = [
         (128, 128),
         (256, 256),
@@ -250,11 +251,13 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
         (512, 256),
     ]
     mma_n_candidates = [128, 256]
-    # cluster_shape_n is pinned to 1: the Rubin finalize kernel triggers
-    # illegal memory accesses with cluster_shape_n>1 at larger token counts
-    # (non-deterministic, routing-dependent).  cluster_shape_m varies here,
-    # but (2, 1) is unreachable at tile_size=128 per the note above.
-    cluster_shape_mn_candidates = [(1, 1), (2, 1)]
+    # cluster_shape_n=2 multicasts the A/SFA tile to the two CTAs of a
+    # cluster, which compute adjacent N tiles of the same routing tile (1-CTA
+    # MMA only: a 2-CTA MMA needs cluster_shape_m == 2). With an odd N tile
+    # count the scheduler adds a padding CTA, whose finalize reduction is
+    # clipped to the output width. (2, 1) is unreachable at tile_size=128 (it
+    # would span two routing tiles).
+    cluster_shape_mn_candidates = [(1, 1), (2, 1), (1, 2)]
     raster_along_m_candidates = [False]
 
     valid_tactics = []
@@ -267,19 +270,16 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
         cluster_shape_mn_candidates,
         raster_along_m_candidates,
     ):
-        # tile_idx_to_expert_idx has one entry per routing tile (tile_size
-        # rows). mma_tiler_m must equal tile_size so that the CTA tile
-        # aligns with the routing tile — matching TRT-LLM's enforcement.
-        if mma_tiler_m != tile_size:
-            continue
-        if cluster_shape_mn[0] * mma_tiler_m > tile_size:
-            continue
-        # 2CTA (mma_inst_m=256) requires even cluster_shape_m
-        if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
-            continue
-
         mma_tiler = (mma_tiler_m, mma_n, mma_tiler_k)
         mma_inst_shape = (mma_inst_m, mma_n, mma_inst_k)
+        # tile_idx_to_expert_idx has one entry per routing tile (tile_size
+        # rows). One cluster must cover exactly that routing tile (the
+        # mma_tiler_m == tile_size part matches TRT-LLM's enforcement).
+        if not rubin_moe_cluster_covers_one_tile(
+            tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
+        ):
+            continue
+
         valid_tactics.append(
             (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
         )
@@ -834,7 +834,23 @@ class CuteDslFusedMoERunner(TunableRunner):
                     gemm2_tactic
                 )
 
-                if gemm1_cluster_shape_mn[0] > 1 or gemm2_cluster_shape_mn[0] > 1:
+                # A cluster must cover exactly one routing tile along M (a
+                # 2-CTA MMA with cluster_shape_m == 2 does); see
+                # rubin_moe_cluster_covers_one_tile.
+                if not (
+                    rubin_moe_cluster_covers_one_tile(
+                        tile_size,
+                        gemm1_mma_tiler,
+                        gemm1_mma_inst_shape,
+                        gemm1_cluster_shape_mn,
+                    )
+                    and rubin_moe_cluster_covers_one_tile(
+                        tile_size,
+                        gemm2_mma_tiler,
+                        gemm2_mma_inst_shape,
+                        gemm2_cluster_shape_mn,
+                    )
+                ):
                     return False
 
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
