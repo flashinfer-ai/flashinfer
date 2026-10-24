@@ -2501,34 +2501,37 @@ def _build_block_tables_from_paged_kv_indices(
 # Measured on B200 (bf16, causal, 20 iters after 5 warmup, medians):
 #   d128 square    cuDNN 1.09-1.45x faster than CUTLASS -> cuDNN first
 #   d256 square    CUTLASS declines the shape entirely  -> cuDNN only
-#   d192/128 MHA   CUTLASS 1.09-1.12x faster than cuDNN -> CUTLASS first
+#   d192/128       cuDNN 9.27.0.42 / 9.29 dev faster on every measured shape
+#                  (table below)
 _BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
 
 # Per-shape overrides of the default order, keyed on
 # (head_dim_qk, head_dim_vo). Deliberately EMPTY: a head-dim key turned out to
 # be the wrong granularity.
 #
-# The 128-head d192/128 cell looked like a clean CUTLASS win at (b16, s4096) --
-# 14.16 vs 15.62 ms, reproduced over four runs. Sweeping the rest of that cell
-# on B200 showed the winner flips with sequence length and head config, not
-# head dim (medians, 30 iters after 10 warmup):
+# The d192/128 cell was first measured with cuDNN 9.26, where CUTLASS led
+# long-sequence MHA and cuDNN led short-sequence and GQA shapes, so no head-dim
+# order could be right for both. Re-measured on a full B200 against three cuDNN
+# libraries (9.26.0.51, 9.27.0.42, a 9.29 dev build), same FlashInfer and
+# frontend (benchmarks/flashinfer_benchmark.py, bf16 causal, 30 iters after 10
+# warmup, median of two rounds; ms):
 #
-#   b4  s1024  128x128   CUTLASS 0.334   cuDNN 0.265   cuDNN  1.26x
-#   b16 s1024  128x128   CUTLASS 1.257   cuDNN 1.030   cuDNN  1.22x
-#   b64 s1024  128x128   CUTLASS 5.764   cuDNN 4.178   cuDNN  1.38x
-#   b8  s2048   32x8     CUTLASS 0.509   cuDNN 0.383   cuDNN  1.33x
-#   b8  s2048   64x8     CUTLASS 0.969   cuDNN 0.716   cuDNN  1.35x
-#   b1  s4096  128x128   CUTLASS 0.738   cuDNN 0.816   CUTLASS 1.11x
-#   b16 s4096  128x128   CUTLASS 14.061  cuDNN 15.818  CUTLASS 1.12x
-#   b4  s16384 128x128   CUTLASS 49.555  cuDNN 68.782  CUTLASS 1.39x
+#   shape                   CUTLASS  cuDNN 9.26  cuDNN 9.27  CUTLASS / cuDNN
+#   b4  s1024    128x128      0.399       0.237       0.230   1.68x -> 1.73x
+#   b16 s1024    128x128      1.431       0.903       0.862   1.59x -> 1.66x
+#   b64 s1024    128x128      5.651       3.551       3.388   1.59x -> 1.67x
+#   b8  s2048     32x8        0.540       0.328       0.327   1.65x -> 1.66x
+#   b8  s2048     64x8        1.006       0.613       0.615   1.64x -> 1.64x
+#   b1  s4096    128x128      0.746       0.708       0.609   1.05x -> 1.22x
+#   b16 s4096    128x128     13.392      11.813       9.720   1.14x -> 1.38x
+#   b4  s16384   128x128     42.297      47.204      36.246   0.90x -> 1.17x
+#   b1  q8k/kv64k 128x128    33.940      43.517      31.398   0.78x -> 1.08x
 #
-# cuDNN takes 5 of 8 -- every short-sequence case and every GQA case -- while
-# CUTLASS only leads long-sequence MHA. Pinning the whole head-dim to CUTLASS
-# would trade 1.22-1.38x away on the majority to win 1.11-1.39x on the rest, so
-# the default order stands and this table stays empty until a heuristic keyed on
-# the axes that actually discriminate (sequence length, MHA vs GQA) is measured
-# across architectures. Until then, callers who know their shape can pin the
-# order with the environment variable below.
+# The 9.26 long-sequence loss was a cuDNN regression (cudnn-frontend issue
+# #1085), fixed in 9.27.0. With cuDNN 9.27.0.42, cuDNN leads all 15 measured
+# d192/128 shapes (1.07-1.73x; the 9.29 dev build matches it), so the
+# default order stands and this table stays empty. On 9.26, callers with
+# long-sequence MHA can pin "cutlass,cudnn" with the environment variable below.
 _BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM: Dict[
     Tuple[int, int], Tuple[str, ...]
 ] = {}
