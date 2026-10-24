@@ -527,7 +527,9 @@ def _expected_records(
     # forward (wy_fwd_rows + fwdh_o_v2_rows); the 64-column form does so on sm_107a alone (wy_fwd_rows +
     # fwdh_o_v1_rows) and keeps the internal-row pair on both paths elsewhere
     paired = save and not seg and v2 and not fused_fwd
-    paired_v1 = save and not seg and not v2 and not fused_fwd and arch in PAIRED_V1_ARCHES
+    paired_v1 = (
+        save and not seg and not v2 and not fused_fwd and arch in PAIRED_V1_ARCHES
+    )
     walk = nseg * h
     prefetch = walk < DHU_PREFETCH_WAVES_BY_ARCH.get(arch, 0.0) * sm
     tma = walk < DHU_TMA_WAVES * sm or (h <= 4 and walk <= DHU_TMA_WAVES * sm)
