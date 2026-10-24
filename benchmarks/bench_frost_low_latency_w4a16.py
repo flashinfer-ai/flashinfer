@@ -137,7 +137,8 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
         run_w4a16_moe,
         _SMALL_BATCH_TILE_CONFIGS,
         _LARGE_BATCH_TILE_CONFIGS,
-        _MAX_DIRECT_TOPK_ROUTE_M,
+        _direct_topk_route_m_cap,
+        _TC_DECODE_MAX_M,
     )
     from flashinfer.quantization.fp4_quantization import block_scale_interleave
 
@@ -180,7 +181,10 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
     block = select_route_block_size_m(t, k, e)
     compiled = {}
     fp16 = x.dtype is torch.float16
-    direct = not fp16 or t <= _MAX_DIRECT_TOPK_ROUTE_M
+    tc_decode = not fp16 and t <= _TC_DECODE_MAX_M
+    direct = tc_decode or t <= _direct_topk_route_m_cap(
+        "fp16" if fp16 else "bf16", "packed", "e4m3_k16", h, i, k
+    )
     tiles = tuple(
         dict.fromkeys((*_SMALL_BATCH_TILE_CONFIGS, *_LARGE_BATCH_TILE_CONFIGS))
     )
@@ -210,11 +214,11 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
                     weight_layout="packed",
                     scale_format="e4m3_k16",
                     direct_topk_routes=direct,
-                    tc_decode_fused_sum=not fp16,
+                    tc_decode_fused_sum=tc_decode,
                     force_tile_config=tactic,
                 )
             fused = compiled[tactic]
-            assert fused.tc_decode_fused_sum == (not fp16)
+            assert fused.tc_decode_fused_sum == tc_decode
             assert fused.direct_topk_routes == direct
         return run_w4a16_moe(
             x,
@@ -320,7 +324,7 @@ def _expand_weight_only_fp16(q, sf, global_scale, weight_format):
 
 
 def _expanded_fp16_native(x, w1, w2, ids, scores):
-    """Hopper dense CUTLASS control; expansion and its larger storage are explicit."""
+    """Dense CUTLASS control; expansion and its larger storage are explicit."""
     from flashinfer.fused_moe.core import (
         get_cutlass_fused_moe_module,
         cutlass_fused_moe,
@@ -330,7 +334,8 @@ def _expanded_fp16_native(x, w1, w2, ids, scores):
     from flashinfer.autotuner import AutoTuner, TuningConfig
 
     t, h, i, e, k = x.shape[0], x.shape[1], w2.shape[2], w1.shape[0], ids.shape[1]
-    module = get_cutlass_fused_moe_module("90")
+    cc = torch.cuda.get_device_capability(x.device)
+    module = get_cutlass_fused_moe_module(str(cc[0] * 10 + cc[1]))
     inner = module.MoERunner(
         x_dtype=torch.float16,
         weight_dtype=torch.float16,
@@ -473,8 +478,10 @@ def main():
         "sm120-tc": ((12, 0), (12, 1)),
     }
     if expanded_fp16:
-        if not is_fp16 or cc != (9, 0):
-            raise ValueError("expanded-fp16 requires FP16 activations on Hopper")
+        if not is_fp16 or cc not in ((9, 0), (10, 0), (10, 3)):
+            raise ValueError(
+                "expanded-fp16 requires FP16 activations on SM90/SM100/SM103"
+            )
     elif is_fp16:
         if (
             cc != (12, 0)
@@ -482,7 +489,7 @@ def main():
             or a.native_backend != "sm120-tc"
         ):
             raise ValueError(
-                "FP16 comparison requires SM120 NVFP4 sm120-tc or Hopper expanded-fp16"
+                "FP16 comparison requires SM120 NVFP4 sm120-tc or expanded-fp16 on SM90/SM100/SM103"
             )
     elif is_w8:
         raise ValueError(

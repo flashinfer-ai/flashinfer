@@ -243,8 +243,13 @@ def test_weight_only_fp16_fresh_storage_metadata(factory, monkeypatch):
 @pytest.mark.parametrize("index", [0, 1], ids=["t1-bf16-out", "t2-fp16-out"])
 def test_weight_only_fp16_advertised_widths_live_graph(factory, index):
     cfg, x, ids, scores, pack, view = factory(SwiGLU(), index)
-    if torch.cuda.get_device_capability(x.device) not in ((9, 0), (10, 3), (12, 0)):
-        pytest.skip("FP16 wider-load performance qualified on SM90/SM103/SM120")
+    if torch.cuda.get_device_capability(x.device) not in (
+        (9, 0),
+        (10, 0),
+        (10, 3),
+        (12, 0),
+    ):
+        pytest.skip("FP16 wider-load performance qualified on SM90/SM100/SM103/SM120")
     cfg = replace(
         cfg,
         quant=replace(
@@ -259,7 +264,9 @@ def test_weight_only_fp16_advertised_widths_live_graph(factory, index):
     runner.build()
     inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), pack)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert len(tactics) == 64 and ("ffma", 1, 2, 8, 8) in tactics
+    grouped = torch.cuda.get_device_capability(x.device) == (9, 0) and x.shape[0] >= 2
+    assert len(tactics) == (88 if grouped else 64)
+    assert ("ffma", 1, 2, 8, 8) in tactics
     graphs = []
     for tactic in tactics:
         runner.forward(inputs, tactic)

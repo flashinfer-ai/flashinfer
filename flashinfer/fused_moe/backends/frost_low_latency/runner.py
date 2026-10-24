@@ -212,7 +212,7 @@ class FrostLowLatencyRunner(MoERunner):
             "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
-                "fp4-route-reuse-load-width-lut-fp16-v7"
+                "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
                 else "unified-fma-tc-standard-timing-v5"
             ),
@@ -238,7 +238,16 @@ class FrostLowLatencyRunner(MoERunner):
                 self.config.quant.activation is QuantFormat.BF16
                 or self.config.quant.weight in (QuantFormat.NVFP4, QuantFormat.MXFP4)
             )
-            and (capability in ((10, 3), (12, 0)) or hopper_fp4)
+            and (
+                capability in ((10, 3), (12, 0))
+                or hopper_fp4
+                or (
+                    capability == (10, 0)
+                    and self.config.quant.activation is QuantFormat.FP16
+                    and self.config.quant.weight
+                    in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+                )
+            )
         ):
             columns = (1, 2, 4, 8)
             tactics = [("ffma", a, b) for a in columns for b in columns] + [
@@ -247,11 +256,7 @@ class FrostLowLatencyRunner(MoERunner):
                 for b in columns
                 for v1, v2 in ((4, 8), (8, 4), (8, 8))
             ]
-            if (
-                hopper_fp4
-                and self.config.quant.activation is QuantFormat.BF16
-                and inputs[0].shape[0] >= 2
-            ):
+            if hopper_fp4 and inputs[0].shape[0] >= 2:
                 tactics += [
                     ("ffma", a, b, group)
                     for group in (2, 4)
