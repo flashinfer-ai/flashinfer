@@ -223,7 +223,10 @@ def test_support_follows_the_row_count_through_the_route_windows(monkeypatch):
     gapped = {
         "arches": ["sm_100a"],
         "route": route,
-        "select_rule": {"kind": "rows_between", "windows": {"sm_100a": [[0, 128], [256, None]]}},
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {"sm_100a": [[0, 128], [256, None]]},
+        },
     }
     monkeypatch.setitem(loader.MODULES, "gapped_record", gapped)
     monkeypatch.setitem(loader.ROUTES["sm_100a"], route, ["gapped_record"])
