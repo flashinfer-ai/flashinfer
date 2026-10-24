@@ -297,6 +297,12 @@ def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
     }
 
 
+def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
+    """A registry whose ``MODULES`` literal holds the shipped records and whose other tables (``TEST_MODULES``)
+    hold programs of a side manifest ``build.json`` never lists: the generic walk over ``MODULES`` alone."""
+    return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
+
+
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
     """``sources.json``: role -> {library, arches, arguments}."""
     registry = json.loads((package_dir / loader).read_text())
@@ -381,6 +387,12 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer/experimental/cake_kda_train",
         "cake_jit.py",
         refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_gdn_train",
+        "flashinfer/experimental/cake_gdn_train",
+        "cake_jit.py",
+        refs_shipped_modules,
     ),
     Package(
         "flashinfer.experimental.cake_moe_grouped_gemm",
