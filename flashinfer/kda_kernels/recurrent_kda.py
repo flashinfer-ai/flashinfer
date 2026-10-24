@@ -2572,6 +2572,15 @@ def run_recurrent_kda(
             out_buf = out_buf.reshape(_batched_spec_B, 1 + num_spec_tokens, HV, V)
         return (out_buf, state if output_final_state else None)
 
+    if state.dtype != torch.bfloat16:
+        raise TypeError(
+            "the CuTe DSL recurrent decode kernels require a bfloat16 state, got "
+            f"{state.dtype}; float32 state pools are supported only by plain "
+            "multi-token prefill (more tokens than sequences)"
+        )
+    if dt_bias is not None and dt_bias.ndim != 1:
+        dt_bias = dt_bias.reshape(-1)
+
     if use_one_warp:
         USE_GATE = 1 if use_gate_in_kernel else 0
         USE_CU = 1 if cu_seqlens_i32 is not None else 0
