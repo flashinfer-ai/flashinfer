@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 """CPU tests of the Cake single-GPU norm package (``flashinfer.cake_muse_spark_norm_backend``): the registry
-records and routes of its two operators as the exporter wrote them, the selection and launch rules over the literals,
-the variant / route helpers of the host module, and ``build.json`` under FlashInfer's manifest checker."""
+records and routes of its three operators as the exporter wrote them, the selection and launch rules over the
+literals, the variant / route / support helpers of the host module, and ``build.json`` under FlashInfer's manifest
+checker."""
 
 import hashlib
 import importlib.util
@@ -223,7 +224,10 @@ def test_support_follows_the_row_count_through_the_route_windows(monkeypatch):
     gapped = {
         "arches": ["sm_100a"],
         "route": route,
-        "select_rule": {"kind": "rows_between", "windows": {"sm_100a": [[0, 128], [256, None]]}},
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {"sm_100a": [[0, 128], [256, None]]},
+        },
     }
     monkeypatch.setitem(loader.MODULES, "gapped_record", gapped)
     monkeypatch.setitem(loader.ROUTES["sm_100a"], route, ["gapped_record"])
@@ -563,6 +567,165 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
                 assert build["mode"] == int(variant[4]) and build[
                     "pdl"
                 ] is variant.endswith("_pdl")
+
+
+def test_gated_residual_rmsnorm_helpers_and_support(monkeypatch):
+    """The variant of a gated residual RMSNorm call is its mode (``weight`` applied before the norm or absent) and
+    its launch form; on the Blackwell architectures every variant's route is exported and its windows partition
+    the positive row counts, so the predicate holds for every row count and fails for none but zero."""
+    assert pkg.GATED_RESIDUAL_RMSNORM == OP_A
+    assert pkg.gated_residual_rmsnorm_variant(False, False) == "mode0"
+    assert pkg.gated_residual_rmsnorm_variant(False, True) == "mode0_pdl"
+    assert pkg.gated_residual_rmsnorm_variant(True, False) == "mode1"
+    assert pkg.gated_residual_rmsnorm_variant(True, True) == "mode1_pdl"
+    for weight_before_norm in (False, True):
+        for enable_pdl in (False, True):
+            variant = pkg.gated_residual_rmsnorm_variant(weight_before_norm, enable_pdl)
+            assert variant in SHIPPED_VARIANTS[OP_A]
+            assert (
+                pkg.gated_residual_rmsnorm_route(weight_before_norm, enable_pdl)
+                == f"{OP_A}_{variant}"
+            )
+    device = torch.device("cuda", 0)
+    for capability, arch in (((10, 0), "sm_100a"), ((10, 3), "sm_103a")):
+        monkeypatch.setattr(
+            torch.cuda, "get_device_capability", lambda *_, c=capability: c
+        )
+        above = OP_A_PARKED_ABOVE[arch]
+        for weight_before_norm in (False, True):
+            for enable_pdl in (False, True):
+                form = dict(
+                    weight_before_norm=weight_before_norm, enable_pdl=enable_pdl
+                )
+                assert pkg.is_cake_gated_residual_rmsnorm_supported(device, **form)
+                for rows in (
+                    1,
+                    16,
+                    17,
+                    64,
+                    65,
+                    128,
+                    129,
+                    above,
+                    above + 1,
+                    2048,
+                    2049,
+                    10**6,
+                ):
+                    assert pkg.is_cake_gated_residual_rmsnorm_supported(
+                        device, rows=rows, **form
+                    ), (arch, form, rows)
+                assert not pkg.is_cake_gated_residual_rmsnorm_supported(
+                    device, rows=0, **form
+                )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
+    assert not pkg.is_cake_gated_residual_rmsnorm_supported(device)
+    assert not pkg.is_cake_gated_residual_rmsnorm_supported(
+        device, weight_before_norm=True, enable_pdl=True
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    assert not pkg.is_cake_gated_residual_rmsnorm_supported(device)
+    assert not pkg.is_cake_gated_residual_rmsnorm_supported(torch.device("cpu"))
+
+
+def test_gated_residual_rmsnorm_support_follows_the_row_count_through_gaps(monkeypatch):
+    """A gap in a route's windows (no record admits the row count) is unsupported for that row count only; the other
+    variants keep their own windows."""
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 3))
+    route = pkg.gated_residual_rmsnorm_route(True, True)
+    gapped = {
+        "arches": ["sm_103a"],
+        "route": route,
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {"sm_103a": [[0, 64], [256, 2048]]},
+        },
+    }
+    monkeypatch.setitem(loader.MODULES, "gapped_a", gapped)
+    monkeypatch.setitem(loader.ROUTES["sm_103a"], route, ["gapped_a"])
+    form = dict(weight_before_norm=True, enable_pdl=True)
+    assert pkg.is_cake_gated_residual_rmsnorm_supported(device, **form)
+    for rows in (1, 64, 257, 2048):
+        assert pkg.is_cake_gated_residual_rmsnorm_supported(device, rows=rows, **form)
+    for rows in (65, 256, 2049):
+        assert not pkg.is_cake_gated_residual_rmsnorm_supported(
+            device, rows=rows, **form
+        )
+    with pytest.raises(NotImplementedError, match="admits 100 rows"):
+        loader.selected_module("sm_103a", route, 100)
+    assert pkg.is_cake_gated_residual_rmsnorm_supported(
+        device, rows=100, weight_before_norm=False, enable_pdl=True
+    )
+    assert pkg.is_cake_gated_residual_rmsnorm_supported(
+        device, rows=100, weight_before_norm=True, enable_pdl=False
+    )
+
+
+def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
+    """The sigmoid gate has one route; its windows name the head counts 128, 32 and 16 and partition the positive
+    token counts of each on the Blackwell architectures, so the predicate holds for those head counts at every
+    token count and fails for every other head count (a 2-D ``(rows, 64)`` call is one head)."""
+    assert pkg.RMSNORM_SIGMOID_GATE == OP_C
+    assert pkg.HEAD_DIM == 64 and pkg.ROW_ALIGNMENT_BYTES == 16
+    assert pkg.rmsnorm_sigmoid_gate_route() == f"{OP_C}_bf16"
+    device = torch.device("cuda", 0)
+    routed_heads = sorted({key[0] for key in OP_C_WINDOWS})
+    assert routed_heads == [16, 32, 128]
+    for capability in ((10, 0), (10, 3)):
+        monkeypatch.setattr(
+            torch.cuda, "get_device_capability", lambda *_, c=capability: c
+        )
+        assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
+        for heads in routed_heads:
+            assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=heads)
+            for tokens in (1, 8, 9, 256, 257, 1024, 1025, 16384):
+                assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+                    device, heads=heads, tokens=tokens
+                ), (capability, heads, tokens)
+            assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+                device, heads=heads, tokens=0
+            )
+        for heads in (1, 2, 8, 64, 256):
+            assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=heads)
+            assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+                device, heads=heads, tokens=64
+            )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=32, tokens=1)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(torch.device("cpu"))
+
+
+def test_rmsnorm_sigmoid_gate_support_follows_the_head_and_token_counts_through_gaps(
+    monkeypatch,
+):
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    route = pkg.rmsnorm_sigmoid_gate_route()
+    gapped = {
+        "arches": ["sm_100a"],
+        "route": route,
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {"sm_100a": [[128, 0, 8], [128, 256, None], [32, 0, 1024]]},
+        },
+    }
+    monkeypatch.setitem(loader.MODULES, "gapped_c", gapped)
+    monkeypatch.setitem(loader.ROUTES["sm_100a"], route, ["gapped_c"])
+    assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
+    assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=128)
+    assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=128, tokens=8)
+    assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=128, tokens=257)
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=128, tokens=9)
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=128, tokens=256)
+    assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=32, tokens=1024)
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=32, tokens=1025)
+    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=16)
+    with pytest.raises(NotImplementedError, match="admits 100 rows of 128 heads"):
+        loader.selected_module("sm_100a", route, 100, 128)
 
 
 def test_launch_grid_and_args_follow_the_record(monkeypatch):
