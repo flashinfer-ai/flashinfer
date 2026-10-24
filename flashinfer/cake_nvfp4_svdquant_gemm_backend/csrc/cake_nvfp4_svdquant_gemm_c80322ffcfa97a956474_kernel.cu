@@ -912,7 +912,8 @@ kernel_cake_nvfp4_svdquant_gemm_c80322ffcfa97a956474(const __grid_constant__ CUt
                     last_stage = mma_stage;
                     if (cta_rank == 0) {
                         elect_commit_cg2_local(klast_done_addr);
-                        mbarrier_wait(klast_done_addr, completed & 1);
+                        unsigned int _parity_klast_done = completed % 2;
+                        mbarrier_wait(klast_done_addr, _parity_klast_done);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
                     #pragma unroll 1
@@ -1217,7 +1218,8 @@ kernel_cake_nvfp4_svdquant_gemm_c80322ffcfa97a956474(const __grid_constant__ CUt
                     last_stage = mma_stage;
                     if (cta_rank == 0) {
                         elect_commit_cg2_local(klast_done_addr);
-                        mbarrier_wait(klast_done_addr, completed & 1);
+                        unsigned int _parity_klast_done_1 = completed % 2;
+                        mbarrier_wait(klast_done_addr, _parity_klast_done_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
                     #pragma unroll 1
