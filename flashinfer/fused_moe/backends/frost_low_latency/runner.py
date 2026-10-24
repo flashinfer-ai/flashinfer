@@ -8,7 +8,15 @@ import torch
 from packaging.version import Version
 
 from ....autotuner import TuningConfig
-from ...api import FrostLowLatencyConfig, QuantFormat, RoutingInputMode, SwiGLU
+from ...api import (
+    FrostLowLatencyConfig,
+    GeGLU,
+    QuantFormat,
+    ReLU2,
+    RoutingInputMode,
+    SiLU,
+    SwiGLU,
+)
 from ...runners import MoERunner, _validate_prerouted_inputs
 from .fma.activation_config import ACTIVATIONS, lower_activation
 
@@ -115,9 +123,16 @@ class FrostLowLatencyRunner(MoERunner):
 
         arch = get_compute_capability(self.device)
         self._supports_tc = arch in ((10, 0), (10, 3), (10, 7))
-        if not self._supports_tc and arch not in ((9, 0), (12, 0)):
+        if not self._supports_tc and arch not in ((8, 0), (9, 0), (12, 0)):
             raise NotImplementedError(
-                "frost_low_latency requires SM90, SM100, SM103, SM107 or SM120"
+                "frost_low_latency requires SM80, SM90, SM100, SM103, SM107 or SM120"
+            )
+        if arch == (8, 0) and self.config.quant.weight not in (
+            QuantFormat.BF16,
+            QuantFormat.FP16,
+        ):
+            raise NotImplementedError(
+                "Frost SM80 currently supports BF16/FP16 inputs and weights only"
             )
         if not self._supports_tc and self.config.routing.top_k > 32:
             raise NotImplementedError("Frost FMA requires top_k <= 32")
@@ -220,9 +235,13 @@ class FrostLowLatencyRunner(MoERunner):
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
                     else (
-                        "bf16-grouped-tc-v2"
+                        "bf16-grouped-tc-v5"
                         if self.config.quant.weight is QuantFormat.BF16
-                        else "unified-fma-tc-standard-timing-v5"
+                        else (
+                            "fp16-grouped-tc-v3"
+                            if self.config.quant.weight is QuantFormat.FP16
+                            else "unified-fma-tc-standard-timing-v5"
+                        )
                     )
                 )
             ),
@@ -299,22 +318,83 @@ class FrostLowLatencyRunner(MoERunner):
                 for second in (1, 2, 4, 8)
             ]
             if (
-                capability in ((9, 0), (12, 0))
-                and self.config.quant.weight is QuantFormat.BF16
-                and self.config.quant.activation is QuantFormat.BF16
-                and self.config.quant.output is QuantFormat.BF16
+                capability in ((8, 0), (9, 0), (12, 0))
+                and self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16)
+                and self.config.quant.activation is self.config.quant.weight
+                and self.config.quant.output is self.config.quant.weight
                 and inputs[0].shape[0] in (4, 8)
-                and inputs[0].shape[1] == 2048
-                and self.config.experts.intermediate_size == 512
-                and self.config.routing.top_k == 10
-                and self.config.activation == SwiGLU()
+                and (
+                    (
+                        capability == (8, 0)
+                        and (
+                            (
+                                (
+                                    inputs[0].shape[1],
+                                    self.config.experts.intermediate_size,
+                                    self.config.routing.top_k,
+                                )
+                                == (2048, 512, 10)
+                                and self.config.activation in (SwiGLU(), ReLU2())
+                            )
+                            or (
+                                (
+                                    inputs[0].shape[1],
+                                    self.config.experts.intermediate_size,
+                                    self.config.routing.top_k,
+                                )
+                                == (7168, 2048, 8)
+                                and self.config.quant.weight is QuantFormat.BF16
+                                and self.config.activation == SwiGLU()
+                            )
+                        )
+                    )
+                    or (
+                        capability in ((9, 0), (12, 0))
+                        and (
+                            inputs[0].shape[1],
+                            self.config.experts.intermediate_size,
+                            self.config.routing.top_k,
+                        )
+                        == (2048, 512, 10)
+                        and (
+                            self.config.activation in (SwiGLU(), GeGLU())
+                            or (
+                                self.config.activation in (ReLU2(), SiLU())
+                                and (capability == (12, 0) or inputs[0].shape[0] == 8)
+                            )
+                        )
+                    )
+                )
                 and self.config.finalize.do_finalize
             ):
                 # Qualified reuse cases benefit, while disjoint routes favor FMA.
                 # Offer both to tuning; keep the untuned default unchanged.
-                if capability == (9, 0):
-                    tile_k = 128 if inputs[0].shape[0] == 4 else 64
-                    tactics += [("wgmma", 2, stages, tile_k) for stages in (2, 4, 8)]
+                if capability == (8, 0):
+                    choice = (
+                        (8, 2, 64)
+                        if inputs[0].shape[1] == 7168
+                        else ((4, 4, 128) if inputs[0].shape[0] == 4 else (4, 2, 64))
+                    )
+                    tactics.append(("ampere_mma", *choice))
+                elif capability == (9, 0):
+                    if self.config.activation == GeGLU():
+                        tile_k = 128 if inputs[0].shape[0] == 4 else 64
+                        tactics.append(("wgmma", 2, 4, tile_k))
+                    elif (
+                        self.config.activation in (ReLU2(), SiLU())
+                        or self.config.quant.weight is QuantFormat.FP16
+                    ):
+                        tiles = (
+                            (128,)
+                            if self.config.activation in (ReLU2(), SiLU())
+                            else ((64, 128) if inputs[0].shape[0] == 4 else (64,))
+                        )
+                        tactics += [("wgmma", 2, 4, tile_k) for tile_k in tiles]
+                    else:
+                        tile_k = 128 if inputs[0].shape[0] == 4 else 64
+                        tactics += [
+                            ("wgmma", 2, stages, tile_k) for stages in (2, 4, 8)
+                        ]
                 else:
                     choices = (
                         ((4, 4, 64), (2, 2, 128))

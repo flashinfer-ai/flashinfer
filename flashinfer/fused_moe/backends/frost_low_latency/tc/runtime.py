@@ -6,6 +6,7 @@ import cutlass
 from cutlass import cute
 
 from ..quantization import _mul
+from .ampere import AmpereGroupedProjection
 from .hopper import HopperGroupedProjection
 from .warp import WarpGroupedProjection
 
@@ -57,7 +58,16 @@ def launch(
     architecture: cutlass.Constexpr = 90,
 ):
     top_k = cute.size(ids, mode=[1])
-    if cutlass.const_expr(architecture == 90):
+    if cutlass.const_expr(architecture == 80):
+        first_ampere = AmpereGroupedProjection(
+            True, group_size, stages, tile_k, top_k, activation, gated, parameters
+        )
+        second_ampere = AmpereGroupedProjection(
+            False, group_size, stages, tile_k, top_k
+        )
+        first_ampere(w1, x, ids, mid, stream)
+        second_ampere(w2, mid, ids, routes, stream)
+    elif cutlass.const_expr(architecture == 90):
         first_hopper = HopperGroupedProjection(
             True, group_size, stages, tile_k, top_k, activation, gated, parameters
         )
@@ -84,7 +94,8 @@ def launch(
 
 
 _TACTICS = tuple(
-    ("wgmma", group, stages, tile_k)
+    (kind, group, stages, tile_k)
+    for kind in ("wgmma", "ampere_mma")
     for group in (2, 4, 8)
     for stages in (2, 4, 8)
     for tile_k in (64, 128)
@@ -109,8 +120,8 @@ def execute(inputs, config, tactic):
             "Grouped decode requires a valid architecture/group/stage/K tactic"
         )
     x, ids, scores, w1, w2, mid, routes, output, narrow = inputs
-    architecture = 90 if tactic[0] == "wgmma" else 120
-    expected = (9, 0) if architecture == 90 else (12, 0)
+    architecture = {"wgmma": 90, "warp_mma": 120, "ampere_mma": 80}[tactic[0]]
+    expected = (architecture // 10, architecture % 10)
     if get_compute_capability(x.device) != expected:
         raise ValueError(f"Grouped {tactic[0]} decode requires SM{architecture}")
     if (
@@ -148,7 +159,14 @@ def execute(inputs, config, tactic):
                     name, parameters = lower_activation(config.activation)
                     compiled = cute.compile(
                         launch,
-                        *(from_dlpack(v) for v in tensors),
+                        # pack_inputs validates weight alignment. Ampere's
+                        # 128-bit cp.async atom needs that fact in its IR.
+                        *(
+                            from_dlpack(v, assumed_align=16)
+                            if architecture == 80 and j in (1, 4)
+                            else from_dlpack(v)
+                            for j, v in enumerate(tensors)
+                        ),
                         group_size,
                         stages,
                         tile_k,
@@ -159,7 +177,7 @@ def execute(inputs, config, tactic):
                         finalize,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                         architecture,
-                        options=f"--gpu-arch sm_{architecture}a --enable-tvm-ffi",
+                        options=f"--gpu-arch sm_{architecture}{'' if architecture == 80 else 'a'} --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
         compiled(*tensors)

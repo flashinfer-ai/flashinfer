@@ -10,6 +10,11 @@ Timing excludes preparation, host enqueue, router-network evaluation, shared
 experts and communication. Each baseline uses its runner's compound candidate
 search plus its heuristic, not an exhaustive compound search. Repeat with
 --baseline cutile_bf16 and --baseline cudnn_grouped_gemm_bf16 when available.
+SM80 defaults to cuDNN; its standalone vLLM-device comparison additionally needs
+--baseline vllm_device_triton --vllm-source /path/to/fused_moe.py from upstream
+commit 71c20f73f2f1764576fed799c152319c9fd1c820. This loads only two unmodified
+Triton device functions, checks the pinned file hash, and requires no vLLM install.
+It is not a stock vLLM or serving benchmark; see baseline_contract in the JSON.
 """
 
 import argparse
@@ -32,6 +37,9 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     SwiGLU,
+    ReLU2,
+    GeGLU,
+    SiLU,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
 from flashinfer.testing import bench_gpu_time_with_cupti
@@ -58,11 +66,18 @@ def _require_cupti():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, choices=(4, 8), default=4)
+    parser.add_argument("--shape", choices=("small", "large"), default="small")
     parser.add_argument("--route-seed", type=int, default=7191)
     parser.add_argument(
         "--baseline",
-        choices=("cutlass_bf16", "cutile_bf16", "cudnn_grouped_gemm_bf16"),
-        default="cutlass_bf16",
+        choices=(
+            "cutlass_bf16",
+            "cutlass_fp16",
+            "cutile_bf16",
+            "cudnn_grouped_gemm_bf16",
+            "vllm_device_triton",
+        ),
+        default=None,
     )
     parser.add_argument(
         "--reuses",
@@ -70,15 +85,68 @@ def main():
         choices=("shared", "paired", "quartet", "disjoint"),
         default=("shared", "paired", "quartet", "disjoint"),
     )
+    parser.add_argument(
+        "--vllm-source",
+        type=Path,
+        help="Pinned vLLM fused_moe.py for the standalone device comparator",
+    )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument(
+        "--activation", choices=("swiglu", "relu2", "geglu", "silu"), default="swiglu"
+    )
     args = parser.parse_args()
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     cupti_version = _require_cupti()
-    if torch.cuda.get_device_capability() not in ((9, 0), (12, 0)):
-        raise RuntimeError("This benchmark qualifies Hopper SM90 and SM120")
-    t, h, i, e, k = args.tokens, 2048, 512, 512, 10
+    activation = {
+        "swiglu": SwiGLU,
+        "relu2": ReLU2,
+        "geglu": GeGLU,
+        "silu": SiLU,
+    }[args.activation]()
+    arch = torch.cuda.get_device_capability()
+    if arch not in ((8, 0), (9, 0), (12, 0)):
+        raise RuntimeError("This benchmark qualifies SM80, SM90 and SM120")
+    if args.baseline is None:
+        args.baseline = (
+            "cudnn_grouped_gemm_bf16"
+            if arch == (8, 0)
+            else ("cutlass_fp16" if dtype == torch.float16 else "cutlass_bf16")
+        )
+    standalone = args.baseline == "vllm_device_triton"
+    if standalone != (args.vllm_source is not None):
+        parser.error(
+            "--baseline vllm_device_triton requires --vllm-source (only for that baseline)"
+        )
+    if args.shape == "large" and arch != (8, 0):
+        parser.error("The large grouped workload is qualified only on SM80")
+    if arch == (8, 0) and (dtype == torch.float16 or args.activation != "swiglu"):
+        if (
+            args.shape != "small"
+            or not standalone
+            or args.activation not in ("swiglu", "relu2")
+        ):
+            parser.error(
+                "Typed SM80 cases require small SwiGLU/ReLU2 and the pinned standalone baseline"
+            )
+    if standalone and args.activation not in ("swiglu", "relu2"):
+        parser.error("The pinned standalone adapter supports SwiGLU and ReLU2")
+    if dtype == torch.float16 and not standalone and args.baseline != "cutlass_fp16":
+        parser.error("FP16 uses native CUTLASS or the pinned standalone baseline")
+    if dtype == torch.bfloat16 and args.baseline == "cutlass_fp16":
+        parser.error("--baseline cutlass_fp16 requires --dtype fp16")
+    t = args.tokens
+    h, i, e, k = (7168, 2048, 256, 8) if args.shape == "large" else (2048, 512, 512, 10)
     print("Preparing checkpoint and Frost buffers", flush=True)
     cfg, x, w1, w2, ids, scores, weights = _inputs(
-        SwiGLU(), tokens=t, hidden=h, intermediate=i, experts=e, topk=k
+        activation,
+        tokens=t,
+        hidden=h,
+        intermediate=i,
+        experts=e,
+        topk=k,
+        dtype=dtype,
+        output_dtype=dtype,
     )
     x.mul_(0.1)
     # The correctness fixture includes repeated experts. All baseline warmup
@@ -93,47 +161,164 @@ def main():
     tactics = frost.get_valid_tactics(buffers, None)
     families = {
         "fma": [v for v in tactics if v[0] == "ffma"],
-        "grouped_tc": [v for v in tactics if v[0] in ("wgmma", "warp_mma")],
+        "grouped_tc": [
+            v for v in tactics if v[0] in ("wgmma", "warp_mma", "ampere_mma")
+        ],
     }
-    assert len(families["fma"]) == 16 and len(families["grouped_tc"]) in (2, 3, 4)
-    native_config = {
-        "cutlass_bf16": CutlassBf16Config,
-        "cutile_bf16": CuTileBf16Config,
-        "cudnn_grouped_gemm_bf16": CudnnGroupedGemmBf16Config,
-    }[args.baseline]()
-    native_weights = MoEWeightPack()
-    native_weights.prepare_for(
-        args.baseline,
-        native_config.prepare_weights(
-            w1,
-            w2,
-            num_local_experts=e,
-            hidden_size=h,
-            intermediate_size=i,
-            activation=SwiGLU(),
-        ),
-    )
-    native_layer = MoELayer(replace(cfg, backend=BackendOptions((native_config,))))
-    print("Preparing", args.baseline, "(first use can compile)", flush=True)
-    with autotune(False):
-        native_layer(act, native_weights)
-    print(args.baseline, "ready", flush=True)
-    bucket, (native_runner, native_initial) = next(iter(native_layer._winners.items()))
-    assert native_runner.backend_key == args.baseline
+    assert len(families["fma"]) == 16
+    if not families["grouped_tc"]:
+        parser.error(
+            "This architecture/dtype/activation/token case has no advertised grouped TC tactic"
+        )
+    if standalone:
+        from benchmarks.frost_vllm_device_baseline import (
+            VllmTritonComparator,
+            VLLM_COMMIT,
+            VLLM_SOURCE_SHA256,
+        )
+
+        native_runner = VllmTritonComparator(
+            x, w1, w2, ids, scores, args.vllm_source, gated=args.activation == "swiglu"
+        )
+        native_initial = native_runner.tactics[0]
+        native_selected = native_initial
+        native_runner.forward(native_initial)
+    elif dtype == torch.float16:
+        from flashinfer.fused_moe.core import (
+            get_cutlass_fused_moe_module,
+            cutlass_fused_moe,
+            cutlass_fused_moe_workspace_size,
+        )
+        from flashinfer.autotuner import AutoTuner, TuningConfig
+
+        cc = torch.cuda.get_device_capability()
+        module = get_cutlass_fused_moe_module(str(cc[0] * 10 + cc[1]))
+        inner = module.MoERunner(
+            x_dtype=dtype,
+            weight_dtype=dtype,
+            output_dtype=dtype,
+            top_k=k,
+            tp_size=1,
+            tp_rank=0,
+            ep_size=1,
+            ep_rank=0,
+            cluster_size=1,
+            cluster_rank=0,
+            enable_alltoall=False,
+            use_deepseek_fp8_block_scale=False,
+            use_w4_group_scaling=False,
+            use_mxfp8_act_scaling=False,
+            min_latency_mode=False,
+            enable_pdl=False,
+            activation_type=activation.type,
+            use_packed_weights=False,
+            use_fused_finalize=True,
+            use_wfp4afp8_humming=False,
+        )
+        stage_choices = []
+        with autotune(True):
+            for stage in (1, 2):
+                inner.gemm_idx_for_tuning = stage
+                stage_choices.append(
+                    AutoTuner.get().rank_tactics(
+                        f"frost_grouped_fp16_native_stage{stage}",
+                        [inner],
+                        TuningConfig(),
+                        [x, w1, None, w2, None],
+                        k=2,
+                        gemm_idx=stage,
+                    )
+                )
+        inner.gemm_idx_for_tuning = None
+        native_choices = [
+            -1,
+            *[(int(a), int(b)) for a in stage_choices[0] for b in stage_choices[1]],
+        ]
+        workspace = torch.empty(
+            cutlass_fused_moe_workspace_size(
+                t,
+                h,
+                i,
+                e,
+                k,
+                x_dtype=dtype,
+                weight_dtype=dtype,
+                output_dtype=dtype,
+                use_w4_group_scaling=False,
+                device=x.device,
+            ),
+            device=x.device,
+            dtype=torch.uint8,
+        )
+        native_output = torch.empty_like(x)
+
+        def native(tactic):
+            with autotune(False):
+                value = cutlass_fused_moe(
+                    x,
+                    ids,
+                    scores,
+                    w1,
+                    w2,
+                    dtype,
+                    [],
+                    output=native_output,
+                    use_w4_group_scaling=False,
+                    tune_max_num_tokens=t,
+                    activation_type=activation.type,
+                    enable_pdl=False,
+                    profile_ids=None if tactic == -1 else list(tactic),
+                    workspace_buffer=workspace,
+                )
+            return value[0] if isinstance(value, (list, tuple)) else value
+
+        native(-1)
+        args.baseline = "cutlass_fp16"
+    else:
+        native_config = {
+            "cutlass_bf16": CutlassBf16Config,
+            "cutile_bf16": CuTileBf16Config,
+            "cudnn_grouped_gemm_bf16": CudnnGroupedGemmBf16Config,
+        }[args.baseline]()
+        native_weights = MoEWeightPack()
+        native_weights.prepare_for(
+            args.baseline,
+            native_config.prepare_weights(
+                w1,
+                w2,
+                num_local_experts=e,
+                hidden_size=h,
+                intermediate_size=i,
+                activation=activation,
+            ),
+        )
+        native_layer = MoELayer(replace(cfg, backend=BackendOptions((native_config,))))
+        print("Preparing", args.baseline, "(first use can compile)", flush=True)
+        with autotune(False):
+            native_layer(act, native_weights)
+        print(args.baseline, "ready", flush=True)
+        bucket, (native_runner, native_initial) = next(
+            iter(native_layer._winners.items())
+        )
+        assert native_runner.backend_key == args.baseline
     root = Path(__file__).resolve().parents[1]
     sources = [
         Path(__file__).resolve(),
+        root / "flashinfer/fused_moe/core.py",
+        root / "flashinfer/fused_moe/runners.py",
         root / "flashinfer/fused_moe/backends/frost_low_latency/runner.py",
         root / "flashinfer/fused_moe/backends/frost_low_latency/runtime.py",
         *sorted(
             (root / "flashinfer/fused_moe/backends/frost_low_latency/tc").glob("*.py")
         ),
     ]
+    if standalone:
+        sources.append(Path(__file__).with_name("frost_vllm_device_baseline.py"))
     result = {
         "shape": {"T": t, "H": h, "I": i, "E": e, "top_k": k},
         "route_seed": args.route_seed,
-        "dtype": "bf16",
-        "activation": "default SwiGLU",
+        "dtype": args.dtype,
+        "activation": repr(activation),
         "gpu": torch.cuda.get_device_name(),
         "software": {
             "torch": torch.__version__,
@@ -148,11 +333,32 @@ def main():
         },
         "timing": "CUPTI CUDA Graph complete routed-expert interval",
         "native_backend": args.baseline,
-        "native_search": "Runner compound candidates plus default, not exhaustive",
+        "native_search": (
+            "27 shared FC1/FC2 configurations; not exhaustive independent-stage pairs"
+            if standalone
+            else (
+                "Per-stage top two, their Cartesian product plus heuristic; not exhaustive"
+                if dtype == torch.float16
+                else "Runner compound candidates plus default, not exhaustive"
+            )
+        ),
+        "baseline_contract": (
+            "Unmodified vLLM matmul device functions with standalone Triton activation/combine "
+            "and upstream naive route policy. Native typed preactivation and weighted-before-cast "
+            "expert rounding differ from Frost; independent references. Not stock vLLM or serving."
+            if standalone
+            else "FlashInfer native runner; same checkpoint, backend-specific rounding"
+        ),
         "selection": [],
         "validation": [],
         "completed": False,
     }
+
+    if standalone:
+        result["vllm_device_source"] = {
+            "commit": VLLM_COMMIT,
+            "sha256": VLLM_SOURCE_SHA256,
+        }
 
     def save():
         args.output.write_text(json.dumps(result, indent=2) + "\n")
@@ -202,12 +408,16 @@ def main():
         ).to(x.device)
         ids.copy_(expert_perm[ids.long()].gather(1, slot_perm))
         scores.copy_(torch.randn_like(scores).softmax(-1).bfloat16().float())
-        _, reference, _ = _reference(x, w1, w2, ids, scores, SwiGLU(), True)
+        _, reference, _ = _reference(
+            x, w1, w2, ids, scores, activation, True, output_dtype=dtype
+        )
+        native_reference = native_runner.reference() if standalone else reference
         for cold in (False, True):
 
             def measure(name, tactic, call, phase):
                 destination = call()
-                check(destination, reference)
+                expected = native_reference if name == args.baseline else reference
+                check(destination, expected)
 
                 def measured_call():
                     nonlocal destination
@@ -224,7 +434,7 @@ def main():
                         cold_l2_cache=cold,
                     )
                 ]
-                errors = check(destination, reference)
+                errors = check(destination, expected)
                 row = {
                     "reuse": reuse,
                     "cold": cold,
@@ -256,30 +466,66 @@ def main():
                 ]
                 selected[name] = min(rows, key=lambda v: v["median_us"])["tactic"]
                 calls[name] = lambda name=name: frost.forward(buffers, selected[name])
-            with autotune(True):
-                # Baseline tuning hooks can rewrite routing. Give discovery
-                # independent live inputs, preserving the measured workload.
-                tuning_act = MoEActivationPack(
-                    x.clone(), None, ids.clone(), scores.clone()
-                )
-                choices = native_runner.get_valid_tactics(
-                    native_runner.pack_inputs(tuning_act, native_weights), None
-                )
-            native_choices = []
-            for tactic in [native_initial, -1, *choices]:
-                if tactic not in native_choices:
-                    native_choices.append(tactic)
+            if standalone:
+                native_choices = native_runner.get_valid_tactics()
 
-            def native_call():
-                return native_layer(act, native_weights)
+                def native_call():
+                    return native_runner.forward(native_selected)
 
-            rows = []
-            for tactic in native_choices:
-                native_layer._winners[bucket] = (native_runner, tactic)
-                rows.append(measure(args.baseline, tactic, native_call, "selection"))
-            selected[args.baseline] = min(rows, key=lambda v: v["median_us"])["tactic"]
-            native_layer._winners[bucket] = (native_runner, selected[args.baseline])
-            calls[args.baseline] = native_call
+                rows = []
+                for tactic in native_choices:
+                    native_selected = tactic
+                    rows.append(
+                        measure(args.baseline, tactic, native_call, "selection")
+                    )
+                selected[args.baseline] = min(rows, key=lambda v: v["median_us"])[
+                    "tactic"
+                ]
+                native_selected = selected[args.baseline]
+                calls[args.baseline] = native_call
+            elif dtype == torch.float16:
+                rows = [
+                    measure(
+                        args.baseline,
+                        tactic,
+                        lambda tactic=tactic: native(tactic),
+                        "selection",
+                    )
+                    for tactic in native_choices
+                ]
+                selected[args.baseline] = min(rows, key=lambda row: row["median_us"])[
+                    "tactic"
+                ]
+                calls[args.baseline] = lambda: native(selected[args.baseline])
+            else:
+                with autotune(True):
+                    # Baseline tuning hooks can rewrite routing. Give discovery
+                    # independent live inputs, preserving the measured workload.
+                    tuning_act = MoEActivationPack(
+                        x.clone(), None, ids.clone(), scores.clone()
+                    )
+                    choices = native_runner.get_valid_tactics(
+                        native_runner.pack_inputs(tuning_act, native_weights), None
+                    )
+                native_choices = []
+                for tactic in [native_initial, -1, *choices]:
+                    if tactic not in native_choices:
+                        native_choices.append(tactic)
+
+                def native_call():
+                    return native_layer(act, native_weights)
+
+                rows = []
+                for tactic in native_choices:
+                    native_layer._winners[bucket] = (native_runner, tactic)
+                    rows.append(
+                        measure(args.baseline, tactic, native_call, "selection")
+                    )
+                selected[args.baseline] = min(rows, key=lambda v: v["median_us"])[
+                    "tactic"
+                ]
+                native_layer._winners[bucket] = (native_runner, selected[args.baseline])
+                calls[args.baseline] = native_call
             for baseline in ("fma", args.baseline):
                 for repeat in range(2):
                     for current in (baseline, "grouped_tc", "grouped_tc", baseline):
