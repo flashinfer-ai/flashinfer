@@ -33,6 +33,7 @@ Notes on test construction:
   than element-wise equality.
 """
 
+import time
 import zlib
 
 import pytest
@@ -380,6 +381,125 @@ def test_large_batch_smoke(routing_method, num_experts, top_k):
             top_k,
             tile_tokens_dim,
         )
+
+
+_HOLD_SMS_SOURCE = r"""
+#include <cuda_runtime.h>
+
+// Each CTA takes all of an SM's shared memory, so no other kernel's CTA fits beside it, counts
+// itself in *started once resident, and spins until *release is set or timeout_ns passes (so a
+// failing test cannot hang).
+__global__ void hold_sms_kernel(volatile int* release, int* started, unsigned long long timeout_ns) {
+  extern __shared__ char smem[];
+  if (threadIdx.x == 0) {
+    atomicAdd_system(started, 1);
+    unsigned long long start, now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+    do {
+      __nanosleep(1000);
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    } while (*release == 0 && now - start < timeout_ns);
+    smem[0] = 1;
+  }
+  __syncthreads();
+}
+
+void hold_sms(int64_t release, int64_t started, int64_t num_sms, int64_t timeout_ns,
+              int64_t stream) {
+  int device, bytes;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  cudaFuncSetAttribute(hold_sms_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  hold_sms_kernel<<<num_sms, 32, bytes, reinterpret_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<volatile int*>(release), reinterpret_cast<int*>(started),
+      static_cast<unsigned long long>(timeout_ns));
+}
+"""
+
+
+def test_coop_routing_runs_while_other_kernels_hold_sms():
+    """The cooperative routing kernel must start while other kernels hold some SMs.
+
+    A cooperative launch starts only once every CTA of its grid is resident. The
+    routing grid covers every SM except the reserved ones (getCoopLaunchSMCounts),
+    so it fits beside kernels running on another stream, such as communication
+    kernels, only while two of its CTAs fit on one SM. The 896-expert tier runs
+    896 threads per CTA, and top_k 16 selects its bounded-state instantiation, so
+    two CTAs fit only at 32 registers per thread. The test holds a quarter of the
+    SMs, more than the reserved count, and requires routing to finish before they
+    are released.
+    """
+    from torch.utils.cpp_extension import load_inline
+
+    device = torch.device("cuda")
+    props = torch.cuda.get_device_properties(device)
+    if props.max_threads_per_multi_processor < 2048:
+        pytest.skip("two 1024-thread CTAs cannot share an SM on this GPU")
+    holder = load_inline(
+        name="test_trtllm_gen_routing_hold_sms",
+        cpp_sources=[
+            "void hold_sms(int64_t release, int64_t started, int64_t num_sms, "
+            "int64_t timeout_ns, int64_t stream);"
+        ],
+        cuda_sources=[_HOLD_SMS_SOURCE],
+        functions=["hold_sms"],
+        verbose=False,
+    )
+
+    num_tokens, num_experts, top_k, tile_tokens_dim = 4096, 896, 16, 64
+    logits = make_logits(num_tokens, num_experts, torch.float32, stable_seed("coop"))
+
+    def route():
+        return trtllm_gen_routing(
+            logits,
+            None,
+            RoutingMethodType.Renormalize,
+            top_k,
+            tile_tokens_dim=tile_tokens_dim,
+        )
+
+    route()  # builds the module before any SM is held
+    torch.cuda.synchronize()
+
+    held_sms = props.multi_processor_count // 4
+    release = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+    started = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+    hold_timeout_s = 10.0
+    holder_stream, routing_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    holder.hold_sms(
+        release.data_ptr(),
+        started.data_ptr(),
+        held_sms,
+        int(hold_timeout_s * 1e9),
+        holder_stream.cuda_stream,
+    )
+    try:
+        deadline = time.monotonic() + hold_timeout_s / 2
+        while started.item() < held_sms and time.monotonic() < deadline:
+            time.sleep(1e-3)
+        assert started.item() == held_sms, "the holding kernel did not become resident"
+        # Timed from the call, so a host synchronization inside it cannot hide a wait.
+        begin = time.monotonic()
+        with torch.cuda.stream(routing_stream):
+            result = route()
+            done = torch.cuda.Event()
+            done.record()
+        while not done.query() and time.monotonic() - begin < hold_timeout_s / 2:
+            time.sleep(1e-3)
+        waited_s = time.monotonic() - begin
+        finished_while_held = done.query() and waited_s < hold_timeout_s / 2
+    finally:
+        release[0] = 1
+        torch.cuda.synchronize()
+    assert finished_while_held, (
+        f"cooperative routing waited {waited_s:.1f}s for {held_sms} held SMs to be "
+        f"released (of {props.multi_processor_count})"
+    )
+    permute_info, ref_scores = routing_reference_renormalize(
+        logits, top_k, num_experts, tile_tokens_dim
+    )
+    check_selection(result, permute_info, ref_scores, top_k)
+    check_permutation(result, permute_info, num_tokens, top_k)
 
 
 def test_invalid_group_args_rejected():

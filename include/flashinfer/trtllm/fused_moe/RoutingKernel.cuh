@@ -991,9 +991,22 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 //
 // The kernel handles both mPtrTopKIds and mPtrTopKPacked input formats.
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+// The grid covers every SM except the reserved ones (getCoopLaunchSMCounts), and a cooperative
+// launch starts only once its whole grid is resident, so at one CTA per SM it waits while kernels
+// on other streams hold more than the reserved SMs. Tiers above 512 experts keep two CTAs per SM
+// where the SM holds 2048 threads; that caps them at 32 registers per thread without local memory,
+// while smaller tiers would move their per-thread state to local memory. A minimum of 0 leaves the
+// bound unset, as before, for every other instantiation.
+#if (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+static constexpr int kRoutingCoopMinCtasPerSmAbove512Experts = 2;
+#else
+static constexpr int kRoutingCoopMinCtasPerSmAbove512Experts = 0;
+#endif
 template <typename KernelParams>
-__global__ void __launch_bounds__(KernelParams::MaxNumExperts)
-    routingIndicesCoopKernel(KernelParams params) {
+__global__ void __launch_bounds__(KernelParams::MaxNumExperts,
+                                  KernelParams::MaxNumExperts > 512
+                                      ? kRoutingCoopMinCtasPerSmAbove512Experts
+                                      : 0) routingIndicesCoopKernel(KernelParams params) {
   // number of experts is bounded by number of threads (coop kernel requires MaxNumExperts <= 1024)
   using OutputT = typename KernelParams::OutputT;
   static constexpr int MaxNumExperts = KernelParams::MaxNumExperts;
