@@ -44,6 +44,9 @@ from flashinfer.cute_dsl.attention.fmha.fmha_blockscaled import (
     create_scale_factor_tensor,
 )
 from flashinfer.cute_dsl.attention.fmha.helpers import fmha_helpers as fmha_utils
+from flashinfer.cute_dsl.attention.fmha.helpers.expcast import (
+    expcast_pack_decode4,
+)
 from flashinfer.cute_dsl.attention.fmha.compile import _ex2_emulation_enabled
 
 pytestmark = pytest.mark.skipif(
@@ -328,7 +331,8 @@ def _sf_ref_5d(ref_flat, s, b, h_k, h_r, d):
 @pytest.mark.parametrize("qk_mode", list(_BS_MODES))
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("with_lse", [False, True])
-def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
+@pytest.mark.parametrize("p_exp_mode", ["exp2", "expcast"])
+def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse, p_exp_mode):
     """Block-scaled (MXFP8 / NVFP4) non-varlen prefill, JIT-compiled."""
     torch.manual_seed(0)
     qk_dt, sf_dt, sf_vec = _BS_MODES[qk_mode]
@@ -370,6 +374,7 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
         enable_ex2_emulation=ENABLE_EX2,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
+        p_exp_mode=p_exp_mode,
         use_tma_store=True,  # non-varlen
     )
     stream = _default_stream()
@@ -438,3 +443,74 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
     if with_lse:
         lse = _readback(lse_cute, (b, s_q, h_k, h_r))
         torch.testing.assert_close(lse, lse_ref.cpu(), atol=0.2, rtol=1e-2)
+
+
+@cute.kernel
+def _expcast_test_kernel(
+    scores: cute.Tensor,
+    packed: cute.Tensor,
+    decoded: cute.Tensor,
+    remove_clamps: cutlass.Constexpr[bool],
+):
+    idx = cute.arch.thread_idx()[0] + cute.arch.block_idx()[0] * 128
+    if idx < cute.size(packed):
+        code, p0, p1, p2, p3 = expcast_pack_decode4(
+            scores[idx * 4],
+            scores[idx * 4 + 1],
+            scores[idx * 4 + 2],
+            scores[idx * 4 + 3],
+            remove_clamps=remove_clamps,
+        )
+        packed[idx] = code
+        decoded[idx * 4] = p0
+        decoded[idx * 4 + 1] = p1
+        decoded[idx * 4 + 2] = p2
+        decoded[idx * 4 + 3] = p3
+
+
+@cute.jit
+def _expcast_test_launch(
+    scores: cute.Tensor,
+    packed: cute.Tensor,
+    decoded: cute.Tensor,
+    remove_clamps: cutlass.Constexpr[bool],
+):
+    _expcast_test_kernel(scores, packed, decoded, remove_clamps).launch(
+        grid=[cute.ceil_div(cute.size(packed), 128), 1, 1], block=[128, 1, 1]
+    )
+
+
+@pytest.mark.parametrize("remove_clamps", [False, True])
+def test_expcast_encoding_and_exact_decode(remove_clamps):
+    scores = torch.linspace(-30, 8 if remove_clamps else 20, 4092, device=DEVICE)
+    scores = torch.cat(
+        (
+            scores,
+            torch.tensor(
+                [-torch.inf, -20.0 if remove_clamps else torch.inf, 0.0, 8.0],
+                device=DEVICE,
+            ),
+        )
+    )
+    packed = torch.empty(scores.numel() // 4, device=DEVICE, dtype=torch.int32)
+    decoded = torch.empty_like(scores)
+    compiled = cute.compile(
+        _expcast_test_launch,
+        from_dlpack(scores),
+        from_dlpack(packed),
+        from_dlpack(decoded),
+        remove_clamps,
+    )
+    compiled(from_dlpack(scores), from_dlpack(packed), from_dlpack(decoded))
+    # Emulate the single-rounding FP32 FMA before rounding to an integer code.
+    bias = torch.tensor(55.65, dtype=torch.float32).double()
+    expected_codes = (
+        (scores.double() * 8 + bias).float().clamp(0, 126).round().to(torch.uint8)
+    )
+    torch.testing.assert_close(packed.view(torch.uint8), expected_codes, rtol=0, atol=0)
+    torch.testing.assert_close(
+        decoded, expected_codes.view(torch.float8_e4m3fn).float(), rtol=0, atol=0
+    )
+    assert (
+        decoded[-4] == 0
+    )  # Masked -inf must contribute neither numerator nor denominator.
