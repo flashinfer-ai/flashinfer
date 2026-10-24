@@ -73,14 +73,43 @@ which does not read like "throw the tuning results away" the way `enable_tuning=
 Bucketing (`tuning_buckets`, `round_up`, `skip_ops`) is delegated to `autotune()` unchanged;
 only persistence and measurement differ.
 
-**Attach semantics.** `persistent_cache=True` attaches the store for the remainder of the
-*process*; the context scopes only *when profiling cost may be paid*. This is forced by how the
-consumers actually run: both vLLM and SGLang serve **outside** any context (serving replays a
-captured CUDA graph — no Python runs at replay, and the autotuned ops are buried in layer
-forwards), so a context-scoped store would silently regress serving to heuristics the moment
-warmup exits. Consequently a process serves under one ambient policy (last attach wins), and
-`autotune_v2` does **not** nest — a v2-in-v2 context has ambiguous store targeting and fails
-fast. Nesting a plain `autotune()` inside or around it stays supported.
+**Attach semantics.** The default `cache_scope="process"` keeps the managed store
+attached after warmup, so bare inference continues using it. Sequential process
+attachments are last-wins. `cache_scope="context"` instead selects the store only
+inside the context, without changing the ambient pointer. Both use the same
+store registry, measurement identities and atomic persistence.
+
+An identified context scope (a managed store or a nonempty explicit measurement
+policy) excludes legacy-loaded and bundled winners. The legacy serving state
+remains available outside the scope. With `persistent_cache=False` and no policy
+identity, legacy memory/file behavior is unchanged. Shortlists and delegated
+protocol records follow the same identity as ordinary winners; only the first
+shortlisted tactic is persisted, as in process scope.
+
+Tune before capture, then select the same identity for capture-time warmups and
+capture. A completed CUDA graph replays no Python cache lookup. Uncaptured eager
+tails must use their appropriate policy or the ambient path. For example:
+
+```python
+graph_policy = MeasurementPolicy(execution_mode="cuda_graph", cold_l2=False)
+with autotune_v2(cache_scope="context", measurement_policy=graph_policy):
+    graph_region(inputs)  # tune before capture
+graph = torch.cuda.CUDAGraph()
+with autotune_v2(mode="replay", cache_scope="context", measurement_policy=graph_policy):
+    graph_region(inputs)  # capture-time warmup, using cached winners
+    with torch.cuda.graph(graph):
+        output = graph_region(inputs)
+graph.replay()
+eager_tail(output)  # existing ambient/legacy behavior
+```
+
+Nested v2 contexts remain unsupported; nesting ordinary `autotune()` is
+unchanged. `autotune_v2_reload()` must run outside context scopes: it clears all
+in-process partitions, immediately hydrates the ambient store, and other stores
+hydrate when next selected. Overlapping read-only replay scopes are supported;
+concurrent tuning/serving and distributed scoped-store use require separate
+qualification. Scoped ownership does not make the process-global tuning mode
+thread-local.
 
 ### 2.2 Store layout on disk
 
@@ -402,9 +431,10 @@ the `cache=` argument would change meaning under existing callers, and attach-vs
 change behavior after the `with` block exits. A distinct symbol makes the eventual convergence a
 rename rather than a silent semantic drift — provided §4 is committed to.
 
-**Context-scoped store instead of process attach.** Rejected: both consumers serve outside any
-context, so the store would detach at the end of warmup and serving would silently fall back to
-heuristics. The `with` belongs to tuning; serving is unavoidably context-free.
+**Context scope as the default.** Rejected: existing integrations serve bare
+Python calls after warmup. Process attachment remains the default; explicit
+context scope is available for integrations that select the correct identity
+during every uncaptured lookup, including capture-time forwards.
 
 **Tune on first call (Triton-style).** Rejected for serving: latency jitter in the engine loop,
 collective deadlocks when ranks tune at different times, must-precede-graph-capture ordering, and
@@ -414,9 +444,12 @@ profiling OOM risk.
 cross-rank lock either serializes warmup or deadlocks it. Redundant measurement is the cheaper
 failure mode.
 
-**Per-bucket or per-region measurement policy.** Explicit non-goal. Prefill (large M) and decode
-(small M) land in disjoint shape buckets, so each bucket is served in one consistent mode; a
-single ambient policy matching the mode-sensitive path is sufficient.
+**Mixed execution policies.** Eager and graph execution can share a bucket.
+Frameworks should select policy by actual capture coverage and fallback routing,
+not by prefill/decode labels or an M threshold alone. Explicit context scopes
+allow managed graph winners alongside existing eager serving. Frameworks still
+own region routing and must track warmup by identity/region, not one global
+"warmed up" flag.
 
 ## 6. Limitations and future work
 
