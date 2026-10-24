@@ -165,9 +165,13 @@ def _collective_call(function, group, description):
         result = function()
     except BaseException as exc:
         error = exc
-    reports = _gather(
-        None if error is None else f"{type(error).__name__}: {error}", group
-    )
+    report = None
+    if error is not None:
+        # Bound peer diagnostics while preserving the original local exception.
+        report = f"{type(error).__name__}: {error}"
+        if len(report) > 512:
+            report = report[:509] + "..."
+    reports = _gather(report, group)
     if any(report is not None for report in reports):
         if error is not None:
             raise error

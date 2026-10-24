@@ -425,3 +425,42 @@ def test_failed_selection_rolls_back_mutated_workspace(host_case, monkeypatch, p
     assert c.ws.tactic == original and c.ws.is_autotuned
     assert c.ws.restores == [original]
     assert get_autotune_process_group() is None
+
+
+@pytest.mark.parametrize(
+    "message", ["short failure", "x" * 501, "x" * 502, "x" * 10000]
+)
+def test_collective_failure_bounds_peer_report_and_preserves_local_error(
+    monkeypatch, message
+):
+    module = importlib.import_module(select_tactic.__module__)
+    error = ValueError(message)
+    sent = []
+
+    def gather(report, group):
+        sent.append(report)
+        return [report]
+
+    def fail():
+        raise error
+
+    monkeypatch.setattr(module, "_gather", gather)
+    with pytest.raises(ValueError) as raised:
+        module._collective_call(fail, None, "test selection")
+    assert raised.value is error
+    assert str(raised.value) == message
+    report = sent[0]
+    assert len(report) <= 512
+    if len(f"ValueError: {message}") <= 512:
+        assert report == f"ValueError: {message}"
+    else:
+        assert report.startswith("ValueError: ") and report.endswith("...")
+
+    def peer_failure(local_report, group):
+        assert local_report is None
+        return [None, report]
+
+    monkeypatch.setattr(module, "_gather", peer_failure)
+    with pytest.raises(RuntimeError, match="failed on a peer") as raised:
+        module._collective_call(lambda: 42, None, "test selection")
+    assert report in str(raised.value)

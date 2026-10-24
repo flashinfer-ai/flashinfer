@@ -360,3 +360,6 @@ group. Recoverable host/compilation failures during selection restore the
 pre-sweep tactic and tuning state on every rank before returning an error.
 The tuner serializes the whole collective session; other threads using that
 tuner wait until it completes. Call selection in the same order on all EP ranks.
+Use one process per GPU. Session serialization is required for correctness
+through selection and rollback, so the shared tuning group and policy cannot
+change between collectives.

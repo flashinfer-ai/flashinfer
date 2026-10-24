@@ -2126,6 +2126,9 @@ class AutoTuner:
         must not change between preflight, preparation and timing collectives.
         Use one process per GPU and call in the same order on every rank.
         Other threads using this tuner wait until the entire session finishes.
+        This serialization is required for correctness, including rollback:
+        narrowing the lock to preflight would let another session change the
+        shared group or tuning policy between collectives.
         """
         with self._lock:
             previous = get_autotune_process_group()

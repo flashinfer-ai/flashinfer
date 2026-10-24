@@ -213,6 +213,8 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
             # Scheduling/epilogue-only changes reuse exactly the same counters.
             # Their phases persist; each launch resets its declared prefixes.
             self.tactic, self.plan = tactic, plan
+            # Deliberately invalidate selection even when storage is unchanged:
+            # the new scheduling tactic has not been selected by the tuner.
             self.clear_autotune_selection()
             return
         # No rank may still run on the old layout while a peer clears the
