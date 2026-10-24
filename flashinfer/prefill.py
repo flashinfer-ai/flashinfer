@@ -8225,6 +8225,10 @@ def trtllm_batch_context_with_kv_cache(
         When :attr:`kv_layout` is ``NHD``, scale tensors are transposed to HND internally
         (incurring a ``.contiguous()`` copy). Use ``HND`` for better performance.
 
+        For a ``head_dim`` without an NVFP4 KV context kernel, convert the pages to FP8
+        with :func:`flashinfer.quantization.kernels.nvfp4_kv_materialize_fp8` and pass
+        the FP8 cache instead.
+
         **Contiguity requirements (trtllm-gen backend):**
 
         - The last two dims (``page_size``, ``head_dim // 16``) **must** be contiguous
