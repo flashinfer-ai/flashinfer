@@ -42,7 +42,7 @@ def test_xqa_mla_reference_correctness(shape_kwargs):
     from flashinfer.trace.templates.page import xqa_mla_trace
 
     if _cc()[0] != 12:
-        pytest.skip("XQA MLA kernel only supports SM120/121")
+        pytest.skip("XQA MLA kernel only supports SM120/SM121")
     inputs = xqa_mla_trace.init(**shape_kwargs)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     xqa_mla(
