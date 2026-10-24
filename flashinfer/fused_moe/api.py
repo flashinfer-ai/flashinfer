@@ -2946,14 +2946,14 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM100/SM103/SM107, with FMA-only SM120 support.
+    """Low-token routed MoE on SM90/SM100/SM103/SM107/SM120.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
     NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
     prepared weights and numerical contract. Both are multi-kernel pipelines,
-    with precomputed routing and no EP communication. The Tensor Core path
+    with precomputed routing and no EP communication. The MX Tensor Core path
     overlaps its fused GU/activation/quantizer and Down GEMM through PDL.
     Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
     Prepare other backend views as well to permit fallback for larger inputs.
@@ -2965,7 +2965,11 @@ class FrostLowLatencyConfig:
     outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
     separate FP32 multiplication and addition. Packed routing scores retain
     BF16 rounding regardless of the input/output dtype. This is distinct from
-    the MX intermediate quantization/combine contract.
+    the MX intermediate quantization/combine contract. SM90 and SM120 also
+    offer grouped BF16 Tensor Core candidates for default SwiGLU,
+    H=2048/I=512/top-k=10, T=4 or 8, with finalized BF16 output. Those
+    projections share the typed intermediate and ordered combine contract;
+    FMA remains the untuned default and a tuning candidate.
 
     Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
     BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
