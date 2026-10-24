@@ -429,8 +429,8 @@ __device__ __forceinline__ float compute_4over6_error_rn(float diff) {
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
-    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout,
-    float rowAmax = 0.0f) {
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, float reciprocalSFScaleVal,
+    uint8_t* SFout, float rowAmax = 0.0f) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
@@ -500,11 +500,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
-    // Get the output scale.
-    // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
-    outputScale = vecMax != 0
-                      ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                      : 0.0f;
+    // Preserve the original decode scale when the caller has it: rcp(rcp(s)) can differ from s.
+    outputScale = vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
   }
 
   if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
