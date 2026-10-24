@@ -2941,3 +2941,58 @@ def test_batch_prefill_plan_max_lens(batch_size, page_size, seq_lens_dtype):
     assert wrapper._max_q_len == int(q_lens.max())
     assert type(wrapper._max_kv_len) is int
     assert wrapper._max_kv_len == int(kv_lens.max())
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    # (q fill value, head_dim): (32768, 128) hits the NaN case of issue #6907,
+    # (16384, 128) the finite-LSE-bias case, and head_dim 512 routes the kernel
+    # through the VO-split rescale path.
+    "q_val, head_dim",
+    [(32768, 128), (16384, 128), (32768, 512), (1024, 512)],
+)
+def test_ragged_prefill_unchanged_running_max(dtype, q_val, head_dim):
+    # Regression for #6907: an early dominant key keeps the running max unchanged
+    # across KV tiles. Rescaling must not produce NaNs or -inf LSE.
+    if head_dim > 256 and get_compute_capability(torch.device("cuda"))[0] < 8:
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
+
+    num_heads, kv_len = 1, 4096
+    q = torch.full((1, num_heads, head_dim), q_val, dtype=dtype, device="cuda")
+    k = torch.zeros(kv_len, 1, head_dim, dtype=dtype, device="cuda")
+    v = torch.zeros_like(k)
+    k[0] = 160.0
+    v[0] = 1.0
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="fa2",
+    )
+    wrapper.plan(
+        torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        torch.tensor([0, kv_len], dtype=torch.int32, device="cuda"),
+        1,
+        1,
+        head_dim,
+        q_data_type=q.dtype,
+        kv_data_type=k.dtype,
+        disable_split_kv=True,
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    assert not torch.isnan(o.float()).any()
+    assert torch.isfinite(lse).all()
+    o_ref, _ = ref_single_prefill(q, k, v)
+    torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+    # log2-domain LSE (the kernel's convention). Allow FP32 rounding error
+    # while catching the finite LSE drift at q=16384 (pre-fix ~62; -inf at
+    # q=32768).
+    scores = (q[0, 0].double() @ k[:, 0].double().T) * head_dim**-0.5
+    lse_ref = (
+        scores.max() + torch.log(torch.exp(scores - scores.max()).sum())
+    ) * math.log2(math.e)
+    atol = 8 * torch.finfo(torch.float32).eps * abs(float(lse_ref))
+    torch.testing.assert_close(
+        lse.flatten().float(), lse_ref.flatten().float(), rtol=0.0, atol=atol
+    )
