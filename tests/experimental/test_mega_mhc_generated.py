@@ -44,6 +44,8 @@ H4096_TOKENS = (
     8192,
 )
 H4096_SM_COUNTS = (148, 152, 208, 212, 216)
+# The architectures every hidden-4096 program ships for, in the records' order.
+H4096_ARCHES = ["sm_107a", "sm_100a", "sm_103a"]
 # The hidden-4096 output layouts: the BF16 output alone, or the BF16 output beside
 # its quantization (vLLM's per-token-group FP8 of it; bitwise, the tests hold).
 H4096_LAYOUTS = ("bf16", "fp8_group128", "nvfp4")
@@ -1200,11 +1202,13 @@ def test_h4096_quant_routes_select_their_programs():
         == base["launch"]["dynamic_smem_bytes"] + 4096 * 2
     )
     matrix = _runtime._support_matrix()
-    assert "hidden=4096 output=bf16 on ['sm_107a']" in matrix
+    assert f"hidden=4096 output=bf16 on {H4096_ARCHES}" in matrix
     for layout in ("fp8_group128", "nvfp4"):
         exported = _runtime.supported("sm_107a", 4096, layout)
         assert not _runtime.supported("sm_107a", 5120, layout)
-        assert not _runtime.supported("sm_100a", 4096, layout)
+        assert _runtime.supported("sm_100a", 4096, layout) == exported
+        assert _runtime.supported("sm_103a", 4096, layout) == exported
+        assert not _runtime.supported("sm_120a", 4096, layout)
         if not exported:
             assert f"output={layout}" not in matrix
             with pytest.raises(NotImplementedError, match="(?i)exported:"):
@@ -1225,13 +1229,43 @@ def test_h4096_quant_routes_select_their_programs():
             )
             assert same[0] == program, "a single-program layout ignores the regime"
         record = _runtime.PROGRAMS[program]
-        assert record["hidden"] == 4096 and record["arches"] == ["sm_107a"]
+        assert record["hidden"] == 4096 and record["arches"] == H4096_ARCHES
         routes = [r for r in _runtime.ROUTES if r["program"] == program]
         assert [r["sf_layout"] for r in routes] == [layout]
-        assert f"hidden=4096 output={layout} on ['sm_107a']" in matrix
+        assert f"hidden=4096 output={layout} on {H4096_ARCHES}" in matrix
         names = [name for _kind, name in _runtime.record_arg_plan(record)]
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"]
         assert set(QUANT_OUTPUTS[layout]) < set(names)
+
+
+def test_h4096_every_program_ships_for_every_listed_architecture():
+    """Each hidden-4096 record lists the same three architectures, sm_107a first,
+    and the routes select the same program on each of them; hidden 5120 stays
+    unexported on sm_107a."""
+    h4096 = [
+        name for name, record in _runtime.PROGRAMS.items() if record["hidden"] == 4096
+    ]
+    assert len(h4096) == 5
+    for name in h4096:
+        assert _runtime.record_arches(_runtime.PROGRAMS[name]) == H4096_ARCHES, name
+    for arch in H4096_ARCHES:
+        for splits, regime, program in (
+            (64, "bf16", BF16_PROGRAM),
+            (16, "tailpipe", TAILPIPE_PROGRAM),
+            (16, "tailpipe_wsmem", WSMEM_PROGRAM),
+        ):
+            assert _runtime.select_program(
+                4096, splits, False, False, "bf16", arch, regime=regime
+            ) == (program, {})
+        for layout in ("fp8_group128", "nvfp4"):
+            if _runtime.supported(arch, 4096, layout):
+                program, defines = _runtime.select_program(
+                    4096, 16, False, False, layout, arch
+                )
+                assert program not in (BF16_PROGRAM, TAILPIPE_PROGRAM, WSMEM_PROGRAM)
+                assert defines == {}
+        assert _runtime.supported(arch, 5120, "col") == (arch != "sm_107a")
+    assert _runtime.shipped_arches() == sorted(H4096_ARCHES)
 
 
 def test_h4096_quant_keyword_rules():
