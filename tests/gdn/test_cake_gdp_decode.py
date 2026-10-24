@@ -1134,10 +1134,17 @@ def test_misaligned_bf16_output_is_copied_back() -> None:
 def test_alignment_constants_match_the_kernel_sources() -> None:
     """The host checks' alignment constants are the widest vector accesses the shipped
     kernel sources make on q, k and the output (``reinterpret_cast`` on those pointers);
-    v, a and b are read element by element."""
+    v, a and b are read element by element (at most one 2-byte element per access)."""
     import flashinfer.cake_gdp_backend as backend
 
-    widths = {"__nv_bfloat162": 4, "int2": 8, "uint2": 8, "uint4": 16, "float4": 16}
+    widths = {
+        "uint16_t": 2,
+        "__nv_bfloat162": 4,
+        "int2": 8,
+        "uint2": 8,
+        "uint4": 16,
+        "float4": 16,
+    }
     access = re.compile(
         r"reinterpret_cast<(?:const )?(\w+)\s*\*>\("
         r"(?:&\(\(\w+\*\)\()?(q|k|v|a|b|out)\b"
@@ -1150,7 +1157,7 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
             widest[name] = max(widest.get(name, 0), widths[cast])
     assert widest["q"] == widest["k"] == backend._QK_ALIGNMENT_BYTES == 8
     assert widest["out"] == backend._OUTPUT_ALIGNMENT_BYTES == 8
-    assert not {"v", "a", "b"} & widest.keys(), widest
+    assert all(widest.get(name, 0) <= 2 for name in ("v", "a", "b")), widest
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
