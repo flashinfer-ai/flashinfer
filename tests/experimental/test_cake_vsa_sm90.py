@@ -2991,24 +2991,70 @@ def _fp8_plan_for(mask, scales, scale=None, route=None):
     )
 
 
-def _cuda_kernel_names(fn) -> list[str]:
-    """CUDA kernel names of one call of ``fn`` (memcpy / memset activities excluded); the profiler's warm-up
-    step runs one call whose records are discarded."""
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-    ) as profile:
+def _profiled_kernel_names(fn, scheduled: bool) -> list[str]:
+    """CUDA kernel names of one call of ``fn`` from a ``torch.profiler`` session (memcpy / memset activities
+    excluded); the scheduled form runs one warm-up call whose records are discarded."""
+    kwargs = {"activities": [torch.profiler.ProfilerActivity.CUDA]}
+    if scheduled:
+        kwargs["schedule"] = torch.profiler.schedule(
+            wait=0, warmup=1, active=1, repeat=1
+        )
+    with torch.profiler.profile(**kwargs) as profile:
         fn()
         torch.cuda.synchronize()
-        profile.step()
-        fn()
-        torch.cuda.synchronize()
+        if scheduled:
+            profile.step()
+            fn()
+            torch.cuda.synchronize()
     return [
         event.name
         for event in profile.events()
         if event.device_type == torch.autograd.DeviceType.CUDA
         and not event.name.startswith(("Memcpy", "Memset"))
     ]
+
+
+def _graph_kernel_names(fn) -> list[str]:
+    """Kernel names of one call of ``fn`` read from a CUDA graph capture of it through cuda-python (memset /
+    memcpy nodes excluded): a CUPTI-free route for a process whose profiler no longer records device activity."""
+    from cuda.bindings import driver
+
+    def check(result):
+        err, *rest = result
+        assert err == driver.CUresult.CUDA_SUCCESS, err
+        return rest[0] if len(rest) == 1 else rest
+
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        fn()
+    torch.cuda.synchronize()
+    handle = driver.CUgraph(graph.raw_cuda_graph())
+    _, count = check(driver.cuGraphGetNodes(handle, 0))
+    nodes, count = check(driver.cuGraphGetNodes(handle, count))
+    names = []
+    for node in nodes[:count]:
+        kind = check(driver.cuGraphNodeGetType(node))
+        if kind != driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            continue
+        params = check(driver.cuGraphKernelNodeGetParams(node))
+        func = params.func
+        if int(func) == 0 and int(params.kern) != 0:
+            func = check(driver.cuKernelGetFunction(params.kern))
+        names.append(check(driver.cuFuncGetName(func)).decode())
+    return names
+
+
+def _cuda_kernel_names(fn) -> list[str]:
+    """CUDA kernel names of one call of ``fn``, read from a CUDA graph capture of it (every kernel node, in launch
+    order; memset / memcpy nodes excluded).  The capture route does not depend on CUPTI: in a long test process
+    Kineto drops device records whose GPU timestamps fall outside the profiler's capture window, so a
+    ``torch.profiler`` session can come back empty or partial.  The profiler route is kept only for a torch
+    without ``CUDAGraph.raw_cuda_graph``."""
+    if hasattr(torch.cuda.CUDAGraph, "raw_cuda_graph"):
+        return _graph_kernel_names(fn)
+    return _profiled_kernel_names(fn, scheduled=True)
 
 
 @requires_hopper
@@ -3759,7 +3805,8 @@ def test_gqa_tagged_kernel_matches_the_untagged_and_mha_programs(
     assert tagged.mode == "pair" and not tagged.queue and not tagged.compact
     assert tagged.tagged and tagged.stage == "attention_gqa_tagged"
     symbol = loader.MODULES["attention_gqa_tagged"]["kernel_symbol"]
-    names = _cuda_kernel_names(lambda: tagged.run(q, k, v))
+    scratch = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    names = _cuda_kernel_names(lambda: tagged.run(q, k, v, out=scratch))
     assert [name for name in names if name.startswith("kernel_")] == [symbol], names
     record_property("gqa_tagged_stage", tagged.stage)
     record_property("gqa_tagged_kernel", symbol)
@@ -4156,7 +4203,8 @@ def test_fp8_gqa_tagged_kernel_matches_the_untagged_and_mha_programs(
     assert tagged.mode == "pair" and not tagged.queue and not tagged.compact
     assert tagged.tagged and tagged.stage == "attention_fp8_gqa_tagged"
     symbol = loader.MODULES["attention_fp8_gqa_tagged"]["kernel_symbol"]
-    names = _cuda_kernel_names(lambda: tagged.run(q8, k8, v8))
+    scratch = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    names = _cuda_kernel_names(lambda: tagged.run(q8, k8, v8, out=scratch))
     assert [name for name in names if name.startswith("kernel_")] == [symbol], names
     record_property("fp8_gqa_tagged_stage", tagged.stage)
     record_property("fp8_gqa_tagged_kernel", symbol)
