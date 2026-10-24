@@ -117,13 +117,18 @@ TILE_TOKENS = 64
 # decode, 512 for the tcgen05 one), the resident CTAs per SM the split rule
 # counts on (the plain decode's launch bound: two for the ``mma.sync`` decode,
 # one for the tcgen05 decode, whose tensor memory and shared-memory pool hold
-# the SM) and the co-residency of the cooperative decode per SM, the fused
-# form's capacity (the architectures whose multi-split calls take the fused
-# form; ``sm_80`` is absent: its calls take the split form alone).  The
-# exporter holds every table to the kernel files.
+# the SM) and the fused form's capacity per SM: the form rule picks the fused
+# form only below ``DECODE_FUSED_CTAS_PER_SM[arch]`` x the SM count CTAs
+# (``sm_80`` is absent: its calls take the split form alone).  0 = the fused
+# form is never selected for the architecture: on sm_100a / sm_103a the
+# tcgen05 program's separate form (the plain decode, then the merge kernel)
+# measured faster whole-call at every row whose fused grid fits (a B200 by
+# 0.7-4.5 us, a GB300 by 2.5-5.3 us at rows 16-32); the co-resident records
+# stay for the tests that launch them.  The exporter holds the launch-bound
+# tables to the kernel files and the fused table to its host policy.
 DECODE_THREADS = {"sm_80": 128, "sm_90a": 128, "sm_100a": 512, "sm_103a": 512}
 DECODE_CTAS_PER_SM = {"sm_80": 2, "sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
-DECODE_FUSED_CTAS_PER_SM = {"sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
+DECODE_FUSED_CTAS_PER_SM = {"sm_90a": 2, "sm_100a": 0, "sm_103a": 0}
 # The long-stream bound of the ``multi_wave_long`` grid class: the per-CTA tile
 # stream, ``ceil(tiles / splits)``, from which the whole-tile program measured
 # faster than the K-first one above one resident wave; 16 tiles = 1024 selected

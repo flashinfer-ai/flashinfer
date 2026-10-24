@@ -77,15 +77,16 @@ B200 (148 SMs) at the owner's 24 x 2 heads and 2051 selections the formula
 gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1, 2, 4, 8, 16, 32, 64, 128.
 
 **Form rule.** With one split the plain decode writes `out` itself. Above
-one split, on compute capability 9.0, 10.0 and 10.3 the call takes the *fused*
-form (the cooperative build of the architecture's decode, whose CTAs merge the
-splits in the same launch through a counter per (row, KV head)) when `rows *
-num_kv_heads * splits` does not exceed the co-residency the decode's launch
-bound guarantees (`FUSED_CTAS_PER_SM[arch]` times the SM count: two per SM on
-9.0, 264 on an H100; one per SM on 10.0 / 10.3, 148 on a B200); otherwise, and
-always on compute capability 8.x, the *split* form: the plain decode, then
-the separate merge (`(rows, ceil(num_qo_heads / heads_per_cta))` CTAs, one
-head per CTA above four splits, four at or below).
+one split, on compute capability 9.0 the call takes the *fused* form (the
+cooperative build of the decode, whose CTAs merge the splits in the same
+launch through a counter per (row, KV head)) when `rows * num_kv_heads *
+splits` does not exceed the co-residency the decode's launch bound guarantees
+(`FUSED_CTAS_PER_SM[arch]` times the SM count: two per SM, 264 on an H100);
+otherwise, and always on compute capability 8.x, 10.0 and 10.3
+(`FUSED_CTAS_PER_SM` is 0 there: the tcgen05 decode's separate form measured
+faster whole-call at every row whose fused grid fits), the *split* form: the
+plain decode, then the separate merge (`(rows, ceil(num_qo_heads /
+heads_per_cta))` CTAs, one head per CTA above four splits, four at or below).
 
 **Program rule.** The records are filtered by the device's architecture
 first: the `mma.sync` decode's records on 8.x / 9.0, the tcgen05 decode's on
@@ -158,7 +159,7 @@ environment-stream context.
   that slice, writing the gated BF16 output.
 - `decode_tcgen05` (plain build, `sm_100a` / `sm_103a`): the Blackwell
   decode with the same parameters, grid and outputs; 512 threads in six roles
-  (softmax, K transform, V transform, gather, two MMA issuers), a six-stage
+  (softmax, K transform, V transform, gather, two MMA issuers), a four-stage
   `cp.async` raw ring, K dequantized into tensor memory and V into shared
   memory as BF16, `S^T = K Q^T` and `O^T = V^T P^T` on `tcgen05.mma`, the same
   64-token online softmax and rounding points as the `mma.sync` decode; its
@@ -166,11 +167,14 @@ environment-stream context.
   one CTA per SM.
 - `decode_tcgen05_coop` (cooperative build, `sm_100a` / `sm_103a`): the
   tcgen05 decode launched cooperatively, its softmax warps running the same
-  counter and slice merge as `decode_coop`; one CTA per SM, so the fused
-  form's capacity is the SM count.
+  counter and slice merge as `decode_coop`; one CTA per SM. The host never
+  selects it (the fused form's capacity is 0 on 10.0 / 10.3: the separate
+  form measured faster whole-call); it ships for the tests that launch it.
 - `merge`: `out[row, head] = bf16(bf16(merged) * sigmoid(gate))` where
   `merged` is the LSE-weighted mean of the splits' partials; split-parallel
-  over four warps above four splits, one warp per head at or below.
+  over four warps above four splits, one warp per head at or below. On
+  `sm_100a` / `sm_103a` the split-parallel form prefetches a wider first
+  batch.
 
 Every kernel is compiled with `--use_fast_math` (recorded on every
 `build.json` entry); `--fmad=true` is nvcc's default.
@@ -194,4 +198,4 @@ The registry's derived leaves and everything under `csrc/`, `build.json` and
 Experimental. Validated against the default implementation's test suite with
 `backend="cake"` on compute capability 9.0 (`sm_90a`, H100) and 8.0 (`sm_80`,
 A100 80 GB and 40 GB PCIe); the tcgen05 programs (`sm_100a`, `sm_103a`)
-against the same suite on a B200 (10.0).
+against the same suite on a B200 (10.0) and a GB300 (10.3).

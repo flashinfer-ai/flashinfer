@@ -68,9 +68,9 @@ CTAS_PER_SM = {"sm_80": 2, "sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
 # The mma.sync decode's shared-memory pool, passed as dynamic shared memory by its binding;
 # two CTAs of it fit an SM (the launch bound).  The merge uses static shared memory alone.
 DECODE_SMEM_BYTES = 49792
-# The tcgen05 decode's pool, written into the registry by the export render of the first
-# Blackwell delivery (0 is the seed's placeholder until that render lands).
-DECODE_TCGEN05_SMEM_BYTES = 0
+# The tcgen05 decode's pool (four raw stages, 158,848 B, plus its barrier words), passed as
+# dynamic shared memory by its binding; one CTA of it holds an SM (the launch bound).
+DECODE_TCGEN05_SMEM_BYTES = 159872
 MAX_SPLITS = 128  # the merge kernel's split bound: the host rule never passes more
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128)  # the decode row counts of the owner's shape list
 
@@ -788,10 +788,11 @@ def test_capabilities_route_to_the_four_libraries():
     for capability in ((7, 5), (10, 7), (12, 0), (12, 1)):
         assert cake_jit.arch_for_capability(capability) is None
     assert set(cake_jit.ARCH_BY_CAPABILITY.values()) == set(cake_jit.ARCHES)
-    # The per-architecture launch-bound tables cover every architecture; the fused table every one but sm_80.
+    # The per-architecture launch-bound tables cover every architecture; the fused table every one but sm_80, with
+    # the host policy's 0 on the tcgen05 architectures (the separate form is faster whole-call there).
     assert cake_jit.DECODE_THREADS == {"sm_80": 128, "sm_90a": 128, "sm_100a": 512, "sm_103a": 512}
     assert cake_jit.DECODE_CTAS_PER_SM == CTAS_PER_SM
-    assert cake_jit.DECODE_FUSED_CTAS_PER_SM == {"sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
+    assert cake_jit.DECODE_FUSED_CTAS_PER_SM == {"sm_90a": 2, "sm_100a": 0, "sm_103a": 0}
     assert cake_backend.FUSED_CTAS_PER_SM == cake_jit.DECODE_FUSED_CTAS_PER_SM
 
 

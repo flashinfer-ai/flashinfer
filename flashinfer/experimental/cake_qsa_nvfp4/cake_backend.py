@@ -34,20 +34,21 @@ names ``(sm_count, rows)``; then ``splits <= min(tiles, MAX_SPLITS)``.  The
 rule reads the architecture and the SM count alone, cached per device.  On a
 B200 (148 SMs) the formula gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1,
 2, 4, 8, 16, 32, 64, 128 of the owner's shape (2 KV heads, 33 tiles); the
-table has no entry for 148 SMs yet.
+table has no entry for 148 SMs (nor for the GB300's 152): the formula wins or
+ties every measured alternative there.
 
 Form rule (:func:`select_form`): with one split the plain decode writes the
-output itself.  Above one split, on an architecture of
-:data:`FUSED_CTAS_PER_SM` (compute capability 9.0, 10.0 and 10.3) the call
-takes the *fused* form -- the cooperative build of the decode, whose CTAs merge
-the splits in the same launch through a counter per (row, KV head) -- when its
+output itself.  Above one split, on compute capability 9.0 the call takes the
+*fused* form -- the cooperative build of the decode, whose CTAs merge the
+splits in the same launch through a counter per (row, KV head) -- when its
 grid ``rows * num_kv_heads * splits`` does not exceed the co-residency the
 decode's launch bound guarantees on the device (:func:`fused_capacity`:
-``FUSED_CTAS_PER_SM[arch]`` times the SM count: 264 on an H100, 148 on a B200,
-where a tensor-memory kernel holds one CTA per SM; a cooperative launch above
-the device's co-residency is refused by the driver); else, and always on
-compute capability 8.x, the *split* form: the plain decode, then the separate
-merge.
+``FUSED_CTAS_PER_SM[arch]`` times the SM count, 264 on an H100; a cooperative
+launch above the device's co-residency is refused by the driver); else, and
+always on compute capability 8.x, 10.0 and 10.3 (``FUSED_CTAS_PER_SM`` is 0
+there: the tcgen05 decode's separate form measured faster whole-call at every
+row whose fused grid fits), the *split* form: the plain decode, then the
+separate merge.
 
 Program rule (:func:`select_wide`, then :func:`cake_jit.select_records`): the
 registry's records are filtered by the device's architecture first (the
@@ -136,7 +137,8 @@ _LOG2E = math.log2(math.e)
 # (2 KV heads, a selection of 2051 tokens = 33 tiles) differs from the formula.  Keyed by the SM count, never by a
 # product name.  H100 (132 SMs): rows 4 take 16 splits and rows 8 take 8; A100 (108 SMs): rows 64 take 4 and rows
 # 128 take 2 (both above the formula's capacity; a plain launch runs in more than one wave).  No entry for a Blackwell
-# SM count yet (B200: 148): its rows run the formula at the tcgen05 decode's one CTA per SM until measured.
+# SM count: on 148 SMs (B200) and 152 SMs (GB300) the tcgen05 decode's one-CTA-per-SM formula wins or ties every measured
+# alternative (half splits, two-wave grids: whole call, both layouts, both flushes), so its rows run the formula.
 SPLIT_OVERRIDES: dict[tuple[int, int], int] = {
     (132, 4): 16,
     (132, 8): 8,
