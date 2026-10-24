@@ -474,6 +474,110 @@ def test_xqa(
     )
 
 
+@pytest.mark.parametrize("head_dim,num_kv_heads,group_size", [(128, 8, 4), (256, 2, 8)])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("window", [0, 255, 256, 257])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("workspace_bytes", [1024, 16 << 20])
+def test_xqa_sm120_split_graph_replay(
+    head_dim, num_kv_heads, group_size, enable_pdl, window, use_sinks, workspace_bytes
+):
+    """One graph handles changing split counts and mixed request lengths safely."""
+    if get_compute_capability(torch.device("cuda")) != (12, 0):
+        pytest.skip("Requires SM120")
+    set_random_seed(6694)
+    batch = sm_count // num_kv_heads + 1 if head_dim == 128 else 3
+    page_size, stored_length, capacity = 16, 4096, 65536
+    pages = stored_length // page_size
+    shape = (batch * pages, num_kv_heads, page_size, head_dim)
+    k = torch.randn(shape, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    q = torch.randn(
+        (batch, 1, num_kv_heads * group_size, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    out = torch.empty_like(q)
+    table = torch.zeros(
+        (batch, capacity // page_size), device="cuda", dtype=torch.int32
+    )
+    table[:, :pages] = torch.arange(batch * pages, device="cuda").reshape(batch, pages)
+    lens = torch.full((batch, 1), stored_length, device="cuda", dtype=torch.uint32)
+    guarded = torch.full((workspace_bytes + 512,), 91, device="cuda", dtype=torch.uint8)
+    workspace = guarded[256:-256]
+    sem = torch.zeros(
+        (2 * batch * num_kv_heads + 8,), device="cuda", dtype=torch.uint32
+    )
+    sinks = (
+        torch.randn((num_kv_heads, group_size), device="cuda") if use_sinks else None
+    )
+    q_scale = torch.tensor(0.5, device="cuda")
+    kv_scale = torch.tensor(0.5, device="cuda")
+
+    def run():
+        xqa(
+            q,
+            k,
+            v,
+            table,
+            lens,
+            out,
+            workspace,
+            sem,
+            num_kv_heads,
+            page_size,
+            kv_layout="HND",
+            enable_pdl=enable_pdl,
+            sinks=sinks,
+            sliding_win_size=window,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    pattern = [0, 1, 255, 256, 257, 1024, 4096]
+    for step in range(4):
+        lengths = [pattern[(i + step * 2) % len(pattern)] for i in range(batch)]
+        lens.copy_(
+            torch.tensor(lengths, device="cuda", dtype=torch.uint32).view(batch, 1)
+        )
+        q.mul_(0.9)
+        q_scale.fill_(0.5 if step % 2 else 1.0)
+        kv_scale.fill_(0.5 if step % 2 else 1.0)
+        graph.replay()
+        for i, length in enumerate(lengths):
+            if length == 0:
+                reference = torch.zeros_like(out[i])
+            else:
+                ki = k[i * pages : (i + 1) * pages].permute(1, 0, 2, 3)
+                vi = v[i * pages : (i + 1) * pages].permute(1, 0, 2, 3)
+                reference = ref_attention(
+                    q[i].reshape(1, num_kv_heads, group_size, head_dim),
+                    ki.reshape(1, num_kv_heads, stored_length, head_dim),
+                    vi.reshape(1, num_kv_heads, stored_length, head_dim),
+                    length,
+                    q_scale,
+                    kv_scale,
+                    1.0,
+                    sinks,
+                    window,
+                    head_dim,
+                ).reshape_as(out[i])
+            torch.testing.assert_close(
+                out[i].float(), reference.float(), rtol=0.03, atol=0.004
+            )
+        assert torch.all(guarded[:256] == 91)
+        assert torch.all(guarded[-256:] == 91)
+        assert torch.count_nonzero(sem) == 0
+
+
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
     reason="XQA mla is only supported on SM120/SM121 GPUs",
