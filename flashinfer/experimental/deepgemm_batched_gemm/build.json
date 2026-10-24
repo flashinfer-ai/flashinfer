@@ -52,14 +52,14 @@
     }
   },
   "generator": {
-    "cake_revision": "ec8ee046ea9f8691145091f7fff60fe83f024376",
-    "cuda": "13.4.92",
-    "rendered_at": "2026-10-20T23:25:25Z"
+    "cake_revision": "2aa3949d9e5ccfe1fc51fe6e2a50f562a1155c4a",
+    "cuda": "13.5.0",
+    "rendered_at": "2026-10-24T05:41:33Z"
   },
   "libraries": [
     {
       "arch": "sm_100a",
-      "closure_sha256": "255fd827b8a7cce2fe18467c10a4e9792a8561bc9f42c957fecb97ecfd68b23e",
+      "closure_sha256": "012bb09ce088e769caa2d7333d1aec31493b30000cef61824f60f141fcc38210",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -69,7 +69,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_1931777936a4c257b75f_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_binding.cu": "2f4c7c8936b962dcfb6960958d5f1eb450376bced56eb307e064ab7adff8d746",
-        "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_kernel.cu": "35b4571b2808f7693fb728cc20b4af8a178bcd0a9c29194bfbb6e1fb56a3163c"
+        "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_kernel.cu": "6db6b623cd2574f386d74783f6856e33f6310e333c7e3c6c14a74deec5b3c1e6"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_kernel.cu",
@@ -78,7 +78,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "b21c86acf37f228e827eac57d4c05747248e4b76dc766bb3d7193e7768040a8a",
+      "closure_sha256": "023f5bc7420896f00940a3c8bdd97af755954a9b459ed8798f42ea0344b62b3e",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -88,7 +88,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_1931777936a4c257b75f_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_binding.cu": "2f4c7c8936b962dcfb6960958d5f1eb450376bced56eb307e064ab7adff8d746",
-        "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_kernel.cu": "35b4571b2808f7693fb728cc20b4af8a178bcd0a9c29194bfbb6e1fb56a3163c"
+        "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_kernel.cu": "6db6b623cd2574f386d74783f6856e33f6310e333c7e3c6c14a74deec5b3c1e6"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_1931777936a4c257b75f_kernel.cu",
@@ -97,7 +97,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "553c46f45883073d8a0949dd8a37b23853b43c13aace722de53b7d7a148ffabf",
+      "closure_sha256": "6162c4ef3d169962a1e1416dbcb5619a2c288167cf400bafad33e037638fba62",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -107,7 +107,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_binding.cu": "02861ee2a2464e4cacdf09588567a80091b4fee8fe08912e00cdde9dabb9a872",
-        "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_kernel.cu": "13d32680359b3fc7d9b67b320a047b0f4c3adcd2ab1b7d7a6ef1e285f0861c26"
+        "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_kernel.cu": "fa1ed5be69db8945de3e4f0a6f8abc58a511d66068900f6a8ae8965f07653999"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_kernel.cu",
@@ -116,7 +116,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "c98b88d325b4bacb2f3b8eda876f956f74ea84a5ca44651d3fcf8b89de47cc40",
+      "closure_sha256": "4736c8b7290f22839e5bb0fc93cc4fca5afe6f3305f3917cb98a4d7dde38e804",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -126,7 +126,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_binding.cu": "02861ee2a2464e4cacdf09588567a80091b4fee8fe08912e00cdde9dabb9a872",
-        "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_kernel.cu": "13d32680359b3fc7d9b67b320a047b0f4c3adcd2ab1b7d7a6ef1e285f0861c26"
+        "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_kernel.cu": "fa1ed5be69db8945de3e4f0a6f8abc58a511d66068900f6a8ae8965f07653999"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_7e76dfdd9b10af2f8359_kernel.cu",
@@ -135,7 +135,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "54485118a8ce28c8175da1dd556e0e0b5ac13f151ab8e5fa05f96cf32d2dd37b",
+      "closure_sha256": "18ad6e01d9eba5cbca095e282669c7b1e7ec5e137007f094765f86af0f81d4f9",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -145,7 +145,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_8b30436f526588de8d13_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_binding.cu": "1db7ead85d127051c66a4fd631761bd44c11a2caf773d73b38886b5b27acf5e1",
-        "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_kernel.cu": "fde244226c67727a476150309563d5759a0eb08751099d72a796be22522b3fbe"
+        "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_kernel.cu": "54e7193c2224e9c327b4d1301939d26af5c24c9c51bcec90fe1068ab02fd18df"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_kernel.cu",
@@ -154,7 +154,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "eb18bbfcdea79ab2db0b2fbe477772a0deda5bebff1005a9d8502459e7b6013b",
+      "closure_sha256": "43f8f284be02bb9736a508d22cb5f7a67f992747826dbac0ed9df1a70ab4804f",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -164,7 +164,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_8b30436f526588de8d13_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_binding.cu": "1db7ead85d127051c66a4fd631761bd44c11a2caf773d73b38886b5b27acf5e1",
-        "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_kernel.cu": "fde244226c67727a476150309563d5759a0eb08751099d72a796be22522b3fbe"
+        "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_kernel.cu": "54e7193c2224e9c327b4d1301939d26af5c24c9c51bcec90fe1068ab02fd18df"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_8b30436f526588de8d13_kernel.cu",
@@ -173,7 +173,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "c352045e4422fb938e712ac58447d2b2d434682f536841cec6cf23a936581853",
+      "closure_sha256": "da87c4e4eca57e707a4afa8f9544a3a0ac0e0da36d7f9df9f9e1c026aa8d656d",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -183,7 +183,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_binding.cu": "0021ccb5291e152d94ef0c6ed14d332605a91b285006ab0fb9ff0b36d9d215d8",
-        "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_kernel.cu": "af57a0cc4f62bb54b3242f3611b44ca4af7216d0030622a1ac86e98ce737a215"
+        "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_kernel.cu": "9c28022a4838f1b76626261c1ae01c2a4d7fbde37d327de66a864b88c4b0ad65"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_kernel.cu",
@@ -192,7 +192,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "3ffd17987247c7c481d97ccb9d55026ae2eae2d2188fc6e0b9e57d8edd2e5e03",
+      "closure_sha256": "53b6793cadbf025b0d01a1fc5a1c852de2c58069674aacac4b49dd6420b18e85",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -202,7 +202,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_binding.cu": "0021ccb5291e152d94ef0c6ed14d332605a91b285006ab0fb9ff0b36d9d215d8",
-        "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_kernel.cu": "af57a0cc4f62bb54b3242f3611b44ca4af7216d0030622a1ac86e98ce737a215"
+        "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_kernel.cu": "9c28022a4838f1b76626261c1ae01c2a4d7fbde37d327de66a864b88c4b0ad65"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_94affe3b74cd7c5a6422_kernel.cu",
@@ -211,7 +211,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "fc1862a455537968ed76aa4eeff45d24c62d68697f119b529a2d8d8c236f72c1",
+      "closure_sha256": "cb72f228e7ae3ac154867935dc260471bf7faa899ec3ef6abf96d3b88917dfae",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -221,7 +221,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_binding.cu": "1ab2bc1400ee03de62d26e444fe77e39c955c1a91e3c84dacfce08e7d8c3e59d",
-        "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_kernel.cu": "736a608c0f736f949ee35de93ad28b0858acaa7a21af76344c983e0ec7cd678c"
+        "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_kernel.cu": "1e502e871cafb91fc46e1789cb87eb877eaa34d17bd62fed007aa38e3d59d9ac"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_kernel.cu",
@@ -230,7 +230,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "a2caf38cbd9dd866745eeeb5ffd6701c6c141c19eaa03c8df5046c200b92f3d4",
+      "closure_sha256": "f06daa7c048aa1e2bb559c234cefad3cfe5f73f08eba110aaddf85f29f4471a4",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -240,7 +240,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_binding.cu": "1ab2bc1400ee03de62d26e444fe77e39c955c1a91e3c84dacfce08e7d8c3e59d",
-        "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_kernel.cu": "736a608c0f736f949ee35de93ad28b0858acaa7a21af76344c983e0ec7cd678c"
+        "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_kernel.cu": "1e502e871cafb91fc46e1789cb87eb877eaa34d17bd62fed007aa38e3d59d9ac"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02_kernel.cu",
@@ -249,7 +249,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "cb06c78ee68c8efc8e5e00aba699b3999546dad7ac9756cf2b7879b9bd74fdc0",
+      "closure_sha256": "b35dbbb768c48e2c0faf8acf29f2350af0d54f3933c25e7bb570c967c88fada8",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -259,7 +259,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_binding.cu": "348d0fa103fecaee3282e51588563e22954dbbc0de11cc2d899fcf7b761c2f80",
-        "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_kernel.cu": "93865584836b7b6979996151addaf51ea431b6711bb26803d19bbd0aafdb4b28"
+        "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_kernel.cu": "06ffff54e64927f9fedffe8d153b83b1202c1e3d769dd12c3ee00a1e2bfd408b"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_kernel.cu",
@@ -268,7 +268,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "2fc9a7b9be232802e4ab731fe8847ccbb434661a52d6241073a55c219ca9f96e",
+      "closure_sha256": "f066e7fc9501fff8da046916e587c4f3cb2e3bd0238344e5fbce0c7c8fd64263",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -278,7 +278,7 @@
       "path": "aot/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_binding.cu": "348d0fa103fecaee3282e51588563e22954dbbc0de11cc2d899fcf7b761c2f80",
-        "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_kernel.cu": "93865584836b7b6979996151addaf51ea431b6711bb26803d19bbd0aafdb4b28"
+        "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_kernel.cu": "06ffff54e64927f9fedffe8d153b83b1202c1e3d769dd12c3ee00a1e2bfd408b"
       },
       "sources": [
         "csrc/cake_deepgemm_batched_gemm_e8aa7f5b9aa0575db281_kernel.cu",
