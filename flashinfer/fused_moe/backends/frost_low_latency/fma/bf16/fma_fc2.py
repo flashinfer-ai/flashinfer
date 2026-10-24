@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""BF16 routed FC2 using FP32 FMA and slot-ordered output combination."""
+"""BF16/FP16 routed FC2 using FP32 FMA and slot-ordered output combination."""
 
 import cutlass
 from cutlass import cute, utils
 from cutlass._mlir.dialects import llvm
 
 from flashinfer.fused_moe.backends.frost_low_latency.fma.bf16.fma_fc1 import (
-    _bf16x4,
+    _quad,
 )
 
 
@@ -36,6 +36,7 @@ def _kernel(
     narrow: cutlass.Constexpr = False,
     finalize: cutlass.Constexpr = True,
     outputs: cutlass.Constexpr = 4,
+    dequant=None,
 ):
     bid, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
@@ -55,13 +56,20 @@ def _kernel(
         cutlass.Float32, cute.make_layout((outputs, k)), byte_alignment=16
     )
     if expert >= 0 and expert < cute.size(weights, mode=[0]):
-        xp = cute.recast_ptr(mid.iterator, dtype=cutlass.Uint64)
-        wp = cute.recast_ptr(weights.iterator, dtype=cutlass.Uint64)
+        word_type = (
+            cutlass.Uint32
+            if mid.element_type == cutlass.Float8E4M3FN
+            else cutlass.Uint64
+        )
+        xp = cute.recast_ptr(mid.iterator, dtype=word_type)
+        wp = cute.recast_ptr(weights.iterator, dtype=word_type)
         for group in range(i // 128):
             col = group * 32 + lane
-            xv = _bf16x4(xp[route * (i // 4) + col])
+            xv = _quad(xp[route * (i // 4) + col], mid.element_type)
             for o in cutlass.range_constexpr(outputs):
-                wv = _bf16x4(wp[(expert * h + row + o) * (i // 4) + col])
+                wv = _quad(
+                    wp[(expert * h + row + o) * (i // 4) + col], weights.element_type
+                )
                 for c in cutlass.range_constexpr(4):
                     acc[c, o] = acc[c, o] + xv[c] * wv[c]
     for o in cutlass.range_constexpr(outputs):
@@ -69,24 +77,27 @@ def _kernel(
             acc[0, o] + acc[1, o] + acc[2, o] + acc[3, o]
         )
         if lane == 0:
+            if cutlass.const_expr(mid.element_type == cutlass.Float8E4M3FN):
+                if expert >= 0 and expert < cute.size(weights, mode=[0]):
+                    value = _mul(value, dequant[expert])
             if cutlass.const_expr(finalize):
                 weighted = cutlass.Float32(0.0)
                 if expert >= 0 and expert < cute.size(weights, mode=[0]):
-                    value = value.to(cutlass.BFloat16).to(cutlass.Float32)
+                    value = value.to(out.element_type).to(cutlass.Float32)
                     score = scores[token, slot].to(cutlass.Float32)
                     if cutlass.const_expr(narrow):
                         score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                     weighted = _mul(value, score)
                 shared[o, slot] = weighted
             else:
-                out[route, row + o] = value.to(cutlass.BFloat16)
+                out[route, row + o] = value.to(out.element_type)
     if cutlass.const_expr(finalize):
         cute.arch.sync_threads()
         if tid < outputs:
             total = cutlass.Float32(0.0)
             for s in cutlass.range_constexpr(k):
                 total = total + shared[tid, s]
-            out[token, row + tid] = total.to(cutlass.BFloat16)
+            out[token, row + tid] = total.to(out.element_type)
 
 
 @cute.jit

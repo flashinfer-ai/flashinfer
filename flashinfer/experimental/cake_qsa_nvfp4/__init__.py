@@ -15,12 +15,13 @@ limitations under the License.
 """
 
 # Experimental Cake backend: QSA sparse paged GQA decode over an NVFP4 KV
-# cache on SM80 through SM90 (the split-KV decode, its cooperative build that
-# merges the splits in the same launch, and the separate split-KV merge with
-# the sigmoid output gate).  The public entry point is
-# ``flashinfer.sparse.qsa_sparse_paged_attention(..., backend="cake")``; the
-# host plan, workspace, launch sequence, registry and generated sources live
-# here.  The host module is imported on first attribute access, so importing
+# cache on SM80 through SM90 (the split-KV decode, its whole-tile build for
+# the wide grids of SM80, its cooperative build that merges the splits in the
+# same launch, and the separate split-KV merge with the sigmoid output gate).
+# The public entry point is ``flashinfer.sparse.qsa_sparse_paged_attention``:
+# its default ``backend="auto"`` selects this package on SM80 through SM90 and
+# ``backend="cake"`` selects it explicitly; the host plan, workspace, launch
+# sequence, registry and generated sources live here.  The host module is imported on first attribute access, so importing
 # the package loads neither torch nor the libraries.
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ _BACKEND = (
     "qsa_workspace_bytes",
     "reset_workspace",
     "select_form",
+    "select_wide",
 )
 _JIT = ("ARCHES", "ARCH_BY_CAPABILITY", "MAX_SPLITS")
 

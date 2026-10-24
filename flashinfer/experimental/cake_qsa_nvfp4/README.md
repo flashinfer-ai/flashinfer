@@ -8,8 +8,9 @@ that `nvfp4_quantize_append_paged_kv_cache_with_slot_mapping` writes, on
 compute capability 8.x (the `sm_80` libraries) and 9.0 (`sm_90a`).
 
 Both the API and the backend are experimental: no compatibility guarantee.
-The feature does not participate in automatic backend selection, autotuning
-or trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
+The public entry's `backend="auto"` (its default) selects this package on
+SM80 through SM90; the feature does not participate in autotuning or
+trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
 ships them and JIT-built by FlashInfer from `build.json` otherwise (see
 "Layout of this package"). Toolkit requirement: CUDA 12.8 or newer
 (`build.json` `min_cuda`; FlashInfer's supported toolkits apply).
@@ -23,12 +24,16 @@ from flashinfer.sparse import qsa_sparse_paged_attention
 out = qsa_sparse_paged_attention(
     q, k_cache, v_cache, logical_indices, block_table, token_to_req, False,
     out, k_scale, v_scale, output_gate=gate, k_sf=k_sf, v_sf=v_sf,
-    backend="cake",
 )
 ```
 
-`backend="default"` (the default) runs the existing implementation; `"cake"`
-runs this package; any other value raises `ValueError`. The arguments, their
+`backend="auto"` (the default) runs this package on SM80 through SM90 and the
+existing implementation on any other device, which then reports it as
+unsupported; `"cake"` selects this package and `"default"` the existing
+implementation explicitly; any other value raises `ValueError`. This package's
+results agree with the existing implementation within the test suites'
+tolerances but are not bit-identical to it: callers that need the existing
+numerics pass `backend="default"`. The arguments, their
 checks and the result contract are the public entry's (its docstring). The
 package's own entry, `flashinfer.experimental.cake_qsa_nvfp4.qsa_sparse_paged_attention`,
 takes the same arguments plus the keyword `workspace_buffer` (below).
@@ -71,6 +76,24 @@ always on compute capability 8.x, the *split* form: the plain decode, then
 the separate merge (`(rows, ceil(num_qo_heads / heads_per_cta))` CTAs, one
 head per CTA above four splits, four at or below).
 
+**Program rule.** The plain decode has two programs. On compute capability
+8.x a split-form call is *wide* when both hold: its decode grid `rows *
+num_kv_heads * splits` exceeds one resident wave (two CTAs per SM times the
+SM count; 216 on an A100) and each of its CTAs walks a long tile stream,
+`ceil(tiles / splits) >= 16` (1024 selected tokens). A wide call launches
+`decode_whole_tile`, the previous release's `sm_80` program (whole-tile
+gather, no L2 cache hint, shift selector); every other call launches the
+K-first program `decode`, and compute capability 9.0 always does. On an
+A100 (108 SMs) at the owner's 24 x 2 heads and 2051 selections (33 tiles):
+rows 1-32 run at most one wave and take the K-first program; rows 64 (4
+splits, 512 CTAs, 9 tiles per CTA) take the K-first program; rows 128 (2
+splits, 512 CTAs, 17 tiles per CTA) and the 2048-row single-split call (33
+tiles per CTA) take the whole-tile program. Measured paired on two A100s
+(80 GB and 40 GB PCIe) under a memset flush, the K-first program is 1-7 %
+faster at rows 64 and the whole-tile program 6-8 % faster at rows 128, on
+both units. The rule reads the architecture, the SM count and the call's
+tile and split counts alone.
+
 **Workspace.** `partial_out` FP32 `[splits, rows, num_qo_heads, 256]`,
 `partial_lse` FP32 `[splits, rows, num_qo_heads]` and the fused form's
 counters uint32 `[rows * num_kv_heads]`. With `workspace_buffer` (a
@@ -82,15 +105,23 @@ capturable with a replay-stable layout. The counters are zeroed once, the
 first time a buffer's storage is seen for a `rows * num_kv_heads` (a new
 buffer at a freed buffer's address is a new storage and is zeroed again), and
 reset themselves after every launch; `reset_workspace(buffer)` forgets a
-buffer whose bytes another use overwrote. Without a workspace the partials are
-allocated per call, as the default implementation does, and the fused form's
-counters come from a module buffer per (device, stream): zeroed when it is
-allocated, left idle by every launch, grown on demand; a capturing stream
-allocates its counters per call instead (the graph's private pool). That path
-is outside the zero-allocation guarantee.
+buffer whose bytes another use overwrote. Without a workspace the partials
+come from a module scratch per (device, stream) -- one float32 buffer, grown
+when a call needs more, its views kept per call shape -- and the fused form's
+counters from a module buffer per (device, stream): zeroed when it is
+allocated, left idle by every launch, grown on demand. Calls on one stream are
+ordered, so no two launches share live partials or counters; a module lock
+orders two Python threads enqueuing on one stream from the carve through the
+call's last launch. A capturing stream allocates its partials and counters per
+call instead (the graph's private pool) and leaves both caches untouched. That
+path is outside the zero-allocation guarantee.
 
 Nothing on the host reads tensor contents; every dispatch is on host scalars
-and tensor metadata.
+and tensor metadata. The launch plan of a call shape -- split count, form,
+program, loaded FFI entries, argument order and grids -- is resolved once per
+shape and device (`cake_jit.resolved_launches`); a call checks its arguments,
+binds them in one flat sequence and issues its launches under one
+environment-stream context.
 
 ## Kernel structure of one call
 
@@ -101,6 +132,12 @@ and tensor metadata.
   and the normalised partial output of its group's heads in FP32 and, above
   one split, writes `partial_out` / `partial_lse`; with one split it writes
   the gated BF16 output.
+- `decode_whole_tile` (plain build, `sm_80` only): the previous release's
+  decode program with the same parameters, grid, launch bound and
+  shared-memory pool; it gathers each tile's K / V rows whole, issues its
+  copies without an L2 cache hint and selects the E2M1 nibbles by shift.
+  The program rule launches it on the wide grids: above one resident wave
+  with at least 16 tiles (1024 selected tokens) per CTA.
 - `decode_coop` (cooperative build): the same decode launched cooperatively;
   after its partials each CTA takes a slice of its (row, KV head) group's
   output, waits on the group's counter and merges every split's partial for
@@ -116,8 +153,8 @@ Every kernel is compiled with `--use_fast_math` (recorded on every
 
 | File | Role |
 | --- | --- |
-| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves), the rules as data (`select_records`, `launch_grid`), `run_module` |
-| `cake_backend.py` | the host plan: checks, split rule, form rule, workspace rule, launch sequence |
+| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves; a record lists the architectures it ships for), the rules as data (`select_records`, `launch_grid`), the launch plan resolved once per shape (`resolved_launches`), `run_module` |
+| `cake_backend.py` | the host plan: checks, split rule, form rule, program rule, workspace rule, launch sequence |
 | `build.json` | the manifest: one library per (program, architecture), sources with digests, nvcc flags |
 | `cake_build.py` | the loader: `aot/` prebuilt libraries first, else FlashInfer's JIT from `build.json` |
 | `csrc/` | per program: `<library>_kernel.cu` (device unit), `<library>_binding.cu` (tvm-ffi `run`); `cake_ffi_checks.h` |
@@ -129,6 +166,5 @@ The registry's derived leaves and everything under `csrc/`, `build.json` and
 ## Status
 
 Experimental. Validated against the default implementation's test suite with
-`backend="cake"` on compute capability 9.0 (`sm_90a`, H100). The `sm_80`
-libraries build from `build.json` but have not been run on a compute
-capability 8.x device.
+`backend="cake"` on compute capability 9.0 (`sm_90a`, H100) and 8.0 (`sm_80`,
+A100 80 GB and 40 GB PCIe).

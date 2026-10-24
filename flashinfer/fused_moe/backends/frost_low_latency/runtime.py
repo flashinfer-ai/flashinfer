@@ -19,11 +19,15 @@ _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
+    if config.quant.weight is QuantFormat.FP8PerTensor:
+        from .fp8_per_tensor import execute as execute_fp8
+
+        return execute_fp8(inputs, config, tile_k)
     if config.quant.weight is QuantFormat.NVFP4:
         from .nvfp4 import execute as execute_nvfp4
 
         return execute_nvfp4(inputs, config, tile_k)
-    if config.quant.weight is QuantFormat.BF16:
+    if config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16):
         from .fma.bf16.runtime import execute as execute_bf16
 
         return execute_bf16(inputs, config, tile_k)

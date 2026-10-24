@@ -92,7 +92,15 @@ def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation):
 
 
 def prepare_bf16_weights(w1, w2, activation):
-    """Prepare canonical BF16 [up, gate] or non-gated weights without rounding.
+    return _prepare_float16_weights(w1, w2, activation, torch.bfloat16)
+
+
+def prepare_fp16_weights(w1, w2, activation):
+    return _prepare_float16_weights(w1, w2, activation, torch.float16)
+
+
+def _prepare_float16_weights(w1, w2, activation, dtype):
+    """Prepare canonical 16-bit [up, gate] or non-gated weights without rounding.
 
     Logical I is padded to 128 for the shared FC2 reduction. Weight preparation
     is outside execution/capture; no activation values or pointers are cached.
@@ -100,8 +108,8 @@ def prepare_bf16_weights(w1, w2, activation):
     from .fma.activation_config import lower_activation
 
     lower_activation(activation)
-    if w1.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
-        raise TypeError("BF16 preparation requires two bfloat16 weight tensors")
+    if w1.dtype != dtype or w2.dtype != dtype:
+        raise TypeError(f"Preparation requires two {dtype} weight tensors")
     if w1.ndim != 3 or w2.ndim != 3:
         raise ValueError("weights must be 3-D")
     e, h, i = w2.shape
@@ -118,3 +126,37 @@ def prepare_bf16_weights(w1, w2, activation):
     second = torch.zeros((e, h, physical), dtype=w2.dtype, device=w2.device)
     second[:, :, :i].copy_(w2)
     return dict(w1_weight=first.view(e, branches * physical, h), w2_weight=second)
+
+
+def prepare_fp8_per_tensor_weights(w1_bf16, w2_bf16, **kwargs):
+    from ...prepare import prepare_cutlass_fp8_per_tensor_weights
+    from ...api import SwiGLU
+    from .fma.activation_config import lower_activation
+
+    activation = kwargs.get("activation") or SwiGLU()
+    lower_activation(activation)
+    view = prepare_cutlass_fp8_per_tensor_weights(w1_bf16, w2_bf16, **kwargs)
+    e, h, i = view["fc2_expert_weights"].shape
+    if h % 128 or i % 32:
+        raise ValueError("Frost FP8 requires H divisible by 128 and I by 32")
+    p = (i + 127) // 128 * 128
+    if p != i:
+        branches = 2 if activation.is_gated else 1
+        first = torch.zeros(
+            (e, branches, p, h),
+            device=view["fc1_expert_weights"].device,
+            dtype=torch.float8_e4m3fn,
+        )
+        first[:, :, :i].copy_(view["fc1_expert_weights"].reshape(e, branches, i, h))
+        second = torch.zeros(
+            (e, h, p),
+            device=view["fc2_expert_weights"].device,
+            dtype=torch.float8_e4m3fn,
+        )
+        second[:, :, :i].copy_(view["fc2_expert_weights"])
+        view = dict(
+            view,
+            fc1_expert_weights=first.view(e, branches * p, h),
+            fc2_expert_weights=second,
+        )
+    return view

@@ -43,9 +43,10 @@ def prepare_mega_mhc(
     and exact packed UE8M0 scales: 'col' emits GEMM scale storage, 'extra'
     emits routed and padded shared-expert scale storage. sf_layout 'bf16'
     (hidden 4096, shifted_prev_mix=None) emits the BF16 output alone through
-    one of two programs chosen by the split count the token count yields on
-    the device (the tailpipe program up to 22 splits, the BF16 program at 32
-    and 64; bitwise the same output); both read fn through the BF16 pieces
+    one of three programs chosen by the split count and the task waves the
+    token count yields on the device (the tailpipe program up to 22 splits,
+    its weight-staging twin up to 16 splits over five or more waves, the BF16
+    program at 32 and 64; bitwise the same output); all read fn through the BF16 pieces
     fnp[3,32,4H], built here from fn or taken from the caller's fnp, and
     plan.update_fn() re-splits a changed fn. The quantized layouts of hidden 4096 emit the BF16 output and its
     quantization, bitwise what vLLM computes from y_bf16: 'fp8_group128' adds

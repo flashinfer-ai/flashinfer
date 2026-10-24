@@ -178,6 +178,10 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_fefa19
   int tid_0 = tid;
   int lane_local = lane;
   int warp_local = warp;
+#if __CUDA_ARCH__ == 900
+#else
+  int q_warp_local = (warp_local + 1) % 4;
+#endif
   int u = tid_0 - tid_0 / 8 * 8;
   int g = tid_0 / 8;
   int row0 = g * 4;
@@ -600,7 +604,7 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_fefa19
 #else
 #pragma unroll
     for (int tt = 0; tt < 1; tt++) {
-      int t = tt * 4 + warp_local;
+      int t = tt * 4 + q_warp_local;
       if ((tt + 1) * 4 <= 1) {
         long long q_index =
             (long long)n * q_stride_p0 + (long long)t * q_stride_p1 + (long long)h * q_stride_p2;
@@ -4141,13 +4145,20 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_fefa19
         long long out_index = (long long)n * out_stride_p0 + (long long)t_1 * out_stride_p1 +
                               (long long)h * out_stride_p2 + (long long)row0;
 #endif
-        {
-          uint2 _pk2;
-          __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-          _pk[0] = __floats2bfloat162_rn(o4[0 + 0], o4[0 + 1]);
-          _pk[1] = __floats2bfloat162_rn(o4[0 + 2], o4[0 + 3]);
-          *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out))[out_index]) = _pk2;
+        unsigned int _packed_0[2];
+#pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+          __nv_bfloat162 _bf2 =
+              __float22bfloat162_rn(make_float2(o4[_lp * 2 + 0], o4[_lp * 2 + 1 + 0]));
+          _packed_0[_lp] = *(uint32_t*)&_bf2;
         }
+#pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+          __nv_bfloat162 _bf2 =
+              __float22bfloat162_rn(make_float2(o4[_lp * 2 + 2], o4[_lp * 2 + 1 + 2]));
+          _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+        }
+        reinterpret_cast<int2*>(out + (out_index))[0] = reinterpret_cast<int2*>(_packed_0)[0];
       }
       if (use_ssm_state_indices != 0) {
 #if __CUDA_ARCH__ == 900

@@ -1439,9 +1439,8 @@ kernel_cake_dsa_h64_nope_train_d7b52eccaf718555e88f(const __grid_constant__ CUte
                             int _parity_k_full = (int)((unsigned int)(tord_3 + i_3) % 2);
                             mbarrier_wait(k_full_addr, _parity_k_full);
                             if (tord_3 > 0) {
-                                int s_prev_stage = 0;
-                                unsigned int s_prev_phase = tord_3 + i_3 & 1 ^ 1;
-                                mbarrier_wait(s_free_addr + (s_prev_stage) * 8, s_prev_phase);
+                                int _parity_s_free = (int)((unsigned int)(tord_3 + i_3 - 1) % 2);
+                                mbarrier_wait(s_free_addr, _parity_s_free);
                             }
                             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -1821,9 +1820,8 @@ kernel_cake_dsa_h64_nope_train_d7b52eccaf718555e88f(const __grid_constant__ CUte
                         mbarrier_wait(p_full_addr, _parity_p_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (tord_3 + i_3 > 0) {
-                            int dkv_b_drained_stage = 0;
-                            unsigned int dkv_b_drained_phase = tord_3 + i_3 & 1 ^ 1;
-                            mbarrier_wait(dkv_b_drained_addr + (dkv_b_drained_stage) * 8, dkv_b_drained_phase);
+                            int _parity_dkv_b_drained = (int)((unsigned int)(tord_3 + i_3) % 2) ^ 1;
+                            mbarrier_wait(dkv_b_drained_addr, _parity_dkv_b_drained);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                         }
 #if __CUDA_ARCH__ == 1070
@@ -2317,12 +2315,10 @@ kernel_cake_dsa_h64_nope_train_d7b52eccaf718555e88f(const __grid_constant__ CUte
                         tcgen05_commit(dkv_b_full_addr);
                         tcgen05_commit(ds_free_addr);
                         if (blocks_3 > i_3 + 1) {
-                            int k_full_stage = 0;
-                            unsigned int k_full_phase = tord_3 + i_3 & 1 ^ 1;
-                            mbarrier_wait(k_full_addr + (k_full_stage) * 8, k_full_phase);
-                            int s_free_stage = 0;
-                            unsigned int s_free_phase = tord_3 + i_3 & 1;
-                            mbarrier_wait(s_free_addr + (s_free_stage) * 8, s_free_phase);
+                            int _parity_k_full_1 = (int)((unsigned int)(tord_3 + i_3 + 1) % 2);
+                            mbarrier_wait(k_full_addr, _parity_k_full_1);
+                            int _parity_s_free_1 = (int)((unsigned int)(tord_3 + i_3) % 2);
+                            mbarrier_wait(s_free_addr, _parity_s_free_1);
                             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_13 = ((q_k_addr) >> 4) & 0x7FFF;
@@ -2652,7 +2648,8 @@ kernel_cake_dsa_h64_nope_train_d7b52eccaf718555e88f(const __grid_constant__ CUte
                     #pragma unroll 1
                     for (int i_4 = 0; i_4 < blocks_4; i_4++) {
                         int n = blocks_4 - 1 - i_4;
-                        int slot_3 = (tord_5 + i_4) % 2;
+                        int slot_3 = (int)((unsigned int)(tord_5 + i_4) % 2);
+                        int _phase_slot_1_1 = (int)((unsigned int)(tord_5 + i_4) / 2 % 2) ^ 1;
                         unsigned int mask = 0;
                         int position = n * 64 + lane_0_3 * 8;
                         int values[8];
@@ -2737,9 +2734,7 @@ kernel_cake_dsa_h64_nope_train_d7b52eccaf718555e88f(const __grid_constant__ CUte
                             }
                             values[7] = value_13;
                         }
-                        int free_stage = slot_3;
-                        int free_phase = (tord_5 + i_4) / 2 & 1 ^ 1;
-                        mbarrier_wait(idx_free_addr + (free_stage) * 8, free_phase);
+                        mbarrier_wait(idx_free_addr + (slot_3) * 8, _phase_slot_1_1);
                         int ok = (int)(values[0] >= 0 && values[0] < num_kv);
                         if (ok != 0) {
                             mask = mask | 1;

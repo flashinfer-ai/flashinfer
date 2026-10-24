@@ -29,10 +29,16 @@ from tests.moe.test_frost_low_latency import _assert_near, _quant, _require_gpu
 from tests.moe.test_frost_low_latency_bf16 import _inputs, _reference as bf16_reference
 from tests.moe.test_frost_low_latency_mx_activations import reference as mx_reference
 from tests.moe.test_frost_low_latency_nvfp4 import reference as nvfp4_reference
+from tests.moe.test_frost_low_latency_fp8_per_tensor import _reference as fp8_reference
 
 
 def make_case(fmt, tokens, finalize, seed):
-    _require_gpu()
+    _require_gpu(allow_sm120=True, allow_sm90=True)
+    if torch.cuda.get_device_capability() == (9, 0) and fmt not in (
+        QuantFormat.BF16,
+        QuantFormat.FP8PerTensor,
+    ):
+        pytest.skip("SM90 Frost admits dense16 and per-tensor FP8 FMA only")
     torch.manual_seed(seed)
     activation = SwiGLU()
     if fmt == QuantFormat.BF16:
@@ -61,8 +67,8 @@ def make_case(fmt, tokens, finalize, seed):
         scores = torch.rand(tokens, k, device="cuda")
         quant = QuantConfig(
             weight=fmt,
-            activation=QuantFormat.NVFP4
-            if fmt == QuantFormat.NVFP4
+            activation=fmt
+            if fmt in (QuantFormat.NVFP4, QuantFormat.FP8PerTensor)
             else QuantFormat.MXFP8,
             **({"nvfp4_4over6": None} if fmt == QuantFormat.NVFP4 else {}),
         )
@@ -81,6 +87,21 @@ def make_case(fmt, tokens, finalize, seed):
             reference = lambda: nvfp4_reference(
                 q, sf, view, ids, scores, activation, True
             )
+        elif fmt == QuantFormat.FP8PerTensor:
+            view = FrostLowLatencyConfig.prepare_fp8_per_tensor_weights(
+                w1,
+                w2,
+                hidden_states_scale_global=32.0,
+                intermediate_scale_global=128.0,
+                num_local_experts=e,
+                hidden_size=h,
+                intermediate_size=i,
+                activation=activation,
+            )
+            q, sf = FrostLowLatencyConfig.prepare_fp8_per_tensor_activations(
+                x, hidden_states_scale_global=32.0
+            )
+            reference = lambda: fp8_reference(q, ids, scores, view, activation, True)
         else:
 
             def weight(w):
@@ -121,6 +142,8 @@ def make_case(fmt, tokens, finalize, seed):
 
 
 PATHS = [
+    (QuantFormat.FP8PerTensor, ("ffma", 1, 4)),
+    (QuantFormat.FP8PerTensor, ("ffma", 2, 8)),
     (QuantFormat.BF16, ("ffma", 1, 4)),
     (QuantFormat.NVFP4, ("nvfp4_ffma", 2)),
     (QuantFormat.NVFP4, ("nvfp4_ffma", 4)),
@@ -138,6 +161,9 @@ PATHS = [
 def test_warm_ffi_fresh_bindings_and_concurrent_streams(
     fmt, tactic, tokens, finalize, monkeypatch
 ):
+    _require_gpu(allow_sm120=True, allow_sm90=True)
+    if torch.cuda.get_device_capability() == (12, 0) and not isinstance(tactic, tuple):
+        pytest.skip("SM120 supports Frost FMA tactics only")
     first, a, reference_a = make_case(fmt, tokens, finalize, 9301)
     second, b, reference_b = make_case(fmt, tokens, finalize, 9302)
     first.forward(a, tactic)
@@ -154,11 +180,15 @@ def test_warm_ffi_fresh_bindings_and_concurrent_streams(
         runtime as nvfp4,
     )
 
+    from flashinfer.fused_moe.backends.frost_low_latency.fma import (
+        fp8_per_tensor as fp8,
+    )
+
     def unexpected(*args, **kwargs):
         raise AssertionError("warm calls must not compile or construct DLPack wrappers")
 
     monkeypatch.setattr(cute, "compile", unexpected)
-    for module in (runtime, mx, bf16, nvfp4):
+    for module in (runtime, mx, bf16, nvfp4, fp8):
         monkeypatch.setattr(module, "from_dlpack", unexpected)
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     for stream in streams:
@@ -190,7 +220,9 @@ def test_warm_ffi_fresh_bindings_and_concurrent_streams(
             runner.forward(inputs, tactic)
     # Update existing input storage after capture; only route IDs and scores
     # change, so all three independent numerical references remain applicable.
-    id_index, score_index = (1, 2) if fmt == QuantFormat.BF16 else (2, 3)
+    id_index, score_index = (
+        (1, 2) if fmt in (QuantFormat.BF16, QuantFormat.FP8PerTensor) else (2, 3)
+    )
     for inputs in (a, b):
         inputs[id_index].add_(1).remainder_(5)
         if finalize:
@@ -207,6 +239,9 @@ def test_warm_ffi_fresh_bindings_and_concurrent_streams(
 
 @pytest.mark.parametrize("fmt,tactic", PATHS)
 def test_compiled_entry_does_not_retain_call_storage(fmt, tactic):
+    _require_gpu(allow_sm120=True, allow_sm90=True)
+    if torch.cuda.get_device_capability() == (12, 0) and not isinstance(tactic, tuple):
+        pytest.skip("SM120 supports Frost FMA tactics only")
     runner, inputs, reference = make_case(fmt, 1, True, 9401)
     refs = [weakref.ref(v) for v in inputs if isinstance(v, torch.Tensor)]
     runner.forward(inputs, tactic)

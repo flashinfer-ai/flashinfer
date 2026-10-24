@@ -170,6 +170,7 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_4d40c9
   int tid_0 = tid;
   int lane_local = lane;
   int warp_local = warp;
+  int q_warp_local = (warp_local + 1) % 4;
   int u = tid_0 - tid_0 / 8 * 8;
   int g = tid_0 / 8;
   int row0 = g * 4;
@@ -207,7 +208,7 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_4d40c9
       }
     }
   }
-  if (warp_local == 0) {
+  if (q_warp_local == 0) {
     int t0 = 0;
     long long pre_q_index =
         (long long)n * q_stride_p0 + (long long)t0 * q_stride_p1 + (long long)h * q_stride_p2;
@@ -382,7 +383,7 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_4d40c9
         sBeta[m_0] = _rcp_19;
       }
     }
-    if (warp_local == 0) {
+    if (q_warp_local == 0) {
       int t0_1 = 0;
       float2 q_raw_pair0 = make_float2(r_q[0], r_q[1]);
       float2 q_raw_pair1 = make_float2(r_q[2], r_q[3]);
@@ -1044,13 +1045,20 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_4d40c9
       if (u == 0) {
         long long out_index = (long long)n * out_stride_p0 + (long long)t * out_stride_p1 +
                               (long long)h * out_stride_p2 + (long long)row0;
-        {
-          uint2 _pk2;
-          __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-          _pk[0] = __floats2bfloat162_rn(o4[0 + 0], o4[0 + 1]);
-          _pk[1] = __floats2bfloat162_rn(o4[0 + 2], o4[0 + 3]);
-          *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out))[out_index]) = _pk2;
+        unsigned int _packed_0[2];
+#pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+          __nv_bfloat162 _bf2 =
+              __float22bfloat162_rn(make_float2(o4[_lp * 2 + 0], o4[_lp * 2 + 1 + 0]));
+          _packed_0[_lp] = *(uint32_t*)&_bf2;
         }
+#pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+          __nv_bfloat162 _bf2 =
+              __float22bfloat162_rn(make_float2(o4[_lp * 2 + 2], o4[_lp * 2 + 1 + 2]));
+          _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+        }
+        reinterpret_cast<int2*>(out + (out_index))[0] = reinterpret_cast<int2*>(_packed_0)[0];
       }
     }
     int ssm_slot0 = sSsm[0];
