@@ -949,3 +949,49 @@ Native stage-ranking hooks receive private routing tensors; the benchmark
 verifies that the measured IDs and scores remain unchanged. Host enqueue,
 router-network evaluation, shared experts, communication and serving are
 outside its scope.
+
+### W8A16 qualification
+
+The following results use H=2048, I=512, E=512, top-k=10 and SwiGLU, with
+synthetic tensors at model geometry. Both pipelines receive identical E4M3
+weights, FP32 per-expert scales, BF16 inputs and precomputed routing, and share
+the BF16 preactivation/intermediate/expert boundaries described above.
+CUPTI measures each full routed-expert GPU span inside CUDA Graph replay.
+Cold L2 eviction is outside that interval. Warm means repeated operands and
+does not guarantee that all selected weights fit in cache.
+
+| GPU | T | Routes / cache | Best tested cuTile µs | Frost µs | Speedup |
+|---|---:|---|---:|---:|---:|
+| RTX PRO 6000 Blackwell / SM120 | 1 | warm | 18.912 | 8.608 | 2.20× |
+| RTX PRO 6000 Blackwell / SM120 | 1 | cold | 37.288 | 26.143 | 1.43× |
+| RTX PRO 6000 Blackwell / SM120 | 2 | disjoint / warm | 60.831 | 13.248 | 4.59× |
+| RTX PRO 6000 Blackwell / SM120 | 8 | shared / warm | 28.816 | 38.088 | 0.76× |
+| H100 / SM90 | 1 | warm | 33.600 | 11.920 | 2.82× |
+| H100 / SM90 | 1 | cold | 42.864 | 22.328 | 1.92× |
+| H100 / SM90 | 8 | shared / warm | 43.072 | 46.632 | 0.92× |
+
+The search tests 289 native candidates for SM120 T1/T2 and 337 for T8;
+H100 tests 301 for T1 and 351 for T8. It includes every advertised stage pair
+for all supported native blocks and gather/sorted modes, plus the default.
+Frost tests all 16 FC1/FC2 column pairs. Selected tactics are frozen before four
+ABBA validation blocks; separate warm CUDA-event graph chains confirm the
+ranking. A/A ratios in these records are within 0.6% of one. This is a full
+advertised search for these conditions, not a claim that all possible native
+kernel configurations have been searched.
+
+The T8/shared losses remain in the table: Tensor Core weight reuse can beat
+route-wise FMA as more tokens reuse experts. The large T2/disjoint gain is
+specific to that sparse routing and baseline pipeline; it is not a universal
+W8A16 speedup. Default backend selection is unchanged.
+
+Both GPUs used CuTe DSL 4.8.0 and TVM-FFI 0.1.14.post1. SM120 used
+PyTorch 2.14.1+cu130; H100 used PyTorch 2.14.0a0+b2c75dd062.nv26.09 with
+CUDA 13.4. See [results and controls](frost_low_latency_w8a16.json) for exact
+native/Frost source hashes, cuTile versions, actual routing, all selected
+tactics, correctness errors and frozen validation samples. This measures
+routed-expert kernel GPU time, not a model decode step or token throughput.
+
+```bash
+python benchmarks/bench_frost_low_latency_w8a16.py \
+  --tokens 1 --cache-mode warm --expert-reuse disjoint --output w8a16-t1-warm.json
+```
