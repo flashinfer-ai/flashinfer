@@ -407,34 +407,42 @@ def _gated_residual_rmsnorm_tensors_ok(
     beta: torch.Tensor,
 ) -> bool:
     """The tensor contract of ``gated_residual_rmsnorm`` (shapes, dtypes, one CUDA
-    device, contiguous, aligned storage), without the backend decision."""
-    tensors = (branch, residual, alpha, beta)
+    device, contiguous, aligned storage), without the backend decision; one flat
+    check, since every call pays for it."""
+    shape = branch.shape
+    if len(shape) != 2 or shape[1] != _GATED_RESIDUAL_HIDDEN_SIZE or not branch.is_cuda:
+        return False
+    device = branch.device
+    vector = (_GATED_RESIDUAL_HIDDEN_SIZE,)
+    alignment = _FUSED_NORM_ALIGNMENT
     return (
-        branch.ndim == 2
-        and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
-        and residual.shape == branch.shape
-        and (weight is None or weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,))
-        and alpha.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
-        and beta.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        residual.shape == shape
+        and alpha.shape == vector
+        and beta.shape == vector
         and branch.dtype == torch.bfloat16
-        and (weight is None or weight.dtype == torch.bfloat16)
         and residual.dtype == torch.float32
         and alpha.dtype == torch.float32
         and beta.dtype == torch.float32
-        and all(
-            tensor.is_cuda
-            and tensor.is_contiguous()
-            and tensor.device == branch.device
-            and _is_aligned(tensor)
-            for tensor in tensors
+        and residual.device == device
+        and alpha.device == device
+        and beta.device == device
+        and branch.is_contiguous()
+        and residual.is_contiguous()
+        and alpha.is_contiguous()
+        and beta.is_contiguous()
+        and (
+            branch.data_ptr() | residual.data_ptr() | alpha.data_ptr() | beta.data_ptr()
         )
+        % alignment
+        == 0
         and (
             weight is None
             or (
-                weight.is_cuda
+                weight.shape == vector
+                and weight.dtype == torch.bfloat16
+                and weight.device == device
                 and weight.is_contiguous()
-                and weight.device == branch.device
-                and _is_aligned(weight)
+                and weight.data_ptr() % alignment == 0
             )
         )
     )

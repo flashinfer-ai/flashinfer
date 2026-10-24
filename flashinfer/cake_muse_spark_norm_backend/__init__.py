@@ -47,7 +47,8 @@ the facade's ``"auto"`` keeps the CuTe DSL kernel there.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import operator
+from typing import Any, Callable, Optional, cast
 
 import torch
 import tvm_ffi
@@ -377,6 +378,7 @@ def _check_row(
 # tvm-ffi stream context; the binding itself guards the device).  The slow path keeps every check and message.
 
 _RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_STREAM_CONTEXT = getattr(tvm_ffi, "StreamContext", None)
 _FFI_DEVICES: dict[int, Any] = {}
 _LAUNCH_PLANS: dict[tuple[Any, ...], "_LaunchPlan"] = {}
 _VECTOR = (HIDDEN_SIZE,)
@@ -392,7 +394,17 @@ def _ffi_device(index: int) -> Any:
 class _LaunchPlan:
     """One record bound to one call signature: the loaded entry, its grid and its argument order, resolved once."""
 
-    __slots__ = ("name", "rows", "device_index", "entry", "grid", "order", "ffi_device")
+    __slots__ = (
+        "name",
+        "rows",
+        "device_index",
+        "entry",
+        "grid",
+        "order",
+        "ffi_device",
+        "constants",
+        "pack",
+    )
 
     def __init__(
         self, name: str, arch: str, device_index: int, values: dict[str, Any], rows: int
@@ -417,6 +429,30 @@ class _LaunchPlan:
         )
         self.entry = getattr(_loader.load(name, arch), record["ffi_entry"])
         self.ffi_device = _ffi_device(device_index)
+        # ``pack`` turns one positional row -- the call's values in the order ``values`` lists them, followed by
+        # ``constants`` -- into the entry's argument tuple without a dict or a comprehension per call.
+        names = tuple(values)
+        constants: list[Any] = []
+        indices: list[int] = []
+        for source in self.order:
+            if type(source) is str:
+                indices.append(names.index(source))
+            else:
+                indices.append(len(names) + len(constants))
+                constants.append(source)
+        self.constants = tuple(constants)
+        if len(indices) == 1:
+            only = indices[0]
+
+            def pack(row: tuple[Any, ...], index: int = only) -> tuple[Any, ...]:
+                return (row[index],)
+
+            self.pack: Callable[[tuple[Any, ...]], tuple[Any, ...]] = pack
+        else:
+            self.pack = cast(
+                Callable[[tuple[Any, ...]], tuple[Any, ...]],
+                operator.itemgetter(*indices),
+            )
 
     def args(self, values: dict[str, Any]) -> tuple[Any, ...]:
         return tuple(
@@ -426,11 +462,11 @@ class _LaunchPlan:
 
 def _launch(plan: _LaunchPlan, args: tuple[Any, ...]) -> None:
     """Call the plan's entry on the current torch stream of its device (a CUDA-graph capture stream included)."""
-    if _RAW_STREAM is None:
+    if _RAW_STREAM is None or _STREAM_CONTEXT is None:
         with torch.cuda.device(plan.device_index), tvm_ffi.use_torch_stream():
             plan.entry(*args)
         return
-    with tvm_ffi.use_raw_stream(plan.ffi_device, _RAW_STREAM(plan.device_index)):
+    with _STREAM_CONTEXT(plan.ffi_device, _RAW_STREAM(plan.device_index)):
         plan.entry(*args)
 
 
@@ -501,7 +537,7 @@ def _prepare_gated_residual_rmsnorm(
     }
     key = (
         GATED_RESIDUAL_RMSNORM,
-        device.index,
+        branch.get_device(),
         rows,
         weight_before_norm,
         bool(enable_pdl),
@@ -529,51 +565,58 @@ def cake_gated_residual_rmsnorm(
     count; ``enable_pdl`` selects the programmatic dependent launch build.  ``out`` may alias ``residual``.  An
     empty batch launches nothing.
     """
-    device = branch.device
     shape = branch.shape
+    index = branch.get_device()
     weight_before_norm = weight is not None
     plan = None
     if len(shape) == 2:
         plan = _LAUNCH_PLANS.get(
             (
                 GATED_RESIDUAL_RMSNORM,
-                device.index,
+                index,
                 shape[0],
                 weight_before_norm,
                 bool(enable_pdl),
             )
         )
+    # The plan's key fixes the device, the row count, the variant and the launch mode; the rest of the contract
+    # is one flat check per call (dtypes, shapes, same device, contiguous, 16-byte aligned storage).
     f32, bf16, align = torch.float32, torch.bfloat16, ROW_ALIGNMENT_BYTES
     if plan is None or not (
-        branch.dtype is bf16
-        and branch.is_contiguous()
-        and branch.data_ptr() % align == 0
-        and residual.shape == shape
+        shape[1] == HIDDEN_SIZE
+        and branch.dtype is bf16
         and residual.dtype is f32
-        and residual.device == device
-        and residual.is_contiguous()
-        and residual.data_ptr() % align == 0
-        and out.shape == shape
         and out.dtype is f32
-        and out.device == device
-        and out.is_contiguous()
-        and out.data_ptr() % align == 0
-        and alpha.shape == _VECTOR
         and alpha.dtype is f32
-        and alpha.device == device
-        and alpha.is_contiguous()
-        and alpha.data_ptr() % align == 0
-        and beta.shape == _VECTOR
         and beta.dtype is f32
-        and beta.device == device
+        and residual.shape == shape
+        and out.shape == shape
+        and alpha.shape == _VECTOR
+        and beta.shape == _VECTOR
+        and residual.get_device() == index
+        and out.get_device() == index
+        and alpha.get_device() == index
+        and beta.get_device() == index
+        and branch.is_contiguous()
+        and residual.is_contiguous()
+        and out.is_contiguous()
+        and alpha.is_contiguous()
         and beta.is_contiguous()
-        and beta.data_ptr() % align == 0
+        and (
+            branch.data_ptr()
+            | residual.data_ptr()
+            | out.data_ptr()
+            | alpha.data_ptr()
+            | beta.data_ptr()
+        )
+        % align
+        == 0
         and (
             weight is None
             or (
-                weight.shape == _VECTOR
-                and weight.dtype is bf16
-                and weight.device == device
+                weight.dtype is bf16
+                and weight.shape == _VECTOR
+                and weight.get_device() == index
                 and weight.is_contiguous()
                 and weight.data_ptr() % align == 0
             )
@@ -586,18 +629,19 @@ def cake_gated_residual_rmsnorm(
             return
     _launch(
         plan,
-        plan.args(
-            {
-                "branch": branch,
-                "residual": residual,
-                "weight": weight if weight is not None else branch,
-                "alpha": alpha,
-                "beta": beta,
-                "out": out,
-                "rows": plan.rows,
-                "eps": float(eps),
-                "gain_center": float(gain_center),
-            }
+        plan.pack(
+            (
+                branch,
+                residual,
+                weight if weight is not None else branch,
+                alpha,
+                beta,
+                out,
+                plan.rows,
+                float(eps),
+                float(gain_center),
+            )
+            + plan.constants
         ),
     )
 
@@ -748,7 +792,8 @@ def cake_rmsnorm_sigmoid_gate(
         )
     bf16, align = torch.bfloat16, ROW_ALIGNMENT_BYTES
     if plan is None or not (
-        gate.shape == shape
+        shape[-1] == HEAD_DIM
+        and gate.shape == shape
         and input.dtype is bf16
         and gate.dtype is bf16
         and gate.device == device
@@ -765,16 +810,9 @@ def cake_rmsnorm_sigmoid_gate(
         input_stride, gate_stride = input.stride(0), gate.stride(0)
     _launch(
         plan,
-        plan.args(
-            {
-                "input": input,
-                "gate": gate,
-                "tokens": plan.rows,
-                "heads": heads,
-                "input_stride": input_stride,
-                "gate_stride": gate_stride,
-                "eps": float(eps),
-            }
+        plan.pack(
+            (input, gate, plan.rows, heads, input_stride, gate_stride, float(eps))
+            + plan.constants
         ),
     )
 

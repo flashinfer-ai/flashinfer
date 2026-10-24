@@ -136,6 +136,7 @@ def test_a_plan_orders_its_arguments_like_the_loader(plans):
     assert plan.args(values) == loader.launch_args(record, values, plan.grid)
     assert plan.grid == loader.launch_grid(record, 64, device_index=0, values=values)
     assert launched[0][1] == plan.args(values)
+    assert plan.pack(tuple(values.values()) + plan.constants) == plan.args(values)
 
 
 def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
