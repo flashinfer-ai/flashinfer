@@ -68,6 +68,7 @@ POLICY_FIELDS = (
     "sample_tiles_tiny_units",  # sample-tile cap of tiny units (lever K3b)
     "sample_dispatch_tiny_tiles_max",  # mean unit tiles up to which the tiny-unit cap applies
     "sample_shift_permille",  # conservative shift of the sampled rank
+    "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
     "check_period_knob_max",  # cap on an explicit check period (tiles)
     "check_period_cap_divisor",  # default period = cand_cap // divisor
@@ -106,7 +107,7 @@ MERGE_KEY = "merge"
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
         "candidate_slack", "split_max", "split_min_range_tiles", "tile_unroll_default", "tile_unroll_factor",
-        "sample_tiles_max", "sample_tiles_short_units", "sample_tiles_tiny_units", "sample_shift_permille",
+        "sample_tiles_max", "sample_tiles_short_units", "sample_tiles_tiny_units", "sample_shift_permille", "far_sample",
         "check_period_max", "check_period_knob_max", "check_period_cap_divisor", "finalize_items",
         "finalize_threads_small", "finalize_top_k_small", "finalize_threads", "rank_top_k_min",
         "rank_slab_window_max", "rank_bulk_align_bytes", "rank_persist_max_k", "rank_persist_ctas_per_sm")  # fmt: skip
@@ -184,6 +185,7 @@ class DispatchPolicy:
     sample_tiles_tiny_units: int
     sample_dispatch_tiny_tiles_max: float
     sample_shift_permille: int
+    far_sample: int
     check_period_max: int
     check_period_knob_max: int
     check_period_cap_divisor: int
@@ -345,6 +347,8 @@ class DispatchPolicy:
                 )
         if raw["sample_tiles_max"] < 0:
             raise ValueError("policy['sample_tiles_max'] must be >= 0")
+        if raw["far_sample"] not in (0, 1):
+            raise ValueError("policy['far_sample'] must be 0 or 1")
         values = dict(raw)
         for name in _OPTIONAL_RULE:
             if values[name] is not None:
@@ -904,6 +908,7 @@ class ProgramChoice:
     grid_ctas: int  # launched persistent grid (even for the CTA-pair program)
     sample_tiles_max: int
     sample_shift_permille: int
+    far_sample: int
     cand_cap_multiplier: int
     cand_cap: int
     first_cap: int
@@ -976,6 +981,7 @@ def select_program(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     outputs_aligned: bool = True,
@@ -984,7 +990,9 @@ def select_program(
 
     The keyword knobs change the internal partition and scheduling only
     (results are bitwise identical for every admissible value); ``None`` takes
-    the policy's default.  ``max_seqlen_k`` (the call's bound on every key
+    the policy's default.  ``far_sample`` (``0`` or ``1``) is the far-sample
+    first threshold switch of the ascending-tile-order scan programs (the
+    descending-order and wide programs ignore it).  ``max_seqlen_k`` (the call's bound on every key
     segment, optional) sizes the rank finalize's bitmap pool under lever RW
     (``rank_seg_window``); results are identical with and without it.  The finalize program is the prefix-popcount rank
     scatter where ``finalize_rank_for`` names a bitmap window for the call
@@ -1015,6 +1023,9 @@ def select_program(
         if sample_shift_permille is None
         else int(sample_shift_permille)
     )
+    far = policy.far_sample if far_sample is None else int(far_sample)
+    if far not in (0, 1):
+        raise ValueError(f"far_sample must be 0 or 1, got {far_sample!r}")
     mult = (
         policy.cand_cap_multiplier_for(T, Tkv, S, r, K)
         if candidate_multiplier is None
@@ -1077,6 +1088,7 @@ def select_program(
         grid_ctas=grid_ctas,
         sample_tiles_max=tiles,
         sample_shift_permille=shift,
+        far_sample=far,
         cand_cap_multiplier=mult,
         cand_cap=cap,
         first_cap=cap,
