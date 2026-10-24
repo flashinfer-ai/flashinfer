@@ -552,7 +552,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
         "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.7": ["fa2", "cutlass", "trtllm-native"],
+        "10.7": ["fa2", "cutlass", "trtllm-native", "cute-dsl"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
     },
