@@ -141,6 +141,63 @@ returned metadata through the explicit HCA arguments. Arbitrary TRTLLM-GEN
 token-row selections in the compressed segment cannot be represented by an HCA
 page table without repacking the compressed KV pool.
 
+Raw-index small-head DSv4 decode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``flashinfer.mla.try_batch_decode_sparse_mla_dsv4_raw`` is a pre-packing
+integration helper for B300 ordinary FP8 decode. It accepts logical SWA IDs,
+request-local compressed IDs, request IDs, a physical-page table and token
+validity. Address translation is fused into the existing attention gather,
+removing the separate index-packing launch. H16 supports 1/2/4 query rows;
+H32 supports 1/2 rows. Head dimension is 512, SWA width is 128 and compressed
+width is 512. This interface does not accept packed NVFP4/HCA cache formats,
+prefill, speculative verification or mixed decode/prefill batches.
+
+The caller provides normalized HND FP8 pools, an output tensor and serialized
+uint8 scratch. ``get_dsv4_raw_decode_workspace_size(rows, heads)`` returns
+scratch bytes without CUDA work. Warm each geometry outside CUDA Graph capture.
+The helper returns ``False`` before any GPU work for unsupported metadata or
+an unprepared capture. Keep the original packing and attention call on that
+branch. Compilation and execution failures propagate.
+
+.. code-block:: python
+
+    from flashinfer.mla import (
+        get_dsv4_raw_decode_workspace_size,
+        try_batch_decode_sparse_mla_dsv4_raw,
+    )
+
+    # Allocate once outside capture, or reuse sufficiently large native scratch.
+    scratch = torch.empty(
+        get_dsv4_raw_decode_workspace_size(rows, heads),
+        dtype=torch.uint8, device=query.device,
+    )
+    selected = try_batch_decode_sparse_mla_dsv4_raw(
+        query=query, swa_kv_cache=swa_pool, compressed_kv_cache=compressed_pool,
+        swa_indices=swa_ids, compressed_indices=compressed_ids,
+        seq_lens=seq_lens, request_ids=request_ids,
+        compressed_block_table=block_table, token_valid=token_valid,
+        sinks=sinks, workspace_buffer=scratch, out=output,
+        bmm1_scale=qk_scale, bmm2_scale=value_scale, enable_pdl=True,
+    )
+    if not selected:
+        original_pack_and_decode(...)  # Existing framework fallback.
+
+The compressed length is the count of nonnegative IDs, interpreted as a
+prefix rather than a compacted list. Interior holes and negative page entries
+are masked. Invalid-token rows suppress only compressed attention; SWA validity
+still follows its indices and original sequence length. Request IDs and
+nonnegative compressed IDs/page entries must remain in bounds even on masked
+rows. The API documents these caller-owned value invariants; execution checks
+tensor metadata only and performs no device-to-host validation.
+
+This path needs a framework call before index packing. Upgrading FlashInfer
+alone preserves the existing automatic packed-index optimization but does not
+remove a framework's index-packing kernel. The two paths share the same QK/PV
+and merge arithmetic; the raw path changes address resolution and length
+calculation. Performance should be compared over packing plus attention, with
+matching geometry, cache conditions and downstream consumers.
+
 Fused MoE
 ---------
 
