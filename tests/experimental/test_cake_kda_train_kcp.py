@@ -2533,7 +2533,7 @@ def test_saved_carry_knob_is_gated_and_validated(monkeypatch) -> None:
         offset_class="fla",
         exchange="a2a",
         precision_mode=0,
-        transfer_walk="tf32_hilo",
+        transfer_walk="bf16x3_hw64",
     )
     s_in, c1, m_seg, plane = (
         torch.zeros(n, dtype=torch.float32) for n in (3, 5, 7, 11)
@@ -3779,7 +3779,7 @@ def test_capped_launch_without_cudart_degrades(monkeypatch) -> None:
     assert len(runtime_warnings) == 1 and "unavailable" in str(
         runtime_warnings[0].message
     )
-    assert jit.launched == [(program, 4, 0, 0, "tf32_hilo")]
+    assert jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")]
     assert (
         programs.carveout_log == {}
         and programs.carveout_state == {}
@@ -3835,7 +3835,7 @@ def test_capped_launch_skips_the_bracket_inside_a_capture(monkeypatch) -> None:
     call = _fake_call(cake_kcp.WALK_GEOMETRY_DEFAULT)
     programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
     assert (
-        jit.launched == [(program, 4, 0, 0, "tf32_hilo")]
+        jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")]
         and sets == []
         and programs.capture_skips == 1
     )
@@ -4044,7 +4044,7 @@ def test_host_trim_kernel_backend_run_skips_the_discarded_abi() -> None:
             walk_geometry=geometry,
             scratch={},
             precision_mode=0,
-            transfer_walk="tf32_hilo",
+            transfer_walk="bf16x3_hw64",
         )
 
     backend = cake_kcp.KernelBackend(programs=cake_kcp._FiPrograms(FakeJit()))
@@ -4183,7 +4183,7 @@ def test_capped_launch_sets_the_node_attribute_inside_a_capture(monkeypatch) -> 
     call = _fake_node_call("node_attr")
     programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
     programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
-    assert jit.launched == [(program, 4, 0, 0, "tf32_hilo")] * 2
+    assert jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")] * 2
     assert programs.capture_skips == 0 and programs.node_attrs == 2
     assert (
         call.scratch["node_attr_launches"] == 2
