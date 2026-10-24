@@ -8865,6 +8865,512 @@
           }
         }
       }
+    },
+    {
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "cc": [
+        9,
+        0
+      ],
+      "numerical_contract": "FP16 input/intermediate/output; Frost FP4/E4M3 rounds preactivation to FP16, MXINT4 retains FP32. Expanded CUTLASS rounds preactivation to FP16; SM120 native retains FP32 preactivation/partials. Each has a separate reference.",
+      "native_backend": "cutlass_fp16_expanded",
+      "native_weight_storage": "Exact offline mxfp4 expansion to FP16; 4x payload storage; expansion excluded; not a native low-bit implementation",
+      "timer": "CUPTI single-call first-to-last GPU activity span",
+      "versions": {
+        "torch": "2.14.0a0+b2c75dd062.nv26.9.68203377",
+        "nvidia-cutlass-dsl": "4.8.0",
+        "apache-tvm-ffi": "0.1.14.post1",
+        "cupti-python": "13.4.0"
+      },
+      "selected": {
+        "frost": [
+          2,
+          8,
+          4
+        ],
+        "native": [
+          38,
+          100
+        ]
+      },
+      "validation_median_us": {
+        "frost": 78.0395,
+        "native": 51.92775
+      },
+      "speedup": 0.6654034175001121,
+      "aa_ratio": {
+        "frost": 1.0005190760446405,
+        "native": 1.0020139822403384
+      },
+      "native_search": "All advertised native choices plus default; cuTile additionally enumerates the selected/all supported block-size stage pairs; SM120 native uses all same-thread small/large-tile pairs; expanded FP16 ranks top-two per stage plus default",
+      "native_tactic_count": 5,
+      "evidence_label": "weight-only-fp16-boundary-mxfp4-t8-warm-sm90-v1",
+      "source_snapshot": "6c1e578af7281f0ee75b0f30c050c51aec0519650a342152b491459c3d769a58",
+      "workload": {
+        "weight_format": "mxfp4",
+        "activation_dtype": "fp16",
+        "native_backend": "expanded-fp16",
+        "timer": "cupti",
+        "tokens": 8,
+        "native_tactic_json": null,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "shared"
+      },
+      "native_revision": "stock-native",
+      "candidate_counts": {
+        "native": 5,
+        "frost": 88
+      },
+      "validation": [
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-0-A1",
+          "median_us": 51.776
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-0-B1",
+          "median_us": 78.1275
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-0-B2",
+          "median_us": 78.015
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-0-A2",
+          "median_us": 51.887
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-1-A1",
+          "median_us": 51.968
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-1-B1",
+          "median_us": 78.08
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-1-B2",
+          "median_us": 78.04750000000001
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-1-A2",
+          "median_us": 51.872
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-2-A1",
+          "median_us": 52.0155
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-2-B1",
+          "median_us": 77.984
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-2-B2",
+          "median_us": 78.03150000000001
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-2-A2",
+          "median_us": 52.2235
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-3-A1",
+          "median_us": 52.0475
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-3-B1",
+          "median_us": 78.04750000000001
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            2,
+            8,
+            4
+          ],
+          "phase": "ABBA-3-B2",
+          "median_us": 78.015
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-3-A2",
+          "median_us": 51.8875
+        }
+      ],
+      "reference_errors_max_over_validation": {
+        "native": {
+          "fp16_preact": {
+            "relative_l2": 0.0007579087201996263,
+            "normalized_max": 0.0013686131386861315
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0006210571484167147,
+            "normalized_max": 0.0013686131386861315
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.000585796484114395,
+            "normalized_max": 0.0013673655423883319
+          }
+        },
+        "frost": {
+          "fp16_preact": {
+            "relative_l2": 2.973300207734911e-05,
+            "normalized_max": 0.0004562043795620438
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0005802991367982018,
+            "normalized_max": 0.0009124087591240876
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0005549581190453886,
+            "normalized_max": 0.0009115770282588879
+          }
+        }
+      },
+      "warm_event_chain_control": {
+        "frost": {
+          "median_us": 77.40287482738495
+        },
+        "native": {
+          "median_us": 50.3345001488924
+        }
+      }
+    },
+    {
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "cc": [
+        9,
+        0
+      ],
+      "numerical_contract": "FP16 input/intermediate/output; Frost FP4/E4M3 rounds preactivation to FP16, MXINT4 retains FP32. Expanded CUTLASS rounds preactivation to FP16; SM120 native retains FP32 preactivation/partials. Each has a separate reference.",
+      "native_backend": "cutlass_fp16_expanded",
+      "native_weight_storage": "Exact offline mxfp4 expansion to FP16; 4x payload storage; expansion excluded; not a native low-bit implementation",
+      "timer": "CUPTI single-call first-to-last GPU activity span",
+      "versions": {
+        "torch": "2.14.0a0+b2c75dd062.nv26.9.68203377",
+        "nvidia-cutlass-dsl": "4.8.0",
+        "apache-tvm-ffi": "0.1.14.post1",
+        "cupti-python": "13.4.0"
+      },
+      "selected": {
+        "frost": [
+          4,
+          8,
+          2
+        ],
+        "native": [
+          38,
+          100
+        ]
+      },
+      "validation_median_us": {
+        "frost": 85.4075,
+        "native": 58.911
+      },
+      "speedup": 0.6897637795275591,
+      "aa_ratio": {
+        "frost": 1.0006561103202638,
+        "native": 1.0008108681808534
+      },
+      "native_search": "All advertised native choices plus default; cuTile additionally enumerates the selected/all supported block-size stage pairs; SM120 native uses all same-thread small/large-tile pairs; expanded FP16 ranks top-two per stage plus default",
+      "native_tactic_count": 5,
+      "evidence_label": "weight-only-fp16-boundary-mxfp4-t8-cold-sm90-v1",
+      "source_snapshot": "6c1e578af7281f0ee75b0f30c050c51aec0519650a342152b491459c3d769a58",
+      "workload": {
+        "weight_format": "mxfp4",
+        "activation_dtype": "fp16",
+        "native_backend": "expanded-fp16",
+        "timer": "cupti",
+        "tokens": 8,
+        "native_tactic_json": null,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "shared"
+      },
+      "native_revision": "stock-native",
+      "candidate_counts": {
+        "native": 5,
+        "frost": 88
+      },
+      "validation": [
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-0-A1",
+          "median_us": 58.751999999999995
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-0-B1",
+          "median_us": 85.487
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-0-B2",
+          "median_us": 85.231
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-0-A2",
+          "median_us": 58.864000000000004
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-1-A1",
+          "median_us": 58.911
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-1-B1",
+          "median_us": 85.37549999999999
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-1-B2",
+          "median_us": 85.5195
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-1-A2",
+          "median_us": 58.911
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-2-A1",
+          "median_us": 58.959500000000006
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-2-B1",
+          "median_us": 85.29499999999999
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-2-B2",
+          "median_us": 85.43950000000001
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-2-A2",
+          "median_us": 59.1515
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-3-A1",
+          "median_us": 59.135999999999996
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-3-B1",
+          "median_us": 85.43950000000001
+        },
+        {
+          "backend": "frost",
+          "tactic": [
+            4,
+            8,
+            2
+          ],
+          "phase": "ABBA-3-B2",
+          "median_us": 85.2635
+        },
+        {
+          "backend": "native",
+          "tactic": [
+            38,
+            100
+          ],
+          "phase": "ABBA-3-A2",
+          "median_us": 58.784000000000006
+        }
+      ],
+      "reference_errors_max_over_validation": {
+        "native": {
+          "fp16_preact": {
+            "relative_l2": 0.0007389565473821235,
+            "normalized_max": 0.0013686131386861315
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0006019472606185234,
+            "normalized_max": 0.0013686131386861315
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0005704337490917784,
+            "normalized_max": 0.0013673655423883319
+          }
+        },
+        "frost": {
+          "fp16_preact": {
+            "relative_l2": 2.973300207734911e-05,
+            "normalized_max": 0.0004562043795620438
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0005802991367982018,
+            "normalized_max": 0.0009124087591240876
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0005549581190453886,
+            "normalized_max": 0.0009115770282588879
+          }
+        }
+      },
+      "warm_event_chain_control": {
+        "frost": {
+          "median_us": 78.60337570309639
+        },
+        "native": {
+          "median_us": 50.26737600564957
+        }
+      }
     }
   ]
 }

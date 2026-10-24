@@ -1416,6 +1416,7 @@ route packing where required. Neither table measures model throughput.
 | H100 / E4M3 / 1 | Expanded FP16 CUTLASS | 53.456 -> 11.944 | 4.476x | 61.760 -> 21.679 | 2.849x |
 | H100 / E4M3 / 4, shared | Expanded FP16 CUTLASS | 51.608 -> 29.192 | 1.768x | 59.312 -> 36.904 | 1.607x |
 | H100 / E4M3 / 8, shared | Expanded FP16 CUTLASS | 51.896 -> 46.504 | 1.116x | 59.216 -> 55.568 | 1.066x |
+| H100 / MXFP4 / 8, shared | Expanded FP16 CUTLASS | 51.928 -> 78.040 | 0.665x | 58.911 -> 85.408 | 0.690x |
 | SM120 / NVFP4 / 1 | Native FP16 TC | 11.104 -> 7.776 | 1.428x | 21.000 -> 19.488 | 1.078x |
 | SM120 / NVFP4 / 2, shared | Native FP16 TC | 14.080 -> 12.104 | 1.163x | 21.720 -> 22.232 | 0.977x |
 | SM120 / NVFP4 / 8, shared | Improved native FP16 TC | 40.032 -> 34.504 | 1.160x | 49.064 -> 50.288 | 0.976x |
