@@ -374,8 +374,49 @@ def test_small_b_row_order_rule(monkeypatch):
     assert ro(4, 4, b200, num_sms=74) is True
 
 
+def test_small_b_launch_bound(monkeypatch):
+    """_SMALL_GRID_LB_CC (sm_107a): a small non-persistent grid (at most 2 CTAs per SM) with 4
+    value heads per key head compiles with a 2-CTA/SM launch bound, except the register-split
+    builds (setmaxnreg assumes 64 registers per thread) and Philox (no measured gain); larger
+    grids, other heads per key head, the persistent kernel and sm_100a keep 4. CPU-only."""
+    M = _rubin_mod()
+    rubin, b200 = _targets()
+
+    def mb(B, T, tgt=rubin, **kw):
+        return _cpu_launch(monkeypatch, B, T, tgt, **kw)["kw"]["min_blocks"]
+
+    for hpc, edge in ((1, 6), (2, 13), (4, 26)):
+        got = [mb(B, 4, heads_per_cta=hpc, persistent=False) for B in (edge, edge + 1)]
+        assert got == [2, 4], (hpc, got)
+    # register split: RN 4 heads per CTA at T >= 5, Philox 2 heads at T = 8
+    assert M._use_regsplit(8, 4, "") and mb(4, 8, heads_per_cta=4) == 4
+    assert mb(4, 8, heads_per_cta=2) == 2
+    assert mb(4, 8, heads_per_cta=2, sr="philox") == 4
+    assert mb(4, 8, heads_per_cta=2, sr="lcg") == 2
+    assert mb(4, 4, heads_per_cta=1, sr="philox") == 4
+    assert mb(4, 4, persistent=True) == 4
+    assert mb(4, 4, b200, num_sms=74) == 4
+    # 4 value heads per key head only (the measured shape): HV / H = 2 or 3 keep 4
+    assert (
+        mb(4, 4, HV=16, heads_per_cta=1) == 4 and mb(4, 4, HV=24, heads_per_cta=1) == 4
+    )
+    monkeypatch.setattr(M, "_SMALL_GRID_LB_CC", ())
+    assert mb(4, 4) == 4
+    # the build: the launch bound only, nothing else
+    o2 = M.GdnReplayMtpUmmaRubin(4, 8, 32, True, False, 2, min_blocks=2)
+    o4 = M.GdnReplayMtpUmmaRubin(4, 8, 32, True, False, 2)
+    assert o2.min_blocks == 2 and o4.min_blocks == 4
+    assert {k: v for k, v in vars(o2).items() if k != "min_blocks"} == {
+        k: v for k, v in vars(o4).items() if k != "min_blocks"
+    }
+    with pytest.raises(AssertionError):
+        M.GdnReplayMtpUmmaRubin(
+            8, 8, 32, True, False, 4, min_blocks=2
+        )  # register split
+
+
 # the sm_107a small-batch switches: each () gives the code without it (same bits)
-_SMALL_B_SWITCHES = ("_SMALL_B_DISPATCH_CC",)
+_SMALL_B_SWITCHES = ("_SMALL_B_DISPATCH_CC", "_SMALL_GRID_LB_CC")
 
 
 @pytest.mark.parametrize("mode", ["none", "philox5", "lcg"])

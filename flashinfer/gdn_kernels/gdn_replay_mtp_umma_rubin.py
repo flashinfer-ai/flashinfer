@@ -235,6 +235,7 @@ class GdnReplayMtpUmmaRubin:
         persistent: bool = False,
         h_io: Optional[int] = None,
         hv_io: Optional[int] = None,
+        min_blocks: int = _MIN_BLOCKS_PER_SM,
     ):
         assert 1 <= T <= 8
         assert hv % h == 0 and 1 <= hv // h <= HPK, (h, hv)
@@ -333,6 +334,13 @@ class GdnReplayMtpUmmaRubin:
         self.early_split = self.split and self.hpc == HPK and not self.pro_reorder
         # persistent: kernel_persist, see call_persist
         self.persistent = persistent
+        # CTAs per SM the non-persistent launch bound promises (registers per thread = 64K /
+        # (threads x this)): _MIN_BLOCKS_PER_SM, or _SMALL_GRID_CTAS_PER_SM for small grids
+        # (_launch). Not in the register-split builds, whose setmaxnreg counts assume 64.
+        assert min_blocks == _MIN_BLOCKS_PER_SM or (
+            min_blocks == _SMALL_GRID_CTAS_PER_SM and not self.split and not persistent
+        ), (min_blocks, self.split, persistent)
+        self.min_blocks = min_blocks
         if persistent:
             assert _persist_ok(T, self.hpk, hpc, self.sr), (T, self.hpk, hpc, self.sr)
             assert self.split and self.vsmem and self.nsub == 1
@@ -413,7 +421,7 @@ class GdnReplayMtpUmmaRubin:
         ).launch(
             grid=(self.h * self.nsub, q.shape[0], 1),
             block=(self.num_threads, 1, 1),
-            min_blocks_per_mp=_MIN_BLOCKS_PER_SM,
+            min_blocks_per_mp=self.min_blocks,
             stream=stream,
         )
 
@@ -4212,10 +4220,12 @@ class GdnReplayMtpUmmaRubin:
         persistent: bool = False,
         h_io: Optional[int] = None,
         hv_io: Optional[int] = None,
+        min_blocks: int = _MIN_BLOCKS_PER_SM,
     ):
         """Compile one specialisation for ``device``'s architecture (callers use ``_get_kernel``).
         ``h_io`` / ``hv_io``: head counts of the input / output tensors' token rows (see
-        ``__init__``); q / k / v / a / b / out are then head-slice views with those strides."""
+        ``__init__``); q / k / v / a / b / out are then head-slice views with those strides.
+        ``min_blocks``: the non-persistent launch bound's CTAs per SM (see ``_launch``)."""
         h_io = h if h_io is None else h_io
         hv_io = hv if hv_io is None else hv_io
         batch = cute.sym_int()
@@ -4257,6 +4267,7 @@ class GdnReplayMtpUmmaRubin:
             persistent,
             h_io,
             hv_io,
+            min_blocks,
         )
         opts = gdn_compile_options(device, cute.EnableTVMFFI(True))
         if persistent:
@@ -4289,6 +4300,7 @@ def _get_kernel(
     persistent: bool = False,
     h_io: Optional[int] = None,
     hv_io: Optional[int] = None,
+    min_blocks: int = _MIN_BLOCKS_PER_SM,
 ):
     """The compiled kernel for this specialisation on ``device``'s architecture: one per
     (compile target, parameters); batch and pool sizes are dynamic."""
@@ -4307,6 +4319,7 @@ def _get_kernel(
         persistent,
         h_io,
         hv_io,
+        min_blocks,
     )
     fn = _KERNELS.get(key)
     if fn is None:
@@ -4323,6 +4336,7 @@ def _get_kernel(
             persistent,
             h_io,
             hv_io,
+            min_blocks,
         )
         _KERNELS[key] = fn
     return fn
@@ -4431,6 +4445,13 @@ _HPC2_NO_FLUSH_ONE_WAVE = 1.0
 # on either grid, whatever the heads per key head.
 _SMALL_B_DISPATCH_CC = ((10, 7),)
 _SMALL_GRID_CTAS_PER_SM = 2
+# Launch bound of small non-persistent grids (_small_grid) on these archs, with 4 value heads per
+# key head (the only shape measured): _SMALL_GRID_CTAS_PER_SM CTAs per SM instead of
+# _MIN_BLOCKS_PER_SM (ptxas may then use more registers per thread in the 192-thread builds; the
+# register-split builds keep theirs). Rubin VR200, uGPU, flush rows first, slide rates, B = 1-4:
+# round to nearest 1.01-1.05x, LCG 1.01-1.04x; Philox 0.98-1.03x (within noise), so not the
+# Philox builds.
+_SMALL_GRID_LB_CC = ((10, 7),)
 
 
 def _small_grid(n_key_heads: int, hpk: int, hpc: int, batch: int, num_sms: int) -> bool:
@@ -5181,6 +5202,19 @@ def _launch(
         # row): rows in batch order, same results (a CTA's row only picks its work). Rubin,
         # uGPU, B <= 128: 1.01-1.13x where it applies
         use_ro = False
+    min_blocks = _MIN_BLOCKS_PER_SM
+    if (
+        not persistent
+        and (target.major, target.minor) in _SMALL_GRID_LB_CC
+        and hpk == HPK
+        and _small_grid(H, hpk, hpc, B, nsm)
+        and sr != "philox"
+        and not _use_regsplit(T, hpc, sr)
+    ):
+        # small grid: a launch bound of _SMALL_GRID_CTAS_PER_SM CTAs per SM (more registers
+        # for the latency-bound CTAs, never more CTAs than that per SM anyway); not Philox
+        # (0.98-1.03x, within noise)
+        min_blocks = _SMALL_GRID_CTAS_PER_SM
     args = (
         q,
         k,
@@ -5213,6 +5247,7 @@ def _launch(
         bool(persistent),
         h_io,
         hv_io,
+        min_blocks=min_blocks,
     )
     if persistent:
         ctr = (
