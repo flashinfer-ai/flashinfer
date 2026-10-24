@@ -97,14 +97,14 @@ def _edge_tokens(heads: int) -> list[int]:
 def test_every_window_matches_the_reference(heads, eps):
     route = pkg.rmsnorm_sigmoid_gate_route()
     launched = []
-    original = loader.run_module
+    original = pkg._launch
 
-    def spy(name, values, *, rows, device_index):
-        launched.append((name, rows, values["heads"]))
-        return original(name, values, rows=rows, device_index=device_index)
+    def spy(plan, args):
+        launched.append((plan.name, plan.rows))
+        return original(plan, args)
 
     try:
-        loader.run_module = spy
+        pkg._launch = spy
         for tokens in _edge_tokens(heads):
             x, gate, projection = _inputs(tokens, heads, seed=919 + tokens)
             assert gate.stride()[1:] == (HEAD_DIM, 1)
@@ -118,9 +118,9 @@ def test_every_window_matches_the_reference(heads, eps):
             assert x.data_ptr() == pointer
             torch.testing.assert_close(x, expected, atol=ATOL, rtol=RTOL)
             name = loader.selected_module(_arch(), route, tokens, heads)
-            assert launched[-1] == (name, tokens, heads)
+            assert launched[-1] == (name, tokens)
     finally:
-        loader.run_module = original
+        pkg._launch = original
 
 
 @pytest.mark.parametrize("heads", HEADS)
@@ -155,7 +155,7 @@ def test_a_two_d_call_is_one_head_and_falls_to_the_cute_kernel(monkeypatch):
     rows, rows_gate = x.view(-1, HEAD_DIM).clone(), gate.reshape(-1, HEAD_DIM).clone()
     expected = _reference(rows, rows_gate, 1e-5)
     launched = []
-    monkeypatch.setattr(loader, "run_module", lambda *a, **k: launched.append(a))
+    monkeypatch.setattr(pkg, "_launch", lambda *a: launched.append(a))
     assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(_device(), heads=1)
     rmsnorm_sigmoid_gate(rows, rows_gate, 1e-5, backend="auto")
     torch.cuda.synchronize()
@@ -167,13 +167,13 @@ def test_a_two_d_call_is_one_head_and_falls_to_the_cute_kernel(monkeypatch):
 
 def test_empty_batch_launches_nothing():
     launched = []
-    original = loader.run_module
+    original = pkg._launch
     try:
-        loader.run_module = lambda *a, **k: launched.append(a)
+        pkg._launch = lambda *a: launched.append(a)
         x, gate, _ = _inputs(0, 32, seed=1)
         rmsnorm_sigmoid_gate(x, gate, 1e-5, backend="cake")
     finally:
-        loader.run_module = original
+        pkg._launch = original
     assert launched == []
 
 
@@ -211,8 +211,9 @@ def test_a_gap_of_the_windows_falls_to_the_cute_kernel(monkeypatch):
     }
     monkeypatch.setitem(loader.MODULES, "gapped_record", gapped)
     monkeypatch.setitem(loader.ROUTES[_arch()], route, ["gapped_record"])
+    pkg.clear_launch_plans()  # plans prepared under the real registry must not serve the gapped one
     launched = []
-    monkeypatch.setattr(loader, "run_module", lambda *a, **k: launched.append(a))
+    monkeypatch.setattr(pkg, "_launch", lambda *a: launched.append(a))
     x, gate, _ = _inputs(9, 32, seed=9)
     expected = _reference(x, gate, 1e-5)
     assert supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM, backend="cake")
@@ -229,7 +230,7 @@ def test_refuses_inputs_outside_the_contract():
     x, gate, _ = _inputs(2, 32, seed=2)
     call = pkg.cake_rmsnorm_sigmoid_gate
     call(x.clone(), gate, eps=1e-5)
-    with pytest.raises(ValueError, match="must be a CUDA bfloat16"):
+    with pytest.raises(ValueError, match="must be a bfloat16"):
         call(x.half(), gate.half(), eps=1e-5)
     with pytest.raises(ValueError, match="gate must have the shape"):
         call(x, gate[:1], eps=1e-5)
