@@ -1036,11 +1036,11 @@ def resolve_launch(
             values["cols_per_cta"] = int(
                 rec.get("grid_rule", {}).get("cols_per_cta", cols_per_cta)
             )
-        grid = (
-            tuple(int(x) for x in jit.launch_grid(record, **grid_args))
-            if grid_args
-            else (int(args["_grid"]), 1, 1)
-        )
+        if grid_args:
+            gx, gy, gz = (int(x) for x in jit.launch_grid(record, **grid_args))
+            grid = (gx, gy, gz)
+        else:
+            grid = (int(args["_grid"]), 1, 1)
         if call is not None:
             call.records.append((record, grid))
         return record, values, grid, is_test
@@ -1478,7 +1478,7 @@ class _Tables:
         # tape coverage: #2 / #7 ``program=tape`` write h / v_new (dh / dv_new) for the walked
         # segments' chunks only; the local programs read chunks c < NC only, every such chunk belongs to exactly one
         # live segment, and every tape phase below walks every live segment -- no pre-zeroing of the tapes.
-        live = {
+        live_segs: set[int] = {
             s
             for s in range(NSEG)
             if int(hp.seg_chunk_start[s + 1]) > int(hp.seg_chunk_start[s])
@@ -1494,12 +1494,12 @@ class _Tables:
                 (self.walk_end, self.walk_cross_last, self.walk_cross_rest),
             ),
         ):
-            covered = set()
+            covered: set[int] = set()
             for lst in lists:
                 covered.update(int(x) for x in lst)
-            if not live <= covered:
+            if not live_segs <= covered:
                 raise RuntimeError(
-                    f"tape walks ({label}) miss live segments {sorted(live - covered)}: the tapes would hold "
+                    f"tape walks ({label}) miss live segments {sorted(live_segs - covered)}: the tapes would hold "
                     f"unwritten rows"
                 )
         # -- tile tables [slot][h]
@@ -2062,7 +2062,7 @@ class KcpWorkspace:
         self.state_dtype = state_dtype
         self.device: torch.device | None = None
         self._pools: dict[str, torch.Tensor] = {}
-        self._tables: dict[tuple[Any, int, int], _Tables] = {}
+        self._tables: dict[tuple[Any, int, int, int | None], _Tables] = {}
         self._tapes: dict[str, torch.Tensor] = {}
         self._tickets: torch.Tensor | None = (
             None  # u32 [len(TICKET_SITES) * 32]: one 128-byte slot per site
