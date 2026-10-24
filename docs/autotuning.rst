@@ -428,6 +428,53 @@ with ``torchrun``), you could use separate output files per rank and merge them 
    expected to be atomic on most network filesystems (NFS, Lustre) per POSIX
    semantics.  FlashInfer's cubin caching also relies on this guarantee.
 
+Batch-Invariant Autotuning
+--------------------------
+
+Some tactics change the floating-point reduction order; for example the
+``mm_mxfp8(backend="cute-dsl")`` split-K tactics, offered only for M <= 32,
+sum K in slices across CTAs. Each such tactic is deterministic, but which one
+wins depends on timing noise and on the M bucket. Without coordination, two
+ranks (or two restarts) that tuned the same GEMM can therefore round the same
+row differently, and a small-M call (such as a prefix-cache extend) can round
+differently from the same rows inside a large prefill.
+
+To restrict tuning to tactics whose result does not depend on the tactic or on
+M, enable batch-invariant autotuning before tuning and serving:
+
+.. code-block:: python
+
+    from flashinfer.autotuner import set_autotune_batch_invariant
+
+    set_autotune_batch_invariant(True)  # or FLASHINFER_AUTOTUNE_BATCH_INVARIANT=1
+
+The autotuner then profiles and serves only tactics for which the runner's
+``TunableRunner.is_batch_invariant_tactic(tactic)`` returns ``True``; a cached
+tactic that is not batch-invariant (in memory, from ``autotune(cache=...)`` or
+from bundled configs) is treated as a cache miss. Runners report every tactic
+as batch-invariant unless they override the method. When the mode is on, a
+runner list whose untuned default would split the reduction (for example the
+SM100/SM103 MXFP8 warp split-K runner at small N) puts a non-split runner
+first instead, and an ``autotune_v2`` tuning context does not race a
+non-invariant default tactic.
+
+Interaction with other autotuner features:
+
+* The setting is process-wide. Under ``set_autotune_process_group`` every rank
+  must use the same value: it changes the candidate set, so ranks that
+  disagree fail the distributed plan check with an "Autotune group plan
+  mismatch" error instead of profiling.
+* The mode is not part of the cache key or of the stored profiling policy.
+  Rejected entries are re-profiled in tuning mode, and the new winner replaces
+  the old entry in the active cache (a managed store or ``autotune(cache=...)``
+  file). Keep separate caches if you switch the mode back and forth.
+* ``ReplayCoverage`` reports a rejected cached winner as a miss with reason
+  ``not_batch_invariant``. Under ``strict_replay=True`` that miss raises, like
+  any other miss: a strict replay with the mode on needs a cache that was
+  tuned with the mode on.
+* Graph timing (``use_cuda_graph_individual_timing``) and the tactics blocklist
+  apply to the remaining candidates unchanged.
+
 Custom tuning protocols
 -----------------------
 

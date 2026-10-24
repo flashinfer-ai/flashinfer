@@ -821,6 +821,23 @@ class TunableRunner(ABC):
         """
         return [-1]
 
+    def is_batch_invariant_tactic(self, tactic: Any) -> bool:
+        """Whether ``tactic`` reduces each output element in the same order as
+        this runner's fallback (``tactic=-1``) at every M.
+
+        Under batch-invariant autotuning (see
+        :func:`set_autotune_batch_invariant`) the autotuner only selects
+        tactics for which this returns ``True``, so the result for a row does
+        not depend on which tactic won the timing race, on the rank that tuned
+        it, or on the batch size (M bucket) it ran at.
+
+        Override it in runners whose tactic space includes tactics that split
+        the reduction differently, e.g. split-K across CTAs or warps. The
+        default trusts every tactic. ``tactic`` may come from a cache file, so
+        tuples can arrive as lists.
+        """
+        return True
+
     def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
         """Return extra values to include in the autotune cache key.
 
@@ -1200,6 +1217,44 @@ def is_in_profile_measurement() -> bool:
 
 
 _tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
+
+_batch_invariant: bool = os.environ.get(
+    "FLASHINFER_AUTOTUNE_BATCH_INVARIANT", "0"
+).lower() in ("1", "true", "yes", "on")
+
+
+def set_autotune_batch_invariant(enabled: bool) -> None:
+    """Restrict autotuning to batch-invariant tactics (process-wide).
+
+    When enabled, the autotuner only selects tactics whose runner reports
+    :meth:`TunableRunner.is_batch_invariant_tactic`, both when profiling and
+    when it serves a cached result (in-memory, ``autotune(cache=...)`` file or
+    bundled config); a cached tactic that is not batch-invariant counts as a
+    cache miss. Runners whose untuned default would itself split the reduction
+    also switch to a batch-invariant default.
+
+    Tactics such as split-K change the floating-point reduction order. They are
+    deterministic run to run, but the chosen tactic depends on timing noise and
+    on the M bucket, so without this mode the same row can round differently
+    across ranks, restarts, or batch sizes (e.g. a 27-token prefix-cache extend
+    versus a full prefill). Enable it when bitwise reproducibility matters more
+    than the last few percent of small-M GEMM speed.
+
+    Also enabled by ``FLASHINFER_AUTOTUNE_BATCH_INVARIANT=1``. Under
+    :func:`set_autotune_process_group` every rank must use the same setting,
+    since it changes the candidate set; ranks that disagree fail the
+    distributed plan check. The setting is not part of the cache key: a
+    rejected entry is reported by ``ReplayCoverage`` as a miss with reason
+    ``"not_batch_invariant"`` (so ``strict_replay`` raises), and re-profiling
+    it in tuning mode replaces it in the active cache. Not thread-safe.
+    """
+    global _batch_invariant
+    _batch_invariant = bool(enabled)
+
+
+def get_autotune_batch_invariant() -> bool:
+    """Return whether batch-invariant autotuning is enabled."""
+    return _batch_invariant
 
 
 def set_autotune_process_group(
@@ -1975,6 +2030,50 @@ class AutoTuner:
                 )
         return ok
 
+    def _cached_tactic_rejection(
+        self, runner: TunableRunner, inputs, tactic: Any, custom_op: str, source: str
+    ) -> str | None:
+        """Why a cached tactic cannot be served, or ``None`` if it can.
+
+        ``"not_batch_invariant"``: batch-invariant autotuning is enabled and
+        the runner does not report the tactic as batch-invariant.
+        ``"invalid_tactic"``: the tactic failed :meth:`_tactic_still_valid`.
+        Either way the lookup treats the entry as a cache miss; replay
+        coverage reports the reason, and strict replay rejects it like any
+        other miss.
+        """
+        if not self._batch_invariance_allows(runner, tactic, custom_op, source):
+            return "not_batch_invariant"
+        if not self._tactic_still_valid(runner, inputs, tactic, custom_op, source):
+            return "invalid_tactic"
+        return None
+
+    def _batch_invariance_allows(
+        self, runner: TunableRunner, tactic: Any, custom_op: str, source: str
+    ) -> bool:
+        """False iff batch-invariant autotuning rejects this cached tactic."""
+        if not _batch_invariant or runner.is_batch_invariant_tactic(tactic):
+            return True
+        key = (custom_op, runner.__class__.__name__, f"{source}:batch_invariant")
+        if key not in self._logged_invalid_tactic:
+            self._logged_invalid_tactic.add(key)
+            logger.info(
+                f"[Autotuner]: ignoring cached tactic {tactic!r} for "
+                f"{custom_op} (runner={runner.__class__.__name__}, "
+                f"source={source}): not batch-invariant"
+            )
+        return False
+
+    def _filter_candidates(
+        self, custom_op: str, runner: TunableRunner, tactics: list[Any]
+    ) -> list[Any]:
+        """Profiling candidates after the offline blocklist and, under
+        batch-invariant autotuning, the runner's batch-invariance check."""
+        tactics = self._blocklist.filter(custom_op, runner, tactics)
+        if _batch_invariant:
+            tactics = [t for t in tactics if runner.is_batch_invariant_tactic(t)]
+        return tactics
+
     @property
     def _active_managed_store(self):
         """The store lookups/publishes target right now.
@@ -2211,14 +2310,12 @@ class AutoTuner:
                             rejections.append("policy_mismatch")
                         continue
                     tactic, stored_profile = winners[cache_key]
-                    if not self._tactic_still_valid(
+                    reason = self._cached_tactic_rejection(
                         r, inputs, tactic, custom_op, "memory"
-                    ):
-                        if (
-                            rejections is not None
-                            and "invalid_tactic" not in rejections
-                        ):
-                            rejections.append("invalid_tactic")
+                    )
+                    if reason is not None:
+                        if rejections is not None and reason not in rejections:
+                            rejections.append(reason)
                         # Fall through: another runner, a disk source, or
                         # (in tuning mode) a re-profile may still serve.
                         continue
@@ -2259,14 +2356,12 @@ class AutoTuner:
                             ):
                                 rejections.append("runner_mismatch")
                             continue
-                        if not self._tactic_still_valid(
+                        reason = self._cached_tactic_rejection(
                             runners[r_id], inputs, tactic, custom_op, "config file"
-                        ):
-                            if (
-                                rejections is not None
-                                and "invalid_tactic" not in rejections
-                            ):
-                                rejections.append("invalid_tactic")
+                        )
+                        if reason is not None:
+                            if rejections is not None and reason not in rejections:
+                                rejections.append(reason)
                             continue
                         log_key = (custom_op, runner_name)
                         if log_key not in self._logged_file_hits:
@@ -2331,14 +2426,12 @@ class AutoTuner:
                         ):
                             rejections.append("runner_mismatch")
                         continue
-                    if not self._tactic_still_valid(
+                    reason = self._cached_tactic_rejection(
                         runners[r_id], inputs, tactic, custom_op, "managed cache"
-                    ):
-                        if (
-                            rejections is not None
-                            and "invalid_tactic" not in rejections
-                        ):
-                            rejections.append("invalid_tactic")
+                    )
+                    if reason is not None:
+                        if rejections is not None and reason not in rejections:
+                            rejections.append(reason)
                         continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
@@ -2380,6 +2473,15 @@ class AutoTuner:
                     ):
                         continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
+                    if is_hit and not self._batch_invariance_allows(
+                        runners[r_id], file_tactic, custom_op, "bundled"
+                    ):
+                        if (
+                            rejections is not None
+                            and "not_batch_invariant" not in rejections
+                        ):
+                            rejections.append("not_batch_invariant")
+                        continue
                     if is_hit:
                         if report is not None:
                             report._record(
@@ -2893,13 +2995,17 @@ class AutoTuner:
                             valid_tactics = []
                             try:
                                 valid_tactics = r.get_valid_tactics(tensors, p)
-                                valid_tactics = self._blocklist.filter(
+                                valid_tactics = self._filter_candidates(
                                     custom_op, r, valid_tactics
                                 )
                                 if (
                                     r_id == 0
                                     and race_default
                                     and -1 not in valid_tactics
+                                    and (
+                                        not _batch_invariant
+                                        or r.is_batch_invariant_tactic(-1)
+                                    )
                                 ):
                                     valid_tactics = [-1, *valid_tactics]
                             except (torch.cuda.OutOfMemoryError, MemoryError):
@@ -3367,7 +3473,9 @@ class AutoTuner:
             valid_tactics = []
             try:
                 valid_tactics = runner.get_valid_tactics(tensors, profile)
-                valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+                valid_tactics = self._filter_candidates(
+                    custom_op, runner, valid_tactics
+                )
             except (torch.cuda.OutOfMemoryError, MemoryError):
                 if _tune_process_group is None:
                     raise
