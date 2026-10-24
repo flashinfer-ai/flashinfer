@@ -44,3 +44,5 @@ class PrimsTsGemmConfig:
     use_tma_store: bool = False
     # Store Q, K, V as three contiguous [M, N/3] sections.
     separate_qkv_output: bool = False
+    # Add a BF16 [M, N] tensor to the dequantized accumulator.
+    has_delta: bool = False
