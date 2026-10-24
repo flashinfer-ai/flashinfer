@@ -450,7 +450,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # (2 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
     # routed record of a higher threshold admits C; below every threshold the
     # fallback record (no select_rule) runs.
-    "cake_causal_conv1d_train_be6f561d1572ef3c852a": {
+    "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6": {
         "arches": [
             "sm_103a",
             "sm_107a",
@@ -489,8 +489,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_be6f561d1572ef3c852a",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_be6f561d1572ef3c852a",
+        "kernel": "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -498,7 +498,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 66560,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_be6f561d1572ef3c852a",
+        "library": "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
         "logical": {
             "C": "C",
             "S": "S",
@@ -1229,7 +1229,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
-    "cake_causal_conv1d_train_f37ed33278f737fe4c0a": {
+    "cake_causal_conv1d_train_149ca6f53934ba630033": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1270,8 +1270,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_f37ed33278f737fe4c0a",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_f37ed33278f737fe4c0a",
+        "kernel": "cake_causal_conv1d_train_149ca6f53934ba630033",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_149ca6f53934ba630033",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1279,7 +1279,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 74752,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_f37ed33278f737fe4c0a",
+        "library": "cake_causal_conv1d_train_149ca6f53934ba630033",
         "logical": {
             "C": "C",
             "S": "S",
@@ -1311,7 +1311,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
-    "cake_causal_conv1d_train_2ece5c7c6b17ac7609b3": {
+    "cake_causal_conv1d_train_843c010db78c79107fd3": {
         "arches": [
             "sm_107a",
         ],
@@ -1348,8 +1348,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_2ece5c7c6b17ac7609b3",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_2ece5c7c6b17ac7609b3",
+        "kernel": "cake_causal_conv1d_train_843c010db78c79107fd3",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_843c010db78c79107fd3",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1357,7 +1357,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 74752,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_2ece5c7c6b17ac7609b3",
+        "library": "cake_causal_conv1d_train_843c010db78c79107fd3",
         "logical": {
             "C": "C",
             "S": "S",
@@ -1383,11 +1383,12 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # Rendered by the exporter from the family adapter's scaffold: the backward
-    # with vec 8, copy tma2d, stage_tokens 8, min_blocks 2, dtype_flags
+    # with vec 8, copy tma2d, stage_tokens 8, min_blocks 2, dtype_flags,
+    # fold_layout thread
     # (2 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
     # routed record of a higher threshold admits C; below every threshold the
     # fallback record (no select_rule) runs.
-    "cake_causal_conv1d_train_0361dd07e37460048dfa": {
+    "cake_causal_conv1d_train_2675cc1cb4efc0937378": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1429,8 +1430,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_0361dd07e37460048dfa",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_0361dd07e37460048dfa",
+        "kernel": "cake_causal_conv1d_train_2675cc1cb4efc0937378",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_2675cc1cb4efc0937378",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1438,7 +1439,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_0361dd07e37460048dfa",
+        "library": "cake_causal_conv1d_train_2675cc1cb4efc0937378",
         "logical": {
             "C": "C",
             "S": "S",
@@ -2032,12 +2033,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_517710d1f0988cf570a9",
         ],
         "bwd_bias_fp32g": [
-            "cake_causal_conv1d_train_f37ed33278f737fe4c0a",
+            "cake_causal_conv1d_train_149ca6f53934ba630033",
             "cake_causal_conv1d_train_a681165b3e81204c73ff",
         ],
         "bwd_dt": [
             "cake_causal_conv1d_train_9c8310a1d3fa9b8ccffa",
-            "cake_causal_conv1d_train_0361dd07e37460048dfa",
+            "cake_causal_conv1d_train_2675cc1cb4efc0937378",
         ],
         "bwd_fp32g": [
             "cake_causal_conv1d_train_c8027a64ba3cc38333bf",
@@ -2057,19 +2058,19 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd": [
             "cake_causal_conv1d_train_e08749684c395f2ab65e",
             "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
-            "cake_causal_conv1d_train_be6f561d1572ef3c852a",
+            "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_train_2d91e5f926238453c78c",
             "cake_causal_conv1d_train_517710d1f0988cf570a9",
         ],
         "bwd_bias_fp32g": [
-            "cake_causal_conv1d_train_f37ed33278f737fe4c0a",
+            "cake_causal_conv1d_train_149ca6f53934ba630033",
             "cake_causal_conv1d_train_a681165b3e81204c73ff",
         ],
         "bwd_dt": [
             "cake_causal_conv1d_train_9c8310a1d3fa9b8ccffa",
-            "cake_causal_conv1d_train_0361dd07e37460048dfa",
+            "cake_causal_conv1d_train_2675cc1cb4efc0937378",
         ],
         "bwd_fp32g": [
             "cake_causal_conv1d_train_c8027a64ba3cc38333bf",
@@ -2089,7 +2090,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd": [
             "cake_causal_conv1d_train_9a07bcaa0223632640ee",
             "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
-            "cake_causal_conv1d_train_be6f561d1572ef3c852a",
+            "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
             "cake_causal_conv1d_train_aeff6106e2822f313a0c",
         ],
         "bwd_bias": [
@@ -2097,12 +2098,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_517710d1f0988cf570a9",
         ],
         "bwd_bias_fp32g": [
-            "cake_causal_conv1d_train_2ece5c7c6b17ac7609b3",
+            "cake_causal_conv1d_train_843c010db78c79107fd3",
             "cake_causal_conv1d_train_a681165b3e81204c73ff",
         ],
         "bwd_dt": [
             "cake_causal_conv1d_train_8b9b8db0833fd64a578f",
-            "cake_causal_conv1d_train_0361dd07e37460048dfa",
+            "cake_causal_conv1d_train_2675cc1cb4efc0937378",
         ],
         "bwd_fp32g": [
             "cake_causal_conv1d_train_f1545adfd2bb28044419",
