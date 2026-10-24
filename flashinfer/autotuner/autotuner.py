@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import copy
@@ -534,6 +537,13 @@ class TuningConfig:
             lane views in the reusable A/B profiling arenas. Their contents are
             staged once per profile even when they are not value-aware. Shared
             read-only tensors may be omitted and retain one pointer.
+        preserve_input_storage (bool): Reuse the original input addresses during
+            profiling, including cold-L2 measurements. Use for symmetric-memory
+            collective kernels; requires static input profiles.
+        profiling_warmup (int | None): Per-operation warmup count. None inherits
+            the tuner default. Tactic preparation still runs when this is zero.
+        rank_reduction (str): Reduce distributed timings with "mean" (default)
+            or "max" for collectives limited by their slowest participant.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -554,6 +564,28 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
+    # Collective kernels may bind symmetric storage that cannot be cloned.
+    # Cold-L2 measurements still evict L2, but reuse these input addresses.
+    preserve_input_storage: bool = False
+    # None inherits the tuner default; zero still performs tactic preparation.
+    profiling_warmup: int | None = None
+    # Collective latency is sometimes determined by the slowest participant.
+    rank_reduction: str = "mean"
+
+    def __post_init__(self):
+        if self.rank_reduction not in ("mean", "max"):
+            raise ValueError("rank_reduction must be 'mean' or 'max'")
+        if self.profiling_warmup is not None and self.profiling_warmup < 0:
+            raise ValueError("profiling_warmup must be nonnegative")
+        if self.preserve_input_storage and self.dynamic_tensor_specs:
+            raise ValueError("preserve_input_storage requires static input profiles")
+        if self.preserve_input_storage and (
+            self.profile_arena_input_indices or self.value_aware_input_indices
+        ):
+            raise ValueError(
+                "preserve_input_storage cannot be combined with profile-arena "
+                "or value-aware inputs, which rotate input addresses"
+            )
 
     @property
     def uses_cold_chain(self) -> bool:
@@ -573,6 +605,26 @@ class TuningConfig:
         if self.uses_cold_chain:
             return f"cold-chain:{self.cold_chain_launches}"
         return "cold"
+
+
+@dataclass(frozen=True)
+class TuningPreflight:
+    """Public snapshot of a single runner's selection policy and cache state.
+
+    Collective callers compare this object across ranks before selection. The
+    stored profile and process-local runner identity are deliberately excluded.
+    Obtain a fresh snapshot after selection to check whether tuning succeeded.
+    """
+
+    config: TuningConfig
+    cache_hit: bool
+    runner_id: int
+    tactic: Any
+    allowed_tactics: tuple[Any, ...]
+    is_tuning: bool
+    skipped: bool
+    measurement_policy: Any
+    managed_cache: bool
 
 
 class ValueProfileArena:
@@ -793,6 +845,19 @@ class OptimizationProfile:
 
 
 class TunableRunner(ABC):
+    def prepare_tactic(self, inputs, tactic, **kwargs) -> None:  # noqa: B027
+        """Prepare one tactic before warmup, timing, or graph capture.
+
+        Unlike ``precompile_tactics``, this runs immediately before each
+        measured tactic, including when profiling warmup is zero. It may
+        change workspace layouts or compile/bind kernels, but must not launch
+        a collective kernel. When a tune group is installed, preparation
+        failures are agreed across ranks before any rank begins profiling.
+
+        ``AutoTuner.prepare_tactic_profile`` prepares a reusable input
+        schedule; this hook binds the runner to one selected tactic.
+        """
+
     @abstractmethod
     def get_valid_tactics(
         self, inputs: list[torch.Tensor], profile: OptimizationProfile
@@ -1198,8 +1263,11 @@ _tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
 def set_autotune_process_group(
     group: Optional["torch.distributed.ProcessGroup"],
 ) -> None:
-    """All-reduce (mean) per-tactic profile timings across ``group`` so every
+    """All-reduce per-tactic profile timings across ``group`` so every
     rank's ``argmin`` picks the same tactic.
+
+    Uses the mean by default; ``TuningConfig.rank_reduction="max"`` selects
+    the slowest participant's latency instead.
 
     Without it, GPU timing noise makes ranks diverge on tactic choice, which
     deadlocks NCCL symmetric-memory allocation (``NCCL_WIN_COLL_SYMMETRIC``).
@@ -2048,6 +2116,84 @@ class AutoTuner:
             if self._override_tuning_buckets is not None or self._override_round_up:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
         return tuning_config.dynamic_tensor_specs[spec_idx].map_to_tuning_buckets
+
+    @contextlib.contextmanager
+    def collective_session(self, group):
+        """Serialize selection and temporarily bind its collective domain.
+
+        Like choose_one, this holds the tuner lock throughout GPU profiling:
+        concurrent measurements interfere, and the process-wide tune group
+        must not change between preflight, preparation and timing collectives.
+        Use one process per GPU and call in the same order on every rank.
+        Other threads using this tuner wait until the entire session finishes.
+        This serialization is required for correctness, including rollback:
+        narrowing the lock to preflight would let another session change the
+        shared group or tuning policy between collectives.
+        """
+        with self._lock:
+            previous = get_autotune_process_group()
+            set_autotune_process_group(group)
+            try:
+                yield
+            finally:
+                set_autotune_process_group(previous)
+
+    def effective_config(self, tuning_config: TuningConfig) -> TuningConfig:
+        """Apply the active bucket and measurement overrides used by selection."""
+        with self._lock:
+            config = self._apply_tuning_overrides(tuning_config)
+            policy = self._effective_measure_policy
+            return (
+                self._apply_measure_policy(config, policy)
+                if policy is not None
+                else config
+            )
+
+    def selection_preflight(
+        self,
+        custom_op: str,
+        runner: TunableRunner,
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor],
+        *,
+        tactics: Sequence[Any],
+    ) -> TuningPreflight:
+        """Return named, comparable selection state without launching a kernel.
+
+        Use within collective_session when preflight and choose_one must see
+        one consistent policy/cache state. This owns filtering, cache tuple
+        decoding, skip policy and managed-cache context on behalf of backends.
+        """
+        with self._lock:
+            config = self.effective_config(tuning_config)
+            hit, runner_id, tactic, _ = self.search_cache(
+                custom_op,
+                [runner],
+                tuple(self._get_input_sizes(inputs)),
+                config,
+                inputs=inputs,
+            )
+            return TuningPreflight(
+                config=config,
+                cache_hit=hit,
+                runner_id=runner_id,
+                tactic=tactic,
+                allowed_tactics=tuple(
+                    self._blocklist.filter(custom_op, runner, list(tactics))
+                ),
+                is_tuning=self.is_tuning_mode,
+                skipped=custom_op in self._effective_skip_ops,
+                measurement_policy=self._effective_measure_policy,
+                managed_cache=self._in_v2_context,
+            )
+
+    def prepare_selected_tactic(self, runner, inputs, tactic, **kwargs) -> None:
+        """Prepare a selected tactic with the cross-rank failure handshake.
+
+        The collective runs even for KeyboardInterrupt/SystemExit, before the
+        original exception is propagated, so peers can finish the handshake.
+        """
+        self._prepare_tactic(runner, inputs, tactic, **kwargs)
 
     def search_cache(
         self,
@@ -3083,6 +3229,27 @@ class AutoTuner:
             for tensor in inputs
         )
 
+    def _prepare_tactic(self, runner, inputs, tactic, **kwargs) -> None:
+        """Prepare before launch; even interrupts must join the failure collective."""
+        prepare = getattr(runner, "prepare_tactic", None)
+        if (
+            prepare is None
+            or getattr(prepare, "__func__", None) is TunableRunner.prepare_tactic
+        ):
+            return
+        error = None
+        try:
+            prepare(inputs, tactic, **kwargs)
+        except BaseException as exc:
+            error = exc
+        # The same failure handshake as input-preparation OOM, but applied to
+        # all compile/bind failures before peers can enter a collective kernel.
+        failed = _sync_oom_across_tune_group(error is not None)
+        if error is not None:
+            raise error
+        if failed:
+            raise RuntimeError("Tactic preparation failed on another autotune rank")
+
     def _profile_single_kernel(
         self,
         runner: TunableRunner,
@@ -3354,6 +3521,7 @@ class AutoTuner:
         # fallback).
         profile_exc: Optional[BaseException] = None
         try:
+            self._prepare_tactic(runner, inputs, tactic, **kwargs)
             # The CUPTI route stays INSIDE this try so a rank using it still
             # reaches the all-reduce below on failure (cardinality invariant),
             # and its measured time participates in the cross-rank mean like
@@ -3402,7 +3570,8 @@ class AutoTuner:
                     )
                 with _profile_measurement_scope():
                     # warm up, no timing
-                    for _ in range(self.warmup):
+                    warmup = tuning_config.profiling_warmup
+                    for _ in range(self.warmup if warmup is None else warmup):
                         runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
                     avg_time = (
@@ -3429,9 +3598,17 @@ class AutoTuner:
                     [avg_time], dtype=torch.float64, device=device
                 )
                 dist.all_reduce(
-                    time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
+                    time_tensor,
+                    op=(
+                        dist.ReduceOp.MAX
+                        if tuning_config.rank_reduction == "max"
+                        else dist.ReduceOp.SUM
+                    ),
+                    group=_tune_process_group,
                 )
-                avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
+                avg_time = time_tensor.item()
+                if tuning_config.rank_reduction == "mean":
+                    avg_time /= dist.get_world_size(_tune_process_group)
         finally:
             # Re-raise even if the collective itself failed, so the original
             # profiling error is never masked by a secondary reduce error.
@@ -3512,7 +3689,8 @@ class AutoTuner:
                 new caller must handle it or it will surface as a crash.
         """
         with _profile_measurement_scope():
-            for _ in range(self.warmup):
+            warmup = tuning_config.profiling_warmup
+            for _ in range(self.warmup if warmup is None else warmup):
                 runner(inputs, tactic=tactic, **kwargs)
 
             flush_buffer = None
@@ -3544,7 +3722,9 @@ class AutoTuner:
                     runner(inputs, tactic=tactic, **kwargs)
 
             spans_ms = _cupti_measure_spans(
-                run_iteration, self.repeat, prologue=prologue
+                run_iteration,
+                self._get_profiling_repeat(tuning_config),
+                prologue=prologue,
             )
 
         # Median, not mean: robust to first-iteration instrumentation
@@ -3715,6 +3895,8 @@ class AutoTuner:
         tuning_config: TuningConfig,
         extras: tuple[Any, ...] = (),
     ) -> ProfilingCacheKey:
+        if tuning_config.rank_reduction != "mean":
+            extras = (*extras, ("rank_reduction", tuning_config.rank_reduction))
         return ProfilingCacheKey(
             custom_op=custom_op,
             runner_class_name=runner.__class__.__name__,
@@ -4224,8 +4406,8 @@ class AutoTuner:
         inputs: list[Any],
         tuning_config: TuningConfig,
     ) -> list[list[Any]]:
-        """Prepare arena schedules or reuse inputs for explicitly flushed profiling."""
-        if not tuning_config.use_cold_l2_cache:
+        """Prepare arena schedules, preserving addresses when required by the runner."""
+        if tuning_config.preserve_input_storage or not tuning_config.use_cold_l2_cache:
             return [inputs]
 
         schedule_length = (

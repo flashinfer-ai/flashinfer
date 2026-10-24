@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """SM100 (Blackwell) mega-kernel backends."""
 
 from . import (
@@ -6,6 +9,7 @@ from . import (
     fp8_fp4_bf16_deepgemm,
     bf16_mxfp8_bf16_cutedsl,
     bf16_nvfp4_bf16_cutedsl,
+    mxfp8_mxfp4_bf16_cutedsl,
     mxfp8_mxfp8_bf16_cutedsl,
     nvfp4_nvfp4_bf16_cutedsl,
 )
@@ -16,6 +20,7 @@ __all__ = [
     "fp8_fp4_bf16_deepgemm",
     "bf16_mxfp8_bf16_cutedsl",
     "bf16_nvfp4_bf16_cutedsl",
+    "mxfp8_mxfp4_bf16_cutedsl",
     "mxfp8_mxfp8_bf16_cutedsl",
     "nvfp4_nvfp4_bf16_cutedsl",
 ]

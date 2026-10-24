@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+
 # MoE-EP benchmarks (NCCL-EP) — container, how to run, and results
 
 Benchmarking the FlashInfer **MoE expert-parallel** path (`nccl.ep` dispatch / combine,
@@ -191,3 +193,89 @@ B200, both `nccl_ep` and `nixl_ep`. Correctness is covered in `docs/design_docs/
 - nsys kernel times: `nsys profile -t cuda … bench_ep_matrix.py` then
   `nsys stats --report cuda_gpu_kern_sum`. Host burn-down: `EP_PROFILE_HOST=1`.
 - ep_bench reference (separate C++ build) for the parity numbers above.
+
+## MXFP8 x MXFP4 MegaMoE
+
+`benchmarks/bench_mxfp8_mxfp4.py` measures the native SM100
+MegaMoE block with pre-staged inputs, default tactics, and cold-L2 CUPTI
+timing over CUDA graph replay. It records absolute latency, GPU identity,
+geometry, software versions, and tactics. Use `--save-outputs` for exact
+before/after checks. Run each revision in a fresh process on the same B200,
+then repeat the baseline to detect drift:
+
+```bash
+python benchmarks/bench_mxfp8_mxfp4.py \
+  --tokens 32 128 512 --hidden 4096 --intermediate 6400 \
+  --experts 32 --top-k 8 \
+  --output /tmp/mxfp8-mxfp4.json --save-outputs /tmp/mxfp8-mxfp4.pt
+```
+
+`benchmarks/profile_mxfp8_mxfp4_lean.py` provides focused FC1/FC2 profiling.
+Routing and attention are excluded from these measurements.
+
+### Synthetic EP2 example on GB300
+
+NVIDIA GB300, synthetic EP2 workload: hidden 4096, intermediate 6400, eight experts, top-2,
+seed 42, pre-staged input. These dimensions form one tile-aligned synthetic
+example; they are not a public-model configuration or a representative workload
+suite. Results below are absolute latencies, not a comparison with an existing
+backend.
+
+CUDA-event timing follows a 256 MiB L2 flush and GPU rank synchronization.
+Each graph contains 50 consecutive samples; report the median of five round
+medians, with each sample reduced to the slowest rank. Measurements use default
+tactics and exclude routing, attention, input staging, and the caller-owned
+output copy.
+
+| Tokens/rank | Default-tactic latency (us) |
+| --- | --- |
+| 32 | 69.008 |
+| 256 | 78.960 |
+| 512 | 121.136 |
+| 1024 | 151.360 |
+
+On this geometry at 256 tokens/rank, the default 32-candidate autotuning sweep
+took 65.757 s on its first invocation. The selected tactic measured 77.824 us
+with cold-L2 graph timing. Repeating selection after clearing the profiling
+cache, while retaining compiled frontends, took 0.081 s. Sweep timing surrounds
+`autotune_mxfp8_mxfp4_mega_moe` after input creation and one default launch;
+use `warmup_iters=0`, `timed_iters=3`, and `candidate_tactics` for the workload.
+The 128-candidate grid is available through `exhaustive=True` or the offline
+CLI's `--mxfp8-mxfp4-exhaustive` option. Tuning results depend on workload and policy.
+
+### Caller-owned output copy
+
+The backend keeps a stable workspace output binding during CUDA graph capture
+and copies into the layer's caller-owned BF16 output. This preserves output
+ownership across forwards. On NVIDIA GB300, the standalone `[tokens, 4096]`
+copy has the following CUPTI activity durations (CUDA 13.2 / CUPTI 13.2.0,
+graph replay, 50 warmups, median of 100 samples):
+
+| Tokens | Bytes | Warm L2 copy (us) | Cold L2 copy (us) |
+| --- | --- | --- | --- |
+| 32 | 262144 | 1.152 | 1.936 |
+| 256 | 2097152 | 1.408 | 2.752 |
+| 512 | 4194304 | 1.984 | 3.616 |
+| 1024 | 8388608 | 2.609 | 4.832 |
+
+Cache residency determines the copy cost in a real forward. These activity
+durations isolate the copy; full MoE timings above use the workspace view.
+Add `--owned-output` to `benchmarks/bench_mxfp8_mxfp4.py` to include the copy
+in an end-to-end single-GPU measurement. Reproduce the isolated copy with:
+
+```python
+import statistics
+import torch
+from cupti import cupti  # Require CUPTI rather than an event fallback.
+from flashinfer.testing import bench_gpu_time
+
+for tokens in (32, 256, 512, 1024):
+    source = torch.ones((tokens, 4096), device="cuda", dtype=torch.bfloat16)
+    destination = torch.empty_like(source)
+    for cold in (False, True):
+        times = bench_gpu_time(
+            lambda: destination.copy_(source), dry_run_iters=50, repeat_iters=100,
+            enable_cupti=True, use_cuda_graph=True, cold_l2_cache=cold,
+        )
+        print(tokens, cold, statistics.median(times) * 1000)
+```

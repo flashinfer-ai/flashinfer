@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+
 # moe_ep Runbook
 
 Practical how-to for building, testing, and extending the Expert-Parallel MoE
@@ -1279,3 +1281,25 @@ pytest tests/moe_ep/test_fault_tolerance_reconcile.py \
        tests/moe_ep/test_fault_tolerance_api.py \
        tests/moe_ep/nccl_ep/test_mask_ffi.py -q
 ```
+
+## MXFP8 x MXFP4 MegaMoE
+
+Select `Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` from
+`flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl`.
+This stable backend runs dispatch, FC1, SwiGLU, FC2, and combine on SM100/SM103.
+It accepts MXFP8 activations and MXFP4 weights with UE8M0 block-32 scales.
+Routing scores are applied after FC2 in deterministic FP32 slot order.
+The result is weighted BF16 `[tokens, hidden]`.
+
+Default tactic bands were measured on GB200 EP16. The knob cache can
+override them. Use explicit `knobs` for reproducible A/B runs, including
+`epilogue_warps`, `in_kernel_reduce`, and `load_balance_mode`. Complete
+collective tuning and eager warmup before CUDA graph capture. The selected
+tactic is bound to workspace capacity, so serving with fewer active tokens
+retains the prepared layout. `FLASHINFER_MXFP8_MXFP4_WAIT_STATS` is a
+compile-time diagnostic; leave it unset for performance measurements.
+
+Validate single-GPU behavior with `pytest tests/moe_ep/test_mxfp8_mxfp4*.py`.
+For NVLink reference checks, repeated launches, and graph replay, run
+`torchrun --standalone --nproc-per-node=2 tests/moe_ep/run_mxfp8_mxfp4_multirank.py`
+with `--autotune` to exercise collective tactic preparation and cache reuse.
