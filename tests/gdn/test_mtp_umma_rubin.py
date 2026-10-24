@@ -226,9 +226,10 @@ def test_auto_heads_per_cta_rubin_caps():
 
 
 def test_persistent_auto_items():
-    """_pz_auto's minimum (key head, row) items per CTA slot (CPU only): 3 items with
-    flush_hint "none" (H = 8 on a 106-SM die: B >= 159), 8 otherwise (B >= 424); never on a
-    whole-device launch, at T = 1, with fewer heads per CTA or with grid_override."""
+    """_pz_auto's minimum (key head, row) items per CTA slot (CPU only): with flush_hint "none"
+    _PZ_AUTO_MIN_ITEMS["none"][T] (H = 8 on a 106-SM die: B >= 53 x items, e.g. T = 2 186,
+    T = 4 128, T = 8 292), 8 otherwise (B >= 424); never on a whole-device launch, at T = 1, with
+    fewer heads per CTA or with grid_override."""
     from types import SimpleNamespace
 
     M = _rubin_mod()
@@ -237,8 +238,15 @@ def test_persistent_auto_items():
     def auto(T, B, hint, nsm=106, hpc=None, grid=None, target=rubin):
         return M._pz_auto(T, 4, hpc, 8 * B, nsm, grid, target, hint)
 
+    tab = M._PZ_AUTO_MIN_ITEMS["none"]
+    assert tab == {2: 3.5, 3: 2.4, 4: 2.4, 5: 2.4, 6: 5.0, 7: 5.5, 8: 5.5}
+    # the first B per die with 8 B >= items x 424 CTA slots
+    first_b = {2: 186, 3: 128, 4: 128, 5: 128, 6: 265, 7: 292, 8: 292}
+    for T, first in first_b.items():
+        assert 8 * first >= tab[T] * 424 > 8 * (first - 1), T
+        got = [auto(T, b, "none") for b in (53, first - 1, first)]
+        assert got == [False, False, True], T
     for T in (2, 4, 8):
-        assert [auto(T, b, "none") for b in (53, 158, 159)] == [False, False, True], T
         for hint in (None, "some", "flush_first"):
             assert [auto(T, b, hint) for b in (423, 424)] == [False, True], (T, hint)
     assert not auto(1, 4096, "none")
@@ -248,6 +256,156 @@ def test_persistent_auto_items():
     assert not auto(
         4, 4096, "none", target=SimpleNamespace(major=10, minor=0, num_sms=148)
     )
+
+
+# ---------------------------------------------------------------------------
+# Host-side launch choices without a GPU: _launch on meta tensors with _get_kernel replaced by a
+# recorder (CPU-only; the bitwise checks of the same choices are the GPU tests further down).
+def _targets():
+    from flashinfer.gdn_kernels.device_target import GdnDeviceTarget
+
+    return (
+        GdnDeviceTarget(0, "sm_107a", 10, 7, 212, True),
+        GdnDeviceTarget(0, "sm_100a", 10, 0, 148, True),
+    )
+
+
+def _cpu_launch(
+    monkeypatch,
+    B,
+    T,
+    target,
+    *,
+    H=8,
+    HV=32,
+    num_sms=106,
+    flush_hint="flush_first",
+    sr="",
+    persistent=None,
+    heads_per_cta=None,
+    use_ro=True,
+    **extra,
+):
+    """One _launch over meta tensors (a die's 8 / 32 heads on 106 SMs by default); returns the
+    recorded _get_kernel call: dict(ro, hpc, pz, sr, kw)."""
+    M = _rubin_mod()
+    seen = []
+
+    def spy(device, T_, h, hv, u_bf16, ro, hpc, sr_, sr_rounds, pz=False, *rest, **kw):
+        seen.append(dict(ro=ro, hpc=hpc, pz=pz, sr=sr_, kw=kw))
+        return lambda *a: None
+
+    monkeypatch.setattr(M, "_get_kernel", spy)
+    monkeypatch.setattr(M, "_pz_counter", lambda dev: None)
+    meta = torch.device("meta")
+
+    def e(*shape, dt=torch.bfloat16):
+        return torch.empty(shape, dtype=dt, device=meta)
+
+    q = e(B, T, H, 128)
+    v = e(B, T, HV, 128)
+    ab = e(B, T, HV)
+    i32 = e(B, dt=torch.int32)
+    M._launch(
+        q,
+        q,
+        v,
+        ab,
+        ab,
+        e(HV, dt=torch.float32),
+        e(HV, dt=torch.float32),
+        e(4, HV, 128, 128, dt=torch.float16),
+        e(4, H, 32, 128),
+        e(4, HV, 32, 128),
+        e(4, HV, 32, dt=torch.float32),
+        v,
+        0,
+        num_sms,
+        None,
+        state_idx=i32,
+        hist_len=i32,
+        cache_base=i32,
+        row_order=i32,
+        rand_seed=e(1, dt=torch.int64),
+        T=T,
+        u_bf16=True,
+        use_ro=use_ro,
+        heads_per_cta=heads_per_cta,
+        sr=sr,
+        sr_rounds=5 if sr == "philox" else 0,
+        persistent=persistent,
+        grid_override=None,
+        flush_hint=flush_hint,
+        target=target,
+        scale=1.0,
+        flush_min=17 - T,
+        h_io=H,
+        hv_io=HV,
+        **extra,
+    )
+    assert len(seen) == 1, seen
+    return seen[0]
+
+
+def test_small_b_row_order_rule(monkeypatch):
+    """_SMALL_B_DISPATCH_CC (sm_107a): a non-persistent launch of at most 2 CTAs per SM (8 key heads
+    x 4 / hpc CTAs per row on 106 SMs: B <= 6 / 13 / 26 at hpc = 1 / 2 / 4), or without flush rows
+    (flush_hint "none"), ignores row_order; larger grids, the persistent kernel and sm_100a keep
+    it; a call without row_order stays without. CPU-only."""
+    rubin, b200 = _targets()
+
+    def ro(B, T, tgt=rubin, **kw):
+        return _cpu_launch(monkeypatch, B, T, tgt, **kw)["ro"]
+
+    for hpc, edge in ((1, 6), (2, 13), (4, 26)):
+        got = [ro(B, 4, heads_per_cta=hpc, persistent=False) for B in (edge, edge + 1)]
+        assert got == [False, True], (hpc, got)
+    # automatic heads per CTA: hpc = 1 up to B = 13 (grid 4 CTAs per SM), 2 from 14 (B > 13)
+    assert [ro(B, 1) for B in (1, 6, 7, 13, 14, 40)] == [False] * 2 + [True] * 4
+    # no flush rows: any B on the non-persistent kernel; the persistent one keeps its order
+    assert [ro(B, 4, flush_hint="none", persistent=False) for B in (1, 64, 512)] == [
+        False
+    ] * 3
+    assert ro(512, 4, flush_hint="none", persistent=True) is True
+    assert ro(4, 4, use_ro=False) is False
+    monkeypatch.setattr(_rubin_mod(), "_SMALL_B_DISPATCH_CC", ())
+    assert ro(4, 4) is True and ro(64, 4, flush_hint="none", persistent=False) is True
+    monkeypatch.undo()
+    assert ro(4, 4, b200, num_sms=74) is True
+
+
+# the sm_107a small-batch switches: each () gives the code without it (same bits)
+_SMALL_B_SWITCHES = ("_SMALL_B_DISPATCH_CC",)
+
+
+@pytest.mark.parametrize("mode", ["none", "philox5", "lcg"])
+def test_small_b_bit_identical(mode, monkeypatch):
+    """The small-batch choices (_SMALL_B_SWITCHES) change no bit: outputs, state pool and rings
+    equal with every switch off, on small and larger grids, with and without flush rows, row
+    order flush-first, automatic heads per CTA and persistent choice. One whole-device launch."""
+    _skip_if_no_rubin_build()
+    M = _rubin_mod()
+    sr = _sr_kw(mode)
+    for T, pattern, hint in (
+        (1, "FV", "flush_first"),
+        (2, "VFPVFFVV" * 3, "flush_first"),
+        (5, "FVVF", None),
+        (6, "FVVFVFVVPF" * 2, "flush_first"),
+        (8, "VFP", None),
+        (4, "V" * 36, "none"),
+        (4, "FV" * 20, "flush_first"),
+    ):
+        case, fm = _pz_case(T, 880 + len(pattern), pattern)
+        ro = M.flush_first_row_order(case[11], fm)
+        for hpc in (None, 1, 2):
+            kw = dict(flush_hint=hint, row_order=ro, heads_per_cta=hpc, **sr)
+            with monkeypatch.context() as m:
+                for name in _SMALL_B_SWITCHES:
+                    m.setattr(M, name, ())
+                ref = _pz_call(case, fm, **kw)
+            got = _pz_call(case, fm, **kw)
+            for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+                assert torch.equal(x, y), (T, pattern, hint, hpc, mode, name)
 
 
 def test_auto_heads_per_cta_dispatch(monkeypatch):

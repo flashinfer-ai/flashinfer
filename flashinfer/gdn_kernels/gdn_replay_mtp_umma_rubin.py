@@ -170,13 +170,22 @@ _PZ_CC = ((10, 7),)
 # starts the state stream early): not automatic; one whole-GPU launch over die-interleaved
 # memory: 0.88-0.98x.
 _PZ_AUTO_T = (2, 3, 4, 5, 6, 7, 8)
-# flush_hint "none": from 3 items per CTA slot (uGPU, H = 16: B >= 159 per die). The no-flush gains
-# above were against hpc = 2; against the non-persistent kernel at the hpc = 4 that
-# auto_heads_per_cta picks from 0.8 waves, the persistent one measured 1.5-18 % slower at B = 28-96
-# per die and 0-6 % at 128 (T = 2 / 4 / 8, warm and serving-like L2; to B = 48 with LCG / Philox-5 /
-# 10 too, LCG T = 8 serving-like a tie) and 1-3.4 % faster at B = 192-256 at T = 2 / 4 (3-5 % slower
-# at T = 8; B = 129-191 untimed). Flush rows possible (None / "some" / "flush_first"): >= 8 items
-_PZ_AUTO_MIN_ITEMS = {"none": 3.0, "some": 8}
+# flush_hint "none": from these items per CTA slot by T (uGPU, H = 16, 8 key heads on a 106-SM
+# die: B >= 53 x items per die, i.e. T = 2 186, T = 3-5 128, T = 6 265, T = 7 / 8 292). The
+# no-flush gains above were against hpc = 2; against the non-persistent kernel at the hpc = 4 that
+# auto_heads_per_cta picks from 0.8 waves, the persistent one measured 1.5-18 % slower at
+# B = 28-96 per die (T = 2 / 4 / 8, warm and serving-like L2; to B = 48 with LCG / Philox-5 / 10
+# too) and 10-16 % slower at B = 96 at every T. Forced persistent vs not, interleaved, B = 96-320
+# per die, warm and serving-like L2 (one CUDA graph over 36 state pools): the crossovers are T = 2
+# 176-192, T = 3-5 at 128-144 (T = 5 serving-like 2.7-4.1 % faster at B = 128-144), T = 6
+# 256-288, T = 7 / 8 288-320; with these minimums the automatic choice was within 1 % of the
+# faster kernel in 134 of 140 cells and at most 1.3 % (warm) / 3.0 % (serving-like, T = 6
+# B = 160, where warm L2 has the other kernel 2 % ahead) slower. Flush rows possible (None /
+# "some" / "flush_first"): >= 8 items at every T.
+_PZ_AUTO_MIN_ITEMS = {
+    "none": {2: 3.5, 3: 2.4, 4: 2.4, 5: 2.4, 6: 5.0, 7: 5.5, 8: 5.5},
+    "some": 8,
+}
 
 
 def _use_regsplit(T: int, hpc: int, sr: str) -> bool:
@@ -4415,6 +4424,20 @@ _HPC2_MAX_WAVES_PHILOX = 3.6
 # (and 5-14 % faster with warm L2)
 _HPC_NO_FLUSH_WAVES = (0.65, 0.8)
 _HPC2_NO_FLUSH_ONE_WAVE = 1.0
+# Small-batch dispatch on these archs (measured on Rubin VR200, uGPU, B <= 128 per die, with the
+# heads-per-CTA caps above; see _launch): a non-persistent launch whose grid is small
+# (_small_grid: every CTA resident from the start), or that has no flush rows (flush_hint "none":
+# equal work per row), ignores row_order. Shape-independent: the row order has nothing to balance
+# on either grid, whatever the heads per key head.
+_SMALL_B_DISPATCH_CC = ((10, 7),)
+_SMALL_GRID_CTAS_PER_SM = 2
+
+
+def _small_grid(n_key_heads: int, hpk: int, hpc: int, batch: int, num_sms: int) -> bool:
+    """A non-persistent grid of at most _SMALL_GRID_CTAS_PER_SM CTAs per SM (key heads x
+    hpk / hpc CTAs per row): every CTA is resident from the launch on, so the row order buys no
+    balance and the CTAs are latency-bound."""
+    return n_key_heads * (hpk // hpc) * batch <= _SMALL_GRID_CTAS_PER_SM * int(num_sms)
 
 
 def auto_heads_per_cta(
@@ -4643,7 +4666,11 @@ def _pz_auto(
     target,
     flush_hint: Optional[str] = None,
 ) -> bool:
-    """persistent=None: the persistent kernel where it measured faster (see _PZ_AUTO_T)."""
+    """persistent=None: the persistent kernel where it measured faster (see _PZ_AUTO_T and
+    _PZ_AUTO_MIN_ITEMS)."""
+    min_items = _PZ_AUTO_MIN_ITEMS["none" if flush_hint == "none" else "some"]
+    if isinstance(min_items, dict):  # by T
+        min_items = min_items.get(T, math.inf)
     return (
         (target.major, target.minor) in _PZ_CC
         and T in _PZ_AUTO_T
@@ -4652,10 +4679,7 @@ def _pz_auto(
         and grid_override is None
         and num_sms is not None
         and int(num_sms) < target.num_sms
-        and n_items
-        >= _PZ_AUTO_MIN_ITEMS["none" if flush_hint == "none" else "some"]
-        * _CTA_SLOTS_PER_SM
-        * int(num_sms)
+        and n_items >= min_items * _CTA_SLOTS_PER_SM * int(num_sms)
     )
 
 
@@ -4809,14 +4833,14 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     persistent kernel on sm_107a for T = 2-8 with all value heads per CTA when ``num_sms`` is
     given and below the device's SM count (a partial-device launch, e.g. one die's green
     context), ``grid_override`` is unset and there are at least 8 (key head, row) items per CTA slot
-    (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at H = 16), or 3 items with
-    ``flush_hint`` "none" (H x B >= 12 x ``num_sms``: B >= 159 per die); the non-persistent
-    kernel otherwise.
+    (H x B >= 32 x ``num_sms``: B >= 424 per 106-SM die for the die's 8 key heads of H = 16), or
+    with ``flush_hint`` "none" 2.4-5.5 items by T (``_PZ_AUTO_MIN_ITEMS``: B >= 128-292 per die);
+    the non-persistent kernel otherwise.
 
     ``flush_hint`` (performance only, never changes results: both kernels are bit-identical on
     every row mix) tells the host which flush rows the launch has, since it cannot read
     ``hist_len`` (a device tensor) without a sync. "none" lowers the automatic choice's
-    minimum from 8 items per CTA slot to 3. On sm_107a the hint also moves the heads per
+    minimum from 8 items per CTA slot to 2.4-5.5 by T. On sm_107a the hint also moves the heads per
     CTA of non-persistent launches (``auto_heads_per_cta``): "none" gives all value heads per
     CTA from 0.8 waves of CTA slots (B = 22 per die at H = 16), or from one wave (B = 27) at
     T = 1 and on whole-device launches at T = 2-4; "flush_first" on a partial-device launch
@@ -5146,6 +5170,17 @@ def _launch(
             persistent = (
                 False  # measured dispatch rule: the non-persistent kernel is faster
             )
+    if (
+        use_ro
+        and not persistent
+        and (target.major, target.minor) in _SMALL_B_DISPATCH_CC
+        and (flush_hint == "none" or _small_grid(H, hpk, hpc, B, nsm))
+    ):
+        # the row order is one dependent global round trip ahead of every CTA's cursors and buys
+        # nothing on a small grid (all CTAs resident) or without flush rows (equal work per
+        # row): rows in batch order, same results (a CTA's row only picks its work). Rubin,
+        # uGPU, B <= 128: 1.01-1.13x where it applies
+        use_ro = False
     args = (
         q,
         k,
