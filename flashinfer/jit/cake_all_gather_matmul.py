@@ -39,7 +39,11 @@ twin (``main_n128``) into its sequence module; ``main_block_n`` selects that
 twin per call from the frozen wave rule (``SM_COUNT_BY_ARCH`` and the
 per-architecture wave cap ``N128_MAX_WAVES_BY_ARCH``) and the table, and the
 launcher receives the chosen ``block_n``. ``N`` stays a positive multiple of
-``BLOCK_N`` (256) either way.
+``BLOCK_N`` (256) either way. On an architecture listed True in
+``CG2_N128_PRECEDENCE_ARCHES`` a call inside a measured ``CG2_REGIONS``
+rectangle of a class listed in ``CG2_CLASSES`` keeps ``block_n = 256`` so that
+``main_form`` selects the CTA-pair twin (the kernel module's default-path rule:
+the pair takes precedence over the wave rule).
 A route whose class is listed in ``CG2_CLASSES`` for the device's architecture
 also compiles the CTA-pair twin of the N256 main (``main_cg2``:
 ``tcgen05.mma.cta_group::2`` over a cluster of two CTAs, each loading its own
@@ -156,7 +160,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -221,14 +225,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_b4f547b76a4b6c14c87b": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b4f547b76a4b6c14c87b_kernel.cu",
-        ],
-        "arches": ["sm_100a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -397,7 +393,6 @@ ROUTES: dict[str, str] = {
     "main_float16_ws2_n_major": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
     "main_float16_ws4_k_major": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
     "main_float16_ws4_k_major_cg2": "cake_all_gather_matmul_72ae81d01ed72fe75fe8",
-    "main_float16_ws4_k_major_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
     "main_float16_ws4_n_major": "cake_all_gather_matmul_f0cbdce7150397ae0989",
     "main_float16_ws8_k_major": "cake_all_gather_matmul_f85e6d8165a64ac49252",
     "main_float16_ws8_k_major_ks4": "cake_all_gather_matmul_8ec093514b46431df041",
@@ -779,7 +774,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b4f547b76a4b6c14c87b_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -792,7 +787,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
-            "main_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
+            "main_cg2": "cake_all_gather_matmul_72ae81d01ed72fe75fe8",
         },
     },
     "float16_ws4_k_major_sm_103a": {
@@ -803,8 +798,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_126e6d87bacceb57"],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "float16",
@@ -962,7 +958,6 @@ COMPILE_FLAGS: list[str] = ["--use_fast_math"]
 N128_CLASSES: dict[str, list[list[Any]]] = {
     "sm_100a": [
         [4, "bfloat16", "k_major"],
-        [4, "float16", "k_major"],
         [8, "bfloat16", "k_major"],
         [8, "bfloat16", "n_major"],
         [8, "float16", "k_major"],
@@ -978,6 +973,11 @@ N128_CLASSES: dict[str, list[list[Any]]] = {
 # architecture).
 SM_COUNT_BY_ARCH: dict[str, int] = {"sm_100a": 148, "sm_103a": 148}
 N128_MAX_WAVES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 1}
+# Per-architecture precedence of the CTA pair over the N128 wave rule (copied
+# from the kernel module): where True, ``main_block_n`` keeps a call inside a
+# ``CG2_REGIONS`` rectangle of a ``CG2_CLASSES`` class at 256; an arch outside
+# the table is an error, never a default.
+CG2_N128_PRECEDENCE_ARCHES: dict[str, bool] = {"sm_100a": True, "sm_103a": False}
 # Per-architecture SM push bands ``[world_size, padded_rows, max_cols]`` beyond
 # the base rule of ``uses_sm_push`` (copied from the kernel module; an arch
 # outside the table is an error, never the base rule alone).
@@ -1017,6 +1017,7 @@ CG2_CLASSES: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major"],
         [2, "float16", "k_major"],
         [4, "bfloat16", "k_major"],
+        [4, "float16", "k_major"],
         [8, "bfloat16", "k_major"],
     ],
     "sm_103a": [
@@ -1049,6 +1050,8 @@ CG2_REGIONS: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
         [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
         [2, "float16", "k_major", 1024, 1024, 2048, 2048],
+        [4, "bfloat16", "k_major", 512, 512, 2560, 2560],
+        [4, "float16", "k_major", 512, 512, 2560, 2560],
     ],
     "sm_103a": [
         [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
@@ -1291,6 +1294,20 @@ def _cg2_regions(
     ]
 
 
+def _cg2_rectangle_qualifies(
+    arch: str, world_size: int, dtype_name: str, b_layout: str, padded: int, cols: int
+) -> bool:
+    """Whether some measured rectangle of the class on ``arch`` (``CG2_REGIONS``)
+    contains the call: ``min_padded_rows <= padded <= max_padded_rows`` and
+    ``min_cols <= cols <= max_cols``. Shared by ``main_block_n`` and ``main_form``."""
+
+    rectangles = _cg2_regions(arch, world_size, dtype_name, b_layout)
+    return any(
+        min_rows <= padded <= max_rows and min_cols <= cols <= max_cols
+        for min_rows, max_rows, min_cols, max_cols in rectangles
+    )
+
+
 def _cg2s_classes(arch: str) -> frozenset[tuple[int, str, str, str]]:
     """``(world_size, dtype, b_layout, form)`` classes with a delivered spill-wave
     N-split pair main on ``arch`` (the emitted ``CG2S_CLASSES`` table); an
@@ -1391,8 +1408,12 @@ def main_block_n(
     ``S = SM_COUNT_BY_ARCH[arch]``), the call spans at most
     ``N128_MAX_WAVES_BY_ARCH[arch]`` N256 waves, and the ``(world_size,
     dtype_name, b_layout)`` class has a delivered ``_n128`` program on ``arch``
-    (``N128_CLASSES``). The rule mirrors the kernel module's ``main_block_n``;
-    the table restricts it to delivered programs."""
+    (``N128_CLASSES``). On an architecture listed True in
+    ``CG2_N128_PRECEDENCE_ARCHES`` a call inside a measured ``CG2_REGIONS``
+    rectangle of a class listed in ``CG2_CLASSES`` keeps 256 (the pair takes
+    precedence over the wave rule). The rule mirrors the kernel module's
+    ``main_block_n`` in its default path; the tables restrict it to delivered
+    programs."""
 
     if arch not in SM_COUNT_BY_ARCH or arch not in N128_MAX_WAVES_BY_ARCH:
         raise ValueError(
@@ -1409,6 +1430,15 @@ def main_block_n(
     w128 = -(-(2 * t256) // sm_count)
     qualify = 2 * w256 > w128
     cap = w256 <= max_waves
+    pair_key = (world_size, str(dtype_name), str(b_layout))
+    if (
+        CG2_N128_PRECEDENCE_ARCHES[arch]
+        and pair_key in _cg2_classes(arch)
+        and _cg2_rectangle_qualifies(
+            arch, world_size, dtype_name, b_layout, padded_rows(rows), int(n)
+        )
+    ):
+        return 256
     delivered = (world_size, str(dtype_name), str(b_layout)) in _n128_classes(arch)
     return 128 if (qualify and cap and max_waves > 0 and delivered) else 256
 
@@ -1454,10 +1484,8 @@ def main_form(
     delivered = (int(world_size), str(dtype_name), str(b_layout)) in _cg2_classes(arch)
     padded = padded_rows(rows)
     cols = int(n)
-    rectangles = _cg2_regions(arch, world_size, dtype_name, b_layout)
-    qualify = any(
-        min_rows <= padded <= max_rows and min_cols <= cols <= max_cols
-        for min_rows, max_rows, min_cols, max_cols in rectangles
+    qualify = _cg2_rectangle_qualifies(
+        arch, world_size, dtype_name, b_layout, padded, cols
     )
     key = (int(world_size), str(dtype_name), str(b_layout))
     if not (qualify and delivered):
@@ -1933,6 +1961,7 @@ __all__ = [
     "CG2S_CLASSES",
     "CG2_CLASSES",
     "CG2_CLUSTER_DIMS",
+    "CG2_N128_PRECEDENCE_ARCHES",
     "CG2_REGIONS",
     "CG2_SPILL_POINTS",
     "CHUNK_ROWS",
