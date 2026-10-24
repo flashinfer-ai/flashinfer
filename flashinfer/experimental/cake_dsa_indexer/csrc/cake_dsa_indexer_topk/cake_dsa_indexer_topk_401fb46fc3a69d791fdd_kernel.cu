@@ -53,7 +53,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int check_period, int grid_ctas, float softmax_scale, int n_split)
+kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -782,22 +782,33 @@ kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtens
                                     int need[2];
                                     int kw[2];
                                     int km[2];
+                                    int sk[2];
                                     int c_q = s_count[wg * 2];
                                     int limit_q = ((tau[0] != 0) ? cand_cap : first_cap);
                                     int need_q = ((limit_q < c_q + trigger_room) ? 1 : 0);
                                     int kw_q = top_k;
                                     int km_q = keep_cap;
+                                    int sk_q = 0;
                                     if (need_q == 0) {
                                         if (sample_now != 0) {
                                             if (row_valid[0] != 0) {
-                                                if (visible[0] > 0) {
-                                                    int r_q = (top_k * c_q + visible[0] - 1) / visible[0];
+                                                int vis_abs = visible[0];
+                                                int vis_c = vis_abs;
+                                                int t_near = (n_s - 1) * stride_1;
+                                                int _max_5 = ((vis_c - t_near * 128) > (0) ? (vis_c - t_near * 128) : (0));
+                                                int _min_4 = ((_max_5) < (128) ? (_max_5) : (128));
+                                                int n_near = _min_4 * far_sample;
+                                                int c_far = c_q - n_near;
+                                                int v_far = vis_c - n_near;
+                                                if (v_far > 0) {
+                                                    int r_q = (top_k * c_far + v_far - 1) / v_far;
                                                     int r_shift = r_q + r_q * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift < c_q) {
+                                                    if (r_shift < c_far) {
                                                         need_q = 1;
                                                         kw_q = r_shift;
-                                                        int _min_4 = ((r_shift + 64) < (keep_cap) ? (r_shift + 64) : (keep_cap));
-                                                        km_q = _min_4;
+                                                        int _min_6 = ((r_shift + 64) < (keep_cap) ? (r_shift + 64) : (keep_cap));
+                                                        km_q = _min_6;
+                                                        sk_q = n_near;
                                                     }
                                                 }
                                             }
@@ -806,23 +817,34 @@ kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtens
                                     need[0] = need_q;
                                     kw[0] = kw_q;
                                     km[0] = km_q;
+                                    sk[0] = sk_q;
                                     need_any = need_any | need_q;
                                     int c_q_0 = s_count[wg * 2 + 1];
                                     int limit_q_1 = ((tau[1] != 0) ? cand_cap : first_cap);
                                     int need_q_2 = ((limit_q_1 < c_q_0 + trigger_room) ? 1 : 0);
                                     int kw_q_3 = top_k;
                                     int km_q_4 = keep_cap;
+                                    int sk_q_5 = 0;
                                     if (need_q_2 == 0) {
                                         if (sample_now != 0) {
                                             if (row_valid[1] != 0) {
-                                                if (visible[1] > 0) {
-                                                    int r_q_1 = (top_k * c_q_0 + visible[1] - 1) / visible[1];
+                                                int vis_abs_1 = visible[1];
+                                                int vis_c_1 = vis_abs_1;
+                                                int t_near_1 = (n_s - 1) * stride_1;
+                                                int _max_8 = ((vis_c_1 - t_near_1 * 128) > (0) ? (vis_c_1 - t_near_1 * 128) : (0));
+                                                int _min_7 = ((_max_8) < (128) ? (_max_8) : (128));
+                                                int n_near_1 = _min_7 * far_sample;
+                                                int c_far_1 = c_q_0 - n_near_1;
+                                                int v_far_1 = vis_c_1 - n_near_1;
+                                                if (v_far_1 > 0) {
+                                                    int r_q_1 = (top_k * c_far_1 + v_far_1 - 1) / v_far_1;
                                                     int r_shift_1 = r_q_1 + r_q_1 * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift_1 < c_q_0) {
+                                                    if (r_shift_1 < c_far_1) {
                                                         need_q_2 = 1;
                                                         kw_q_3 = r_shift_1;
-                                                        int _min_5 = ((r_shift_1 + 64) < (keep_cap) ? (r_shift_1 + 64) : (keep_cap));
-                                                        km_q_4 = _min_5;
+                                                        int _min_9 = ((r_shift_1 + 64) < (keep_cap) ? (r_shift_1 + 64) : (keep_cap));
+                                                        km_q_4 = _min_9;
+                                                        sk_q_5 = n_near_1;
                                                     }
                                                 }
                                             }
@@ -831,16 +853,19 @@ kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtens
                                     need[1] = need_q_2;
                                     kw[1] = kw_q_3;
                                     km[1] = km_q_4;
+                                    sk[1] = sk_q_5;
                                     need_any = need_any | need_q_2;
                                     asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
                                     if (need_any != 0) {
                                         int need_pair = need[1];
                                         int kw_pair = kw[1];
                                         int km_pair = km[1];
+                                        int sk_pair = sk[1];
                                         if (pair == 0) {
                                             need_pair = need[0];
                                             kw_pair = kw[0];
                                             km_pair = km[0];
+                                            sk_pair = sk[0];
                                         }
                                         if (need_pair != 0) {
                                             int c_pair = s_count[slot_pair];
@@ -870,19 +895,19 @@ kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtens
                                                     for (int u = 0; u < 8; u++) {
                                                         int idx_l = s_pro * 512 + half * 32 + lane_0 + 64 * u;
                                                         ring[s_pro * 8 + u] = 0;
-                                                        if (idx_l < c_pair) {
+                                                        if (idx_l < c_pair - sk_pair) {
                                                             ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pair + idx_l];
                                                         }
                                                     }
                                                 }
-                                                int nbat = (c_pair + 512 - 1) / 512;
+                                                int nbat = (c_pair - sk_pair + 512 - 1) / 512;
                                                 #pragma unroll 1
                                                 for (int g = 0; g < nbat; g += 2) {
                                                     #pragma unroll
                                                     for (int s_st = 0; s_st < 2; s_st++) {
                                                         #pragma unroll
                                                         for (int u_1 = 0; u_1 < 8; u_1++) {
-                                                            int valid_p = ((c_pair > (g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1) ? 1 : 0);
+                                                            int valid_p = (((g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1 < c_pair - sk_pair) ? 1 : 0);
                                                             unsigned int bits_0 = (unsigned int)(ring[s_st * 8 + u_1] >> 32);
                                                             int kid_1 = (int)(unsigned int)(ring[s_st * 8 + u_1] & 4294967295);
                                                             unsigned int magnitude_2 = bits_0 & 2147483647;
@@ -904,7 +929,7 @@ kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtens
                                                         for (int u_2 = 0; u_2 < 8; u_2++) {
                                                             int idx_l_1 = (g + s_st + 1) * 512 + half * 32 + lane_0 + 64 * u_2;
                                                             ring[(s_st + 1) % 2 * 8 + u_2] = 0;
-                                                            if (idx_l_1 < c_pair) {
+                                                            if (idx_l_1 < c_pair - sk_pair) {
                                                                 ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pair + idx_l_1];
                                                             }
                                                         }
@@ -1091,15 +1116,15 @@ kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtens
                                             unsigned int lo = (unsigned int)s_tau[wg * 2 * 2];
                                             unsigned int hi = (unsigned int)s_tau[wg * 2 * 2 + 1];
                                             unsigned long long tau_new = (unsigned long long)hi << 32 | (unsigned long long)lo;
-                                            unsigned long long _max_6 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
-                                            tau[0] = _max_6;
+                                            unsigned long long _max_10 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
+                                            tau[0] = _max_10;
                                         }
                                         if (need[1] != 0) {
                                             unsigned int lo_1 = (unsigned int)s_tau[(wg * 2 + 1) * 2];
                                             unsigned int hi_1 = (unsigned int)s_tau[(wg * 2 + 1) * 2 + 1];
                                             unsigned long long tau_new_1 = (unsigned long long)hi_1 << 32 | (unsigned long long)lo_1;
-                                            unsigned long long _max_7 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
-                                            tau[1] = _max_7;
+                                            unsigned long long _max_11 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
+                                            tau[1] = _max_11;
                                         }
                                     }
                                 }
@@ -1114,8 +1139,8 @@ kernel_cake_dsa_indexer_topk_401fb46fc3a69d791fdd(const __grid_constant__ CUtens
                             if (attempt_3 == 0) {
                                 int fail_pair = 0;
                                 if (valid_pair != 0) {
-                                    int _min_8 = ((top_k) < (visible_pair) ? (top_k) : (visible_pair));
-                                    if (c_final < _min_8) {
+                                    int _min_12 = ((top_k) < (visible_pair) ? (top_k) : (visible_pair));
+                                    if (c_final < _min_12) {
                                         fail_pair = 1;
                                     }
                                 }
