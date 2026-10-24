@@ -1137,7 +1137,14 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
     v, a and b are read element by element (at most one 2-byte element per access)."""
     import flashinfer.cake_gdp_backend as backend
 
-    widths = {"uint16_t": 2, "__nv_bfloat162": 4, "int2": 8, "uint2": 8, "uint4": 16, "float4": 16}
+    widths = {
+        "uint16_t": 2,
+        "__nv_bfloat162": 4,
+        "int2": 8,
+        "uint2": 8,
+        "uint4": 16,
+        "float4": 16,
+    }
     access = re.compile(
         r"reinterpret_cast<(?:const )?(\w+)\s*\*>\("
         r"(?:&\(\(\w+\*\)\()?(q|k|v|a|b|out)\b"
