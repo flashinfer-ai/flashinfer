@@ -1,0 +1,119 @@
+diff --git a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_5672f5747ccf635abc4c_kernel.cu b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_5672f5747ccf635abc4c_kernel.cu
+index 2dd3e5c0fd9..a7b75ee8c80 100644
+--- a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_5672f5747ccf635abc4c_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_5672f5747ccf635abc4c_kernel.cu
+@@ -328,6 +328,12 @@ kernel_cake_kimi_k3_latent_moe_5672f5747ccf635abc4c(const __grid_constant__ CUte
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_704a177ce25d48b0969e_kernel.cu b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_704a177ce25d48b0969e_kernel.cu
+index d600b12c39f..9784f7b7565 100644
+--- a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_704a177ce25d48b0969e_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_704a177ce25d48b0969e_kernel.cu
+@@ -347,6 +347,12 @@ kernel_cake_kimi_k3_latent_moe_704a177ce25d48b0969e(const __grid_constant__ CUte
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll
++                for (int _ = 0; _ < 6; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_715f9200ec523324ea43_kernel.cu b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_715f9200ec523324ea43_kernel.cu
+index 6c2516c9d3b..14407301f7b 100644
+--- a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_715f9200ec523324ea43_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_715f9200ec523324ea43_kernel.cu
+@@ -319,6 +319,12 @@ kernel_cake_kimi_k3_latent_moe_715f9200ec523324ea43(const __grid_constant__ CUte
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll
++                for (int _ = 0; _ < 9; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 9) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_85546046418e8b56c00c_kernel.cu b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_85546046418e8b56c00c_kernel.cu
+index dcbdbd328a5..be75f4f8711 100644
+--- a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_85546046418e8b56c00c_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_85546046418e8b56c00c_kernel.cu
+@@ -307,6 +307,12 @@ kernel_cake_kimi_k3_latent_moe_85546046418e8b56c00c(const __grid_constant__ CUte
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_8a3e1501cab6a75cf180_kernel.cu b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_8a3e1501cab6a75cf180_kernel.cu
+index 8a064e8fea1..d526f93208a 100644
+--- a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_8a3e1501cab6a75cf180_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_8a3e1501cab6a75cf180_kernel.cu
+@@ -320,6 +320,12 @@ kernel_cake_kimi_k3_latent_moe_8a3e1501cab6a75cf180(const __grid_constant__ CUte
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_a3737025ddafbf1fa5af_kernel.cu b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_a3737025ddafbf1fa5af_kernel.cu
+index b012512ab7f..63b369543c3 100644
+--- a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_a3737025ddafbf1fa5af_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_a3737025ddafbf1fa5af_kernel.cu
+@@ -349,6 +349,12 @@ kernel_cake_kimi_k3_latent_moe_a3737025ddafbf1fa5af(const __grid_constant__ CUte
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_f2749aaad466a0ec6dc5_kernel.cu b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_f2749aaad466a0ec6dc5_kernel.cu
+index a0bfee9bfab..b19551422b2 100644
+--- a/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_f2749aaad466a0ec6dc5_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_latent_moe/csrc/cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_f2749aaad466a0ec6dc5_kernel.cu
+@@ -319,6 +319,12 @@ kernel_cake_kimi_k3_latent_moe_f2749aaad466a0ec6dc5(const __grid_constant__ CUte
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }

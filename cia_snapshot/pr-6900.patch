@@ -1,0 +1,52 @@
+diff --git a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5dbbe3415920815e812e_kernel.cu b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5dbbe3415920815e812e_kernel.cu
+index 5d9d6872c1e..a1fd69d4767 100644
+--- a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5dbbe3415920815e812e_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5dbbe3415920815e812e_kernel.cu
+@@ -252,7 +252,7 @@ kernel_cake_kimi_k3_fp8_projection_5dbbe3415920815e812e(const __grid_constant__
+                     if (res_stage_m == 4) { res_stage_m = 0; _phase_res_full ^= 1; }
+                 }
+                 m_prev_m = m_tile_m;
+-                unsigned int cur_slot = res_stage_m - 1;
++                unsigned int cur_slot = (res_stage_m + 3u) % 4u;
+                 #pragma unroll 1
+                 for (int i_1 = 0; i_1 < k_count_1; i_1++) {
+                     mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
+diff --git a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_7518d0ddd0f8eb901098_kernel.cu b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_7518d0ddd0f8eb901098_kernel.cu
+index c20235b9153..c6b8bd8cc87 100644
+--- a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_7518d0ddd0f8eb901098_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_7518d0ddd0f8eb901098_kernel.cu
+@@ -252,7 +252,7 @@ kernel_cake_kimi_k3_fp8_projection_7518d0ddd0f8eb901098(const __grid_constant__
+                     if (res_stage_m == 4) { res_stage_m = 0; _phase_res_full ^= 1; }
+                 }
+                 m_prev_m = m_tile_m;
+-                unsigned int cur_slot = res_stage_m - 1;
++                unsigned int cur_slot = (res_stage_m + 3u) % 4u;
+                 #pragma unroll 1
+                 for (int i_1 = 0; i_1 < k_count_1; i_1++) {
+                     mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
+diff --git a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184_kernel.cu b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184_kernel.cu
+index 7819536f2da..2c6fa463e94 100644
+--- a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184_kernel.cu
+@@ -269,7 +269,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant
+                     if (res_stage_m == 4) { res_stage_m = 0; _phase_res_full ^= 1; }
+                 }
+                 m_prev_m = m_tile_m;
+-                unsigned int cur_slot = res_stage_m - 1;
++                unsigned int cur_slot = (res_stage_m + 3u) % 4u;
+                 #pragma unroll 1
+                 for (int i_1 = 0; i_1 < k_count_1; i_1++) {
+                     mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
+diff --git a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8cceae711ab4461f4135_kernel.cu b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8cceae711ab4461f4135_kernel.cu
+index 76ae63496e8..5cfede68f1a 100644
+--- a/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8cceae711ab4461f4135_kernel.cu
++++ b/flashinfer/experimental/kimi_k3_fp8_projection/csrc/cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8cceae711ab4461f4135_kernel.cu
+@@ -270,7 +270,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant
+                     if (res_stage_m == 4) { res_stage_m = 0; _phase_res_full ^= 1; }
+                 }
+                 m_prev_m = m_tile_m;
+-                unsigned int cur_slot = res_stage_m - 1;
++                unsigned int cur_slot = (res_stage_m + 3u) % 4u;
+                 #pragma unroll 1
+                 for (int i_1 = 0; i_1 < k_count_1; i_1++) {
+                     mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
