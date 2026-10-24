@@ -19,8 +19,11 @@
 #include <cublasLt.h>
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <string>
 
 #include "bmm_fp8.cuh"
 
@@ -74,8 +77,8 @@ struct GemmDescriptors {
 /*!
  * \brief Query heuristics once and serialize all cublasLtMatmulAlgo_t structs into a buffer.
  *
- * Each algo occupies kAlgoBytes (64) contiguous bytes.  The buffer can be cached
- * and later passed to run_with_algo() to skip the heuristic lookup entirely.
+ * Each algo occupies kAlgoBytes (64) contiguous bytes; any of them can later be passed
+ * to run_with_descriptor(), including for a different M.
  *
  * \param algo_buf  Output buffer, must hold at least max_algos * kAlgoBytes bytes.
  * \param max_algos Maximum number of algorithms to retrieve.
@@ -106,27 +109,41 @@ inline int get_algorithms(int m, int n, int k, cudaDataType_t d_type, const __nv
 }
 
 /*!
- * \brief Run a BF16 GEMM using a pre-resolved algorithm — zero heuristic overhead.
+ * \brief Run a BF16 GEMM with a caller-provided cuBLASLt algorithm descriptor.
  *
- * \param algo_buf  Buffer of serialized cublasLtMatmulAlgo_t structs (from get_algorithms).
- * \param algo_idx  Index into algo_buf selecting which algorithm to use.
+ * \param algo_desc  A serialized cublasLtMatmulAlgo_t (kAlgoBytes), e.g. one returned by
+ *                   get_algorithms() for another M, or null for the heuristic default. See
+ *                   bmm_fp8::resolve_algo() for how it is validated for this problem.
+ * \param used_descriptor  Set to whether \p algo_desc ran (false when the heuristic default ran).
  */
-inline cublasStatus_t run_with_algo(const __nv_bfloat16* mat1, const __nv_bfloat16* mat2, void* out,
-                                    const __nv_bfloat16* bias, int m, int n, int k,
-                                    cudaDataType_t d_type, void* workspace,
-                                    size_t workspace_size_in_bytes, cublasLtHandle_t lt_handle,
-                                    cudaStream_t stream, const void* algo_buf, int algo_idx) {
+inline cublasStatus_t run_with_descriptor(const __nv_bfloat16* mat1, const __nv_bfloat16* mat2,
+                                          void* out, const __nv_bfloat16* bias, int m, int n, int k,
+                                          cudaDataType_t d_type, void* workspace,
+                                          size_t workspace_size_in_bytes,
+                                          cublasLtHandle_t lt_handle, cudaStream_t stream,
+                                          int device_id, const void* algo_desc,
+                                          bool* used_descriptor) {
   GemmDescriptors desc(m, n, k, d_type, bias);
 
-  cublasLtMatmulAlgo_t algo;
-  std::memcpy(&algo, static_cast<const uint8_t*>(algo_buf) + algo_idx * kAlgoBytes, kAlgoBytes);
+  const auto bias_address = reinterpret_cast<uintptr_t>(bias);
+  const int64_t bias_alignment =
+      bias_address == 0 ? 0 : std::min<uintptr_t>(bias_address & -bias_address, 256);
+  const std::string key = bmm_fp8::ResolvedAlgoCache::make_key(
+      algo_desc, {bmm_fp8::kBf16ProblemTag, device_id, m, n, k, d_type, bias_alignment,
+                  static_cast<int64_t>(workspace_size_in_bytes)});
+  bmm_fp8::ResolvedAlgo resolved;
+  FLASHINFER_CUBLAS_CALL(bmm_fp8::resolved_algo_cache().resolve(
+      key, lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
+      desc.b_layout.descriptor(), desc.d_layout.descriptor(), workspace_size_in_bytes, algo_desc,
+      &resolved));
+  *used_descriptor = resolved.from_descriptor;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
   FLASHINFER_CUBLAS_CALL(cublasLtMatmul(
       lt_handle, desc.matmul_desc.descriptor(), &alpha, mat2, desc.a_layout.descriptor(), mat1,
       desc.b_layout.descriptor(), &beta, nullptr, desc.d_layout.descriptor(), out,
-      desc.d_layout.descriptor(), &algo, workspace, workspace_size_in_bytes, stream));
+      desc.d_layout.descriptor(), &resolved.algo, workspace, workspace_size_in_bytes, stream));
   return CUBLAS_STATUS_SUCCESS;
 }
 
