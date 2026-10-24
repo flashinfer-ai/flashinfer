@@ -62,7 +62,8 @@ other fields are the host plan and never change.
 from __future__ import annotations
 
 import functools
-from typing import Any
+import operator
+from typing import Any, Callable
 
 import tvm_ffi
 
@@ -166,6 +167,12 @@ LOGICAL_SCALARS = (
     "num_tiles",
     "num_splits",
 )
+# Position of each logical argument in the flat sequence the host's fast path
+# binds, ``LOGICAL_TENSORS`` then ``LOGICAL_SCALARS`` (:func:`resolved_launches`).
+# Derived, not a literal: the exporter and the manifest checker skip it.
+LOGICAL_INDEX: dict[str, int] = {
+    name: index for index, name in enumerate(LOGICAL_TENSORS + LOGICAL_SCALARS)
+}
 
 # The kernel parameter names of each program, in parameter order: the identity
 # ``logical`` map of its record and the order its ``arg_plan`` follows.  The
@@ -783,6 +790,86 @@ def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
     return tuple(plan)
 
 
+@functools.cache
+def _raw_stream_getter() -> Callable[[int], int]:
+    """``torch._C._cuda_getCurrentRawStream`` -- the handle of a device's
+    current torch stream as an integer, without constructing a ``Stream``
+    object -- or the ``torch.cuda`` form on a torch build without it.  Bound
+    on first use: this module imports torch lazily."""
+    import torch
+
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if getter is not None:
+        return getter
+
+    def fallback(device_index: int) -> int:
+        return torch.cuda.current_stream(device_index).cuda_stream
+
+    return fallback
+
+
+def current_raw_stream(device_index: int) -> int:
+    """The ``cudaStream_t`` handle (an integer) of torch's current stream on
+    CUDA device ``device_index``; the key of the host's per-stream caches."""
+    return _raw_stream_getter()(device_index)
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def ffi_stream_context(device_index: int, stream: int) -> Any:
+    """The tvm-ffi environment-stream context that runs the launches inside it
+    on ``stream`` (a raw ``cudaStream_t`` handle, :func:`current_raw_stream`)
+    of CUDA device ``device_index``: the bindings read that stream.  The FFI
+    device handle is kept per index; the context itself is cheap, unlike
+    ``tvm_ffi.use_torch_stream()``, which builds a ``torch.cuda.Stream`` and
+    parses a device string on every entry."""
+    device = _FFI_DEVICES.get(device_index)
+    if device is None:
+        device = _FFI_DEVICES[device_index] = tvm_ffi.device(f"cuda:{device_index}")
+    return tvm_ffi.use_raw_stream(device, stream)
+
+
+@functools.lru_cache(maxsize=4096)
+def resolved_launches(
+    *,
+    form: str,
+    splits: int,
+    arch: str,
+    wide: bool,
+    rows: int,
+    kv_heads: int,
+    qo_heads: int,
+) -> tuple[tuple[Any, Callable[[Any], tuple[Any, ...]], tuple[int, int, int]], ...]:
+    """The launches of one call, resolved once per key of host scalars: per
+    record of :func:`select_records`, in launch order, its loaded FFI entry,
+    a getter that picks the record's kernel arguments out of the flat
+    argument sequence ``LOGICAL_TENSORS + LOGICAL_SCALARS`` (``LOGICAL_INDEX``)
+    and its launch grid (:func:`launch_grid`).  A launch is then
+    ``entry(*getter(arguments), *grid)``: every argument plan ends with the
+    three grid arguments, and the host interprets no plan per call.
+    """
+    launches = []
+    for name in select_records(form=form, splits=splits, arch=arch, wide=wide):
+        plan = _argument_plan(name)
+        grid_axes = [axis for logical, axis in plan if logical is None]
+        if grid_axes != [0, 1, 2] or any(logical is None for logical, _ in plan[:-3]):
+            raise RuntimeError(
+                f"record {name}: the grid arguments are not the suffix of its argument plan"
+            )
+        names = [logical for logical, _ in plan[:-3]]
+        for logical in names:
+            if logical not in LOGICAL_INDEX:
+                raise ValueError(f"record {name} needs logical argument {logical!r}")
+        getter = operator.itemgetter(*(LOGICAL_INDEX[logical] for logical in names))
+        entry = getattr(load(name, arch), MODULES[name]["ffi_entry"])
+        grid = launch_grid(
+            name, rows=rows, kv_heads=kv_heads, qo_heads=qo_heads, splits=splits
+        )
+        launches.append((entry, getter, grid))
+    return tuple(launches)
+
+
 def run_module(
     name: str,
     values: dict[str, Any],
@@ -796,7 +883,9 @@ def run_module(
     tensors (``None`` for an absent optional tensor) and Python scalars; the
     record maps its kernel parameters onto that vocabulary and ``grid`` is the
     call's launch grid (:func:`launch_grid`).  The kernel runs on the current
-    torch stream of the device.
+    torch stream of the device.  The host's entry resolves its launches once
+    per shape instead (:func:`resolved_launches`); this form interprets the
+    plan per call and serves callers that bind by logical name.
     """
     record = MODULES[name]
     args = []
@@ -811,7 +900,7 @@ def run_module(
                     f"record {name} needs logical argument {logical_name!r}"
                 ) from None
     module = load(name, device_arch(device_index))
-    with tvm_ffi.use_torch_stream():
+    with ffi_stream_context(device_index, current_raw_stream(device_index)):
         getattr(module, record["ffi_entry"])(*args)
 
 
@@ -823,6 +912,7 @@ __all__ = [
     "DECODE_PARAMETERS",
     "DECODE_THREADS",
     "FORMS",
+    "LOGICAL_INDEX",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MAX_SPLITS",
@@ -834,13 +924,16 @@ __all__ = [
     "STAGES",
     "TILE_TOKENS",
     "arch_for_capability",
+    "current_raw_stream",
     "device_arch",
     "device_capability",
+    "ffi_stream_context",
     "launch_grid",
     "library_name",
     "load",
     "merge_heads_per_cta",
     "records_of_stage",
+    "resolved_launches",
     "run_module",
     "select_record",
     "select_records",

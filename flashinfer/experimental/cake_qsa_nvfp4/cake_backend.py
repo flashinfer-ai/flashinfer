@@ -73,25 +73,36 @@ seen for a ``rows * num_kv_heads`` -- a new buffer the allocator places at a
 freed buffer's address is a new storage and is zeroed again -- and reset
 themselves after every launch), so a call with a workspace allocates nothing
 and is CUDA-graph capturable with a replay-stable layout.  A call with no rows
-returns before the workspace is read.  Without a workspace the partials are
-allocated per call, as the reference implementation does, and the fused form's
-counters come from a module buffer per (device, stream): zeroed when it is
-allocated, left at its idle value by every launch, grown when a call needs more
-counters than it holds; calls on one stream are ordered, so no two launches
-share live counters.  A capturing stream allocates its counters per call (the
-graph's private pool, replayed with the zero fill), so the cache never holds a
-graph pool's memory.  That path is outside the zero-allocation guarantee.
+returns before the workspace is read.  Without a workspace the partials come
+from a module scratch per (device, stream) -- one float32 buffer, grown when a
+call needs more than it holds, its ``(partial_out, partial_lse)`` views kept
+per call shape -- and the fused form's counters from a module buffer per
+(device, stream): zeroed when it is allocated, left at its idle value by every
+launch, grown when a call needs more counters than it holds.  Calls on one
+stream are ordered, so no two launches share live partials or counters; two
+Python threads enqueuing on one stream are ordered by a module lock from the
+scratch's carve through the call's last launch (the split form's merge reads
+the partials its own decode wrote).  A capturing stream allocates its partials
+and counters per call (the graph's private pool, the counters replayed with
+the zero fill) and leaves both caches untouched, so neither holds a graph
+pool's memory and no graph replays into a buffer the host may replace.  That
+path is outside the zero-allocation guarantee.
 
 Nothing here reads tensor contents: every dispatch is on host scalars and
-tensor metadata.  The kernels run on the current torch stream of the device.
+tensor metadata.  The launch plan of a call shape -- split count, form,
+program, loaded FFI entries, argument order and grids -- is resolved once per
+shape and device and reused; a call then checks its arguments, binds them in
+one flat sequence and issues its launches under one environment-stream
+context.  The kernels run on the current torch stream of the device.
 """
 
 from __future__ import annotations
 
 import functools
 import math
+import threading
 import weakref
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -325,26 +336,109 @@ def reset_workspace(workspace: torch.Tensor) -> None:
     _zeroed_counters.pop(workspace.untyped_storage(), None)
 
 
+# The three CUDA state queries of the per-call path, bound to their C entries
+# (``torch.cuda.current_stream`` constructs a ``Stream`` object per call), with
+# the ``torch.cuda`` forms on a torch build without them.
+_current_raw_stream = cake_jit.current_raw_stream
+try:
+    _current_stream_capturing = torch._C._cuda_isCurrentStreamCapturing
+except AttributeError:  # pragma: no cover - older torch
+    _current_stream_capturing = torch.cuda.is_current_stream_capturing
+try:
+    _current_device = torch._C._cuda_getDevice
+except AttributeError:  # pragma: no cover - older torch
+    _current_device = torch.cuda.current_device
+
 # The fused form's group counters for calls without a workspace, one buffer per (device index, CUDA stream
 # handle) (module docstring, "Workspace rule"): zeroed when allocated, left at an idle value by every launch,
 # replaced by a larger zeroed buffer when a call needs more counters.  Launches on one stream are ordered, so a
-# buffer per stream is never live in two launches at once.
+# buffer per stream is never live in two launches at once.  The ``[:count]`` view of a buffer is kept per
+# (stream, count) beside the buffer it views, so a repeated call slices nothing; a view of a replaced buffer is
+# dropped.  Both tables are bounded.
 _STREAM_COUNTERS_MIN = 1024
+_STREAM_VIEWS_MAX = 4096
 _stream_counters: dict[tuple[int, int], torch.Tensor] = {}
+_stream_counter_views: dict[
+    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _stream_counters_buffer(
-    device: torch.device, device_index: int, count: int
+    device: torch.device, key: tuple[int, int], count: int
 ) -> torch.Tensor:
-    """``count`` idle group counters (uint32, contiguous) of the current stream's buffer on ``device``."""
-    key = (device_index, torch.cuda.current_stream(device_index).cuda_stream)
+    """``count`` idle group counters (uint32, contiguous) of the buffer of stream ``key`` -- ``(device index,
+    raw stream handle)`` -- on ``device``."""
     buffer = _stream_counters.get(key)
     if buffer is None or buffer.numel() < count:
         buffer = torch.zeros(
             max(count, _STREAM_COUNTERS_MIN), dtype=torch.uint32, device=device
         )
         _stream_counters[key] = buffer
-    return buffer[:count]
+        for stale in [k for k in _stream_counter_views if k[:2] == key]:
+            del _stream_counter_views[stale]
+    view_key = (key[0], key[1], count)
+    cached = _stream_counter_views.get(view_key)
+    if cached is not None and cached[0] is buffer:
+        return cached[1]
+    if len(_stream_counter_views) >= _STREAM_VIEWS_MAX:
+        _stream_counter_views.clear()
+    view = buffer[:count]
+    _stream_counter_views[view_key] = (buffer, view)
+    return view
+
+
+# The partials of calls without a workspace (module docstring, "Workspace rule"): one float32 scratch per
+# (device index, CUDA stream handle), grown when a call needs more, with the ``(partial_out, partial_lse)``
+# views kept per call shape.  Launches on one stream are ordered, so a stream's partials are never live in two
+# launches at once; ``_SCRATCH_LOCK`` orders two Python threads enqueuing on one stream from the carve through
+# the call's last launch (the split form's merge reads the partials its own decode wrote).  A capturing stream
+# allocates its partials per call and never touches the scratch: a graph must not replay into a buffer the host
+# may replace.  Bounded: one buffer per stream (the largest call seen), at most ``_SCRATCH_VIEWS_MAX`` view
+# pairs each.
+class _Scratch:
+    __slots__ = ("buffer", "views")
+
+    def __init__(self, buffer: torch.Tensor) -> None:
+        self.buffer = buffer
+        self.views: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+_SCRATCH_VIEWS_MAX = 64
+_SCRATCH_LOCK = threading.Lock()
+_stream_partials: dict[tuple[int, int], _Scratch] = {}
+
+
+def _stream_partials_views(
+    device: torch.device,
+    key: tuple[int, int],
+    splits: int,
+    num_rows: int,
+    num_qo_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(partial_out, partial_lse)`` -- float32 ``[splits, rows, qo_heads, 256]`` and ``[splits, rows,
+    qo_heads]``, each on a 256-byte boundary -- as views of the scratch of stream ``key`` on ``device``.
+    Called under ``_SCRATCH_LOCK``."""
+    shape = (splits, num_rows, num_qo_heads)
+    scratch = _stream_partials.get(key)
+    if scratch is not None:
+        views = scratch.views.get(shape)
+        if views is not None:
+            return views
+    count = splits * num_rows * num_qo_heads
+    lse_offset = _round_up(count * HEAD_DIM, ALIGN // 4)
+    need = lse_offset + count
+    if scratch is None or scratch.buffer.numel() < need:
+        scratch = _Scratch(torch.empty(need, dtype=torch.float32, device=device))
+        _stream_partials[key] = scratch
+    elif len(scratch.views) >= _SCRATCH_VIEWS_MAX:
+        scratch.views.clear()
+    buffer = scratch.buffer
+    views = (
+        buffer[: count * HEAD_DIM].view(splits, num_rows, num_qo_heads, HEAD_DIM),
+        buffer[lse_offset : lse_offset + count].view(splits, num_rows, num_qo_heads),
+    )
+    scratch.views[shape] = views
+    return views
 
 
 def _device_index(device: torch.device | int | None) -> int:
@@ -360,15 +454,61 @@ def _check(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def _check_aligned(tensor: torch.Tensor, name: str, num_bytes: int) -> None:
-    # The kernel moves rows in num_bytes vectors: base and every outer stride must be aligned.
-    element_size = tensor.element_size()
-    _check(
-        tensor.stride(-1) == 1
-        and tensor.data_ptr() % num_bytes == 0
-        and all(s * element_size % num_bytes == 0 for s in tensor.stride()[:-1]),
-        f"{name} needs a contiguous last dim and {num_bytes}-byte aligned base and strides",
+@functools.cache
+def _device_facts(device_index: int) -> tuple[str, int]:
+    """``(arch, sm_count)`` of a supported CUDA device, once per index; ``RuntimeError`` for a capability
+    outside SM80 through SM90 (the refusal is not cached, the facts are)."""
+    capability = cake_jit.device_capability(device_index)
+    arch = cake_jit.arch_for_capability(capability)
+    if arch is None:
+        raise RuntimeError(
+            f"QSA NVFP4 attention supports SM80 through SM90, got SM{capability[0]}{capability[1]}"
+        )
+    return arch, cake_jit.sm_count(device_index)
+
+
+@functools.lru_cache(maxsize=4096)
+def _resolve(
+    num_rows: int, num_kv_heads: int, num_qo_heads: int, tiles: int, device_index: int
+) -> tuple[int, bool, tuple[Any, ...]]:
+    """The plan of one call shape on one device, resolved once per key: ``(splits, fused, launches)`` from
+    the split rule, the form rule, the program rule and :func:`cake_jit.resolved_launches` (the loaded FFI
+    entries, their argument getters and grids, in launch order).  Pure in its host scalars."""
+    arch, sm_count = _device_facts(device_index)
+    splits = num_splits(num_rows, num_kv_heads, tiles * TILE_TOKENS, sm_count)
+    form = select_form(num_rows, num_kv_heads, splits, device_index)
+    wide = select_wide(num_rows, num_kv_heads, splits, tiles, form, sm_count)
+    launches = cake_jit.resolved_launches(
+        form=form,
+        splits=splits,
+        arch=arch,
+        wide=wide,
+        rows=num_rows,
+        kv_heads=num_kv_heads,
+        qo_heads=num_qo_heads,
     )
+    return splits, form == "fused", launches
+
+
+# Slots of the three scratch tensors in the flat argument sequence (``cake_jit.LOGICAL_INDEX``).
+_SLOT_PARTIAL_OUT = cake_jit.LOGICAL_INDEX["partial_out"]
+_SLOT_PARTIAL_LSE = cake_jit.LOGICAL_INDEX["partial_lse"]
+_SLOT_COUNTERS = cake_jit.LOGICAL_INDEX["merge_counters"]
+
+
+def _launch(
+    launches: tuple[
+        tuple[Any, Callable[[Any], tuple[Any, ...]], tuple[int, int, int]], ...
+    ],
+    arguments: list[Any],
+    device_index: int,
+    stream: int,
+) -> None:
+    """Issue the resolved ``launches`` over the flat ``arguments`` under one environment-stream context on
+    ``stream`` (torch's current stream of ``device_index``)."""
+    with cake_jit.ffi_stream_context(device_index, stream):
+        for entry, get, grid in launches:
+            entry(*get(arguments), *grid)
 
 
 def qsa_sparse_paged_attention(
@@ -392,190 +532,269 @@ def qsa_sparse_paged_attention(
     ``flashinfer.sparse.qsa_sparse_paged_attention``), through the Cake kernels.
 
     The arguments are the public entry's; ``workspace_buffer`` is the caller-owned scratch of the module docstring
-    ("Workspace rule"), ``None`` for per-call allocation.
+    ("Workspace rule"), ``None`` for the module's per-stream scratch.
     """
     del (
         use_prefill_config
     )  # kept for the signature; the split rule does not depend on it
-    if q.device.type != "cuda":
+    # Every check raises before any launch; each predicate reads tensor metadata once.
+    q_device = q.device
+    if q_device.type != "cuda":
         raise ValueError("device must be a cuda device")
-    device_index = _device_index(q.device)
-    capability = cake_jit.device_capability(device_index)
-    if cake_jit.arch_for_capability(capability) is None:
-        raise RuntimeError(
-            f"QSA NVFP4 attention supports SM80 through SM90, got SM{capability[0]}{capability[1]}"
-        )
-    _check(q.ndim == 3 and k_cache.ndim == 4, "q must be 3D and k_cache 4D")
-    num_rows, num_qo_heads, head_dim = q.shape
-    num_blocks, page_size, num_kv_heads, packed_dim = k_cache.shape
-    _check(q.dtype == torch.bfloat16, "q must be bfloat16")
-    _check(head_dim == HEAD_DIM, f"head_dim must be {HEAD_DIM}")
-    _check(packed_dim * 2 == head_dim, "k_cache must hold head_dim / 2 packed bytes")
-    _check(
+    device_index = q_device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    _device_facts(device_index)
+    q_shape = q.shape
+    k_shape = k_cache.shape
+    if len(q_shape) != 3 or len(k_shape) != 4:
+        raise ValueError("q must be 3D and k_cache 4D")
+    num_rows, num_qo_heads, head_dim = q_shape
+    num_blocks, page_size, num_kv_heads, packed_dim = k_shape
+    if q.dtype != torch.bfloat16:
+        raise ValueError("q must be bfloat16")
+    if head_dim != HEAD_DIM:
+        raise ValueError(f"head_dim must be {HEAD_DIM}")
+    if packed_dim * 2 != head_dim:
+        raise ValueError("k_cache must hold head_dim / 2 packed bytes")
+    k_stride = k_cache.stride()
+    if not (
         k_cache.dtype == torch.uint8
-        and v_cache.shape == k_cache.shape
+        and v_cache.shape == k_shape
         and v_cache.dtype == k_cache.dtype
-        and v_cache.stride() == k_cache.stride(),
-        "k_cache and v_cache must be uint8 views with the same shape and strides",
-    )
+        and v_cache.stride() == k_stride
+    ):
+        raise ValueError(
+            "k_cache and v_cache must be uint8 views with the same shape and strides"
+        )
     sf_shape = (num_blocks, page_size, num_kv_heads, head_dim // 16)
-    _check(
+    sf_stride = k_sf.stride()
+    if not (
         k_sf.dtype == torch.float8_e4m3fn
-        and tuple(k_sf.shape) == sf_shape
+        and k_sf.shape == sf_shape
         and v_sf.shape == k_sf.shape
         and v_sf.dtype == k_sf.dtype
-        and v_sf.stride() == k_sf.stride(),
-        f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides",
-    )
-    _check(num_blocks > 0 and page_size > 0, "k_cache must not be empty")
-    _check(
+        and v_sf.stride() == sf_stride
+    ):
+        raise ValueError(
+            f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides"
+        )
+    if not (num_blocks > 0 and page_size > 0):
+        raise ValueError("k_cache must not be empty")
+    if not (
         num_qo_heads % num_kv_heads == 0
-        and num_qo_heads // num_kv_heads <= MAX_GROUP_SIZE,
-        f"num_qo_heads must be a multiple of num_kv_heads, at most {MAX_GROUP_SIZE}x",
-    )
-    _check(
-        logical_indices.ndim == 2
-        and logical_indices.shape[0] == num_rows
-        and logical_indices.shape[1] >= 2
+        and num_qo_heads // num_kv_heads <= MAX_GROUP_SIZE
+    ):
+        raise ValueError(
+            f"num_qo_heads must be a multiple of num_kv_heads, at most {MAX_GROUP_SIZE}x"
+        )
+    indices_shape = logical_indices.shape
+    indices_stride = logical_indices.stride()
+    if not (
+        len(indices_shape) == 2
+        and indices_shape[0] == num_rows
+        and indices_shape[1] >= 2
         and logical_indices.dtype == torch.int32
-        and logical_indices.stride(1) == 1,
-        "logical_indices must be int32 [rows, selection_width + 1] with a contiguous last dim",
-    )
-    _check(
-        block_table.ndim == 2
-        and block_table.numel() > 0
+        and indices_stride[1] == 1
+    ):
+        raise ValueError(
+            "logical_indices must be int32 [rows, selection_width + 1] with a contiguous last dim"
+        )
+    table_shape = block_table.shape
+    table_stride = block_table.stride()
+    if not (
+        len(table_shape) == 2
+        and table_shape[0] > 0
+        and table_shape[1] > 0
         and block_table.dtype == torch.int32
-        and block_table.stride(1) == 1,
-        "block_table must be a non-empty int32 2D tensor with a contiguous last dim",
-    )
-    _check(
+        and table_stride[1] == 1
+    ):
+        raise ValueError(
+            "block_table must be a non-empty int32 2D tensor with a contiguous last dim"
+        )
+    if not (
         token_to_req.shape == (num_rows,)
         and token_to_req.dtype == torch.int32
-        and token_to_req.is_contiguous(),
-        "token_to_req must be contiguous int32 [rows]",
-    )
-    _check(
-        k_scale is not None and v_scale is not None, "k_scale and v_scale are required"
-    )
-    _check(
-        output_gate.shape == q.shape
+        and token_to_req.is_contiguous()
+    ):
+        raise ValueError("token_to_req must be contiguous int32 [rows]")
+    if k_scale is None or v_scale is None:
+        raise ValueError("k_scale and v_scale are required")
+    if not (
+        output_gate.shape == q_shape
         and output_gate.dtype == torch.bfloat16
-        and output_gate.is_contiguous(),
-        "output_gate must be contiguous bfloat16 with the shape of q",
-    )
+        and output_gate.is_contiguous()
+    ):
+        raise ValueError("output_gate must be contiguous bfloat16 with the shape of q")
     if out is None:
         out = torch.empty_like(q)
-    _check(
-        out.shape == q.shape and out.dtype == q.dtype,
-        "out must match q in shape and dtype",
-    )
-    tensors = (q, k_cache, v_cache, k_sf, v_sf, logical_indices, block_table)
-    _check(
-        all(x.device == q.device for x in (*tensors, token_to_req, output_gate, out)),
-        "all tensors must be on the same device",
-    )
-    _check_aligned(q, "q", 8)
-    for name, tensor in (
-        ("k_cache", k_cache),
-        ("v_cache", v_cache),
-        ("k_sf", k_sf),
-        ("v_sf", v_sf),
-        ("output_gate", output_gate),
-        ("out", out),
+    if not (out.shape == q_shape and out.dtype == q.dtype):
+        raise ValueError("out must match q in shape and dtype")
+    if not (
+        k_cache.device == q_device
+        and v_cache.device == q_device
+        and k_sf.device == q_device
+        and v_sf.device == q_device
+        and logical_indices.device == q_device
+        and block_table.device == q_device
+        and token_to_req.device == q_device
+        and output_gate.device == q_device
+        and out.device == q_device
     ):
-        _check_aligned(tensor, name, 16)
+        raise ValueError("all tensors must be on the same device")
+    # The kernels move rows in 8- or 16-byte vectors: base and every outer stride must be aligned (the BF16
+    # tensors' strides in elements of two bytes).  ``v_cache`` and ``v_sf`` carry the dtype and strides of
+    # ``k_cache`` and ``k_sf`` (checked above), so their base alone remains to check.
+    q_stride = q.stride()
+    if not (
+        q_stride[2] == 1
+        and q.data_ptr() % 8 == 0
+        and q_stride[0] * 2 % 8 == 0
+        and q_stride[1] * 2 % 8 == 0
+    ):
+        raise ValueError(
+            "q needs a contiguous last dim and 8-byte aligned base and strides"
+        )
+    if not (
+        k_stride[3] == 1
+        and k_cache.data_ptr() % 16 == 0
+        and k_stride[0] % 16 == 0
+        and k_stride[1] % 16 == 0
+        and k_stride[2] % 16 == 0
+    ):
+        raise ValueError(
+            "k_cache needs a contiguous last dim and 16-byte aligned base and strides"
+        )
+    if v_cache.data_ptr() % 16 != 0:
+        raise ValueError(
+            "v_cache needs a contiguous last dim and 16-byte aligned base and strides"
+        )
+    if not (
+        sf_stride[3] == 1
+        and k_sf.data_ptr() % 16 == 0
+        and sf_stride[0] % 16 == 0
+        and sf_stride[1] % 16 == 0
+        and sf_stride[2] % 16 == 0
+    ):
+        raise ValueError(
+            "k_sf needs a contiguous last dim and 16-byte aligned base and strides"
+        )
+    if v_sf.data_ptr() % 16 != 0:
+        raise ValueError(
+            "v_sf needs a contiguous last dim and 16-byte aligned base and strides"
+        )
+    gate_stride = output_gate.stride()
+    if not (
+        gate_stride[2] == 1
+        and output_gate.data_ptr() % 16 == 0
+        and gate_stride[0] * 2 % 16 == 0
+        and gate_stride[1] * 2 % 16 == 0
+    ):
+        raise ValueError(
+            "output_gate needs a contiguous last dim and 16-byte aligned base and strides"
+        )
+    out_stride = out.stride()
+    if not (
+        out_stride[2] == 1
+        and out.data_ptr() % 16 == 0
+        and out_stride[0] * 2 % 16 == 0
+        and out_stride[1] * 2 % 16 == 0
+    ):
+        raise ValueError(
+            "out needs a contiguous last dim and 16-byte aligned base and strides"
+        )
     if num_rows == 0:
         return out
 
-    selection_width = logical_indices.shape[1] - 1
-    tiles = num_tiles(selection_width)
-    sm_count = cake_jit.sm_count(device_index)
-    splits = num_splits(num_rows, num_kv_heads, selection_width, sm_count)
-    form = select_form(num_rows, num_kv_heads, splits, device_index)
-    fused = form == "fused"
-    arch = cake_jit.device_arch(device_index)
-    wide = select_wide(num_rows, num_kv_heads, splits, tiles, form, sm_count)
+    selection_width = indices_shape[1] - 1
+    tiles = -(-selection_width // TILE_TOKENS)
+    splits, fused, launches = _resolve(
+        num_rows, num_kv_heads, num_qo_heads, tiles, device_index
+    )
     raw = (
         _check_workspace(
-            workspace_buffer, q.device, num_rows, num_qo_heads, num_kv_heads, splits
+            workspace_buffer, q_device, num_rows, num_qo_heads, num_kv_heads, splits
         )
         if workspace_buffer is not None
         else None
     )
+    # The flat argument sequence, ``cake_jit.LOGICAL_TENSORS`` then ``cake_jit.LOGICAL_SCALARS``; the three
+    # scratch slots are filled below.
+    arguments = [
+        q,
+        k_cache,
+        v_cache,
+        k_sf.view(torch.uint8),
+        v_sf.view(torch.uint8),
+        logical_indices,
+        block_table,
+        token_to_req,
+        output_gate,
+        out,
+        None,  # partial_out
+        None,  # partial_lse
+        None,  # merge_counters
+        q_stride[0],
+        q_stride[1],
+        k_stride[0],
+        k_stride[1],
+        k_stride[2],
+        sf_stride[0],
+        sf_stride[1],
+        sf_stride[2],
+        indices_stride[0],
+        table_stride[0],
+        out_stride[0],
+        out_stride[1],
+        float(k_scale) * _LOG2E / math.sqrt(head_dim),  # score_scale
+        float(v_scale),  # output_scale
+        num_rows,
+        table_shape[0],  # num_requests
+        num_blocks,
+        page_size,  # page_div
+        table_shape[1],  # table_width
+        selection_width,  # topk
+        num_qo_heads // num_kv_heads,  # group_size
+        num_qo_heads,
+        tiles,
+        splits,
+    ]
+    stream = _current_raw_stream(device_index)
     if splits == 1:
-        partial_out = partial_lse = merge_counters = None
+        _launch(launches, arguments, device_index, stream)
     elif raw is not None:
-        partial_out, partial_lse, merge_counters = _carve(
-            raw,
-            num_rows,
-            num_qo_heads,
-            num_kv_heads,
-            splits,
-            counters=fused,
-        )
-    else:
-        partial_out = q.new_empty(
+        (
+            arguments[_SLOT_PARTIAL_OUT],
+            arguments[_SLOT_PARTIAL_LSE],
+            arguments[_SLOT_COUNTERS],
+        ) = _carve(raw, num_rows, num_qo_heads, num_kv_heads, splits, counters=fused)
+        _launch(launches, arguments, device_index, stream)
+    elif _current_stream_capturing() or device_index != _current_device():
+        # The graph's private pool: a capture records no buffer the host may later replace.  The
+        # capture state is readable for the current device's stream only, so a call on another
+        # device takes this per-call path as well.
+        arguments[_SLOT_PARTIAL_OUT] = q.new_empty(
             (splits, num_rows, num_qo_heads, head_dim), dtype=torch.float32
         )
-        partial_lse = q.new_empty((splits, num_rows, num_qo_heads), dtype=torch.float32)
-        if not fused:
-            merge_counters = None
-        elif torch.cuda.is_current_stream_capturing():
-            merge_counters = torch.zeros(
-                num_rows * num_kv_heads, dtype=torch.uint32, device=q.device
-            )
-        else:
-            merge_counters = _stream_counters_buffer(
-                q.device, device_index, num_rows * num_kv_heads
-            )
-    values = {
-        "q": q,
-        "k_data": k_cache,
-        "v_data": v_cache,
-        "k_sf": k_sf.view(torch.uint8),
-        "v_sf": v_sf.view(torch.uint8),
-        "indices": logical_indices,
-        "block_table": block_table,
-        "token_to_req": token_to_req,
-        "gate": output_gate,
-        "out": out,
-        "partial_out": partial_out,
-        "partial_lse": partial_lse,
-        "merge_counters": merge_counters,
-        "q_stride_row": q.stride(0),
-        "q_stride_head": q.stride(1),
-        "data_stride_block": k_cache.stride(0),
-        "data_stride_token": k_cache.stride(1),
-        "data_stride_head": k_cache.stride(2),
-        "sf_stride_block": k_sf.stride(0),
-        "sf_stride_token": k_sf.stride(1),
-        "sf_stride_head": k_sf.stride(2),
-        "indices_stride_row": logical_indices.stride(0),
-        "table_stride_req": block_table.stride(0),
-        "out_stride_row": out.stride(0),
-        "out_stride_head": out.stride(1),
-        "score_scale": float(k_scale) * _LOG2E / math.sqrt(head_dim),
-        "output_scale": float(v_scale),
-        "num_rows": num_rows,
-        "num_requests": block_table.shape[0],
-        "num_blocks": num_blocks,
-        "page_div": page_size,
-        "table_width": block_table.shape[1],
-        "topk": selection_width,
-        "group_size": num_qo_heads // num_kv_heads,
-        "num_qo_heads": num_qo_heads,
-        "num_tiles": tiles,
-        "num_splits": splits,
-    }
-    for name in cake_jit.select_records(form=form, splits=splits, arch=arch, wide=wide):
-        grid = cake_jit.launch_grid(
-            name,
-            rows=num_rows,
-            kv_heads=num_kv_heads,
-            qo_heads=num_qo_heads,
-            splits=splits,
+        arguments[_SLOT_PARTIAL_LSE] = q.new_empty(
+            (splits, num_rows, num_qo_heads), dtype=torch.float32
         )
-        cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+        if fused:
+            arguments[_SLOT_COUNTERS] = torch.zeros(
+                num_rows * num_kv_heads, dtype=torch.uint32, device=q_device
+            )
+        _launch(launches, arguments, device_index, stream)
+    else:
+        key = (device_index, stream)
+        with _SCRATCH_LOCK:
+            arguments[_SLOT_PARTIAL_OUT], arguments[_SLOT_PARTIAL_LSE] = (
+                _stream_partials_views(q_device, key, splits, num_rows, num_qo_heads)
+            )
+            if fused:
+                arguments[_SLOT_COUNTERS] = _stream_counters_buffer(
+                    q_device, key, num_rows * num_kv_heads
+                )
+            _launch(launches, arguments, device_index, stream)
     return out
 
 
