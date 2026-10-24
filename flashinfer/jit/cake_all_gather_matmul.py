@@ -982,7 +982,7 @@ N128_MAX_WAVES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 1}
 # the base rule of ``uses_sm_push`` (copied from the kernel module; an arch
 # outside the table is an error, never the base rule alone).
 SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
-    "sm_100a": [],
+    "sm_100a": [[8, 1024, 1619]],
     "sm_103a": [[8, 1024, 1619]],
 }
 # Per-architecture SM push launch rows ``[world_size, padded_rows, ctas_per_peer,
@@ -1085,6 +1085,7 @@ CG2_SPILL_POINTS: dict[str, list[list[Any]]] = {
     "sm_100a": [
         [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
         [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
+        [4, "bfloat16", "k_major", 2048, 2560, "cg2s2"],
     ],
     "sm_103a": [
         [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
