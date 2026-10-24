@@ -191,7 +191,11 @@ Serving outside a context uses the attached store's measurement policy.
 ### 2.5 MeasurementPolicy — tune the way you deploy
 
 ```python
-MeasurementPolicy(execution_mode="auto" | "cuda_graph" | "eager", cold_l2=None)
+MeasurementPolicy(
+    execution_mode="auto" | "cuda_graph" | "eager",
+    cold_l2=None,
+    graph_timing=None | "amortized" | "individual",
+)
 ```
 
 The primary axis is **whether per-call host cost counts**, not the timer implementation. Under
@@ -208,10 +212,31 @@ derived from it (`eager` → event timing with no delay kernel; otherwise standa
 under different policies land in different directories and never overwrite each other — which is
 what closes the eager-warmup / graph-serving aliasing.
 
+`graph_timing` optionally selects the **hot-L2 graph** measurement objective.
+`"amortized"` divides a repeated replay window by its invocation count;
+`"individual"` takes the median of per-call intervals recorded inside the graph.
+The latter uses external CUDA events, or timestamp kernels when the autotuner
+selects `%globaltimer`. These nodes can change scheduling, so individual timing
+needs validation against the deployment's uninstrumented graph. It is not model
+decode latency or a guarantee of better tactic selection.
+
+The default `None` inherits `TuningConfig.use_cuda_graph_individual_timing`, which
+defaults to `False`. Existing policies retain their cache identity. An explicit
+objective creates a distinct managed-cache namespace and can override a runner's
+default in either direction. It does not enable graph capture by itself; specify
+`execution_mode="cuda_graph"` for that. Cold-L2 profiling keeps its existing
+measurement path. Explicit eager or CUPTI policies reject `graph_timing`;
+CUPTI also overrides an inherited per-op individual-timing flag.
+
+`prepare_tactic_profile` applies the same measurement and replay-count overrides
+before preparing the input schedule used by `profile_tactic`. Delegated tuning
+contexts also preserve the attached store's graph-timing objective after warmup.
+
 Each newly tuned entry also records an optional `profiling_policy` payload: the effective
-CUDA-graph replay count (or `null` without graphs) and L2 policy (`hot`, `cold`, or
-`cold-chain:<n>`, see `TuningConfig.cold_chain_launches`) after context and measurement
-overrides. These inherited settings are not fully represented by the manifest.
+CUDA-graph replay count (or `null` without graphs), L2 policy (`hot`, `cold`, or
+`cold-chain:<n>`, see `TuningConfig.cold_chain_launches`), and active individual-call
+graph timing after context and measurement overrides. These inherited settings
+are not fully represented by the manifest.
 When `choose_one` can profile, it reuses a managed winner only when this provenance matches,
 including after preload, reload, and promotion to the root/environment-partitioned memory
 cache. A missing or different policy is a profiling miss, not deletion; replay, bare inference,
