@@ -156,6 +156,9 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
         Sm107BlockScaledSymmBuffer,
     )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+        AutoTuningState,
+    )
 
     cfg = Sm107BlockScaledMoeConfig(
         num_total_experts=4,
@@ -175,6 +178,7 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     ws._destroyed = False
     ws._launch_key = None
     ws._launch_kwargs = None
+    ws._tuning_state = AutoTuningState()
     ws.x = torch.empty(
         4, 64 if kind == "nvfp4" else 128, device="cuda", dtype=cfg.torch_act_data_dtype
     )
@@ -208,5 +212,6 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     graph.replay()
     torch.cuda.synchronize()
     assert ws._launch_key[-1] == stream.cuda_stream
+    assert ws._tuning_state.graph_captured
     assert (ws.output_activation == 3).all()
     del graph
