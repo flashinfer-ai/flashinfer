@@ -221,6 +221,69 @@ excluded comparisons and an independent comparison against the best prior
 FC2=4 tuning space. BF16 uses a separate numerical contract from the MX
 performance tables; do not combine their ratios.
 
+### PowLU across the shared epilogues
+
+`PowLU(m=2.5, limit=None)` now uses the existing Frost FC1/activation and
+FC2/combine pipeline across the supported weight and activation formats.
+The positive gate uses a power with an input-dependent exponent; the
+non-positive gate uses SiLU. An optional limit clamps the activated gate
+from above and the linear branch symmetrically. Parameters remain part of
+the compiled specialization. Accurate log/sqrt/power evaluation preserves
+positive subnormals for small `m`, and the power at positive infinity is one.
+
+The following BF16 kernel-call comparison uses H2048/I512/E512/K10,
+`PowLU()` and disjoint expert routes. The baseline is CUTLASS with each
+GEMM stage tuned, followed by a comparison of the top-two-by-top-two pairs
+and the heuristic configuration. This is not an exhaustive compound search.
+Frost selects among all 16 column pairs and its default. Table entries are
+the median of two independent frozen-winner validation processes.
+
+| GPU | T | Warm CUTLASS → Frost µs | Speedup | Cold CUTLASS → Frost µs | Speedup |
+|---|---:|---:|---:|---:|---:|
+| H100 | 1 | 52.648 → 25.500 | 2.065× | 58.640 → 32.704 | 1.793× |
+| H100 | 2 | 69.272 → 42.568 | 1.627× | 78.168 → 52.388 | 1.492× |
+| H100 | 4 | 101.464 → 76.512 | 1.326× | 110.780 → 86.340 | 1.283× |
+| H100 | 8 | 170.532 → 142.504 | 1.197× | 178.608 → 151.828 | 1.176× |
+| B200 | 1 | 44.292 → 12.064 | 3.671× | 51.636 → 19.880 | 2.597× |
+| B200 | 2 | 52.600 → 27.692 | 1.899× | 58.736 → 35.552 | 1.652× |
+| B300 | 1 | 38.840 → 14.748 | 2.634× | 52.392 → 26.228 | 1.998× |
+| B300 | 2 | 63.408 → 39.612 | 1.601× | 69.052 → 48.772 | 1.416× |
+| B300 | 4 | 96.520 → 74.052 | 1.303× | 105.348 → 84.360 | 1.249× |
+| B300 | 8 | 161.608 → 143.004 | 1.130× | 170.176 → 153.292 | 1.110× |
+
+Both backends pass the independent FP64-dot reference with BF16 intermediate
+and expert-output boundaries, packed BF16 routing scores, and FP32 combine
+(1% relative L2 / 3% normalized maximum; not bitwise equality). The complete
+[measurement record](../benchmarks/data/frost_powlu_bf16_20261024.json)
+includes configuration ranking, source/environment identity, samples,
+forward/reverse order, duplicate A/A captures and graph-output checks.
+
+H100 uses external CUDA-event intervals. B200/B300 use globaltimer intervals
+because the initial B300 individual-call CUDA-event samples were coarsely
+quantized. The B300 empty interval is approximately 0.46 µs, retained in
+both timings rather than subtracted. Cold tests evict at least 512 MiB
+before each measured call; eviction is outside the interval. These are
+complete routed-expert GPU-call times, including backend adapters and
+combine, excluding routing selection, shared experts, communication, host
+submission and serving throughput. The gain narrows as T grows: at T=8 it
+is about 1.18–1.20× on H100 and 1.11–1.13× on B300. These cases do not
+establish a win for every model shape.
+
+```bash
+python benchmarks/bench_frost_low_latency_bf16.py \
+  --activation powlu --tokens 1 --backends cutlass --cache-mode warm \
+  --timer globaltimer --select --output powlu-selection.json
+python benchmarks/bench_frost_low_latency_bf16.py \
+  --activation powlu --tokens 1 --backends cutlass --cache-mode warm \
+  --timer globaltimer --selection powlu-selection.json --output powlu-forward.json
+python benchmarks/bench_frost_low_latency_bf16.py \
+  --activation powlu --tokens 1 --backends cutlass --cache-mode warm \
+  --timer globaltimer --selection powlu-selection.json --reverse --output powlu-reverse.json
+```
+
+Use `--timer cuda-event` for the H100 cohort, and repeat selection for each
+new token count, cache mode, source revision or software environment.
+
 ### MXFP4/MXFP8 with clamped SwiGLU
 
 This separate cohort uses H2048/I512/E512/K10, MXFP8 activations, BF16 output,
@@ -259,12 +322,12 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
 | Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3/NVFP4/MXFP4/MXINT4 weight-only checkpoints with BF16/FP16 input and output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
-| MX activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
-| BF16 activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
-| FP16 / per-tensor FP8 / DeepSeek block FP8 activation | Same ten activations and scalar restrictions as BF16 |
-| BF16 parameters | SwiGLU alpha/beta/limit and SwiGLUStep limit; other activations require their default parameters |
+| MX activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, PowLU, GELU, ReLU, ReLU2, SiLU, Identity |
+| BF16 activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, PowLU, GELU, ReLU, ReLU2, SiLU, Identity |
+| FP16 / per-tensor FP8 / DeepSeek block FP8 activation | Same eleven activations and scalar restrictions as BF16 |
+| BF16 parameters | SwiGLU alpha/beta/limit, SwiGLUStep limit, and PowLU m/optional limit; other activations require their default parameters |
 | MX parameters | Same typed scalar restrictions as BF16; activation remains FP32 before MXFP8 quantization |
-| NVFP4 | NVFP4 weights and inputs, BF16 output; shared FMA, the same ten activations, H divisible by 512, I by 128, top-k <= 32; no 4over6 intermediate quantization |
+| NVFP4 | NVFP4 weights and inputs, BF16 output; shared FMA, the same eleven activations, H divisible by 512, I by 128, top-k <= 32; no 4over6 intermediate quantization |
 | BF16/FP16/per-tensor FP8/DeepSeek block FP8 FMA | top-k <= 32; FC1 and FC2 output columns 1/2/4/8 (16 combinations), default 1 and 4; GELU/GeGLU require compiler `erf` support |
 | MX/BF16/FP16/per-tensor FP8 geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
 | DeepSeek block FP8 | E4M3 weights, arbitrary FP32 128×128 scales; BF16 input or prequantized E4M3 with FP32 1×128 scales; H and I divisible by 128; FP32 preactivation, BF16 output |
@@ -998,6 +1061,61 @@ python benchmarks/bench_frost_low_latency_w8a16.py \
   --tokens 1 --cache-mode warm --expert-reuse disjoint --output w8a16-t1-warm.json
 ```
 
+
+### SM120 E4M3 expert reuse with BF16/FP16 input
+
+The same grouped FC1 body now handles both FP4 and E4M3 weights. It matches
+expert IDs across token/top-k slots at runtime, shares one weight load across
+two or four independent dot products, and writes each result to its original
+route. FC2 and ordered combine remain unchanged. There is no assumption that
+routes stay fixed between graph replays.
+
+Only SM120 T>=4 advertises the 24 new groups alongside the existing 16 column
+pairs. T=2 was excluded: approximately 6% warm improvement came with a 7–8%
+cold regression. Grouped E4M3 did not qualify on SM90/SM100/SM103. The default
+tactic remains unchanged; autotune with representative routing and cache state.
+
+This is an **incremental comparison against the best of the 16 existing Frost
+tactics**, not a comparison against another backend. All rows use
+H2048/I512/E512/K10, SwiGLU, shared experts and identical E4M3 checkpoints,
+scales and typed rounding. CUPTI measures the complete FC1/activation +
+FC2/combine span; four ABBA blocks validate frozen winners. The
+[16-case record](../benchmarks/data/frost_w8_route_reuse_20261024.json) retains
+all selection/validation medians, reference errors and separate warm event
+controls, including disjoint routes.
+
+| Input/output | T | Warm original Frost → expanded Frost µs | Speedup | Cold original Frost → expanded Frost µs | Speedup |
+|---|---:|---:|---:|---:|---:|
+| BF16 | 4 | 22.160 → 19.792 | 1.120× | 33.480 → 33.648 | 0.995× |
+| BF16 | 8 | 38.864 → 36.031 | 1.079× | 52.927 → 51.872 | 1.020× |
+| FP16 | 4 | 22.184 → 19.904 | 1.115× | 33.400 → 33.567 | 0.995× |
+| FP16 | 8 | 38.831 → 36.024 | 1.078× | 53.064 → 51.784 | 1.025× |
+
+Disjoint-route speedups are 0.996–1.003×: effectively unchanged when the tuner
+can retain an original tactic. Routing changes after tuning can still alter
+the best choice. A separate native comparison searches 337 cuTile stage-pair,
+block-size and routing choices against all 40 Frost choices. Both paths use
+the same BF16 rounding reference, checkpoint, routes and full-call CUPTI
+intervals within this cohort:
+
+| T | Warm cuTile → Frost µs | Speedup | Cold cuTile → Frost µs | Speedup |
+|---:|---:|---:|---:|---:|
+| 4 | 25.503 → 19.127 | 1.333× | 39.976 → 33.264 | 1.202× |
+| 8 | 28.800 → 35.199 | 0.818× | 43.104 → 51.344 | 0.840× |
+
+The [native boundary record](../benchmarks/data/frost_w8_native_boundary_20261024.json)
+retains all candidate medians, reference errors and 16 frozen ABBA validation
+intervals per case. cuTile still wins T=8 even after the Frost reuse change.
+This reproducer uses a different checkpoint generator from the incremental
+Frost ablation above; do not multiply their ratios or combine their absolute
+times. Default backend selection is unchanged.
+
+```bash
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format w8a16 --activation-dtype fp16 \
+  --native-backend frost-ungrouped --tokens 4 --expert-reuse shared \
+  --cache-mode warm --output w8-reuse.json
+```
 
 ## DeepSeek block-scaled FP8
 
