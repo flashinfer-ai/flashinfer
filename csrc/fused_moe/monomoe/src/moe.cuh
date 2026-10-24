@@ -133,7 +133,8 @@ __device__ void moe_kernel_topk_impl(
   // skips the bar_rwin wait.  Warps 1..11 wait for the Phase-1 load, then
   // quantize bf16 → fp8_act_full + act_scale.  The two sides touch
   // disjoint SHM; the single trailing __syncthreads() publishes both to
-  // all warps before Phase 3.
+  // all warps before Phase 3.  The quantize warps also fence fp8_act_full
+  // for the async proxy first, since Phase 3 reads it as a WGMMA operand.
   if (warp_id == 0) {
     prepare_moe_topk<Dims>(batch_size, top_k, shmem);
   } else {
@@ -142,6 +143,8 @@ __device__ void moe_kernel_topk_impl(
     }
     routing_phase_quantize<Dims>(u_tma->bf16_in_full, u_tma->fp8_act_full, shmem->act_scale,
                                  batch_size);
+    // fp8_act_full is read as a WGMMA shared operand (async proxy) in Phase 3.
+    fence_proxy_async_shared_cta();
   }
   __syncthreads();
 
