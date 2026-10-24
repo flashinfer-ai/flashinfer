@@ -80,6 +80,7 @@ from .moe_w4a16_route_pack import (
 )
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
+    _W4A16_MAX_DIRECT_ROUTE_TOKENS,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     plan_w4a16_buffers,
@@ -150,7 +151,7 @@ def _tc_decode_m_cap(
         and intermediate_size <= 512
         and top_k <= 10
     ):
-        return 8
+        return _W4A16_MAX_DIRECT_ROUTE_TOKENS
     return _TC_DECODE_MAX_M
 
 
@@ -173,7 +174,7 @@ def _direct_topk_route_m_cap(
         and intermediate_size <= 512
         and top_k <= 10
     ):
-        return 8
+        return _W4A16_MAX_DIRECT_ROUTE_TOKENS
     return _MAX_DIRECT_TOPK_ROUTE_M
 
 

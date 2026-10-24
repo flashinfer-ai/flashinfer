@@ -58,8 +58,9 @@ def test_fp16_direct_route_cap_preserves_large_expert_reuse(
 @cuda_13_required
 @pytest.mark.parametrize("tokens", [7, 8])
 @pytest.mark.parametrize("activation", ["silu", "relu2"])
+@pytest.mark.parametrize("hidden,intermediate,top_k", [(256, 256, 3), (2048, 512, 10)])
 def test_fp16_direct_matches_packed_routes_and_live_graph(
-    tokens, activation, monkeypatch
+    tokens, activation, hidden, intermediate, top_k, monkeypatch
 ):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
         prepare_w4a16_packed_weights,
@@ -73,7 +74,7 @@ def test_fp16_direct_matches_packed_routes_and_live_graph(
     from flashinfer.quantization.fp4_quantization import block_scale_interleave
 
     torch.manual_seed(7190 + tokens)
-    e, h, i, k = 16, 256, 256, 3
+    e, h, i, k = 16, hidden, intermediate, top_k
     branches = 2 if activation == "silu" else 1
     x = torch.randn(tokens, h, device="cuda", dtype=torch.float16) * 0.1
     ids = (
