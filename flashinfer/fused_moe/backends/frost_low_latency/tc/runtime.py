@@ -11,7 +11,9 @@ from .warp import WarpGroupedProjection
 
 
 @cute.kernel
-def combine_kernel(routes, scores, output, narrow: cutlass.Constexpr):
+def combine_kernel(
+    routes, ids, scores, output, experts: cutlass.Constexpr, narrow: cutlass.Constexpr
+):
     thread, _, _ = cute.arch.thread_idx()
     block, _, _ = cute.arch.block_idx()
     index = block * 256 + thread
@@ -22,11 +24,14 @@ def combine_kernel(routes, scores, output, narrow: cutlass.Constexpr):
         value = cutlass.Float32(0)
         # Match the existing separate FP32 multiply/add and ascending slot order.
         for slot in cutlass.range_constexpr(k):
-            score = scores[token, slot].to(cutlass.Float32)
-            if cutlass.const_expr(narrow):
-                score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-            partial = routes[token * k + slot, column].to(cutlass.Float32)
-            value = value + _mul(partial, score)
+            # Invalid slots contribute nothing, even with non-finite padding scores.
+            expert = ids[token, slot]
+            if expert >= 0 and expert < experts:
+                score = scores[token, slot].to(cutlass.Float32)
+                if cutlass.const_expr(narrow):
+                    score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                partial = routes[token * k + slot, column].to(cutlass.Float32)
+                value = value + _mul(partial, score)
         output[token, column] = value.to(output.element_type)
 
 
@@ -69,7 +74,9 @@ def launch(
         first_warp(w1, x, ids, mid, stream)
         second_warp(w2, mid, ids, routes, stream)
     if cutlass.const_expr(finalize):
-        combine_kernel(routes, scores, output, narrow).launch(
+        combine_kernel(
+            routes, ids, scores, output, cute.size(w1, mode=[0]), narrow
+        ).launch(
             grid=(cute.ceil_div(cute.size(output), 256), 1, 1),
             block=(256, 1, 1),
             stream=stream,
@@ -120,7 +127,7 @@ def execute(inputs, config, tactic):
     finalize = config.finalize.do_finalize
     tensors = (x, w1, ids, mid, w2, routes, scores, output)
     key = (
-        "grouped-tc-ffi-v2",
+        "grouped-tc-ffi-v3",
         architecture,
         tuple((v.dtype, tuple(v.shape), tuple(v.stride()), v.device) for v in tensors),
         config.activation,

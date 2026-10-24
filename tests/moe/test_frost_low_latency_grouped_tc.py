@@ -386,3 +386,58 @@ def test_unmeasured_workloads_keep_fma_choices(case):
     runner.build()
     inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), weights)
     assert all(v[0] == "ffma" for v in runner.get_valid_tactics(inputs, None))
+
+
+@pytest.mark.parametrize("tokens", [4, 8])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("padding_score", [float("nan"), float("inf"), -float("inf")])
+def test_invalid_route_scores_are_ignored_after_graph_capture(
+    tokens, packed, padding_score
+):
+    _require_grouped_tc()
+    cfg, x, w1, w2, ids, scores, weights = _inputs(
+        SwiGLU(), tokens=tokens, hidden=2048, intermediate=512, experts=17, topk=10
+    )
+    runner = FrostLowLatencyRunner(cfg, x.device)
+    runner.check_support()
+    runner.build()
+    mode = (
+        RoutingInputMode.PackedPrecomputed
+        if packed
+        else RoutingInputMode.UnpackedPrecomputed
+    )
+    inputs = runner.pack_inputs(
+        MoEActivationPack(x, None, ids, scores, routing_input_mode=mode), weights
+    )
+    tactic = next(
+        t
+        for t in runner.get_valid_tactics(inputs, None)
+        if t[0] in ("wgmma", "warp_mma")
+    )
+    got = runner.forward(inputs, tactic)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs, tactic)
+    ids[0, 0] = -1
+    ids[1, 1] = w1.shape[0]
+    scores[0, 0] = padding_score
+    scores[1, 1] = padding_score
+    valid = (ids >= 0) & (ids < w1.shape[0])
+    _, expected, _ = _reference(
+        x,
+        w1,
+        w2,
+        ids.clamp(0, w1.shape[0] - 1),
+        scores.masked_fill(~valid, 0),
+        SwiGLU(),
+        packed,
+    )
+    for _ in range(2):
+        for buf in inputs[5:8]:
+            buf.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        delta = got.double() - expected.double()
+        assert torch.isfinite(got).all()
+        assert delta.norm() / expected.double().norm() < 0.01
+        assert delta.abs().max() / expected.double().abs().max() < 0.03
