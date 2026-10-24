@@ -334,10 +334,10 @@ defaults to 128, which selects the Q128/KV128 tile. Block-sparse plans require
 both.
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
-Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
-plans, a row keeps its softmax exponent anchor while a tile raises the row
-maximum by at most that many binades, so the accumulated output is not
-rescaled; 0 rescales on every new maximum.
+Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
+softmax exponent anchor while a tile raises the row maximum by at most that
+many binades, so the accumulated output is not rescaled; 0 rescales on every
+new maximum.
 
 ## Sage attention
 
@@ -383,15 +383,15 @@ be finite and positive; the kernels do not check the values. Q and K scales
 use the trtllm-gen flat layout: within one head, sequence `b` of
 `[B, S, H, D]` starts at slot `b * S // blk + b` and token `t` uses slot
 `t // blk` inside it, so one head owns
-`flat_scale_numel(B, S, blk) == ceil(B * S / blk) + B - 1` slots.
+`sage_flat_scale_numel(B, S, blk) == ceil(B * S / blk) + B - 1` slots.
 
 | Field | Shape |
 | --- | --- |
-| `q_scale` | `[Hq, flat_scale_numel(B, Sq, q_block_size)]` |
-| `k_scale` | `[Hkv, flat_scale_numel(B, Skv, k_block_size)]` |
+| `q_scale` | `[Hq, sage_flat_scale_numel(B, Sq, q_block_size)]` |
+| `k_scale` | `[Hkv, sage_flat_scale_numel(B, Skv, k_block_size)]` |
 | `v_scale` | `[B, Hkv, D]` |
 | `v_mean` | `[B, Hkv, D]`; exactly when the recipe sets `v_mean=True` |
-| `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
+| `k_summary_scale` | `[Hkv, sage_flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
 
 With proxy routes, `k_summary` holds the per-block K means in the K dtype,
 quantized as one more K sequence of `ceil(Skv / kv_block_size)` tokens with
@@ -422,9 +422,9 @@ the scores in place in the max pass, which costs more per score.
 | Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) | `head_dim=128`; 128-token Q tiles of one Q head |
 | Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask) | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
 | Split-KV | Rejected: only the direct output store applies `sfV` and `v_mean` | No split-KV launch |
-| K transport | `RING` for every K block size: the load warp stages each K tile's scales in shared memory | `GLOBAL` for 4-token and coarser blocks: the softmax loads them before the score wait; `RING` for 1-token blocks |
-| Score scaling | `BLOCK` for 4-token and coarser blocks; `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
-| P scale `C` | `448 * 2**-h`, with `h` the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256 tiles and block-sparse plans, and 0 elsewhere | 1: the lazy correction lets `p` reach `2**8` |
+| K transport | `SMEM` for every K block size: the load warp stages each K tile's scales in shared memory | `GMEM` for 4-token and coarser blocks: the softmax loads them from global memory before the score wait; `SMEM` for 1-token blocks |
+| Score scaling | `DEQUANTIZED` on dense Q128/KV128 tiles, whose score row stays in registers; on Q64/KV256 tiles and block-sparse routes, `BLOCK` for 4-token and coarser blocks and `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
+| P scale `C` | `448 * 2**-h`, with `h` the plan's `softmax_rescale_threshold_log2` (default 8) | 1: the lazy correction lets `p` reach `2**8` |
 
 Masks and scheduling otherwise follow each kernel's 16-bit plans. In the
 decode kernel the default threshold quantizes FP8 P at
@@ -457,7 +457,7 @@ from flashinfer.attention.prims_ts import (
     SageAttentionConfig,
     SageAttentionParams,
 )
-from flashinfer.attention.prims_ts.sage import flat_scale_numel
+from flashinfer.attention.prims_ts.sage import sage_flat_scale_numel
 
 device = torch.device("cuda")
 B, Sq, Skv, Hq, Hkv, D = 2, 128, 1000, 4, 4, 128
@@ -479,8 +479,8 @@ q = torch.randn(B, Sq, Hq, D, device=device).to(fp8)
 k = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
 v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
 scales = SageAttentionParams(
-    q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
-    k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
+    q_scale=torch.rand(Hq, sage_flat_scale_numel(B, Sq, 1), device=device),
+    k_scale=torch.rand(Hkv, sage_flat_scale_numel(B, Skv, 16), device=device),
     v_scale=torch.rand(B, Hkv, D, device=device),
 )
 out = wrapper.run(q, k, v, sage=scales)  # [B, Sq, Hq, D] bfloat16
@@ -522,11 +522,11 @@ block_indptr = (
 ) * selected.numel()
 
 scales = SageAttentionParams(
-    q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
-    k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
+    q_scale=torch.rand(Hq, sage_flat_scale_numel(B, Sq, 1), device=device),
+    k_scale=torch.rand(Hkv, sage_flat_scale_numel(B, Skv, 16), device=device),
     v_scale=torch.rand(B, Hkv, D, device=device),
     k_summary_scale=torch.rand(
-        Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
+        Hkv, sage_flat_scale_numel(B, num_kv_blocks, 16), device=device
     ),
 )
 out = wrapper.run(
