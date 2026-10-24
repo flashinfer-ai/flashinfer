@@ -19,6 +19,14 @@ _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
+    if config.quant.activation is QuantFormat.BF16 and config.quant.weight in (
+        QuantFormat.NVFP4,
+        QuantFormat.MXFP4,
+        QuantFormat.MXINT4,
+    ):
+        from .fp4_weight_only import execute as execute_w4a16
+
+        return execute_w4a16(inputs, config, tile_k)
     if config.quant.weight is QuantFormat.DeepSeekFp8:
         from .deepseek_fp8 import execute as execute_deepseek
 

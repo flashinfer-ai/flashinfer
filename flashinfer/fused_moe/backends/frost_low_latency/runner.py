@@ -28,6 +28,9 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.FP8PerTensor, QuantFormat.BF16),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.NVFP4, QuantFormat.BF16),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
+        (QuantFormat.MXINT4, QuantFormat.BF16),
     )
     supported_output_formats = (QuantFormat.BF16, QuantFormat.FP16)
     supported_activation_classes = tuple(ACTIVATIONS)
@@ -40,6 +43,9 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.FP8PerTensor, QuantFormat.BF16): tuple(ACTIVATIONS),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): tuple(ACTIVATIONS),
         (QuantFormat.NVFP4, QuantFormat.NVFP4): tuple(ACTIVATIONS),
+        (QuantFormat.NVFP4, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.MXFP4, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.MXINT4, QuantFormat.BF16): tuple(ACTIVATIONS),
     }
     supports_expert_parallelism = False
     # This path honors an explicit disabled recipe; 4over6 is rejected below.
@@ -55,6 +61,11 @@ class FrostLowLatencyRunner(MoERunner):
     def __init__(self, config, device):
         super().__init__()
         self.config = config
+        self._fp4_weight_only = (
+            config.quant.activation is QuantFormat.BF16
+            and config.quant.weight
+            in (QuantFormat.NVFP4, QuantFormat.MXFP4, QuantFormat.MXINT4)
+        )
         self.device = torch.device(device)
         if self.device.index is None and self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
@@ -87,14 +98,19 @@ class FrostLowLatencyRunner(MoERunner):
             )
         if not self._supports_tc and self.config.routing.top_k > 32:
             raise NotImplementedError("Frost FMA requires top_k <= 32")
-        if arch == (9, 0) and self.config.quant.weight not in (
-            QuantFormat.BF16,
-            QuantFormat.FP16,
-            QuantFormat.FP8PerTensor,
-            QuantFormat.DeepSeekFp8,
+        if (
+            arch == (9, 0)
+            and not self._fp4_weight_only
+            and self.config.quant.weight
+            not in (
+                QuantFormat.BF16,
+                QuantFormat.FP16,
+                QuantFormat.FP8PerTensor,
+                QuantFormat.DeepSeekFp8,
+            )
         ):
             raise NotImplementedError(
-                "Frost SM90 supports BF16, FP16, per-tensor FP8 and DeepSeek FP8 FMA only"
+                "Frost SM90 supports BF16, FP16, per-tensor FP8, DeepSeek FP8 and packed-four-bit-weight/BF16-activation FMA only"
             )
         name, _ = lower_activation(self.config.activation)
         if self.config.quant.weight in (
@@ -112,11 +128,14 @@ class FrostLowLatencyRunner(MoERunner):
             and self.config.experts.intermediate_size % 128
         ):
             raise NotImplementedError("DeepSeek Frost requires I divisible by 128")
-        if self.config.quant.weight is QuantFormat.NVFP4:
-            self._check_nvfp4_recipe()
+        if self.config.quant.weight is QuantFormat.NVFP4 or self._fp4_weight_only:
+            if self.config.routing.top_k > 32:
+                raise NotImplementedError("Frost NVFP4 requires top_k <= 32")
+            if not self._fp4_weight_only:
+                self._check_nvfp4_recipe()
             if (
-                self.config.routing.top_k > 32
-                or self.config.experts.intermediate_size % 128
+                not self._fp4_weight_only
+                and self.config.experts.intermediate_size % 128
             ):
                 raise NotImplementedError(
                     "Frost NVFP4 requires top_k <= 32 and I divisible by 128"
@@ -150,7 +169,7 @@ class FrostLowLatencyRunner(MoERunner):
             )
 
     def _accepts_shape(self, act):
-        if self.config.quant.weight is QuantFormat.NVFP4:
+        if self.config.quant.weight is QuantFormat.NVFP4 and not self._fp4_weight_only:
             return (
                 act.hidden_states_q.ndim == 2
                 and 1 <= act.num_tokens <= self.options.max_num_tokens
@@ -167,16 +186,46 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "unified-fma-tc-standard-timing-v5",
+            "mxint4-load-width-v1"
+            if self.config.quant.weight is QuantFormat.MXINT4
+            else (
+                "fp4-route-reuse-load-width-lut-v4"
+                if self._fp4_weight_only
+                else "unified-fma-tc-standard-timing-v5"
+            ),
             self.options.max_num_tokens,
             self.config.execution.enable_pdl,
         )
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
-        if self.config.quant.weight is QuantFormat.NVFP4:
+        if self.config.quant.weight is QuantFormat.NVFP4 and not self._fp4_weight_only:
             return [("nvfp4_ffma", width) for width in (2, 4)]
-        if self.config.quant.weight in (
+        from ....utils import get_compute_capability
+
+        capability = get_compute_capability(self.device)
+        hopper_fp4 = (
+            self._fp4_weight_only
+            and self.config.quant.weight in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+            and capability == (9, 0)
+        )
+        if self._fp4_weight_only and (capability in ((10, 3), (12, 0)) or hopper_fp4):
+            columns = (1, 2, 4, 8)
+            tactics = [("ffma", a, b) for a in columns for b in columns] + [
+                ("ffma", a, b, v1, v2)
+                for a in columns
+                for b in columns
+                for v1, v2 in ((4, 8), (8, 4), (8, 8))
+            ]
+            if hopper_fp4 and inputs[0].shape[0] >= 2:
+                tactics += [
+                    ("ffma", a, b, group)
+                    for group in (2, 4)
+                    for a in (1, 2, 4)
+                    for b in columns
+                ]
+            return tactics
+        if self._fp4_weight_only or self.config.quant.weight in (
             QuantFormat.BF16,
             QuantFormat.FP16,
             QuantFormat.FP8PerTensor,
@@ -213,6 +262,10 @@ class FrostLowLatencyRunner(MoERunner):
         )
         if self.config.quant.weight is QuantFormat.FP8PerTensor:
             from .fp8_per_tensor import pack_inputs
+
+            return pack_inputs(act, weights, self.config, self.device)
+        if self._fp4_weight_only:
+            from .fp4_weight_only import pack_inputs
 
             return pack_inputs(act, weights, self.config, self.device)
         if self.config.quant.weight is QuantFormat.DeepSeekFp8:
@@ -380,7 +433,9 @@ class FrostLowLatencyRunner(MoERunner):
         from .runtime import execute
 
         if tactic == -1:
-            if self.config.quant.weight is QuantFormat.NVFP4:
+            if self._fp4_weight_only:
+                tactic = ("ffma", 1, 4)
+            elif self.config.quant.weight is QuantFormat.NVFP4:
                 tactic = ("nvfp4_ffma", 2)
             else:
                 tactic = (
