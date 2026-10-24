@@ -53,6 +53,8 @@ POLICY_FIELDS = (
     "candidate_multiplier_unsampled",  # capacity multiplier when the sampled first threshold is off
     "cand_mult_rule_unsampled",  # its [min mean unit tiles, multiplier] long-unit rule, or None
     "cand_cap_floor_unsampled",  # its minimum candidate slots, or None
+    "cand_cap_ceiling",  # most candidate slots the default multiplier requests per (warpgroup, query), or None; lowers the multiplier, the floor and top_k + slack still hold
+    "cand_cap_ceiling_unsampled",  # its ceiling when the sampled first threshold is off, or None
     "l6_rule",  # [max mean unit tiles, min top_k] of the three-warpgroup program, or None
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
     "split_max",  # most key-range splits per unit
@@ -135,7 +137,12 @@ _NUMBER = (
     "sample_dispatch_mean_tiles_max",
     "sample_dispatch_tiny_tiles_max",
 )
-_OPTIONAL_INT = ("cand_cap_floor", "cand_cap_floor_unsampled")
+_OPTIONAL_INT = (
+    "cand_cap_floor",
+    "cand_cap_floor_unsampled",
+    "cand_cap_ceiling",
+    "cand_cap_ceiling_unsampled",
+)
 _OPTIONAL_RULE = (
     "cand_mult_rule",
     "cand_mult_rule_unsampled",
@@ -179,6 +186,8 @@ class DispatchPolicy:
     candidate_multiplier_unsampled: int
     cand_mult_rule_unsampled: Optional[list]
     cand_cap_floor_unsampled: Optional[int]
+    cand_cap_ceiling: Optional[int]
+    cand_cap_ceiling_unsampled: Optional[int]
     l6_rule: Optional[list]
     wide_rule: list
     split_max: int
@@ -338,6 +347,18 @@ class DispatchPolicy:
             raise ValueError(
                 "policy['rank_t16_slots'] must be an ascending list of positive sort-slot counts divisible by 16"
             )
+        for floor_name, ceiling_name in (
+            ("cand_cap_floor", "cand_cap_ceiling"),
+            ("cand_cap_floor_unsampled", "cand_cap_ceiling_unsampled"),
+        ):
+            ceiling = raw[ceiling_name]
+            if ceiling is not None and (
+                ceiling <= 0
+                or (raw[floor_name] is not None and ceiling < raw[floor_name])
+            ):
+                raise ValueError(
+                    f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}], got {ceiling!r}"
+                )
         fit_kinds = raw["sample_fit_kinds"]
         if (
             not isinstance(fit_kinds, (list, tuple))
@@ -458,18 +479,22 @@ class DispatchPolicy:
     ) -> int:
         """Capacity multiplier of a call: the sampled values by default, the ``*_unsampled`` values
         when the sampled first threshold is off (``sample_tiles_max=0``), whose larger buffers would
-        only delay the first selection."""
+        only delay the first selection.  The long-unit rule replaces the multiplier, the floor raises it
+        and the ceiling lowers it (``cand_cap_ceiling // top_k``, so the buffer stops growing with
+        ``top_k`` once it holds the ceiling)."""
         if sampled:
-            mult, rule, floor = (
+            mult, rule, floor, ceiling = (
                 self.candidate_multiplier,
                 self.cand_mult_rule,
                 self.cand_cap_floor,
+                self.cand_cap_ceiling,
             )
         else:
-            mult, rule, floor = (
+            mult, rule, floor, ceiling = (
                 self.candidate_multiplier_unsampled,
                 self.cand_mult_rule_unsampled,
                 self.cand_cap_floor_unsampled,
+                self.cand_cap_ceiling_unsampled,
             )
         if rule is not None:
             if (
@@ -479,6 +504,8 @@ class DispatchPolicy:
                 mult = int(rule[1])
         if floor is not None and int(top_k) * mult < int(floor):
             mult = -(-int(floor) // int(top_k))
+        if ceiling is not None and int(top_k) * mult > int(ceiling):
+            mult = max(1, int(ceiling) // int(top_k))
         return mult
 
     def candidate_capacity(self, top_k: int, multiplier: Optional[int] = None) -> int:
