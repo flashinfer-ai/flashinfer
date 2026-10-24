@@ -2952,8 +2952,8 @@ def test_batch_prefill_plan_max_lens(batch_size, page_size, seq_lens_dtype):
     [(32768, 128), (16384, 128), (32768, 512), (1024, 512)],
 )
 def test_ragged_prefill_unchanged_running_max(dtype, q_val, head_dim):
-    # Regression for #6907: an early dominant key keeps the running max unchanged
-    # across KV tiles. Rescaling must not produce NaNs or -inf LSE.
+    """An early dominant key keeps the online-softmax running max unchanged
+    across KV tiles; the rescale must not produce NaNs or -inf LSE (#6907)."""
     if head_dim > 256 and get_compute_capability(torch.device("cuda"))[0] < 8:
         pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
 
@@ -2984,6 +2984,10 @@ def test_ragged_prefill_unchanged_running_max(dtype, q_val, head_dim):
     assert torch.isfinite(lse).all()
     o_ref, _ = ref_single_prefill(q, k, v)
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    # The issue reproducer: every non-dominant logit is 0, so its softmax
+    # weight underflows to exactly 0 and the output must be exactly 1.
+    if q_val == 32768 and head_dim == 128:
+        assert torch.equal(o, torch.ones_like(o))
 
     # log2-domain LSE (the kernel's convention). Allow FP32 rounding error
     # while catching the finite LSE drift at q=16384 (pre-fix ~62; -inf at
