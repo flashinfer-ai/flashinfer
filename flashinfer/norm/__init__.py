@@ -86,14 +86,16 @@ try:
     )
     from .kernels.rmsnorm_sigmoid_gate import (
         rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
-        supports_rmsnorm_sigmoid_gate,
+    )
+    from .kernels.rmsnorm_sigmoid_gate import (
+        supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
     )
 
     _HAS_CUTE_DSL_FUSED_NORM = True
 except (ImportError, AttributeError):
     _HAS_CUTE_DSL_FUSED_NORM = False
 
-    def supports_rmsnorm_sigmoid_gate(
+    def _cute_supports_rmsnorm_sigmoid_gate(
         dtype: torch.dtype,
         head_dim: int,
         device: torch.device | str | None = None,
@@ -106,7 +108,19 @@ try:
         cake_gated_residual_next_rmsnorm as _cake_gated_residual_next_rmsnorm,
     )
     from ..cake_muse_spark_norm_backend import (
+        cake_gated_residual_rmsnorm as _cake_gated_residual_rmsnorm,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        cake_rmsnorm_sigmoid_gate as _cake_rmsnorm_sigmoid_gate,
+    )
+    from ..cake_muse_spark_norm_backend import (
         is_cake_gated_residual_next_rmsnorm_supported as _cake_gated_residual_next_rmsnorm_supported,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        is_cake_gated_residual_rmsnorm_supported as _cake_gated_residual_rmsnorm_supported,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        is_cake_rmsnorm_sigmoid_gate_supported as _cake_rmsnorm_sigmoid_gate_supported,
     )
 
     _HAS_CAKE_FUSED_NORM = True
@@ -180,6 +194,7 @@ def _normalize_scale_tensor(
 
 _GATED_RESIDUAL_HIDDEN_SIZE = 8192
 _GATED_RESIDUAL_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+_RMSNORM_SIGMOID_GATE_HEAD_DIM = 64
 _FUSED_NORM_ALIGNMENT = 16
 _DUAL_NORM_ALIGNMENT = 32
 
@@ -241,18 +256,140 @@ def _gated_residual_next_rmsnorm_backend(
     return None
 
 
+def _resolved_pdl(device: torch.device, enable_pdl: bool) -> bool:
+    """The programmatic dependent launch flag a call runs with: the caller's, where the device supports it."""
+    return bool(enable_pdl) and device_support_pdl(device)
+
+
+def _cute_gated_residual_rmsnorm_available(device: torch.device) -> bool:
+    return _HAS_CUTE_DSL_FUSED_NORM and _fused_norm_arch_supported(device)
+
+
+def _cake_gated_residual_rmsnorm_available(
+    device: torch.device,
+    *,
+    weight_before_norm: bool,
+    enable_pdl: bool,
+    rows: Optional[int] = None,
+) -> bool:
+    return _HAS_CAKE_FUSED_NORM and _cake_gated_residual_rmsnorm_supported(
+        device, weight_before_norm=weight_before_norm, enable_pdl=enable_pdl, rows=rows
+    )
+
+
+def _gated_residual_rmsnorm_backend(
+    backend: str,
+    device: torch.device,
+    *,
+    weight_before_norm: bool,
+    enable_pdl: bool,
+    rows: Optional[int] = None,
+) -> Optional[str]:
+    """The backend one call runs on: ``"cake"`` when the Cake package ships a
+    program for the device, the call's variant (``weight`` applied before the
+    norm or absent, programmatic dependent launch or not) and (with ``rows``)
+    its row count (preferred under ``"auto"``; a row count in a gap of the
+    package's windows falls to the CuTe DSL kernel), else ``"cute"`` when the
+    CuTe DSL kernel targets the device; ``None`` when the requested backend is
+    not available."""
+    if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
+        )
+    if backend != "cute" and _cake_gated_residual_rmsnorm_available(
+        device,
+        weight_before_norm=weight_before_norm,
+        enable_pdl=enable_pdl,
+        rows=None if backend == "cake" else rows,
+    ):
+        return "cake"
+    if backend != "cake" and _cute_gated_residual_rmsnorm_available(device):
+        return "cute"
+    return None
+
+
+def _cake_rmsnorm_sigmoid_gate_available(
+    device: torch.device,
+    *,
+    heads: Optional[int] = None,
+    tokens: Optional[int] = None,
+) -> bool:
+    return _HAS_CAKE_FUSED_NORM and _cake_rmsnorm_sigmoid_gate_supported(
+        device, heads=heads, tokens=tokens
+    )
+
+
+def _rmsnorm_sigmoid_gate_backend(
+    backend: str,
+    device: torch.device,
+    *,
+    heads: Optional[int] = None,
+    tokens: Optional[int] = None,
+) -> Optional[str]:
+    """The backend one call runs on: ``"cake"`` when the Cake package ships a
+    program for the device and (with ``heads`` and ``tokens``) the call's head
+    count and token count (preferred under ``"auto"``; a head count the
+    package's windows do not name, or a token count in a gap of them, falls to
+    the CuTe DSL kernel), else ``"cute"`` when the CuTe DSL kernel targets the
+    device; ``None`` when the requested backend is not available."""
+    if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
+        )
+    if backend != "cute" and _cake_rmsnorm_sigmoid_gate_available(
+        device,
+        heads=None if backend == "cake" else heads,
+        tokens=None if backend == "cake" else tokens,
+    ):
+        return "cake"
+    if backend != "cake" and _cute_supports_rmsnorm_sigmoid_gate(
+        torch.bfloat16, _RMSNORM_SIGMOID_GATE_HEAD_DIM, device=device
+    ):
+        return "cute"
+    return None
+
+
+def supports_rmsnorm_sigmoid_gate(
+    dtype: torch.dtype,
+    head_dim: int,
+    device: torch.device | str | None = None,
+    *,
+    backend: Literal["auto", "cake", "cute"] = "auto",
+) -> bool:
+    """Whether a BF16, head-dimension-64 call can run on ``device`` (the current
+    one when ``None``) through ``backend`` (``"auto"``: the Cake package or the
+    CuTe DSL kernel).  The package routes on the head count and the token count
+    of a call as well; ``rmsnorm_sigmoid_gate`` falls to the CuTe DSL kernel
+    where they lie outside its windows."""
+    if dtype != torch.bfloat16 or head_dim != _RMSNORM_SIGMOID_GATE_HEAD_DIM:
+        return False
+    if device is None:
+        if not torch.cuda.is_available():
+            return False
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    else:
+        resolved = torch.device(device)
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        return False
+    return _rmsnorm_sigmoid_gate_backend(backend, resolved) is not None
+
+
 def supports_gated_residual_rmsnorm(
     branch: torch.Tensor,
     residual: torch.Tensor,
     weight: Optional[torch.Tensor],
     alpha: torch.Tensor,
     beta: torch.Tensor,
+    *,
+    enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> bool:
-    """Return whether tensors satisfy the SM100/SM103/SM107 fused-kernel contract."""
+    """Return whether tensors satisfy the SM100/SM103/SM107 fused-kernel contract
+    and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
+    the call on their device."""
     tensors = (branch, residual, alpha, beta)
     return (
-        _HAS_CUTE_DSL_FUSED_NORM
-        and branch.ndim == 2
+        branch.ndim == 2
         and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
         and residual.shape == branch.shape
         and (weight is None or weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,))
@@ -279,7 +416,13 @@ def supports_gated_residual_rmsnorm(
                 and _is_aligned(weight)
             )
         )
-        and _fused_norm_arch_supported(branch.device)
+        and _gated_residual_rmsnorm_backend(
+            backend,
+            branch.device,
+            weight_before_norm=weight is not None,
+            enable_pdl=_resolved_pdl(branch.device, enable_pdl),
+        )
+        is not None
     )
 
 
@@ -586,6 +729,7 @@ def gated_residual_rmsnorm(
     out: Optional[torch.Tensor] = None,
     *,
     enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> torch.Tensor:
     r"""Gated residual RMSNorm for hidden size 8192: blend a normalized branch into the stream.
 
@@ -613,7 +757,17 @@ def gated_residual_rmsnorm(
         Optional FP32 output tensor with the same shape and layout as ``residual``.
     enable_pdl : bool
         Whether to enable programmatic dependent launch. Defaults to ``True``;
-        pass ``False`` to disable it.
+        pass ``False`` to disable it. The Cake package ships a plain and a
+        programmatic-dependent-launch build of each program and runs the one
+        the flag selects.
+    backend : str
+        ``"auto"`` (default) runs the Cake kernels
+        (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
+        a program for the device, the call's inputs (``weight`` present or not,
+        ``enable_pdl``) and its row count (the package's routes may leave
+        row-count gaps where the CuTe DSL kernel measured ahead), else the CuTe
+        DSL kernel; ``"cake"`` and ``"cute"`` select one and raise ``ValueError``
+        when it is not available (``"cake"`` at a row count in a gap raises too).
 
     Returns
     -------
@@ -622,6 +776,18 @@ def gated_residual_rmsnorm(
     """
     if not supports_gated_residual_rmsnorm(branch, residual, weight, alpha, beta):
         raise ValueError("tensors do not satisfy the gated_residual_rmsnorm contract")
+    if (
+        _gated_residual_rmsnorm_backend(
+            backend,
+            branch.device,
+            weight_before_norm=weight is not None,
+            enable_pdl=_resolved_pdl(branch.device, enable_pdl),
+        )
+        is None
+    ):
+        raise ValueError(
+            f"gated_residual_rmsnorm: backend {backend!r} is not available on {branch.device}"
+        )
     if out is not None and (
         out.shape != branch.shape
         or out.dtype != residual.dtype
@@ -646,6 +812,7 @@ def gated_residual_rmsnorm(
         gain_center,
         weight is not None,
         enable_pdl,
+        backend,
     )
     return out
 
@@ -662,9 +829,35 @@ def _gated_residual_rmsnorm_impl(
     gain_center: float,
     apply_weight_before_norm: bool,
     enable_pdl: bool = True,
+    backend: str = "auto",
 ) -> None:
     if enable_pdl:
         enable_pdl = device_support_pdl(branch.device)
+    chosen = _gated_residual_rmsnorm_backend(
+        backend,
+        branch.device,
+        weight_before_norm=apply_weight_before_norm,
+        enable_pdl=enable_pdl,
+        rows=branch.shape[0],
+    )
+    if chosen == "cake":
+        # The package binds the unread weight slot of its mode-0 programs itself.
+        _cake_gated_residual_rmsnorm(
+            branch,
+            residual,
+            weight if apply_weight_before_norm else None,
+            alpha,
+            beta,
+            out,
+            eps=eps,
+            gain_center=gain_center,
+            enable_pdl=enable_pdl,
+        )
+        return
+    if chosen is None:
+        raise ValueError(
+            f"gated_residual_rmsnorm: backend {backend!r} is not available on {branch.device}"
+        )
     _gated_residual_rmsnorm_cute(
         branch,
         residual,
@@ -691,6 +884,7 @@ def _gated_residual_rmsnorm_fake(
     gain_center: float,
     apply_weight_before_norm: bool,
     enable_pdl: bool = True,
+    backend: str = "auto",
 ) -> None:
     return None
 
@@ -702,6 +896,7 @@ def rmsnorm_sigmoid_gate(
     eps: float = 1e-5,
     *,
     enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> None:
     r"""Per-head RMSNorm and sigmoid gate, in place, for head dim 64.
 
@@ -720,8 +915,18 @@ def rmsnorm_sigmoid_gate(
     eps : float
         Epsilon added to the RMS denominator.
     enable_pdl : bool
-        Whether to enable programmatic dependent launch. Defaults to ``True``;
-        pass ``False`` to disable it.
+        Whether to enable programmatic dependent launch on the CuTe DSL kernel.
+        Defaults to ``True``; pass ``False`` to disable it. The Cake kernels
+        launch without the attribute and ignore this argument.
+    backend : str
+        ``"auto"`` (default) runs the Cake kernels
+        (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
+        a program for the device, the call's head count and its token count (the
+        package routes 128, 32 and 16 heads; its windows may leave token-count
+        gaps where the CuTe DSL kernel measured ahead), else the CuTe DSL kernel;
+        ``"cake"`` and ``"cute"`` select one and raise ``ValueError`` when it is
+        not available (``"cake"`` at a head count or token count outside the
+        package's windows raises too).
     """
     if input.ndim not in (2, 3) or gate.shape != input.shape:
         raise ValueError("input and gate must have matching 2-D or 3-D shapes")
@@ -729,6 +934,10 @@ def rmsnorm_sigmoid_gate(
         input.dtype, input.shape[-1], device=input.device
     ):
         raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
+    if _rmsnorm_sigmoid_gate_backend(backend, input.device) is None:
+        raise ValueError(
+            f"rmsnorm_sigmoid_gate: backend {backend!r} is not available on {input.device}"
+        )
     if (
         gate.dtype != torch.bfloat16
         or not gate.is_cuda
@@ -743,7 +952,7 @@ def rmsnorm_sigmoid_gate(
         or not _is_aligned(gate)
     ):
         raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
-    _rmsnorm_sigmoid_gate_impl(input, gate, eps, enable_pdl)
+    _rmsnorm_sigmoid_gate_impl(input, gate, eps, enable_pdl, backend)
 
 
 @register_custom_op("flashinfer::rmsnorm_sigmoid_gate", mutates_args=("input",))
@@ -752,7 +961,22 @@ def _rmsnorm_sigmoid_gate_impl(
     gate: torch.Tensor,
     eps: float,
     enable_pdl: bool = True,
+    backend: str = "auto",
 ) -> None:
+    chosen = _rmsnorm_sigmoid_gate_backend(
+        backend,
+        input.device,
+        heads=input.shape[1] if input.ndim == 3 else 1,
+        tokens=input.shape[0],
+    )
+    if chosen == "cake":
+        # The Cake programs launch without programmatic dependent launch.
+        _cake_rmsnorm_sigmoid_gate(input, gate, eps=eps)
+        return
+    if chosen is None:
+        raise ValueError(
+            f"rmsnorm_sigmoid_gate: backend {backend!r} is not available on {input.device}"
+        )
     if enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     _rmsnorm_sigmoid_gate_cute(input, gate, eps, enable_pdl=enable_pdl)
@@ -764,6 +988,7 @@ def _rmsnorm_sigmoid_gate_fake(
     gate: torch.Tensor,
     eps: float,
     enable_pdl: bool = True,
+    backend: str = "auto",
 ) -> None:
     return None
 
