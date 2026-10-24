@@ -867,3 +867,24 @@ The benchmark requires `cupti-python >= 13`; `--timer globaltimer` explicitly
 selects graph intervals that include stamp-boundary overhead instead. It does
 not silently substitute CUDA events. Larger weights are prepared in per-expert
 chunks outside timing to bound transient preparation memory.
+
+
+#### Hopper FP8 accumulation boundary
+
+The native CUTLASS SM90 per-tensor FP8 path selects
+`KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum`. Its Tensor Core
+accumulation is not numerically identical to the Frost FP32 FMA reduction,
+even though both preserve the BF16 preactivation and E4M3 intermediate
+boundaries described above. The small-shape table passed the fixed reference
+tolerances for both implementations; it does not establish equivalence at
+arbitrary reduction lengths.
+
+A separate `T=1, H=7168, I=2048, E=256, top-k=8` control stopped before native
+timing: the native default exceeded the benchmark's unchanged relative-L2
+limit (`0.01608` versus `0.015`). All 16 Frost tactics passed. The native output
+was bitwise equal to an independent cuBLAS control with `use_fast_accum=True`
+in both GEMMs and the same quantization/activation boundaries. Disabling fast
+accumulation in that control reproduced the reference discrepancy. This
+identifies the source of the mismatch; it does not qualify a speedup for that
+case. No large-shape Hopper FP8 performance result is reported, and the
+benchmark still fails closed rather than relaxing the numerical gate.
