@@ -24,6 +24,7 @@ OP = pkg.GATED_RESIDUAL_NEXT_RMSNORM
 OP_A = "gated_residual_rmsnorm"
 OP_C = "rmsnorm_sigmoid_gate"
 BLACKWELL = ("sm_100a", "sm_103a")
+EVERY = (*BLACKWELL, "sm_107a")
 # The kernel parameters of each operator's programs, in binding order (the grid triple follows).
 PARAMETERS = {
     OP: (
@@ -124,6 +125,119 @@ OP_C_WINDOWS = {
         "order": "tokens",
     },
 }
+# Op C's windows of record on sm_107a: nine programs over ten windows (the plain 256-thread program owns the top
+# window of 128 and of 32 heads); the token counts of each head count are partitioned but for the declared gaps,
+# where the FlashInfer kernel measured ahead: 128 heads at 1 and 3-8 tokens, 32 heads at 10-64 and 257-1024.
+OP_C_WINDOWS_SM107A = {
+    (128, 1, 2): {
+        "threads": 256,
+        "lanes": 32,
+        "cluster": 16,
+        "tcluster": 1,
+        "order": "tokens",
+        "rows_per_thread": 1,
+    },
+    (128, 8, 64): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 16,
+        "order": "heads",
+        "rows_per_thread": 1,
+    },
+    (128, 64, 256): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "tokens",
+        "rows_per_thread": 2,
+    },
+    (128, 256, 1024): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "heads",
+        "rows_per_thread": 1,
+    },
+    (128, 1024, None): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "tokens",
+        "rows_per_thread": 1,
+    },
+    (32, 0, 9): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 16,
+        "order": "tokens",
+        "rows_per_thread": 1,
+    },
+    (32, 64, 256): {
+        "threads": 128,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 8,
+        "order": "tokens",
+        "rows_per_thread": 1,
+    },
+    (32, 1024, None): {
+        "threads": 256,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "tokens",
+        "rows_per_thread": 1,
+    },
+    (16, 0, 1024): {
+        "threads": 128,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 16,
+        "order": "tokens",
+        "rows_per_thread": 1,
+    },
+    (16, 1024, None): {
+        "threads": 128,
+        "lanes": 8,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "tokens",
+        "rows_per_thread": 1,
+    },
+}
+# The declared gaps of the sm_107a routes, (above, at_most) ranges of rows (tokens for op C) no program admits, keyed
+# (route, head count or None) like the partition test's window classes; every other route partitions its counts.
+GAPS_SM107A = {
+    (f"{OP}_alpha_scalar_pw", None): ((0, 255),),
+    (f"{OP_A}_mode0", None): ((128, 256),),
+    (f"{OP_A}_mode0_pdl", None): ((128, 256),),
+    (f"{OP_C}_bf16", 128): ((0, 1), (2, 8)),
+    (f"{OP_C}_bf16", 32): ((9, 64), (256, 1024)),
+}
+# Op A's windows of record on sm_107a, one tuple of windows per record: the two composites alternate below 65 rows
+# (mode 1 keeps the whole-row program from 33), the whole-row persistent program owns 257-8192 rows in both modes,
+# the parked program the rows beyond (and 129-256 in mode 1; mode 0 leaves them to the FlashInfer kernel).
+OP_A_WINDOWS_SM107A = {
+    0: {
+        ((0, 1), (16, 32)),
+        ((1, 16), (32, 64)),
+        ((64, 128),),
+        ((256, 8192),),
+        ((8192, None),),
+    },
+    1: {
+        ((0, 1), (16, 32)),
+        ((1, 16),),
+        ((32, 128),),
+        ((128, 256), (8192, None)),
+        ((256, 8192),),
+    },
+}
 FAMILY_FLAGS = ("--prec-div=true", "--prec-sqrt=true", "--ftz=false")
 NAME = re.compile(r"cake_muse_spark_norm_[0-9a-f]{20}")
 
@@ -203,7 +317,23 @@ def test_support_follows_the_device_architecture(monkeypatch):
                 )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
     assert pkg._arch(device) == "sm_107a"
-    assert not pkg.is_cake_gated_residual_next_rmsnorm_supported(device)
+    for tensor_alpha in (True, False):
+        for has_post_weight in (True, False):
+            assert pkg.is_cake_gated_residual_next_rmsnorm_supported(
+                device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight
+            )
+    scalar_pw = dict(tensor_alpha=False, has_post_weight=True)
+    for rows in (1, 16, 255):
+        assert not pkg.is_cake_gated_residual_next_rmsnorm_supported(
+            device, rows=rows, **scalar_pw
+        )
+    for rows in (256, 4096, 10**6):
+        assert pkg.is_cake_gated_residual_next_rmsnorm_supported(
+            device, rows=rows, **scalar_pw
+        )
+    assert pkg.is_cake_gated_residual_next_rmsnorm_supported(
+        device, rows=1, tensor_alpha=True, has_post_weight=True
+    )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
     assert pkg._arch(device) is None
     assert not pkg.is_cake_gated_residual_next_rmsnorm_supported(device)
@@ -265,7 +395,7 @@ def test_registry_records_reference_the_build_manifest():
             record
         ), name
         arches = tuple(record["arches"])
-        assert arches and set(arches) <= set(BLACKWELL), name
+        assert arches and set(arches) <= set(EVERY), name
         build = record["build"]
         if op != OP_C:
             assert build["H"] == pkg.HIDDEN_SIZE
@@ -295,7 +425,7 @@ def test_registry_records_reference_the_build_manifest():
             assert rule["tcluster"] == build["tcluster"]
             assert rule["order"] == build["order"]
             assert rule["interleave"] == build["interleave"]
-            assert build["tail"] == "none"
+            assert build["tail"] in ("none", "clamp")
         else:
             assert rule["kind"] == (
                 "persistent_rows" if build["persistent"] else "rows"
@@ -349,7 +479,7 @@ def test_registry_records_reference_the_build_manifest():
 
 def test_routes_partition_the_row_counts():
     for arch, routes in loader.ROUTES.items():
-        assert arch in BLACKWELL
+        assert arch in EVERY
         assert set(routes) == {
             loader.route_key(op, variant)
             for op in loader.OPS
@@ -379,19 +509,40 @@ def test_routes_partition_the_row_counts():
             assert set(classes) == ({128, 32, 16} if keyed else {None})
             for heads, windows in classes.items():
                 windows.sort()
-                assert windows[0][0] == 0
-                assert [w[1] for w in windows[:-1]] == [w[0] for w in windows[1:]]
+                bounds = [(0, windows[0][0])] + [
+                    (w[1], v[0]) for w, v in zip(windows[:-1], windows[1:], strict=True)
+                ]
+                assert all(at_most <= above for at_most, above in bounds), (
+                    arch,
+                    route,
+                    heads,
+                )
+                gaps = tuple(
+                    (at_most, above) for at_most, above in bounds if at_most != above
+                )
+                expected = (
+                    GAPS_SM107A.get((route, heads), ()) if arch == "sm_107a" else ()
+                )
+                assert gaps == expected, (arch, route, heads)
                 assert windows[-1][1] is None and all(
                     w[1] is not None for w in windows[:-1]
                 )
                 top = windows[-1][0] + 2
                 for rows in range(1, top + 1):
-                    (owner,) = [
+                    owners = [
                         name
                         for above, at_most, name in windows
                         if above < rows <= (at_most or rows)
                     ]
-                    assert loader.selected_module(arch, route, rows, heads) == owner
+                    if any(above < rows <= at_most for above, at_most in gaps):
+                        assert not owners
+                        with pytest.raises(
+                            NotImplementedError, match=f"admits {rows} rows"
+                        ):
+                            loader.selected_module(arch, route, rows, heads)
+                    else:
+                        (owner,) = owners
+                        assert loader.selected_module(arch, route, rows, heads) == owner
                 assert (
                     loader.selected_module(arch, route, 10**6, heads) == windows[-1][2]
                 )
@@ -400,14 +551,21 @@ def test_routes_partition_the_row_counts():
                     loader.selected_module(arch, route, 1)
                 with pytest.raises(NotImplementedError, match="of 64 heads"):
                     loader.selected_module(arch, route, 1, 64)
-    assert not loader.route_available(
-        "sm_107a", loader.route_key(OP, "alpha_tensor_pw")
-    )
+    assert loader.route_available("sm_107a", loader.route_key(OP, "alpha_tensor_pw"))
     assert (
-        loader.route_modules("sm_107a", loader.route_key(OP, "alpha_tensor_pw")) == ()
+        len(loader.route_modules("sm_107a", loader.route_key(OP, "alpha_tensor_pw")))
+        == 2
     )
+    scalar_pw = loader.route_key(OP, "alpha_scalar_pw")
+    (whole_range,) = loader.route_modules("sm_107a", scalar_pw)
+    with pytest.raises(NotImplementedError, match="admits 255 rows"):
+        loader.selected_module("sm_107a", scalar_pw, 255)
+    assert loader.selected_module("sm_107a", scalar_pw, 256) == whole_range
+    unexported = loader.route_key(OP, "alpha_tensor_nopw")
+    assert not loader.route_available("sm_100a", unexported)
+    assert loader.route_modules("sm_100a", unexported) == ()
     with pytest.raises(NotImplementedError, match="no exported program"):
-        loader.selected_module("sm_107a", loader.route_key(OP, "alpha_tensor_pw"), 1)
+        loader.selected_module("sm_100a", unexported, 1)
     with pytest.raises(ValueError, match="positive row count"):
         loader.selected_module("sm_100a", loader.route_key(OP, "alpha_tensor_pw"), 0)
     assert loader.admits(None, 1, "sm_100a")
@@ -499,6 +657,80 @@ def test_rmsnorm_sigmoid_gate_routes_window_the_token_count_per_head_count():
         loader.launch_grid(plain, 4096, device_index=0)
 
 
+def test_rmsnorm_sigmoid_gate_routes_on_sm_107a():
+    """On sm_107a op C's route holds nine programs over ten windows: 128 heads at 2 tokens, 9-64 (the head-major
+    16-CTA token cluster), 65-256 (two rows per thread), 257-1024 (head-major) and 1025- (plain); 32 heads at 1-9
+    (the 16-CTA token cluster), 65-256 (the 128-thread 8-CTA token cluster) and 1025- (plain); 16 heads as on the
+    Blackwell architectures.  128 heads at 1 and 3-8 tokens and 32 heads at 10-64 and 257-1024 are declared gaps:
+    no program admits them."""
+    route = loader.route_key(OP_C, "bf16")
+    names = loader.route_modules("sm_107a", route)
+    assert len(names) == 9
+    windows = {}
+    for name in names:
+        for heads, above, at_most in loader.MODULES[name]["select_rule"]["windows"][
+            "sm_107a"
+        ]:
+            windows[(heads, above, at_most)] = name
+    assert set(windows) == set(OP_C_WINDOWS_SM107A)
+    for key, selecting in OP_C_WINDOWS_SM107A.items():
+        record = loader.MODULES[windows[key]]
+        build = record["build"]
+        assert {k: build[k] for k in selecting} == selecting, key
+        assert build["pdl"] is False
+        assert tuple(record["launch"]["cluster"]) == _cluster_dims(build), key
+        assert key[0] % record["grid_rule"]["rows_per_cta"] == 0, key
+    assert windows[(128, 1024, None)] == windows[(32, 1024, None)]
+    assert windows[(128, 8, 64)] != windows[(128, 256, 1024)]
+    for heads, tokens, key in (
+        (128, 2, (128, 1, 2)),
+        (128, 9, (128, 8, 64)),
+        (128, 64, (128, 8, 64)),
+        (128, 65, (128, 64, 256)),
+        (128, 256, (128, 64, 256)),
+        (128, 257, (128, 256, 1024)),
+        (128, 1024, (128, 256, 1024)),
+        (128, 1025, (128, 1024, None)),
+        (128, 16384, (128, 1024, None)),
+        (32, 1, (32, 0, 9)),
+        (32, 9, (32, 0, 9)),
+        (32, 65, (32, 64, 256)),
+        (32, 256, (32, 64, 256)),
+        (32, 1025, (32, 1024, None)),
+        (16, 1, (16, 0, 1024)),
+        (16, 1024, (16, 0, 1024)),
+        (16, 1025, (16, 1024, None)),
+    ):
+        assert (
+            loader.selected_module("sm_107a", route, tokens, heads) == windows[key]
+        ), (heads, tokens)
+    for heads, tokens in (
+        (128, 1),
+        (128, 3),
+        (128, 8),
+        (32, 10),
+        (32, 64),
+        (32, 257),
+        (32, 1024),
+    ):
+        with pytest.raises(
+            NotImplementedError, match=f"admits {tokens} rows of {heads} heads"
+        ):
+            loader.selected_module("sm_107a", route, tokens, heads)
+    two_rows = loader.MODULES[windows[(128, 64, 256)]]
+    assert (
+        two_rows["grid_rule"]["rows_per_cta"] == 64
+        and two_rows["build"]["tail"] == "clamp"
+    )
+    assert loader.launch_grid(two_rows, 65, device_index=0, values={"heads": 128}) == (
+        65,
+        2,
+        1,
+    )
+    for key in ((128, 8, 64), (128, 64, 256), (32, 64, 256)):
+        assert loader.MODULES[windows[key]]["arches"] == ["sm_107a"], key
+
+
 # Op A's parked whole-row program (beta's plane parked in shared memory) owns the mid band of every route: above
 # these row counts and up to 2048 (384-2048 rows on sm_100a, 256-2048 on sm_103a); the prologue whole-row program
 # owns the rows on both sides of it.
@@ -506,7 +738,7 @@ OP_A_PARKED_ABOVE = {"sm_100a": 383, "sm_103a": 255}
 
 
 def test_gated_residual_rmsnorm_routes_window_the_row_count():
-    """Op A's eight routes (two architectures x four variants) hold five programs each over the windows 1-16 /
+    """Op A's Blackwell routes (two architectures x four variants) hold five programs each over the windows 1-16 /
     17-64 / 65-128 / 129-above / above+1-2048 / 2049-: the 65-128 window is the whole-row (one CTA per row, 512
     threads) program, the prologue whole-row program owns 129-above and 2049- (two windows of one record), the
     parked whole-row program owns above+1-2048 (above = 383 on sm_100a, 255 on sm_103a), and the programs of a
@@ -569,10 +801,69 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
                 ] is variant.endswith("_pdl")
 
 
+def test_gated_residual_rmsnorm_routes_on_sm_107a():
+    """On sm_107a op A's four routes hold five programs each: the two composites alternate over 1 / 2-16 / 17-32 /
+    33-64 rows in mode 0 (mode 1 keeps the whole-row program from 33), the whole-row program owns 65-128 (33-128 in
+    mode 1), the whole-row persistent program (one 1024-thread CTA per SM) owns 257-8192 and the parked program the
+    rows beyond; mode 1 also parks 129-256, which mode 0 leaves to the FlashInfer kernel (a declared gap)."""
+    for variant in SHIPPED_VARIANTS[OP_A]:
+        mode = int(variant[4])
+        route = loader.route_key(OP_A, variant)
+        names = loader.route_modules("sm_107a", route)
+        assert len(names) == 5, route
+        windows = {
+            tuple(
+                tuple(w)
+                for w in loader.MODULES[name]["select_rule"]["windows"]["sm_107a"]
+            ): name
+            for name in names
+        }
+        assert set(windows) == OP_A_WINDOWS_SM107A[mode], route
+
+        def owner(rows):
+            (name,) = [
+                name
+                for ws, name in windows.items()
+                for above, at_most in ws
+                if above < rows <= (at_most or rows)
+            ]
+            return name
+
+        samples = [1, 2, 16, 17, 32, 33, 64, 65, 128, 257, 8192, 8193, 10**6] + (
+            [129, 256] if mode else []
+        )
+        for rows in samples:
+            assert loader.selected_module("sm_107a", route, rows) == owner(rows), (
+                route,
+                rows,
+            )
+        if not mode:
+            for rows in (129, 200, 256):
+                with pytest.raises(NotImplementedError, match=f"admits {rows} rows"):
+                    loader.selected_module("sm_107a", route, rows)
+        persistent = loader.MODULES[owner(1024)]
+        build = persistent["build"]
+        assert (
+            build["persistent"] is True
+            and build["threads"] == 1024
+            and build["split"] == 1
+        )
+        assert persistent["grid_rule"]["kind"] == "persistent_rows"
+        assert persistent["grid_rule"]["cluster"] == 1
+        assert tuple(persistent["launch"]["block"]) == (1024, 1, 1)
+        assert persistent["arches"] == ["sm_107a"]
+        parked = loader.MODULES[owner(10**6)]["build"]
+        assert parked["planes_smem"] == "beta" and parked["planes_path"] == "sts"
+        for name in names:
+            build = loader.MODULES[name]["build"]
+            assert build["mode"] == mode and build["pdl"] is variant.endswith("_pdl")
+
+
 def test_gated_residual_rmsnorm_helpers_and_support(monkeypatch):
     """The variant of a gated residual RMSNorm call is its mode (``weight`` applied before the norm or absent) and
     its launch form; on the Blackwell architectures every variant's route is exported and its windows partition
-    the positive row counts, so the predicate holds for every row count and fails for none but zero."""
+    the positive row counts, so the predicate holds for every row count and fails for none but zero; on sm_107a
+    mode 0 leaves 129-256 rows to the FlashInfer kernel."""
     assert pkg.GATED_RESIDUAL_RMSNORM == OP_A
     assert pkg.gated_residual_rmsnorm_variant(False, False) == "mode0"
     assert pkg.gated_residual_rmsnorm_variant(False, True) == "mode0_pdl"
@@ -619,10 +910,26 @@ def test_gated_residual_rmsnorm_helpers_and_support(monkeypatch):
                     device, rows=0, **form
                 )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
-    assert not pkg.is_cake_gated_residual_rmsnorm_supported(device)
-    assert not pkg.is_cake_gated_residual_rmsnorm_supported(
-        device, weight_before_norm=True, enable_pdl=True
-    )
+    for weight_before_norm in (False, True):
+        for enable_pdl in (False, True):
+            form = dict(weight_before_norm=weight_before_norm, enable_pdl=enable_pdl)
+            assert pkg.is_cake_gated_residual_rmsnorm_supported(device, **form)
+            for rows in (1, 16, 17, 32, 33, 64, 65, 128, 257, 8192, 8193, 10**6):
+                assert pkg.is_cake_gated_residual_rmsnorm_supported(
+                    device, rows=rows, **form
+                ), (form, rows)
+            for rows in (129, 200, 256):
+                assert (
+                    bool(
+                        pkg.is_cake_gated_residual_rmsnorm_supported(
+                            device, rows=rows, **form
+                        )
+                    )
+                    is weight_before_norm
+                ), (form, rows)
+            assert not pkg.is_cake_gated_residual_rmsnorm_supported(
+                device, rows=0, **form
+            )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
     assert not pkg.is_cake_gated_residual_rmsnorm_supported(device)
     assert not pkg.is_cake_gated_residual_rmsnorm_supported(torch.device("cpu"))
@@ -665,7 +972,8 @@ def test_gated_residual_rmsnorm_support_follows_the_row_count_through_gaps(monke
 def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
     """The sigmoid gate has one route; its windows name the head counts 128, 32 and 16 and partition the positive
     token counts of each on the Blackwell architectures, so the predicate holds for those head counts at every
-    token count and fails for every other head count (a 2-D ``(rows, 64)`` call is one head)."""
+    token count and fails for every other head count (a 2-D ``(rows, 64)`` call is one head); on sm_107a the
+    declared gaps of 128 and 32 heads are unsupported token counts."""
     assert pkg.RMSNORM_SIGMOID_GATE == OP_C
     assert pkg.HEAD_DIM == 64 and pkg.ROW_ALIGNMENT_BYTES == 16
     assert pkg.rmsnorm_sigmoid_gate_route() == f"{OP_C}_bf16"
@@ -692,8 +1000,44 @@ def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
                 device, heads=heads, tokens=64
             )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
-    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
-    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=32, tokens=1)
+    assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
+    for heads in routed_heads:
+        assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=heads)
+        assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+            device, heads=heads, tokens=0
+        )
+    for heads, tokens, supported in (
+        (128, 1, False),
+        (128, 2, True),
+        (128, 3, False),
+        (128, 8, False),
+        (128, 9, True),
+        (128, 64, True),
+        (128, 256, True),
+        (128, 1024, True),
+        (128, 16384, True),
+        (32, 1, True),
+        (32, 9, True),
+        (32, 10, False),
+        (32, 64, False),
+        (32, 65, True),
+        (32, 256, True),
+        (32, 257, False),
+        (32, 1024, False),
+        (32, 1025, True),
+        (16, 1, True),
+        (16, 1024, True),
+        (16, 1025, True),
+        (64, 64, False),
+    ):
+        assert (
+            bool(
+                pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+                    device, heads=heads, tokens=tokens
+                )
+            )
+            is supported
+        ), (heads, tokens)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
     assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
     assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(torch.device("cpu"))
