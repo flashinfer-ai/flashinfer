@@ -870,6 +870,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFro
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  // Per-row parameters are keyed by the probability row they describe, like the top-p and
+  // joint kernels.  Indexing by bx would read past a length-`unique_batch_size` tensor whenever
+  // `indices` reuses rows, i.e. whenever batch_size > unique_batch_size.
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
 
   extern __shared__ __align__(
@@ -1129,6 +1132,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  // Per-row parameters are keyed by the probability row they describe, like the top-p and
+  // joint kernels.  Indexing by bx would read past a length-`unique_batch_size` tensor whenever
+  // `indices` reuses rows, i.e. whenever batch_size > unique_batch_size.
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[row_idx];
 
   extern __shared__ __align__(
