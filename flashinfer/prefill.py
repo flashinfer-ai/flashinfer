@@ -2573,7 +2573,8 @@ def _plan_indptr_host(indptr, indptr_cpu, name):
         or indptr_cpu.dtype != indptr.dtype
     ):
         raise ValueError(f"{name} must have the same integer dtype as its indptr")
-    return indptr_cpu
+    # Normalized: the planner reads this as a raw pointer (#5260).
+    return indptr_cpu.contiguous()
 
 
 def _cutlass_plan_work_items(qo_indptr_host: torch.Tensor, num_qo_heads: int) -> int:
@@ -3284,6 +3285,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
+        # Normalized like plan(): the native size query reads raw pointers (#5260).
+        qo_indptr = qo_indptr.contiguous()
+        paged_kv_indptr = paged_kv_indptr.contiguous()
+        paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+        # paged_kv_indices is only length-checked here, so it is left as given.
+
         batch_size = len(qo_indptr) - 1
         qo_indptr_host = qo_indptr.to("cpu")
         total_num_rows = int(qo_indptr_host[-1])
@@ -3653,6 +3662,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"module: the module was built with use_token_head_sf="
                 f"{self._jit_use_token_head_sf}, plan() passed use_token_head_sf={use_token_head_sf}"
             )
+
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        qo_indptr = qo_indptr.contiguous()
+        paged_kv_indptr = paged_kv_indptr.contiguous()
+        paged_kv_indices = paged_kv_indices.contiguous()
+        paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -5622,6 +5639,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 f"module: the module was built with use_token_head_sf="
                 f"{self._jit_use_token_head_sf}, plan() passed use_token_head_sf={use_token_head_sf}"
             )
+
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        qo_indptr = qo_indptr.contiguous()
+        kv_indptr = kv_indptr.contiguous()
+        if o_indptr is not None:
+            o_indptr = o_indptr.contiguous()
+        if v_indptr is not None:
+            v_indptr = v_indptr.contiguous()
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
