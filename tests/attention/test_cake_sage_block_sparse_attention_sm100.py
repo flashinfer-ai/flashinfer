@@ -23,6 +23,7 @@ flashinfer public routes are covered by
 ``test_cake_sage_block_sparse_attention_sm100_api.py``.
 """
 
+import functools
 import math
 import re
 from pathlib import Path
@@ -314,10 +315,32 @@ def test_cake_sage_sm100_v_scale_without_batch_axis():
     assert torch.equal(out_b, out_hd)
 
 
+@functools.cache
+def _profiler_records_cuda():
+    """CUPTI can fail to initialize even when CUDA execution works."""
+    value = torch.ones(1, device="cuda")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        value.cpu()
+    return any(
+        event.device_type == torch.autograd.DeviceType.CUDA
+        for event in profile.events()
+    )
+
+
 def _cuda_kernel_names(fn) -> list[str]:
     """CUDA kernel names of one call of ``fn`` (memcpy / memset activities excluded).  The profiler's
     warm-up step runs one call whose records are discarded: CUDA activity collection starts
     asynchronously once the profiler is entered."""
+    if not _profiler_records_cuda():
+        pytest.skip(
+            "CUDA profiler records no device activities; CUPTI may be unavailable"
+        )
+
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
@@ -339,8 +362,8 @@ def _cuda_kernel_names(fn) -> list[str]:
 def test_cake_sage_sm100_launches_one_kernel_per_call():
     """The attention call is one kernel: the TMA descriptors travel by value in the
     kernel parameters, so no upload kernel precedes the attention kernel.  The
-    quantizer is its two kernels behind the zero-fill of its V amax scratch
-    (``torch.zeros``, a torch fill kernel)."""
+    quantizer is its two kernels behind the zero-initialization of its V amax scratch;
+    ``torch.zeros`` may appear as a fill kernel or as a filtered memset activity."""
     device = torch.device("cuda")
     c = _make_case(
         ("one_launch_b2_h4", 2, 4, 2, 257, 1000, 6, True, True, 2, 40, True, 1.0),
@@ -366,7 +389,11 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
         loader.MODULES["quantize_qk_vamax"]["kernel_symbol"],
         loader.MODULES["quantize_v"]["kernel_symbol"],
     ], names
-    assert len(names) == len(kernels) + 1 and "Fill" in names[0], names
+    assert names == kernels or (
+        len(names) == len(kernels) + 1
+        and "Fill" in names[0]
+        and names[1:] == kernels
+    ), names
 
 
 @requires_sm100
