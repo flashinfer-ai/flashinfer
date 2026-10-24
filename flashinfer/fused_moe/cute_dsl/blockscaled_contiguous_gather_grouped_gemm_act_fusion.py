@@ -789,6 +789,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             a_major="k",
             b_major="k",
             c_major="n",
+            gated=gated,
         )
     if not can_impl:
         raise ValueError(
