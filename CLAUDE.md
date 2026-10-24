@@ -32,6 +32,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
 | Set SM100-family MXFP8 CuTe-DSL compile workers (default 4; 0/1 means on-demand) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS=4` |
+| Set MXFP8 precompile timeout per worker chunk (seconds; default 600; 0 disables) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT=600` |
 | Limit MXFP8 CuTe-DSL autotune candidates (experimental; default 0 keeps full search) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=32` |
 | Limit parallel ninja jobs | `export MAX_JOBS=4` |
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |

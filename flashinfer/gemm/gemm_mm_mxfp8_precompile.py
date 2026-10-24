@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import math
 import os
 import pickle
 import subprocess
@@ -95,6 +96,15 @@ def _mm_mxfp8_precompile_main():
             )
 
 
+def _get_mm_mxfp8_compile_timeout():
+    timeout = float(
+        os.environ.get("FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT", "600")
+    )
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("MXFP8 compile timeout must be finite and nonnegative")
+    return timeout or None
+
+
 def _run_mm_mxfp8_precompile_chunk(payloads):
     # A spawn Pool reexecutes the application's __main__ while the parent holds
     # the cache lock. An unguarded calling script then deadlocks on that lock.
@@ -109,6 +119,7 @@ def _run_mm_mxfp8_precompile_chunk(payloads):
         [sys.executable, "-c", entry],
         input=pickle.dumps(sys.path) + pickle.dumps(payloads),
         check=True,
+        timeout=_get_mm_mxfp8_compile_timeout(),
     )
 
 

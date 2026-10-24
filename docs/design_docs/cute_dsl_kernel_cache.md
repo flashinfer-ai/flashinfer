@@ -243,6 +243,10 @@ precompile pools across TP ranks sharing that cache. Each waiting rank rechecks
 the artifacts after acquiring the lock. Separate caches do not coordinate.
 Worker failures fall back to the normal compile path; disabling JIT or the
 CuTe-DSL disk cache also disables precompilation.
+`FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT` bounds each worker's entire chunk
+(not each kernel) to 600 seconds by default. A timeout kills that worker; once
+the workers finish or time out, the cache lock is released and missing artifacts
+are compiled on demand. Set it to 0 to disable the timeout.
 
 `FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=0` preserves the full search and its
 order. Positive values opt into the FP4 analytical ranking for persistent

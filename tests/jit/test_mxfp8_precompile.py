@@ -233,6 +233,53 @@ def test_worker_budget_respects_cpu_and_cgroup(monkeypatch):
     assert precompile._get_mm_mxfp8_compile_workers() == 0
 
 
+@pytest.mark.parametrize("value,expected", [(None, 600), ("0", None), ("1.5", 1.5)])
+def test_worker_chunk_timeout_configuration(monkeypatch, value, expected):
+    name = "FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert precompile._get_mm_mxfp8_compile_timeout() == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+def test_worker_chunk_timeout_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT", value)
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        precompile._get_mm_mxfp8_compile_timeout()
+
+
+def test_timed_out_workers_exit_and_release_cache_lock(cpu_cache, monkeypatch):
+    children, locks = [], []
+    run, popen, lock_type = subprocess.run, subprocess.Popen, precompile.FileLock
+
+    def record_process(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def stalled_worker(command, **kwargs):
+        # Keep the real process/timeout lifecycle, replacing only compiler work.
+        return run([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+
+    def record_lock(path, **kwargs):
+        locks.append(path)
+        return lock_type(path, **kwargs)
+
+    monkeypatch.setenv("FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT", "0.2")
+    monkeypatch.setattr(precompile.subprocess, "Popen", record_process)
+    monkeypatch.setattr(precompile.subprocess, "run", stalled_worker)
+    monkeypatch.setattr(precompile, "FileLock", record_lock)
+    with pytest.raises(subprocess.TimeoutExpired):
+        prepare([PERSISTENT, SPLITK])
+    assert len(children) == 2
+    assert all(child.poll() is not None for child in children)
+    assert len(locks) == 1
+    with lock_type(locks[0], timeout=0):
+        pass
+
+
 @pytest.mark.parametrize("sm_minor,low_m_only", [(0, False), (3, False), (7, True)])
 def test_runner_precompiles_only_tactics_selected_by_tuner(
     monkeypatch, sm_minor, low_m_only
