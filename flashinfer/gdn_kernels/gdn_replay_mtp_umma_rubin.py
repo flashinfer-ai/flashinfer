@@ -17,12 +17,13 @@ Differences from the base kernel:
   (stochastic rounding everywhere, round to nearest on sm_107a at most T, with packed
   fp16 x fp32 FMAs);
 * a persistent kernel (``kernel_persist``, sm_107a; chosen automatically at T = 2-8 when
-  ``num_sms`` names a die-restricted stream, or forced with ``persistent``), with
+  ``num_sms`` is below the device's SM count, e.g. one die's green context, or forced with
+  ``persistent``), with
   ``num_sms`` / ``grid_override`` / ``persistent_counter`` / ``flush_hint``;
 * on sm_107a the automatic heads per CTA of non-persistent launches also depend on T,
-  ``flush_hint``, the rounding mode and whether the launch is die-restricted
-  (``auto_heads_per_cta``: all value heads of a key head per CTA from 1.5-3.6 waves of CTA
-  slots with flush rows and from 0.8 without, not 8);
+  ``flush_hint``, the rounding mode and whether the launch covers the whole device
+  (``auto_heads_per_cta``: all value heads of a key head per CTA from 1.5-4.5 waves of CTA
+  slots with flush rows and from 0.8-1 without, not 8);
 * the fp32 copies of bf16 ``A_log`` / ``dt_bias`` are safe across streams and re-made after an
   in-place update.
 
@@ -162,15 +163,19 @@ _PZ_CC = ((10, 7),)
 # Automatic choice (persistent=None, the default): the persistent kernel where it measured faster
 # -- T in _PZ_AUTO_T, all 4 value heads per CTA, a die-localized launch (``num_sms`` below the
 # device's SMs) and at least _PZ_AUTO_MIN_ITEMS[hint] (key head, row) items per CTA slot
-# (H x B / (4 x num_sms)). Rubin, 106 SMs per die, persistent vs non-persistent: no flush rows
-# T = 2-8 1.03-1.18x; 30 % flush rows 1.00-1.09x from 9.7 items per slot, 0.89-0.99x below 5;
-# T = 1 0.94-1.03x (its prologue reorder already starts the state stream early): not automatic;
-# one whole-GPU launch over die-interleaved memory: 0.88-0.98x.
+# (H x B / (4 x num_sms)). Rubin, 106 SMs per die, persistent vs non-persistent (with the
+# 8-wave heads-per-CTA rule): no flush rows T = 2-8 1.03-1.18x; 30 % flush rows 1.00-1.09x from
+# 9.7 items per slot, 0.89-0.99x below 5; T = 1 0.94-1.03x (its prologue reorder already
+# starts the state stream early): not automatic; one whole-GPU launch over die-interleaved
+# memory: 0.88-0.98x.
 _PZ_AUTO_T = (2, 3, 4, 5, 6, 7, 8)
-# flush_hint "none": from half an item per CTA slot (uGPU, H = 16: B >= 27; below that the
-# non-persistent kernel measured up to 1.5x faster per die); flush rows possible (None /
-# "some" / "flush_first"): >= 8 items
-_PZ_AUTO_MIN_ITEMS = {"none": 0.5, "some": 8}
+# flush_hint "none": from one item per CTA slot (uGPU, H = 16: B >= 53 per die). The no-flush gains
+# above were against hpc = 2; against the non-persistent kernel at the hpc = 4 that
+# auto_heads_per_cta picks from 0.8 waves, the persistent one measured 3-10 % slower at B = 28-48
+# per die (T = 2 / 4 / 8, round to nearest, LCG, Philox-5 / 10, warm and serving-like L2; LCG T = 8
+# serving-like a tie), and below half an item the non-persistent kernel was up to 1.5x faster. Flush
+# rows possible (None / "some" / "flush_first"): >= 8 items
+_PZ_AUTO_MIN_ITEMS = {"none": 1.0, "some": 8}
 
 
 def _use_regsplit(T: int, hpc: int, sr: str) -> bool:
@@ -4373,24 +4378,39 @@ _CVT_RS_CC = (
 _CTA_SLOTS_PER_SM = _MIN_BLOCKS_PER_SM
 # Heads per CTA (auto_heads_per_cta): 1 while the hpc = 1 grid fits cap1 waves of CTA slots, 2
 # while the hpc = 2 grid fits cap2 waves, else all of a key head's value heads. On the archs of
-# _HPC_TUNED_CC the caps depend on T, flush_hint, the rounding mode and whether the launch is
-# die-restricted (measured on Rubin, see auto_heads_per_cta); elsewhere cap1 = 1 and cap2 =
+# _HPC_TUNED_CC the caps depend on T, flush_hint, the rounding mode and whether the launch covers
+# the whole device (fitted on Rubin, see auto_heads_per_cta); elsewhere cap1 = 1 and cap2 =
 # _HPC2_MAX_WAVES.
 _HPC_TUNED_CC = ((10, 7),)
 _HPC1_MAX_WAVES = 1.0
 _HPC2_MAX_WAVES = 8  # without T
 _HPC2_MAX_WAVES_MTP = 1.5  # T >= 2, round to nearest
-_HPC2_MAX_WAVES_MTP_SR = 1.75  # T >= 2, LCG or Philox with few rounds
-_HPC2_MAX_WAVES_T1_FF = 2.4  # T = 1, "flush_first" on a die-restricted launch
+# T >= 2 with LCG or Philox of at most _HPC_PHILOX_FAST_ROUNDS rounds, and with slower Philox at
+# T >= 5 when "flush_first" moves the caps or the launch covers the whole device
+_HPC2_MAX_WAVES_MTP_SR = 1.75
+_HPC2_MAX_WAVES_T1_FF = 2.4  # T = 1, "flush_first" on a partial-device launch
 _HPC2_MAX_WAVES_T1 = 2.7  # T = 1 otherwise
-# Philox with more than _HPC_PHILOX_FAST_ROUNDS rounds (the API default is 10) at T <= 4: its
-# 4-heads-per-CTA build runs longer per CTA, so hpc = 2 holds longer. (T = 1, T = 2-4) with flush
-# rows first on a die-restricted launch; _HPC2_MAX_WAVES_PHILOX otherwise (rows in any order, or
-# a whole-device launch: hpc = 4 measured slower to B = 80-112 per die there).
-_HPC_PHILOX_FAST_ROUNDS = 5
+# Philox with more than _HPC_PHILOX_FAST_ROUNDS rounds: its builds run longer per CTA, so hpc = 2
+# holds longer. Timed at 5, 6, 8 and 10 rounds (10 is the API default): 6 measured like 5 and 8
+# like 10; 7 and 9 were not timed and take these caps.
+#   _HPC2_MAX_WAVES_PHILOX_FF (T = 1, T = 2-4): "flush_first" on a partial-device launch (hpc = 4
+#     from B = 73 / 67 per die; T >= 5 keeps _HPC2_MAX_WAVES_MTP_SR, 47);
+#   _HPC2_MAX_WAVES_PHILOX_PART (T <= 4, T >= 5): a partial-device launch without "flush_first",
+#     e.g. the uGPU launches of gated_delta_rule_mtp_ucache_flush (no hint, rows in random order):
+#     hpc = 4 from B = 120 / 56 per die, where it first wins with serving-like L2 (120-128 /
+#     52-56); the earlier 3.6 / 1.75 waves (from 96 / 47) cost 1.2-9.3 % at B = 96-112 / 47-52;
+#   _HPC2_MAX_WAVES_PHILOX: a whole-device launch at T <= 4 (hpc = 4 from B = 96 per 16 key
+#     heads; T >= 5 takes _HPC2_MAX_WAVES_MTP_SR).
+_HPC_PHILOX_FAST_ROUNDS = 6
 _HPC2_MAX_WAVES_PHILOX_FF = (2.75, 2.5)
+_HPC2_MAX_WAVES_PHILOX_PART = (4.5, 2.1)
 _HPC2_MAX_WAVES_PHILOX = 3.6
-_HPC_NO_FLUSH_WAVES = (0.65, 0.8)  # flush_hint "none", any T: (cap1, cap2)
+# flush_hint "none" (no flush rows): (cap1, cap2) at any T, except cap2 = _HPC2_NO_FLUSH_ONE_WAVE
+# (hpc = 2 while its grid fits one wave) at T = 1 on any launch and at T = 2-4 on a whole-device
+# launch, where hpc = 4 at 0.8-1 waves (B = 22-26 per die) is 3-12 % slower with serving-like L2
+# (and 5-14 % faster with warm L2)
+_HPC_NO_FLUSH_WAVES = (0.65, 0.8)
+_HPC2_NO_FLUSH_ONE_WAVE = 1.0
 
 
 def auto_heads_per_cta(
@@ -4421,49 +4441,145 @@ def auto_heads_per_cta(
     L2, but the Rubin caps below cost 1.7-4.2 % there with cold L2 at T = 4, B = 40-56 (one
     launch) and 3.2-5.2 % per die at B = 28-40 (uGPU), so sm_100a keeps this rule.
 
-    With ``T`` (sm_107a): cap1 = 1, and cap2 =
+    With ``T`` (sm_107a), ``whole_device`` is True for a launch over all of the device's SMs and
+    False for a partial-device launch (``num_sms`` below the device's SM count). The only
+    partial launches measured are uGPU per-die launches (8 of 16 key heads on one 106-SM Rubin
+    die); other partial launches, e.g. a 132-SM green context, get the same caps untimed. Eager
+    uGPU calls with B x HV below ``_UGPU_EAGER_MIN_STATES`` (8192) run each die's key heads over
+    the whole device, back to back: they are whole-device launches of 8 key heads on 212 SMs, so
+    their batch boundaries are twice the per-die ones below and "flush_first" counts as None
+    (e.g. round to nearest at T >= 2: hpc = 4 from B = 80, not 40). cap1 = 1, and cap2 =
 
-    * 1.5 at T >= 2; 1.75 with stochastic rounding ``sr`` (LCG, or Philox with at most 5
-      ``sr_rounds``);
-    * 2.4 at T = 1 with ``flush_hint`` "flush_first" on a die-restricted launch, else 2.7
-      (``whole_device``: a launch over all of the device's SMs, where hpc = 4 overtakes later
-      with cold L2, so "flush_first" counts as None there);
-    * Philox with more than 5 ``sr_rounds`` at T <= 4: 2.75 (T = 1) / 2.5 (T = 2-4) with
-      "flush_first" on a die-restricted launch, else 3.6;
-    * ``flush_hint`` "none" (no flush rows), any T and rounding: cap1 = 0.65, cap2 = 0.8; with
-      an odd ``heads_per_key`` (no hpc = 2) cap1 = 1 at T >= 5.
+    * 1.5 at T >= 2 with round to nearest; 1.75 at T >= 2 with stochastic rounding ``sr``: LCG,
+      Philox with at most 6 ``sr_rounds``, and Philox with more rounds at T >= 5 on a
+      whole-device launch or with "flush_first" on a partial-device launch;
+    * 2.4 at T = 1 with ``flush_hint`` "flush_first" on a partial-device launch, else 2.7
+      (a whole-device launch treats "flush_first" as None: hpc = 4 overtakes later there with
+      cold L2);
+    * Philox with more than 6 ``sr_rounds`` (the API default is 10), except at T >= 5 as above:
+      with "flush_first" on a partial-device launch 2.75 (T = 1) / 2.5 (T = 2-4); on a
+      partial-device launch without it 4.5 (T <= 4) / 2.1 (T >= 5); on a whole-device launch
+      3.6 (T <= 4);
+    * ``flush_hint`` "none" (no flush rows), any rounding: cap1 = 0.65 (1 at T >= 5 with an odd
+      ``heads_per_key``, which has no hpc = 2); cap2 = 1 at T = 1 and on a whole-device launch at
+      T = 2-4, else 0.8.
 
-    Per Rubin die (8 key heads on 106 SMs; a whole-device launch of 16 key heads on 212 SMs has
-    the same boundaries): 1 for B <= 13, then 2, and 4 from B = 40 at T >= 2 (47 with stochastic
-    rounding), from 64 at T = 1 with flush rows first and 72 otherwise; Philox with 10 rounds at
-    T <= 4: 4 from 73 (T = 1) / 67 (T = 2-4) with flush rows first, 96 otherwise; no flush rows:
-    1 for B <= 8, 2 for B <= 21, else 4 (the 8-wave cap: 2 up to B = 212).
+    Batch boundaries per Rubin die (8 key heads on 106 SMs, B = rows; a whole-device launch of 16
+    key heads on 212 SMs has the same waves and boundaries):
 
-    Measured on Rubin VR200 (CUPTI step time and the slower die's kernel time, hpc = 1 / 2 / 4
-    forced and interleaved; T = 1-8, uGPU and whole-device launches, warm, cold and serving-like L2,
-    flush rows first and in random order, flush rates 0-100 %, H = 16 / 8 / 4, HV / H = 2 / 3 / 4;
-    out of sample on 3 nodes with new row placements): hpc = 4 overtakes hpc = 2 at B = 26-44 per
-    die at T >= 2 and 29-66 at T = 1 (latest with cold L2); the waves of CTA slots, not the rows,
-    set the crossover at every H. uGPU, flush rows first, warm L2, against the 8-wave cap, out of
-    sample: 1.10-1.13x (geomean) over the cells the caps change; B = 128: T = 1 28.29 -> 25.47 us, T
-    = 4 36.03 -> 31.84 us, T = 8 46.30 -> 41.31 us. Known costs with hpc = 4: a step on which every
-    row flushes (e.g. requests that all started together at T = 1) runs 5-7 % slower at B = 64-80
-    per die (where the hpc = 2 grid takes an odd number of waves, the twice-as-long hpc = 4 CTAs
-    leave a tail); with the whole L2 cold, whole-device launches at T = 2-4 and B = 40-63, and
-    launches without flush rows at T = 1-4 and B = 22-64, lose 2-5 % (whole-device T = 4 at B =
-    40-48 with a serving-like L2: within 1 %)."""
+    * T >= 2: hpc = 1 for B <= 13, 2 up to 39 (round to nearest) / 46 (stochastic rounding),
+      else 4; T = 1: 2 up to 63 with "flush_first" on a die, else up to 71;
+    * Philox above 6 rounds: with "flush_first" on a die hpc = 4 from 73 (T = 1) / 67 (T = 2-4) /
+      47 (T >= 5); on a die without it from 120 (T <= 4) / 56 (T >= 5); whole-device from 96
+      (T <= 4) / 47 (T >= 5);
+    * no flush rows: hpc = 1 for B <= 8, 2 up to 26 at T = 1 and on whole-device launches at
+      T = 2-4, up to 21 otherwise, else 4; an odd heads per key (e.g. 3): hpc = 1 for B <= 11 at
+      T <= 4 and 17 at T >= 5, else all of them;
+    * the 8-wave cap (no ``T``): 2 up to B = 212.
+
+    Measured on Rubin VR200 nodes of two kinds, the second about 7 % slower (arms compared within a
+    node): the first for the caps and the Philox-cap confirmation, the second for the serving-path
+    and branch follow-ups. CUPTI step time and the slower die's kernel time, hpc = 1 / 2 / 3 / 4
+    forced and interleaved, 3 reps; T = 1-8, uGPU and whole-device launches, flush rows first and in
+    random order, flush rates 0-100 %, H = 16 / 8 / 4, HV / H = 2 / 3 / 4; three L2 modes: warm,
+    cold (zeroed before every step) and serving-like (one CUDA graph of 36 calls on 36 rotated state
+    pools with q / k / v hot, the closest to serving). Where serving-like and warm L2 disagree the
+    caps follow serving-like L2. The waves of CTA slots, not the rows, set the crossover at every H.
+    Where hpc = 4 first beats hpc = 2 (B per die, or per 16 key heads of a whole-device launch):
+
+    * uGPU, flush rows first: T = 1 48-60 (Philox-10 71-80). T >= 2, round to nearest 32-40 warm
+      and serving-like (32 was the lowest timed B), 64 cold at T = 2; cold LCG T = 2 64, cold
+      Philox-5 T = 2 47 and T = 3-4 42; Philox-10 T = 2-4 63-67 warm, 64-72 cold, serving-like
+      timed only at T = 4 (B = 64 / 96);
+    * uGPU, rows in random order (``gated_delta_rule_mtp_ucache_flush``: no hint, no row order).
+      Serving-like L2: round to nearest T = 1 60, T = 2-4 40, T = 6 / 8 32; LCG / Philox-5
+      T = 1 between 72 and 96 depending on the row placement (+-4-7 % per cell), T = 2-4 47-56
+      with hpc = 2 ahead again at 60-64 (hpc = 4 has 1.13-1.21 waves there) and hpc = 4 from
+      68-72, T = 6 / 8 by 47; Philox-10 T <= 4 120-128, T >= 5 52-56. Cold L2: round to
+      nearest T = 1 96, T = 2-4 36, T >= 5 32; LCG / Philox-5 T = 1 not by 112, T = 2-3 72,
+      T = 4 64, T >= 5 32 (LCG T = 5: 96); Philox-10 T <= 4 not by 112, T >= 5 52-56;
+    * whole-device, rows flush-first but no hint: warm T = 1 64-71 (Philox-10 96), T = 4 36-64
+      (Philox-10 80), T = 8 32-42; cold T = 1 96-112, T = 4 64-80, T = 8 32-40; serving-like
+      (round to nearest) T = 1 72, T = 4 56, T = 8 32. Philox-10 with the "flush_first" hint
+      (which a whole-device launch ignores), warm and serving-like: T = 2 72 (warm 67), T = 3 80;
+    * no flush rows: warm L2, hpc = 4 already ahead at B = 20-26 at T = 1-4; serving-like L2,
+      hpc = 2 ahead while its grid fits one wave (B <= 26) at T = 1 (by 9-12 % on a die, 3-10 %
+      whole-device) and on whole-device launches at T = 2-4 (2-9 %), tied on a die at T = 2-4,
+      hpc = 4 ahead or tied at T = 8 (whole-device also T = 7); every T crosses to hpc = 4 at
+      B = 27-28 in serving-like L2 (the hpc = 2 grid takes a second wave); whole-device cold 80
+      (T = 2 / 4) / 21 (T = 8). HV / H = 3: hpc = 3 is 4-11 % faster than hpc = 1 from B = 12
+      at T = 1-4 (uGPU warm); at T = 5-8 hpc = 1 is best or tied through B = 16 and hpc = 3
+      wins from 18 (uGPU warm and serving-like, whole-device warm).
+
+    Against the 8-wave cap (uGPU, flush rows first, warm L2, interleaved, 3 nodes with new row
+    placements): 1.10-1.14x (geomean) over the cells the caps change; B = 128: T = 1 28.29 -> 25.47
+    us, T = 4 36.03 -> 31.84 us, T = 8 46.30 -> 41.31 us. Serving-like L2 with flush rows first:
+    1.07-1.08x (Philox-10 1.12x). The uGPU path of ``gated_delta_rule_mtp_ucache_flush`` with
+    serving-like L2 (2 nodes of the second kind): round to nearest 1.04-1.19x per T over the changed
+    cells, LCG / Philox-5 1.01-1.03x at T = 1-4 and 1.07-1.14x at T = 6 / 8, Philox-10 at T >= 5 (B
+    >= 56) faster by 6-13 %; Philox-10 at T <= 4 keeps hpc = 2 to B = 119.
+
+    Known costs: cells slower than the 8-wave cap beyond the noise floor of same-config control
+    pairs (warm and cold 0.6-1.8 %, serving-like 0.4-1.0 %):
+
+    * a step on which every row flushes (e.g. requests that all started together at T = 1):
+      B = 56-112 per die, up to 7.3 % (warm T = 1 B = 76); cold T = 2 / 4 B = 56 6.3-6.4 %,
+      B = 60 5.0-5.5 %; T = 1 B = 108-112 3.2-4.0 % (warm and cold). The hpc = 2 grid takes an
+      odd number of waves there and the twice-as-long hpc = 4 CTAs leave a tail. With 75 % flush
+      rows: T = 7 B = 76 1.5-2.1 %, cold T = 4 B = 72-76 3.1-3.4 %, cold T = 2 B = 72 2.5 %;
+    * uGPU, rows in random order, serving-like L2: LCG / Philox-5 / Philox-6 T = 2-4 B = 60-68
+      up to 6.6 % (wave quantization: every cap that removes it costs 3-11 % warm at B = 47-56 and
+      gives up the serving-like gain at B = 52-56); LCG / Philox-5 T = 1 B = 88 1.3-3.5 % (at
+      B = 72-92 single cells swing +-4-7 % with the row placement); Philox-5 T = 2 B = 47
+      1.8-2.3 %;
+    * uGPU, flush rows first: serving-like Philox-5 / Philox-6 T = 2 / 4 B = 47-52 2-4.8 %;
+      warm T = 7 B = 40-41 1.4-1.5 % on two nodes (0.99x on a third: noise-level);
+    * uGPU, rows in random order, cold L2: T = 1 B = 76-112 up to 5.7 % (B = 80: round to nearest
+      4.4 %, LCG 5.7 %, Philox-5 5.5 %; serving-like round to nearest 1.5 % at B = 80); LCG /
+      Philox-5 T = 2-4 B = 56-64 up to 3.5 %; LCG T = 5 B = 80 2.4 %;
+    * whole-device, cold L2: T = 1 B = 72-80 up to 2.9 % (LCG with the "flush_first" hint, which
+      it ignores; Philox-5 2.7 %; warm a 1-4 % gain); T = 4 round to nearest B = 40-56 up to
+      3.2 % (B = 44; H = 4 at the same waves 2.8 %), LCG / Philox-5 B = 47-56 3-5.4 %. Warm:
+      Philox-5 T = 4 B = 48 1.4 %. Serving-like: round to nearest T = 4 B = 40 / 48 0.8 % (at
+      the floor);
+    * no flush rows: cold whole-device T = 2 B = 27-64 up to 4.6 % and H = 8 T = 4 B = 44 4.9 %;
+      cold uGPU T = 1 B = 27-72 up to 3.6 % and T = 2 B = 56 1.2 %; serving-like uGPU T = 2-4 B =
+      22-26 up to 2.5 % with stochastic rounding (warm 6-12 % faster); hpc = 2 over hpc = 1 (cap1)
+      on whole-device T = 8 B = 9-10, cold, 2.9 / 1.8 %, and on uGPU B = 9 with serving-like L2,
+      1-2.3 %; warm whole-device T = 5-8 B = 22-24 0.5-7.4 % (second kind; 2-3 % on the first),
+      where serving-like L2 has hpc = 4 1-5.8 % faster at T = 6-8 (and up to 4 % slower at T = 5 /
+      6, second kind); HV / H = 3 at B = 17 (hpc = 1), serving-like T = 5 2.3 %, T = 6 1.5 %.
+
+    Gains the caps leave (hpc = 4 faster than the pick beyond the floor): warm L2 without flush
+    rows, B = 22-26, T = 1 (12-14 % on a die, 6-11 % whole-device) and whole-device T = 2-4 (5-11
+    %), where serving-like L2 decides for hpc = 2; whole-device Philox-10 with the "flush_first"
+    hint, T = 2 B = 76-88 2.6-8.8 % and T = 3 B = 80-88 1-4.7 % (T = 4 and cold L2 untimed);
+    whole-device Philox-10 T = 4 warm B = 80-88 2-7 %; Philox-10 T = 2 with flush rows first B = 66
+    1.8 %; uGPU round to nearest T >= 5 in random order with serving-like L2, hpc = 4 5-15 % faster
+    at B = 32-36 (second kind, not confirmed).
+
+    Not timed: Philox with 7 or 9 rounds; the Philox caps of 4.5 / 2.1 waves with cold L2;
+    whole-device Philox-10 in random order at T >= 5 (B = 47-55); uGPU launches without flush
+    rows at T = 5-7 (even heads per key), B = 27, and cap2 = 1 with cold L2; Philox-10
+    "flush_first" at T = 2-4, B = 67-71 cold and B = 67-95 serving-like; partial launches other
+    than one Rubin die."""
     slots = _CTA_SLOTS_PER_SM * num_sms
     hpk = heads_per_key
-    # flush rows first moves the caps of die-restricted launches only
+    # flush rows first moves the caps of partial-device launches only
     ff = flush_hint == "flush_first" and not whole_device
+    slow_philox = sr == "philox" and sr_rounds > _HPC_PHILOX_FAST_ROUNDS
     cap1 = _HPC1_MAX_WAVES
     if T is None:
         cap2 = _HPC2_MAX_WAVES
     elif flush_hint == "none":
         cap1, cap2 = _HPC_NO_FLUSH_WAVES
+        if T == 1 or (whole_device and T <= 4):
+            cap2 = _HPC2_NO_FLUSH_ONE_WAVE
         if hpk % 2 and T >= 5:  # no hpc = 2 tier: hpc = 1 up to one wave
             cap1 = _HPC1_MAX_WAVES
-    elif sr == "philox" and sr_rounds > _HPC_PHILOX_FAST_ROUNDS and T <= 4:
+    elif slow_philox and not ff and not whole_device:
+        cap2 = _HPC2_MAX_WAVES_PHILOX_PART[0 if T <= 4 else 1]
+    elif slow_philox and T <= 4:
         cap2 = (
             _HPC2_MAX_WAVES_PHILOX_FF[0 if T == 1 else 1]
             if ff
@@ -4674,23 +4790,29 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     running launch its own). ``persistent_counter_reset`` re-zeroes the cached counters after
     an aborted launch. It measured faster only on die-localized launches (Rubin: each die's
     rows with their buffers in that die's memory, ``num_sms`` = the die's 106 SMs): T = 2-8
-    1.03-1.18x without flush rows, 1.00-1.09x with 30 % from B = 512 (slower below); T = 1
-    0.94-1.03x; one whole-GPU launch over die-interleaved memory 0.88-0.98x. Automatic (None):
-    the persistent kernel on sm_107a for T = 2-8 with all value heads per CTA when ``num_sms``
-    is given and below the device's SM count (a die-restricted stream, e.g. a green context),
-    ``grid_override`` is unset and there are at least 8 (key head, row) items per CTA slot
-    (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at H = 16), or half an item with
-    ``flush_hint`` "none" (H x B >= 2 x ``num_sms``); the non-persistent kernel otherwise.
+    1.03-1.18x without flush rows against 2 heads per CTA (3-10 % slower than 4 heads per CTA
+    at B = 28-48 per die), 1.00-1.09x with 30 % from B = 512 (slower below); T = 1 0.94-1.03x;
+    one whole-GPU launch over die-interleaved memory 0.88-0.98x. Automatic (None): the
+    persistent kernel on sm_107a for T = 2-8 with all value heads per CTA when ``num_sms`` is
+    given and below the device's SM count (a partial-device launch, e.g. one die's green
+    context), ``grid_override`` is unset and there are at least 8 (key head, row) items per CTA slot
+    (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at H = 16), or one item with
+    ``flush_hint`` "none" (H x B >= 4 x ``num_sms``: B >= 53 per die); the non-persistent
+    kernel otherwise.
 
     ``flush_hint`` (performance only, never changes results: both kernels are bit-identical on
     every row mix) tells the host which flush rows the launch has, since it cannot read
     ``hist_len`` (a device tensor) without a sync. "none" lowers the automatic choice's
-    minimum from 8 items per CTA slot to half an item. On sm_107a the hint also moves the heads
-    per CTA of non-persistent launches (``auto_heads_per_cta``): "none" gives all value heads per
-    CTA from 0.8 waves of CTA slots (B = 22 per die at H = 16), and "flush_first" on a
-    die-restricted launch from 2.4 waves at T = 1 (B = 64 per die, not 72) and, with Philox
-    above 5 rounds at T <= 4, from 2.5-2.75 waves (not 3.6). ``gated_delta_rule_mtp_ucache_flush``
-    passes no hint (None). With Philox rounding at T = 6-8 and
+    minimum from 8 items per CTA slot to one item. On sm_107a the hint also moves the heads per
+    CTA of non-persistent launches (``auto_heads_per_cta``): "none" gives all value heads per
+    CTA from 0.8 waves of CTA slots (B = 22 per die at H = 16), or from one wave (B = 27) at
+    T = 1 and on whole-device launches at T = 2-4; "flush_first" on a partial-device launch
+    (``num_sms`` below the device's SMs, e.g. a uGPU per-die launch) from 2.4 waves at T = 1
+    (B = 64 per die, not 72) and, with Philox above 6 rounds, from 2.75 / 2.5 / 1.75 waves at
+    T = 1 / 2-4 / >= 5 (B = 73 / 67 / 47 per die, not 120 / 120 / 56); a whole-device launch
+    treats "flush_first" as None there. ``gated_delta_rule_mtp_ucache_flush`` passes no hint
+    (None) and no row order.
+    With Philox rounding at T = 6-8 and
     few items per CTA slot a persistent launch (chosen or forced, without ``grid_override``) runs the non-persistent
     kernel instead (measured faster there); how few depends on the hint:
 

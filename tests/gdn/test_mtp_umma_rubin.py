@@ -98,61 +98,150 @@ def test_bit_identical_to_base_kernel(T, hpc):
 def test_auto_heads_per_cta_rubin_caps():
     """auto_heads_per_cta with T (the sm_107a caps): hpc = 1 while the hpc = 1 grid fits one wave
     of CTA slots, hpc = 2 while the hpc = 2 grid fits 1.5 waves at T >= 2 (1.75 with LCG or
-    Philox-5), 2.4 (flush rows first, die-restricted launch) / 2.7 waves at T = 1; Philox with
-    10 rounds at T <= 4: 2.75 / 2.5 waves (T = 1 / T = 2-4) with flush rows first on a
-    die-restricted launch, else 3.6; no flush rows: 0.65 / 0.8 waves at any T (odd heads per
-    key: one hpc = 1 wave at T >= 5). Without T: the 8-wave cap whatever the hint and rounding
-    (also the base file's policy test, run here against this build)."""
+    Philox of at most 6 rounds), 2.4 (flush rows first, partial-device launch) / 2.7 waves at
+    T = 1; Philox with more than 6 rounds: 2.75 / 2.5 waves (T = 1 / T = 2-4) with flush rows
+    first on a partial-device launch, 4.5 / 2.1 (T <= 4 / T >= 5) on a partial-device launch
+    without them, 3.6 on a whole-device launch at T <= 4, else the 1.75 of stochastic rounding;
+    no flush rows: 0.65 / 0.8 waves, cap2 one wave at T = 1 and on whole-device launches at
+    T = 2-4 (odd heads per key: one hpc = 1 wave at T >= 5). Without T: the 8-wave cap whatever
+    the hint and rounding (also the base file's policy test, run here against this build)."""
     f = _rubin_mod().auto_heads_per_cta
     die = (8, 106)  # one die of a Rubin uGPU launch: key heads and SMs (424 CTA slots)
     assert [f(b, *die) for b in (13, 14, 212, 213)] == [1, 2, 2, 4]
     got = [f(b, *die, 4, None, "none", "philox", 10, True) for b in (13, 14, 212, 213)]
     assert got == [1, 2, 2, 4]
+    # caps that land on a whole grid: hpc = 1 / 2 while the grid fits, not only below (one key
+    # head, 106 SMs: 4 x 106 hpc = 1 CTAs is one wave, 2 x 318 hpc = 2 CTAs 1.5 waves)
+    for T in (None, 2):
+        assert [f(b, 1, 106, 4, T) for b in (106, 107)] == [1, 2], T
+    assert [f(b, 1, 106, 4, 2) for b in (318, 319)] == [2, 4]
     for T in (2, 4, 8):
         for hint in (None, "some", "flush_first"):
             got = [f(b, *die, 4, T, hint) for b in (13, 14, 39, 40, 212)]
             assert got == [1, 2, 2, 4, 4], (T, hint)
-            for sr, rounds in (("philox", 5), ("lcg", 0), ("lcg_clock", 0)):
+            for sr, rounds in (
+                ("philox", 5),
+                ("philox", 6),
+                ("lcg", 0),
+                ("lcg_clock", 0),
+            ):
                 got = [f(b, *die, 4, T, hint, sr, rounds) for b in (13, 14, 46, 47)]
-                assert got == [1, 2, 2, 4], (T, hint, sr)
-    for sr in ("", "philox"):  # T = 1: the hint moves the cap, Philox-5 does not
-        got = [f(b, *die, 4, 1, "flush_first", sr, 5) for b in (13, 14, 63, 64)]
-        assert got == [1, 2, 2, 4], sr
-        for hint in (None, "some"):
-            got = [f(b, *die, 4, 1, hint, sr, 5) for b in (13, 14, 71, 72)]
-            assert got == [1, 2, 2, 4], (hint, sr)
-    # Philox with 10 rounds at T <= 4: hpc = 2 to 66 rows (T = 2-4) / 72 (T = 1) with flush
-    # rows first, to 95 otherwise; T >= 5 keeps the stochastic-rounding cap
+                assert got == [1, 2, 2, 4], (T, hint, sr, rounds)
+    for sr in ("", "philox"):  # T = 1: the hint moves the cap, Philox-5 / 6 do not
+        for rounds in (5, 6):
+            got = [
+                f(b, *die, 4, 1, "flush_first", sr, rounds) for b in (13, 14, 63, 64)
+            ]
+            assert got == [1, 2, 2, 4], (sr, rounds)
+            for hint in (None, "some"):
+                got = [f(b, *die, 4, 1, hint, sr, rounds) for b in (13, 14, 71, 72)]
+                assert got == [1, 2, 2, 4], (hint, sr, rounds)
+    # Philox with 10 rounds on a die: with flush rows first hpc = 2 to 72 rows (T = 1) / 66
+    # (T = 2-4) / 46 (T >= 5); without them to 119 (T <= 4) / 55 (T >= 5)
+    assert [f(b, *die, 4, 1, "flush_first", "philox", 10) for b in (72, 73)] == [2, 4]
     for T in (2, 3, 4):
         got = [f(b, *die, 4, T, "flush_first", "philox", 10) for b in (13, 14, 66, 67)]
         assert got == [1, 2, 2, 4], T
+    for T in (1, 2, 3, 4):
         for hint in (None, "some"):
-            got = [f(b, *die, 4, T, hint, "philox", 10) for b in (66, 67, 95, 96)]
-            assert got == [2, 2, 2, 4], (T, hint)
-    assert [f(b, *die, 4, 1, "flush_first", "philox", 10) for b in (72, 73)] == [2, 4]
-    assert [f(b, *die, 4, 1, None, "philox", 10) for b in (72, 95, 96)] == [2, 2, 4]
-    for T in (5, 8):
+            got = [f(b, *die, 4, T, hint, "philox", 10) for b in (13, 14, 96, 119, 120)]
+            assert got == [1, 2, 2, 2, 4], (T, hint)
+    for T in (5, 6, 7, 8):
         got = [f(b, *die, 4, T, "flush_first", "philox", 10) for b in (46, 47)]
         assert got == [2, 4], T
-    for T in (1, 4, 8):
-        for sr, rounds in (("", 0), ("philox", 10)):
+        for hint in (None, "some"):
+            got = [f(b, *die, 4, T, hint, "philox", 10) for b in (47, 55, 56)]
+            assert got == [2, 2, 4], (T, hint)
+    # the Philox rounds threshold: up to 6 rounds the stochastic-rounding cap, from 7 the
+    # Philox caps (rounds 7 and 9 untimed)
+    for rounds in (1, 5, 6):
+        for T in (2, 4, 5):
+            got = [f(b, *die, 4, T, None, "philox", rounds) for b in (46, 47)]
+            assert got == [2, 4], (T, rounds)
+        got = [f(b, *die, 4, 1, "flush_first", "philox", rounds) for b in (63, 64)]
+        assert got == [2, 4], rounds
+        assert [f(b, *die, 4, 1, None, "philox", rounds) for b in (71, 72)] == [2, 4]
+    for rounds in (7, 8, 9):
+        for T in (2, 4):
+            got = [f(b, *die, 4, T, None, "philox", rounds) for b in (47, 119, 120)]
+            assert got == [2, 2, 4], (T, rounds)
+            got = [f(b, *die, 4, T, "flush_first", "philox", rounds) for b in (66, 67)]
+            assert got == [2, 4], (T, rounds)
+        got = [f(b, *die, 4, 1, "flush_first", "philox", rounds) for b in (72, 73)]
+        assert got == [2, 4], rounds
+        assert [f(b, *die, 4, 5, None, "philox", rounds) for b in (55, 56)] == [2, 4]
+        assert [
+            f(b, *die, 4, 5, "flush_first", "philox", rounds) for b in (46, 47)
+        ] == [
+            2,
+            4,
+        ]
+    # no flush rows: hpc = 2 while its grid fits one wave at T = 1, 0.8 waves at T >= 2
+    for sr, rounds in (("", 0), ("lcg", 0), ("philox", 10)):
+        got = [f(b, *die, 4, 1, "none", sr, rounds) for b in (8, 9, 26, 27)]
+        assert got == [1, 2, 2, 4], sr
+        for T in (2, 4, 5, 8):
             got = [f(b, *die, 4, T, "none", sr, rounds) for b in (8, 9, 21, 22)]
             assert got == [1, 2, 2, 4], (T, sr)
-    # one whole-device launch (16 key heads, 212 SMs): the same batch boundaries, but flush
-    # rows first counts as rows in any order
+    # one whole-device launch (16 key heads, 212 SMs): the same waves; flush rows first counts
+    # as rows in any order, Philox above 6 rounds keeps 3.6 waves at T <= 4 and 1.75 at T >= 5,
+    # and without flush rows hpc = 2 holds to one wave at T = 1-4
     whole = (16, 212, 4)
     got = [f(b, *whole, 4, None, "", 0, True) for b in (13, 14, 39, 40)]
     assert got == [1, 2, 2, 4]
     assert [f(b, *whole, 1, "flush_first", "", 0, True) for b in (71, 72)] == [2, 4]
     assert [f(b, 16, 212, 4, 1, "flush_first") for b in (63, 64)] == [2, 4]
-    got = [f(b, *whole, 4, "flush_first", "philox", 10, True) for b in (95, 96)]
-    assert got == [2, 4]
+    for T in (1, 2, 4):
+        for hint in (None, "flush_first"):
+            got = [f(b, *whole, T, hint, "philox", 10, True) for b in (95, 96)]
+            assert got == [2, 4], (T, hint)
+    for hint in (None, "flush_first"):
+        assert [f(b, *whole, 6, hint, "philox", 10, True) for b in (46, 47)] == [2, 4]
+    for T in (1, 2, 3, 4):
+        got = [f(b, *whole, T, "none", "", 0, True) for b in (8, 9, 26, 27)]
+        assert got == [1, 2, 2, 4], T
+    for T in (5, 8):
+        got = [f(b, *whole, T, "none", "", 0, True) for b in (21, 22)]
+        assert got == [2, 4], T
     # 2 value heads per key head: both past one hpc = 1 wave; 3: no hpc = 2 (and without flush
     # rows hpc = 1 to one wave at T >= 5, 0.65 waves at T <= 4)
     assert [f(b, *die, 2, 4) for b in (26, 27, 500)] == [1, 2, 2]
     assert [f(b, *die, 3, 4) for b in (17, 18)] == [1, 3]
-    assert [f(b, *die, 3, 8, "none") for b in (17, 18)] == [1, 3]
-    assert [f(b, *die, 3, 4, "none") for b in (11, 12)] == [1, 3]
+    # odd heads per key without flush rows: 0.65 hpc = 1 waves to T = 4, one wave from T = 5
+    for T in (1, 2, 3, 4):
+        got = [f(b, *die, 3, T, "none") for b in (11, 12, 17, 18)]
+        assert got == [1, 3, 3, 3], T
+    for T in (5, 6, 7, 8):
+        got = [f(b, *die, 3, T, "none") for b in (11, 12, 17, 18)]
+        assert got == [1, 1, 1, 3], T
+    # even heads per key keep the 0.65 waves of hpc = 1 at every T
+    for T in (1, 4, 5):
+        assert [f(b, *die, 4, T, "none") for b in (8, 9)] == [1, 2], T
+
+
+def test_persistent_auto_items():
+    """_pz_auto's minimum (key head, row) items per CTA slot (CPU only): one item with
+    flush_hint "none" (H = 8 on a 106-SM die: B >= 53), 8 otherwise (B >= 424); never on a
+    whole-device launch, at T = 1, with fewer heads per CTA or with grid_override."""
+    from types import SimpleNamespace
+
+    M = _rubin_mod()
+    rubin = SimpleNamespace(major=10, minor=7, num_sms=212)
+
+    def auto(T, B, hint, nsm=106, hpc=None, grid=None, target=rubin):
+        return M._pz_auto(T, 4, hpc, 8 * B, nsm, grid, target, hint)
+
+    for T in (2, 4, 8):
+        assert [auto(T, b, "none") for b in (52, 53)] == [False, True], T
+        for hint in (None, "some", "flush_first"):
+            assert [auto(T, b, hint) for b in (423, 424)] == [False, True], (T, hint)
+    assert not auto(1, 4096, "none")
+    assert not auto(4, 4096, "none", nsm=212)
+    assert not auto(4, 4096, "none", hpc=2)
+    assert not auto(4, 4096, "none", grid=3)
+    assert not auto(
+        4, 4096, "none", target=SimpleNamespace(major=10, minor=0, num_sms=148)
+    )
 
 
 def test_auto_heads_per_cta_dispatch(monkeypatch):
@@ -180,9 +269,13 @@ def test_auto_heads_per_cta_dispatch(monkeypatch):
         (4, 44, None, "lcg", 2),  # stochastic rounding: hpc = 2 up to 46 rows
         (4, 48, None, "philox5", 4),
         (4, 60, None, "philox10", 2),  # Philox-10 at T <= 4: hpc = 2 up to 95 rows
+        (4, 60, "flush_first", "philox10", 2),  # whole device: flush-first as any order
+        (8, 48, None, "philox10", 4),  # T >= 5: the stochastic-rounding cap (46 rows)
         (1, 66, "flush_first", "none", 2),  # whole device: flush-first as any order
         (1, 72, None, "none", 4),  # T = 1, flush rows anywhere: hpc = 2 up to 71 rows
-        (4, 24, "none", "none", 4),  # no flush rows: hpc = 2 up to 21 rows
+        (4, 24, "none", "none", 2),  # no flush rows, T <= 4: hpc = 2 up to 26 rows
+        (4, 28, "none", "none", 4),
+        (8, 24, "none", "none", 4),  # no flush rows, T >= 5: hpc = 2 up to 21 rows
     ):
         case, fm = _pz_case(T, 770 + B, _ugpu_pattern(B, 770 + B))
         H = case[0].shape[2]
@@ -201,6 +294,82 @@ def test_auto_heads_per_cta_dispatch(monkeypatch):
             case, fm, heads_per_cta=None, persistent=False, flush_hint=hint, **sr
         )
         assert seen == [want], (T, B, hint, mode, seen)
+        for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+            assert torch.equal(x, y), (T, B, hint, mode, name)
+
+
+def test_auto_heads_per_cta_ugpu_dies(monkeypatch):
+    """uGPU buffers on Rubin: _launch_ugpu's per-die launches (8 of the 16 key heads on one
+    die's 106 SMs, a partial-device launch, so "flush_first" moves the caps) pick hpc = 4 from
+    B = 64 at T = 1 with "flush_first" (72 without), from 73 (T = 1) / 67 (T = 2-4) / 47
+    (T >= 5) with Philox-10 and "flush_first" (120 / 56 without), from 40 at T >= 2 with round
+    to nearest, from 47 with Philox-6 (Philox-7: the Philox-10 caps), and without flush rows
+    from 27 at T = 1 and 22 at T = 2; the same bits as the 4-D buffers with 4 heads per CTA.
+    Eager calls this small normally run the per-die launches back to back on the whole device;
+    the test lowers that threshold so they take the green-context path of captured serving."""
+    from flashinfer.utils import get_compute_capability
+
+    _skip_if_no_rubin_build()
+    M = _rubin_mod()
+    if get_compute_capability(torch.device("cuda")) != (10, 7):
+        pytest.skip("the per-die caps are sm_107a only")
+    dev = torch.cuda.current_device()
+    if M._locality_domains(dev) != 2:
+        pytest.skip("needs a device with two locality domains")
+    if M._ugpu_streams(dev)[1] != [106, 106]:
+        pytest.skip("the boundaries below are for 106-SM dies")
+    monkeypatch.setattr(M, "_UGPU_EAGER_MIN_STATES", 0)
+    seen, rule_args = [], []
+    real_kernel, real_rule = M._get_kernel, M.auto_heads_per_cta
+
+    def spy_kernel(*args, **kw):
+        seen.append(args[6])  # heads per CTA
+        return real_kernel(*args, **kw)
+
+    def spy_rule(*args, **kw):
+        rule_args.append((args[1], args[2], kw.get("whole_device")))
+        return real_rule(*args, **kw)
+
+    monkeypatch.setattr(M, "_get_kernel", spy_kernel)
+    monkeypatch.setattr(M, "auto_heads_per_cta", spy_rule)
+    # T, rows, flush_hint, rounding, heads per CTA on each die
+    for T, B, hint, mode, want in (
+        (1, 63, "flush_first", "none", 2),
+        (1, 64, "flush_first", "none", 4),
+        (1, 71, None, "none", 2),
+        (1, 72, None, "none", 4),
+        (1, 72, "flush_first", "philox10", 2),
+        (1, 73, "flush_first", "philox10", 4),
+        (2, 66, "flush_first", "philox10", 2),
+        (2, 67, "flush_first", "philox10", 4),
+        (4, 67, None, "philox10", 2),  # no hint: hpc = 2 up to 119 rows
+        (4, 119, None, "philox10", 2),
+        (1, 120, None, "philox10", 4),
+        (8, 47, "flush_first", "philox10", 4),
+        (8, 55, None, "philox10", 2),  # T >= 5, no hint: hpc = 2 up to 55 rows
+        (8, 56, None, "philox10", 4),
+        (4, 66, "flush_first", "philox5", 4),  # 5 rounds: the stochastic-rounding cap
+        (2, 47, None, "philox6", 4),  # 6 rounds too
+        (2, 47, None, "philox7", 2),  # 7: the Philox caps
+        (1, 26, "none", "none", 2),  # no flush rows, T = 1: hpc = 2 up to 26 rows
+        (1, 27, "none", "none", 4),
+        (2, 21, "none", "none", 2),  # T >= 2 on a die: up to 21
+        (2, 22, "none", "none", 4),
+        (2, 39, None, "none", 2),
+        (2, 40, None, "none", 4),
+        (8, 39, "flush_first", "none", 2),
+        (8, 40, "flush_first", "none", 4),
+    ):
+        case, fm = _pz_case(T, 880 + B, _ugpu_pattern(B, 880 + B))
+        sr = _sr_kw(mode)
+        ref = _pz_call(case, fm, heads_per_cta=4, **sr)
+        seen.clear()
+        rule_args.clear()
+        got = _ugpu_call(
+            case, fm, heads_per_cta=None, persistent=False, flush_hint=hint, **sr
+        )
+        assert seen == [want, want], (T, B, hint, mode, seen)
+        assert rule_args == [(8, 106, False)] * 2, (T, B, hint, mode, rule_args)
         for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
             assert torch.equal(x, y), (T, B, hint, mode, name)
 
