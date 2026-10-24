@@ -67,7 +67,7 @@ def load_iket() -> Any:
     for module_name in ("cutlass.cute.experimental", "cutlass.cute"):
         try:
             return importlib.import_module(module_name).iket
-        except Exception:  # availability depends on the DSL build
+        except (ImportError, AttributeError):  # availability depends on the DSL build
             pass
     return _NoIket()
 

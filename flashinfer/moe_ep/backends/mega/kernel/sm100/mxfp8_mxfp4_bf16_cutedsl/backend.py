@@ -122,6 +122,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = candidate_tactics(
                 hidden=fleet_params.token_hidden_size,
                 intermediate=cfg.intermediate_size,
+                max_tokens_per_rank=fleet_params.max_tokens_per_rank,
             )
         return get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
             fleet_params.num_experts,
@@ -134,6 +135,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=cfg.gate_up_clamp,
             knobs=knobs,
             capacity_tactics=capacity,
+            process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
         )
 
     def validate_forward(
@@ -158,6 +160,10 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         num_tokens = t.hidden_states.shape[0]
+        hidden_sf_cols = workspace.hidden // 32
+        padded_sf_cols = ((hidden_sf_cols + 3) // 4) * 4
+        if workspace.x_sf.shape[1] < padded_sf_cols:
+            raise ValueError("workspace MXFP8 scale row is smaller than its padded ABI")
         if quantize_input:
             stage_mega_moe_inputs(
                 t.hidden_states,
@@ -173,8 +179,6 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
         from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
-        hidden_sf_cols = workspace.hidden // 32
-        padded_sf_cols = ((hidden_sf_cols + 3) // 4) * 4
         workspace.x[:num_tokens].view(torch.uint8).copy_(
             t.hidden_states[:num_tokens].view(torch.uint8)
         )
@@ -183,8 +187,6 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         workspace.x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(
             t.scales[:num_tokens, :hidden_sf_cols].view(torch.uint8)
         )
-        if workspace.x_sf.shape[1] < padded_sf_cols:
-            raise ValueError("workspace MXFP8 scale row is smaller than its padded ABI")
         workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
         workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
         if num_tokens < workspace.x.shape[0]:
@@ -206,7 +208,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
         cfg = self._kernel_config
         unpinned = cfg.knobs is None or cfg.knobs == "auto"
-        pending = unpinned and not workspace._autotune_selected
+        pending = unpinned and not workspace.is_autotuned
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -282,27 +284,28 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _forget_workspace_state(self, workspace: Any) -> None:
-        import sys
-
-        quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
+        from ......kernel_src.sm100.cutedsl_megamoe.shim.quant_stage import (
+            forget_staged_tokens,
         )
+
         topk_idx = getattr(workspace, "topk_idx", None)
-        if quant_stage is not None and topk_idx is not None:
-            quant_stage.forget_staged_tokens(topk_idx)
+        if topk_idx is not None:
+            forget_staged_tokens(topk_idx)
 
 
 __all__ = ["Mxfp8Mxfp4CutedslMegaKernelBackend"]
 
 
-# Do not advertise a backend whose persistent device assembler has not landed.
-# The device-kernel component provides this module and class; registration then
-# becomes automatic without making CPU-only config imports depend on CuTe DSL.
+# Auto-selection skips unavailable device kernels; explicit selection reports
+# the original import failure through the registry.
 try:
     from ......cute_dsl.megamoe.mxfp8_mxfp4.persistent_kernel import (
         ASSEMBLY_READY as _ASSEMBLY_READY,
     )
-except ImportError:
+except ImportError as exc:
+    from ......core.kernel.registry import register_unavailable_mega_kernel
+
+    register_unavailable_mega_kernel(KERNEL_NAME, exc)
     _ASSEMBLY_READY = False
 
 if _ASSEMBLY_READY:

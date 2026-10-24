@@ -126,7 +126,7 @@ def test_in_kernel_reduce_rejects_non_boolean_tactic(value) -> None:
 
 def test_pair_tile_candidates_cover_every_default() -> None:
     shape = dict(hidden=4096, intermediate=6400)
-    all_candidates = candidate_tactics(**shape)
+    all_candidates = candidate_tactics(**shape, exhaustive=True)
     assert len(all_candidates) == 128
     candidates = [c for c in all_candidates if c["persistent_clusters"] is None]
     assert len(candidates) == 64
@@ -154,6 +154,10 @@ def test_pair_tile_candidates_cover_every_default() -> None:
     # Tuning can never lose the shipped band on the timed problem.
     for tokens in (1, 64, 255, 256, 511, 512, 1023, 1024, 4096):
         assert default_tactic(tokens, **shape) in candidates
+        bounded = candidate_tactics(**shape, max_tokens_per_rank=tokens)
+        assert len(bounded) == 32
+        assert default_tactic(tokens, **shape) in bounded
+        assert all(c in all_candidates for c in bounded)
     # Shapes the pair tile cannot divide keep the 1-CTA grid.
     assert candidate_tactics(hidden=6528, intermediate=4096) == candidate_tactics()
 
@@ -171,6 +175,8 @@ def test_tune_cli_dispatches_mxfp8_mxfp4_and_schedule_candidates_validate() -> N
     assert tuner._candidates(args, 512, rank=1) == candidate_tactics(
         hidden=4096, intermediate=6400
     )
+    exhaustive_args = _parse_args([*argv, "--mxfp8-mxfp4-exhaustive"])
+    assert len(tuner._candidates(exhaustive_args, 512, rank=1)) == 128
     args = _parse_args(
         [*argv, "--sweep", "schedule", "--base-knobs", '{"epilogue_warps": 4}']
     )
@@ -461,3 +467,47 @@ def test_tuning_keeps_expert_order(hidden):
     candidates = candidate_tactics(hidden=hidden, intermediate=6400)
     assert {c["claim_order"] for c in candidates} == {"expert"}
     assert len({repr(sorted(c.items())) for c in candidates}) == len(candidates)
+
+
+@pytest.mark.parametrize(
+    "name", ["num_stages", "group_hint", "flag_batch", "persistent_clusters"]
+)
+@pytest.mark.parametrize("value", [True, False])
+def test_integer_tactic_fields_reject_boolean(name, value):
+    with pytest.raises(ValueError, match=name):
+        validate_tactic({name: value})
+
+
+def test_unavailable_backend_reports_import_cause(monkeypatch):
+    from flashinfer.moe_ep.core.kernel import registry
+
+    monkeypatch.setattr(registry, "_MEGA_KERNEL_REGISTRY", {})
+    monkeypatch.setattr(registry, "_MEGA_KERNEL_IMPORT_ERRORS", {})
+    config = SimpleNamespace(kernel_name="unavailable_test")
+    cause = ImportError("missing device symbol")
+    registry.register_unavailable_mega_kernel(config.kernel_name, cause)
+    assert registry.is_mega_kernel_config(config)
+    assert config.kernel_name not in registry._available_mega_kernels()
+    with pytest.raises(ImportError, match="could not be imported") as exc:
+        registry.create_mega_kernel(config)
+    assert exc.value.__cause__ is cause
+    registry.register_mega_kernel(config.kernel_name)(lambda config: config)
+    assert registry.is_mega_kernel_config(config)
+    assert registry.create_mega_kernel(config) is config
+
+
+@pytest.mark.parametrize("quantize", [False, True])
+def test_scale_abi_rejected_before_any_staging_write(quantize):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.backend import (
+        Mxfp8Mxfp4CutedslMegaKernelBackend,
+    )
+
+    backend = object.__new__(Mxfp8Mxfp4CutedslMegaKernelBackend)
+    workspace = SimpleNamespace(
+        hidden=128, x_sf=torch.full((2, 3), 23, dtype=torch.uint8)
+    )
+    # No other destination is present: touching it before the ABI check fails.
+    tensors = SimpleNamespace(hidden_states=torch.ones(2, 128))
+    with pytest.raises(ValueError, match="padded ABI"):
+        backend.stage_inputs(tensors, workspace, quantize_input=quantize)
+    assert torch.all(workspace.x_sf == 23)

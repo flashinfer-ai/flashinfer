@@ -28,6 +28,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class HostWorkspace(SimpleNamespace):
+    is_autotuned = integration.Mxfp8Mxfp4MegaMoeWorkspace.is_autotuned
+    mark_autotuned = integration.Mxfp8Mxfp4MegaMoeWorkspace.mark_autotuned
+    clear_autotune_selection = (
+        integration.Mxfp8Mxfp4MegaMoeWorkspace.clear_autotune_selection
+    )
+    restore_tactic = integration.Mxfp8Mxfp4MegaMoeWorkspace.restore_tactic
+
+    def apply_knobs(self, knobs, *, force_reset=False):
+        self.tactic = self.resolve(knobs)
+        self.clear_autotune_selection()
+        if force_reset:
+            self.restores.append(dict(self.tactic))
+            if self.process_group is not None:
+                import torch.distributed as dist
+
+                dist.barrier(group=self.process_group)
+
+
 @pytest.fixture
 def host_case(monkeypatch, tmp_path):
     return _host_case(monkeypatch, tmp_path)
@@ -46,7 +65,9 @@ def _host_case(monkeypatch, tmp_path):
     resolve = lambda knobs: dict(
         resolve_tactic(16, knobs, hidden=256, intermediate=256)
     )
-    ws = SimpleNamespace(
+    ws = HostWorkspace(
+        process_group=None,
+        restores=[],
         rank=0,
         world_size=1,
         num_experts=4,
@@ -70,16 +91,13 @@ def _host_case(monkeypatch, tmp_path):
     )
     prepared = []
 
-    def apply(knobs):
-        ws.tactic = resolve(knobs)
-
     def frontend(**kwargs):
         return SimpleNamespace(
             config=SimpleNamespace(tactic=tuple(sorted(ws.tactic.items()))),
             warmup=lambda spec: prepared.append((dict(ws.tactic), spec)),
         )
 
-    ws.apply_knobs, ws.frontend = apply, frontend
+    ws.frontend = frontend
     fc1, fc2 = (
         (torch.zeros(4, 128, 512), torch.zeros(4, 4096)),
         (torch.zeros(4, 128, 256), torch.zeros(4, 2048)),
@@ -88,7 +106,7 @@ def _host_case(monkeypatch, tmp_path):
     profiled = []
 
     def profile(runner, inputs, tactic, config, **kwargs):
-        tuner._prepare_tactic(runner, inputs, tactic)
+        tuner.prepare_selected_tactic(runner, inputs, tactic)
         profiled.append(tactic)
         assert config.preserve_input_storage
         assert config.rank_reduction == "max"
@@ -264,7 +282,7 @@ def test_backend_tunes_each_workspace_and_pinned_knobs_bypass(host_case, monkeyp
             intermediate_size=256, top_k=2, knobs="auto"
         )
     )
-    second = SimpleNamespace(**vars(c.ws))
+    second = HostWorkspace(**vars(c.ws))
     for ws in (c.ws, c.ws, second):
         backend.compute(ws, (c.fc1, c.fc2), output=c.ws.y[:7])
     assert len(calls) == 2 and calls[0] is c.ws and calls[1] is second
@@ -290,6 +308,7 @@ def _collective_selection_rank(rank, root):
             timeout=datetime.timedelta(seconds=30),
         )
         c.ws.rank, c.ws.world_size = rank, 2
+        c.ws.process_group = dist.group.WORLD
         try:
             with autotune():
                 select_tactic(
@@ -316,6 +335,37 @@ def _collective_selection_rank(rank, root):
                     c.fc1, c.fc2, c.ws, num_tokens=7 - rank, candidates=candidates
                 )
             assert len(c.profiled) == 2
+
+            original = dict(c.ws.tactic)
+            was_autotuned = c.ws.is_autotuned
+            choose = c.tuner.choose_one
+
+            def fail_one_rank(*args, **kwargs):
+                c.ws.apply_knobs({"group_hint": 4096 if rank else 512})
+                if rank == 1:
+                    raise ValueError("injected selection failure")
+                return 0, tuple(sorted(c.ws.tactic.items()))
+
+            monkeypatch.setattr(c.tuner, "choose_one", fail_one_rank)
+            with (
+                autotune(),
+                pytest.raises(
+                    (ValueError, RuntimeError), match="injected selection failure"
+                ),
+            ):
+                select_tactic(
+                    c.fc1, c.fc2, c.ws, num_tokens=7 - rank, candidates=c.candidates
+                )
+            assert c.ws.tactic == original
+            assert c.ws.is_autotuned == was_autotuned
+            assert c.ws.restores == [original]
+            assert get_autotune_process_group() is None
+            monkeypatch.setattr(c.tuner, "choose_one", choose)
+            with autotune():
+                select_tactic(
+                    c.fc1, c.fc2, c.ws, num_tokens=7 - rank, candidates=c.candidates
+                )
+            assert c.ws.is_autotuned and c.ws.tactic["group_hint"] == 512
         finally:
             dist.destroy_process_group()
 
@@ -337,3 +387,41 @@ def test_collective_workload_identity_and_mismatched_cache(tmp_path):
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
+
+
+@pytest.mark.parametrize("phase", ["sweep", "post_lookup", "winner_prepare", "export"])
+def test_failed_selection_rolls_back_mutated_workspace(host_case, monkeypatch, phase):
+    c = host_case
+    c.ws.apply_knobs({"group_hint": 4096})
+    c.ws.mark_autotuned()
+    original = dict(c.ws.tactic)
+    module = importlib.import_module(select_tactic.__module__)
+
+    def fail(*args, **kwargs):
+        c.ws.apply_knobs({"group_hint": 512})
+        raise ValueError("injected failure")
+
+    if phase == "sweep":
+        monkeypatch.setattr(c.tuner, "choose_one", fail)
+    elif phase == "export":
+        monkeypatch.setattr(module, "_export_legacy_winner", fail)
+    elif phase == "post_lookup":
+        preflight = c.tuner.selection_preflight
+        calls = 0
+
+        def lookup(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return fail() if calls == 2 else preflight(*args, **kwargs)
+
+        monkeypatch.setattr(c.tuner, "selection_preflight", lookup)
+    else:
+        tune(c)
+        c.ws.apply_knobs(original)
+        c.ws.mark_autotuned()
+        monkeypatch.setattr(c.tuner, "prepare_selected_tactic", fail)
+    with pytest.raises(ValueError, match="injected failure"):
+        tune(c)
+    assert c.ws.tactic == original and c.ws.is_autotuned
+    assert c.ws.restores == [original]
+    assert get_autotune_process_group() is None

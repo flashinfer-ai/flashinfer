@@ -745,6 +745,15 @@ bands; explicit dictionaries remain pinned. `knobs="auto"` and the general
 symmetric input addresses and minimizing the slowest rank's latency.
 Workspace preparation occurs outside timed launches; failures are reported
 collectively before any rank launches the next tactic.
+Failed selections restore the pre-sweep tactic and tuning state collectively.
+All workspace and tuning collectives use the EP process group, including
+subgroups of WORLD. Changes that preserve counter-region layouts avoid the
+workspace reset and its synchronization.
+
+The default search has 32 candidates and includes the capacity band's default.
+Use `--mxfp8-mxfp4-exhaustive` in the offline CLI for the full 128-entry paired
+search, or pass `candidate_tactics(..., exhaustive=True)` to the explicit API.
+
 
 The binding is keyed by allocated token capacity and geometry, rather than active token count. Tune and warm the full capacity
 before capture; smaller serving batches reuse that layout and tactic.

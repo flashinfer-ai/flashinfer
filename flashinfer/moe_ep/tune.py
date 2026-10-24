@@ -60,6 +60,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
     )
     parser.add_argument(
+        "--mxfp8-mxfp4-exhaustive",
+        action="store_true",
+        help="search the full 128-entry MXFP8 x MXFP4 paired-tile grid (default: 32)",
+    )
+    parser.add_argument(
         "--dtype",
         choices=(
             "nvfp4",

@@ -214,9 +214,10 @@ values. Defaults belong to the shared CLI; in particular, always supply
 | `--combine-dtype` | `bf16` | Only `bf16` is accepted with `mxfp8_mxfp4`. |
 | `--fp8-scale-mode` | `per_tensor` | Applies only to the Hopper FP8 backends; ignored here. Activations always use E8M0/K32 scales. |
 | `--allow-nondeterministic` | `False` | Adds no candidates here; reduction remains deterministic. |
+| `--mxfp8-mxfp4-exhaustive` | `False` | Opt into the 128-entry pair-tile grid, including a 64-cluster cap and both weight L2 policies. |
 | `--max-candidates` | `None` | No truncation; a positive value keeps that many candidates from the front of the list. |
 | `--skew` | `None` | Near-uniform random routing. A supplied ratio requests skewed routing. |
-| `--sweep` | `default` | Full candidate grid; `schedule` sweeps only scheduling fields. |
+| `--sweep` | `default` | Bounded candidate grid; `schedule` sweeps only scheduling fields. |
 | `--base-knobs` | `None` | For `schedule`, use the default tactic for this capacity and geometry. Supplied JSON overrides it. This backend does not use a cached winner as the schedule base. Ignored by the default sweep. |
 | `--warmup-iters` | 3 | Warmup launches per candidate; compilation/binding happens before warmup. |
 | `--timed-iters` | 10 | Timed launches per candidate. |
@@ -226,10 +227,12 @@ values. Defaults belong to the shared CLI; in particular, always supply
 The CLI uses `fast_math=True`; there is no CLI flag for it. Use the explicit
 Python tuner to compare a different numerical setting.
 
-The default pair-tile search has 128 candidates. Its initial 32 comprise
+The default pair-tile search has 32 candidates. They comprise
 24 static candidates over N64/N128/N192, group hints 512/4096, four/eight epilogue warps, and both
 reduction placements; four alternating N192 candidates; and four atomic N64
-candidates. Each is also tried with a 64-cluster cap and both weight L2
+candidates. The default retains the capacity band's weight L2 policy and no
+cluster cap. With `--mxfp8-mxfp4-exhaustive`, each is also tried with a
+64-cluster cap and both weight L2
 eviction policies. The single-CTA search
 has 32 candidates over N64/N128,
 automatic or pinned 3–5 stages, group hints 512/4096, and both reduction
@@ -254,17 +257,18 @@ required wherever they appear in a signature; they have no implicit values.
 | API | Optional argument | Default and behavior |
 |---|---|---|
 | `get_symm_buffer_for_mxfp8_mxfp4_mega_moe` | `knobs` | `None`: persistent cache lookup, then the default tactic. This low-level allocator accepts a mapping or `None`, not `"auto"`. |
+| Same allocator | `process_group` | `None`: use WORLD for multi-rank allocations. Pass the EP subgroup when its membership differs from WORLD; rank and world size must be relative to that group. |
 | Same allocator | `capacity_tactics` | `None`: size only for the resolved tactic. Supply a sequence to reserve enough space for every listed candidate as well. |
 | Same allocator | `gate_up_clamp` | `None`: accepted for API compatibility but unused during allocation. Set the clamp on compute/tuner calls. |
 | `mxfp8_mxfp4_mega_moe` | `gate_up_clamp` | `None`: no clamp. |
 | Same compute function | `fast_math` | `True`: approximate SwiGLU math. |
 | `autotune_mxfp8_mxfp4_mega_moe` | `gate_up_clamp` | `None`: no clamp. |
 | Same tuner | `fast_math` | `True`: approximate SwiGLU math, held fixed across candidates. |
-| Same tuner | `candidates` | `None`: use the 128-candidate pair grid or 32-candidate single-CTA grid, then filter for workspace fit. |
+| Same tuner | `candidates` | `None`: use the bounded 32-candidate grid, then filter for workspace fit. |
 | Same tuner | `warmup_iters` | 3 warmup launches per candidate; compilation/binding happens before warmup. |
 | Same tuner | `timed_iters` | 10 timed launches per candidate. |
 | `create_dummy_mxfp8_mxfp4_inputs` | `seed` | 0: seed the local GPU generator with `seed + rank`. |
-| Same input helper | `capacity_tactics` | `None`: reserve for the full candidate grid. An explicit empty sequence reserves only for the default tactic. |
+| Same input helper | `capacity_tactics` | `None`: reserve for the bounded candidate grid. An explicit empty sequence reserves only for the default tactic. |
 | Same input helper | `gate_up_clamp` | `None`: accepted but unused during input generation. Set it on compute/tuner calls. |
 
 Both compute and tuner require the positional `output` argument. Passing
@@ -272,7 +276,7 @@ Both compute and tuner require the positional `output` argument. Passing
 ignores `output` and always times the workspace's stable output view. `num_tokens` is required on both
 calls. The input helper starts from `knobs={}` (bypassing the cache), creates
 near-uniform random expert assignments, and sets each routing weight to
-`1 / topk`. Backend `knobs="auto"` reserves for the full candidate grid and
+`1 / topk`. Backend `knobs="auto"` reserves for the bounded candidate grid and
 uses the tuner's default iteration counts with the config's numerical settings.
 
 This single-GPU example uses deliberately small synthetic fixtures. Run it
@@ -350,3 +354,9 @@ For graph timing, warm up the exact buffers before capture and replay on all
 ranks in the same order. Report the slowest rank's latency for collective
 execution. Debug wait counters and IKET traces are diagnostic runs, separate
 from uninstrumented performance measurements.
+
+The allocator, tactic switching, tuning, and teardown use the same EP process
+group. Recoverable host/compilation failures during selection restore the
+pre-sweep tactic and tuning state on every rank before returning an error.
+The tuner serializes the whole collective session; other threads using that
+tuner wait until it completes. Call selection in the same order on all EP ranks.

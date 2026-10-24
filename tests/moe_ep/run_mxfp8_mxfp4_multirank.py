@@ -42,6 +42,11 @@ def _knobs(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--ep-subgroup",
+        action="store_true",
+        help="Use ranks [1, 3] of a four-rank job; non-EP ranks do not enter kernel collectives.",
+    )
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--intermediate", type=int, default=256)
     parser.add_argument("--experts", type=int)
@@ -117,7 +122,33 @@ def main():
         to_atom_swizzled,
     )
 
-    _, rank, world, _ = bootstrap_dist()
+    process_group, runtime = None, None
+    if args.ep_subgroup:
+        from flashinfer.moe_ep.config import BootstrapConfig
+        from flashinfer.moe_ep.core.runtime import (
+            bootstrap_moe_ep_runtime,
+            finalize_moe_ep_runtime,
+        )
+
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        dist.init_process_group(
+            "nccl", device_id=torch.device("cuda", torch.cuda.current_device())
+        )
+        if dist.get_world_size() != 4:
+            raise ValueError("--ep-subgroup requires exactly four launched ranks")
+        process_group = dist.new_group([1, 3])
+        if dist.get_rank() not in (1, 3):
+            dist.barrier()
+            dist.destroy_process_group()
+            faulthandler.cancel_dump_traceback_later()
+            return
+        rank, world = dist.get_rank(process_group), dist.get_world_size(process_group)
+        runtime = bootstrap_moe_ep_runtime(
+            BootstrapConfig(rank=rank, world_size=world, process_group=process_group),
+            frozenset({"torch_dist", "nvshmem"}),
+        )
+    else:
+        _, rank, world, _ = bootstrap_dist()
     if world < 2 and not args.allow_single_rank:
         raise ValueError("this gate requires at least two ranks")
     tokens, hidden, intermediate, topk = (
@@ -209,6 +240,7 @@ def main():
         world,
         knobs=_knobs(args),
         capacity_tactics=tuning_candidates,
+        process_group=process_group,
     )
     workspace.x.copy_(xq[rank])
     workspace.x_sf.view(torch.uint8).copy_(xs[rank])
@@ -289,7 +321,7 @@ def main():
                 )
                 if world > 1:
                     winners = [None] * world
-                    dist.all_gather_object(winners, winner)
+                    dist.all_gather_object(winners, winner, group=process_group)
                     assert all(item == winner for item in winners)
                 print(
                     f"rank={rank} scenario={scenario} autotune winner={winner}",
@@ -310,14 +342,14 @@ def main():
             saved[scenario] = baseline.cpu()
             torch.cuda.synchronize()
             if world > 1:
-                dist.barrier()
+                dist.barrier(group=process_group)
             capture_stream = torch.cuda.Stream()
             capture_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(capture_stream):
                 launch()
             torch.cuda.synchronize()
             if world > 1:
-                dist.barrier()
+                dist.barrier(group=process_group)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=capture_stream):
                 actual = launch()
@@ -358,7 +390,13 @@ def main():
         traceback.print_exc()
         os._exit(1)
     workspace.destroy()
-    finalize_dist()
+    if args.ep_subgroup:
+        finalize_moe_ep_runtime(runtime)
+        dist.barrier()
+        dist.destroy_process_group()
+    else:
+        finalize_dist()
+    faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":

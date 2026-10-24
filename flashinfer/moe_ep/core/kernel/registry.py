@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Resolve kernel configs to backend instances."""
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from .base import MegaKernelBackend, SplitKernelBackend, SplitKernelContext
 
 _SPLIT_KERNEL_REGISTRY: dict[str, Type[SplitKernelBackend]] = {}
 _MEGA_KERNEL_REGISTRY: dict[str, Type[MegaKernelBackend]] = {}
+_MEGA_KERNEL_IMPORT_ERRORS: dict[str, ImportError] = {}
 # Pre-taxonomy kernel_name spellings -> canonical name. Resolvable for
 # backward compatibility, but WILL BE REMOVED in a future release; using one
 # emits a DeprecationWarning.
@@ -25,6 +29,7 @@ def register_split_kernel(name: str):
 
 def register_mega_kernel(name: str, *, deprecated_aliases: tuple[str, ...] = ()):
     def decorator(cls: Type[MegaKernelBackend]) -> Type[MegaKernelBackend]:
+        _MEGA_KERNEL_IMPORT_ERRORS.pop(name, None)
         _MEGA_KERNEL_REGISTRY[name] = cls
         for alias in deprecated_aliases:
             _MEGA_KERNEL_REGISTRY[alias] = cls
@@ -32,6 +37,12 @@ def register_mega_kernel(name: str, *, deprecated_aliases: tuple[str, ...] = ())
         return cls
 
     return decorator
+
+
+def register_unavailable_mega_kernel(name: str, error: ImportError) -> None:
+    """Remember an optional device import failure without enabling auto-selection."""
+    _MEGA_KERNEL_REGISTRY.pop(name, None)
+    _MEGA_KERNEL_IMPORT_ERRORS[name] = error
 
 
 def _warn_if_deprecated_mega_name(name: str) -> None:
@@ -79,16 +90,24 @@ def create_split_kernel(config: object) -> SplitKernelBackend:
 
 
 def is_mega_kernel_config(config: object) -> bool:
-    """True when ``config`` names a registered mega-kernel plugin."""
+    """True for a known mega config, including an unavailable optional plugin.
+
+    This classifies explicit layer requests so creation can report the import
+    cause. Unavailable plugins are excluded from the available-kernel list.
+    """
     try:
         name = _kernel_name(config)
     except TypeError:
         return False
-    return name in _MEGA_KERNEL_REGISTRY
+    return name in _MEGA_KERNEL_REGISTRY or name in _MEGA_KERNEL_IMPORT_ERRORS
 
 
 def create_mega_kernel(config: object) -> MegaKernelBackend:
     name = _kernel_name(config)
+    if name in _MEGA_KERNEL_IMPORT_ERRORS:
+        raise ImportError(
+            f"mega kernel {name!r} could not be imported"
+        ) from _MEGA_KERNEL_IMPORT_ERRORS[name]
     if name not in _MEGA_KERNEL_REGISTRY:
         available = _available_mega_kernels()
         raise KeyError(f"unknown mega kernel {name!r}; available: {available}")
