@@ -3,7 +3,10 @@
 import hashlib
 import logging
 import os
-from multiprocessing import get_context
+import pickle
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from filelock import FileLock
@@ -81,21 +84,43 @@ def _mm_mxfp8_precompile_worker(payload):
         return name, f"{type(exc).__name__}: {exc}"
 
 
-def _run_mm_mxfp8_precompile_pool(payloads, workers):
-    logger.info(
-        "[mm_mxfp8 cute-dsl] precompiling %d tactics with %d workers",
-        len(payloads),
-        workers,
-    )
-    with get_context("spawn").Pool(workers) as pool:
-        results = pool.map(_mm_mxfp8_precompile_worker, payloads)
-    for name, error in results:
+def _mm_mxfp8_precompile_main():
+    for payload in pickle.load(sys.stdin.buffer):
+        name, error = _mm_mxfp8_precompile_worker(payload)
         if error is not None:
             logger.warning(
                 "[mm_mxfp8 cute-dsl] precompile failed for %s: %s; retrying on demand",
                 name,
                 error,
             )
+
+
+def _run_mm_mxfp8_precompile_chunk(payloads):
+    # A spawn Pool reexecutes the application's __main__ while the parent holds
+    # the cache lock. An unguarded calling script then deadlocks on that lock.
+    # Start a dedicated interpreter entry point and preserve the caller's import
+    # paths so editable/source installs load the same FlashInfer implementation.
+    entry = (
+        "import pickle, sys; sys.path = pickle.load(sys.stdin.buffer); "
+        "from flashinfer.gemm.gemm_mm_mxfp8_precompile "
+        "import _mm_mxfp8_precompile_main; _mm_mxfp8_precompile_main()"
+    )
+    subprocess.run(
+        [sys.executable, "-c", entry],
+        input=pickle.dumps(sys.path) + pickle.dumps(payloads),
+        check=True,
+    )
+
+
+def _run_mm_mxfp8_precompile_pool(payloads, workers):
+    logger.info(
+        "[mm_mxfp8 cute-dsl] precompiling %d tactics with %d workers",
+        len(payloads),
+        workers,
+    )
+    chunks = [payloads[i::workers] for i in range(min(workers, len(payloads)))]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_run_mm_mxfp8_precompile_chunk, chunks))
 
 
 def precompile_mm_mxfp8_tactics(

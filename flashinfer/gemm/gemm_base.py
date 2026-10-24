@@ -6585,11 +6585,6 @@ def _cute_dsl_gemm_mxfp8_runner(
 
     from ..cute_dsl.utils import torch_to_cutlass_dtype
 
-    if out_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(
-            f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
-            "Supported: torch.bfloat16, torch.float16."
-        )
     c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
     _ = sm_major, sm_minor
 

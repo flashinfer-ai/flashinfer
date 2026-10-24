@@ -167,6 +167,8 @@ parallel population, fresh-process disk hits, and saved tuning winners. It uses
 isolated caches and checks results after CUDA graph replay. Run on B200/B300;
 the default shapes exercise the SM100-family persistent/split-K runner. See
 `docs/design_docs/cute_dsl_kernel_cache.md` for the scope and cache layers.
+MXFP8 precompile workers start a dedicated interpreter entry point; they do not
+rerun application scripts or require callers to use a `__main__` guard.
 
 Run the regular test suite:
 

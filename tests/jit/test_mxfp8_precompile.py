@@ -3,6 +3,12 @@
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import textwrap
 import time
 
 import pytest
@@ -17,6 +23,58 @@ from flashinfer.jit import cute_dsl_core
 
 PERSISTENT = ((128, 128), (1, 1), False, False, 1)
 SPLITK = ((128, 8), (1, 1), True, False, 2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group timeout cleanup")
+def test_unguarded_caller_does_not_reexecute_while_holding_cache_lock(tmp_path):
+    caller = tmp_path / "unguarded_caller.py"
+    caller.write_text(
+        textwrap.dedent(
+            """
+            from pathlib import Path
+            import sys
+            from filelock import FileLock
+            from flashinfer.gemm.gemm_mm_mxfp8_precompile import (
+                _run_mm_mxfp8_precompile_pool,
+            )
+
+            root = Path(sys.argv[1])
+            with (root / 'caller-executions').open('a') as stream:
+                stream.write('entered\\n')
+            # Deliberately no __main__ guard: this is an ordinary calling script.
+            with FileLock(root / 'precompile.lock'):
+                # An invalid compile description exercises worker error fallback
+                # without a GPU. Device -1 is a no-op in torch.cuda.set_device.
+                _run_mm_mxfp8_precompile_pool(
+                    [{'kernel_name': 'probe-0', 'device_index': -1},
+                     {'kernel_name': 'probe-1', 'device_index': -1}], 2
+                )
+            """
+        )
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(str(Path(p or os.getcwd())) for p in sys.path)
+    process = subprocess.Popen(
+        [sys.executable, str(caller), str(tmp_path)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=40)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate()
+        pytest.fail(f"unguarded precompile caller timed out:\n{output}")
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+    assert process.returncode == 0, output
+    assert (tmp_path / "caller-executions").read_text() == "entered\n"
+    assert output.count("precompile failed for probe-") == 2, output
 
 
 @pytest.fixture
@@ -175,14 +233,19 @@ def test_worker_budget_respects_cpu_and_cgroup(monkeypatch):
     assert precompile._get_mm_mxfp8_compile_workers() == 0
 
 
-def test_runner_precompiles_only_tactics_selected_by_tuner(monkeypatch):
+@pytest.mark.parametrize("sm_minor,low_m_only", [(0, False), (3, False), (7, True)])
+def test_runner_precompiles_only_tactics_selected_by_tuner(
+    monkeypatch, sm_minor, low_m_only
+):
     from flashinfer.gemm import gemm_base
 
     calls = []
     monkeypatch.setattr(
         gemm_base, "precompile_mm_mxfp8_tactics", lambda *args: calls.append(args)
     )
-    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 3, False, torch.bfloat16)
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(
+        10, sm_minor, False, torch.bfloat16, low_m_only=low_m_only
+    )
     a, b = torch.empty(8, 4096), torch.empty(4096, 512)
     assert runner.precompile_tactics([a, b], [-1, SPLITK], None)
     assert calls[0][0] == [SPLITK]

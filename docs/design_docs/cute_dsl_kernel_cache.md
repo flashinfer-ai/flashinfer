@@ -234,7 +234,9 @@ separate `mm_mxfp8` namespace from FP4. Source invalidation also covers the
 split-K kernel and the parallel compiler's constructor choices.
 
 Before profiling, the runner precompiles missing tactics using up to four
-spawned processes. `FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS` sets the upper
+dedicated worker processes. Their interpreter entry point imports the compiler
+without rerunning the calling application, so ordinary top-level scripts do not
+need a `__main__` guard. `FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS` sets the upper
 bound; CPU affinity and available host/cgroup memory can lower it. Values 0 or 1
 use ordinary on-demand compilation. A lock per cache directory coordinates
 precompile pools across TP ranks sharing that cache. Each waiting rank rechecks
