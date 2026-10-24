@@ -368,6 +368,138 @@ def assert_w4a16_bits(actual, expected):
     )
 
 
+def canonical_split_w4a16_weights(tensors, gated):
+    """Decode split's packed layout without its production dequantizer.
+
+    Preserve the actual E2M1 codes and E4M3 scales; only undo the scale layout
+    and the gated FC1 row interleave. The oracle then dequantizes these bytes.
+    """
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+
+    def unpack(name):
+        packed = tensors[f"{name}_weight"]
+        experts, rows, packed_k = packed.shape
+        assert packed_k % 8 == 0
+        # Logical scale coordinates are (row%32, row//32%4, row//128,
+        # block%4, block//4, expert). Crop padding before reordering FC1.
+        padded_rows = ((rows + 127) // 128) * 128
+        padded_blocks = ((2 * packed_k + 63) // 64) * 4
+        scales = (
+            tensors[f"{name}_weight_sf"]
+            .permute(5, 2, 1, 0, 4, 3)
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(experts, padded_rows, padded_blocks)
+        )[:, :rows, : packed_k // 8].contiguous()
+        if name == "w1" and gated:
+            # Split stores [up64,gate64,...]; the oracle consumes
+            # canonical [all_gate,all_up], including matching scales.
+            assert rows % 128 == 0
+
+            def gate_first(value):
+                return (
+                    value.reshape(experts, rows // 128, 2, 64, value.shape[-1])
+                    .transpose(1, 2)
+                    .flip(1)
+                    .reshape_as(value)
+                    .contiguous()
+                )
+
+            packed, scales = gate_first(packed), gate_first(scales)
+        return packed, scales.view(torch.float8_e4m3fn)
+
+    w13, w13_scale = unpack("w1")
+    w2, w2_scale = unpack("w2")
+    return PrequantizedMoEWeights(w13, w2, w13_scale, w2_scale)
+
+
+def prepare_split_w4a16_exact_fused(tensors):
+    """Partition FC2 output channels for exact fused tests with top-k > 2.
+
+    Every expert retains arbitrary packed weights on its owned channels, but
+    at most two experts contribute a nonzero term to each output coordinate.
+    With distinct routed experts, the zero-seeded BF16 atomic sum is therefore
+    independent of arrival order. Dense unfused and top-k <= 2 fused tests do
+    not need this fixture and retain their original weights.
+    """
+    weight = tensors["w2_weight"]
+    experts, hidden, _ = weight.shape
+    assert 0 < experts <= 2 * hidden
+    expert = torch.arange(experts, device=weight.device)[:, None]
+    column = torch.arange(hidden, device=weight.device)[None, :]
+    owns_channel = column % min(experts, hidden) == expert % hidden
+    weight.masked_fill_(~owns_channel[:, :, None], 0)
+
+
+def split_w4a16_reference_from_tensors(
+    tensors,
+    *,
+    activation_type=None,
+    use_fused_finalize=True,
+    local_expert_offset=0,
+    swiglu_alpha=1.0,
+    swiglu_beta=0.0,
+    swiglu_limit=3.4028234663852886e38,
+    situ_beta=None,
+    situ_linear_beta=None,
+    token_selected_experts=None,
+    token_final_scales=None,
+    wrong_formula=False,
+):
+    """Adapt the existing split test tensor pack to the shared exact oracle.
+
+    The activation defaults to SwiGLU and finalization defaults to fused, as
+    in the split functional API. Routing overrides support local expert slices
+    and graph tests whose live routing differs from the initial tensor pack.
+    ``wrong_formula`` replaces ReLU2 with plain ReLU as a negative control.
+    """
+    from flashinfer.tllm_enums import ActivationType
+
+    activation_type = (
+        ActivationType.Swiglu if activation_type is None else activation_type
+    )
+    activation = {
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.GegluTanh: "geglu_tanh",
+        ActivationType.Relu2: "relu2",
+        ActivationType.Situ: "situ",
+    }[activation_type]
+    if situ_beta is not None:
+        assert activation in ("swiglu", "situ")
+        activation = "situ"
+    if wrong_formula:
+        assert activation == "relu2"
+        activation = "relu"
+    problem = {
+        "hidden_states": tensors["x_bf16"],
+        "topk_ids": (
+            tensors["token_selected_experts"]
+            if token_selected_experts is None
+            else token_selected_experts
+        ),
+        "topk_weights": (
+            tensors["token_final_scales"]
+            if token_final_scales is None
+            else token_final_scales
+        ),
+        "activation": activation,
+        "gate_up_clamp": swiglu_limit,
+        "swiglu_alpha": swiglu_alpha,
+        "swiglu_beta": swiglu_beta,
+        "situ_beta": situ_beta,
+        "situ_linear_beta": situ_linear_beta,
+    }
+    return w4a16_reference(
+        problem,
+        canonical_split_w4a16_weights(tensors, activation not in ("relu2", "relu")),
+        fc1_alpha=tensors["w1_alpha"],
+        fc2_alpha=tensors["w2_alpha"],
+        backend="split",
+        local_expert_offset=local_expert_offset,
+        use_fused_finalize=use_fused_finalize,
+    )
+
+
 @functools.cache
 def _split_combine_kernel():
     import triton
@@ -448,15 +580,21 @@ def combine_w4a16_split_terms(
     Deterministic mode uses FP32 multiplication for slot zero and FP32 FMA for
     later slots, without FTZ, then one BF16 cast. Invalid slots are skipped.
     Fused mode accepts already weighted BF16 terms and reproduces zero-seeded
-    BF16 atomic addition only for at most two valid local routes per token;
-    larger unordered reductions do not have a unique bit-exact oracle.
+    BF16 atomic addition only for at most two nonzero local terms per output
+    coordinate. Zero additions leave this finite sum unchanged, including its
+    zero-seeded +0 result. Larger unordered sums lack a unique bit-exact oracle.
     """
     assert terms_bf16.dtype == torch.bfloat16 and terms_bf16.ndim == 3
     assert scores_fp32.dtype == torch.float32
     assert local_mask_bool.dtype == torch.bool
     assert terms_bf16.shape[:2] == scores_fp32.shape == local_mask_bool.shape
-    if use_fused_finalize and torch.any(local_mask_bool.sum(dim=1) > 2).item():
-        raise ValueError("Exact fused split combine supports at most two local routes")
+    if use_fused_finalize:
+        nonzero = (terms_bf16 != 0) & local_mask_bool[:, :, None]
+        if torch.any(nonzero.sum(dim=1) > 2).item():
+            raise ValueError(
+                "Exact fused split combine supports at most two nonzero local "
+                "terms per output coordinate"
+            )
     terms, scores, local = (
         terms_bf16.contiguous(),
         scores_fp32.contiguous(),
@@ -519,16 +657,27 @@ def _split_activation_kernel():
         LINEAR_INV_BETA: tl.constexpr,
     ):
         index = tl.program_id(0) * 256 + tl.arange(0, 256)
-        if ACTIVATION == "relu2":
+        if ACTIVATION == "relu2" or ACTIVATION == "relu":
             value = tl.load(FC1 + index, index < N, other=0)
-            result = tl.inline_asm_elementwise(
-                "{ .reg .f32 r; max.f32 r, $1, 0f00000000; mul.rn.f32 $0, r, r; }",
-                constraints="=f,f",
-                args=[value],
-                dtype=tl.float32,
-                is_pure=True,
-                pack=1,
-            )
+            if ACTIVATION == "relu2":
+                result = tl.inline_asm_elementwise(
+                    "{ .reg .f32 r; max.f32 r, $1, 0f00000000; mul.rn.f32 $0, r, r; }",
+                    constraints="=f,f",
+                    args=[value],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+            else:
+                # Test-only counterfactual for the ReLU2 activation contract.
+                result = tl.inline_asm_elementwise(
+                    "max.f32 $0, $1, 0f00000000;",
+                    constraints="=f,f",
+                    args=[value],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
         else:
             offset = (index // I) * (2 * I) + index % I
             gate = tl.load(FC1 + offset, index < N, other=0)
@@ -667,7 +816,7 @@ def _split_reference(
     if dist.is_initialized() and dist.get_world_size() != 1:
         raise ValueError("The split reference supports a single rank")
     activation_kind = problem.get("activation", "swiglu")
-    assert activation_kind in ("swiglu", "geglu_tanh", "relu2", "situ")
+    assert activation_kind in ("swiglu", "geglu_tanh", "relu2", "relu", "situ")
     matmul = torch.backends.cuda.matmul
     if not hasattr(matmul, "allow_bf16_reduced_precision_reduction_split_k"):
         pytest.skip("Bit-exact W4A16 oracle requires PyTorch 2.12 BF16 split-K control")
@@ -677,10 +826,6 @@ def _split_reference(
     experts = weights.w13.shape[0]
     offset = 0 if local_expert_offset is None else local_expert_offset
     local = (ids >= offset) & (ids < offset + experts)
-    if use_fused_finalize and torch.any(local.sum(dim=1) > 2).item():
-        raise ValueError(
-            "Exact fused split reference supports at most two local routes"
-        )
     terms = torch.zeros((*ids.shape, x.shape[1]), dtype=torch.bfloat16, device=x.device)
     fc1_alpha = torch.ones(experts, device=x.device) if fc1_alpha is None else fc1_alpha
     fc2_alpha = torch.ones(experts, device=x.device) if fc2_alpha is None else fc2_alpha
@@ -720,7 +865,7 @@ def _split_reference(
             w2 = _dequantize(weights.w2[expert], weights.w2_scale[expert])
             intermediate = w2.shape[1]
             assert w13.shape[0] == intermediate * (
-                1 if activation_kind == "relu2" else 2
+                1 if activation_kind in ("relu2", "relu") else 2
             )
             for start in range(0, rows.numel(), 256):
                 batch, route_slots = (
@@ -784,7 +929,7 @@ def w4a16_reference(
     Both modes accept canonical logical weights, not a production packed layout.
     The default MegaMoE path retains its existing distributed and IKR behavior.
     Split mode supports local expert slices on one rank; its fused reference is
-    limited to two local contributions because larger BF16 atomic sums reorder.
+    limited to two nonzero terms per coordinate because larger BF16 sums reorder.
     """
     if backend == "megamoe":
         if local_expert_offset is not None or use_fused_finalize:

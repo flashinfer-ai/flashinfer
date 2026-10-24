@@ -53,6 +53,11 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.w4a16_reference import (
+    assert_w4a16_bits,
+    prepare_split_w4a16_exact_fused,
+    split_w4a16_reference_from_tensors,
+)
 from .utils import (
     check_accuracy,
     compute_reference_moe_fp4,
@@ -184,6 +189,8 @@ _MOE_QUANT_MODE_CASES = (
 def _prepare_moe_quant_mode_inputs(
     tensors: dict,
     quant_mode: str,
+    *,
+    use_fused_finalize: bool = True,
 ) -> tuple[dict, dict]:
     """Select API and reference inputs for a shared MoE test case."""
     if quant_mode == "w4a4":
@@ -205,6 +212,12 @@ def _prepare_moe_quant_mode_inputs(
             },
         )
     elif quant_mode == "w4a16":
+        if use_fused_finalize and tensors["token_selected_experts"].shape[1] > 2:
+            # Keep every route active while limiting each FC2 output channel
+            # to two expert owners. Arbitrary BF16 atomic sums of >2 nonzero
+            # terms depend on arrival order and have no single exact result.
+            # Unfused tests and fused top-k<=2 retain the original dense weights.
+            prepare_split_w4a16_exact_fused(tensors)
         return (
             {
                 "x": tensors["x_bf16"],
@@ -212,22 +225,45 @@ def _prepare_moe_quant_mode_inputs(
                 "fc2_input_scale": None,
                 "per_token_scale": None,
             },
-            {
-                "hidden_states": tensors["x_bf16"],
-                "gemm1_weights": (
-                    tensors["w1_weight_bf16"].float()
-                    * tensors["w1_alpha"].view(-1, 1, 1)
-                ).to(torch.bfloat16),
-                "gemm2_weights": (
-                    tensors["w2_weight_bf16"].float()
-                    * tensors["w2_alpha"].view(-1, 1, 1)
-                ).to(torch.bfloat16),
-                "fc2_input_scale": None,
-                "use_per_token_activation": False,
-            },
+            {},
         )
     else:
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
+
+
+def _compute_moe_quant_mode_reference(
+    tensors, quant_mode, *, use_fused_finalize=True, **kwargs
+):
+    if quant_mode == "w4a16":
+        # The shared oracle reads the actual packed E2M1 weights and E4M3 scale
+        # planes, preserving alpha, activation and combine rounding separately.
+        reference_keys = (
+            "activation_type",
+            "local_expert_offset",
+            "swiglu_alpha",
+            "swiglu_beta",
+            "swiglu_limit",
+            "situ_beta",
+            "situ_linear_beta",
+            "token_selected_experts",
+            "token_final_scales",
+        )
+        return split_w4a16_reference_from_tensors(
+            tensors,
+            use_fused_finalize=use_fused_finalize,
+            **{key: kwargs[key] for key in reference_keys if key in kwargs},
+        )
+    return compute_reference_moe_fp4(**kwargs)
+
+
+def _assert_moe_quant_mode_reference(actual, expected, quant_mode):
+    if quant_mode == "w4a16":
+        assert_w4a16_bits(actual, expected)
+    else:
+        passed, percent_within, atol = check_accuracy(actual, expected)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
 
 
 def test_geglu_tanh_activation_is_supported():
@@ -1778,10 +1814,11 @@ class TestCuteDslMoeW4A16:
         # Weight scales are serving-owned tensors and may be updated in place.
         # Reuse the same allocation to ensure W4A16 reads the current contents.
         result = run()
+        assert_w4a16_bits(result, split_w4a16_reference_from_tensors(tensors))
         assert torch.count_nonzero(result).item() > 0
         tensors["w1_weight_sf"].zero_()
         updated = run()
-        torch.testing.assert_close(updated, torch.zeros_like(updated), rtol=0, atol=0)
+        assert_w4a16_bits(updated, torch.zeros_like(updated))
 
     @pytest.mark.parametrize("scale_axis", ["row", "k"])
     @pytest.mark.parametrize(
@@ -1862,7 +1899,7 @@ class TestCuteDslMoeW4A16:
         expected[:scale_k] = (
             scale_codes.squeeze(0).view(torch.float8_e4m3fn).to(torch.bfloat16).T
         )
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        assert_w4a16_bits(output, expected)
 
     @pytest.mark.parametrize(
         "route_tile,gemm1_tactic,gemm2_tactic",
@@ -1939,7 +1976,9 @@ class TestCuteDslMoeW4A16:
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
         )
-        _, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a16")
+        _, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, "w4a16", use_fused_finalize=use_fused_finalize
+        )
         tactic = (gemm1_tactic, gemm2_tactic)
         assert tactic in W4A16_MOE_TACTICS
 
@@ -1964,7 +2003,10 @@ class TestCuteDslMoeW4A16:
             activation_type=ActivationType.Swiglu,
             tactic=tactic,
         )
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            "w4a16",
+            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -1976,10 +2018,7 @@ class TestCuteDslMoeW4A16:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, "w4a16")
 
 
 # =============================================================================
@@ -2188,7 +2227,7 @@ class TestCuteDslFusedMoeFunctional:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode
+            tensors, quant_mode, use_fused_finalize=use_fused_finalize
         )
 
         result = cute_dsl_fused_moe(
@@ -2214,7 +2253,10 @@ class TestCuteDslFusedMoeFunctional:
         assert not torch.isnan(result).any()
         assert not torch.isinf(result).any()
 
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
+            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2226,10 +2268,7 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
@@ -2272,7 +2311,9 @@ class TestCuteDslFusedMoeFunctional:
             **api_inputs,
         )
 
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2284,7 +2325,9 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        swiglu_ref_output = compute_reference_moe_fp4(
+        swiglu_ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2296,16 +2339,18 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
-        geglu_error = torch.mean(torch.abs(result.float() - ref_output)).item()
-        swiglu_error = torch.mean(torch.abs(result.float() - swiglu_ref_output)).item()
-        assert geglu_error < swiglu_error, (
-            f"GeGLU output is not closer to GeGLU reference ({geglu_error:.4f}) "
-            f"than SwiGLU reference ({swiglu_error:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
+        if quant_mode == "w4a16":
+            assert not torch.equal(result, swiglu_ref_output)
+        else:
+            geglu_error = torch.mean(torch.abs(result.float() - ref_output)).item()
+            swiglu_error = torch.mean(
+                torch.abs(result.float() - swiglu_ref_output)
+            ).item()
+            assert geglu_error < swiglu_error, (
+                f"GeGLU output is not closer to GeGLU reference ({geglu_error:.4f}) "
+                f"than SwiGLU reference ({swiglu_error:.4f})"
+            )
 
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
@@ -2360,7 +2405,9 @@ class TestCuteDslFusedMoeFunctional:
             **api_inputs,
         )
 
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2374,7 +2421,9 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        swiglu_ref_output = compute_reference_moe_fp4(
+        swiglu_ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2386,16 +2435,18 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
-        situ_error = torch.mean(torch.abs(result.float() - ref_output)).item()
-        swiglu_error = torch.mean(torch.abs(result.float() - swiglu_ref_output)).item()
-        assert situ_error < swiglu_error, (
-            f"SiTU output is not closer to SiTU reference ({situ_error:.4f}) "
-            f"than SwiGLU reference ({swiglu_error:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
+        if quant_mode == "w4a16":
+            assert not torch.equal(result, swiglu_ref_output)
+        else:
+            situ_error = torch.mean(torch.abs(result.float() - ref_output)).item()
+            swiglu_error = torch.mean(
+                torch.abs(result.float() - swiglu_ref_output)
+            ).item()
+            assert situ_error < swiglu_error, (
+                f"SiTU output is not closer to SiTU reference ({situ_error:.4f}) "
+                f"than SwiGLU reference ({swiglu_error:.4f})"
+            )
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_with_autotune(self, quant_mode: str):
@@ -2444,6 +2495,15 @@ class TestCuteDslFusedMoeFunctional:
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
+        if quant_mode == "w4a16":
+            reference = split_w4a16_reference_from_tensors(
+                tensors,
+                swiglu_alpha=1.702,
+                swiglu_beta=1.0,
+                swiglu_limit=7.0,
+            )
+            assert_w4a16_bits(result, reference)
+
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_swiglu_oai_accuracy(self, quant_mode: str):
         """Accuracy test for the OAI SwiGLU epilogue variant."""
@@ -2488,7 +2548,9 @@ class TestCuteDslFusedMoeFunctional:
             **api_inputs,
         )
 
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2503,10 +2565,7 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     @pytest.mark.parametrize("swiglu_limit", [0.05, 0.1])
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
@@ -2557,24 +2616,27 @@ class TestCuteDslFusedMoeFunctional:
             activation_type=ActivationType.Swiglu,
             **reference_inputs,
         )
-        ref_output = compute_reference_moe_fp4(
-            swiglu_limit=swiglu_limit, **reference_kwargs
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors, quant_mode, swiglu_limit=swiglu_limit, **reference_kwargs
         )
-        unclamped_ref = compute_reference_moe_fp4(**reference_kwargs)
+        unclamped_ref = _compute_moe_quant_mode_reference(
+            tensors, quant_mode, **reference_kwargs
+        )
 
         def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
             return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
-        # The outputs are small enough that check_accuracy's absolute floor
-        # accepts an unclamped result, so also require the limit to bind and
-        # the result to land far closer to the clamped reference.
-        assert rel_err(ref_output, unclamped_ref) > 0.5
-        assert rel_err(result, ref_output) < 0.5 * rel_err(result, unclamped_ref)
+        if quant_mode == "w4a16":
+            assert not torch.equal(ref_output, unclamped_ref), "Clamp must bind"
+            assert not torch.equal(result, unclamped_ref)
+        else:
+            # The outputs are small enough that check_accuracy's absolute floor
+            # accepts an unclamped result, so also require the limit to bind and
+            # the result to land far closer to the clamped reference.
+            assert rel_err(ref_output, unclamped_ref) > 0.5
+            assert rel_err(result, ref_output) < 0.5 * rel_err(result, unclamped_ref)
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
 
 # =============================================================================
@@ -2620,7 +2682,7 @@ class TestCuteDslMoEWrapper:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode
+            tensors, quant_mode, use_fused_finalize=use_fused_finalize
         )
 
         # Create wrapper WITHOUT CUDA graph
@@ -2650,7 +2712,10 @@ class TestCuteDslMoEWrapper:
         assert not torch.isnan(result).any()
         assert not torch.isinf(result).any()
 
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
+            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2661,10 +2726,7 @@ class TestCuteDslMoEWrapper:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_wrapper_swiglu_oai_accuracy(self, quant_mode: str):
@@ -2716,7 +2778,9 @@ class TestCuteDslMoEWrapper:
             **api_inputs,
         )
 
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2731,10 +2795,7 @@ class TestCuteDslMoEWrapper:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
@@ -2771,7 +2832,7 @@ class TestCuteDslMoEWrapper:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode
+            tensors, quant_mode, use_fused_finalize=use_fused_finalize
         )
 
         # Create wrapper WITH CUDA graph
@@ -2840,7 +2901,9 @@ class TestCuteDslMoEWrapper:
             results.append(output.clone())
 
         for i in range(1, len(results)):
-            if use_fused_finalize:
+            if quant_mode == "w4a16":
+                assert_w4a16_bits(results[0], results[i])
+            elif use_fused_finalize:
                 max_diff = (results[0] - results[i]).abs().max().item()
                 assert max_diff < 0.5, (
                     f"Replay {i} differs too much: max_diff={max_diff}"
@@ -2849,7 +2912,10 @@ class TestCuteDslMoEWrapper:
                 assert torch.equal(results[0], results[i]), f"Replay {i} differs"
 
         # Verify accuracy
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
+            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2864,10 +2930,7 @@ class TestCuteDslMoEWrapper:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(results[0], ref_output)
-        assert passed, (
-            f"CUDA graph accuracy: {percent_within * 100:.2f}% (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(results[0], ref_output, quant_mode)
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     @pytest.mark.parametrize(
@@ -2935,7 +2998,9 @@ class TestCuteDslMoEWrapper:
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2949,10 +3014,7 @@ class TestCuteDslMoEWrapper:
             situ_linear_beta=situ_linear_beta,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     def test_cuda_graph_wrapper_lifetime_before_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC."""
@@ -3202,6 +3264,13 @@ class TestApiConsistency:
         assert not torch.isnan(result_functional).any()
         assert not torch.isnan(result_wrapper).any()
 
+        if quant_mode == "w4a16":
+            reference = split_w4a16_reference_from_tensors(tensors)
+            assert_w4a16_bits(result_functional, reference)
+            assert_w4a16_bits(result_wrapper, reference)
+            assert_w4a16_bits(result_functional, result_wrapper)
+            return
+
         # Outputs should be very close (may not be exactly equal due to different
         # tuning paths, but should be within FP4 tolerance)
         diff = (result_functional - result_wrapper).abs()
@@ -3285,7 +3354,9 @@ class TestExpertParallelism:
         assert not torch.isinf(result).any()
 
         # Numerical accuracy verification against reference
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
             token_selected_experts=token_selected_experts,
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -3298,11 +3369,7 @@ class TestExpertParallelism:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"EP accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}, "
-            f"offset={local_expert_offset}): {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
@@ -3337,7 +3404,7 @@ class TestExpertParallelism:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode
+            tensors, quant_mode, use_fused_finalize=use_fused_finalize
         )
 
         result = cute_dsl_fused_moe(
@@ -3363,7 +3430,10 @@ class TestExpertParallelism:
         assert not torch.isinf(result).any()
 
         # Numerical accuracy verification
-        ref_output = compute_reference_moe_fp4(
+        ref_output = _compute_moe_quant_mode_reference(
+            tensors,
+            quant_mode,
+            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -3376,11 +3446,7 @@ class TestExpertParallelism:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"EP functional API accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}): "
-            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
+        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
 
 # =============================================================================

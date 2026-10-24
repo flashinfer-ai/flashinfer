@@ -15,6 +15,7 @@ from flashinfer.tllm_enums import (
 )
 from tests.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
+    canonical_split_w4a16_weights,
     combine_w4a16_split_terms,
     w4a16_reference,
 )
@@ -123,42 +124,6 @@ def test_dynamic_n_grouped_gemm_tails(mma_m, route_tile, cluster_m, activation_t
         # Includes the untouched invalid rows, so writing stale accumulator
         # columns cannot pass merely because the live prefix was correct.
         assert_w4a16_bits(output, expected)
-
-
-def _canonical_reference_weights(tensors, gated):
-    """Read packed split weights without using the production dequantizer."""
-    from flashinfer.moe_ep import PrequantizedMoEWeights
-
-    def unpack(name):
-        packed = tensors[f"{name}_weight"]
-        experts, rows, packed_k = packed.shape
-        # Logical scale coordinates are (row%32, row//32%4, row//128,
-        # block%4, block//4, expert). Flatten them to [expert,row,block].
-        scales = (
-            tensors[f"{name}_weight_sf"]
-            .permute(5, 2, 1, 0, 4, 3)
-            .contiguous()
-            .view(torch.uint8)
-            .reshape(experts, rows, packed_k // 8)
-        )
-        if name == "w1" and gated:
-            # Split stores [up64,gate64,...]; the shared oracle consumes
-            # canonical [all_gate,all_up], including the matching scales.
-            def gate_first(value):
-                return (
-                    value.reshape(experts, rows // 128, 2, 64, value.shape[-1])
-                    .transpose(1, 2)
-                    .flip(1)
-                    .reshape_as(value)
-                    .contiguous()
-                )
-
-            packed, scales = gate_first(packed), gate_first(scales)
-        return packed, scales.view(torch.float8_e4m3fn)
-
-    w13, w13_scale = unpack("w1")
-    w2, w2_scale = unpack("w2")
-    return PrequantizedMoEWeights(w13, w2, w13_scale, w2_scale)
 
 
 @pytest.mark.parametrize(
@@ -310,7 +275,7 @@ def _check_dynamic_n_graph_routing(
             **activation_options,
         )
 
-    weights = _canonical_reference_weights(tensors, gated)
+    weights = canonical_split_w4a16_weights(tensors, gated)
     activation = {
         ActivationType.Swiglu: "swiglu",
         ActivationType.GegluTanh: "geglu_tanh",

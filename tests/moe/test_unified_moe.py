@@ -2813,6 +2813,55 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
     runner = layer.runners[0]
     layer._select_winner = lambda *_: (runner, -1)
     actual = layer(act_pack, weight_pack)
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+        from tests.test_helpers.w4a16_reference import (
+            assert_w4a16_bits,
+            split_w4a16_reference_from_tensors,
+        )
+
+        def exact_reference(value, *, wrong_formula=False):
+            activation_options = {"activation_type": value.type}
+            if isinstance(value, SwiGLU):
+                activation_options.update(
+                    swiglu_alpha=value.alpha,
+                    swiglu_beta=value.beta,
+                    swiglu_limit=value.limit,
+                )
+            elif isinstance(value, SiTU):
+                activation_options.update(
+                    situ_beta=value.gate_scale,
+                    situ_linear_beta=value.linear_scale,
+                )
+            return split_w4a16_reference_from_tensors(
+                tensors,
+                token_selected_experts=act_pack.topk_ids,
+                token_final_scales=act_pack.topk_weights,
+                local_expert_offset=config.experts.local_expert_offset,
+                use_fused_finalize=config.finalize.use_fused_finalize,
+                wrong_formula=wrong_formula,
+                **activation_options,
+            )
+
+        reference = exact_reference(activation)
+        assert_w4a16_bits(actual, reference)
+        # The same packed inputs must distinguish the intended formula from
+        # a counterfactual with matching gated/non-gated geometry.
+        control = {
+            ActivationType.Swiglu: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
+            ActivationType.Situ: SiTU(gate_scale=0.25, linear_scale=0.5),
+            ActivationType.GegluTanh: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
+        }.get(activation.type)
+        control_reference = (
+            exact_reference(activation, wrong_formula=True)
+            if control is None
+            else exact_reference(control)
+        )
+        assert torch.isfinite(control_reference).all()
+        assert not torch.equal(
+            actual.view(torch.int16), control_reference.view(torch.int16)
+        ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
+        return
+
     reference = _compute_ref(act_pack, tensors, shape, activation)
     passed, pct, atol = check_accuracy(actual, reference)
     assert passed, (

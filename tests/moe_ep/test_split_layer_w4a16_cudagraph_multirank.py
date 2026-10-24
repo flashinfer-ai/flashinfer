@@ -31,6 +31,8 @@ from datetime import timedelta
 
 import pytest
 
+from tests.test_helpers.w4a16_reference import assert_w4a16_bits
+
 pytestmark = [
     pytest.mark.nvep,
     pytest.mark.gpu_4,
@@ -172,12 +174,12 @@ def _build_layer(rank, world_size, backend):
 def _make_tensors(rank):
     """Per-rank inputs for the W4A16 chain.
 
-    ``topk_weights`` comes from a softmax, so every token's combine weights
-    sum to 1 and the combined result stays O(x) rather than scaled by TOPK --
-    which keeps the eager-vs-replay tolerance meaningful. The seed is
-    rank-dependent on purpose: identical routing on every rank would make
-    dispatch trivially balanced and hide a slot-arithmetic bug behind a
-    uniform load.
+    Two dyadic combine weights keep this transport/capture regression exact:
+    BF16 expert outputs times 1/4 or 3/4 are exactly representable in FP32,
+    and exchanging the two reduction terms does not change the result.
+    Arbitrary routing weights are covered by the shared single-rank oracle
+    tests. The rank-dependent seed keeps dispatch irregular, so a slot bug
+    cannot hide behind identical inputs and routing on every rank.
     """
     import torch
 
@@ -195,9 +197,7 @@ def _make_tensors(rank):
         dtype=torch.int64,
         generator=g,
     )
-    w = torch.softmax(
-        torch.randn(TOKENS_PER_RANK, TOPK, device="cuda", generator=g), dim=-1
-    )
+    w = torch.tensor([0.25, 0.75], device="cuda").expand(TOKENS_PER_RANK, -1).clone()
     return MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=w)
 
 
@@ -267,13 +267,12 @@ def test_w4a16_split_layer_chain_is_capturable(backend):
         "eager output is all zeros -- the W4A16 path degenerated, and every "
         "graph assertion below would pass vacuously"
     )
-    # (2)+(3) replay is faithful. NVFP4 weights are quantized once at layer
-    # construction and the same kernel runs both times, so eager and replay
-    # should agree tightly; the tolerance covers only reduction-order noise.
-    torch.testing.assert_close(replay_same, eager, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(replay_newx, eager_newx, atol=5e-2, rtol=5e-2)
+    # (2)+(3) replay is bitwise faithful. Weights are quantized once at layer
+    # construction; the explicit two-term combine fixture is order-independent.
+    assert_w4a16_bits(replay_same, eager)
+    assert_w4a16_bits(replay_newx, eager_newx)
     # (4) replay re-ran rather than serving a stale buffer
-    assert not torch.allclose(replay_newx, replay_same, atol=5e-2, rtol=5e-2), (
+    assert not torch.equal(replay_newx, replay_same), (
         "replay did not track activations rewritten between replays"
     )
 
@@ -350,12 +349,12 @@ def test_w4a16_graph_matches_eager_across_routing_changes(backend):
     dist.barrier()
 
     assert torch.isfinite(before).all() and torch.isfinite(after).all()
-    torch.testing.assert_close(before, eager_before, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(after, eager_newids, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(after_weights, eager_newweights, atol=5e-2, rtol=5e-2)
-    assert not torch.allclose(after, before, atol=5e-2, rtol=5e-2), (
+    assert_w4a16_bits(before, eager_before)
+    assert_w4a16_bits(after, eager_newids)
+    assert_w4a16_bits(after_weights, eager_newweights)
+    assert not torch.equal(after, before), (
         "replay did not track topk_ids rewritten between replays"
     )
-    assert not torch.allclose(after_weights, after, atol=5e-2, rtol=5e-2), (
+    assert not torch.equal(after_weights, after), (
         "replay did not track topk_weights rewritten between replays"
     )
