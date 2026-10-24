@@ -1,0 +1,104 @@
+{
+  "cases": 120,
+  "candidate_sha256": "9b57b20126b56029fc717c7c6591a63447ac5c021fbd0498e1299a5865447c8b",
+  "runs": [
+    {
+      "order": "forward",
+      "seed": 73,
+      "scale": 1,
+      "cases": 15,
+      "geomean": 1.0154180831135822
+    },
+    {
+      "order": "forward",
+      "seed": 73,
+      "scale": 32,
+      "cases": 15,
+      "geomean": 1.0172475810904893
+    },
+    {
+      "order": "forward",
+      "seed": 109,
+      "scale": 1,
+      "cases": 15,
+      "geomean": 1.0193950630612632
+    },
+    {
+      "order": "forward",
+      "seed": 109,
+      "scale": 32,
+      "cases": 15,
+      "geomean": 1.015303696717531
+    },
+    {
+      "order": "reverse",
+      "seed": 73,
+      "scale": 1,
+      "cases": 15,
+      "geomean": 1.0224299704870925
+    },
+    {
+      "order": "reverse",
+      "seed": 73,
+      "scale": 32,
+      "cases": 15,
+      "geomean": 1.0222308331144603
+    },
+    {
+      "order": "reverse",
+      "seed": 109,
+      "scale": 1,
+      "cases": 15,
+      "geomean": 1.022378039536805
+    },
+    {
+      "order": "reverse",
+      "seed": 109,
+      "scale": 32,
+      "cases": 15,
+      "geomean": 1.0222587596528938
+    }
+  ],
+  "baseline_sha256": "ec32fae9254adb9b888c0affd99822c89806a5881de04db0b0a755d81f6f90a3",
+  "bridge_sha256": "3ca4abc5d3401b0965891b075aecff1254c7242d354ceea6ba5fd49808f93e09",
+  "preallocated": true,
+  "geomean": 1.0195783833181806,
+  "worst": {
+    "shape": [
+      16,
+      2048,
+      7168
+    ],
+    "algorithm": 70,
+    "relative_rms": 0.0016488326393529736,
+    "quant_relative_rms_vs_base": 0.0,
+    "chain_relative_rms_vs_base": 0.0,
+    "baseline_us": 20.6183837890625,
+    "candidate_us": 20.67371520996094,
+    "speedup": 0.9973235859962035,
+    "samples_us": {
+      "baseline": [
+        20.654931640625,
+        20.61921844482422,
+        20.61754913330078,
+        20.63093719482422,
+        20.60750732421875,
+        20.604261779785155
+      ],
+      "candidate": [
+        20.693452453613283,
+        20.6621826171875,
+        20.67881622314453,
+        20.67059783935547,
+        20.657228088378908,
+        20.676832580566405
+      ]
+    },
+    "order": "reverse",
+    "seed": 109,
+    "scale": 1
+  },
+  "regressions_over_2pct": [],
+  "max_chain_relative_rms_vs_base": 0.0002312284050276503,
+  "max_gemm_relative_rms": 0.0018048520558651825
+}

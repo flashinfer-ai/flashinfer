@@ -1,0 +1,5 @@
+9b57b20126b56029fc717c7c6591a63447ac5c021fbd0498e1299a5865447c8b  ../cute-src/flashinfer/cute_dsl/rmsnorm_fp4quant.py
+ed3410b40c3b6c7f9e5f300929bd462d7d24e265dd8c7e420dfbe126038914cd  ../cute-src/benchmarks/bench_rmsnorm_fp4quant_gemm.py
+c9f0de8ca0d09b2161de1ee1ae29b0dd59a2d94c52eeba34bf7b1f58d57d8158  ../cute-src/benchmarks/rmsnorm_fp4quant_cublaslt.cu
+ec32fae9254adb9b888c0affd99822c89806a5881de04db0b0a755d81f6f90a3  baseline/rmsnorm_fp4quant.py
+3ca4abc5d3401b0965891b075aecff1254c7242d354ceea6ba5fd49808f93e09  integrated_bridge.so
