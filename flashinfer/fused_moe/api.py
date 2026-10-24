@@ -3124,7 +3124,8 @@ class FrostLowLatencyConfig:
 
         Canonical gated FC1 rows use [up,gate] order. H is divisible by128;
         logical I is divisible by32 and padded to128. Configure MXFP4 weights
-        with BF16 activations/output. No activation quantization is performed.
+        with BF16/FP16 activations and BF16/FP16 output. No activation
+        quantization is performed.
         """
         import torch
         from .backends.frost_low_latency.fp4_weight_only import prepare_weights
@@ -3159,7 +3160,8 @@ class FrostLowLatencyConfig:
         FP32 global scales dequantize each expert; FC1 accepts [E] or
         [E,branches] and FC2 accepts [E]. H is divisible by 128; logical I
         is divisible by 32 and padded to 128. Configure NVFP4 weights with
-        BF16 inputs/output; no activation quantization is performed.
+        BF16/FP16 inputs and BF16/FP16 output; no activation quantization
+        is performed.
         All tensors must reside on the same CUDA device. Payloads and scales
         from a 4over6 checkpoint are preserved without requantization.
         """
