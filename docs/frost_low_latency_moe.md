@@ -454,6 +454,10 @@ the SM100-family tcgen05/TMEM tactics; MX and NVFP4 continue to produce BF16.
 Historical B300 tables do not establish FP16 or SM120 speedups. The following
 measurements qualify one FP16 workload on SM120.
 
+Native SM120 BF16/NVFP4 T5–8 also has a bounded Tensor Core extension.
+See the [updated native-baseline comparison](sm120_w4a16_decode.md) before
+using historical T8 Frost speedups.
+
 ### FP16 on SM120
 
 NVIDIA RTX PRO 6000 Blackwell Workstation Edition, CUDA 13.0,

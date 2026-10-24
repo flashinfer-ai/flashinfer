@@ -138,7 +138,7 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
         _SMALL_BATCH_TILE_CONFIGS,
         _LARGE_BATCH_TILE_CONFIGS,
         _direct_topk_route_m_cap,
-        _TC_DECODE_MAX_M,
+        _tc_decode_m_cap,
     )
     from flashinfer.quantization.fp4_quantization import block_scale_interleave
 
@@ -181,7 +181,9 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
     block = select_route_block_size_m(t, k, e)
     compiled = {}
     fp16 = x.dtype is torch.float16
-    tc_decode = not fp16 and t <= _TC_DECODE_MAX_M
+    tc_decode = not fp16 and t <= _tc_decode_m_cap(
+        int(props.major) * 10 + int(props.minor), "bf16", "packed", "e4m3_k16", h, i, k
+    )
     direct = tc_decode or t <= _direct_topk_route_m_cap(
         "fp16" if fp16 else "bf16", "packed", "e4m3_k16", h, i, k
     )
