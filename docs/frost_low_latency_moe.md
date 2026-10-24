@@ -1,7 +1,8 @@
 # FROST low-latency routed MoE
 
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
-SM100/SM103/SM107, with FMA-only support on SM90 and SM120.
+SM100/SM103/SM107, with FMA coverage on SM90 and SM120 and bounded
+BF16 grouped Tensor Core candidates on SM90/SM120.
 SM90 admits BF16, FP16, ordinary per-tensor FP8, DeepSeek block FP8 and
 NVFP4/MXFP4/MXINT4 weights with BF16/FP16 activations. MXFP8 inputs and NVFP4 activations remain
 unsupported on SM90. The MX Tensor Core path uses
@@ -21,6 +22,29 @@ the complete pipelines. The MX untuned default remains Tensor Core on SM100/103/
 and uses FMA on SM120. BF16, FP16 and ordinary per-tensor FP8 use
 shared FMA kernels and independently tune one, two, four or eight output
 columns per warp in FC1 and FC2.
+
+Hopper and SM120 additionally offer grouped Tensor Core tactics for the qualified BF16 input,
+weight and output workload: default SwiGLU, H=2048, I=512, top-k=10,
+T=4 or T=8, with finalization. Hopper offers three WGMMA pipeline depths: T4 uses K128 and T8 uses K64,
+with two matching routes per weight load. SM120 offers two warp-MMA
+configurations at T4 and four at T8, varying route-group size, K tile and depth.
+They were selected from 15 valid configurations; warm and cold cases can prefer
+different groups and tiles.
+The original 16 FMA choices remain available and the untuned default remains FMA.
+Other workloads retain their existing advertised tactics.
+
+Both paths read the same prepared weights as FMA. Each CTA discovers live
+matching expert IDs, loads original up/gate weight slices with TMA, and uses
+WGMMA on Hopper or warp MMA on SM120 for both projections. FC1 applies the shared activation before writing
+the typed intermediate. FC2 writes typed expert partials, followed by the same
+ascending-slot FP32 multiply/add combine contract. It needs neither an offline
+interleaved weight copy nor FP32 projection scratch. Repeated, invalid and
+changing routes are handled at execution time; no route values enter the compile
+cache. The shared runtime binds current input/output buffers and stream for every
+call, including replay with changed routes and independently captured buffers.
+Reuse-heavy cases can benefit, while disjoint routes still favor FMA.
+An autotuned choice remains dependent on the profiling routes and cache state;
+this is not a universal token-count heuristic.
 
 Frost uses the existing FlashInfer autotuner. Each runner retains its own
 tuning policy; cross-backend selection measures packing plus forward with the
@@ -326,7 +350,7 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16/FP16-activation FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
+| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16/FP16-activation FMA, top-k <= 32, plus grouped BF16 WGMMA for the qualified workload above; SM100/103/107: FMA and MX Tensor Core; SM120: FMA, top-k <= 32, plus grouped BF16 warp MMA for the qualified workload above |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
 | Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3/NVFP4/MXFP4/MXINT4 weight-only checkpoints with BF16/FP16 input and output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
