@@ -378,10 +378,11 @@ def _activation_precision_from_quant_mode(quant_mode: str) -> str:
 
 def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
     normalized = _normalize_source_format(source_format)
-    if quant_mode != "w4a16" and normalized == "compressed_tensors":
-        raise ValueError(
-            "source_format='compressed_tensors' requires quant_mode='w4a16'."
-        )
+    if quant_mode != "w4a16" and normalized in (
+        "compressed_tensors",
+        "modelopt_e4m3_k32",
+    ):
+        raise ValueError(f"source_format={normalized!r} requires quant_mode='w4a16'.")
     return normalized
 
 
