@@ -1215,8 +1215,8 @@ kernel_cake_kda_train_945a87fa84a265fc9f94(const __grid_constant__ CUtensorMap a
             unsigned int mst = 0;
             unsigned int _phase_wy_full_0 = 0;
             unsigned int _phase_vb_ready_0 = 0;
-            unsigned int _phase_tiles_full = 0;
             unsigned int _phase_w_ready_0 = 0;
+            unsigned int _phase_tiles_full = 0;
             unsigned int _phase_hs_ready_0_2 = 0;
             unsigned int _phase_bv_ready_0_1 = 0;
             unsigned int _phase_dec_done_0 = 0;

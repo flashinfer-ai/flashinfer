@@ -856,8 +856,8 @@ kernel_cake_kda_train_cab3e194b7e9e7557edf(const __grid_constant__ CUtensorMap a
             int nc_3 = seq_chunk_start[seq_3 + 1] - c0_3;
             int row0_3 = c0_3 * 64;
             unsigned int stage_1 = 0;
-            unsigned int _phase_wy_full_0 = 0;
             unsigned int _phase_akk_ready_0 = 0;
+            unsigned int _phase_wy_full_0 = 0;
             unsigned int _phase_vb_ready_0 = 0;
             unsigned int _phase_tiles_full = 0;
             unsigned int _phase_w_ready_0_1 = 0;
