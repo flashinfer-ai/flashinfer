@@ -580,6 +580,12 @@ reports that gap).
   they need through `CAKE_DSA_H64_TRAIN_NEED_*` defines before the include;
   this header is part of the same hand fold, ships with the sources and is
   covered by no `build.json` digest.
+  The main and forward bindings take their host-side check helpers from
+  `cake_dsa_h64_train_binding_helpers.h` and their shared tensor-map
+  encoders from `cake_dsa_h64_train_binding_tma_<operand>.h`, each included
+  once inside the binding's namespace; these ten headers are part of the
+  same hand fold, ship with the sources and are covered by no `build.json`
+  digest.
 
 ## Status
 
