@@ -124,14 +124,14 @@ def test_every_window_matches_the_reference(form):
     weight_before_norm, enable_pdl = form
     route = pkg.gated_residual_rmsnorm_route(weight_before_norm, enable_pdl)
     launched = []
-    original = loader.run_module
+    original = pkg._launch
 
-    def spy(name, values, *, rows, device_index):
-        launched.append((name, rows))
-        return original(name, values, rows=rows, device_index=device_index)
+    def spy(plan, args):
+        launched.append((plan.name, plan.rows))
+        return original(plan, args)
 
     try:
-        loader.run_module = spy
+        pkg._launch = spy
         for rows in _edge_rows(route):
             inputs = _inputs(rows, seed=1000 + rows)
             assert supports_gated_residual_rmsnorm(
@@ -149,7 +149,7 @@ def test_every_window_matches_the_reference(form):
             assert launched[-1] == (name, rows)
             assert loader.MODULES[name]["launch"]["use_pdl"] is enable_pdl
     finally:
-        loader.run_module = original
+        pkg._launch = original
 
 
 @pytest.mark.parametrize("form", FORMS, ids=_form_id)
@@ -178,14 +178,14 @@ def test_output_may_alias_the_residual(weight_before_norm):
 
 def test_empty_batch_launches_nothing():
     launched = []
-    original = loader.run_module
+    original = pkg._launch
     try:
-        loader.run_module = lambda *a, **k: launched.append(a)
+        pkg._launch = lambda *a: launched.append(a)
         inputs = _inputs(0, seed=1)
         out = _call(inputs, True, True)
         assert out.shape == (0, HIDDEN_SIZE) and out.dtype == torch.float32
     finally:
-        loader.run_module = original
+        pkg._launch = original
     assert launched == []
 
 
@@ -220,8 +220,9 @@ def test_a_gap_of_the_windows_falls_to_the_cute_kernel(monkeypatch):
     }
     monkeypatch.setitem(loader.MODULES, "gapped_record", gapped)
     monkeypatch.setitem(loader.ROUTES[_arch()], route, ["gapped_record"])
+    pkg.clear_launch_plans()  # plans prepared under the real registry must not serve the gapped one
     launched = []
-    monkeypatch.setattr(loader, "run_module", lambda *a, **k: launched.append(a))
+    monkeypatch.setattr(pkg, "_launch", lambda *a: launched.append(a))
     assert supports_gated_residual_rmsnorm(*inputs, backend="cake")
     assert not pkg.is_cake_gated_residual_rmsnorm_supported(
         _device(), weight_before_norm=True, enable_pdl=True, rows=65
