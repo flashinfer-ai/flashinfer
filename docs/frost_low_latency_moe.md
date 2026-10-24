@@ -254,7 +254,7 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
+| Architecture | SM90: BF16/FP16/per-tensor FP8 FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
 | Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
@@ -743,9 +743,37 @@ also remains outside this routed-only backend.
 
 SM90 uses the shared BF16/FP16/per-tensor-FP8 FMA kernels and FFI binding.
 It does not admit integer Tensor Core tactics or the unqualified MX/NVFP4
-formats. H100 validation passed 103 tests, with 57 unsupported-format,
-Tensor-Core or native-fallback cases skipped. This establishes correctness
-coverage; the SM120 measurements below do not establish Hopper speedups.
+formats. The final consolidated H100 run passed 109 tests, with 111
+unsupported-format, Tensor-Core or native-fallback cases skipped across all
+seven Frost test files. This run includes the destination-device padding fix
+and final guard tests; it supersedes the earlier preliminary 103-pass run.
+Separate H100 measurements below use H=2048, I=512, E=512, top-k=10 and
+SwiGLU. CUPTI measures the full routed-expert GPU pipeline. Native CUTLASS
+search uses coordinate sweeps, top-two stage combinations and the default:
+45/81 advertised stage choices for FP16, 36/72 for FP8. This is not an
+exhaustive Cartesian search. Frost searches all 16 FMA tactics; four frozen
+ABBA rounds validate the winners. Warm event chains independently cross-check
+ranking. Host enqueue, routing-network evaluation, shared experts,
+communication and serving are outside the measurement.
+
+| Format / T / routes | Warm CUTLASS → Frost µs | Warm speedup | Cold CUTLASS → Frost µs | Cold speedup |
+|---|---:|---:|---:|---:|
+| FP16 / 1 / disjoint | 47.952 → 22.975 | 2.09× | 58.103 → 30.128 | 1.93× |
+| FP16 / 2 / disjoint | 67.127 → 39.735 | 1.69× | 77.495 → 49.200 | 1.58× |
+| FP16 / 4 / shared | 47.735 → 45.672 | 1.05× | 57.104 → 53.312 | 1.07× |
+| FP16 / 8 / shared | 46.696 → 76.751 | 0.61× | 57.512 → 83.663 | 0.69× |
+| FP8 / 1 / disjoint | 38.551 → 10.688 | 3.61× | 48.136 → 18.848 | 2.55× |
+| FP8 / 2 / disjoint | 49.064 → 25.744 | 1.91× | 57.815 → 32.952 | 1.75× |
+| FP8 / 4 / shared | 36.800 → 27.383 | 1.34× | 47.128 → 34.728 | 1.36× |
+| FP8 / 8 / shared | 36.792 → 46.736 | 0.79× | 47.119 → 55.175 | 0.85× |
+
+T8 with shared experts loses for both formats. These synthetic model-shape
+measurements do not establish model throughput. [H100 results and provenance](frost_low_latency_h100.json)
+retain all 28 warm/cold and route-reuse cases, absolute times, candidate counts,
+frozen validation medians and numerical errors. Reproduce with
+`benchmarks/bench_frost_low_latency_fp16.py` or
+`benchmarks/bench_frost_low_latency_fp8.py`; larger-expert Hopper controls are
+not included in this table.
 
 ## Ordinary per-tensor FP8
 
