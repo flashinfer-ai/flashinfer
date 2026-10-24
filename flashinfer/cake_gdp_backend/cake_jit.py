@@ -3458,7 +3458,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 1,
             ),
             "cooperative": False,
-            "dynamic_smem_bytes": 6400,
+            "dynamic_smem_bytes": 2304,
             "use_pdl": False,
         },
         "library": "cake_gdp_f2f0c7abbf10082a6996",
