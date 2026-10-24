@@ -162,7 +162,9 @@ def num_splits(
             f"num_rows={num_rows}, num_kv_heads={num_kv_heads}, sm_count={sm_count} must all be at least 1"
         )
     if arch not in CTAS_PER_SM:
-        raise ValueError(f"unknown arch {arch!r}; the architectures are {cake_jit.ARCHES}")
+        raise ValueError(
+            f"unknown arch {arch!r}; the architectures are {cake_jit.ARCHES}"
+        )
     tiles = num_tiles(selection_width)
     formula = max(
         1,
@@ -231,7 +233,9 @@ def select_wide(
     if form not in cake_jit.FORMS:
         raise ValueError(f"unknown form {form!r}; the forms are {cake_jit.FORMS}")
     if arch not in CTAS_PER_SM:
-        raise ValueError(f"unknown arch {arch!r}; the architectures are {cake_jit.ARCHES}")
+        raise ValueError(
+            f"unknown arch {arch!r}; the architectures are {cake_jit.ARCHES}"
+        )
     multi_wave = int(num_rows) * int(num_kv_heads) * int(splits) > CTAS_PER_SM[
         arch
     ] * int(sm_count)
@@ -479,7 +483,9 @@ def _device_facts(device_index: int) -> tuple[str, int]:
     capability = cake_jit.device_capability(device_index)
     arch = cake_jit.arch_for_capability(capability)
     if arch is None:
-        supported = ", ".join(f"SM{major}{minor}" for major, minor in sorted(cake_jit.ARCH_BY_CAPABILITY))
+        supported = ", ".join(
+            f"SM{major}{minor}" for major, minor in sorted(cake_jit.ARCH_BY_CAPABILITY)
+        )
         raise RuntimeError(
             f"QSA NVFP4 attention supports {supported}, got SM{capability[0]}{capability[1]}"
         )

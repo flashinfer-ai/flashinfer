@@ -228,7 +228,9 @@ def test_omitted_backend_takes_the_auto_route(monkeypatch):
         result = public_api.qsa_sparse_paged_attention(
             t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
         )
-    want = "cake" if cake_jit.arch_for_capability(capability) is not None else "existing"
+    want = (
+        "cake" if cake_jit.arch_for_capability(capability) is not None else "existing"
+    )
     assert result == want
     assert [tag for tag, _, _ in calls] == [want]
 
@@ -324,7 +326,10 @@ def test_program_rule_selects_the_records_of_a_call():
         for form in cake_jit.FORMS:
             for wide in (False, True):
                 cake_jit.select_record("decode", form=form, arch=arch, wide=wide)
-        assert cake_jit.select_record("merge", form="split", arch=arch, wide=False) == "merge"
+        assert (
+            cake_jit.select_record("merge", form="split", arch=arch, wide=False)
+            == "merge"
+        )
     with pytest.raises(ValueError, match="form"):
         select(form="other", splits=1, arch="sm_80", wide=False)
     with pytest.raises(ValueError, match="arch"):
@@ -350,7 +355,12 @@ def test_wide_grid_is_multi_wave_with_long_streams():
     assert tiles == 33
     assert cake_jit.DECODE_LONG_STREAM_TILES == 16
     assert cake_backend.LONG_STREAM_TILES == cake_jit.DECODE_LONG_STREAM_TILES
-    assert cake_backend.CTAS_PER_SM == {"sm_80": 2, "sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
+    assert cake_backend.CTAS_PER_SM == {
+        "sm_80": 2,
+        "sm_90a": 2,
+        "sm_100a": 1,
+        "sm_103a": 1,
+    }
     rows_to_splits = {
         rows: cake_backend.num_splits(rows, 2, 2051, sm_count, arch)
         for rows in (1, 2, 4, 8, 16, 32, 64, 128)
@@ -386,9 +396,9 @@ def test_wide_grid_is_multi_wave_with_long_streams():
         assert not wide(rows, 2, splits, tiles, "split", 148, "sm_100a"), rows
     assert cake_backend.num_splits(128, 2, 2051, 148, "sm_100a") == 1
     assert wide(128, 2, 1, tiles, "split", 148, "sm_100a")
-    assert cake_jit.select_records(form="split", splits=1, arch="sm_100a", wide=True) == (
-        "decode_tcgen05",
-    )
+    assert cake_jit.select_records(
+        form="split", splits=1, arch="sm_100a", wide=True
+    ) == ("decode_tcgen05",)
     for bad in (
         (0, 2, 1, tiles, "split", sm_count, arch),
         (1, 0, 1, tiles, "split", sm_count, arch),

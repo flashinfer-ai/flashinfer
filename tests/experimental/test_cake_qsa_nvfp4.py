@@ -148,7 +148,9 @@ def _sm_count(device) -> int:
 def _splits(rows, num_kv_heads, device) -> int:
     """The split count the package passes for ``rows`` on ``device``: its host split rule."""
     index = device.index if device.index is not None else torch.cuda.current_device()
-    return num_splits(rows, num_kv_heads, WIDTH, _sm_count(device), cake_jit.device_arch(index))
+    return num_splits(
+        rows, num_kv_heads, WIDTH, _sm_count(device), cake_jit.device_arch(index)
+    )
 
 
 def _dequant(data, sf, scale):
@@ -668,7 +670,12 @@ def test_rejects_invalid_inputs(monkeypatch):
     # device's SM count.
     one_tile = torch.full((4, TILE + 1), -1, dtype=torch.int32, device="cuda")
     one_tile[:, -1] = 0
-    assert num_splits(4, 2, TILE, _sm_count(q.device), cake_jit.device_arch(q.device.index)) == 1
+    assert (
+        num_splits(
+            4, 2, TILE, _sm_count(q.device), cake_jit.device_arch(q.device.index)
+        )
+        == 1
+    )
     nbytes = cake_backend.qsa_workspace_bytes(4, 24, 2, 1)
     for buffer in (
         torch.zeros(nbytes, dtype=torch.uint8),
@@ -719,13 +726,63 @@ def test_split_formula_fills_the_device_capacity():
     shape list's rows, 148 SMs on sm_100a (148 CTAs: the B200, one CTA per SM) and on
     sm_103a, the floor (more CTAs than the capacity), one tile, the merge kernel's bound,
     and the sizes it refuses."""
-    assert [num_splits(r, 2, WIDTH, 80, "sm_80") for r in ROWS] == [33, 33, 20, 10, 5, 2, 1, 1]
-    assert [num_splits(r, 2, WIDTH, 66, "sm_80") for r in ROWS] == [33, 33, 16, 8, 4, 2, 1, 1]
-    assert [num_splits(r, 2, WIDTH, 148, "sm_100a") for r in ROWS] == [33, 33, 18, 9, 4, 2, 1, 1]
-    assert [num_splits(r, 2, WIDTH, 148, "sm_103a") for r in ROWS] == [33, 33, 18, 9, 4, 2, 1, 1]
+    assert [num_splits(r, 2, WIDTH, 80, "sm_80") for r in ROWS] == [
+        33,
+        33,
+        20,
+        10,
+        5,
+        2,
+        1,
+        1,
+    ]
+    assert [num_splits(r, 2, WIDTH, 66, "sm_80") for r in ROWS] == [
+        33,
+        33,
+        16,
+        8,
+        4,
+        2,
+        1,
+        1,
+    ]
+    assert [num_splits(r, 2, WIDTH, 148, "sm_100a") for r in ROWS] == [
+        33,
+        33,
+        18,
+        9,
+        4,
+        2,
+        1,
+        1,
+    ]
+    assert [num_splits(r, 2, WIDTH, 148, "sm_103a") for r in ROWS] == [
+        33,
+        33,
+        18,
+        9,
+        4,
+        2,
+        1,
+        1,
+    ]
     # At the same SM count the tcgen05 decode's capacity is half the mma.sync decode's.
-    assert [num_splits(r, 2, WIDTH, 148, "sm_90a") for r in ROWS] == [33, 33, 33, 18, 9, 4, 2, 1]
-    for sm_count, arch in ((80, "sm_80"), (66, "sm_80"), (148, "sm_100a"), (148, "sm_103a")):
+    assert [num_splits(r, 2, WIDTH, 148, "sm_90a") for r in ROWS] == [
+        33,
+        33,
+        33,
+        18,
+        9,
+        4,
+        2,
+        1,
+    ]
+    for sm_count, arch in (
+        (80, "sm_80"),
+        (66, "sm_80"),
+        (148, "sm_100a"),
+        (148, "sm_103a"),
+    ):
         assert [num_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
             _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
         ]
@@ -790,9 +847,18 @@ def test_capabilities_route_to_the_four_libraries():
     assert set(cake_jit.ARCH_BY_CAPABILITY.values()) == set(cake_jit.ARCHES)
     # The per-architecture launch-bound tables cover every architecture; the fused table every one but sm_80, with
     # the host policy's 0 on the tcgen05 architectures (the separate form is faster whole-call there).
-    assert cake_jit.DECODE_THREADS == {"sm_80": 128, "sm_90a": 128, "sm_100a": 512, "sm_103a": 512}
+    assert cake_jit.DECODE_THREADS == {
+        "sm_80": 128,
+        "sm_90a": 128,
+        "sm_100a": 512,
+        "sm_103a": 512,
+    }
     assert cake_jit.DECODE_CTAS_PER_SM == CTAS_PER_SM
-    assert cake_jit.DECODE_FUSED_CTAS_PER_SM == {"sm_90a": 2, "sm_100a": 0, "sm_103a": 0}
+    assert cake_jit.DECODE_FUSED_CTAS_PER_SM == {
+        "sm_90a": 2,
+        "sm_100a": 0,
+        "sm_103a": 0,
+    }
     assert cake_backend.FUSED_CTAS_PER_SM == cake_jit.DECODE_FUSED_CTAS_PER_SM
 
 
@@ -834,7 +900,10 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         assert whole_tile[key] == cake_jit.MODULES["decode"][key], key
     for name in tcgen05:
         for key in ("grid_rule", "arg_plan", "logical"):
-            assert cake_jit.MODULES[name][key] == cake_jit.MODULES["decode"][key], (name, key)
+            assert cake_jit.MODULES[name][key] == cake_jit.MODULES["decode"][key], (
+                name,
+                key,
+            )
     for name, record in cake_jit.MODULES.items():
         assert re.fullmatch(r"cake_qsa_nvfp4_[0-9a-f]{20}", record["library"]), name
         assert tuple(record["arches"]) == arches[name], name
@@ -845,7 +914,9 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         assert record["select_rule"]["value"] in cake_jit.FORMS
         assert isinstance(record["grid_rule"]["kind"], str)
         launch = record["launch"]
-        assert tuple(launch["block"]) == ((512, 1, 1) if name in tcgen05 else (128, 1, 1)), name
+        assert tuple(launch["block"]) == (
+            (512, 1, 1) if name in tcgen05 else (128, 1, 1)
+        ), name
         assert tuple(launch["cluster"]) == (1, 1, 1), name
         assert launch["dynamic_smem_bytes"] == (
             0
@@ -855,7 +926,9 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
             else DECODE_SMEM_BYTES
         ), name
         assert launch["use_pdl"] is False, name
-        assert launch["cooperative"] is (name in ("decode_coop", "decode_tcgen05_coop")), name
+        assert launch["cooperative"] is (
+            name in ("decode_coop", "decode_tcgen05_coop")
+        ), name
         parameters = MERGE_PARAMETERS if name == "merge" else DECODE_PARAMETERS
         plan = record["arg_plan"]
         assert [key for kind, key in plan if kind != "grid"] == list(parameters), name
