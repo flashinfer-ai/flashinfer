@@ -693,7 +693,7 @@ kernel_cake_dense_projection_gemm_dc7aeaa270e09b010bfc(const __grid_constant__ C
                                     if (mis32 == 0) {
                                         #pragma unroll
                                         for (int q = 0; q < 2; q++) {
-                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)(col + 8 * q)) + (0)), "r"(__float_as_uint(out_vals[(8 * q) + 0])), "r"(__float_as_uint(out_vals[(8 * q) + 1])), "r"(__float_as_uint(out_vals[(8 * q) + 2])), "r"(__float_as_uint(out_vals[(8 * q) + 3])), "r"(__float_as_uint(out_vals[(8 * q) + 4])), "r"(__float_as_uint(out_vals[(8 * q) + 5])), "r"(__float_as_uint(out_vals[(8 * q) + 6])), "r"(__float_as_uint(out_vals[(8 * q) + 7])) : "memory");
+                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)(col + 8 * q))), "r"(__float_as_uint(out_vals[(8 * q) + 0])), "r"(__float_as_uint(out_vals[(8 * q) + 1])), "r"(__float_as_uint(out_vals[(8 * q) + 2])), "r"(__float_as_uint(out_vals[(8 * q) + 3])), "r"(__float_as_uint(out_vals[(8 * q) + 4])), "r"(__float_as_uint(out_vals[(8 * q) + 5])), "r"(__float_as_uint(out_vals[(8 * q) + 6])), "r"(__float_as_uint(out_vals[(8 * q) + 7])) : "memory");
                                         }
                                     } else {
                                         #pragma unroll
@@ -706,7 +706,7 @@ kernel_cake_dense_projection_gemm_dc7aeaa270e09b010bfc(const __grid_constant__ C
                                     }
                                 } else if (off_n_1 + col0 + col + 8 <= N) {
                                     if (mis32 == 0) {
-                                        asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)col) + (0)), "r"(__float_as_uint(out_vals[(0) + 0])), "r"(__float_as_uint(out_vals[(0) + 1])), "r"(__float_as_uint(out_vals[(0) + 2])), "r"(__float_as_uint(out_vals[(0) + 3])), "r"(__float_as_uint(out_vals[(0) + 4])), "r"(__float_as_uint(out_vals[(0) + 5])), "r"(__float_as_uint(out_vals[(0) + 6])), "r"(__float_as_uint(out_vals[(0) + 7])) : "memory");
+                                        asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)col)), "r"(__float_as_uint(out_vals[(0) + 0])), "r"(__float_as_uint(out_vals[(0) + 1])), "r"(__float_as_uint(out_vals[(0) + 2])), "r"(__float_as_uint(out_vals[(0) + 3])), "r"(__float_as_uint(out_vals[(0) + 4])), "r"(__float_as_uint(out_vals[(0) + 5])), "r"(__float_as_uint(out_vals[(0) + 6])), "r"(__float_as_uint(out_vals[(0) + 7])) : "memory");
                                     } else {
                                         #pragma unroll
                                         for (int q_2 = 0; q_2 < 2; q_2++) {
@@ -825,7 +825,7 @@ kernel_cake_dense_projection_gemm_dc7aeaa270e09b010bfc(const __grid_constant__ C
                                         if (mis32_1 == 0) {
                                             #pragma unroll
                                             for (int q_5 = 0; q_5 < 2; q_5++) {
-                                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)(col_1 + 8 * q_5)) + (0)), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 0])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 1])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 2])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 3])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 4])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 5])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 6])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 7])) : "memory");
+                                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)(col_1 + 8 * q_5))), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 0])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 1])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 2])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 3])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 4])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 5])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 6])), "r"(__float_as_uint(out_vals_1[(8 * q_5) + 7])) : "memory");
                                             }
                                         } else {
                                             #pragma unroll
@@ -838,7 +838,7 @@ kernel_cake_dense_projection_gemm_dc7aeaa270e09b010bfc(const __grid_constant__ C
                                         }
                                     } else if (off_n_1 + col0 + col_1 + 8 <= N) {
                                         if (mis32_1 == 0) {
-                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)col_1) + (0)), "r"(__float_as_uint(out_vals_1[(0) + 0])), "r"(__float_as_uint(out_vals_1[(0) + 1])), "r"(__float_as_uint(out_vals_1[(0) + 2])), "r"(__float_as_uint(out_vals_1[(0) + 3])), "r"(__float_as_uint(out_vals_1[(0) + 4])), "r"(__float_as_uint(out_vals_1[(0) + 5])), "r"(__float_as_uint(out_vals_1[(0) + 6])), "r"(__float_as_uint(out_vals_1[(0) + 7])) : "memory");
+                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)col_1)), "r"(__float_as_uint(out_vals_1[(0) + 0])), "r"(__float_as_uint(out_vals_1[(0) + 1])), "r"(__float_as_uint(out_vals_1[(0) + 2])), "r"(__float_as_uint(out_vals_1[(0) + 3])), "r"(__float_as_uint(out_vals_1[(0) + 4])), "r"(__float_as_uint(out_vals_1[(0) + 5])), "r"(__float_as_uint(out_vals_1[(0) + 6])), "r"(__float_as_uint(out_vals_1[(0) + 7])) : "memory");
                                         } else {
                                             #pragma unroll
                                             for (int q_7 = 0; q_7 < 2; q_7++) {

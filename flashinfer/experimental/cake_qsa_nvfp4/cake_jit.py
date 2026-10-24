@@ -14,20 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Registry and loader glue of the Cake QSA sparse paged GQA decode over an
-NVFP4 KV cache for SM80 through SM90: the split-KV decode (its plain build and
-its cooperative build, which merges the splits in the same launch) and the
+NVFP4 KV cache for SM80 through SM90: the split-KV decode (its plain K-first
+build, its whole-tile build delivered for ``sm_80`` alone, and its
+cooperative build, which merges the splits in the same launch) and the
 separate split-KV merge with the sigmoid output gate.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
-device translation unit plus a tvm-ffi binding, compiled for ``sm_80`` and
-``sm_90a`` (one source, both architectures).  A record carries the host plan
-only: the program's ``library`` stem (its ``build.json`` entry is
-``<library>_<arch>``), the architectures it is delivered for, the ``stage``
-of the launch order it fills and its ``variant``, the ``select_rule`` that
-picks the records of one call from the host-known form, the ``grid_rule``
-that shapes its launch, the ``workspace_rule`` naming the scratch it writes,
-the kernel-parameter -> logical-argument map (the identity: a logical name is the kernel parameter's name)
-and the argument plan of its ``run`` entry.  What to compile -- sources,
+device translation unit plus a tvm-ffi binding, compiled for each architecture
+of the record's ``arches`` (``sm_80`` and ``sm_90a`` from one source for three
+of the four programs; ``sm_80`` alone for the whole-tile decode).  A record
+carries the host plan only: the program's ``library`` stem (its ``build.json``
+entry is ``<library>_<arch>``), the architectures it is delivered for, the
+``stage`` of the launch order it fills and its ``variant``, the
+``select_rule`` that picks the records of one call from host-known scalars,
+the ``grid_rule`` that shapes its launch, the ``workspace_rule`` naming the
+scratch it writes, the kernel-parameter -> logical-argument map (the
+identity: a logical name is the kernel parameter's name) and the argument
+plan of its ``run`` entry.  What to compile -- sources,
 digests, nvcc flags -- is recorded once in ``build.json`` next to this file;
 :mod:`.cake_build` serves the library from a prebuilt ``aot/`` file when a
 builder compiled it and otherwise through FlashInfer's JIT from the same
@@ -38,10 +41,18 @@ The rules are data, evaluated here (:func:`select_records`,
 :func:`launch_grid`) from host-known scalars: the call's *form* (``"split"``:
 the plain decode, then the merge when the call has more than one split;
 ``"fused"``: the cooperative decode alone, its CTAs merging the splits
-through a counter per (row, KV head)), the row count ``rows``, the KV head
-count ``kv_heads``, the query head count ``qo_heads`` and the split count
-``splits``.  No rule reads a tensor.  Which form a call takes, and its split
-count, is the host's decision (:mod:`.cake_backend`), not a rule.
+through a counter per (row, KV head)), the device's exported architecture
+``arch`` and whether the decode grid is *wide* (a multi-wave, long-stream
+grid: above one resident wave, ``DECODE_CTAS_PER_SM`` CTAs per SM times the
+SM count, with every CTA walking at least ``DECODE_LONG_STREAM_TILES``
+tiles), the row count ``rows``, the KV head count ``kv_heads``, the query
+head count ``qo_heads`` and the split count ``splits``.  A selection rule of
+kind ``form`` admits its form on every architecture; one of kind
+``form_grid`` admits its form on one architecture at one grid class, and wins
+over a ``form`` rule when both admit (the whole-tile decode: the split form on
+``sm_80`` on a wide grid).  No rule reads a tensor.  Which form a call takes,
+its split count and whether its grid is wide are the host's decisions
+(:mod:`.cake_backend`), not rules.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
 ``logical``) are rewritten by the exporter from the rendered binding; the
@@ -57,7 +68,8 @@ import tvm_ffi
 
 # The two verified builds, each compiled with its exact ``-gencode`` flag set
 # (``build.json`` ``arch_flags``): ``sm_80`` serves every compute capability
-# 8.x device, ``sm_90a`` the H100 (9.0).  No other capability is a target.
+# 8.x device, ``sm_90a`` the H100 (9.0).  No other capability is a target.  A
+# record lists the subset it is delivered for (``record["arches"]``).
 ARCHES = ("sm_80", "sm_90a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (8, 0): "sm_80",
@@ -68,11 +80,19 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 }
 PREFIX = "cake_qsa_nvfp4"
 
-# The launch order of a call: the decode (one of its two builds) and, in the
+# The launch order of a call: the decode (one of its three builds) and, in the
 # split form with more than one split, the merge behind it.
 STAGES = ("decode", "merge")
-# The two forms a call takes (``select_rule`` kind ``form``).
+# The two forms a call takes (``select_rule`` value of kinds ``form`` and
+# ``form_grid``).
 FORMS = ("split", "fused")
+# The selection rule kinds, least specific first: ``form`` admits its ``value``
+# form on every architecture; ``form_grid`` admits its ``value`` form on its
+# ``arch`` alone and only at the grid class its ``grid`` names
+# (``"multi_wave_long"``: a decode grid above one resident wave whose CTAs each
+# walk at least ``DECODE_LONG_STREAM_TILES`` tiles).  When both admit, the more
+# specific wins.
+SELECT_RULES = ("form", "form_grid")
 # The merge's split bound: a (row, head) has at most this many partials (one
 # per lane of the merge's four warps).  The host's split rule never exceeds it.
 MAX_SPLITS = 128
@@ -85,6 +105,12 @@ TILE_TOKENS = 64
 # The decode's block and the resident CTAs per SM its split rule counts on.
 DECODE_THREADS = 128
 DECODE_CTAS_PER_SM = 2
+# The long-stream bound of the ``multi_wave_long`` grid class: the per-CTA tile
+# stream, ``ceil(tiles / splits)``, from which the whole-tile program measured
+# faster than the K-first one above one resident wave; 16 tiles = 1024 selected
+# tokens (the 128-row shapes at 17 tiles per CTA favoured it, the 64-row shapes
+# at 9 did not).
+DECODE_LONG_STREAM_TILES = 16
 
 # Logical argument names the host backend binds: the kernels' own parameter
 # names (``record["logical"]`` is the identity map).  Decode: ``q`` BF16
@@ -200,7 +226,10 @@ MERGE_PARAMETERS = (
 # is written by hand.  Every value is a literal:
 # FlashInfer's manifest checker and the exporter read this file with
 # ``ast.literal_eval``.  Record names are the stages, suffixed with the variant
-# where a stage has several programs.
+# where a stage has several programs.  The decode's K-first builds (``decode``,
+# ``decode_coop``) and its whole-tile build (``decode_whole_tile``) differ in
+# the program text alone: same parameters, launch facts, grid and workspace
+# rules.
 MODULES: dict[str, dict[str, Any]] = {
     "decode": {
         "arches": ["sm_80", "sm_90a"],
@@ -248,7 +277,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_5bf192272d1a4b0d1f89",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_ce0eb22c5279f0671378",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -256,7 +285,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 49792,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_5bf192272d1a4b0d1f89",
+        "library": "cake_qsa_nvfp4_ce0eb22c5279f0671378",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -299,6 +328,110 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {"kind": "form", "value": "split"},
         "stage": "decode",
         "variant": "plain",
+        "workspace_rule": {"kind": "split_partials"},
+    },
+    "decode_whole_tile": {
+        "arches": ["sm_80"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k_data"],
+            ["buffer", "v_data"],
+            ["buffer", "k_sf"],
+            ["buffer", "v_sf"],
+            ["buffer", "indices"],
+            ["buffer", "block_table"],
+            ["buffer", "token_to_req"],
+            ["buffer", "gate"],
+            ["buffer", "out"],
+            ["buffer", "partial_out"],
+            ["buffer", "partial_lse"],
+            ["buffer", "merge_counters"],
+            ["parameter", "q_stride_row"],
+            ["parameter", "q_stride_head"],
+            ["parameter", "data_stride_block"],
+            ["parameter", "data_stride_token"],
+            ["parameter", "data_stride_head"],
+            ["parameter", "sf_stride_block"],
+            ["parameter", "sf_stride_token"],
+            ["parameter", "sf_stride_head"],
+            ["parameter", "indices_stride_row"],
+            ["parameter", "table_stride_req"],
+            ["parameter", "out_stride_row"],
+            ["parameter", "out_stride_head"],
+            ["parameter", "score_scale"],
+            ["parameter", "output_scale"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_blocks"],
+            ["parameter", "page_div"],
+            ["parameter", "table_width"],
+            ["parameter", "topk"],
+            ["parameter", "group_size"],
+            ["parameter", "num_qo_heads"],
+            ["parameter", "num_tiles"],
+            ["parameter", "num_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "rows_kv_heads_splits"},
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_27ee9c3b4b04fb0a1cb3",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 49792,
+            "use_pdl": False,
+        },
+        "library": "cake_qsa_nvfp4_27ee9c3b4b04fb0a1cb3",
+        "logical": {
+            "block_table": "block_table",
+            "data_stride_block": "data_stride_block",
+            "data_stride_head": "data_stride_head",
+            "data_stride_token": "data_stride_token",
+            "gate": "gate",
+            "group_size": "group_size",
+            "indices": "indices",
+            "indices_stride_row": "indices_stride_row",
+            "k_data": "k_data",
+            "k_sf": "k_sf",
+            "merge_counters": "merge_counters",
+            "num_blocks": "num_blocks",
+            "num_qo_heads": "num_qo_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "num_splits": "num_splits",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_stride_head": "out_stride_head",
+            "out_stride_row": "out_stride_row",
+            "output_scale": "output_scale",
+            "page_div": "page_div",
+            "partial_lse": "partial_lse",
+            "partial_out": "partial_out",
+            "q": "q",
+            "q_stride_head": "q_stride_head",
+            "q_stride_row": "q_stride_row",
+            "score_scale": "score_scale",
+            "sf_stride_block": "sf_stride_block",
+            "sf_stride_head": "sf_stride_head",
+            "sf_stride_token": "sf_stride_token",
+            "table_stride_req": "table_stride_req",
+            "table_width": "table_width",
+            "token_to_req": "token_to_req",
+            "topk": "topk",
+            "v_data": "v_data",
+            "v_sf": "v_sf",
+        },
+        "select_rule": {
+            "arch": "sm_80",
+            "grid": "multi_wave_long",
+            "kind": "form_grid",
+            "value": "split",
+        },
+        "stage": "decode",
+        "variant": "whole_tile",
         "workspace_rule": {"kind": "split_partials"},
     },
     "decode_coop": {
@@ -347,7 +480,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_4e706fc93843b564281d",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -355,7 +488,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 49792,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_4e706fc93843b564281d",
+        "library": "cake_qsa_nvfp4_69a1ca68c5e159455bc8",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -451,44 +584,70 @@ def records_of_stage(stage: str) -> tuple[str, ...]:
     return tuple(name for name, rec in MODULES.items() if rec["stage"] == stage)
 
 
-def _admits(rule: dict[str, Any], *, form: str) -> bool:
+def _admits(rule: dict[str, Any], *, form: str, arch: str, wide: bool) -> bool:
     kind = rule["kind"]
     if kind == "form":
         return rule["value"] == form
+    if kind == "form_grid":
+        return (
+            rule["value"] == form
+            and rule["arch"] == arch
+            and (rule["grid"] == "multi_wave_long") == bool(wide)
+        )
     raise ValueError(f"unknown Cake QSA NVFP4 decode selection rule: {kind!r}")
 
 
-def select_record(stage: str, *, form: str) -> str:
-    """The one record of ``stage`` the call's ``form`` selects.
+def select_record(stage: str, *, form: str, arch: str, wide: bool) -> str:
+    """The one record of ``stage`` the call selects.
 
     ``form`` is ``"split"`` (the plain decode and, above one split, the merge)
-    or ``"fused"`` (the cooperative decode, which merges its splits itself).
-    The ``merge`` stage has no record in the fused form (:func:`select_records`
-    leaves it out); asking for one is an error.  Exactly one record of a stage
-    admits a form it serves, or the registry is inconsistent.
+    or ``"fused"`` (the cooperative decode, which merges its splits itself);
+    ``arch`` is the device's exported architecture and ``wide`` whether the
+    decode grid is wide -- above one resident wave with at least
+    ``DECODE_LONG_STREAM_TILES`` tiles per CTA (both the host's:
+    :mod:`.cake_backend`).
+    Of the records whose rule admits the call, the most specific rule kind
+    (``SELECT_RULES`` order) wins: on ``sm_80`` a wide split-form call selects
+    the whole-tile decode over the K-first one.  The ``merge`` stage has no
+    record in the fused form (:func:`select_records` leaves it out); asking for
+    one is an error.  Exactly one record remains, or the registry is
+    inconsistent.
     """
     if form not in FORMS:
         raise ValueError(f"unknown form {form!r}; the forms are {FORMS}")
+    if arch not in ARCHES:
+        raise ValueError(f"unknown arch {arch!r}; the architectures are {ARCHES}")
     admitted = [
         name
         for name in records_of_stage(stage)
-        if _admits(MODULES[name]["select_rule"], form=form)
+        if _admits(MODULES[name]["select_rule"], form=form, arch=arch, wide=wide)
     ]
+    if admitted:
+        top = max(
+            SELECT_RULES.index(MODULES[n]["select_rule"]["kind"]) for n in admitted
+        )
+        admitted = [
+            n
+            for n in admitted
+            if SELECT_RULES.index(MODULES[n]["select_rule"]["kind"]) == top
+        ]
     if len(admitted) != 1:
         raise ValueError(
-            f"stage {stage!r}: records {admitted} admit form={form!r}; exactly one must"
+            f"stage {stage!r}: records {admitted} admit form={form!r}, arch={arch!r}, "
+            f"wide={bool(wide)}; exactly one must"
         )
     return admitted[0]
 
 
-def select_records(*, form: str, splits: int) -> tuple[str, ...]:
+def select_records(*, form: str, splits: int, arch: str, wide: bool) -> tuple[str, ...]:
     """The records one call launches, in launch order: the decode of ``form``
-    and, in the split form with ``splits > 1``, the merge."""
+    on ``arch`` at the grid class ``wide`` and, in the split form with
+    ``splits > 1``, the merge."""
     if int(splits) < 1:
         raise ValueError(f"splits must be at least 1, got {splits}")
-    names = [select_record("decode", form=form)]
+    names = [select_record("decode", form=form, arch=arch, wide=wide)]
     if form == "split" and int(splits) > 1:
-        names.append(select_record("merge", form=form))
+        names.append(select_record("merge", form=form, arch=arch, wide=wide))
     return tuple(names)
 
 
@@ -660,6 +819,7 @@ __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "DECODE_CTAS_PER_SM",
+    "DECODE_LONG_STREAM_TILES",
     "DECODE_PARAMETERS",
     "DECODE_THREADS",
     "FORMS",
@@ -670,6 +830,7 @@ __all__ = [
     "MERGE_WARPS",
     "MODULES",
     "PREFIX",
+    "SELECT_RULES",
     "STAGES",
     "TILE_TOKENS",
     "arch_for_capability",

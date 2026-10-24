@@ -818,6 +818,44 @@ def test_every_program_is_launched(
     _check(c, out, what=name)
 
 
+def _two_head_record() -> Optional[str]:
+    """The two-heads-per-CTA T = 1 program of the local architecture (SM90 ships none)."""
+    arch = _arch()
+    for name, record in sorted(loader.MODULES.items()):
+        if (
+            record["role"] == "decode"
+            and arch in record["arches"]
+            and record["build"].get("variant") == "l8r4x2"
+        ):
+            return name
+    return None
+
+
+@pytest.mark.parametrize("odd", ("32xsm_plus_1", "1713x3"))
+def test_two_head_program_runs_an_odd_head_count(odd: str) -> None:
+    """The two-heads-per-CTA T = 1 program launches ceil(B x HV / 2) CTAs; an odd head
+    count leaves the last CTA one head, which is computed and stored like every other
+    (two odd counts at and above the band's lower edge 32 x sm)."""
+    _skip_unless_route(3, 1)
+    name = _two_head_record()
+    if name is None:
+        pytest.skip(f"{_arch()} ships no two-heads-per-CTA program")
+    sms = loader.sm_count(_device().index or 0)
+    B, H = (32 * sms + 1, 1) if odd == "32xsm_plus_1" else (1713, 3)
+    assert (B * H) % 2 == 1 and 32 * sms <= B * H, (B, H, sms)
+    assert loader.selected_module(_arch(), 3, 1, B * H, sm_count=sms) == name
+    record = loader.MODULES[name]
+    assert record["grid_rule"] == {
+        "ctas_per_state": 1,
+        "heads_per_cta": 2,
+        "kind": "state_heads",
+    }
+    assert loader.launch_grid(record, B, H) == ((B * H + 1) // 2, 1, 1)
+    c = _make(B, 1, H, 3, generator=_generator(24, B, H))
+    out, _ = _run(c)
+    _check(c, out, what=f"{name} on an odd head count {B} x {H}")
+
+
 # ---------------------------------------------------------------------------
 # Rejected arguments
 # ---------------------------------------------------------------------------
@@ -976,6 +1014,32 @@ _STATE_HEAD_PROBES = (
     760,
     761,
     4096,
+    # the two-head edge 32 x sm and the many-wave edge 64 x sm, -1 / 0 / +1, for
+    # 132 / 148 / 152 / 160 SMs (every probe is tried on every SM count)
+    4223,
+    4224,
+    4225,
+    4735,
+    4736,
+    4737,
+    4863,
+    4864,
+    4865,
+    5119,
+    5120,
+    5121,
+    8447,
+    8448,
+    8449,
+    9471,
+    9472,
+    9473,
+    9727,
+    9728,
+    9729,
+    10239,
+    10240,
+    10241,
     20480,
 )
 
@@ -1073,7 +1137,7 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
     v, a and b are read element by element."""
     import flashinfer.cake_gdp_backend as backend
 
-    widths = {"__nv_bfloat162": 4, "uint2": 8, "uint4": 16, "float4": 16}
+    widths = {"__nv_bfloat162": 4, "int2": 8, "uint2": 8, "uint4": 16, "float4": 16}
     access = re.compile(
         r"reinterpret_cast<(?:const )?(\w+)\s*\*>\("
         r"(?:&\(\(\w+\*\)\()?(q|k|v|a|b|out)\b"
@@ -1146,13 +1210,15 @@ def _static_pick(
 def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
     """T = 1, three Householder steps, on `sm` SMs: the row-partition program up to 160
     state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], the
-    one-wave-of-5 program l8r4w5 takes (4 x sm, 5 x sm] and l8r4 resumes above it, while
-    SM90 ships neither program and keeps l8r4 above 160.  The choice depends on
+    one-wave-of-5 program l8r4w5 takes (4 x sm, 5 x sm], l8r4 resumes above it and the
+    two-heads-per-CTA program l8r4x2 takes every count from 32 x sm up (inclusive), while
+    SM90 ships none of the three and keeps l8r4 above 160.  The choice depends on
     (arch, T, B x HV, sm_count) only."""
     assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a"}
     for arch in loader.ROUTES:
         one_wave = "l8r4" if arch == "sm_90a" else "l8r4p"
         tail_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
+        two_head = "l8r4" if arch == "sm_90a" else "l8r4x2"
         expected = {
             160: ("splitv", "splitv8_tile8"),
             161: ("lanerow", one_wave),
@@ -1160,7 +1226,10 @@ def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
             4 * sm + 1: ("lanerow", tail_wave),
             5 * sm: ("lanerow", tail_wave),
             5 * sm + 1: ("lanerow", "l8r4"),
-            20480: ("lanerow", "l8r4"),
+            32 * sm - 1: ("lanerow", "l8r4"),
+            32 * sm: ("lanerow", two_head),
+            64 * sm + 1: ("lanerow", two_head),
+            20480: ("lanerow", two_head),
         }
         for state_heads, want in expected.items():
             assert _static_pick(arch, 3, 1, state_heads, sm) == want, (
@@ -1200,6 +1269,7 @@ def test_t4_band_follows_the_architecture(sm: int) -> None:
         assert ("l4r2" in variants) == (arch == "sm_90a"), (arch, sorted(variants))
         assert ("l8r4w5" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
         assert ("l8r4p" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
+        assert ("l8r4x2" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
 
 
 def test_t1_static_programs_partition_every_sm_count() -> None:

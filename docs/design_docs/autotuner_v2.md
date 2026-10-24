@@ -233,9 +233,10 @@ before preparing the input schedule used by `profile_tactic`. Delegated tuning
 contexts also preserve the attached store's graph-timing objective after warmup.
 
 Each newly tuned entry also records an optional `profiling_policy` payload: the effective
-CUDA-graph replay count (or `null` without graphs), hot-/cold-L2 policy and active
-individual-call graph timing after context
-and measurement overrides. These inherited settings are not fully represented by the manifest.
+CUDA-graph replay count (or `null` without graphs), L2 policy (`hot`, `cold`, or
+`cold-chain:<n>`, see `TuningConfig.cold_chain_launches`), and active individual-call
+graph timing after context and measurement overrides. These inherited settings
+are not fully represented by the manifest.
 When `choose_one` can profile, it reuses a managed winner only when this provenance matches,
 including after preload, reload, and promotion to the root/environment-partitioned memory
 cache. A missing or different policy is a profiling miss, not deletion; replay, bare inference,

@@ -15,7 +15,8 @@ limitations under the License.
 
 Host side of the Cake QSA sparse paged GQA decode over an NVFP4 KV cache
 (SM80 through SM90): the argument checks of ``qsa_sparse_paged_attention``,
-the split rule, the form rule, the workspace rule and the launch sequence.
+the split rule, the form rule, the program rule, the workspace rule and the
+launch sequence.
 
 A call attends ``rows`` decode rows (one query token each, ``num_qo_heads``
 heads of 256 dims) to the ``selection_width`` tokens each row selects from a
@@ -40,6 +41,26 @@ CTAs per SM times the SM count, 264 on an H100; a cooperative launch above the
 device's co-residency is refused by the driver); else,
 and always on compute capability 8.x, the *split* form: the plain decode, then
 the separate merge.
+
+Program rule (:func:`select_wide`, then :func:`cake_jit.select_records`): the
+plain decode has two programs.  On ``sm_80`` a split-form call is *wide* when
+both hold: its decode grid ``rows * num_kv_heads * splits`` exceeds one
+resident wave (``CTAS_PER_SM`` CTAs per SM times the SM count: 216 CTAs on an
+A100's 108 SMs) and each of its CTAs walks a long tile stream, ``ceil(tiles /
+splits) >= LONG_STREAM_TILES`` (16 tiles = 1024 selected tokens).  A wide call
+launches the whole-tile program (``decode_whole_tile``: whole-tile gather, no
+L2 cache hint, shift selector -- the previous release's ``sm_80`` decode);
+every other call launches the K-first program (``decode``), and ``sm_90a``
+always does.  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
+tiles): rows 1-32 run at most one wave -> K-first; rows 64 (4 splits, 512
+CTAs, 9 tiles per CTA) -> K-first; rows 128 (2 splits, 512 CTAs, 17 tiles per
+CTA) -> whole-tile; the 2048-row single-split call (33 tiles per CTA) ->
+whole-tile.  Measured paired on two A100s (80 GB and 40 GB PCIe) under the
+memset flush, the K-first program is 1-7 % faster at rows 64 and the
+whole-tile program 6-8 % faster at rows 128, on both units.  The fused form
+is never wide: its grid is within the co-residency by the form rule.  The
+rule reads the architecture, the SM count and the call's tile and split
+counts alone.
 
 Workspace rule: the partials (``partial_out`` FP32 ``[splits, rows,
 num_qo_heads, 256]``, ``partial_lse`` FP32 ``[splits, rows, num_qo_heads]``)
@@ -82,6 +103,8 @@ MAX_GROUP_SIZE = 16
 MAX_SPLITS = cake_jit.MAX_SPLITS
 # Resident decode CTAs per SM the split rule and the fused form's capacity count on (the kernel's launch bound).
 CTAS_PER_SM = cake_jit.DECODE_CTAS_PER_SM
+# The program rule's long-stream bound: tiles per CTA from which an sm_80 multi-wave grid runs the whole-tile program.
+LONG_STREAM_TILES = cake_jit.DECODE_LONG_STREAM_TILES
 # Every workspace slot starts on a 256-byte boundary.
 ALIGN = 256
 _LOG2E = math.log2(math.e)
@@ -152,6 +175,39 @@ def select_form(
     ) <= fused_capacity(device_index):
         return "fused"
     return "split"
+
+
+def select_wide(
+    num_rows: int,
+    num_kv_heads: int,
+    splits: int,
+    num_tiles: int,
+    form: str,
+    sm_count: int,
+) -> bool:
+    """Whether a call of ``form`` is *wide* on a device of ``sm_count`` SMs (module docstring, "Program rule"):
+    the split form with a decode grid ``num_rows * num_kv_heads * splits`` above one resident wave,
+    ``CTAS_PER_SM * sm_count`` CTAs, whose CTAs each walk at least ``LONG_STREAM_TILES`` of the call's
+    ``num_tiles`` tiles (``ceil(num_tiles / splits)``).  The fused form is never wide.  Pure: the SM count is
+    the caller's."""
+    if (
+        int(num_rows) < 1
+        or int(num_kv_heads) < 1
+        or int(splits) < 1
+        or int(num_tiles) < 1
+        or int(sm_count) < 1
+    ):
+        raise ValueError(
+            f"num_rows={num_rows}, num_kv_heads={num_kv_heads}, splits={splits}, num_tiles={num_tiles}, "
+            f"sm_count={sm_count} must all be at least 1"
+        )
+    if form not in cake_jit.FORMS:
+        raise ValueError(f"unknown form {form!r}; the forms are {cake_jit.FORMS}")
+    multi_wave = int(num_rows) * int(num_kv_heads) * int(splits) > CTAS_PER_SM * int(
+        sm_count
+    )
+    long_stream = -(-int(num_tiles) // int(splits)) >= LONG_STREAM_TILES
+    return form == "split" and multi_wave and long_stream
 
 
 def _round_up(n: int, m: int) -> int:
@@ -432,11 +488,13 @@ def qsa_sparse_paged_attention(
         return out
 
     selection_width = logical_indices.shape[1] - 1
-    splits = num_splits(
-        num_rows, num_kv_heads, selection_width, cake_jit.sm_count(device_index)
-    )
+    tiles = num_tiles(selection_width)
+    sm_count = cake_jit.sm_count(device_index)
+    splits = num_splits(num_rows, num_kv_heads, selection_width, sm_count)
     form = select_form(num_rows, num_kv_heads, splits, device_index)
     fused = form == "fused"
+    arch = cake_jit.device_arch(device_index)
+    wide = select_wide(num_rows, num_kv_heads, splits, tiles, form, sm_count)
     raw = (
         _check_workspace(
             workspace_buffer, q.device, num_rows, num_qo_heads, num_kv_heads, splits
@@ -506,10 +564,10 @@ def qsa_sparse_paged_attention(
         "topk": selection_width,
         "group_size": num_qo_heads // num_kv_heads,
         "num_qo_heads": num_qo_heads,
-        "num_tiles": num_tiles(selection_width),
+        "num_tiles": tiles,
         "num_splits": splits,
     }
-    for name in cake_jit.select_records(form=form, splits=splits):
+    for name in cake_jit.select_records(form=form, splits=splits, arch=arch, wide=wide):
         grid = cake_jit.launch_grid(
             name,
             rows=num_rows,
@@ -525,6 +583,7 @@ __all__ = [
     "ALIGN",
     "CTAS_PER_SM",
     "HEAD_DIM",
+    "LONG_STREAM_TILES",
     "MAX_GROUP_SIZE",
     "MAX_SPLITS",
     "SPLIT_OVERRIDES",
@@ -537,4 +596,5 @@ __all__ = [
     "qsa_workspace_bytes",
     "reset_workspace",
     "select_form",
+    "select_wide",
 ]

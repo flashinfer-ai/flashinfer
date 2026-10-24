@@ -156,19 +156,33 @@ kernel_cake_dense_projection_gemm_5b4e87b523f799e09384(float* __restrict__ src, 
             part_vec = 0;
         }
         if (part_vec == 1) {
-            {
-                __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(hi[0 + 0], hi[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(hi[0 + 2], hi[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(hi[0 + 4], hi[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(hi[0 + 6], hi[0 + 7]);
-                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(parts + pk_off))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            unsigned int _packed_0[4];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi[_lp*2 + 0], hi[_lp*2+1 + 0]));
+                _packed_0[_lp] = *(uint32_t*)&_bf2;
             }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi[_lp*2 + 2], hi[_lp*2+1 + 2]));
+                _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi[_lp*2 + 4], hi[_lp*2+1 + 4]));
+                _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi[_lp*2 + 6], hi[_lp*2+1 + 6]));
+                _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            reinterpret_cast<int4*>(parts + pk_off)[0] = reinterpret_cast<int4*>(_packed_0)[0];
         } else {
             #pragma unroll
             for (int j_3 = 0; j_3 < 8; j_3++) {
                 if (nn > e0 + (unsigned long long)j_3) {
-                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off + (unsigned long long)j_3)) + (0)) = __float2bfloat16_rn(hi[j_3]);
+                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off + (unsigned long long)j_3)) + (0)) = (__nv_bfloat16)hi[j_3];
                 }
             }
         }
@@ -179,19 +193,33 @@ kernel_cake_dense_projection_gemm_5b4e87b523f799e09384(float* __restrict__ src, 
             part_vec_2 = 0;
         }
         if (part_vec_2 == 1) {
-            {
-                __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(mid[0 + 0], mid[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(mid[0 + 2], mid[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(mid[0 + 4], mid[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(mid[0 + 6], mid[0 + 7]);
-                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(parts + pk_off_0))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            unsigned int _packed_1[4];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(mid[_lp*2 + 0], mid[_lp*2+1 + 0]));
+                _packed_1[_lp] = *(uint32_t*)&_bf2;
             }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(mid[_lp*2 + 2], mid[_lp*2+1 + 2]));
+                _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(mid[_lp*2 + 4], mid[_lp*2+1 + 4]));
+                _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(mid[_lp*2 + 6], mid[_lp*2+1 + 6]));
+                _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            reinterpret_cast<int4*>(parts + pk_off_0)[0] = reinterpret_cast<int4*>(_packed_1)[0];
         } else {
             #pragma unroll
             for (int j_4 = 0; j_4 < 8; j_4++) {
                 if (nn > e0 + (unsigned long long)j_4) {
-                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_0 + (unsigned long long)j_4)) + (0)) = __float2bfloat16_rn(mid[j_4]);
+                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_0 + (unsigned long long)j_4)) + (0)) = (__nv_bfloat16)mid[j_4];
                 }
             }
         }
@@ -202,19 +230,33 @@ kernel_cake_dense_projection_gemm_5b4e87b523f799e09384(float* __restrict__ src, 
             part_vec_5 = 0;
         }
         if (part_vec_5 == 1) {
-            {
-                __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(lo[0 + 0], lo[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(lo[0 + 2], lo[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(lo[0 + 4], lo[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(lo[0 + 6], lo[0 + 7]);
-                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(parts + pk_off_3))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            unsigned int _packed_2[4];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo[_lp*2 + 0], lo[_lp*2+1 + 0]));
+                _packed_2[_lp] = *(uint32_t*)&_bf2;
             }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo[_lp*2 + 2], lo[_lp*2+1 + 2]));
+                _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo[_lp*2 + 4], lo[_lp*2+1 + 4]));
+                _packed_2[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo[_lp*2 + 6], lo[_lp*2+1 + 6]));
+                _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            reinterpret_cast<int4*>(parts + pk_off_3)[0] = reinterpret_cast<int4*>(_packed_2)[0];
         } else {
             #pragma unroll
             for (int j_5 = 0; j_5 < 8; j_5++) {
                 if (nn > e0 + (unsigned long long)j_5) {
-                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_3 + (unsigned long long)j_5)) + (0)) = __float2bfloat16_rn(lo[j_5]);
+                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_3 + (unsigned long long)j_5)) + (0)) = (__nv_bfloat16)lo[j_5];
                 }
             }
         }

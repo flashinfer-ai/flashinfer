@@ -755,6 +755,7 @@ kernel_cake_dense_projection_gemm_6377283a59ee9230280a(const __grid_constant__ C
                                 int nb = ng * 2048;
                                 if (nb > 0) {
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                    asm volatile("fence.proxy.async.global;" ::: "memory");
                                     asm volatile("tcgen05.fence::before_thread_sync;");
                                     __syncwarp();
                                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -811,7 +812,7 @@ kernel_cake_dense_projection_gemm_6377283a59ee9230280a(const __grid_constant__ C
                                     if (mis32 == 0) {
                                         #pragma unroll
                                         for (int q = 0; q < 2; q++) {
-                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)(col + 8 * q)) + (0)), "r"(__float_as_uint(out_vals[(8 * q) + 0])), "r"(__float_as_uint(out_vals[(8 * q) + 1])), "r"(__float_as_uint(out_vals[(8 * q) + 2])), "r"(__float_as_uint(out_vals[(8 * q) + 3])), "r"(__float_as_uint(out_vals[(8 * q) + 4])), "r"(__float_as_uint(out_vals[(8 * q) + 5])), "r"(__float_as_uint(out_vals[(8 * q) + 6])), "r"(__float_as_uint(out_vals[(8 * q) + 7])) : "memory");
+                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)(col + 8 * q))), "r"(__float_as_uint(out_vals[(8 * q) + 0])), "r"(__float_as_uint(out_vals[(8 * q) + 1])), "r"(__float_as_uint(out_vals[(8 * q) + 2])), "r"(__float_as_uint(out_vals[(8 * q) + 3])), "r"(__float_as_uint(out_vals[(8 * q) + 4])), "r"(__float_as_uint(out_vals[(8 * q) + 5])), "r"(__float_as_uint(out_vals[(8 * q) + 6])), "r"(__float_as_uint(out_vals[(8 * q) + 7])) : "memory");
                                         }
                                     } else {
                                         #pragma unroll
@@ -824,7 +825,7 @@ kernel_cake_dense_projection_gemm_6377283a59ee9230280a(const __grid_constant__ C
                                     }
                                 } else if (off_n_1 + col0 + col + 8 <= N) {
                                     if (mis32 == 0) {
-                                        asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)col) + (0)), "r"(__float_as_uint(out_vals[(0) + 0])), "r"(__float_as_uint(out_vals[(0) + 1])), "r"(__float_as_uint(out_vals[(0) + 2])), "r"(__float_as_uint(out_vals[(0) + 3])), "r"(__float_as_uint(out_vals[(0) + 4])), "r"(__float_as_uint(out_vals[(0) + 5])), "r"(__float_as_uint(out_vals[(0) + 6])), "r"(__float_as_uint(out_vals[(0) + 7])) : "memory");
+                                        asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base + (unsigned long long)col)), "r"(__float_as_uint(out_vals[(0) + 0])), "r"(__float_as_uint(out_vals[(0) + 1])), "r"(__float_as_uint(out_vals[(0) + 2])), "r"(__float_as_uint(out_vals[(0) + 3])), "r"(__float_as_uint(out_vals[(0) + 4])), "r"(__float_as_uint(out_vals[(0) + 5])), "r"(__float_as_uint(out_vals[(0) + 6])), "r"(__float_as_uint(out_vals[(0) + 7])) : "memory");
                                     } else {
                                         #pragma unroll
                                         for (int q_2 = 0; q_2 < 2; q_2++) {
@@ -855,7 +856,7 @@ kernel_cake_dense_projection_gemm_6377283a59ee9230280a(const __grid_constant__ C
                                         if (mis32_1 == 0) {
                                             #pragma unroll
                                             for (int q_3 = 0; q_3 < 2; q_3++) {
-                                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)(col_1 + 8 * q_3)) + (0)), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 0])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 1])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 2])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 3])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 4])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 5])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 6])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 7])) : "memory");
+                                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)(col_1 + 8 * q_3))), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 0])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 1])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 2])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 3])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 4])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 5])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 6])), "r"(__float_as_uint(out_vals_1[(8 * q_3) + 7])) : "memory");
                                             }
                                         } else {
                                             #pragma unroll
@@ -868,7 +869,7 @@ kernel_cake_dense_projection_gemm_6377283a59ee9230280a(const __grid_constant__ C
                                         }
                                     } else if (off_n_1 + col0 + col_1 + 8 <= N) {
                                         if (mis32_1 == 0) {
-                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)col_1) + (0)), "r"(__float_as_uint(out_vals_1[(0) + 0])), "r"(__float_as_uint(out_vals_1[(0) + 1])), "r"(__float_as_uint(out_vals_1[(0) + 2])), "r"(__float_as_uint(out_vals_1[(0) + 3])), "r"(__float_as_uint(out_vals_1[(0) + 4])), "r"(__float_as_uint(out_vals_1[(0) + 5])), "r"(__float_as_uint(out_vals_1[(0) + 6])), "r"(__float_as_uint(out_vals_1[(0) + 7])) : "memory");
+                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_1 + (unsigned long long)col_1)), "r"(__float_as_uint(out_vals_1[(0) + 0])), "r"(__float_as_uint(out_vals_1[(0) + 1])), "r"(__float_as_uint(out_vals_1[(0) + 2])), "r"(__float_as_uint(out_vals_1[(0) + 3])), "r"(__float_as_uint(out_vals_1[(0) + 4])), "r"(__float_as_uint(out_vals_1[(0) + 5])), "r"(__float_as_uint(out_vals_1[(0) + 6])), "r"(__float_as_uint(out_vals_1[(0) + 7])) : "memory");
                                         } else {
                                             #pragma unroll
                                             for (int q_5 = 0; q_5 < 2; q_5++) {
@@ -1011,7 +1012,7 @@ kernel_cake_dense_projection_gemm_6377283a59ee9230280a(const __grid_constant__ C
                                     if (mis32_2 == 0) {
                                         #pragma unroll
                                         for (int q_9 = 0; q_9 < 2; q_9++) {
-                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_2 + (unsigned long long)(col_2 + 8 * q_9)) + (0)), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 0])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 1])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 2])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 3])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 4])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 5])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 6])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 7])) : "memory");
+                                            asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_2 + (unsigned long long)(col_2 + 8 * q_9))), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 0])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 1])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 2])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 3])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 4])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 5])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 6])), "r"(__float_as_uint(out_vals_2[(8 * q_9) + 7])) : "memory");
                                         }
                                     } else {
                                         #pragma unroll
@@ -1024,7 +1025,7 @@ kernel_cake_dense_projection_gemm_6377283a59ee9230280a(const __grid_constant__ C
                                     }
                                 } else if (off_n_1 + col0 + col_2 + 8 <= N) {
                                     if (mis32_2 == 0) {
-                                        asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_2 + (unsigned long long)col_2) + (0)), "r"(__float_as_uint(out_vals_2[(0) + 0])), "r"(__float_as_uint(out_vals_2[(0) + 1])), "r"(__float_as_uint(out_vals_2[(0) + 2])), "r"(__float_as_uint(out_vals_2[(0) + 3])), "r"(__float_as_uint(out_vals_2[(0) + 4])), "r"(__float_as_uint(out_vals_2[(0) + 5])), "r"(__float_as_uint(out_vals_2[(0) + 6])), "r"(__float_as_uint(out_vals_2[(0) + 7])) : "memory");
+                                        asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out32 + (row_base_2 + (unsigned long long)col_2)), "r"(__float_as_uint(out_vals_2[(0) + 0])), "r"(__float_as_uint(out_vals_2[(0) + 1])), "r"(__float_as_uint(out_vals_2[(0) + 2])), "r"(__float_as_uint(out_vals_2[(0) + 3])), "r"(__float_as_uint(out_vals_2[(0) + 4])), "r"(__float_as_uint(out_vals_2[(0) + 5])), "r"(__float_as_uint(out_vals_2[(0) + 6])), "r"(__float_as_uint(out_vals_2[(0) + 7])) : "memory");
                                     } else {
                                         #pragma unroll
                                         for (int q_11 = 0; q_11 < 2; q_11++) {

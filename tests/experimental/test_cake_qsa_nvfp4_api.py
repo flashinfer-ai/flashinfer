@@ -22,6 +22,9 @@ what needs flashinfer itself: the ``backend`` keyword of
 package with every operand, the default keeps the existing implementation, an unknown
 value is refused -- one device run of the route against the package, bit for bit, and
 the NVFP4 paged writer against the torch port the backend suite fills its caches with.
+It also holds the host's program rule on the CPU: which records a call launches for its
+form, architecture and grid class, and when a grid is wide (above one resident wave with
+at least 16 tiles per CTA).
 """
 
 import contextlib
@@ -160,6 +163,99 @@ def test_default_backend_keeps_the_existing_implementation(monkeypatch):
         )
     assert result == "existing"
     assert [tag for tag, _, _ in calls] == ["existing"]
+
+
+def test_program_rule_selects_the_records_of_a_call():
+    """On sm_80 a wide (multi-wave, long-stream) split-form call launches the whole-tile
+    decode, every other call the K-first decode; the merge follows above one split; the
+    fused form is the cooperative decode alone on either architecture; an unknown form,
+    architecture or split count is refused."""
+    select = cake_jit.select_records
+    assert select(form="split", splits=4, arch="sm_80", wide=True) == (
+        "decode_whole_tile",
+        "merge",
+    )
+    assert select(form="split", splits=4, arch="sm_80", wide=False) == (
+        "decode",
+        "merge",
+    )
+    assert select(form="split", splits=1, arch="sm_80", wide=True) == (
+        "decode_whole_tile",
+    )
+    assert select(form="split", splits=1, arch="sm_80", wide=False) == ("decode",)
+    for wide in (False, True):
+        assert select(form="split", splits=4, arch="sm_90a", wide=wide) == (
+            "decode",
+            "merge",
+        )
+        assert select(form="split", splits=1, arch="sm_90a", wide=wide) == ("decode",)
+        for arch in cake_jit.ARCHES:
+            assert select(form="fused", splits=4, arch=arch, wide=wide) == (
+                "decode_coop",
+            )
+    for name in ("decode", "decode_whole_tile", "decode_coop", "merge"):
+        assert cake_jit.MODULES[name]["stage"] in cake_jit.STAGES
+    with pytest.raises(ValueError, match="form"):
+        select(form="other", splits=1, arch="sm_80", wide=False)
+    with pytest.raises(ValueError, match="arch"):
+        select(form="split", splits=1, arch="sm_100a", wide=False)
+    with pytest.raises(ValueError, match="splits"):
+        select(form="split", splits=0, arch="sm_80", wide=False)
+    with pytest.raises(ValueError, match="merge"):
+        cake_jit.select_record("merge", form="fused", arch="sm_90a", wide=False)
+
+
+def test_wide_grid_is_multi_wave_with_long_streams():
+    """``select_wide`` at 108 SMs (216 resident CTAs) over the owner's rows at two KV heads
+    with the host's split counts and the 33 tiles of a 2051-token selection: rows 128
+    (2 splits, 512 CTAs, 17 tiles per CTA) are wide; rows 64 (4 splits, 512 CTAs, 9 tiles
+    per CTA) and rows 1-32 (at most one wave) are not; the 2048-row single split (33 tiles
+    per CTA) is; the fused form never is.  The grid bound is strict and the stream bound
+    inclusive: 16 tiles per CTA (1024 selected tokens) above one wave is wide, 15 is not."""
+    sm_count = 108
+    tiles = cake_backend.num_tiles(2051)
+    assert tiles == 33
+    assert cake_jit.DECODE_LONG_STREAM_TILES == 16
+    assert cake_backend.LONG_STREAM_TILES == cake_jit.DECODE_LONG_STREAM_TILES
+    rows_to_splits = {
+        rows: cake_backend.num_splits(rows, 2, 2051, sm_count)
+        for rows in (1, 2, 4, 8, 16, 32, 64, 128)
+    }
+    assert rows_to_splits[64] == 4 and rows_to_splits[128] == 2
+    wide = cake_backend.select_wide
+    assert wide(128, 2, rows_to_splits[128], tiles, "split", sm_count)
+    assert not wide(128, 2, rows_to_splits[128], tiles, "fused", sm_count)
+    # Rows 64: 512 CTAs exceed one wave, but ceil(33 / 4) = 9 tiles per CTA is a short stream.
+    assert not wide(64, 2, rows_to_splits[64], tiles, "split", sm_count)
+    for rows in (1, 2, 4, 8, 16, 32):
+        splits = rows_to_splits[rows]
+        assert rows * 2 * splits <= cake_backend.CTAS_PER_SM * sm_count, rows
+        assert not wide(rows, 2, splits, tiles, "split", sm_count), rows
+    assert wide(2048, 2, 1, tiles, "split", sm_count)
+    assert not wide(2048, 2, 1, tiles, "fused", sm_count)
+    # The grid bound is strict: one full wave of long streams is not wide.
+    capacity = cake_backend.CTAS_PER_SM * sm_count
+    assert not wide(capacity, 1, 1, 16, "split", sm_count)
+    assert wide(capacity + 1, 1, 1, 16, "split", sm_count)
+    # The stream bound is inclusive and counts ceil(tiles / splits).
+    assert wide(512, 1, 1, 16, "split", sm_count)
+    assert not wide(512, 1, 1, 15, "split", sm_count)
+    assert wide(128, 2, 2, 31, "split", sm_count)  # ceil(31 / 2) = 16
+    assert not wide(128, 2, 2, 30, "split", sm_count)  # 15
+    # On 132 SMs (264 CTAs) the owner's rows 1-128 never exceed one wave in the split form.
+    for rows in (1, 2, 4, 8, 16, 32, 64, 128):
+        splits = cake_backend.num_splits(rows, 2, 2051, 132)
+        assert not wide(rows, 2, splits, tiles, "split", 132), rows
+    for bad in (
+        (0, 2, 1, tiles, "split", sm_count),
+        (1, 0, 1, tiles, "split", sm_count),
+        (1, 2, 0, tiles, "split", sm_count),
+        (1, 2, 1, 0, "split", sm_count),
+        (1, 2, 1, tiles, "split", 0),
+        (1, 2, 1, tiles, "other", sm_count),
+    ):
+        with pytest.raises(ValueError):
+            wide(*bad)
 
 
 def _operands(device):

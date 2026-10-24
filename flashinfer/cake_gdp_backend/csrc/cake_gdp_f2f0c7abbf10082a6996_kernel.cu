@@ -321,8 +321,9 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
     }
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
-    int row_a = warp_local;
-    int row_b = 4 + warp_local;
+    int row_own = lane_local >> 4 & 1;
+    int row_a = warp_local + row_own * 4;
+    int row_b = warp_local + 4 - row_own * 4;
     int v_row_a = split_v_base + row_a;
     int v_row_b = split_v_base + row_b;
     float2 ha_pair0 = make_float2(sState[row_a * 128 + k_col0], sState[row_a * 128 + k_col0 + 1]);
@@ -350,21 +351,21 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
         sum_b_pair = fma_f32x2_rn_ftz(hb_pair1, k_pair1_1, sum_b_pair);
         float sum_a = sum_a_pair.x + sum_a_pair.y;
         float sum_b = sum_b_pair.x + sum_b_pair.y;
-        float _warp_reduce_11 = sum_a;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-          _warp_reduce_11 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_11, offset);
-        sum_a = _warp_reduce_11;
-        float _warp_reduce_12 = sum_b;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-          _warp_reduce_12 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_12, offset);
-        sum_b = _warp_reduce_12;
+        float _shfl_xor_sync_11 = __shfl_xor_sync(0xFFFFFFFF, sum_b, 16);
+        sum_a = sum_a + _shfl_xor_sync_11;
+        float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, sum_a, 8);
+        sum_a = sum_a + _shfl_xor_sync_12;
+        float _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, sum_a, 4);
+        sum_a = sum_a + _shfl_xor_sync_13;
+        float _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, sum_a, 2);
+        sum_a = sum_a + _shfl_xor_sync_14;
+        float _shfl_xor_sync_15 = __shfl_xor_sync(0xFFFFFFFF, sum_a, 1);
+        sum_a = sum_a + _shfl_xor_sync_15;
+        sum_a = sum_a;
         float v_a = sV[m * 8 + row_a];
-        float v_b = sV[m * 8 + row_b];
         float beta_val = sBeta[m];
         float vn_a = (v_a - sum_a) * beta_val;
-        float vn_b = (v_b - sum_b) * beta_val;
+        float vn_b = __shfl_xor_sync(0xFFFFFFFF, vn_a, 16);
         float2 vn_a_pair = make_float2(vn_a, vn_a);
         float2 vn_b_pair = make_float2(vn_b, vn_b);
         ha_pair0 = fma_f32x2_rn_ftz(k_pair0_1, vn_a_pair, ha_pair0);
@@ -380,21 +381,21 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
       sum_hq_b_pair = fma_f32x2_rn_ftz(hb_pair1, q_pair1_1, sum_hq_b_pair);
       float sum_hq_a = sum_hq_a_pair.x + sum_hq_a_pair.y;
       float sum_hq_b = sum_hq_b_pair.x + sum_hq_b_pair.y;
-      float _warp_reduce_13 = sum_hq_a;
-#pragma unroll
-      for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_13 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_13, offset);
-      sum_hq_a = _warp_reduce_13;
-      float _warp_reduce_14 = sum_hq_b;
-#pragma unroll
-      for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_14 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_14, offset);
-      sum_hq_b = _warp_reduce_14;
-      if (lane_local == 0) {
+      float _shfl_xor_sync_16 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_b, 16);
+      sum_hq_a = sum_hq_a + _shfl_xor_sync_16;
+      float _shfl_xor_sync_17 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 8);
+      sum_hq_a = sum_hq_a + _shfl_xor_sync_17;
+      float _shfl_xor_sync_18 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 4);
+      sum_hq_a = sum_hq_a + _shfl_xor_sync_18;
+      float _shfl_xor_sync_19 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 2);
+      sum_hq_a = sum_hq_a + _shfl_xor_sync_19;
+      float _shfl_xor_sync_20 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 1);
+      sum_hq_a = sum_hq_a + _shfl_xor_sync_20;
+      sum_hq_a = sum_hq_a;
+      if ((lane_local & 15) == 0) {
         long long out_index = (long long)n * out_stride_p0 + (long long)t * out_stride_p1 +
                               (long long)h * out_stride_p2;
         out[out_index + (long long)v_row_a] = sum_hq_a;
-        out[out_index + (long long)v_row_b] = sum_hq_b;
       }
       if (use_ssm_state_indices != 0) {
         int ssm_slot = ssm_state_indices[(long long)n * ssm_state_indices_stride_p0 +
@@ -471,11 +472,11 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
           float2 sum_hk_pair = fma_f32x2_rn_ftz(h_pair0, k_pair0_2, make_float2(0.0f, 0.0f));
           sum_hk_pair = fma_f32x2_rn_ftz(h_pair1, k_pair1_2, sum_hk_pair);
           float sum_hk = sum_hk_pair.x + sum_hk_pair.y;
-          float _warp_reduce_15 = sum_hk;
+          float _warp_reduce_21 = sum_hk;
 #pragma unroll
           for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_15 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_15, offset);
-          sum_hk = _warp_reduce_15;
+            _warp_reduce_21 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_21, offset);
+          sum_hk = _warp_reduce_21;
           float v_val = sV[m_1 * 8 + local_row];
           float beta_val_1 = sBeta[m_1];
           float v_new = (v_val - sum_hk) * beta_val_1;
@@ -488,11 +489,11 @@ __global__ __launch_bounds__(128) void kernel_cake_gdp_f2f0c7abbf10082a6996(
         float2 sum_hq_pair = fma_f32x2_rn_ftz(h_pair0, q_pair0_2, make_float2(0.0f, 0.0f));
         sum_hq_pair = fma_f32x2_rn_ftz(h_pair1, q_pair1_2, sum_hq_pair);
         float sum_hq = sum_hq_pair.x + sum_hq_pair.y;
-        float _warp_reduce_16 = sum_hq;
+        float _warp_reduce_22 = sum_hq;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-          _warp_reduce_16 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_16, offset);
-        sum_hq = _warp_reduce_16;
+          _warp_reduce_22 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_22, offset);
+        sum_hq = _warp_reduce_22;
         if (lane_local == 0) {
           long long out_index_1 = (long long)n * out_stride_p0 + (long long)t_1 * out_stride_p1 +
                                   (long long)h * out_stride_p2;

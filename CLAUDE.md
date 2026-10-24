@@ -124,9 +124,14 @@ Caveats:
 
 GitHub PR Test GPU jobs keep a different, per-runner cache: they set
 `CI_COMPILE_CACHE_DIR` to a directory under the runner's work directory, and
-`ci/bash.sh` mounts a per-CI-image subdirectory of it as the FlashInfer workspace
-base and Triton cache. Other `ci/bash.sh` callers leave it unset and run cold.
-Before each job the cache is cleared when it exceeds `CI_COMPILE_CACHE_MAX_MB`
+`ci/bash.sh` namespaces it by runner and the pulled image's immutable ID.
+`CI_COMPILE_CACHE_MODE=read-only` (the default) mounts a read-only seed and runs
+against a private writable copy, discarded even after test failures. The PR Test
+workflow selects `read-write` only for pushes to `main`. A stable per-runner lock
+protects maintenance and execution, including accidentally shared workspaces.
+Other `ci/bash.sh` callers leave caching unset and run cold.
+Before each trusted writable job its runner's cache is cleared when it exceeds
+`CI_COMPILE_CACHE_MAX_MB`
 (default 40960) or its volume has less than `CI_COMPILE_CACHE_MIN_FREE_MB`
 (default 20480) free. Only content-keyed artifacts survive between jobs: CuTe-DSL (with
 `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1`), TIRx, KDA PTX, Triton and downloaded
@@ -134,6 +139,8 @@ cubins. nvcc modules, tuning results and the generated-source tree are pruned,
 since a fresh checkout rebuilds nvcc modules anyway. Each test job's
 `FLASHINFER_JIT_BUILD_LOG` is summarized per toolchain by
 `scripts/summarize_jit_builds.py` in the job summary.
+See [`ci/COMPILE_CACHE.md`](ci/COMPILE_CACHE.md) for lifecycle tests and trust
+boundaries.
 
 ## cuDNN linear attention
 
@@ -615,15 +622,30 @@ directory per op family — `cached_ops/<module>_<arch>_cute_dsl/` (e.g.
 `nvfp4_quantize_sm100a_cute_dsl/`) holding one `meta.json` plus one `.o` per
 specialization. The arch comes from the DSL's compile target (`CUTE_DSL_ARCH` or the
 current device) since the artifacts are single-arch, unlike nvcc fatbins.
-Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
+Invalidation is module-granular: changed DSL/Torch/TVM-FFI distributions, Python
+ABI, or
 kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
 `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`. The SHA256 covers only the files a caller
 passes as `extra_key_files` (often just `__file__`); with
 `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` it also covers every flashinfer module
-those files transitively import (not the top-level `__init__.py`, `version.py` or
-`_build_meta.py`), for
-long-lived caches shared across commits such as CI's.
+those files can run. Source analysis and hashing live in
+`flashinfer/jit/_cute_dsl_source.py`; `cute_dsl_core.py` manages compilation and
+cached artifacts. Plain modules are keyed by content with everything they
+import, including literal `importlib.import_module` calls. Package initializers
+are resolved name by name: a name looked up in a package follows the binding
+that defines it (a re-export to its source, a function into its body, a module
+through the attributes read from it) plus the submodule of that name. The code
+an initializer runs at import, including evaluated function annotations, is
+followed for every keyed file in its package. Star imports remain covered when
+they can replace an earlier binding; lazy fallbacks are followed when a binding
+may be absent.
+Each initializer is keyed by that code and the import lines of used names, so a
+new re-export or `__all__` entry invalidates nothing. Not keyed: import-time
+side effects of modules that keyed code neither imports nor uses, nonliteral
+dynamic imports, and runtime file reads; list the latter in `extra_key_files`.
+`version.py` and `_build_meta.py` are excluded to avoid keying on the checkout
+commit. This is intended for long-lived caches shared across commits.
 Task-scheduled attention shares this cache through
 `flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
 options, and embedded device-capacity constants. It hashes the attention source

@@ -252,7 +252,7 @@ def make_layer(monkeypatch):
     cls = backend.Nvfp4CutedslMegaKernelBackend
     monkeypatch.setattr(backend, "validate_mega_arch", lambda: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(cls, "_uses_native_topk_reduce", lambda *args: False)
+    monkeypatch.setattr(cls, "_cake_reducer_supported", lambda *args: False)
     monkeypatch.setattr(cls, "validate_transformed_weights", mock.Mock())
     monkeypatch.setattr(workspace_pool, "_POOL", {})
     monkeypatch.setattr(workspace_pool, "_KEY_BY_ID", {})
@@ -326,13 +326,20 @@ def test_execution_uses_selected_backend_and_clears_destroyed_state(
         "compute_unfinalized",
         "set_compile_tokens_per_rank",
         "workspace_output",
+        "coordinate_workspace_replacement",
     )
     for name in methods:
         monkeypatch.setattr(
             layer._kernel, name, mock.Mock(side_effect=AssertionError(name))
         )
         for handle in (default, other):
-            monkeypatch.setattr(handle._kernel, name, mock.Mock())
+            monkeypatch.setattr(
+                handle._kernel,
+                name,
+                mock.Mock(return_value=False)
+                if name == "coordinate_workspace_replacement"
+                else mock.Mock(),
+            )
 
     tensors = _inputs(8)
     output = torch.empty(8, 128, dtype=torch.bfloat16)

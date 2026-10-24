@@ -253,6 +253,30 @@ def test_prefill_plan_snapshots_layout_and_replan_rekeys(monkeypatch):
     assert replanned.exact_keys != plan.exact_keys
 
 
+def test_prefill_replan_rechecks_retained_metadata_layout(monkeypatch):
+    """Reusing the input metadata object must not hide a later layout change."""
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
+    metadata = prefill._PrefillMetadata(
+        3,
+        64,
+        False,
+        True,
+        actual_seq_lens_q=torch.empty(2, dtype=torch.int32),
+        actual_seq_lens_kv=torch.empty(2, dtype=torch.int32),
+        block_tables=torch.empty(2, 4, dtype=torch.int32),
+    )
+    device = metadata.block_tables.device
+    original = prefill._CudnnPrefillPlan.prepare(metadata, torch.bfloat16, device)
+    metadata.block_tables.as_strided_((2, 4), (1, 2))
+    replanned = prefill._CudnnPrefillPlan.prepare(
+        metadata, torch.bfloat16, device, original
+    )
+    assert replanned.exact_keys != original.exact_keys
+    assert replanned.exact_keys[True] == prefill._prefill_descriptor_key(
+        **metadata.graph_kwargs(None)
+    )
+
+
 @pytest.mark.parametrize("change", ["view_alias", "set_storage", "set_offset"])
 def test_prefill_replan_tracks_storage_not_tensor_identity(monkeypatch, change):
     """Fresh views reuse bindings; rebinding the same tensor must replace them."""
