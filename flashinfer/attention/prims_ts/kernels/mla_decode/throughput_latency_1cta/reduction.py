@@ -236,6 +236,35 @@ def run_gmem_reduction_kernel(
     cfg,
     num_reduction_ctas,
 ):
+    """Preserve inactive output and never consume stale split scratch."""
+    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    _, _, batch_idx = cute.arch.block_idx()
+    if cache_seqs[batch_idx] > Int32(0):
+        _run_active_gmem_reduction_kernel(
+            kernel,
+            output,
+            lse,
+            acc_output,
+            acc_lse,
+            cache_seqs,
+            cu_seqlens_q,
+            cfg,
+            num_reduction_ctas,
+        )
+
+
+@cute.jit
+def _run_active_gmem_reduction_kernel(
+    kernel,
+    output,
+    lse,
+    acc_output,
+    acc_lse,
+    cache_seqs,
+    cu_seqlens_q,
+    cfg,
+    num_reduction_ctas,
+):
     """Reduce split-KV partial O/LSE rows written by the 1CTA main kernel.
 
     Each reducer CTA owns either a full head row, a small group of Q rows, or a
@@ -251,8 +280,6 @@ def run_gmem_reduction_kernel(
     public storage; inactive tail rows may synchronize and consume workspace
     slots but never publish O or LSE.
     """
-    # Pair with the dense kernel PDL signal before reading partials.
-    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     q_idx, head_dim_tile_idx, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())

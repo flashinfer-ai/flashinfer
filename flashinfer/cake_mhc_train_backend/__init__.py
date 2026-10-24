@@ -1,0 +1,1052 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Backend of :mod:`flashinfer.cake_mhc_train`: Cake four-stream mHC training
+forward / backward (hidden 4096, 4 streams; SM100 / SM103 / SM107) as one
+self-contained package (host API bodies, the ``cake_jit`` loader and the
+generated CUDA sources under ``csrc/``).  The stable, ``@flashinfer_api``-decorated
+entry points and the full user-facing documentation live in
+:mod:`flashinfer.cake_mhc_train`; import that module.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+import torch
+
+from . import cake_jit as _loader
+from .cake_jit import (
+    ARCH_BY_CAPABILITY,
+    ARCHES,
+    GSTATS_COLS,
+    HC_EPS,
+    HIDDEN,
+    HIDDEN_TOTAL,
+    MAPPING_ROWS,
+    RMS_EPS,
+    SINKHORN_ITERS,
+    STATS_COLS,
+    STREAMS,
+    arch_for_capability,
+    route_applies,
+    route_key,
+    route_modules,
+    selected_modules,
+    supported_hidden_sizes,
+)
+
+SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
+    sorted(ARCH_BY_CAPABILITY)
+)
+# Every kernel tensor is read with 256-bit vector loads or described to the
+# tensor memory accelerator: contiguous storage, 32-byte aligned base.
+TENSOR_ALIGNMENT_BYTES = 32
+WORKSPACE_ALIGNMENT_BYTES = 256
+_BF16 = torch.bfloat16
+_F32 = torch.float32
+_TORCH_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "uint32": torch.uint32,
+}
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def _device_arch(device: torch.device) -> str:
+    if device.type != "cuda":
+        raise ValueError(f"Cake mHC training requires CUDA tensors, got {device}")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    arch = arch_for_capability(capability)
+    if arch is None:
+        raise ValueError(
+            f"Cake mHC training supports compute capability {sorted(ARCH_BY_CAPABILITY)} only, got {capability}"
+        )
+    return arch
+
+
+def is_cake_mhc_train_supported(
+    device: torch.device, hidden: Optional[int] = None
+) -> bool:
+    """Whether ``device`` (and optionally ``hidden``) has every exported route."""
+
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    arch = arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
+    if arch is None:
+        return False
+    if hidden is None:
+        return bool(supported_hidden_sizes(arch))
+    return int(hidden) in supported_hidden_sizes(arch)
+
+
+# ----------------------------------------------------------------------------
+# Validation
+
+
+def _validate_tensor(
+    tensor: Any,
+    name: str,
+    *,
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """A kernel operand: exact shape, dtype and device, contiguous, 32-byte aligned storage.
+
+    No layout is materialized silently: a view the kernels cannot read in place
+    is a ``ValueError`` naming the argument (the caller decides whether to copy).
+    """
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.device != device:
+        raise ValueError(f"{name} must live on {device}, got {tensor.device}")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
+    if tensor.numel() == 0:
+        return tensor
+    if not tensor.is_contiguous():
+        raise ValueError(
+            f"{name} must be contiguous (strides {tuple(tensor.stride())} for shape {shape})"
+        )
+    if tensor.data_ptr() % TENSOR_ALIGNMENT_BYTES:
+        raise ValueError(
+            f"{name} must start at a {TENSOR_ALIGNMENT_BYTES}-byte aligned address"
+        )
+    return tensor
+
+
+def _rows_of(X: Any) -> tuple[int, torch.device]:
+    if not isinstance(X, torch.Tensor):
+        raise TypeError("X must be a torch.Tensor")
+    if X.ndim != 3 or tuple(X.shape[1:]) != (STREAMS, HIDDEN):
+        raise ValueError(
+            f"X must be a [T, {STREAMS}, {HIDDEN}] tensor, got {tuple(X.shape)}"
+        )
+    return int(X.shape[0]), X.device
+
+
+def _check_constants(rms_eps: float, hc_eps: float, sinkhorn_iters: int) -> None:
+    """The exported kernels are built for the model's constants; other values are not shipped."""
+
+    if (
+        float(rms_eps) != RMS_EPS
+        or float(hc_eps) != HC_EPS
+        or int(sinkhorn_iters) != SINKHORN_ITERS
+    ):
+        raise NotImplementedError(
+            f"the exported Cake mHC training kernels implement rms_eps={RMS_EPS}, hc_eps={HC_EPS}, "
+            f"sinkhorn_iters={SINKHORN_ITERS}; got rms_eps={rms_eps}, hc_eps={hc_eps}, sinkhorn_iters={sinkhorn_iters}"
+        )
+
+
+def _output(
+    tensor: Optional[torch.Tensor],
+    name: str,
+    *,
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """A caller-provided output (validated like an input) or a fresh contiguous buffer."""
+
+    if tensor is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    return _validate_tensor(tensor, name, shape=shape, device=device, dtype=dtype)
+
+
+def _check_route(device: torch.device, arch: str, kind: str) -> None:
+    if not route_applies(
+        device_capability=tuple(torch.cuda.get_device_capability(device)),
+        hidden=HIDDEN,
+        kind=kind,
+    ):
+        raise ValueError(
+            f"no exported Cake mHC training route {route_key(HIDDEN, kind)!r} on {arch}; "
+            f"supported hidden sizes: {supported_hidden_sizes(arch)}"
+        )
+
+
+def _parameters(
+    fn: Any, scale: Any, base: Any, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fn = _validate_tensor(
+        fn, "fn", shape=(MAPPING_ROWS, HIDDEN_TOTAL), device=device, dtype=_F32
+    )
+    scale = _validate_tensor(scale, "scale", shape=(3,), device=device, dtype=_F32)
+    base = _validate_tensor(
+        base, "base", shape=(MAPPING_ROWS,), device=device, dtype=_F32
+    )
+    return fn, scale, base
+
+
+# ----------------------------------------------------------------------------
+# Workspaces
+
+
+def _workspace_bytes(kind: str, rows: int, device: torch.device) -> int:
+    device = torch.device(device)
+    rows = int(rows)
+    if rows < 0:
+        raise ValueError("T must be non-negative")
+    _device_arch(device)
+    return int(
+        _loader.workspace_bytes_upto(
+            kind, rows, _loader.sm_count(_device_index(device))
+        )
+    )
+
+
+def cake_mhc_train_forward_workspace_bytes(T: int, device: torch.device) -> int:
+    """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
+
+    The forward routes (``forward_prepare`` and the ``forward_stats`` replay) hold
+    the BF16 pieces of ``fn`` in the mapping operand layout, the FP32 per-K-unit
+    partials of the mapping pass and one 256-byte ticket region.  The size is
+    the maximum over every token count up to ``T``, so a buffer sized for the
+    largest token count serves every smaller one (and CUDA Graph replays at a
+    smaller ``T``).  The ticket words must be zero on first use (allocate with
+    ``torch.zeros`` or :func:`cake_mhc_train_forward_workspace`); the kernels
+    leave them zero.  ``T == 0`` needs no workspace (nothing is launched).
+    """
+
+    return _workspace_bytes("fwd", T, device)
+
+
+def cake_mhc_train_backward_workspace_bytes(T: int, device: torch.device) -> int:
+    """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
+
+    The ``backward_finish`` route holds the transposed BF16 pieces of ``fn``, the
+    per-token records of the token-owner pass (``dz'`` pieces and the per-token
+    scalars, padded to a multiple of 128 rows), the per-CTA parameter partials,
+    the per-chunk FP32 partials of ``dfn`` and one 256-byte ticket region.  The
+    size is the maximum over every token count up to ``T`` (see
+    :func:`cake_mhc_train_forward_workspace_bytes`).
+    """
+
+    return _workspace_bytes("bwd", T, device)
+
+
+def cake_mhc_train_forward_workspace(T: int, device: torch.device) -> torch.Tensor:
+    """Allocate a zero-initialized forward workspace (see ``..._forward_workspace_bytes``)."""
+
+    nbytes = cake_mhc_train_forward_workspace_bytes(T, device)
+    return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
+
+
+def cake_mhc_train_backward_workspace(T: int, device: torch.device) -> torch.Tensor:
+    """Allocate a zero-initialized backward workspace (see ``..._backward_workspace_bytes``)."""
+
+    nbytes = cake_mhc_train_backward_workspace_bytes(T, device)
+    return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
+
+
+def cake_mhc_train_reset_workspace(workspace: torch.Tensor) -> None:
+    """Return a workspace to its first-use state after an interrupted launch.
+
+    The kernels' unit tickets self-reset at the end of every launch; a launch
+    that did not complete (an asynchronous error, a cancelled stream capture)
+    can leave them non-zero.  Zeroing the whole buffer restores the contract for
+    every token count the buffer serves; no other region needs a value.
+    """
+
+    if (
+        not isinstance(workspace, torch.Tensor)
+        or workspace.dtype != torch.uint8
+        or workspace.ndim != 1
+    ):
+        raise ValueError("workspace must be a 1-D uint8 tensor")
+    workspace.zero_()
+
+
+def _workspace_views(
+    workspace: Any, kind: str, *, rows: int, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """The region views of ``workspace`` for exactly ``rows`` tokens (validated against the layout)."""
+
+    layout = _loader.workspace_layout(kind, rows, device_index=_device_index(device))
+    if not isinstance(workspace, torch.Tensor):
+        raise TypeError("workspace must be a torch.Tensor")
+    if (
+        workspace.device != device
+        or workspace.dtype != torch.uint8
+        or workspace.ndim != 1
+    ):
+        raise ValueError(
+            f"workspace must be a 1-D uint8 CUDA tensor on {device}, got "
+            f"{workspace.dtype} {tuple(workspace.shape)} on {workspace.device}"
+        )
+    if (
+        not workspace.is_contiguous()
+        or workspace.data_ptr() % WORKSPACE_ALIGNMENT_BYTES != 0
+    ):
+        raise ValueError(
+            f"workspace must be contiguous and {WORKSPACE_ALIGNMENT_BYTES}-byte aligned"
+        )
+    if workspace.numel() < layout["total_bytes"]:
+        helper = (
+            "cake_mhc_train_forward_workspace_bytes"
+            if kind == "fwd"
+            else "cake_mhc_train_backward_workspace_bytes"
+        )
+        raise ValueError(
+            f"workspace holds {workspace.numel()} bytes; T={rows} needs {layout['total_bytes']} ({helper})"
+        )
+    views: dict[str, torch.Tensor] = {}
+    for name, region in layout["regions"].items():
+        begin = region["offset"]
+        views[name] = (
+            workspace[begin : begin + region["bytes"]]
+            .view(_TORCH_DTYPES[region["dtype"]])
+            .view(*region["shape"])
+        )
+    return views
+
+
+# Default workspaces of the convenience path (``workspace=None``): one buffer
+# per (device, kind, power-of-two token bucket), allocated on first use, so a
+# caller that passes no workspace allocates at most log2(T_max) buffers per
+# device while the caller-held path never allocates.
+_DEFAULT_WORKSPACES: dict[tuple[int, str, int], torch.Tensor] = {}
+
+
+def _default_workspace(kind: str, rows: int, device: torch.device) -> torch.Tensor:
+    bucket = 1 << (max(int(rows), 1) - 1).bit_length()
+    key = (_device_index(device), kind, bucket)
+    found = _DEFAULT_WORKSPACES.get(key)
+    if found is None:
+        found = torch.zeros(
+            _workspace_bytes(kind, bucket, device), dtype=torch.uint8, device=device
+        )
+        _DEFAULT_WORKSPACES[key] = found
+    return found
+
+
+def _workspace_for(
+    workspace: Optional[torch.Tensor], kind: str, rows: int, device: torch.device
+) -> dict[str, torch.Tensor]:
+    if workspace is None:
+        workspace = _default_workspace(kind, rows, device)
+    return _workspace_views(workspace, kind, rows=rows, device=device)
+
+
+def _run_route(
+    arch: str, kind: str, values: dict[str, Any], *, rows: int, device: torch.device
+) -> None:
+    device_index = _device_index(device)
+    for name in selected_modules(arch, HIDDEN, kind, rows=rows):
+        _loader.run_module(name, values, rows=rows, device_index=device_index)
+
+
+# ----------------------------------------------------------------------------
+# Entry points
+
+
+def _forward_values(
+    X: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    stats: torch.Tensor,
+    ws: dict[str, torch.Tensor],
+    *,
+    rows: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    plan = _loader.host_plan(rows, _loader.sm_count(_device_index(device)))
+    # The fn split writes the forward operand layout only (``want_t = 0`` is the
+    # record's own scalar); its transposed-layout pointer is bound to the same
+    # region, exactly like the source launcher binds an unused parameter.
+    return {
+        "fn": fn,
+        "fnp": ws["fnp"],
+        "fnTp": ws["fnp"],
+        "x": X,
+        "x_flat": X.view(rows, HIDDEN_TOTAL),
+        "spart": ws["spart"],
+        "qpart": ws["qpart"],
+        "ticket": ws["ticket"],
+        "scale": scale,
+        "base": base,
+        "stats": stats,
+        "rows": rows,
+        "m_tiles": plan["m_tiles"],
+        "log2_pk": plan["log2_pk"],
+        "p_k": plan["p_k"],
+        "t_pad": plan["t_pad"],
+        "rms_eps": float(RMS_EPS),
+        "hc_eps": float(HC_EPS),
+    }
+
+
+def cake_mhc_train_forward_prepare(
+    X: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    rms_eps: float = 1e-5,
+    hc_eps: float = 1e-6,
+    sinkhorn_iters: int = 20,
+    out: Optional[torch.Tensor] = None,
+    stats_out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Forward mapping, coefficients and collapse: ``U`` and the per-token statistics.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, 4096]`` contiguous residual streams (``T`` is a runtime
+        scalar; ``T == 0`` returns empty outputs without launching).
+    fn : torch.Tensor
+        FP32 ``[24, 16384]`` contiguous mapping matrix.
+    scale : torch.Tensor
+        FP32 ``[3]`` group scales of the pre / post / Sinkhorn logits.
+    base : torch.Tensor
+        FP32 ``[24]`` logit offsets.
+    rms_eps : float
+        Normalization epsilon; the exported kernels implement ``1e-5`` (any other
+        value raises ``NotImplementedError``).
+    hc_eps : float
+        Coefficient epsilon; the exported kernels implement ``1e-6``.
+    sinkhorn_iters : int
+        Finite Sinkhorn iteration count; the exported kernels implement ``20``.
+    out : torch.Tensor, optional
+        Preallocated BF16 ``[T, 4096]`` contiguous ``U``.
+    stats_out : torch.Tensor, optional
+        Preallocated FP32 ``[T, 64]`` contiguous statistics record.
+    workspace : torch.Tensor, optional
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_train_forward_workspace`;
+        a per-device default buffer is used when omitted.
+
+    Returns
+    -------
+    ``(U, stats)``: BF16 ``U[t, d] = BF16(sum_i pre[t, i] X[t, i, d])`` and the
+    FP32 ``[T, 64]`` per-token record ``r | z[24] | pre[4] | post[4] | C[16] | pad[15]``
+    (256 bytes per token) that ``forward_finish``, ``backward_prepare`` and
+    ``backward_finish`` consume.  No ``[T, 16384]`` or ``[T, 4, 4096]`` FP32
+    temporary is produced.
+    """
+
+    _check_constants(rms_eps, hc_eps, sinkhorn_iters)
+    rows, device = _rows_of(X)
+    arch = _device_arch(device)
+    X = _validate_tensor(
+        X, "X", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16
+    )
+    fn, scale, base = _parameters(fn, scale, base, device)
+    _check_route(device, arch, "fwd_prepare")
+    U = _output(out, "out", shape=(rows, HIDDEN), device=device, dtype=_BF16)
+    stats = _output(
+        stats_out, "stats_out", shape=(rows, STATS_COLS), device=device, dtype=_F32
+    )
+    if rows == 0:
+        return U, stats
+    ws = _workspace_for(workspace, "fwd", rows, device)
+    values = _forward_values(X, fn, scale, base, stats, ws, rows=rows, device=device)
+    values["u"] = U
+    _run_route(arch, "fwd_prepare", values, rows=rows, device=device)
+    return U, stats
+
+
+def cake_mhc_train_forward_stats(
+    X: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    rms_eps: float = 1e-5,
+    hc_eps: float = 1e-6,
+    sinkhorn_iters: int = 20,
+    stats_out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Recompute the per-token statistics of ``forward_prepare`` (checkpoint replay).
+
+    Parameters
+    ----------
+    X, fn, scale, base : torch.Tensor
+        As in :func:`cake_mhc_train_forward_prepare`.
+    rms_eps, hc_eps, sinkhorn_iters : float, float, int
+        As in :func:`cake_mhc_train_forward_prepare` (``1e-5``, ``1e-6``, ``20``).
+    stats_out : torch.Tensor, optional
+        Preallocated FP32 ``[T, 64]`` contiguous statistics record.
+    workspace : torch.Tensor, optional
+        Caller-owned forward workspace (:func:`cake_mhc_train_forward_workspace`).
+
+    Returns
+    -------
+    FP32 ``[T, 64]`` ``stats``, bitwise identical to the record
+    :func:`cake_mhc_train_forward_prepare` returns for the same inputs on the same
+    device: the route is the strict prefix of the forward (fn split, mapping
+    pass, coefficients) under the same work partition, without the ``U`` write.
+    """
+
+    _check_constants(rms_eps, hc_eps, sinkhorn_iters)
+    rows, device = _rows_of(X)
+    arch = _device_arch(device)
+    X = _validate_tensor(
+        X, "X", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16
+    )
+    fn, scale, base = _parameters(fn, scale, base, device)
+    _check_route(device, arch, "fwd_recompute")
+    stats = _output(
+        stats_out, "stats_out", shape=(rows, STATS_COLS), device=device, dtype=_F32
+    )
+    if rows == 0:
+        return stats
+    ws = _workspace_for(workspace, "fwd", rows, device)
+    values = _forward_values(X, fn, scale, base, stats, ws, rows=rows, device=device)
+    _run_route(arch, "fwd_recompute", values, rows=rows, device=device)
+    return stats
+
+
+def cake_mhc_train_forward_finish(
+    X: torch.Tensor,
+    B: torch.Tensor,
+    stats: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Residual mixing: ``Y[t, j, d] = BF16(post[t, j] B[t, d] + sum_i C[t, i, j] X[t, i, d])``.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, 4096]`` contiguous residual streams (the ``forward_prepare`` input).
+    B : torch.Tensor
+        BF16 ``[T, 4096]`` contiguous output of the external branch applied to ``U``.
+    stats : torch.Tensor
+        FP32 ``[T, 64]`` record returned by :func:`cake_mhc_train_forward_prepare`
+        (or :func:`cake_mhc_train_forward_stats`).
+    out : torch.Tensor, optional
+        Preallocated BF16 ``[T, 4, 4096]`` contiguous ``Y``.
+
+    Returns
+    -------
+    BF16 ``Y`` of shape ``[T, 4, 4096]``; the FP32 sum is rounded once.
+    """
+
+    rows, device = _rows_of(X)
+    arch = _device_arch(device)
+    X = _validate_tensor(
+        X, "X", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16
+    )
+    B = _validate_tensor(B, "B", shape=(rows, HIDDEN), device=device, dtype=_BF16)
+    stats = _validate_tensor(
+        stats, "stats", shape=(rows, STATS_COLS), device=device, dtype=_F32
+    )
+    _check_route(device, arch, "fwd_finish")
+    Y = _output(out, "out", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16)
+    if rows == 0:
+        return Y
+    values = {"x": X, "b": B, "stats": stats, "y": Y, "rows": rows}
+    _run_route(arch, "fwd_finish", values, rows=rows, device=device)
+    return Y
+
+
+def cake_mhc_train_backward_prepare(
+    dY: torch.Tensor,
+    B: torch.Tensor,
+    X: torch.Tensor,
+    stats: torch.Tensor,
+    *,
+    dB: Optional[torch.Tensor] = None,
+    grad_stats_out: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Branch-output gradient and the per-token gradient statistics (before the branch backward).
+
+    Parameters
+    ----------
+    dY : torch.Tensor
+        BF16 ``[T, 4, 4096]`` contiguous gradient of ``Y``.
+    B : torch.Tensor
+        BF16 ``[T, 4096]`` contiguous branch output of the forward.
+    X : torch.Tensor
+        BF16 ``[T, 4, 4096]`` contiguous residual streams of the forward.
+    stats : torch.Tensor
+        FP32 ``[T, 64]`` record of the forward.
+    dB : torch.Tensor, optional
+        Preallocated BF16 ``[T, 4096]`` contiguous output.
+    grad_stats_out : torch.Tensor, optional
+        Preallocated FP32 ``[T, 32]`` contiguous output.
+
+    Returns
+    -------
+    ``(dB, grad_stats)``: ``dB[t, d] = BF16(sum_j post[t, j] dY[t, j, d])`` (one
+    rounding of the full FP32 sum) and the FP32 ``[T, 32]`` record
+    ``dpost[4] | dC[16] | zeros[12]`` (``dpost[t, j] = sum_d dY B``,
+    ``dC[t, i, j] = sum_d X[t, i, d] dY[t, j, d]``) that ``backward_finish`` consumes.
+    """
+
+    rows, device = _rows_of(X)
+    arch = _device_arch(device)
+    X = _validate_tensor(
+        X, "X", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16
+    )
+    dY = _validate_tensor(
+        dY, "dY", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16
+    )
+    B = _validate_tensor(B, "B", shape=(rows, HIDDEN), device=device, dtype=_BF16)
+    stats = _validate_tensor(
+        stats, "stats", shape=(rows, STATS_COLS), device=device, dtype=_F32
+    )
+    _check_route(device, arch, "bwd_prepare")
+    dB = _output(dB, "dB", shape=(rows, HIDDEN), device=device, dtype=_BF16)
+    gstats = _output(
+        grad_stats_out,
+        "grad_stats_out",
+        shape=(rows, GSTATS_COLS),
+        device=device,
+        dtype=_F32,
+    )
+    if rows == 0:
+        return dB, gstats
+    values = {
+        "dy": dY,
+        "b": B,
+        "x": X,
+        "stats": stats,
+        "db": dB,
+        "gstats": gstats,
+        "rows": rows,
+    }
+    _run_route(arch, "bwd_prepare", values, rows=rows, device=device)
+    return dB, gstats
+
+
+def cake_mhc_train_backward_finish(
+    X: torch.Tensor,
+    dY: torch.Tensor,
+    dU: torch.Tensor,
+    B: Optional[torch.Tensor],
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    stats: torch.Tensor,
+    grad_stats: torch.Tensor,
+    *,
+    rms_eps: float = 1e-5,
+    hc_eps: float = 1e-6,
+    sinkhorn_iters: int = 20,
+    accumulate: bool = False,
+    workspace: Optional[torch.Tensor] = None,
+    dX: Optional[torch.Tensor] = None,
+    dfn: Optional[torch.Tensor] = None,
+    dscale: Optional[torch.Tensor] = None,
+    dbase: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Input gradient and parameter gradients (after the branch backward produced ``dU``).
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, 4096]`` contiguous residual streams of the forward.
+    dY : torch.Tensor
+        BF16 ``[T, 4, 4096]`` contiguous gradient of ``Y``.
+    dU : torch.Tensor
+        BF16 ``[T, 4096]`` contiguous gradient of ``U`` from the branch backward.
+    B : torch.Tensor, optional
+        BF16 ``[T, 4096]`` branch output of the forward; accepted for the
+        prepare / finish symmetry and validated when given, not read (its
+        contribution is already in ``grad_stats``).
+    fn, scale, base : torch.Tensor
+        The parameters of the forward (FP32 ``[24, 16384]``, ``[3]``, ``[24]``).
+    stats : torch.Tensor
+        FP32 ``[T, 64]`` record of the forward (saved or recomputed with
+        :func:`cake_mhc_train_forward_stats`; both give bitwise the same gradients).
+    grad_stats : torch.Tensor
+        FP32 ``[T, 32]`` record returned by :func:`cake_mhc_train_backward_prepare`.
+    rms_eps, hc_eps, sinkhorn_iters : float, float, int
+        As in :func:`cake_mhc_train_forward_prepare` (``1e-5``, ``1e-6``, ``20``).
+    accumulate : bool
+        ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
+        ``True``: the caller passes all three and the fixed-order sums are added
+        to their current values (one read-modify-write per element by its single
+        owner, so four consecutive accumulations are reproducible).
+    workspace : torch.Tensor, optional
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_train_backward_workspace`;
+        a per-device default buffer is used when omitted.
+    dX : torch.Tensor, optional
+        Preallocated BF16 ``[T, 4, 4096]`` contiguous output.
+    dfn, dscale, dbase : torch.Tensor, optional
+        Preallocated FP32 ``[24, 16384]``, ``[3]``, ``[24]`` contiguous outputs
+        (required with ``accumulate=True``).
+
+    Returns
+    -------
+    ``(dX, dfn, dscale, dbase)``: the BF16 ``dX`` sums the mapping, collapse and
+    residual-mixing contributions in FP32 and rounds once; the FP32 parameter
+    gradients are fixed-order reductions, bitwise reproducible for a given token
+    count on a given device.  With ``T == 0`` nothing is launched: ``dX`` is
+    empty and the parameter gradients are zeroed (``accumulate=False``) or left
+    untouched (``accumulate=True``).
+    """
+
+    _check_constants(rms_eps, hc_eps, sinkhorn_iters)
+    rows, device = _rows_of(X)
+    arch = _device_arch(device)
+    X = _validate_tensor(
+        X, "X", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16
+    )
+    dY = _validate_tensor(
+        dY, "dY", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16
+    )
+    dU = _validate_tensor(dU, "dU", shape=(rows, HIDDEN), device=device, dtype=_BF16)
+    if B is not None:
+        _validate_tensor(B, "B", shape=(rows, HIDDEN), device=device, dtype=_BF16)
+    fn, scale, base = _parameters(fn, scale, base, device)
+    stats = _validate_tensor(
+        stats, "stats", shape=(rows, STATS_COLS), device=device, dtype=_F32
+    )
+    grad_stats = _validate_tensor(
+        grad_stats, "grad_stats", shape=(rows, GSTATS_COLS), device=device, dtype=_F32
+    )
+    _check_route(device, arch, "bwd_finish")
+    if accumulate and (dfn is None or dscale is None or dbase is None):
+        raise ValueError(
+            "accumulate=True needs the dfn, dscale and dbase buffers to accumulate into"
+        )
+    dX = _output(dX, "dX", shape=(rows, STREAMS, HIDDEN), device=device, dtype=_BF16)
+    dfn = _output(
+        dfn, "dfn", shape=(MAPPING_ROWS, HIDDEN_TOTAL), device=device, dtype=_F32
+    )
+    dscale = _output(dscale, "dscale", shape=(3,), device=device, dtype=_F32)
+    dbase = _output(dbase, "dbase", shape=(MAPPING_ROWS,), device=device, dtype=_F32)
+    if rows == 0:
+        if not accumulate:
+            dfn.zero_()
+            dscale.zero_()
+            dbase.zero_()
+        return dX, dfn, dscale, dbase
+    ws = _workspace_for(workspace, "bwd", rows, device)
+    plan = _loader.host_plan(rows, _loader.sm_count(_device_index(device)))
+    # The fn split writes the transposed operand layout only (``want_t = 1`` is
+    # the record's own scalar); its forward-layout pointer is bound to the same
+    # region.  The column-slab pass describes the ``[T, 4, 4096]`` tensors as
+    # ``[T, 16384]`` and reads the first ``T`` rows of the padded ``dz'`` record.
+    values: dict[str, Any] = {
+        "fn": fn,
+        "fnTp": ws["fnTp"],
+        "fnp": ws["fnTp"],
+        "x": X,
+        "du": dU,
+        "stats": stats,
+        "gstats": grad_stats,
+        "scale": scale,
+        "base": base,
+        "dzp": ws["dzp"],
+        "tokp": ws["tokp"],
+        "param_partial": ws["param_partial"],
+        "rows": rows,
+        "t_pad": plan["t_pad"],
+        "rows_per_cta": plan["rows_per_cta"],
+        "hc_eps": float(HC_EPS),
+        "x_flat": X.view(rows, HIDDEN_TOTAL),
+        "dy_flat": dY.view(rows, HIDDEN_TOTAL),
+        "dzp_rows": ws["dzp"][:rows],
+        "dx_flat": dX.view(rows, HIDDEN_TOTAL),
+        "dfn_part": ws["dfn_part"],
+        "parts": plan["parts"],
+        "rows_per_chunk": plan["rows_per_chunk"],
+        "dfn": dfn,
+        "dscale": dscale,
+        "dbase": dbase,
+        "chunks": plan["chunks"],
+        "accumulate": 1 if accumulate else 0,
+    }
+    _run_route(arch, "bwd_finish", values, rows=rows, device=device)
+    return dX, dfn, dscale, dbase
+
+
+# ----------------------------------------------------------------------------
+# Autograd
+
+
+class _MHCTrainState:
+    """What the prepare and finish autograd nodes of one layer application share.
+
+    The parameters (detached), the constants, the workspaces, ``dY`` and
+    ``grad_stats`` (written by the finish node's backward, read by the prepare
+    node's backward) and, transiently, ``stats``: between the prepare and the
+    finish forward, and as the replay cache of the backward under
+    ``save_stats=False`` or of a finish forward rerun by a checkpoint region
+    that starts after the prepare.  Nothing the forward produced stays on the
+    handle once the finish forward has run: ``stats`` travels through
+    ``save_for_backward`` like the inputs, so an activation checkpoint
+    (non-reentrant ``torch.utils.checkpoint``) keeps no tensor of the layer
+    alive.
+    """
+
+    __slots__ = (
+        "fn",
+        "scale",
+        "base",
+        "stats",
+        "grad_stats",
+        "dY",
+        "save_stats",
+        "rms_eps",
+        "hc_eps",
+        "sinkhorn_iters",
+        "workspace",
+        "backward_workspace",
+    )
+
+    def __init__(
+        self,
+        *,
+        save_stats: bool = True,
+        rms_eps: float = 1e-5,
+        hc_eps: float = 1e-6,
+        sinkhorn_iters: int = 20,
+        workspace: Optional[torch.Tensor] = None,
+        backward_workspace: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.fn = self.scale = self.base = None
+        self.stats = self.grad_stats = self.dY = None
+        self.save_stats = bool(save_stats)
+        self.rms_eps, self.hc_eps, self.sinkhorn_iters = rms_eps, hc_eps, sinkhorn_iters
+        self.workspace, self.backward_workspace = workspace, backward_workspace
+
+    def statistics(self, X: torch.Tensor) -> torch.Tensor:
+        """The saved ``stats``, or the bitwise-identical replay of the forward prefix."""
+
+        if self.stats is None:
+            self.stats = cake_mhc_train_forward_stats(
+                X,
+                self.fn,
+                self.scale,
+                self.base,
+                rms_eps=self.rms_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.sinkhorn_iters,
+                workspace=self.workspace,
+            )
+        return self.stats
+
+
+def _as_bf16(grad: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+    if grad is None:
+        return torch.zeros_like(like, dtype=_BF16)
+    return grad.contiguous().to(_BF16)
+
+
+class CakeMHCTrainPrepareFunction(torch.autograd.Function):
+    """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> U``.
+
+    Its backward is ``backward_finish``: it receives ``dU`` from the external
+    branch and returns the single-cast ``dX`` (mapping, collapse and
+    residual-mixing contributions summed in FP32) and the FP32 parameter
+    gradients; the finish node returns no gradient for ``X``.
+    """
+
+    @staticmethod
+    def forward(ctx, X, fn, scale, base, state):
+        U, stats = cake_mhc_train_forward_prepare(
+            X,
+            fn,
+            scale,
+            base,
+            rms_eps=state.rms_eps,
+            hc_eps=state.hc_eps,
+            sinkhorn_iters=state.sinkhorn_iters,
+            workspace=state.workspace,
+        )
+        state.fn, state.scale, state.base = fn.detach(), scale.detach(), base.detach()
+        state.stats = stats  # read and released by the finish forward
+        if state.save_stats:
+            ctx.save_for_backward(X, stats)
+        else:
+            ctx.save_for_backward(X)
+        ctx.state = state
+        return U
+
+    @staticmethod
+    def backward(ctx, dU):
+        X, *saved = ctx.saved_tensors
+        state = ctx.state
+        rows = int(X.shape[0])
+        stats = saved[0] if saved else state.statistics(X)
+        # ``Y`` did not reach the loss when the finish node's backward never ran:
+        # the residual-mixing path then carries no gradient.
+        dY = state.dY if state.dY is not None else torch.zeros_like(X)
+        grad_stats = (
+            state.grad_stats
+            if state.grad_stats is not None
+            else torch.zeros((rows, GSTATS_COLS), dtype=_F32, device=X.device)
+        )
+        dX, dfn, dscale, dbase = cake_mhc_train_backward_finish(
+            X,
+            dY,
+            _as_bf16(dU, torch.empty((rows, HIDDEN), dtype=_BF16, device=X.device)),
+            None,  # ``B``: validated when given, not read
+            state.fn,
+            state.scale,
+            state.base,
+            stats,
+            grad_stats,
+            rms_eps=state.rms_eps,
+            hc_eps=state.hc_eps,
+            sinkhorn_iters=state.sinkhorn_iters,
+            workspace=state.backward_workspace,
+        )
+        return dX, dfn, dscale, dbase, None
+
+
+class CakeMHCTrainFinishFunction(torch.autograd.Function):
+    """Autograd node of ``forward_finish``: ``forward(X, B, state) -> Y``.
+
+    Its backward is ``backward_prepare``: it returns ``dB`` for the external
+    branch and leaves ``dY`` and the gradient statistics in the shared state for
+    the prepare node, which runs after the branch backward.  When a checkpoint
+    region that starts after the prepare reruns this forward, the statistics
+    the handle already released are replayed bitwise from ``X``.
+    """
+
+    @staticmethod
+    def forward(ctx, X, B, state):
+        stats = state.stats
+        if stats is None:
+            if state.fn is None:
+                raise RuntimeError(
+                    "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare"
+                )
+            # Replay: a checkpoint region that starts after the prepare reruns the
+            # finish on a handle that already released its statistics; recompute
+            # them bitwise from ``X`` (released again below).
+            stats = state.statistics(X)
+        Y = cake_mhc_train_forward_finish(X, B, stats)
+        if state.save_stats:
+            ctx.save_for_backward(X, B, stats)
+        else:
+            ctx.save_for_backward(X, B)
+        state.stats = None  # nothing of the forward stays on the handle
+        ctx.state = state
+        return Y
+
+    @staticmethod
+    def backward(ctx, dY):
+        X, B, *saved = ctx.saved_tensors
+        state = ctx.state
+        stats = saved[0] if saved else state.statistics(X)
+        dY = _as_bf16(dY, X)
+        dB, grad_stats = cake_mhc_train_backward_prepare(dY, B, X, stats)
+        state.dY, state.grad_stats = dY, grad_stats
+        return None, dB, None
+
+
+def cake_mhc_train_prepare(
+    X: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    rms_eps: float = 1e-5,
+    hc_eps: float = 1e-6,
+    sinkhorn_iters: int = 20,
+    save_stats: bool = True,
+    workspace: Optional[torch.Tensor] = None,
+    backward_workspace: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, _MHCTrainState]:
+    """Autograd-enabled ``forward_prepare``: ``(U, handle)``; pass ``handle`` to :func:`cake_mhc_train_finish`.
+
+    Parameters
+    ----------
+    X, fn, scale, base : torch.Tensor
+        As in :func:`cake_mhc_train_forward_prepare` (``X`` and the parameters may require gradients).
+    rms_eps, hc_eps, sinkhorn_iters : float, float, int
+        As in :func:`cake_mhc_train_forward_prepare` (``1e-5``, ``1e-6``, ``20``).
+    save_stats : bool
+        ``True`` (default): the per-token statistics are saved for the backward
+        through the autograd saved tensors (an activation checkpoint frees and
+        recomputes them with the inputs).  ``False``: they are dropped after the
+        forward and recomputed from ``X`` in the backward (checkpoint replay);
+        the gradients are bitwise the same.
+    workspace, backward_workspace : torch.Tensor, optional
+        Caller-owned forward / backward workspaces; per-device defaults when omitted.
+
+    Returns
+    -------
+    ``(U, handle)``: BF16 ``U`` and the state object shared with the finish node.
+    """
+
+    state = _MHCTrainState(
+        save_stats=save_stats,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        workspace=workspace,
+        backward_workspace=backward_workspace,
+    )
+    U = CakeMHCTrainPrepareFunction.apply(X, fn, scale, base, state)
+    return U, state
+
+
+def cake_mhc_train_finish(
+    X: torch.Tensor, B: torch.Tensor, handle: _MHCTrainState
+) -> torch.Tensor:
+    """Autograd-enabled ``forward_finish``: ``Y`` from ``X``, the branch output ``B`` and the prepare ``handle``.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        The BF16 ``[T, 4, 4096]`` tensor passed to :func:`cake_mhc_train_prepare`.
+    B : torch.Tensor
+        BF16 ``[T, 4096]`` output of the external branch applied to ``U`` (may require gradients).
+    handle : object
+        The state returned by :func:`cake_mhc_train_prepare`.
+
+    Returns
+    -------
+    BF16 ``Y`` of shape ``[T, 4, 4096]``.
+    """
+
+    if not isinstance(handle, _MHCTrainState):
+        raise TypeError("handle must be the state returned by cake_mhc_train_prepare")
+    return CakeMHCTrainFinishFunction.apply(X, B, handle)
+
+
+__all__ = [
+    "ARCHES",
+    "SUPPORTED_COMPUTE_CAPABILITIES",
+    "TENSOR_ALIGNMENT_BYTES",
+    "WORKSPACE_ALIGNMENT_BYTES",
+    "CakeMHCTrainFinishFunction",
+    "CakeMHCTrainPrepareFunction",
+    "cake_mhc_train_backward_finish",
+    "cake_mhc_train_backward_prepare",
+    "cake_mhc_train_backward_workspace",
+    "cake_mhc_train_backward_workspace_bytes",
+    "cake_mhc_train_finish",
+    "cake_mhc_train_forward_finish",
+    "cake_mhc_train_forward_prepare",
+    "cake_mhc_train_forward_stats",
+    "cake_mhc_train_forward_workspace",
+    "cake_mhc_train_forward_workspace_bytes",
+    "cake_mhc_train_prepare",
+    "cake_mhc_train_reset_workspace",
+    "is_cake_mhc_train_supported",
+    "route_key",
+    "route_modules",
+]

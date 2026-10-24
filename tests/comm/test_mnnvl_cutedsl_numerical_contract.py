@@ -29,15 +29,26 @@ from flashinfer.comm.mnnvl_cutedsl import (
     BT_ONLY_CONFIG,
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
+    KernelTarget,
+    MNNVLCuteDSLConfig,
+    MRangeDispatch,
+    ProtocolKind,
+    StaticProfile,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
+    LLAllReduceTuning,
+    LLCollectiveTuning,
+    LLFinalizeTuning,
 )
 from flashinfer.comm.mnnvl_cutedsl_ar import (
     MNNVLCuteDSLAllReduceFusionWorkspace,
 )
-from flashinfer.utils import is_sm100a_supported
 
 
-HIDDEN_SIZE = 8192
-TOP_K = 10
 RMS_EPS = 1e-6
 WEIGHT_BIAS = 1.0
 PROTOCOL_CONFIGS = {
@@ -45,7 +56,7 @@ PROTOCOL_CONFIGS = {
     "bt": BT_ONLY_CONFIG,
     "ht": HT_ONLY_CONFIG,
 }
-pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_blackwell]
+pytestmark = pytest.mark.gpu_4
 
 
 @pytest.fixture(scope="module")
@@ -53,14 +64,14 @@ def distributed_group():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size not in (8, 16):
-        pytest.skip("Run this test with eight or sixteen distributed ranks")
+    if world_size not in (4, 8, 16):
+        pytest.skip("Run this test with four, eight, or sixteen distributed ranks")
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
-    if not is_sm100a_supported(device):
-        pytest.skip("SM100 or newer data-center Blackwell is required")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Data-center Blackwell or Rubin is required")
     owns_group = not dist.is_initialized()
     if owns_group:
         dist.init_process_group("nccl", device_id=device)
@@ -173,8 +184,8 @@ def _local_finalize(
     shared: torch.Tensor,
 ) -> torch.Tensor:
     m = weights.shape[0]
-    local = torch.zeros((m, HIDDEN_SIZE), dtype=torch.float32, device="cuda")
-    for route in range(TOP_K):
+    local = torch.zeros((m, routed.shape[1]), dtype=torch.float32, device="cuda")
+    for route in range(weights.shape[1]):
         rows = indices[:, route].to(torch.int64)
         torch.addcmul(
             local,
@@ -186,11 +197,13 @@ def _local_finalize(
     return _sanitize_negative_zero(local.to(torch.bfloat16))
 
 
-def _order_sensitive_local(m: int, rank: int, world_size: int) -> torch.Tensor:
+def _order_sensitive_local(
+    m: int, rank: int, world_size: int, hidden_size: int
+) -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(3100 + rank)
     local = torch.randn(
         m,
-        HIDDEN_SIZE,
+        hidden_size,
         generator=generator,
         dtype=torch.bfloat16,
         device="cuda",
@@ -206,15 +219,15 @@ def _order_sensitive_local(m: int, rank: int, world_size: int) -> torch.Tensor:
     return local
 
 
-def _workspace(protocol: str, capacity_m: int, group):
+def _workspace(protocol: str, capacity_m: int, group, hidden_size: int, top_k: int):
     workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
         tp_size=dist.get_world_size(group),
         tp_rank=dist.get_rank(group),
         max_token_num=capacity_m,
-        hidden_dim=HIDDEN_SIZE,
+        hidden_dim=hidden_size,
         dtype=torch.bfloat16,
         group=group,
-        top_k=TOP_K,
+        top_k=top_k,
         rms_eps=RMS_EPS,
         weight_bias=WEIGHT_BIAS,
         config=PROTOCOL_CONFIGS[protocol],
@@ -225,37 +238,48 @@ def _workspace(protocol: str, capacity_m: int, group):
 
 
 @pytest.mark.parametrize(
-    "protocol,large_bt",
-    (("ll", False), ("bt", False), ("bt", True), ("ht", False)),
+    "protocol,large_bt,hidden_size,top_k",
+    [
+        ("ll", False, 8192, 10),
+        ("bt", False, 8192, 10),
+        ("bt", True, 8192, 10),
+        ("ht", False, 8192, 10),
+        pytest.param("ht", False, 3584, 16, id="ht-k3"),
+    ],
 )
 @torch.inference_mode()
-def test_protocol_numerical_contract(distributed_group, protocol, large_bt):
+@pytest.mark.arch_blackwell
+def test_protocol_numerical_contract(
+    distributed_group, protocol, large_bt, hidden_size, top_k
+):
     group = distributed_group
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
+    if hidden_size == 8192 and world_size == 4:
+        pytest.skip("The H8192 presets require TP8 or TP16")
     m = {8: 257, 16: 513}[world_size] if large_bt else world_size
-    workspace = _workspace(protocol, m, group)
+    workspace = _workspace(protocol, m, group, hidden_size, top_k)
     symmetric_reference = (
-        _make_symmetric_reference((m, HIDDEN_SIZE), group) if protocol == "ht" else None
+        _make_symmetric_reference((m, hidden_size), group) if protocol == "ht" else None
     )
 
     common_generator = torch.Generator(device="cuda").manual_seed(3200)
     residual = torch.randn(
         m,
-        HIDDEN_SIZE,
+        hidden_size,
         generator=common_generator,
         dtype=torch.bfloat16,
         device="cuda",
     )
     gamma = torch.randn(
-        HIDDEN_SIZE,
+        hidden_size,
         generator=common_generator,
         dtype=torch.bfloat16,
         device="cuda",
     )
 
     try:
-        local = _order_sensitive_local(m, rank, world_size)
+        local = _order_sensitive_local(m, rank, world_size, hidden_size)
         residual_out = torch.empty_like(local)
         norm_out = torch.empty_like(local)
         allreduce_fusion(
@@ -279,19 +303,19 @@ def test_protocol_numerical_contract(distributed_group, protocol, large_bt):
         )
 
         routed = torch.zeros(
-            m * TOP_K,
-            HIDDEN_SIZE,
+            m * top_k,
+            hidden_size,
             dtype=torch.bfloat16,
             device="cuda",
         )
-        weights = torch.zeros(m, TOP_K, dtype=torch.bfloat16, device="cuda")
-        shared = torch.zeros(m, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        weights = torch.zeros(m, top_k, dtype=torch.bfloat16, device="cuda")
+        shared = torch.zeros(m, hidden_size, dtype=torch.bfloat16, device="cuda")
         rank_generator = torch.Generator(device="cuda").manual_seed(3300 + rank)
-        routed[rank * TOP_K : (rank + 1) * TOP_K].normal_(generator=rank_generator)
+        routed[rank * top_k : (rank + 1) * top_k].normal_(generator=rank_generator)
         weights[rank].normal_(generator=rank_generator)
         shared[rank].normal_(generator=rank_generator)
-        indices = torch.arange(m * TOP_K, dtype=torch.int32, device="cuda").reshape(
-            m, TOP_K
+        indices = torch.arange(m * top_k, dtype=torch.int32, device="cuda").reshape(
+            m, top_k
         )
         zero_residual = torch.zeros_like(residual)
         residual_out.zero_()
@@ -325,5 +349,303 @@ def test_protocol_numerical_contract(distributed_group, protocol, large_bt):
         _assert_norm_contract(
             protocol, norm_out, residual_out, reference_prenorm, gamma
         )
+    finally:
+        workspace.destroy()
+
+
+@pytest.mark.parametrize(
+    "cluster_size,threads,enable_pdl",
+    [(8, 128, False), (16, 64, True), (16, 128, False), (16, 128, True)],
+)
+@torch.inference_mode()
+def test_ll_cluster_shared_memory_graph_replay(
+    distributed_group, cluster_size, threads, enable_pdl
+):
+    """Peer shared-memory stores require a rendezvous, even before the first sum."""
+    group = distributed_group
+    m = 256
+    hidden_size = 8192
+    top_k = 10
+    collective = LLCollectiveTuning(
+        cluster_size=cluster_size, threads=threads, rank_lanes=1, enable_pdl=enable_pdl
+    )
+    profile = StaticProfile(
+        tp_size=dist.get_world_size(group),
+        hidden_size=hidden_size,
+        top_k=top_k,
+        dtype=torch.bfloat16,
+        finalize_routes=MRangeDispatch(
+            upper_bounds=(None,),
+            targets=(
+                KernelTarget(ProtocolKind.LL, LLFinalizeTuning(collective=collective)),
+            ),
+        ),
+        all_reduce_routes=MRangeDispatch(
+            upper_bounds=(None,),
+            targets=(
+                KernelTarget(ProtocolKind.LL, LLAllReduceTuning(collective=collective)),
+            ),
+        ),
+    )
+    workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
+        tp_size=dist.get_world_size(group),
+        tp_rank=dist.get_rank(group),
+        max_token_num=m,
+        hidden_dim=hidden_size,
+        dtype=torch.bfloat16,
+        group=group,
+        top_k=top_k,
+        rms_eps=RMS_EPS,
+        weight_bias=WEIGHT_BIAS,
+        config=MNNVLCuteDSLConfig(profiles=(profile,)),
+    )
+    local = torch.empty((m, hidden_size), dtype=torch.bfloat16, device="cuda")
+    residual = torch.ones_like(local)
+    gamma = torch.ones(hidden_size, dtype=local.dtype, device=local.device)
+    prenorm = torch.empty_like(local)
+    norm = torch.empty_like(local)
+
+    try:
+        local.fill_(dist.get_rank(group) + 1)
+        torch.cuda.synchronize()
+        dist.barrier(group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(32):
+                allreduce_fusion(
+                    input=local,
+                    workspace=workspace,
+                    pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                    launch_with_pdl=enable_pdl,
+                    residual_in=residual,
+                    residual_out=prenorm,
+                    norm_out=norm,
+                    rms_gamma=gamma,
+                    rms_eps=RMS_EPS,
+                    weight_bias=WEIGHT_BIAS,
+                )
+        for seed in range(4):
+            generator = torch.Generator(device="cuda").manual_seed(
+                3400 + seed * dist.get_world_size(group) + dist.get_rank(group)
+            )
+            local.normal_(generator=generator)
+            graph.replay()
+            torch.cuda.synchronize()
+            reference = _protocol_prenorm("ll", local, residual, group, None)
+            _assert_prenorm_contract("ll", prenorm, reference)
+            _assert_norm_contract("ll", norm, prenorm, reference, gamma)
+    finally:
+        workspace.destroy()
+
+
+_LL_LAMPORT_VARIANTS = {
+    "peer-store-publish": LLAllReduceTuning(peer_stores=True),
+    "split-publish": LLAllReduceTuning(
+        peer_stores=True, publish_multicast_fragments=256, publish_threads=256
+    ),
+    "split-bulk-publish": LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK,
+    "bulk-publish-partial-cta": LLAllReduceTuning(
+        peer_stores=True,
+        publish_multicast_fragments=192,
+        publish_threads=192,
+        publish_bulk_peer_stores=True,
+    ),
+    "two-shot": LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
+    "two-shot-cluster-16": LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64,
+    "two-shot-128-threads": LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192,
+    "two-shot-two-trips": LLAllReduceTuning(
+        two_shot=True, collective=LLCollectiveTuning(cluster_size=4, threads=128)
+    ),
+}
+
+
+@pytest.mark.parametrize("apply_rms_norm", (True, False), ids=("norm", "no-norm"))
+@pytest.mark.parametrize("variant", tuple(_LL_LAMPORT_VARIANTS))
+@torch.inference_mode()
+def test_ll_lamport_variant_graph_replay(distributed_group, variant, apply_rms_norm):
+    """Each LL all-reduce variant matches the rank-ordered reduction bit for bit.
+
+    The two-shot variants advance a Lamport generation per CTA, so the
+    captured sequence alternates token counts: a CTA that sits out a short call
+    must still agree with its peers on the next generation.
+    """
+    group = distributed_group
+    rank = dist.get_rank(group)
+    hidden_size = 8192
+    top_k = 10
+    token_counts = (64, 3, 33, 1)
+    capacity_m = max(token_counts)
+    tuning = _LL_LAMPORT_VARIANTS[variant]
+    route = MRangeDispatch(
+        upper_bounds=(None,), targets=(KernelTarget(ProtocolKind.LL, tuning),)
+    )
+    profile = StaticProfile(
+        tp_size=dist.get_world_size(group),
+        hidden_size=hidden_size,
+        top_k=top_k,
+        dtype=torch.bfloat16,
+        finalize_routes=MRangeDispatch(
+            upper_bounds=(None,),
+            targets=(KernelTarget(ProtocolKind.LL, LLFinalizeTuning()),),
+        ),
+        all_reduce_routes=route,
+    )
+    workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
+        tp_size=dist.get_world_size(group),
+        tp_rank=rank,
+        max_token_num=capacity_m,
+        hidden_dim=hidden_size,
+        dtype=torch.bfloat16,
+        group=group,
+        top_k=top_k,
+        rms_eps=RMS_EPS,
+        weight_bias=WEIGHT_BIAS,
+        add_residual=apply_rms_norm,
+        apply_rms_norm=apply_rms_norm,
+        config=MNNVLCuteDSLConfig(profiles=(profile,), applies_rms_norm=apply_rms_norm),
+    )
+    local = torch.empty((capacity_m, hidden_size), dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn(
+        capacity_m,
+        hidden_size,
+        generator=torch.Generator(device="cuda").manual_seed(3500),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    gamma = torch.randn(
+        hidden_size,
+        generator=torch.Generator(device="cuda").manual_seed(3501),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    prenorm = {
+        m: torch.empty((m, hidden_size), dtype=local.dtype, device="cuda")
+        for m in token_counts
+    }
+    norm = {m: torch.empty_like(prenorm[m]) for m in token_counts}
+
+    def call(m):
+        if apply_rms_norm:
+            allreduce_fusion(
+                input=local[:m],
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_in=residual[:m],
+                residual_out=prenorm[m],
+                norm_out=norm[m],
+                rms_gamma=gamma,
+                rms_eps=RMS_EPS,
+                weight_bias=WEIGHT_BIAS,
+            )
+        else:
+            allreduce_fusion(
+                input=local[:m],
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=prenorm[m],
+                rms_eps=RMS_EPS,
+                weight_bias=WEIGHT_BIAS,
+            )
+
+    try:
+        local.copy_(
+            _order_sensitive_local(
+                capacity_m, rank, dist.get_world_size(group), hidden_size
+            )
+        )
+        for m in token_counts:
+            call(m)
+        torch.cuda.synchronize()
+        dist.barrier(group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for step in range(32):
+                call(token_counts[step % len(token_counts)])
+        for seed in range(3):
+            generator = torch.Generator(device="cuda").manual_seed(
+                3600 + seed * dist.get_world_size(group) + rank
+            )
+            local.normal_(generator=generator)
+            local.copy_(_sanitize_negative_zero(local))
+            graph.replay()
+            torch.cuda.synchronize()
+            for m in token_counts:
+                reference = _protocol_prenorm(
+                    "ll",
+                    local[:m],
+                    residual[:m] if apply_rms_norm else torch.zeros_like(local[:m]),
+                    group,
+                    None,
+                )
+                _assert_prenorm_contract("ll", prenorm[m], reference)
+                if apply_rms_norm:
+                    _assert_norm_contract("ll", norm[m], prenorm[m], reference, gamma)
+    finally:
+        workspace.destroy()
+
+
+@torch.inference_mode()
+def test_ll_two_shot_mailboxes_cover_their_routes(distributed_group):
+    """Each two-shot collective sizes its mailboxes to the token counts routed
+    to it, and the routes still match the rank-ordered reduction bit for bit."""
+    group = distributed_group
+    rank = dist.get_rank(group)
+    tp_size = dist.get_world_size(group)
+    hidden_size = 8192
+    capacity_m = 64
+    small = LLAllReduceTuning(
+        two_shot=True, collective=LLCollectiveTuning(cluster_size=4, threads=128)
+    )
+    large = LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT
+    assert small.collective != large.collective
+    profile = StaticProfile(
+        tp_size=tp_size,
+        hidden_size=hidden_size,
+        top_k=10,
+        dtype=torch.bfloat16,
+        finalize_routes=MRangeDispatch(
+            upper_bounds=(None,),
+            targets=(KernelTarget(ProtocolKind.LL, LLFinalizeTuning()),),
+        ),
+        all_reduce_routes=MRangeDispatch(
+            upper_bounds=(8, None),
+            targets=(
+                KernelTarget(ProtocolKind.LL, small),
+                KernelTarget(ProtocolKind.LL, large),
+            ),
+        ),
+    )
+    workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
+        tp_size=tp_size,
+        tp_rank=rank,
+        max_token_num=capacity_m,
+        hidden_dim=hidden_size,
+        dtype=torch.bfloat16,
+        group=group,
+        add_residual=False,
+        apply_rms_norm=False,
+        config=MNNVLCuteDSLConfig(profiles=(profile,), applies_rms_norm=False),
+    )
+    try:
+        kernels = workspace._protocols[ProtocolKind.LL].all_reduce_kernels
+        for tuning, route_capacity in ((small, 8), (large, capacity_m)):
+            state = kernels[tuning]._state
+            assert state.scatter_mailbox.tensor.shape[2] == route_capacity
+            assert state.gather_mailbox.tensor.shape[1] == route_capacity
+        local = _order_sensitive_local(capacity_m, rank, tp_size, hidden_size)
+        expected = _protocol_prenorm("ll", local, torch.zeros_like(local), group, None)
+        for m in (8, 64, 3, 9, 1, 64, 8):
+            out = torch.empty((m, hidden_size), dtype=torch.bfloat16, device="cuda")
+            allreduce_fusion(
+                input=local[:m],
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=out,
+                rms_eps=workspace.rms_eps,
+            )
+            _assert_prenorm_contract("ll", out, expected[:m])
     finally:
         workspace.destroy()

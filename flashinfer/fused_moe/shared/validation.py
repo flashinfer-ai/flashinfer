@@ -35,10 +35,17 @@ def validate_bf16_gemm1_activation_params(
 ) -> None:
     if gemm1_alpha is None and gemm1_beta is None and gemm1_clamp_limit is None:
         return
-    if int(activation_type) != int(ActivationType.Swiglu):
+    if int(activation_type) == int(ActivationType.SwigluStep):
+        if gemm1_alpha is not None or gemm1_beta is not None:
+            raise ValueError(
+                "ActivationType.SwigluStep accepts gemm1_clamp_limit only; "
+                "gemm1_alpha and gemm1_beta must be absent."
+            )
+    elif int(activation_type) != int(ActivationType.Swiglu):
         raise ValueError(
             "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
-            "for ActivationType.Swiglu."
+            "for ActivationType.Swiglu, or gemm1_clamp_limit alone for "
+            "ActivationType.SwigluStep."
         )
     for name, tensor in (
         ("gemm1_alpha", gemm1_alpha),

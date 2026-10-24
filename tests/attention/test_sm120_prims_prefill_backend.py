@@ -315,6 +315,10 @@ def test_prims_fail_fast_for_unsupported_options():
     sinks = torch.zeros(hq, dtype=torch.float32, device="cuda")
     with pytest.raises(NotImplementedError, match="does not support attention sinks"):
         paged_wrapper.run(q, cache, sinks=sinks)
+    with pytest.raises(
+        NotImplementedError, match="skip_softmax_threshold_scale_factor"
+    ):
+        paged_wrapper.run(q, cache, skip_softmax_threshold_scale_factor=2.0)
 
     ragged_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace, "NHD", backend="cute-dsl-prims"

@@ -29,6 +29,7 @@
 # This file is ported from CUTLASS's Rubin dense_blockscaled_gemm_persistent.py
 # with modifications for FlashInfer integration (alpha scaling, tensor-based API, wrapper method).
 
+import logging
 import os
 import sys
 from typing import Literal, NamedTuple, Optional, Tuple, Type, Union
@@ -49,6 +50,8 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -273,11 +276,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         a_major: str = "k",
         b_major: str = "k",
         c_major: str = "n",
+        mma_tiler_k: int = 256,
     ) -> bool:
         """Pre-sync flashinfer signature; delegates to _can_implement_impl.
 
-        mma_tiler K is fixed at 256, matching the FP4 tactic enumeration in
-        gemm_base.py (mma_tiler_k = 256).
+        ``mma_tiler_k`` is 256 for FP4 and 128 for MXFP8.
         """
         return Sm107BlockScaledPersistentDenseGemmKernel._can_implement_impl(
             (m, n, k, l),
@@ -289,7 +292,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             b_major,
             c_major,
             sf_vec_size,
-            (mma_tiler_mn[0], mma_tiler_mn[1], 256),
+            (mma_tiler_mn[0], mma_tiler_mn[1], mma_tiler_k),
             mma_inst_shape,
             cluster_shape_mn,
         )
@@ -314,17 +317,29 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
     ):
         """Pre-sync flashinfer tensor-based entry point (TVM-FFI path).
 
-        Extracts problem dims and raw pointers from the packed-uint8 A/B and
-        C tensors, then delegates to the TRT-LLM pointer-based wrapper_ptrs.
+        Extracts problem dims and raw pointers from the A/B and C tensors, then
+        delegates to the TRT-LLM pointer-based wrapper_ptrs. A/B are either
+        FP4 packed as uint8 (2 values per byte) or MXFP8 as float8.
         C is compact (c_ld=0 derives the contiguous leading dimension).
         """
         m = cute.size(mA, mode=[0])
-        k_packed = cute.size(mA, mode=[1])
+        k_raw = cute.size(mA, mode=[1])
         n = cute.size(mB, mode=[0])
-        k = k_packed * 2
-
-        a_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
-        b_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
+        if cutlass.const_expr(
+            mA.element_type == cutlass.Uint8 and mB.element_type == cutlass.Uint8
+        ):
+            k = k_raw * 2
+            a_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
+            b_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
+        elif cutlass.const_expr(mA.element_type != mB.element_type):
+            raise TypeError(
+                "Unsupported mixed input dtypes for block-scaled GEMM: "
+                "mA and mB must both be Uint8 (FP4) or both FP8 (MXFP8)."
+            )
+        else:
+            k = k_raw
+            a_ptr = mA.iterator
+            b_ptr = mB.iterator
         self.wrapper_ptrs(
             m,
             n,
@@ -2316,7 +2331,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
         except testing.CantImplementError as e:
-            print(f"[DSL ERROR] CantImplementError: {e}")
+            # Unsupported autotuning candidates are expected, not kernel failures.
+            logger.debug("Skipping unsupported GEMM candidate: %s", e)
             return False
         return True
 

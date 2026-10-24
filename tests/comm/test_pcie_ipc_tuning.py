@@ -21,8 +21,11 @@ reduced with the wrong operator. The multi-GPU tests can only observe the
 consequences, and one of the consequences is a hang.
 """
 
+import ast
 import inspect
 import json
+import textwrap
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -86,6 +89,11 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
         for t in tuning.TUNE_THREADS
         if b > policy.CE_MAX_PIECES or t != policy.CE_THREADS
     }
+    expected_rejected |= {
+        (int(IpcVariant.COPY_ENGINE_RING_MEMOP), b, t)
+        for b in tuning.TUNE_BLOCKS
+        for t in tuning.TUNE_THREADS
+    }
     assert rejected == expected_rejected
 
     # World size 4: no FLAT_STAGED, and threads must be at least world_size
@@ -93,7 +101,12 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
     rejected4 = set(grid) - set(tuning.candidate_tactics(4))
     # The island schedule is a 4+4 decomposition, so world size 4 rejects it.
     assert all(
-        t[0] in (int(IpcVariant.FLAT_STAGED), int(IpcVariant.COPY_ENGINE_ISLAND))
+        t[0]
+        in (
+            int(IpcVariant.FLAT_STAGED),
+            int(IpcVariant.COPY_ENGINE_ISLAND),
+            int(IpcVariant.COPY_ENGINE_RING_MEMOP),
+        )
         or (
             t[0] == int(IpcVariant.COPY_ENGINE_RING)
             and (t[1] > policy.CE_MAX_PIECES or t[2] != policy.CE_THREADS)
@@ -215,6 +228,34 @@ def test_survivor_count_is_a_constant_not_a_threshold() -> None:
     assert "return [TABLE_TACTIC] + kept" in src
 
 
+def _calls_in_source_order(fn) -> list[str]:
+    """The callee of every call in ``fn``, in source order."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    calls = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    return [ast.unparse(node.func) for node in calls]
+
+
+def test_the_barrier_precedes_the_first_collective_launch() -> None:
+    """A barrier sits between the allocations and the first collective launch.
+
+    The warm-up spins with no timeout, so a rank that fails before it must leave
+    its peers in NCCL, not in the kernel.
+    """
+    calls = _calls_in_source_order(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
+    first_launch = calls.index("ws._launch")
+    barriers = [i for i, c in enumerate(calls[:first_launch]) if c == "dist.barrier"]
+    assert barriers, f"a collective launch is issued before any barrier: {calls}"
+    allocations = [
+        i
+        for i, c in enumerate(calls[:first_launch])
+        if c in ("inp.clone", "self._output_for", "torch.zeros", "torch.cuda.Event")
+    ]
+    assert allocations and max(allocations) < barriers[-1], calls
+
+
 def test_timings_are_reduced_with_max(monkeypatch) -> None:
     """MAX, and reduced at all -- a rank-local ranking is the deadlock above."""
     seen = {}
@@ -230,6 +271,85 @@ def test_timings_are_reduced_with_max(monkeypatch) -> None:
     monkeypatch.setattr(tuning, "dist", _FakeDist)
     tuning.reduce_timings(torch.tensor([1.0, 2.0]), group=None)
     assert seen["op"] == _FakeDist.ReduceOp.MAX
+
+
+# The copy-engine plane; every other variant runs on the SM.
+_CE_VARIANTS = (
+    IpcVariant.COPY_ENGINE_RING,
+    IpcVariant.COPY_ENGINE_ISLAND,
+    IpcVariant.COPY_ENGINE_RING_MEMOP,
+)
+
+
+def _on_ce_plane(config) -> bool:
+    return config.variant in _CE_VARIANTS
+
+
+def _stranded(configs, order):
+    """Candidates that every ranking round times right after a plane switch.
+
+    Models get_valid_tactics: one warm-up launch per variant, then the rounds.
+    """
+    warmed = []
+    for config in configs:
+        if all(config.variant != w.variant for w in warmed):
+            warmed.append(config)
+    previous = warmed[-1]
+    escaped = set()
+    for r in range(tuning.TUNE_RANK_ROUNDS):
+        for i in order(len(configs), r):
+            if _on_ce_plane(previous) == _on_ce_plane(configs[i]):
+                escaped.add(i)
+            previous = configs[i]
+    return [c for i, c in enumerate(configs) if i not in escaped]
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 121])
+def test_each_ranking_round_times_every_candidate_once(n: int) -> None:
+    """Every round times each candidate once, and round 0 runs in list order."""
+    for r in range(tuning.TUNE_RANK_ROUNDS):
+        assert sorted(tuning._round_order(n, r)) == list(range(n)), (n, r)
+    assert list(tuning._round_order(n, 0)) == list(range(n))
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+@pytest.mark.parametrize("profile", [PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR])
+@pytest.mark.parametrize("memop_supported", [False, True])
+@pytest.mark.parametrize("numel", [64 * 1024, 1024 * 6144, 8192 * 6144])
+def test_no_candidate_is_timed_behind_a_plane_switch_in_every_round(
+    world_size: int, profile: str, memop_supported: bool, numel: int
+) -> None:
+    """Every candidate gets at least one round free of a plane switch."""
+    tactics = tuning.candidate_tactics(
+        world_size, numel=numel, profile=profile, memop_supported=memop_supported
+    )
+    seed = get_pcie_ipc_launch_config(world_size, numel, 2)
+    configs = [seed] + [tuning.tactic_to_config(t) for t in tactics]
+
+    assert _stranded(configs, tuning._round_order) == []
+    # Not vacuous: a fixed order strands the first copy-engine candidate.
+    first_ce = next(c for c in configs if _on_ce_plane(c))
+    assert first_ce in _stranded(configs, lambda n, r: range(n))
+
+
+def test_the_ranking_rounds_take_their_order_from_round_order() -> None:
+    """The order property above is only worth anything if the loop uses it."""
+    src = inspect.getsource(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
+    loops = [
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(src)))
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and ast.unparse(node.iter.func) == "_round_order"
+    ]
+    assert len(loops) == 1, "the ranking rounds must iterate _round_order"
+    assert ast.unparse(loops[0].target) == "i", ast.unparse(loops[0].target)
+    calls = {
+        ast.unparse(node.func)
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.Call)
+    }
+    assert {"ws._launch", "starts[r][i].record", "ends[r][i].record"} <= calls, calls
 
 
 def test_the_prefill_screen_keeps_every_measured_prefill_winner() -> None:
@@ -349,6 +469,8 @@ def test_resolve_falls_back_to_the_seed() -> None:
     assert resolve(seed, (0, 128, 128), 8, 32) is seed
     # Stale: a variant this world size does not dispatch.
     assert resolve(seed, (int(IpcVariant.FLAT_STAGED), 1, 128), 4, MAX_BLOCKS) is seed
+    # Stale: a copy-engine depth past the workspace's max_blocks.
+    assert resolve(seed, (int(IpcVariant.COPY_ENGINE_RING), 2, 256), 8, 1) is seed
     # Usable.
     assert resolve(seed, (int(IpcVariant.STAGED_RING), 2, 256), 8, MAX_BLOCKS) == (
         IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)
@@ -379,6 +501,7 @@ def test_cache_key_extras_separate_every_workspace_dimension() -> None:
         ("max_blocks", 32),
         ("max_numel", 6144 * 64),
         ("dtype", torch.float16),
+        ("memop_supported", True),
     ):
         assert tuning.cache_key_extras(**{**base, field: other}) != reference, field
 
@@ -397,6 +520,59 @@ def _synthesise_cache(monkeypatch, *entries) -> None:
     monkeypatch.setattr(AutoTuner.get(), "_file_configs", configs, raising=False)
 
 
+@pytest.mark.parametrize("memop_supported", [False, True])
+def test_original_and_memop_cache_namespaces_remain_loadable(
+    memop_supported, monkeypatch, tmp_path
+) -> None:
+    """Original v3 caches still hit; enabled SM120 retains its separate v4 key."""
+    from flashinfer.autotuner import AutoTuner
+
+    workspace_fields = dict(
+        world_size=4, profile=PROFILE_ROOTCPLX, max_blocks=128, max_numel=6144 * 128
+    )
+    # Literal persisted formats, independent of the current key builder.
+    if memop_supported:
+        head = (4, 4, PROFILE_ROOTCPLX, 128, 6144 * 128, True)
+    else:
+        head = (3, 4, PROFILE_ROOTCPLX, 128, 6144 * 128)
+    extras = head + ("torch.bfloat16",)
+    tactic = (6, 1, 256) if memop_supported else (1, 8, 256)
+    file_key = str(
+        (
+            "flashinfer::pcie_ipc_all_reduce",
+            "PcieIpcAllReduceRunner",
+            ((1, 4096),),
+            extras,
+        )
+    )
+    path = tmp_path / "pcie-ipc.json"
+    path.write_text(json.dumps({file_key: ["PcieIpcAllReduceRunner", list(tactic)]}))
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    assert tuner.load_configs(str(path))
+
+    workspace = SimpleNamespace(**workspace_fields, memop_supported=memop_supported)
+    runner = tuning.PcieIpcAllReduceRunner(workspace)
+    inp = torch.empty(1, 4096, dtype=torch.bfloat16)
+    assert runner.get_cache_key_extras([inp]) == extras
+    assert hash(runner) == hash(("PcieIpcAllReduceRunner", *head))
+    assert tuning.cache_covers_workspace(
+        **workspace_fields, memop_supported=memop_supported
+    )
+    assert not tuning.cache_covers_workspace(
+        **workspace_fields, memop_supported=not memop_supported
+    )
+    hit, runner_id, loaded_tactic, _ = tuner.search_cache(
+        tuning.PCIE_IPC_CUSTOM_OP,
+        [runner],
+        (tuple(inp.shape),),
+        tuning.pcie_ipc_tuning_config(),
+        inputs=[inp],
+    )
+    assert hit and runner_id == 0
+    assert loaded_tactic == tactic
+
+
 def test_a_cache_written_for_another_workspace_reads_as_uncovered(monkeypatch) -> None:
     """A key mismatch misses every entry, which looks exactly like a hit."""
     tuned = dict(
@@ -409,6 +585,7 @@ def test_a_cache_written_for_another_workspace_reads_as_uncovered(monkeypatch) -
     assert tuning.cache_covers_workspace(**tuned)
     for field, other in (
         ("max_numel", 6144 * 256),
+        ("memop_supported", True),
         ("world_size", 8),
         ("max_blocks", 32),
         ("profile", PROFILE_SWITCHPAIR),
@@ -645,3 +822,15 @@ def test_unrelated_autotune_context_preserves_workspace_cache(monkeypatch) -> No
     assert tuner.loaded == [workspace._tune_cache]
     assert tuner.lookups == 1
     assert result == IpcLaunchConfig(16, 256, IpcVariant.STAGED)
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_memop_candidate_requires_group_capability_and_single_piece(world_size):
+    common = dict(world_size=world_size, numel=12 * 1024 * 1024 // 2)
+    legacy = set(tuning.candidate_tactics(**common, memop_supported=False))
+    enabled = set(tuning.candidate_tactics(**common, memop_supported=True))
+    expected = {(6, 1, 256)} if world_size in (4, 8) else set()
+    assert enabled - legacy == expected
+    assert legacy <= enabled
+    assert tuning.TUNE_RANK_ROUNDS == 3
+    assert tuning.TUNE_SURVIVORS == 48

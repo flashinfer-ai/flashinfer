@@ -17,32 +17,35 @@ SM90 (Hopper) CuTe-DSL fused MoE, BF16/FP16.
 
 Three kernels per MoE layer:
   1. ``moe_sort``            (C++/JIT routing index maps — no data movement)
-  2. GEMM1: gather + grouped GEMM + SiLU-gating (permute fused in the A load)
+  2. GEMM1: gather + grouped GEMM + fused activation (permute fused in the A load)
   3. GEMM2: grouped GEMM + fused finalize (router-scaled scatter-reduce)
 
 Design doc: docs/design_docs/cute_dsl_moe_sm90.md.
 """
 
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 import torch
 
 from ...api_logging import flashinfer_api
 from ...autotuner import AutoTuner
+from ...tllm_enums import (
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+)
 from ...trace.templates.moe import cute_dsl_fused_moe_bf16_trace
 from ...utils import get_compute_capability, supported_compute_capability
-from .moe_utils import moe_output_memset_inplace, moe_sort, moe_unpermute
-from .sm90_tuner import (
-    _GEMM1_TILE_N_BY_TILE_SIZE,
-    _GEMM2_TILE_N_BY_TILE_SIZE,
-    CuteDslFusedMoESm90Runner,
-    Sm90MoeTactic,
-    _decode_sm90_moe_tactic,
-    _default_gemm2_tile_k,
-    _enumerate_sm90_moe_tactics,
-    _gemm2_tactic_can_implement,
-    _Sm90MoeTacticOverride,
+from .moe_utils import (
+    moe_output_memset_inplace,
+    moe_sort,
+    moe_unpermute,
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
 )
+from .sm90_tuner import CuteDslFusedMoESm90Runner
 from .sm90_contiguous_gather_grouped_gemm_act_fusion import (
     sm90_contiguous_gather_grouped_gemm_act_fusion,
 )
@@ -76,6 +79,15 @@ def _get_cuda_graph_resources() -> _CudaGraphResources:
     return _cuda_graph_resources
 
 
+def _sm90_moe_autotune_op_name(
+    activation_type: int, situ_beta: Optional[float] = None
+) -> str:
+    """Autotuner op name for one activation family (separate tuning caches)."""
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation_name = "Situ" if situ_beta is not None else activation.name
+    return f"CuteDslFusedMoE::run_moe_sm90::{activation_name}"
+
+
 def _moe_core_impl(
     x: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -89,19 +101,28 @@ def _moe_core_impl(
     local_expert_offset: int = 0,
     moe_output: Optional[torch.Tensor] = None,
     intermediate_buffer: Optional[torch.Tensor] = None,
-    tile_size: Optional[int] = None,
-    gemm1_tile_n: Optional[int] = None,
-    gemm2_tile_n: Optional[int] = None,
-    gemm2_tile_k: Optional[int] = None,
-    gemm2_cluster_shape_mn: Optional[Tuple[int, int]] = None,
-    gemm2_raster_along_m: Optional[bool] = None,
+    tile_size: int = 128,
+    gemm1_tile_shape_mn: Tuple[int, int] = (128, 64),
+    gemm1_swizzle_size: int = 1,
+    gemm2_tile_shape_mn: Tuple[int, int] = (128, 64),
+    gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    gemm2_raster_along_m: bool = False,
     use_fused_finalize: bool = True,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ) -> torch.Tensor:
-    """moe_sort + GEMM1 + GEMM2 pipeline with explicit (or auto-selected)
-    tile parameters; :func:`cute_dsl_fused_moe_bf16` dispatches here with
-    the AutoTuner-selected tactic. ``num_local_experts`` is required — the
-    public entry points resolve the ``None``-means-``num_experts`` default."""
+    """moe_sort + GEMM1 + GEMM2 pipeline for one tactic.
+
+    The runner (:class:`~.sm90_tuner.CuteDslFusedMoESm90Runner`) fans the
+    tactic tuple into the tile keywords; the kernel wrappers validate them
+    against the shapes. ``num_local_experts`` is required -- the public entry
+    points resolve the ``None``-means-``num_experts`` default.
+    """
     # Fail fast on the wrong arch: the routing / DSL modules below can abort
     # the process (not raise) when driven on a non-Hopper GPU.
     major, minor = get_compute_capability(x.device)
@@ -111,7 +132,6 @@ def _moe_core_impl(
         )
 
     num_tokens, hidden = x.shape
-    inter2 = w1_weight.shape[1]
 
     if num_tokens == 0:
         # Empty batch (e.g. DP rank with no tokens this step): nothing to
@@ -119,78 +139,6 @@ def _moe_core_impl(
         if moe_output is None:
             moe_output = torch.empty(0, hidden, dtype=x.dtype, device=x.device)
         return moe_output
-
-    inter_per_rank = w2_weight.shape[2]
-    if tile_size is None:
-        # Tile 64 halves the padded-MMA waste of small batches (each touched
-        # expert pads to a full M-tile), but tile 128's fatter tiles win as
-        # soon as experts average one full 64-row tile (kernel A/B at 64
-        # rows/expert: GEMM1 +7..13%, GEMM2 +4..36% across per-rank I).
-        # Tiny reductions (I < 192) amortize GEMM2's fixed per-tile cost so
-        # poorly at tile 64 that they flip far earlier.
-        avg_rows_per_expert = num_tokens * top_k / num_local_experts
-        decode_limit = 16 if inter_per_rank < 192 else 64
-        tile_size = 64 if avg_rows_per_expert < decode_limit else 128
-
-    # Tile N must divide the (padded) GEMM N extents; pick the largest legal
-    # candidate. Gated GEMM1 requires tile_n % 64 == 0.
-    def _pick_tile_n(n, candidates):
-        for c in candidates:
-            if n % c == 0:
-                return c
-        raise ValueError(f"no supported tile N divides n={n}")
-
-    # Prefer the largest tile N (fewer tiles, better B-load amortization and
-    # fewer A re-reads); 2-warpgroup tiles (N > 128 at tile M 128) are
-    # validated. At decode (tile_size 64) stick to 1-WG tiles — the wide-tile
-    # register economics only pay off with 2 consumer warpgroups.
-    if gemm1_tile_n is None:
-        gemm1_tile_n = _pick_tile_n(inter2, _GEMM1_TILE_N_BY_TILE_SIZE[tile_size])
-    if gemm2_tile_n is None:
-        gemm2_tile_n = _pick_tile_n(hidden, _GEMM2_TILE_N_BY_TILE_SIZE[tile_size])
-
-    # Resolve and validate every GEMM2 topology field before routing or
-    # launching GEMM1. The fallback dispatch retains the measured policies;
-    # tuned and explicit calls supply the cluster/raster axes directly.
-    if gemm2_tile_k is None:
-        gemm2_tile_k = _default_gemm2_tile_k(inter_per_rank, tile_size)
-    if gemm2_cluster_shape_mn is None:
-        gemm2_cluster_shape_mn = (
-            (1, 2)
-            if inter_per_rank >= 192 and num_tokens * top_k >= 256 * num_local_experts
-            else (1, 1)
-        )
-        if not _gemm2_tactic_can_implement(
-            hidden,
-            inter_per_rank,
-            (tile_size, gemm2_tile_n),
-            gemm2_tile_k,
-            gemm2_cluster_shape_mn,
-        ):
-            gemm2_cluster_shape_mn = (1, 1)
-    elif not _gemm2_tactic_can_implement(
-        hidden,
-        inter_per_rank,
-        (tile_size, gemm2_tile_n),
-        gemm2_tile_k,
-        gemm2_cluster_shape_mn,
-    ):
-        raise ValueError(
-            "GEMM2 tactic cannot implement "
-            f"hidden={hidden}, intermediate={inter_per_rank}, "
-            f"tile_shape_mn={(tile_size, gemm2_tile_n)}, tile_k={gemm2_tile_k}, "
-            f"cluster_shape_mn={gemm2_cluster_shape_mn}"
-        )
-    if gemm2_raster_along_m is None:
-        out_bytes = num_tokens * hidden * x.element_size()
-        if tile_size < 128 or inter_per_rank > 384:
-            gemm2_raster_along_m = False
-        elif inter_per_rank <= 192:
-            gemm2_raster_along_m = out_bytes >= 32 * 1024 * 1024
-        else:
-            gemm2_raster_along_m = out_bytes >= 64 * 1024 * 1024
-    elif not isinstance(gemm2_raster_along_m, bool):
-        raise ValueError("gemm2_raster_along_m must be bool or None")
 
     (
         tile_idx_to_expert_idx,
@@ -207,10 +155,18 @@ def _moe_core_impl(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
+        enable_pdl=enable_pdl,
     )
     permuted_m = tile_idx_to_expert_idx.numel() * tile_size
 
-    inter = w1_weight.shape[1] // 2
+    _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    inter = w1_weight.shape[1] // (2 if gated else 1)
+    if w2_weight.shape[2] != inter:
+        raise ValueError(
+            f"w2_weight intermediate size {w2_weight.shape[2]} does not match "
+            f"w1_weight ({w1_weight.shape[1]} rows, "
+            f"{'gated' if gated else 'non-gated'} activation -> {inter})"
+        )
     if intermediate_buffer is None:
         intermediate_buffer = torch.empty(
             permuted_m, inter, dtype=x.dtype, device=x.device
@@ -237,11 +193,6 @@ def _moe_core_impl(
             moe_output_memset_inplace(moe_output)
             memset_event.record(aux_stream)
 
-    # Keep GEMM1 unclustered. L2 can service concurrent same-expert B reads,
-    # while clustered execution constrains CTA scheduling and requires both
-    # members of each pair to traverse the pipeline.
-    gemm1_cluster = (1, 1)
-
     intermediate = sm90_contiguous_gather_grouped_gemm_act_fusion(
         x,
         w1_weight,
@@ -252,9 +203,16 @@ def _moe_core_impl(
         out=intermediate_buffer,
         topk=top_k,
         permuted_m=permuted_m,
-        tile_shape_mn=(tile_size, gemm1_tile_n),
-        cluster_shape_mn=gemm1_cluster,
+        tile_shape_mn=gemm1_tile_shape_mn,
+        cluster_shape_mn=(1, 1),
+        swizzle_size=gemm1_swizzle_size,
         enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
     if use_fused_finalize:
@@ -279,8 +237,7 @@ def _moe_core_impl(
         gemm2_output,
         topk=top_k,
         use_fused_finalize=use_fused_finalize,
-        tile_shape_mn=(tile_size, gemm2_tile_n),
-        tile_k=gemm2_tile_k,
+        tile_shape_mn=gemm2_tile_shape_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
         raster_along_m=gemm2_raster_along_m,
         enable_pdl=enable_pdl,
@@ -316,46 +273,51 @@ def cute_dsl_fused_moe_bf16(
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     *,
     intermediate_buffer: Optional[torch.Tensor] = None,
-    tile_size: Optional[int] = None,
-    gemm1_tile_n: Optional[int] = None,
-    gemm2_tile_n: Optional[int] = None,
-    gemm2_tile_k: Optional[int] = None,
-    gemm2_cluster_shape_mn: Optional[Tuple[int, int]] = None,
-    gemm2_raster_along_m: Optional[bool] = None,
+    tactic: Optional[Tuple[Any, ...]] = None,
 ) -> torch.Tensor:
     """SM90 CuTe-DSL fused MoE forward (BF16/FP16, unquantized).
 
-    ``out[t] = sum_k scale[t,k] * ffn_expert(x[t]; e[t,k])`` with
+    ``out[t] = sum_k scale[t,k] * ffn_expert(x[t]; e[t,k])`` with, for the
+    default SwiGLU,
     ``ffn(x; e) = (silu(x @ w1_gate[e].T) * (x @ w1_up[e].T)) @ w2_weight[e].T``.
 
     Supported configuration:
         * Arch: SM90 (Hopper) only.
         * Dtypes: bf16 or fp16 activations and weights (must match), fp32
           accumulation; output dtype = input dtype. No quantized paths.
-        * Activation: SwiGLU (SiLU-gated) only, fused into GEMM1.
+        * Activation, fused into GEMM1: ``ActivationType.Swiglu`` (default;
+          the OAI variant via ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``,
+          SiTU via ``situ_beta``), ``ActivationType.GegluTanh``, or the
+          non-gated ``ActivationType.Relu2``.
         * Routing: pre-routed contract only — the caller runs the router and
           passes global expert ids plus **normalized** scales. ``top_k`` is a
           compile-time constant of the kernels.
         * Parallelism: TP by weight shapes; EP via ``num_local_experts`` +
           ``local_expert_offset`` (tokens routed entirely outside the local
           shard contribute zeros).
-        * Shapes: ``hidden % 64 == 0`` and (GEMM1 reduction) no tile-32
-          fallback, ``2I % 64 == 0``, ``I % 32 == 0`` (weight interleave and
-          GEMM2 tile-k 32 fallback for ``I % 64 != 0``); ``num_tokens == 0``
-          is supported.
+        * Shapes: ``hidden % 8 == 0``; ``I % 32 == 0`` for gated activations
+          (32-column up/gate interleave), ``I % 8 == 0`` for ``Relu2``;
+          partial last K and N tiles are handled; ``num_tokens == 0`` is
+          supported.
         * Execution: CUDA-graph capturable; PDL on by default; fused
           finalize (default) is atomic and not bitwise-reproducible —
           ``use_fused_finalize=False`` selects the deterministic path.
 
     Tile selection goes through the FlashInfer AutoTuner. Under the
-    :func:`autotune` context
-    every enumerated :class:`Sm90MoeTactic` (capped at the top-2 legal N
-    tiles per GEMM) is profiled and the per-bucket winner is
-    cached; outside it the cached winner (or the heuristic auto-selection,
-    as the default tactic) dispatches. Explicit tile / cluster / raster /
-    buffer keyword overrides bypass the tuner::
+    :func:`autotune` context every tactic the runner offers for the token
+    bucket (:meth:`~.sm90_tuner.CuteDslFusedMoESm90Runner.get_valid_tactics`)
+    is profiled and the per-bucket winner is cached; outside it the cached
+    winner (or the fixed default, :data:`~.sm90_tuner.DEFAULT_SM90_MOE_TACTIC`:
+    tile 128, 64-wide N tiles, cluster (1, 1), N-major walks) dispatches. An
+    explicit ``tactic`` bypasses the tuner::
 
         with autotune(True):
             output = cute_dsl_fused_moe_bf16(...)
@@ -365,9 +327,11 @@ def cute_dsl_fused_moe_bf16(
         token_selected_experts: ``[num_tokens, top_k]`` int32.
         token_final_scales: ``[num_tokens, top_k]`` float32, normalized by the
             caller.
-        w1_weight: ``[num_local_experts, 2I, hidden]`` — up/gate interleaved at 32
-            columns. Callers may cache this repack; the in-tree reference is
+        w1_weight: Gated activations: ``[num_local_experts, 2I, hidden]``,
+            up/gate interleaved at 32 columns. Callers may cache this repack;
+            the in-tree reference is
             :func:`~.sm90_contiguous_gather_grouped_gemm_act_fusion.interleave_up_gate_sm90`.
+            ``Relu2``: ``[num_local_experts, I, hidden]``, no interleave.
         w2_weight: ``[num_local_experts, hidden, I]``.
         num_experts: Total (global) expert count.
         top_k: Experts per token.
@@ -390,73 +354,30 @@ def cute_dsl_fused_moe_bf16(
             path's ``moe_unpermute``) with Programmatic Dependent Launch so
             each kernel's prologue overlaps its predecessor's tail. Numerics
             are unaffected. Part of the kernel compile cache key.
+        activation_type: GEMM1 activation, see the supported configuration
+            above. Together with the constants below it is part of the kernel
+            compile key and of the autotuner cache key.
+        swiglu_alpha: SwiGLU sigmoid multiplier (``Swiglu`` only).
+        swiglu_beta: SwiGLU up-projection bias (``Swiglu`` only).
+        swiglu_limit: SwiGLU clamp limit (``Swiglu`` only).
+        situ_beta: With ``Swiglu``, selects the SiTU gate
+            ``beta * tanh(gate / beta) * sigmoid(gate)``.
+        situ_linear_beta: Optional SiTU tanh clamp of the up branch
+            (requires ``situ_beta``).
         intermediate_buffer: Optional pre-allocated GEMM1 output buffer
-            (advanced, keyword-only; bypasses the tuner like the tile
-            overrides).
-        tile_size: Tile size shared by moe_sort and both GEMMs (64 or 128;
-            keyword-only). Default None auto-selects: 64 below an average of
-            64 rows per local expert (``num_tokens * top_k /
-            num_local_experts``) — small/decode batches pad each expert to a
-            full M-tile, so the smaller tile roughly halves the wasted MMA
-            work; 128 from one full tile per expert up (fatter tiles
-            amortize per-tile fixed costs and B loads). Tiny reductions
-            (per-rank ``I < 192``) switch to 128 already at 16 rows per
-            expert.
-        gemm1_tile_n: N tile for GEMM1 (None auto-selects; keyword-only).
-        gemm2_tile_n: N tile for GEMM2 (None auto-selects; keyword-only).
-        gemm2_tile_k: K tile for GEMM2, 64 or 32 (None auto-selects via
-            :func:`_default_gemm2_tile_k`: 32 when 64 does not divide the
-            per-rank I, and on prefill tiles with I >= 384 where its doubled
-            pipeline depth wins; 64 otherwise. Keyword-only).
-        gemm2_cluster_shape_mn: GEMM2 CTA cluster shape, ``(1, 1)`` or
-            ``(1, 2)`` (None applies the fallback heuristic; keyword-only).
-            ``(1, 2)`` requires an even GEMM2 N-tile count.
-        gemm2_raster_along_m: GEMM2 tile raster order (None auto-selects;
-            keyword-only). M-major confines the finalize scatter-RMW working
-            set to one L2-resident output column band per CTA wave, at the
-            cost of re-reading each A tile once per N tile — the default
-            enables it only where that trade wins: prefill tiles with a
-            large output working set (>= 32 MiB for per-rank ``I <= 192``,
-            >= 64 MiB above) and per-rank ``I <= 384``.
+            (advanced, keyword-only).
+        tactic: Optional ``(tile_size, gemm1_tactic, gemm2_tactic)`` tuple
+            (see :mod:`~.sm90_tuner`) dispatched as given, validated by the
+            kernel wrappers; ``None`` selects through the AutoTuner.
 
     Returns:
         ``[num_tokens, hidden]`` in x's dtype.
     """
     if num_local_experts is None:
         num_local_experts = num_experts
-
-    # Explicit tile / buffer overrides are deterministic direct dispatch
-    # (tests, benchmarks); the tuner only owns the auto-selected path.
-    if (
-        tile_size is not None
-        or gemm1_tile_n is not None
-        or gemm2_tile_n is not None
-        or gemm2_tile_k is not None
-        or gemm2_cluster_shape_mn is not None
-        or gemm2_raster_along_m is not None
-        or intermediate_buffer is not None
-    ):
-        return _moe_core_impl(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            w1_weight,
-            w2_weight,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
-            moe_output=moe_output,
-            intermediate_buffer=intermediate_buffer,
-            tile_size=tile_size,
-            gemm1_tile_n=gemm1_tile_n,
-            gemm2_tile_n=gemm2_tile_n,
-            gemm2_tile_k=gemm2_tile_k,
-            gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
-            gemm2_raster_along_m=gemm2_raster_along_m,
-            use_fused_finalize=use_fused_finalize,
-            enable_pdl=enable_pdl,
-        )
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
+    validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     num_tokens, hidden = x.shape
     if num_tokens == 0:
@@ -475,6 +396,12 @@ def cute_dsl_fused_moe_bf16(
         local_expert_offset=local_expert_offset,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
+        activation_type=int(activation),
+        swiglu_alpha=float(swiglu_alpha),
+        swiglu_beta=float(swiglu_beta),
+        swiglu_limit=float(swiglu_limit),
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     inputs = [
         x,
@@ -484,13 +411,15 @@ def cute_dsl_fused_moe_bf16(
         w2_weight,
         moe_output,
     ]
+    if tactic is not None:
+        return runner(inputs, tactic=tactic, intermediate_buffer=intermediate_buffer)
     _, best_tactic = AutoTuner.get().choose_one(
-        "CuteDslFusedMoE::run_moe_sm90::Swiglu",
+        _sm90_moe_autotune_op_name(activation, situ_beta),
         [runner],
         runner.tuning_config,
         inputs,
     )
-    return runner(inputs, tactic=best_tactic)
+    return runner(inputs, tactic=best_tactic, intermediate_buffer=intermediate_buffer)
 
 
 class CuteDslBf16MoEWrapper:
@@ -524,12 +453,15 @@ class CuteDslBf16MoEWrapper:
         intermediate_size: int,
         num_local_experts: Optional[int] = None,
         local_expert_offset: int = 0,
-        tile_size: Optional[int] = None,
         output_dtype: torch.dtype = torch.bfloat16,
         enable_pdl: bool = True,
         use_fused_finalize: bool = True,
-        gemm1_tile_n: Optional[int] = None,
-        gemm2_tile_n: Optional[int] = None,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         """Configure the SM90 fused-MoE wrapper.
 
@@ -538,13 +470,13 @@ class CuteDslBf16MoEWrapper:
             top_k: Experts per token.
             hidden_size: Model hidden dimension.
             intermediate_size: Per-rank expert intermediate dimension
-                (``w1_weight`` is ``[E_local, 2*intermediate, hidden]`` interleaved,
+                (``w1_weight`` is ``[E_local, 2*intermediate, hidden]``
+                interleaved for gated activations or
+                ``[E_local, intermediate, hidden]`` for ``Relu2``;
                 ``w2_weight`` is ``[E_local, hidden, intermediate]``).
             num_local_experts: Experts held by this rank (EP shard);
                 defaults to ``num_experts``.
             local_expert_offset: Global id of this shard's first expert.
-            tile_size: Optional tile override; ``None`` auto-selects (see
-                :func:`cute_dsl_fused_moe_bf16`).
             output_dtype: Output (= activation/weight) dtype, bf16 or fp16;
                 used to allocate ``moe_output`` when the caller does not
                 provide one.
@@ -553,9 +485,24 @@ class CuteDslBf16MoEWrapper:
             use_fused_finalize: True (default) fuses the router-scaled
                 scatter-reduce into GEMM2; False selects the
                 bitwise-reproducible two-stage finalize.
-            gemm1_tile_n: Optional GEMM1 N-tile override.
-            gemm2_tile_n: Optional GEMM2 N-tile override.
+            activation_type: GEMM1 activation (``ActivationType.Swiglu``,
+                ``GegluTanh`` or ``Relu2``); see :func:`cute_dsl_fused_moe_bf16`.
+            swiglu_alpha: SwiGLU sigmoid multiplier (``Swiglu`` only).
+            swiglu_beta: SwiGLU up-projection bias (``Swiglu`` only).
+            swiglu_limit: SwiGLU clamp limit (``Swiglu`` only).
+            situ_beta: With ``Swiglu``, selects the SiTU gate with this scale.
+            situ_linear_beta: Optional SiTU tanh clamp of the up branch
+                (requires ``situ_beta``).
         """
+        activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
+        validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        self.activation_type = int(activation)
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.swiglu_limit = float(swiglu_limit)
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -566,9 +513,6 @@ class CuteDslBf16MoEWrapper:
         self.local_expert_offset = local_expert_offset
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
-        self.tile_size = tile_size
-        self.gemm1_tile_n = gemm1_tile_n
-        self.gemm2_tile_n = gemm2_tile_n
         self.enable_pdl = enable_pdl
 
     def run(
@@ -578,23 +522,16 @@ class CuteDslBf16MoEWrapper:
         token_final_scales: torch.Tensor,
         w1_weight: torch.Tensor,
         w2_weight: torch.Tensor,
-        tactic: Optional[Sm90MoeTactic] = None,
+        tactic: Optional[Tuple[Any, ...]] = None,
         moe_output: Optional[torch.Tensor] = None,
         intermediate_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the fused MoE forward; see :func:`cute_dsl_fused_moe_bf16`.
-        ``tactic`` overrides the instance tile config for this call."""
-        if tactic is None:
-            tactic_override = _Sm90MoeTacticOverride(
-                self.tile_size,
-                self.gemm1_tile_n,
-                self.gemm2_tile_n,
-                None,
-                None,
-                None,
-            )
-        else:
-            tactic_override = _decode_sm90_moe_tactic(tactic)
+
+        ``tactic`` dispatches that tactic tuple as given; ``None`` selects
+        through the AutoTuner (the cached winner for these shapes when one
+        exists, otherwise the fixed default).
+        """
         if moe_output is None:
             moe_output = torch.empty(
                 x.shape[0], self.hidden_size, dtype=self.output_dtype, device=x.device
@@ -611,20 +548,13 @@ class CuteDslBf16MoEWrapper:
             local_expert_offset=self.local_expert_offset,
             moe_output=moe_output,
             intermediate_buffer=intermediate_buffer,
-            tile_size=tactic_override.tile_size,
-            gemm1_tile_n=tactic_override.gemm1_tile_n,
-            gemm2_tile_n=tactic_override.gemm2_tile_n,
-            gemm2_tile_k=tactic_override.gemm2_tile_k,
-            gemm2_cluster_shape_mn=tactic_override.gemm2_cluster_shape_mn,
-            gemm2_raster_along_m=tactic_override.gemm2_raster_along_m,
             use_fused_finalize=self.use_fused_finalize,
             enable_pdl=self.enable_pdl,
-        )
-
-    def get_valid_tactics(self) -> List[Sm90MoeTactic]:
-        """All tunable tactics for this wrapper's geometry."""
-        return _enumerate_sm90_moe_tactics(
-            2 * self.intermediate_size,
-            self.hidden_size,
-            self.intermediate_size,
+            activation_type=self.activation_type,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
+            tactic=tactic,
         )

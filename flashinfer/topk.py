@@ -37,6 +37,9 @@ from .utils import (
     register_fake_op,
 )
 
+# RadixRowState's global histograms and inter-CTA counters require 1 MiB.
+_ROW_STATES_NBYTES = 1024 * 1024
+
 
 class TopKTieBreak(IntEnum):
     """Top-k tie-break mode.
@@ -669,6 +672,27 @@ def can_use_cub_topk(algo, input_tensor, tie_break, deterministic, sorted_output
     return True
 
 
+def _resolve_graph_safe_backend(api_name, k, algo, cub_supported, device):
+    """Return whether CUB is required when the preferred path is native."""
+    # Capability takes precedence over performance: FilteredTopK needs
+    # 128 KiB of shared memory, which does not fit on SM120/SM121.
+    with torch.cuda.device(device):
+        # Keep the k limit in sync with FILTERED_TOPK_MAX_K in topk.cuh.
+        native_supported = k <= 2048 and can_implement_filtered_topk()
+    if native_supported:
+        return False
+    if not cub_supported:
+        raise NotImplementedError(
+            f"{api_name} with dsa_graph_safe=True requires "
+            "native FilteredTopK (k <= 2048 and 128 KiB shared memory) "
+            "or a supported CUB call. Native FilteredTopK cannot serve "
+            f"this call (k={k}, device={device}), and CUB is unavailable "
+            "for the requested dtype, shape, sorted output, deterministic mode, or "
+            f"FLASHINFER_TOPK_ALGO override ({algo!r})."
+        )
+    return True
+
+
 def is_cub_topk_beneficial(
     algo, num_rows, d, k, dtype, tie_break, dsa_graph_safe, clusters_eligible
 ):
@@ -959,9 +983,8 @@ def top_k(
         algo, input.device, deterministic, tie_break, dsa_graph_safe
     )
 
-    if can_use_cub_topk(
-        algo, input, tie_break, deterministic, sorted
-    ) and is_cub_topk_beneficial(
+    cub_supported = can_use_cub_topk(algo, input, tie_break, deterministic, sorted)
+    use_cub = cub_supported and is_cub_topk_beneficial(
         algo,
         batch_size,
         input.size(1),
@@ -970,7 +993,11 @@ def top_k(
         tie_break,
         dsa_graph_safe,
         clusters_eligible,
-    ):
+    )
+    if dsa_graph_safe and not use_cub:
+        use_cub = _resolve_graph_safe_backend("top_k", k, algo, cub_supported, device)
+
+    if use_cub:
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
@@ -1005,14 +1032,9 @@ def top_k(
             return sorted_values, sorted_indices
         return output_values, indices
 
-    # Allocate row_states buffer for multi-CTA path
-    # 1MB is enough for any reasonable GPU (covers up to ~200 groups for deterministic
-    # mode and ~300 groups for non-deterministic mode)
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{input.device}",
-        1024 * 1024,  # 1MB
-        input.device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=input.device
     )
 
     # Allocate output_values for kernel to write directly
@@ -1159,8 +1181,10 @@ def top_k_page_table_transform(
     - This is specifically designed for sparse attention's second stage.
     - ``input`` may have padding between rows, but its last dimension must be
       contiguous.
-    - If ``lengths[i] <= k``, raw indices are ``0..lengths[i]-1`` and remaining
-      positions are set to -1.
+    - If ``lengths[i] <= k``, all valid indices ``0..lengths[i]-1`` are
+      selected, including when ``k > max_len``. Outputs retain shape
+      ``(num_rows, k)``; unused positions are ``-1`` in both the mapped output
+      and optional raw indices. Padding is not translated through the page table.
 
     Examples
     --------
@@ -1218,9 +1242,8 @@ def top_k_page_table_transform(
         and input.is_contiguous()
     )
 
-    if can_use_cub_topk(
-        algo, input, tie_break, deterministic
-    ) and is_cub_page_table_transform_beneficial(
+    cub_supported = can_use_cub_topk(algo, input, tie_break, deterministic)
+    use_cub = cub_supported and is_cub_page_table_transform_beneficial(
         algo,
         input.size(0),
         input.size(1),
@@ -1228,7 +1251,13 @@ def top_k_page_table_transform(
         tie_break,
         dsa_graph_safe,
         clusters_eligible,
-    ):
+    )
+    if dsa_graph_safe and not use_cub:
+        use_cub = _resolve_graph_safe_backend(
+            "top_k_page_table_transform", k, algo, cub_supported, device
+        )
+
+    if use_cub:
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
@@ -1264,12 +1293,9 @@ def top_k_page_table_transform(
     if clusters_eligible:
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=device
     )
 
     if out is None:
@@ -1369,8 +1395,9 @@ def top_k_ragged_transform(
     ----
     - This is specifically designed for sparse attention's second stage with
       ragged KV cache layout.
-    - If lengths[i] <= k, the output contains [offsets[i], offsets[i]+1, ..., offsets[i]+lengths[i]-1]
-      with remaining positions set to -1.
+    - If ``lengths[i] <= k``, all valid indices receive ``offsets[i]``,
+      including when ``k > max_len``. Output retains shape ``(num_rows, k)``;
+      unused positions remain ``-1`` without adding the offset.
 
     Examples
     --------
@@ -1397,9 +1424,8 @@ def top_k_ragged_transform(
         and row_starts is None
     )
 
-    if can_use_cub_topk(
-        algo, input, tie_break, deterministic
-    ) and is_cub_ragged_transform_beneficial(
+    cub_supported = can_use_cub_topk(algo, input, tie_break, deterministic)
+    use_cub = cub_supported and is_cub_ragged_transform_beneficial(
         algo,
         input.size(0),
         input.size(1),
@@ -1407,7 +1433,13 @@ def top_k_ragged_transform(
         tie_break,
         dsa_graph_safe,
         clusters_eligible,
-    ):
+    )
+    if dsa_graph_safe and not use_cub:
+        use_cub = _resolve_graph_safe_backend(
+            "top_k_ragged_transform", k, algo, cub_supported, device
+        )
+
+    if use_cub:
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
@@ -1434,12 +1466,9 @@ def top_k_ragged_transform(
     if clusters_eligible:
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=device
     )
 
     # Allocate output

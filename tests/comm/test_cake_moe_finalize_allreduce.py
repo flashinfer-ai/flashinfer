@@ -179,16 +179,15 @@ def _run_backend(
     quant_out = None
     scale_out = None
     if output_profile == "111":
+        # Packed E2M1 pairs and E4M3 scales (SWIZZLED_128x4) are byte buffers.
         quant_out = torch.zeros(
-            residual_in.numel() // 4,
-            dtype=residual_in.dtype,
-            device=residual_in.device,
+            residual_in.numel() // 2, dtype=torch.uint8, device=residual_in.device
         )
         padded_rows = ((residual_in.shape[0] + 127) // 128) * 128
         padded_columns = ((HIDDEN_SIZE // 16 + 3) // 4) * 4
         scale_out = torch.zeros(
             padded_rows * padded_columns,
-            dtype=residual_in.dtype,
+            dtype=torch.float8_e4m3fn,
             device=residual_in.device,
         )
     comm.trtllm_moe_finalize_allreduce_fusion(

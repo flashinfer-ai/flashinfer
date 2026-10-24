@@ -2270,7 +2270,9 @@ def _batched_gemm_kernel_bf16_body(
             token_cta_idx = block_n
         else:
             token_cta_idx = block_m
-        is_active_cta = token_cta_idx < num_non_exiting_ctas
+        is_active_cta = (
+            token_cta_idx // Int32(cfg.token_metadata_stride) < num_non_exiting_ctas
+        )
     else:
         is_active_cta = True
 
@@ -2429,74 +2431,42 @@ def batched_gemm_kernel_bf16(
             token_cta_idx = block_n
         else:
             token_cta_idx = block_m
-        if token_cta_idx < num_non_exiting_ctas:
-            _batched_gemm_kernel_bf16_body(
-                tma_a_desc,
-                tma_b_desc,
-                tma_c_desc,
-                tma_sfa_desc,
-                tma_sfb_desc,
-                c_tensor,
-                sf_c_tensor,
-                bias_tensor,
-                scale_c_tensor,
-                scale_gate_tensor,
-                gemm1_alpha_tensor,
-                gemm1_beta_tensor,
-                gemm1_clamp_limit_tensor,
-                per_token_sf_a_tensor,
-                per_token_sf_b_tensor,
-                tile_idx_tensor,
-                route_map_tensor,
-                mn_limit_tensor,
-                num_non_exiting_ctas_tensor,
-                total_num_padded_tokens_tensor,
-                act_tensor,
-                sfa_gmem_tensor,
-                sfb_gmem_tensor,
-                problem_m,
-                problem_n,
-                problem_k,
-                num_tokens,
-                num_experts,
-                tile_sched_params,
-                cfg,
-                early_exit_max_token_ctas,
-            )
-    else:
-        _batched_gemm_kernel_bf16_body(
-            tma_a_desc,
-            tma_b_desc,
-            tma_c_desc,
-            tma_sfa_desc,
-            tma_sfb_desc,
-            c_tensor,
-            sf_c_tensor,
-            bias_tensor,
-            scale_c_tensor,
-            scale_gate_tensor,
-            gemm1_alpha_tensor,
-            gemm1_beta_tensor,
-            gemm1_clamp_limit_tensor,
-            per_token_sf_a_tensor,
-            per_token_sf_b_tensor,
-            tile_idx_tensor,
-            route_map_tensor,
-            mn_limit_tensor,
-            num_non_exiting_ctas_tensor,
-            total_num_padded_tokens_tensor,
-            act_tensor,
-            sfa_gmem_tensor,
-            sfb_gmem_tensor,
-            problem_m,
-            problem_n,
-            problem_k,
-            num_tokens,
-            num_experts,
-            tile_sched_params,
-            cfg,
-            early_exit_max_token_ctas,
-        )
+        # Early exit: DSL 4.8 rejects allocator list appends under a runtime `if`.
+        if token_cta_idx // Int32(cfg.token_metadata_stride) >= num_non_exiting_ctas:
+            prims.exit()
+    _batched_gemm_kernel_bf16_body(
+        tma_a_desc,
+        tma_b_desc,
+        tma_c_desc,
+        tma_sfa_desc,
+        tma_sfb_desc,
+        c_tensor,
+        sf_c_tensor,
+        bias_tensor,
+        scale_c_tensor,
+        scale_gate_tensor,
+        gemm1_alpha_tensor,
+        gemm1_beta_tensor,
+        gemm1_clamp_limit_tensor,
+        per_token_sf_a_tensor,
+        per_token_sf_b_tensor,
+        tile_idx_tensor,
+        route_map_tensor,
+        mn_limit_tensor,
+        num_non_exiting_ctas_tensor,
+        total_num_padded_tokens_tensor,
+        act_tensor,
+        sfa_gmem_tensor,
+        sfb_gmem_tensor,
+        problem_m,
+        problem_n,
+        problem_k,
+        num_tokens,
+        num_experts,
+        tile_sched_params,
+        cfg,
+        early_exit_max_token_ctas,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2545,7 +2515,8 @@ def gemm(
     per_token_sf_a_ptr = per_token_sf_a_raw_ptr
     per_token_sf_b_ptr = per_token_sf_b_raw_ptr
 
-    # TMA route (gather4): the routed operand is 2D (K, total_rows) flat.
+    # TMA route (gather4) reads compact (K, num_tokens) input storage.
+    # GEMM M/N include routing padding and must not define its source bounds.
     # TmaOobOpt: non-routed activations use a 4D out-of-bounds TMA descriptor.
     # Non-swapAB: A=activations (routed 2D), B=weights (3D).
     # SwapAB:     A=weights (3D), B=activations (routed 2D).
@@ -2564,7 +2535,7 @@ def gemm(
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
         a_layout = cute.make_layout(
-            (cute.assume(k, 32), m), stride=(1, cute.assume(k, 32))
+            (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
@@ -2599,7 +2570,7 @@ def gemm(
         )
     elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
         b_layout = cute.make_layout(
-            (cute.assume(k, 32), n), stride=(1, cute.assume(k, 32))
+            (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
     elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
         b_layout = cute.make_layout(
@@ -2770,11 +2741,12 @@ def gemm(
         # SFA descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
         # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
         if cutlass.const_expr(uses_routed_sfa_tma_desc(cfg)):
-            # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4.
+            # Bound the descriptor by physical input rows, not padded output
+            # capacity, so invalid gather rows receive TMA zero-fill.
             # Pad sf_k to 16-byte alignment (TMA requirement).
             sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
             sfa_2d_layout = cute.make_layout(
-                (sf_k_total, m),
+                (sf_k_total, num_tokens),
                 stride=(1, sf_k_total),
             )
             sfa_tensor = cute.make_tensor(
@@ -2849,10 +2821,11 @@ def gemm(
         # SFB descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
         # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
         if cutlass.const_expr(uses_routed_sfb_tma_desc(cfg)):
-            # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4
+            # Routed SF storage has one row per input token. Padded output
+            # capacity can exceed this allocation and is not its TMA extent.
             sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
             sfb_2d_layout = cute.make_layout(
-                (sf_k_total, n),
+                (sf_k_total, num_tokens),
                 stride=(1, sf_k_total),
             )
             sfb_tensor = cute.make_tensor(
@@ -2868,7 +2841,7 @@ def gemm(
         else:
             # Tiled SF layout with the same folded-weight/no-L-activation
             # convention as SFA. Legacy tiled descriptors are rank-3.
-            if cutlass.const_expr(cfg.use_tile256_tmem_overlap):
+            if cutlass.const_expr(cfg.uses_rank4_sfb_tma):
                 sfb_outer_tiles = (sfb_outer_rows + 127) // 128
                 sfb_tile_outer = (cfg.tile_n + 127) // 128
                 sfb_layout = cute.make_layout(
@@ -2917,32 +2890,6 @@ def gemm(
                     swizzle=cuda.TensorMapSwizzle.none,
                     tma_format=cuda.TensorMapDataFormat.BYTE,
                 )
-            elif cutlass.const_expr(
-                (cfg.is_mx_mma or cfg.has_cast_a)
-                and cfg.smem_sfb_layout == int(SfLayout.R128c4)
-            ):
-                sfb_outer_tiles = (sfb_outer_rows + 127) // 128
-                sfb_tile_outer = (cfg.tile_n + 127) // 128
-                sfb_layout = cute.make_layout(
-                    (256, 2, cute.assume(rest_k_blocks, 4), sfb_outer_tiles),
-                    stride=(
-                        1,
-                        256,
-                        512,
-                        cute.assume(512 * rest_k_blocks, 512 * 4),
-                    ),
-                )
-                sfb_tensor = cute.make_tensor(
-                    cute.recast_ptr(sfb_ptr, dtype=sf_tma_ptr_dtype),
-                    sfb_layout,
-                )
-                tma_sfb_desc = cuda.create_tensor_map_tiled_from_tensor(
-                    tensor=sfb_tensor,
-                    box_dims=(256, 2, rest_k_per_tile, sfb_tile_outer),
-                    stride_order=(0, 1, 2, 3),
-                    swizzle=cuda.TensorMapSwizzle.none,
-                    tma_format=cuda.TensorMapDataFormat.BYTE,
-                )
             else:
                 sfb_dim0 = cfg.tile_n * k_atoms_per_block // 2
                 sfb_rest_n = sfb_outer_rows // cfg.tile_n
@@ -2979,7 +2926,7 @@ def gemm(
         else:
             launch_num_tiles_m = early_exit_max_token_ctas
     block = cfg.threads_per_cta
-    cluster_shape = (cfg.cluster_m, 1, 1)
+    cluster_shape = cfg.cluster_shape
 
     if cutlass.const_expr(cfg.is_persistent):
         clc_raster_along_m = True
@@ -3043,9 +2990,12 @@ def gemm(
             )
     else:
         # Non-swapAB: C is (M, N) row-major.
+        output_n_for_c = (
+            n // Int32(2) if cutlass.const_expr(cfg.has_gated_epilogue) else n
+        )
         c_layout = cute.make_layout(
-            (cute.assume(m, 32), cute.assume(n, 16)),
-            stride=(cute.assume(n, 16), 1),
+            (cute.assume(m, 32), cute.assume(output_n_for_c, 16)),
+            stride=(cute.assume(output_n_for_c, 16), 1),
         )
     if cutlass.const_expr(cfg.has_epilogue_quant or cfg.uses_fp8_output):
         c_quant_dtype = (
@@ -3062,9 +3012,9 @@ def gemm(
     if cutlass.const_expr(cfg.is_swap_ab and cfg.use_tma_store):
         tma_store_cols = cfg.epi_tile_n
     else:
-        tma_store_cols = min(16, max(8, cfg.tile_n))
+        tma_store_cols = cfg.non_swap_tma_store_cols
     if cutlass.const_expr(cfg.has_epilogue_quant):
-        if cutlass.const_expr(cfg.use_tma_store):
+        if cutlass.const_expr(cfg.use_tma_store and cfg.is_swap_ab):
             if cutlass.const_expr(cfg.uses_mxfp8_output_quant):
                 tma_c_swizzle = cuda.TensorMapSwizzle.s64b
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
@@ -3093,6 +3043,7 @@ def gemm(
             tma_c_desc = tma_a_desc
     else:
         if cutlass.const_expr(cfg.is_swap_ab and cfg.use_tma_store):
+            tma_store_rows = 64
             if cutlass.const_expr(cfg.uses_fp8_output):
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
                 tma_c_swizzle = cuda.TensorMapSwizzle.s64b
@@ -3102,7 +3053,7 @@ def gemm(
             if cutlass.const_expr(cfg.use_tma_oob_opt):
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(64, tma_store_cols, 1, 1),
+                    box_dims=(tma_store_rows, tma_store_cols, 1, 1),
                     stride_order=(0, 1, 2, 3),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3110,7 +3061,7 @@ def gemm(
             else:
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(64, tma_store_cols),
+                    box_dims=(tma_store_rows, tma_store_cols),
                     stride_order=(0, 1),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3120,11 +3071,19 @@ def gemm(
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
             else:
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
+            tma_c_swizzle = cuda.TensorMapSwizzle.none
+            if cutlass.const_expr(cfg.use_swizzled_non_swap_tma):
+                box_bytes = tma_store_cols * cfg.dtype_c_bits // 8
+                tma_c_swizzle = {
+                    32: cuda.TensorMapSwizzle.s32b,
+                    64: cuda.TensorMapSwizzle.s64b,
+                    128: cuda.TensorMapSwizzle.s128b,
+                }[box_bytes]
             tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                 tensor=c_tensor,
                 box_dims=(cfg.tile_m, tma_store_cols),
                 stride_order=(1, 0),
-                swizzle=cuda.TensorMapSwizzle.none,
+                swizzle=tma_c_swizzle,
                 tma_format=tma_c_format,
             )
 
@@ -3132,14 +3091,17 @@ def gemm(
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
         output_m_for_sf = m // Int32(2)
     if cutlass.const_expr(cfg.has_epilogue_quant):
+        sf_tokens = n if cutlass.const_expr(cfg.is_swap_ab) else m
+        if cutlass.const_expr(not cfg.is_swap_ab):
+            output_m_for_sf = n // Int32(2)
         sf_block_m = Int32(cfg.output_sf_block_size_c)
         sf_group_m = sf_block_m * Int32(4)
         if cutlass.const_expr(cfg.sf_layout_c == int(SfLayout.R8c4)):
-            sf_c_elems = ((n + Int32(7)) // Int32(8)) * (
+            sf_c_elems = ((sf_tokens + Int32(7)) // Int32(8)) * (
                 ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(32)
             )
         else:
-            sf_c_elems = ((n + Int32(127)) // Int32(128)) * (
+            sf_c_elems = ((sf_tokens + Int32(127)) // Int32(128)) * (
                 ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(512)
             )
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))
@@ -3199,12 +3161,15 @@ def gemm(
         per_token_sf_layout,
     )
 
-    # tile_idx and mn_limit: indexed by the TOKEN dimension tiles.
-    # non-swapAB: tokens = M → num_tiles_m.  swapAB: tokens = N → num_tiles_n.
+    # tile_idx and mn_limit use CGA indices on the token dimension.
+    # Keep num_token_tiles in CTA units until applying the metadata stride.
     if cutlass.const_expr(cfg.is_swap_ab):
         num_token_tiles = num_tiles_n
     else:
         num_token_tiles = num_tiles_m
+    num_token_tiles = (
+        num_token_tiles + cfg.token_metadata_stride - 1
+    ) // cfg.token_metadata_stride
     tile_idx_layout = cute.make_layout((num_token_tiles,), stride=(1,))
     tile_idx_tensor = cute.make_tensor(tile_idx_raw_ptr, tile_idx_layout)
 

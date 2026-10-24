@@ -37,9 +37,9 @@ DEVICE = "cpu"  # the checker is pure tensor math; no GPU needed
 
 
 def _ctx(rows=2, max_len=8, next_n=1):
-    """context_lens/next_n that make the whole row causally valid."""
+    """seq_lens/next_n that make the whole row causally valid."""
     return dict(
-        context_lens=torch.full((rows,), max_len, dtype=torch.int32, device=DEVICE),
+        seq_lens=torch.full((rows,), max_len, dtype=torch.int32, device=DEVICE),
         next_n=next_n,
     )
 
@@ -118,11 +118,11 @@ def test_nonfinite_actual_outside_the_causal_region_is_ignored():
     rows, max_len = 2, 8
     ref = torch.randn(rows, max_len, device=DEVICE)
     act = ref.clone()
-    # context_lens=4 with next_n=1 makes positions >4 non-causal
+    # seq_lens=4 with next_n=1 makes positions >4 non-causal
     act[:, 6:] = float("-inf")
     ref[:, 6:] = float("-inf")
     ctx = dict(
-        context_lens=torch.full((rows,), 4, dtype=torch.int32, device=DEVICE),
+        seq_lens=torch.full((rows,), 4, dtype=torch.int32, device=DEVICE),
         next_n=1,
     )
     assert _paged_mqa_logits_masked_check(ref, act, **ctx)

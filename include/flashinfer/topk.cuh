@@ -143,7 +143,17 @@ struct RadixRowState {
   int arrival_counter;         // For inter-CTA synchronization
   int output_counter;          // For collecting top-k indices (RadixTopK)
   float sum_topk;              // For RenormProb: sum of top-k elements
+  // For deterministic RenormProb: fixed-point sum of top-k elements. Integer
+  // atomics are associative, so the accumulated value is independent of CTA
+  // arrival order (float atomicAdd on sum_topk is not).
+  unsigned long long sum_topk_fixed;
 };
+
+// 2^44 fixed-point scale for the deterministic renorm sum. Probability inputs
+// keep row sums near 1, far below the 2^20 overflow bound of a u64
+// accumulator at this scale; the quantization error (<= 2^-44 per CTA
+// contribution) is below fp32 ulp at probability magnitudes.
+constexpr double kRenormDeterministicScale = 17592186044416.0;  // 2^44
 
 constexpr uint32_t RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP = 256;
 
@@ -406,182 +416,6 @@ __device__ __forceinline__ void RadixSuffixSum(uint32_t* suffix_sum, uint32_t tx
 }
 
 /*!
- * \brief Find the threshold bucket that contains the k-th largest element.
- *
- * The threshold bucket satisfies: count_ge >= k && count_gt < k
- * where count_ge = suffix_sum[bucket] and count_gt = suffix_sum[bucket+1].
- *
- * \param suffix_sum Shared memory array containing suffix sums
- * \param remaining_k Number of top-k elements still to find
- * \param found_bucket Output: the found threshold bucket
- * \param found_remaining_k Output: remaining_k minus count of elements > threshold
- * \param tx Thread index within the block
- */
-__device__ __forceinline__ void RadixFindThresholdBucket(uint32_t* suffix_sum, uint32_t remaining_k,
-                                                         uint32_t* found_bucket,
-                                                         uint32_t* found_remaining_k, uint32_t tx) {
-  constexpr uint32_t RADIX = 256;
-  // Initialize (only thread 0)
-  if (tx == 0) {
-    *found_bucket = 0;
-    *found_remaining_k = remaining_k;
-  }
-  __syncthreads();
-
-  // All threads in RADIX range check their bucket
-  if (tx < RADIX) {
-    uint32_t count_ge = suffix_sum[tx];
-    uint32_t count_gt = (tx + 1 < RADIX) ? suffix_sum[tx + 1] : 0;
-    if (count_ge >= remaining_k && count_gt < remaining_k) {
-      *found_bucket = tx;
-      *found_remaining_k = remaining_k - count_gt;
-    }
-  }
-  __syncthreads();
-}
-
-/*!
- * \brief Build local histogram for one round of radix select.
- *
- * Counts elements in shared_ordered that match the current prefix and bins them
- * by their byte at the current shift position.
- *
- * \tparam OrderedType The ordered integer type (uint16_t or uint32_t)
- * \param shared_ordered Shared memory containing ordered values
- * \param actual_chunk_size Number of elements in this CTA's chunk
- * \param local_histogram Output shared memory histogram
- * \param prefix Current prefix (high bits determined so far)
- * \param shift Bit shift for extracting current byte
- * \param round Current round (0 to NUM_ROUNDS-1)
- * \param tx Thread index
- */
-template <uint32_t BLOCK_THREADS, typename OrderedType>
-__device__ __forceinline__ void RadixBuildLocalHistogram(const OrderedType* shared_ordered,
-                                                         uint32_t actual_chunk_size,
-                                                         uint32_t* local_histogram, uint32_t prefix,
-                                                         uint32_t shift, uint32_t round,
-                                                         uint32_t tx) {
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-  constexpr uint32_t RADIX_BITS = 8;
-
-  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-    OrderedType ordered = shared_ordered[i];
-
-    // Check if this element matches the prefix (high bits determined so far)
-    OrderedType mask =
-        (round == 0)
-            ? OrderedType(0)
-            : static_cast<OrderedType>(~OrderedType(0) << (ORDERED_BITS - round * RADIX_BITS));
-    if ((ordered & mask) == static_cast<OrderedType>(prefix)) {
-      uint32_t bucket = (ordered >> shift) & 0xFF;
-      atomicAdd(&local_histogram[bucket], 1);
-    }
-  }
-}
-
-/*!
- * \brief Perform one round of radix select with optional multi-CTA synchronization.
- *
- * This is the core radix select logic used by all TopK kernels.
- * It builds histogram, aggregates across CTAs (if multi-CTA), computes suffix sum,
- * and finds the threshold bucket.
- *
- * \tparam BLOCK_THREADS Number of threads per block
- * \tparam SINGLE_CTA True if single-CTA mode (no inter-CTA sync needed)
- * \tparam OrderedType The ordered integer type
- *
- * \param shared_ordered Shared memory containing ordered values
- * \param actual_chunk_size Number of elements in this CTA's chunk
- * \param local_histogram Shared memory for local histogram (size RADIX)
- * \param suffix_sum Shared memory for suffix sum computation (size RADIX)
- * \param state Pointer to RadixRowState for multi-CTA sync (nullptr if SINGLE_CTA)
- * \param prefix Current prefix value
- * \param remaining_k Current remaining k value
- * \param round Current round (0 to NUM_ROUNDS-1)
- * \param barrier_phase Reference to barrier phase counter
- * \param ctas_per_group Number of CTAs per group
- * \param tx Thread index
- * \param out_new_prefix Output: updated prefix after this round
- * \param out_new_remaining_k Output: updated remaining_k after this round
- */
-template <uint32_t BLOCK_THREADS, bool SINGLE_CTA, typename OrderedType>
-__device__ __forceinline__ void RadixSelectOneRound(
-    const OrderedType* shared_ordered, uint32_t actual_chunk_size, uint32_t* local_histogram,
-    uint32_t* suffix_sum, uint32_t* shared_scalars, RadixRowState* state, uint32_t prefix,
-    uint32_t remaining_k, uint32_t round, uint32_t iter, int& barrier_phase,
-    uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx, uint32_t* out_new_prefix,
-    uint32_t* out_new_remaining_k) {
-  constexpr uint32_t RADIX = 256;
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-  constexpr uint32_t RADIX_BITS = 8;
-  constexpr uint32_t NUM_ROUNDS = ORDERED_BITS / RADIX_BITS;
-  uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
-  uint32_t global_round = iter * NUM_ROUNDS + round;
-
-  // For multi-CTA: pointers to global histograms (triple buffer)
-  uint32_t* current_hist = nullptr;
-  uint32_t* next_hist = nullptr;
-  if constexpr (!SINGLE_CTA) {
-    current_hist = state->histogram[global_round % 3];
-    next_hist = state->histogram[(global_round + 1) % 3];
-  }
-
-  // Clear local histogram only
-  for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-    local_histogram[i] = 0;
-  }
-  __syncthreads();
-
-  // Build local histogram from shared memory
-  RadixBuildLocalHistogram<BLOCK_THREADS, OrderedType>(shared_ordered, actual_chunk_size,
-                                                       local_histogram, prefix, shift, round, tx);
-  __syncthreads();
-
-  // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
-  // For single-CTA: local_histogram is already the complete histogram
-  if constexpr (!SINGLE_CTA) {
-    // Accumulate local histogram to global
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      if (local_histogram[i] > 0) {
-        atomicAdd(&current_hist[i], local_histogram[i]);
-      }
-    }
-
-    // Only leading CTA clears next round's histogram BEFORE barrier
-    if (cta_in_group == 0) {
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        next_hist[i] = 0;
-      }
-    }
-
-    // Barrier: wait for all CTAs to finish atomicAdd and clearing
-    AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-
-    // Read current histogram (after barrier, all atomicAdds are complete)
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      suffix_sum[i] = current_hist[i];
-    }
-  } else {
-    // Single-CTA: copy local histogram directly to suffix_sum
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      suffix_sum[i] = local_histogram[i];
-    }
-  }
-  __syncthreads();
-
-  // Compute suffix sum
-  RadixSuffixSum<BLOCK_THREADS>(suffix_sum, tx);
-
-  // Find threshold bucket using shared_scalars for found_bucket and found_remaining_k
-  // shared_scalars[0] = found_bucket, shared_scalars[1] = found_remaining_k
-  RadixFindThresholdBucket(suffix_sum, remaining_k, &shared_scalars[0], &shared_scalars[1], tx);
-
-  // Output new prefix and remaining_k
-  *out_new_prefix = prefix | (shared_scalars[0] << shift);
-  *out_new_remaining_k = shared_scalars[1];
-}
-
-/*!
  * \brief Load data from global memory to shared memory and convert to ordered representation.
  *
  * This is the common Stage 1 for all TopK kernels. It loads data using vectorized
@@ -734,6 +568,7 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
           next_hist[i] = 0;
         }
       }
+      __syncthreads();  // converge the CTA so tx0's release covers every thread's atomicAdds/clears
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
       for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
@@ -1759,8 +1594,8 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
  * Finds the k-th largest probability, then normalizes all probs >= pivot to sum to 1,
  * setting all others to 0. Reuses the shared load+radix-select helper.
  */
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, typename DType,
-          typename IdType>
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, bool DETERMINISTIC,
+          typename DType, typename IdType>
 __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_MultiCTA(
     DType* probs,          // [batch, vocab_size]
     DType* renormed_prob,  // [batch, vocab_size]
@@ -1850,22 +1685,41 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
       __syncthreads();
 
       if constexpr (!SINGLE_CTA) {
-        // Multi-CTA: atomic add to global sum
+        // Multi-CTA: accumulate the group sum. The deterministic path uses
+        // fixed-point integer atomics (order-independent); the default path
+        // keeps float atomicAdd, whose CTA-arrival-order-dependent rounding
+        // makes results vary across invocations.
         if (tx == 0) {
           if (cta_in_group == 0) {
-            state->sum_topk = 0.0f;  // First CTA initializes
+            if constexpr (DETERMINISTIC) {
+              state->sum_topk_fixed = 0;  // First CTA initializes
+            } else {
+              state->sum_topk = 0.0f;  // First CTA initializes
+            }
           }
         }
         // Barrier for initialization
         AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
         if (tx == 0 && block_sum > 0) {
-          atomicAdd(&state->sum_topk, block_sum);
+          if constexpr (DETERMINISTIC) {
+            atomicAdd(&state->sum_topk_fixed,
+                      static_cast<unsigned long long>(
+                          double(block_sum) * kRenormDeterministicScale + 0.5));
+          } else {
+            atomicAdd(&state->sum_topk, block_sum);
+          }
         }
 
         // Barrier to ensure all CTAs have contributed
         AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-        normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
+        float group_sum;
+        if constexpr (DETERMINISTIC) {
+          group_sum = float(double(state->sum_topk_fixed) / kRenormDeterministicScale);
+        } else {
+          group_sum = state->sum_topk;
+        }
+        normalizer = math::ptx_rcp(max(group_sum, 1e-8f));
       } else {
         // Single-CTA: use block_sum directly
         if (tx == 0) {
@@ -1945,22 +1799,39 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     __syncthreads();
 
     if constexpr (!SINGLE_CTA) {
-      // Multi-CTA: atomic add to global sum
+      // Multi-CTA: accumulate the group sum. See the k >= vocab_size branch
+      // above for the deterministic-vs-float-atomic rationale.
       if (tx == 0) {
         if (cta_in_group == 0) {
-          state->sum_topk = 0.0f;  // First CTA initializes
+          if constexpr (DETERMINISTIC) {
+            state->sum_topk_fixed = 0;  // First CTA initializes
+          } else {
+            state->sum_topk = 0.0f;  // First CTA initializes
+          }
         }
       }
       // Barrier for initialization
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
       if (tx == 0 && block_sum > 0) {
-        atomicAdd(&state->sum_topk, block_sum);
+        if constexpr (DETERMINISTIC) {
+          atomicAdd(
+              &state->sum_topk_fixed,
+              static_cast<unsigned long long>(double(block_sum) * kRenormDeterministicScale + 0.5));
+        } else {
+          atomicAdd(&state->sum_topk, block_sum);
+        }
       }
 
       // Barrier to ensure all CTAs have contributed
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-      normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
+      float group_sum;
+      if constexpr (DETERMINISTIC) {
+        group_sum = float(double(state->sum_topk_fixed) / kRenormDeterministicScale);
+      } else {
+        group_sum = state->sum_topk;
+      }
+      normalizer = math::ptx_rcp(max(group_sum, 1e-8f));
     } else {
       // Single-CTA: use block_sum directly
       if (tx == 0) {
@@ -2000,7 +1871,7 @@ template <typename DType, typename IdType>
 cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdType* top_k_arr,
                                         uint32_t batch_size, uint32_t top_k_val,
                                         uint32_t vocab_size, RadixRowState* row_states_buffer,
-                                        cudaStream_t stream = 0) {
+                                        bool deterministic = false, cudaStream_t stream = 0) {
   using OrderedType = typename RadixTopKTraits<DType>::OrderedType;
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), vocab_size);
@@ -2043,28 +1914,24 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
   uint32_t total_ctas = num_groups * ctas_per_group;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      auto kernel =
-          RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    } else {
-      auto kernel =
-          RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    // Single-CTA sums with a block reduction in a fixed order, so it is
+    // already deterministic; the DETERMINISTIC path only changes multi-CTA
+    // accumulation.
+    auto kernel =
+        RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, false, DType, IdType>;
+    if (!single_cta) {
+      kernel = deterministic ? RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false,
+                                                                  true, DType, IdType>
+                             : RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false,
+                                                                  false, DType, IdType>;
     }
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    dim3 nblks(total_ctas);
+    dim3 nthrs(BLOCK_THREADS);
+    void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
+                    &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   });
 
   return cudaSuccess;

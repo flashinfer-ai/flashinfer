@@ -177,6 +177,16 @@ def optional_annotation_payload(node: ast.expr) -> ast.expr | None:
     return None
 
 
+def literal_annotation_values(node: ast.expr) -> frozenset[str] | None:
+    """Return the member dumps of a ``Literal[...]`` annotation, else ``None``."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    if typing_annotation_name(node.value) != "Literal":
+        return None
+    members = node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+    return frozenset(ast.dump(member) for member in members)
+
+
 def is_compatible_annotation(before: str | None, after: str | None) -> bool:
     if before == after:
         return True
@@ -188,7 +198,17 @@ def is_compatible_annotation(before: str | None, after: str | None) -> bool:
     except SyntaxError:
         return False
     payload = optional_annotation_payload(after_node)
-    return payload is not None and ast.dump(before_node) == ast.dump(payload)
+    if payload is not None and ast.dump(before_node) == ast.dump(payload):
+        return True
+    # A ``Literal`` that keeps every old member and adds new ones accepts every
+    # value the old signature accepted (for example a new ``backend`` choice).
+    before_literal = literal_annotation_values(before_node)
+    after_literal = literal_annotation_values(after_node)
+    return (
+        before_literal is not None
+        and after_literal is not None
+        and before_literal <= after_literal
+    )
 
 
 def is_compatible_parameter(before: ApiParameter, after: ApiParameter) -> bool:

@@ -96,6 +96,7 @@ class Sm100W4A16GroupedGemmKernel:
         use_clc_scheduler: bool,
         raster_along_m: bool,
         transform_fragment_size: int,
+        m_cluster_aligned: bool,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
@@ -116,6 +117,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.use_clc_scheduler = use_clc_scheduler
         self.raster_along_m = raster_along_m
         self.transform_fragment_size = transform_fragment_size
+        self.m_cluster_aligned = m_cluster_aligned
         if activation_type is None:
             if situ_beta is not None or situ_linear_beta is not None:
                 raise ValueError("SiTU parameters require an activation")
@@ -439,6 +441,33 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
     @cute.jit
+    def _trace_transform_push(
+        self, name: cutlass.Constexpr, k_tile: cutlass.Int32
+    ) -> None:
+        """Let callers optionally trace a transform stage."""
+        pass
+
+    @cute.jit
+    def _trace_transform_pop(self) -> None:
+        """Close an optional caller-owned transform range."""
+        pass
+
+    @cute.jit
+    def _finish_transform_stage(
+        self,
+        a_load2trans_pipeline: pipeline.PipelineTmaAsync,
+        trans2mma_pipeline: pipeline.PipelineAsyncUmma,
+        cur_a_load2trans_consumer_state: pipeline.PipelineState,
+        trans2mma_producer_state: pipeline.PipelineState,
+    ) -> None:
+        if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.TMEM):
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
+        a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
+        trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+
+    @cute.jit
     def _transform_tile(
         self,
         a_load2trans_pipeline: pipeline.PipelineTmaAsync,
@@ -471,10 +500,12 @@ class Sm100W4A16GroupedGemmKernel:
             )
 
         for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            self._trace_transform_push("transform_wait_raw_tma_ready", _k_tile)
             a_load2trans_pipeline.consumer_wait(
                 a_load2trans_consumer_state,
                 peek_load2trans_full_status,
             )
+            self._trace_transform_pop()
             a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (
                 a_load2trans_consumer_state.index,
             )
@@ -485,10 +516,13 @@ class Sm100W4A16GroupedGemmKernel:
                 1,
                 cute.rank(tAsA_input_slice),
             )
+            self._trace_transform_push("transform_wait_tmem_slot_free", _k_tile)
             trans2mma_pipeline.producer_acquire(
                 trans2mma_producer_state,
                 peek_trans2mma_empty_status,
             )
+            self._trace_transform_pop()
+            self._trace_transform_push("transform_load_decode_nvfp4", _k_tile)
             scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
                 a_load2trans_consumer_state.index,
             )
@@ -528,7 +562,9 @@ class Sm100W4A16GroupedGemmKernel:
                     scale_fragment,
                 )
                 tArA_transform_store[(None, idx)].store(tensor_transformed)
+            self._trace_transform_pop()
 
+            self._trace_transform_push("transform_store_commit_bf16", _k_tile)
             a_transform_stage_coord = (None,) * (cute.rank(tAsA_transform) - 1) + (
                 trans2mma_producer_state.index,
             )
@@ -537,14 +573,13 @@ class Sm100W4A16GroupedGemmKernel:
                 tAsA_transform[a_transform_stage_coord],
                 dst_copy_a,
             )
-            if cutlass.const_expr(
-                self.transform_a_source == tcgen05.OperandSource.TMEM
-            ):
-                cute.arch.fence_view_async_tmem_store()
-            else:
-                cute.arch.fence_proxy("async.shared", space="cta")
-            a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
-            trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+            self._finish_transform_stage(
+                a_load2trans_pipeline,
+                trans2mma_pipeline,
+                cur_a_load2trans_consumer_state,
+                trans2mma_producer_state,
+            )
+            self._trace_transform_pop()
             trans2mma_producer_state.advance()
             if trans2mma_producer_state.count < k_tile_cnt:
                 peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(
@@ -570,7 +605,7 @@ class Sm100W4A16GroupedGemmKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         num_tokens: cutlass.Int64,
-        top_k: cutlass.Int64,
+        top_k: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -1394,6 +1429,13 @@ class Sm100W4A16GroupedGemmKernel:
             )
             if cutlass.const_expr(self.enable_pdl):
                 griddepcontrol_wait()
+                # Let the standalone finalizer prepare routing metadata while
+                # FC2 runs; its own dependency wait protects every output load.
+                if cutlass.const_expr(
+                    not self.fuse_activation and not self.use_fused_finalize
+                ):
+                    with cute.arch.elect_one():
+                        griddepcontrol_launch_dependents()
 
             while work_tile.is_valid_tile:
                 coord_n_offset = (
@@ -2211,19 +2253,28 @@ class Sm100W4A16GroupedGemmKernel:
                             hidden_base = (
                                 work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
                             )
-                            valid_elements = (
-                                cutlass.Int64(final_output.shape[0]) - hidden_base
-                            )
-                            if valid_elements > 0:
+                            valid_elements = cutlass.Int64(self.cta_tile_shape_mnk[0])
+                            if cutlass.const_expr(not self.m_cluster_aligned):
+                                valid_elements = (
+                                    cutlass.Int64(final_output.shape[0]) - hidden_base
+                                )
+                            if (
+                                cutlass.const_expr(self.m_cluster_aligned)
+                                or valid_elements > 0
+                            ):
                                 scatter_out = cute.domain_offset(
                                     (hidden_base, reduce_token_idx, 0), final_output
                                 )
                                 copy_elements = cutlass.Int32(
-                                    cutlass.min(
-                                        cutlass.Int64(self.cta_tile_shape_mnk[0]),
-                                        valid_elements,
-                                    )
+                                    self.cta_tile_shape_mnk[0]
                                 )
+                                if cutlass.const_expr(not self.m_cluster_aligned):
+                                    copy_elements = cutlass.Int32(
+                                        cutlass.min(
+                                            cutlass.Int64(self.cta_tile_shape_mnk[0]),
+                                            valid_elements,
+                                        )
+                                    )
                                 blk_reduce_bf16(
                                     scatter_out,
                                     sFinalize[(reduce_route, None)],
@@ -2233,7 +2284,9 @@ class Sm100W4A16GroupedGemmKernel:
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         self.epilog_sync_barrier.arrive_and_wait()
-                    elif tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
+                    elif (
+                        tma_distance_to_boundary >= (subtile_idx + 1) * self.epi_tile_n
+                    ):
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         if cutlass.const_expr(not self.fuse_activation):
@@ -2279,10 +2332,15 @@ class Sm100W4A16GroupedGemmKernel:
                         m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
                         for i in cutlass.range(cute.size(tCpC), unroll_full=True):
                             tCpC[i] = (
-                                m_thr_slice[(i)][0]
-                                + work_tile.cta_coord_m * self.cta_tile_shape_mnk_c[0]
-                                < cute.size(tensor_c.shape[0])
-                            ) and (m_thr_slice[(i)][1] < work_tile.distance_to_boundary)
+                                m_thr_slice[(i)][1] < work_tile.distance_to_boundary
+                            )
+                            if cutlass.const_expr(not self.m_cluster_aligned):
+                                tCpC[i] = (
+                                    m_thr_slice[(i)][0]
+                                    + work_tile.cta_coord_m
+                                    * self.cta_tile_shape_mnk_c[0]
+                                    < cute.size(tensor_c.shape[0])
+                                ) and tCpC[i]
                         # Store C to global memory
                         cute.copy(
                             simt_atom,
@@ -2309,7 +2367,9 @@ class Sm100W4A16GroupedGemmKernel:
             if cutlass.const_expr(not self.use_fused_finalize):
                 c_pipeline.producer_tail()
 
-        if cutlass.const_expr(self.enable_pdl and not self.fuse_activation):
+        if cutlass.const_expr(
+            self.enable_pdl and not self.fuse_activation and self.use_fused_finalize
+        ):
             if warp_idx == self.mma_warp_id:
                 with cute.arch.elect_one():
                     griddepcontrol_launch_dependents()

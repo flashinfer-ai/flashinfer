@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ctypes
 import functools
 import math
 from enum import IntEnum
@@ -23,6 +24,7 @@ import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
+from ...utils import get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -32,6 +34,19 @@ def _get_cuda_stream_ptr() -> int:
     PyTorch's current stream, not TVM's default stream.
     """
     return torch.cuda.current_stream().cuda_stream
+
+
+def _is_finite_fp32(value: float, *, positive: bool = False) -> bool:
+    """Whether ``value`` is finite (and positive, if requested) after fp32 rounding.
+
+    The kernels consume these constants (and, for the SiTU scales, their
+    reciprocals) as fp32, so a Python float that rounds to ``0.0`` or ``inf``
+    in fp32 is unusable even though it is finite and positive in f64.
+    """
+    if not math.isfinite(value) or (positive and value <= 0):
+        return False
+    value_f32 = ctypes.c_float(value).value
+    return math.isfinite(value_f32) and (not positive or value_f32 > 0)
 
 
 # ============================ Helper Functions ============================
@@ -56,6 +71,20 @@ def normalize_cute_dsl_moe_activation_type(
     return activation_type, is_gated_activation(activation_type)
 
 
+def validate_cute_dsl_moe_swiglu_config(
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+) -> None:
+    """Validate the SwiGLU epilogue constants."""
+    if not _is_finite_fp32(swiglu_alpha):
+        raise ValueError("swiglu_alpha must be finite in fp32")
+    if not _is_finite_fp32(swiglu_beta):
+        raise ValueError("swiglu_beta must be finite in fp32")
+    if not _is_finite_fp32(swiglu_limit, positive=True):
+        raise ValueError("swiglu_limit must be positive and finite in fp32")
+
+
 def validate_cute_dsl_moe_situ_config(
     activation_type: ActivationType,
     situ_beta: Optional[float],
@@ -68,12 +97,14 @@ def validate_cute_dsl_moe_situ_config(
         return
     if activation_type != ActivationType.Swiglu:
         raise ValueError("SiTU parameters require ActivationType.Swiglu")
-    if not math.isfinite(situ_beta) or situ_beta <= 0:
-        raise ValueError("situ_beta must be positive and finite")
-    if situ_linear_beta is not None and (
-        not math.isfinite(situ_linear_beta) or situ_linear_beta <= 0
+    if not _is_finite_fp32(situ_beta, positive=True):
+        raise ValueError("situ_beta must be positive and finite in fp32")
+    if situ_linear_beta is not None and not _is_finite_fp32(
+        situ_linear_beta, positive=True
     ):
-        raise ValueError("situ_linear_beta must be positive and finite when set")
+        raise ValueError(
+            "situ_linear_beta must be positive and finite in fp32 when set"
+        )
 
 
 def get_max_num_tiles(
@@ -695,11 +726,15 @@ def moe_sort(
     else:
         num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024).
+    # Expert counts buffer, required by the cooperative and multi-kernel routing
+    # paths. The block, dynamic-block and (SM90+ only) single-cluster kernels
+    # route small batches without it; 1024 tokens on SM90+ and 4 tokens before
+    # SM90 are conservative bounds of those kernels' limits.
     # Required size: 2 * num_experts. The kernel zeros this internally via
     # launchInitExpertCounts before reading, so no Python-side init is needed
     # (matching trt-llm's torch::empty allocation pattern).
-    if num_tokens > 1024:
+    expert_counts_min_tokens = 1024 if get_compute_capability(device)[0] >= 9 else 4
+    if num_tokens > expert_counts_min_tokens:
         expert_counts = torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
@@ -768,6 +803,8 @@ def moe_activation(
 
     This is a generic activation function that supports multiple activation types.
     For convenience, use the specific wrappers like moe_swiglu(), moe_gelu(), etc.
+    Only rows below their tile's ``tile_idx_to_mn_limit``, in the first
+    ``num_non_exiting_tiles`` tiles, are written.
 
     Args:
         input: Input tensor. For GLU activations (Swiglu, Geglu), shape is
@@ -803,6 +840,7 @@ def moe_activation(
         interm_size,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 

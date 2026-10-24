@@ -27,6 +27,7 @@ ENV PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/bin:$PATH"
 # does not exist for a particular CUDA major is harmless.
 ENV LD_LIBRARY_PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cu13/lib:/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+ENV TRITON_PTXAS_BLACKWELL_PATH="/usr/local/cuda/bin/ptxas"
 ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
 ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 
@@ -59,6 +60,18 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install pre-commit
+
+# sccache for the JIT/AOT compiles; a devcontainer activates it by exporting
+# FLASHINFER_{CXX,NVCC}_LAUNCHER. Sourcing the CI helper keeps the pinned
+# version shared with the jit-cache wheel builds.
+COPY scripts/jit_cache_build_common.sh /install/jit_cache_build_common.sh
+RUN bash -c 'source /install/jit_cache_build_common.sh \
+    && install_sccache "${SCCACHE_VERSION}" "$(uname -m)"'
+
+# Docker creates missing mount parents as root, so a volume on
+# ~/.cache/sccache would leave ~/.cache unwritable and break the JIT cache.
+RUN mkdir -p "/home/${USERNAME}/.cache/sccache" \
+    && chown -R "${USER_UID}:${USER_GID}" "/home/${USERNAME}/.cache"
 
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}

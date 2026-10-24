@@ -30,6 +30,7 @@
 #define FLASHINFER_COMM_PCIE_IPC_CE_RING_CUH_
 
 #include "pcie_ipc_all_reduce.cuh"
+#include "pcie_ipc_ce_memop.cuh"
 
 // This file follows the surrounding style: plain cudaError_t returns, no
 // framework headers. Scoped to the file and undefined at the bottom.
@@ -47,6 +48,9 @@ namespace pcie_ipc {
 // captured graph keeps references to recorded events, a lifetime rule Python
 // cannot enforce. Created in pcie_ipc_init, destroyed in pcie_ipc_dispose.
 struct CeResources {
+  int32_t* binary_flags[kMaxWorldSize];
+  bool memop_enabled;
+
   cudaStream_t copy_stream;
   cudaStream_t flag_stream;
   cudaEvent_t input_ready;
@@ -141,7 +145,7 @@ inline size_t ce_slot_stride(const WorkspaceLayout& layout, int world_size) {
 // instead of costing a full-size copy on the critical path. Note the `a` operand
 // is always the *input*: the scratch already carries the upstream ranks'
 // accumulated partial for that chunk, and this rank adds only its own.
-template <typename T>
+template <typename T, bool UseStreamMemops = false>
 cudaError_t ce_ring_all_reduce_flat(const T* input, T* output, int64_t numel,
                                     const PeerViews& views, int rank, int world_size,
                                     const WorkspaceLayout& layout, const CeResources& ce,
@@ -150,6 +154,15 @@ cudaError_t ce_ring_all_reduce_flat(const T* input, T* output, int64_t numel,
   const int64_t shard_elems = numel / world_size;
   const size_t shard_bytes = static_cast<size_t>(shard_elems) * sizeof(T);
   const int pieces = ce_pick_pieces(shard_elems, shard_bytes, kPackElems, pieces_hint);
+  if constexpr (UseStreamMemops) {
+    if (!ce.memop_enabled || pieces != 1) {
+      return ce_ring_all_reduce_flat<T>(input, output, numel, views, rank, world_size, layout, ce,
+                                        pieces_hint, threads, stream);
+    }
+    for (int peer = 0; peer < world_size; ++peer) {
+      if (ce.binary_flags[peer] == nullptr) return cudaErrorInvalidValue;
+    }
+  }
   const int64_t piece_elems = shard_elems / pieces;
   const size_t piece_bytes = static_cast<size_t>(piece_elems) * sizeof(T);
   const size_t slot_stride = detail::ce_slot_stride(layout, world_size);
@@ -166,6 +179,10 @@ cudaError_t ce_ring_all_reduce_flat(const T* input, T* output, int64_t numel,
     return reinterpret_cast<int32_t*>(views.ce_flags[peer] +
                                       static_cast<uint64_t>(slot) * kCeFlagStride);
   };
+  auto binary_flag_at = [&](int peer, int slot) {
+    return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(ce.binary_flags[peer]) +
+                                      static_cast<size_t>(slot) * 128u);
+  };
   auto scratch_at = [&](int peer, int k, int p) {
     return reinterpret_cast<char*>(views.ce_scratch[peer]) +
            static_cast<ptrdiff_t>(k) * static_cast<ptrdiff_t>(slot_stride) +
@@ -177,7 +194,9 @@ cudaError_t ce_ring_all_reduce_flat(const T* input, T* output, int64_t numel,
   // eager call races the caller's producer.
   FI_CE_CHECK(cudaEventRecord(ce.input_ready, stream));
   FI_CE_CHECK(cudaStreamWaitEvent(ce.copy_stream, ce.input_ready));
-  FI_CE_CHECK(cudaStreamWaitEvent(ce.flag_stream, ce.input_ready));
+  if constexpr (!UseStreamMemops) {
+    FI_CE_CHECK(cudaStreamWaitEvent(ce.flag_stream, ce.input_ready));
+  }
 
   for (int k = 0; k < steps; ++k) {
     const bool reduce_phase = k < world_size - 1;
@@ -203,12 +222,19 @@ cudaError_t ce_ring_all_reduce_flat(const T* input, T* output, int64_t numel,
       }
       FI_CE_CHECK(cudaMemcpyAsync(scratch_at(next, k, p), src, piece_bytes,
                                   cudaMemcpyDeviceToDevice, ce.copy_stream));
-      FI_CE_CHECK(cudaEventRecord(ce.copied[slot], ce.copy_stream));
-
-      FI_CE_CHECK(cudaStreamWaitEvent(ce.flag_stream, ce.copied[slot]));
-      ce_publish_flag_kernel<<<1, 1, 0, ce.flag_stream>>>(flag_at(next, slot),
-                                                          views.ce_send_counters + slot);
-      ce_wait_flag_kernel<<<1, 1, 0, stream>>>(flag_at(rank, slot), views.ce_wait_counters + slot);
+      if constexpr (UseStreamMemops) {
+        // The default stream write fences the preceding copy. Clearing readiness
+        // permits consumption; the common end handshake protects next-call reuse.
+        FI_CE_CHECK(ce_binary_write(ce.copy_stream, binary_flag_at(next, slot), 1));
+        FI_CE_CHECK(ce_binary_wait_clear(stream, binary_flag_at(rank, slot)));
+      } else {
+        FI_CE_CHECK(cudaEventRecord(ce.copied[slot], ce.copy_stream));
+        FI_CE_CHECK(cudaStreamWaitEvent(ce.flag_stream, ce.copied[slot]));
+        ce_publish_flag_kernel<<<1, 1, 0, ce.flag_stream>>>(flag_at(next, slot),
+                                                            views.ce_send_counters + slot);
+        ce_wait_flag_kernel<<<1, 1, 0, stream>>>(flag_at(rank, slot),
+                                                 views.ce_wait_counters + slot);
+      }
 
       const int64_t roff = static_cast<int64_t>(recv_c) * shard_elems + p * piece_elems;
       auto* landed = scratch_at(rank, k, p);
@@ -228,9 +254,13 @@ cudaError_t ce_ring_all_reduce_flat(const T* input, T* output, int64_t numel,
   // cudaErrorStreamCaptureUnjoined, and in eager mode the caller reads a torn
   // result because the side streams are still running.
   FI_CE_CHECK(cudaEventRecord(ce.copy_done, ce.copy_stream));
-  FI_CE_CHECK(cudaEventRecord(ce.flag_done, ce.flag_stream));
+  if constexpr (!UseStreamMemops) {
+    FI_CE_CHECK(cudaEventRecord(ce.flag_done, ce.flag_stream));
+  }
   FI_CE_CHECK(cudaStreamWaitEvent(stream, ce.copy_done));
-  FI_CE_CHECK(cudaStreamWaitEvent(stream, ce.flag_done));
+  if constexpr (!UseStreamMemops) {
+    FI_CE_CHECK(cudaStreamWaitEvent(stream, ce.flag_done));
+  }
 
   // End-of-call rendezvous with the rank whose staging this one writes.
   //
