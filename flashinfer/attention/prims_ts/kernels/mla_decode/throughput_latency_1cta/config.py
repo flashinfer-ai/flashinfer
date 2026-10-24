@@ -31,7 +31,7 @@ from math import ceil
 from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.query import FlatQueryTileLayout
 
@@ -98,6 +98,7 @@ class MlaConfig:
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
+    lse_base_on_e: bool = False
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512
@@ -627,10 +628,15 @@ def q_tile_work_count(
 
 
 def automatic_split_kv_step_tokens(tile_size_q: int) -> int:
-    """Return one steady-state K step for the selected task graph."""
+    """Return a profitable K span per split, at least two physical KV tiles.
+
+    One-tile splits do not amortize CTA setup and final reduction. The
+    one-instance Q64+ schedules retain two tiles as a policy work bound,
+    while the kernel and its hardware ceiling still accept larger counts.
+    """
 
     num_kv_insts = 1 if tile_size_q >= 64 else MlaConfig.num_insts_kv
-    return MlaConfig.tile_size_kv * num_kv_insts
+    return MlaConfig.tile_size_kv * max(num_kv_insts, 2)
 
 
 def select_auto_split_kv(
@@ -647,7 +653,6 @@ def select_auto_split_kv(
     split_kv = min(
         max_split_kv,
         max(1, target_work // base_work),
-        MAX_MLA_SPLITS_KV,
     )
     local_k_steps = ceil(max_split_kv / split_kv)
     return ceil(max_split_kv / local_k_steps)
@@ -862,6 +867,8 @@ def resolve_runtime_cluster_reduction_mode(
     cfg: MlaConfig | None,
     *,
     reduction_mode: str | None,
+    hardware_info=None,
+    stream=None,
     log=None,
 ) -> str | None:
     """Use cached device occupancy to resolve the runtime reduction mode."""
@@ -877,7 +884,11 @@ def resolve_runtime_cluster_reduction_mode(
     cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
     from ...._hardware import get_max_active_clusters
 
-    active_clusters = get_max_active_clusters(cluster_size)
+    active_clusters = (
+        get_max_active_clusters(cluster_size)
+        if hardware_info is None
+        else hardware_info.get_max_active_clusters(cluster_size, stream)
+    )
     cluster_count = cluster_reduction_cluster_count(cfg)
     if log is not None:
         log(

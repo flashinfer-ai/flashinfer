@@ -46,6 +46,7 @@ from ..helpers.schedule import (
 )
 from ..helpers.stage import MlaStage
 from ..helpers.tile import (
+    runtime_split_count,
     runtime_base_seq_len_kv,
     runtime_local_kv_tiles,
     runtime_seq_len_kv_from_task_cache,
@@ -58,6 +59,7 @@ class MlaDecodeTask(Task):
     def __init__(self, **kwargs):
         """Initialize MLA-specific task parameters and cached thread indices."""
         self.cfg = kwargs.pop("cfg", None)
+        self.runtime_split_kv = kwargs.pop("runtime_split_kv", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.cu_seqlens_q = kwargs.pop("cu_seqlens_q", None)
         self.domain_bias = kwargs.pop("domain_bias", 0)
@@ -67,6 +69,7 @@ class MlaDecodeTask(Task):
         self._local_warp_idx = Int32(0)
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
+        self._local_kv_tiles = Int32(1)
 
     @cute.jit
     def init_variables(self, context=None):
@@ -116,7 +119,7 @@ class MlaDecodeTask(Task):
             self._local_warp_idx,
             self._lane_idx,
             self._seq_len_kv,
-            Int32(0),
+            self._local_kv_tiles,
             Int32(0),
             Int32(0),
         )
@@ -145,11 +148,21 @@ class MlaDecodeTask(Task):
         # raw batch length for causal can move an all-masked tile into tail and
         # replace a real loop accumulator at a tile boundary.
         cta_idx_q = tile_coord[0]
-        if cutlass.const_expr(self.cfg.use_persistent_scheduler != 1):
+        if cutlass.const_expr(
+            self.cfg.use_persistent_scheduler != 1 and self.cfg.num_ctas_per_seq_q == 1
+        ):
+            cta_idx_q = Int32(0)
+        elif cutlass.const_expr(self.cfg.use_persistent_scheduler != 1):
             # Nonpersistent grid X combines (head tile, Q tile, KV split), with
             # KV split innermost. Persistent work queues already expose Q as
             # tile coordinate 0 and must not be decoded a second time.
-            cta_idx_q = (tile_coord[0] // Int32(self.cfg.num_ctas_per_seq_kv)) % Int32(
+            grid_splits = Int32(self.cfg.num_ctas_per_seq_kv)
+            if cutlass.const_expr(
+                self.runtime_split_kv is not None
+                and self.cfg.use_cluster_reduction != 1
+            ):
+                grid_splits = runtime_split_count(self.runtime_split_kv)
+            cta_idx_q = (tile_coord[0] // grid_splits) % Int32(
                 self.cfg.num_ctas_per_seq_q
             )
         # Cache the raw batch length once per task/work tile. Resource work
@@ -169,7 +182,10 @@ class MlaDecodeTask(Task):
         )
         if cutlass.const_expr(self.cfg.fixed_sparse_kv_tiles > 0):
             return Int32(self.domain_bias)
-        total_kv_tiles = runtime_local_kv_tiles(self.cfg, seq_len_kv)
+        total_kv_tiles = runtime_local_kv_tiles(
+            self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
+        )
+        self._local_kv_tiles = total_kv_tiles
         remaining_kv_tiles = cute.math.max(
             total_kv_tiles - Int32(self.cfg.num_insts_kv), Int32(0)
         )

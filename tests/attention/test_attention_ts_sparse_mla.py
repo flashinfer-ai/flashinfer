@@ -39,7 +39,7 @@ def _reference(
     q_scale=1.0,
     kv_scale=1.0,
     output_scale=1.0,
-    sinks=None,
+    attention_sinks=None,
     softmax_scale=512**-0.5,
 ):
     rows, heads = query.numel() // (query.shape[-2] * 512), query.shape[-2]
@@ -79,8 +79,8 @@ def _reference(
         row_lse = logits.logsumexp(-1)
         normalizer = (
             row_lse
-            if sinks is None
-            else torch.logaddexp(row_lse, sinks.double()[None, :])
+            if attention_sinks is None
+            else torch.logaddexp(row_lse, attention_sinks.double()[None, :])
         )
         normalizer = normalizer.masked_fill(empty[:, None], 0)
         weights = (logits - normalizer[..., None]).exp()
@@ -172,13 +172,13 @@ def prepare_sparse_mla_indices(
     Inputs are physical page-slot indices, as in the original model fixtures.
     All allocations/preparation belong outside measured attention. Supplying
     out reuses addresses and supports preparation in graph-lifetime tests.
-    Scales and sinks are passed directly to run(); this adapter does not copy them.
+    Scales and attention_sinks are passed directly to run(); this adapter does not copy them.
     """
     state = wrapper._state
     if state is None:
         raise ValueError("a prepared attention plan is required")
-    rows = query.numel() // (state["heads"] * 512)
-    ks, kc = state["ks"], state["kc"]
+    rows = query.numel() // (state["num_qo_heads"] * 512)
+    ks, kc = state["max_topk"], state["max_extra_topk"]
     device = query.device
 
     def empty(shape, dtype=torch.int32):
@@ -294,8 +294,8 @@ def test_rope_quant_graph(
     if rows > 1:
         lengths[0], extra_lengths[0] = 0, 0
         lengths[-1] = min(topk, 17)
-    sinks = torch.linspace(-3, 4, heads, device="cuda")
-    sinks[0] = torch.inf
+    attention_sinks = torch.linspace(-3, 4, heads, device="cuda")
+    attention_sinks[0] = torch.inf
     descales = dict(
         kv_scale=0.5 if dtype == torch.float8_e4m3fn else 1.0,
         output_scale=0.75,
@@ -318,8 +318,8 @@ def test_rope_quant_graph(
         max_extra_topk=128,
         max_seq_len_q=queries,
         packed_query=packed,
-        q_data_type=dtype,
-        has_sinks=True,
+        q_dtype=dtype,
+        use_attention_sinks=True,
         return_lse=True,
         output_quant_block_size=block,
         out_scale_format=fmt,
@@ -342,7 +342,7 @@ def test_rope_quant_graph(
     )
     kwargs = dict(
         qo_indptr=indptr,
-        sinks=sinks,
+        attention_sinks=attention_sinks,
         token_positions=positions,
         cos_sin_cache=cos_sin,
         softmax_scale=512**-0.5 * descales["kv_scale"],
@@ -403,7 +403,7 @@ def test_rope_quant_graph(
         extra_indices,
         lengths=lengths,
         extra_lengths=extra_lengths,
-        sinks=sinks,
+        attention_sinks=attention_sinks,
         **descales,
     )
     ref = _inverse_output_rope(ref, positions, cos_sin)
@@ -622,7 +622,7 @@ def test_rope_quant_group_layout(heads, groups, block, fmt):
 
 def test_rope_quant_plan_options():
     plan = dict(
-        device="cuda", batch_size=1, num_heads=8, max_topk=1, num_output_groups=2
+        device="cuda", batch_size=1, num_qo_heads=8, max_topk=1, num_output_groups=2
     )
     for block, error in ((True, TypeError), (32.0, TypeError), (64, ValueError)):
         with pytest.raises(error, match="output_quant_block_size"):
@@ -692,8 +692,8 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     al[0] = 0
     if extra:
         bl[0] = 0
-    sinks = torch.randn(heads, device="cuda")
-    sinks[0], sinks[1] = torch.inf, -torch.inf
+    attention_sinks = torch.randn(heads, device="cuda")
+    attention_sinks[0], attention_sinks[1] = torch.inf, -torch.inf
     kv_scale = torch.tensor(
         0.75 if dtype == torch.float8_e4m3fn else 1.0, device="cuda"
     )
@@ -715,9 +715,9 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         max_extra_topk=kb,
         max_seq_len_q=queries,
         packed_query=packed,
-        q_data_type=dtype,
+        q_dtype=dtype,
         kv_layout="HND" if packed else "NHD",
-        has_sinks=True,
+        use_attention_sinks=True,
         return_lse=True,
         assume_valid_prefix=prefix,
     )
@@ -728,7 +728,7 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     scales = dict(
         softmax_scale=effective_softmax_scale,
         output_scale=effective_output_scale,
-        sinks=sinks,
+        attention_sinks=attention_sinks,
     )
 
     def prepare(out=None):
@@ -780,7 +780,7 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
             kv_scale=kv_scale.item(),
             softmax_scale=attention_scale.item(),
             output_scale=output_multiplier.item(),
-            sinks=sinks,
+            attention_sinks=attention_sinks,
         )
         if dtype == torch.float8_e4m3fn:
             assert ((out.double() - ref).abs() <= bound).all()
@@ -853,7 +853,7 @@ def test_caller_workspace_single_source_and_eager_api():
     kv[1] *= 2
     indices = torch.tensor([[[0, 1, -1]]], device="cuda", dtype=torch.int32)
     args = dict(
-        device=q.device, batch_size=1, num_heads=16, max_topk=3, return_lse=True
+        device=q.device, batch_size=1, num_qo_heads=16, max_topk=3, return_lse=True
     )
     size = get_prims_ts_sparse_mla_decode_workspace_size(**args)
     workspace = torch.empty(size, device=q.device, dtype=torch.uint8)
@@ -972,9 +972,9 @@ def test_source_tile_boundary_graph(heads, prefix, dtype):
         heads,
         max_topk=129,
         max_extra_topk=5,
-        q_data_type=dtype,
+        q_dtype=dtype,
         return_lse=True,
-        has_sinks=True,
+        use_attention_sinks=True,
         assume_valid_prefix=prefix,
     )
 
@@ -985,13 +985,13 @@ def test_source_tile_boundary_graph(heads, prefix, dtype):
         extra_indices=extra_indices,
         extra_lengths=extra_lengths,
     )
-    sinks = torch.full((heads,), -torch.inf, device=q.device)
+    attention_sinks = torch.full((heads,), -torch.inf, device=q.device)
     out, lse = wrapper.run(
         q,
         primary,
         **metadata,
         extra_kv_cache=extra,
-        sinks=sinks,
+        attention_sinks=attention_sinks,
         softmax_scale=512 ** (-0.5) * kv_scale,
         output_scale=kv_scale,
     )
@@ -1002,7 +1002,7 @@ def test_source_tile_boundary_graph(heads, prefix, dtype):
             primary,
             **metadata,
             extra_kv_cache=extra,
-            sinks=sinks,
+            attention_sinks=attention_sinks,
             out=out,
             lse=lse,
             validate=False,
@@ -1039,7 +1039,7 @@ def test_source_tile_boundary_graph(heads, prefix, dtype):
     if not prefix:
         indices[:, 0] = -1
         extra_indices[:, 0] = -1
-    sinks.zero_()
+    attention_sinks.zero_()
     graph.replay()
     primary_count, extra_count = (129, 5) if prefix else (128, 4)
     count = primary_count + extra_count
@@ -1073,8 +1073,8 @@ def test_softmax_score_jumps(heads, dtype):
         .view(1, 1, -1)
         .repeat(batch, 1, 1)
     )
-    sinks = torch.zeros(heads, device="cuda")
-    sinks[0], sinks[1] = -torch.inf, torch.inf
+    attention_sinks = torch.zeros(heads, device="cuda")
+    attention_sinks[0], attention_sinks[1] = -torch.inf, torch.inf
     out = torch.empty_like(q, dtype=torch.bfloat16)
     lse = torch.empty(q.shape[:-1], device="cuda")
     w = BatchSparseMLADecodePagedTSWrapper()
@@ -1082,10 +1082,10 @@ def test_softmax_score_jumps(heads, dtype):
         q.device,
         batch,
         heads,
-        q_data_type=q.dtype,
+        q_dtype=q.dtype,
         max_topk=128,
         max_extra_topk=384,
-        has_sinks=True,
+        use_attention_sinks=True,
         return_lse=True,
     )
     softmax_scale = 0.6931471805599453
@@ -1102,7 +1102,7 @@ def test_softmax_score_jumps(heads, dtype):
         swa,
         **meta,
         extra_kv_cache=kv,
-        sinks=sinks,
+        attention_sinks=attention_sinks,
         softmax_scale=softmax_scale,
         out=out,
         lse=lse,
@@ -1114,7 +1114,7 @@ def test_softmax_score_jumps(heads, dtype):
             swa,
             **meta,
             extra_kv_cache=kv,
-            sinks=sinks,
+            attention_sinks=attention_sinks,
             softmax_scale=softmax_scale,
             out=out,
             lse=lse,
@@ -1129,7 +1129,7 @@ def test_softmax_score_jumps(heads, dtype):
             kv,
             si,
             ci,
-            sinks=sinks,
+            attention_sinks=attention_sinks,
             softmax_scale=softmax_scale,
         )
         assert torch.isfinite(out).all()

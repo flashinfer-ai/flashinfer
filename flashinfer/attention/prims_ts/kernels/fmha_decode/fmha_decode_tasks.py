@@ -63,7 +63,10 @@ from .fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
 )
+from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
+
 from .fmha_decode_resources.helpers_common import (
+    split_kv_grid_coord,
     _assume_nonnegative_i32,
     _q_group_token_base,
     _q_seq_bounds,
@@ -71,6 +74,7 @@ from .fmha_decode_resources.helpers_common import (
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_last_valid_page_idx,
+    _runtime_configured_local_kv_tiles,
     _runtime_total_kv_tiles,
     _sliding_window_start_idx,
 )
@@ -210,7 +214,9 @@ class PackedDecodeWorkQueue(WorkQueue):
                     lengths = HeadIndexedMetadataView(lengths, self.num_heads_kv, h_idx)
             empty_kv = cutlass.Int32(lengths[b_idx]) <= cutlass.Int32(0)
         q_group_idx = cutlass.Int32(q_group_cta_idx)
-        if cutlass.const_expr(self.cfg.use_split_kv):
+        if cutlass.const_expr(self.cfg.uses_compact_split_grid):
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % self.cfg.num_q_ctas
+        elif cutlass.const_expr(self.cfg.use_split_kv):
             q_group_idx = q_group_idx // cutlass.Int32(self.cfg.splits_kv)
         _, seq_len_q = _q_seq_bounds(
             self.cfg,
@@ -256,13 +262,20 @@ def _can_hold_native_page_window(
     cfg: FmhaDecodeConfig,
     smem_page_offsets: MemoryResource | None,
 ) -> bool:
-    """Return whether one native page-ID stage covers every runtime KV range."""
+    """Return whether one native page-ID stage covers every runtime KV range.
+
+    A runtime launch selects the CTA-relative window only when its host KV
+    bound and count guarantee the entire instruction-aligned span fits.
+    Longer spans retain the ordinary staged pipeline.
+    """
     if (
         smem_page_offsets is None
         or not smem_page_offsets.use_native_paged_kv
         or cfg.use_sliding_window_causal
     ):
         return False
+    if cfg.runtime_split_kv:
+        return cfg.runtime_page_window
     pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
     if cfg.uses_scattered_page_route:
         # Each sparse route gets a page-offset stage sized for its complete
@@ -673,6 +686,7 @@ class DecodeGenTask(Task):
     def __init__(self, **kwargs: TaskKwarg) -> None:
         """Capture decode-specific task config and initialize cache slots."""
         self.cfg = kwargs.pop("cfg", None)
+        self.requested_splits = kwargs.pop("requested_splits", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.block_table_capacity = kwargs.pop("block_table_capacity", None)
         self.sparse_row_route_offsets = kwargs.pop("sparse_row_route_offsets", None)
@@ -720,25 +734,12 @@ class DecodeGenTask(Task):
             self._tmem_base_offset = _warp_broadcast_i32(loaded, 0)
 
     @cute.jit
-    def make_task_cache(
-        self,
-    ) -> tuple[
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-    ]:
+    def make_task_cache(self):
         """Return cached task-local values passed through StageInfo."""
         # The cache is threaded through StageInfo so resource methods can read
         # task-local constants without recomputing them or adding more
         # resource variables to every schedule edge.
-        return (
+        values = (
             self._tmem_base_offset,
             self._warp_grp_thread_idx,
             self._local_warp_idx,
@@ -750,6 +751,15 @@ class DecodeGenTask(Task):
             self._kv_valid_tile_end,
             self._kv_window_start,
         )
+
+        if cutlass.const_expr(self.cfg.runtime_split_kv):
+            count = (
+                cutlass.Int32(self.cfg.splits_kv)
+                if self.requested_splits is None
+                else self.requested_splits
+            )
+            values = (*values, count)
+        return values
 
     @cute.jit
     def _refresh_packed_q_bounds(self, work_tile: Any) -> None:
@@ -807,6 +817,11 @@ class DecodeGenTask(Task):
         context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
+        if cutlass.const_expr(self.cfg is not None and self.cfg.runtime_split_kv):
+            work_tile = WorkTileInfo(
+                split_kv_grid_coord(self.cfg, work_tile.tile_idx),
+                work_tile.is_valid_tile,
+            )
         Task._run_task_body_impl(
             self,
             work_tile,
@@ -1029,11 +1044,12 @@ class DecodeGenTask(Task):
             )
             return loop_domain + cutlass.Int32(self.domain_bias)
 
-        # Decode the logical Q tile with the configured physical split fanout,
-        # then derive its causal/window K union and useful runtime split prefix.
+        # Work-tile coordinates retain the configured capacity stride.
         q_group_cta_idx = cutlass.Int32(tile_coord[0])
         q_group_idx = q_group_cta_idx
-        if self.cfg.use_split_kv:
+        if self.cfg.uses_compact_split_grid:
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % self.cfg.num_q_ctas
+        elif self.cfg.use_split_kv:
             q_group_idx = q_group_cta_idx // cutlass.Int32(self.cfg.splits_kv)
         q_token_base = _q_group_token_base(self.cfg, q_group_idx)
         seq_len_q = (
@@ -1059,24 +1075,20 @@ class DecodeGenTask(Task):
         # Split-KV groups CTAs by K/V split. The loop domain is rounded so
         # each CTA in the group executes the same number of instruction pairs.
         if self.cfg.use_split_kv:
-            # The useful active prefix is derived from this configured-fanout
-            # local span at kernel entry. Recomputing it in every scheduled
-            # task produces the same span but adds a runtime integer division
-            # to each task warp.
-            splits_kv = cutlass.Int32(self.cfg.splits_kv)
-            num_insts_kv = cutlass.Int32(self.cfg.num_insts_kv)
-            tiles_per_cta_group = splits_kv * num_insts_kv
-            num_groups = (
-                total_kv_tiles + tiles_per_cta_group - cutlass.Int32(1)
-            ) // tiles_per_cta_group
-            total_kv_tiles = cute.math.max(
-                num_groups * num_insts_kv,
-                num_insts_kv,
+            # The domain and tile consumers share the instruction-aligned
+            # partition. Runtime launches carry its host-prepared reciprocal.
+            total_kv_tiles = _runtime_configured_local_kv_tiles(
+                self.cfg,
+                seq_len_kv,
+                seq_len_q,
+                q_token_base,
+                requested_splits=self.requested_splits,
             )
-            # Physical split coordinates and page-cache strides are laid out with
-            # the configured launch fanout.  Runtime pruning only shortens the
-            # useful prefix; it must not renumber the remaining CTAs.
-            split_idx = cutlass.Int32(tile_coord[0]) % cutlass.Int32(self.cfg.splits_kv)
+            split_idx = cutlass.Int32(cute.arch.block_idx()[0])
+            if not self.cfg.uses_compact_split_grid:
+                split_idx = cutlass.Int32(tile_coord[0]) % cutlass.Int32(
+                    self.cfg.splits_kv
+                )
             self._kv_raw_tile_base = skipped_tiles + split_idx * total_kv_tiles
         else:
             self._kv_raw_tile_base = skipped_tiles

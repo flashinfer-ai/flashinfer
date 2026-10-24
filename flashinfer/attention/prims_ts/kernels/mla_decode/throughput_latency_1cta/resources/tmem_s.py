@@ -476,7 +476,14 @@ class TmemSResource(MlaResource):
             batch_idx,
         )
         local_tile_idx = softmax_kv_tile_idx(cfg, stage_info, self.inst_id)
-        tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+        tile_idx = global_kv_tile_idx(
+            cfg,
+            local_tile_idx,
+            seq_len_kv,
+            cta_idx_kv,
+            requested_splits=self.runtime_split_kv,
+            task_cache=task_cache,
+        )
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
         next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         raw_mask_routes = (

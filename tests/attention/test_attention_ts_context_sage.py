@@ -111,10 +111,10 @@ def _random_params(
 
 
 @torch.no_grad()
-def _reference(q, k, v, params: SageAttentionParams, *, config, sm_scale: float):
+def _reference(q, k, v, params: SageAttentionParams, *, config, softmax_scale: float):
     """FP32 attention on the dequantized inputs with the kernel's tile model.
 
-    ``O = sfV * softmax(sfQ sfK (Q8 K8^T) sm_scale) V8 + v_mean`` per batch
+    ``O = sfV * softmax(sfQ sfK (Q8 K8^T) softmax_scale) V8 + v_mean`` per batch
     entry and KV head, folded one 128-token K tile at a time.
     """
     batch_size, seq_len_kv, num_kv_heads, _ = k.shape
@@ -132,7 +132,7 @@ def _reference(q, k, v, params: SageAttentionParams, *, config, sm_scale: float)
                     q_real[batch_idx, :, heads],
                     k_real[batch_idx, :, kv_head],
                 )
-                * sm_scale
+                * softmax_scale
             )
             state = None
             for begin in range(0, seq_len_kv, _KV_TILE):
@@ -205,9 +205,9 @@ def test_context_sage_matches_dequantized_reference(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
     )
-    sm_scale = _HEAD_DIM**-0.5
+    softmax_scale = _HEAD_DIM**-0.5
     wrapper = _plan(
-        sage=config, sm_scale=sm_scale, **_qk_dtype_options(qk_dtype), **shape
+        sage=config, softmax_scale=softmax_scale, **_qk_dtype_options(qk_dtype), **shape
     )
     params = _random_params(config, qk_dtype=qk_dtype, **shape)
     q = random_qk((batch_size, seq_len_q, num_qo_heads, _HEAD_DIM), qk_dtype)
@@ -217,7 +217,7 @@ def test_context_sage_matches_dequantized_reference(
     torch.cuda.synchronize()
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
-    expected = _reference(q, k, v, params, config=config, sm_scale=sm_scale)
+    expected = _reference(q, k, v, params, config=config, softmax_scale=softmax_scale)
     torch.testing.assert_close(actual.float(), expected, rtol=8e-3, atol=2e-3)
 
 
@@ -232,8 +232,10 @@ def test_context_int8_extreme_scores_stay_in_the_bias_binade(k_block_size) -> No
     shape = dict(
         batch_size=1, seq_len_q=256, seq_len_kv=1000, num_qo_heads=2, num_kv_heads=2
     )
-    sm_scale = _HEAD_DIM**-0.5
-    wrapper = _plan(sage=config, sm_scale=sm_scale, **_qk_dtype_options(_INT8), **shape)
+    softmax_scale = _HEAD_DIM**-0.5
+    wrapper = _plan(
+        sage=config, softmax_scale=softmax_scale, **_qk_dtype_options(_INT8), **shape
+    )
     params = _random_params(config, qk_dtype=_INT8, **shape)
     q = random_qk((1, 256, 2, _HEAD_DIM), _INT8)
     k = random_qk((1, 1000, 2, _HEAD_DIM), _INT8)
@@ -250,7 +252,7 @@ def test_context_int8_extreme_scores_stay_in_the_bias_binade(k_block_size) -> No
     actual = wrapper.run(q, k, v, sage=params)
     torch.cuda.synchronize()
     assert torch.isfinite(actual).all()
-    expected = _reference(q, k, v, params, config=config, sm_scale=sm_scale)
+    expected = _reference(q, k, v, params, config=config, softmax_scale=softmax_scale)
     torch.testing.assert_close(actual.float(), expected, rtol=8e-3, atol=2e-3)
 
 
@@ -326,6 +328,8 @@ def test_context_sage_plan_rejects_unsupported_recipes() -> None:
         _plan(sage=config, mask_type="causal", **shape)
     with pytest.raises(TypeError, match="SageAttentionConfig"):
         _plan(sage=SageAttentionParams, **shape)
+    with pytest.raises(NotImplementedError, match="V-mean.*attention sinks"):
+        _plan(sage=SageAttentionConfig(v_mean=True), use_attention_sinks=True, **shape)
 
 
 @_REQUIRES_CONTEXT_SAGE_GPU

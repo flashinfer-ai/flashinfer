@@ -212,3 +212,12 @@ def init_softmax_scratch_u32(scratch, warp_grp_thread_idx, num_entries: int):
         warp_grp_thread_idx, Int32(num_entries), Int32(128), unroll=1
     ):
         scratch[scratch_idx] = encoded
+
+
+@cute.jit
+def final_lse(value, base_on_e: cutlass.Constexpr[bool]):
+    """Convert final statistics; partial/reduction statistics stay base2."""
+    # Preserve the caller's base-2 value for subsequent split normalization.
+    if cutlass.const_expr(base_on_e):
+        return value * Float32(0.6931471805599453)
+    return value
