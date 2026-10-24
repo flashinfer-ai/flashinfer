@@ -13,6 +13,13 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   install_flashinfer_editable
 fi
 
+# Print the resolved TVM-FFI version right before tests (traceability for the
+# pre-release verification in PR #2599; the override itself is applied by
+# setup_test_env.sh sourced above).
+echo "Checking TVM-FFI version before tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+echo ""
+
 # Separate processes release CUDA memory between files.
 # Not a pytest target, so a targeted run (JIT_TEST_SCOPE) never covers it.
 if [ -z "${JIT_TEST_SCOPE:-}" ]; then
