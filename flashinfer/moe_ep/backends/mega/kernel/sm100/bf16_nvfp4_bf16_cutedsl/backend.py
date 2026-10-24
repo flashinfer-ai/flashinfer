@@ -125,6 +125,9 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
         config = self._kernel_config
+        # An explicit empty dict starts fresh AUTO from uniform defaults;
+        # frontend None would resolve a persistent winner before the sweep.
+        knobs = {} if config.knobs == "auto" else self._workspace_knobs(fleet_params)
         workspace = get_symm_buffer_for_bf16_nvfp4_mega_moe(
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
@@ -146,7 +149,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             activation=config.activation,
             situ_beta=config.situ_beta,
             situ_linear_beta=config.situ_linear_beta,
-            knobs=self._workspace_knobs(fleet_params),
+            knobs=knobs,
         )
         if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(

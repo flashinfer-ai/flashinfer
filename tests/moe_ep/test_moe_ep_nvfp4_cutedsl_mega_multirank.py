@@ -1897,6 +1897,75 @@ def test_nvfp4_mega_uneven_sources_and_empty_refill(
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "fallback_cluster_shape,load_balance_mode,hidden,intermediate,token_back_mode",
+    [
+        pytest.param(None, "static", 128, 64, "epi_warps", id="uniform4-static-small"),
+        pytest.param(
+            None,
+            "atomic_counter",
+            288,
+            448,
+            "reuse_dispatch_warps",
+            id="uniform4-atomic-tail",
+        ),
+        pytest.param(
+            (2, 1, 1), "static", 288, 448, "epi_warps", id="mixed4+2-static-tail"
+        ),
+        pytest.param(
+            (2, 1, 1),
+            "atomic_counter",
+            768,
+            384,
+            "reuse_dispatch_warps",
+            id="mixed4+2-atomic-pair-tail",
+        ),
+    ],
+)
+def test_w4a16_cluster_geometry_empty_refill(
+    fallback_cluster_shape,
+    load_balance_mode,
+    hidden,
+    intermediate,
+    token_back_mode,
+):
+    """Four-CTA logical tiles retain exact results across tails and workspace reuse."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    # Tiny channels leave whole CTA pairs inactive; 288/448 also exercise K
+    # tails, while 768/384 end on an odd number of two-CTA channel tiles.
+    # Requested mixed geometry follows device occupancy and may normalize to
+    # uniform4 when no fallback capacity remains. The scheduler unit test also
+    # covers forced fallback placement independently of the device's GPC layout.
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode="w4a16",
+        hidden=hidden,
+        intermediate=intermediate,
+        knobs={
+            "mma_tiler_mnk": (256, 32, 256),
+            "cluster_shape_mnk": (4, 1, 1),
+            "fallback_cluster_shape_mnk": fallback_cluster_shape,
+            "use_2cta_instrs": True,
+            "group_hint": 6,
+            "num_sched_stages": 2,
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": load_balance_mode,
+        },
+        changing_batches=True,
+        num_tokens=33,
+        num_experts=8,
+        balanced_routing=True,
+        boundary_token_counts=(33,),
+        graph_rounds=("refill", "tile_boundary_33"),
+    )
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
 @pytest.mark.parametrize(
     "mode,hidden,intermediate,tile_n",
