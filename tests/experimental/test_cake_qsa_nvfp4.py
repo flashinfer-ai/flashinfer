@@ -825,6 +825,65 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
     assert num_splits(1, 1, 200 * TILE, 1000, "sm_90a") == MAX_SPLITS
 
 
+def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
+    monkeypatch,
+):
+    """``select_form``: never above one split or the device's fused capacity. Within
+    it, compute capability 9.0 takes the fused form on every host, eager or captured;
+    10.0 / 10.3 take it only on an ``aarch64`` host, at ``rows <= FUSED_MAX_ROWS`` and
+    outside capture (the captured call keeps the split form); 8.x is split alone.
+    GPU-free: the device facts are faked per device index."""
+    facts = {
+        800: ("sm_80", 108),
+        900: ("sm_90a", 132),
+        1000: ("sm_100a", 148),
+        1030: ("sm_103a", 152),
+    }
+    form = cake_backend.select_form
+    reads = cake_backend._reads_capture_state
+    monkeypatch.setattr(cake_backend, "_device_facts", lambda index: facts[index])
+    cake_backend.fused_capacity.cache_clear()
+    reads.cache_clear()
+    try:
+        assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a")
+        assert cake_backend.FUSED_HOSTS == ("aarch64",)
+        assert cake_backend.FUSED_MAX_ROWS == 8
+        capacity = [cake_backend.fused_capacity(i) for i in (800, 900, 1000, 1030)]
+        assert capacity == [0, 264, 148, 152]
+        for host in ("aarch64", "x86_64"):
+            monkeypatch.setattr(cake_backend, "HOST_MACHINE", host)
+            reads.cache_clear()
+            grace = host == "aarch64"
+            eager = "fused" if grace else "split"
+            for index, splits_at in (
+                (1000, (33, 33, 18, 9)),
+                (1030, (33, 33, 19, 9)),
+            ):
+                sm_count = facts[index][1]
+                for rows, splits in zip((1, 2, 4, 8), splits_at, strict=True):
+                    assert rows * 2 * splits <= sm_count
+                    assert form(rows, 2, splits, index) == eager, (host, index, rows)
+                    assert form(rows, 2, splits, index, True) == "split"
+                    assert reads(rows, index) is grace
+                # Above FUSED_MAX_ROWS, with one split or above the capacity: split.
+                assert form(16, 2, 4, index) == "split"
+                assert form(8, 2, 1, index) == "split"
+                assert form(8, 2, sm_count // 16 + 1, index) == "split"
+                assert reads(16, index) is False
+            # Compute capability 9.0: the fused form within 264 CTAs, whatever the host
+            # or the capture state; above it the split form.
+            for capturing in (False, True):
+                assert form(16, 2, 8, 900, capturing) == "fused"
+                assert form(16, 2, 9, 900, capturing) == "split"
+            assert reads(8, 900) is False
+            # Compute capability 8.x: the split form alone.
+            assert form(1, 2, 33, 800) == "split"
+            assert reads(1, 800) is False
+    finally:
+        cake_backend.fused_capacity.cache_clear()
+        reads.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # CPU tests: the registry and the build.json contract of the package
 # ---------------------------------------------------------------------------
@@ -846,7 +905,7 @@ def test_capabilities_route_to_the_four_libraries():
         assert cake_jit.arch_for_capability(capability) is None
     assert set(cake_jit.ARCH_BY_CAPABILITY.values()) == set(cake_jit.ARCHES)
     # The per-architecture launch-bound tables cover every architecture; the fused table every one but sm_80, with
-    # the host policy's 0 on the tcgen05 architectures (the separate form is faster whole-call there).
+    # the co-resident build's one CTA per SM on the tcgen05 architectures (the eager host rule bounds the form there).
     assert cake_jit.DECODE_THREADS == {
         "sm_80": 128,
         "sm_90a": 128,
@@ -856,8 +915,8 @@ def test_capabilities_route_to_the_four_libraries():
     assert cake_jit.DECODE_CTAS_PER_SM == CTAS_PER_SM
     assert cake_jit.DECODE_FUSED_CTAS_PER_SM == {
         "sm_90a": 2,
-        "sm_100a": 0,
-        "sm_103a": 0,
+        "sm_100a": 1,
+        "sm_103a": 1,
     }
     assert cake_backend.FUSED_CTAS_PER_SM == cake_jit.DECODE_FUSED_CTAS_PER_SM
 
