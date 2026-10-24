@@ -316,11 +316,11 @@ def test_forward_backward_match_fp64(hidden: int, rows: int) -> None:
     _check_case(hidden, rows)
 
 
-def _forward_switch_rows(arch: str, hidden: int, residual: bool) -> tuple[int, ...]:
-    """Row counts on both sides of every forward program switch point of one route (and a single row)."""
+def _switch_rows(arch: str, hidden: int, kind: str, residual: bool) -> tuple[int, ...]:
+    """Row counts on both sides of every program switch point of one route (and a single row)."""
 
     switches = set()
-    for name in loader.route_modules(arch, hidden, "fwd", residual):
+    for name in loader.route_modules(arch, hidden, kind, residual):
         rule = loader.MODULES[name]["select_rule"]
         if rule is None:
             continue
@@ -361,7 +361,7 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
     names = loader.route_modules(arch, hidden, "fwd", residual)
     eps = EPS[hidden]
     launched = set()
-    for rows in _forward_switch_rows(arch, hidden, residual):
+    for rows in _switch_rows(arch, hidden, "fwd", residual):
         selected = loader.selected_modules(arch, hidden, "fwd", residual, rows=rows)
         assert len(selected) == 1, (
             f"hidden={hidden} residual={residual} rows={rows}: {selected}"
@@ -380,6 +380,28 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
             assert torch.equal(outputs[2], h_new_ref), f"h_new {label}"
     assert launched == set(names), (
         f"hidden={hidden} residual={residual}: never launched {set(names) - launched}"
+    )
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_backward_programs_switch_on_row_count(hidden: int) -> None:
+    """Exactly one pair -- a main program and its dw reduce program -- runs per
+    call, every exported backward program runs for some row count, and forward
+    + backward match the FP64 reference on both sides of each switch point."""
+
+    _skip_unless_hidden(hidden)
+    arch = loader.arch_for_capability(_capability())
+    names = loader.route_modules(arch, hidden, "bwd", False)
+    launched = set()
+    for rows in _switch_rows(arch, hidden, "bwd", False):
+        selected = loader.selected_modules(arch, hidden, "bwd", False, rows=rows)
+        assert len(selected) == 2, f"hidden={hidden} rows={rows}: {selected}"
+        main, reduce = (loader.MODULES[name] for name in selected)
+        assert main.get("workspace_rule") is not None and reduce["role"] == "bwd_reduce"
+        launched.update(selected)
+        _check_case(hidden, rows)
+    assert launched == set(names), (
+        f"hidden={hidden}: never launched {set(names) - launched}"
     )
 
 
@@ -590,8 +612,10 @@ def test_deterministic_dw_is_bitwise_reproducible(hidden: int, rows: int) -> Non
             (rows, hidden), float("nan"), dtype=torch.bfloat16, device=_device()
         )
         dw = torch.full((hidden,), float("nan"), dtype=torch.float32, device=_device())
-        # Poison the partial region; the kernels must rewrite every chunk they read.
-        workspace[: 4 * hidden].view(torch.float32).fill_(float("nan"))
+        # Poison the first partial row (after the counters); the kernels must
+        # rewrite every chunk they read.
+        begin = loader.COUNTERS_BYTES
+        workspace[begin : begin + 4 * hidden].view(torch.float32).fill_(float("nan"))
         cake_rmsnorm_train_backward(g, x, w, rstd, workspace=workspace, dx=dx, dw=dw)
         torch.cuda.synchronize()
         results.append((dx.clone(), dw.clone()))
@@ -717,9 +741,10 @@ def test_autograd_end_to_end(hidden: int, residual: bool, rows: int) -> None:
 def test_workspace_bytes_and_layout(hidden: int) -> None:
     _skip_unless_hidden(hidden)
     small = cake_rmsnorm_train_backward_workspace_bytes(1, hidden, _device())
+    middle = cake_rmsnorm_train_backward_workspace_bytes(129, hidden, _device())
     large = cake_rmsnorm_train_backward_workspace_bytes(65536, hidden, _device())
     assert small > 0 and small % 256 == 0 and large % 256 == 0
-    assert large >= small
+    assert small <= middle <= large
     workspace = cake_rmsnorm_train_backward_workspace(65536, hidden, _device())
     assert workspace.dtype == torch.uint8 and workspace.numel() == large
     assert torch.count_nonzero(workspace) == 0

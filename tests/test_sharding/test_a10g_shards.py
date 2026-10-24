@@ -251,3 +251,31 @@ def test_logging_keeps_results_and_failure_exit(tmp_path, fails):
     telemetry = json.loads(output.with_suffix(".telemetry.json").read_text())
     assert telemetry
     assert output.with_suffix(".meta.json").is_file()
+
+
+def test_logging_skips_files_outside_targeted_scope(tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copy2(ROOT / "scripts/__init__.py", scripts)
+    shutil.copytree(ROOT / "scripts/test_sharding", scripts / "test_sharding")
+    (tmp_path / "tests").mkdir()
+    for name in ("test_in", "test_out", "test_in_too"):
+        (tmp_path / f"tests/{name}.py").write_text("def test_case(): pass\n")
+    script = tmp_path / "part.sh"
+    script.write_text(
+        f'set -e\nsource "{ROOT}/scripts/jit_test_logging.sh"\n'
+        "pytest -s tests/test_in.py\n"
+        "pytest -s tests/test_out.py\n"
+        "pytest -s tests/test_in_too.py -k case\n"
+    )
+    env = os.environ.copy()
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
+    env.pop("PYTHONPATH", None)
+    env["JIT_TEST_SCOPE"] = "tests/test_in.py,tests/test_in_too.py"
+    result = subprocess.run(
+        ["bash", str(script)], cwd=tmp_path, env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SKIP (outside targeted scope): pytest -s tests/test_out.py" in result.stdout
+    ran = {p.stem for p in (tmp_path / "junit/part").glob("*.xml")}
+    assert ran == {"test_in", "test_in_too"}

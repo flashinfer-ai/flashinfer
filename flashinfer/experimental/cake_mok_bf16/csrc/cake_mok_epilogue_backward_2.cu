@@ -197,8 +197,7 @@ kernel_cake_mok_epilogue_backward_2(__nv_bfloat16* __restrict__ shared, __nv_bfl
         int stage = first % 6;
         int token = (bid + first * ctas) / col_blocks;
         int col = (bid + first * ctas) % col_blocks * 1024;
-        int _min_1 = ((1024) < (hidden - col) ? (1024) : (hidden - col));
-        int cols = _min_1;
+        int cols = ((1024) < (hidden - col) ? (1024) : (hidden - col));
         if (tid == 0) {
             mbarrier_arrive_expect_tx(inputs_addr + (stage) * 8, (unsigned int)(3 * cols * 2));
         }
@@ -214,8 +213,7 @@ kernel_cake_mok_epilogue_backward_2(__nv_bfloat16* __restrict__ shared, __nv_bfl
         int unit = bid + j * ctas;
         int token_1 = unit / col_blocks;
         int col_1 = unit % col_blocks * 1024;
-        int _min_2 = ((1024) < (hidden - col_1) ? (1024) : (hidden - col_1));
-        int cols_1 = _min_2;
+        int cols_1 = ((1024) < (hidden - col_1) ? (1024) : (hidden - col_1));
         mbarrier_wait(inputs_addr + (stage_1) * 8, j / 6 & 1);
         if (cols_1 > tid * 4) {
             int base = stage_1 * 3 * 512 + tid * 2;
@@ -239,8 +237,7 @@ kernel_cake_mok_epilogue_backward_2(__nv_bfloat16* __restrict__ shared, __nv_bfl
             long long out = ((long long)token_1 * (long long)hidden + (long long)col_1) / 2 + (long long)(tid * 2);
             #pragma unroll
             for (int pair_2 = 0; pair_2 < 2; pair_2++) {
-                __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(accumulator[pair_2 * 2], accumulator[pair_2 * 2 + 1]));
-                output[out + (long long)pair_2] = __as_u32(_bf16x2_0);
+                output[out + (long long)pair_2] = __as_u32(__float22bfloat162_rn(make_float2(accumulator[pair_2 * 2], accumulator[pair_2 * 2 + 1])));
             }
         }
         __syncthreads();
@@ -248,8 +245,7 @@ kernel_cake_mok_epilogue_backward_2(__nv_bfloat16* __restrict__ shared, __nv_bfl
             int stage_0 = (j + 6) % 6;
             int token_1_1 = (bid + (j + 6) * ctas) / col_blocks;
             int col_2 = (bid + (j + 6) * ctas) % col_blocks * 1024;
-            int _min_3 = ((1024) < (hidden - col_2) ? (1024) : (hidden - col_2));
-            int cols_3 = _min_3;
+            int cols_3 = ((1024) < (hidden - col_2) ? (1024) : (hidden - col_2));
             if (tid == 0) {
                 mbarrier_arrive_expect_tx(inputs_addr + (stage_0) * 8, (unsigned int)(3 * cols_3 * 2));
             }

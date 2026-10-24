@@ -1991,6 +1991,35 @@ def _trtllm_fp4_block_scale_moe_topk_routing_reference(
     )
 
 
+def _nvfp4_4over6_axis_value(kwargs: dict) -> int | None:
+    """Wire code of an explicit ``nvfp4_4over6=``; ``None`` when unset.
+
+    Unset is not resolved here: that would read the environment and make the
+    definition name depend on the process rather than on the call.
+    """
+    from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: PLC0415
+        _UNSET,
+        nvfp4_4over6_code,
+        resolve_nvfp4_4over6,
+    )
+
+    setting = kwargs.get("nvfp4_4over6", _UNSET)
+    if setting is _UNSET:
+        return None
+    return nvfp4_4over6_code(resolve_nvfp4_4over6(setting))
+
+
+def _nvfp4_4over6_axis() -> Const:
+    return Const(
+        description=(
+            "NVFP4 4over6 recipe as the nvfp4_4over6_code() wire code (0 = off); "
+            "absent when the call left nvfp4_4over6 unset."
+        ),
+        abbrev="r4o6",
+        extract=_nvfp4_4over6_axis_value,
+    )
+
+
 _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "seq_len": Var(description="Number of tokens."),
     "num_experts": Const(description="Total number of experts.", abbrev=""),
@@ -2022,6 +2051,7 @@ _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "activation_type": Const(
         description="Fused activation type; 10 selects SiTU.", abbrev="act"
     ),
+    "nvfp4_4over6": _nvfp4_4over6_axis(),
 }
 
 _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
@@ -3220,6 +3250,7 @@ cutlass_fused_moe_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Const(abbrev="i"),
         "top_k": Const(abbrev="topk"),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "input": Tensor(
@@ -3785,6 +3816,7 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         "activation_type": Const(
             description="Fused activation type; 10 selects SiTU.", abbrev="act"
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "gemm1_bias": _FP4_STANDARD_INPUTS["gemm1_bias"],
@@ -4125,6 +4157,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
                 "intermediate_size for non-gated ReLU^2."
             ),
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "x": Tensor(

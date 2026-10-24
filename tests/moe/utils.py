@@ -214,6 +214,20 @@ def compute_reference_moe(
 
 
 @contextmanager
+def env_var(name: str, value: str):
+    """Set one environment variable for the block, restoring it afterwards."""
+    saved = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
+
+
+@contextmanager
 def nvfp4_4over6_env(use_4over6: bool):
     original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)
     if use_4over6:

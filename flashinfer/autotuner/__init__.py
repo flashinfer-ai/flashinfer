@@ -10,6 +10,7 @@ Environment variables:
         when rank agreement on tactic choice is required.
 """
 
+from flashinfer.autotuner.protocol import TuningContext, TuningProtocol, TuningResult
 from flashinfer.autotuner.initializers import (
     autotuner_initializer_empty,
     autotuner_initializer_zeros,
@@ -56,6 +57,9 @@ __all__ = [
     "StaticDim",
     "TunableRunner",
     "TuningConfig",
+    "TuningContext",
+    "TuningProtocol",
+    "TuningResult",
     "ValueProfileArena",
     "_METADATA_KEY",
     "_collect_metadata",

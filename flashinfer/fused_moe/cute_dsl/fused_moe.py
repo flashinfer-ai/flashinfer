@@ -1144,6 +1144,7 @@ class CuteDslMoEWrapper:
         per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
         use_async_memset: bool = True,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -1190,6 +1191,7 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            nvfp4_4over6=nvfp4_4over6,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1209,6 +1211,7 @@ class CuteDslMoEWrapper:
         tactic: Optional[Tuple] = None,
         *,
         per_token_scale: Optional[torch.Tensor] = None,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL fused-MoE forward pass.
 
@@ -1249,6 +1252,11 @@ class CuteDslMoEWrapper:
             tuner.
         per_token_scale : Optional[torch.Tensor]
             Optional W4A4 per-token input row scale for GEMM1.
+        nvfp4_4over6 : NVFP44Over6Config or None
+            NVFP4 4over6 recipe for the W4A4 per-token requantization of the
+            GEMM2 input; see :func:`cute_dsl_fused_moe`. Unset reads the
+            environment, ``None`` turns 4over6 off, a pinned recipe requires
+            ``per_token_scale`` and a matching ``fc2_input_scale``.
 
         Returns
         -------
@@ -1335,14 +1343,18 @@ class CuteDslMoEWrapper:
 
         if runner is None:
             raise RuntimeError(f"{self.quant_mode} runner was not initialized")
+        recipe_kwargs = _cute_dsl_recipe_kwargs(
+            nvfp4_4over6, self.quant_mode, per_token_scale
+        )
         if tactic is not None:
-            return runner(inputs, tactic=tactic)
+            return runner(inputs, tactic=tactic, **recipe_kwargs)
 
         _, best_tactic = tuner.choose_one(
             op_name,
             [runner],
             runner.tuning_config,
             inputs,
+            **recipe_kwargs,
         )
         if self.quant_mode in ("w4a4", "w4a8"):
             # Timed tactic runs retain the default async path; only this
@@ -1352,7 +1364,7 @@ class CuteDslMoEWrapper:
             runner_kwargs = {}
         else:
             raise RuntimeError(f"Unexpected quant_mode {self.quant_mode!r}")
-        return runner(inputs, tactic=best_tactic, **runner_kwargs)
+        return runner(inputs, tactic=best_tactic, **runner_kwargs, **recipe_kwargs)
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
@@ -1371,6 +1383,30 @@ class CuteDslMoEWrapper:
 # =============================================================================
 # Functional API (Simple Function Call)
 # =============================================================================
+
+
+def _cute_dsl_recipe_kwargs(
+    nvfp4_4over6: Optional[NVFP44Over6Config],
+    quant_mode: str,
+    per_token_scale: Optional[torch.Tensor],
+) -> dict:
+    """Forward kwargs for the public ``nvfp4_4over6=``; empty when unset.
+
+    A pinned recipe is only honored on the W4A4 per-token path, the one path
+    whose GEMM2-input quantizer has a 4over6 variant; elsewhere it is rejected
+    rather than dropped. ``None`` is forwarded only where it means anything.
+    """
+    if nvfp4_4over6 is _UNSET:
+        return {}
+    pinned = resolve_nvfp4_4over6(nvfp4_4over6) is not None
+    on_per_token_w4a4 = quant_mode == "w4a4" and per_token_scale is not None
+    if pinned and not on_per_token_w4a4:
+        raise ValueError(
+            "nvfp4_4over6 requires quant_mode='w4a4' with per_token_scale; no "
+            "other CuTe-DSL path has a 4over6 requantization. Pass None to turn "
+            "4over6 off, or omit it to read the environment."
+        )
+    return {"nvfp4_4over6": nvfp4_4over6} if quant_mode == "w4a4" else {}
 
 
 def _cute_dsl_fused_moe_impl(
@@ -1505,6 +1541,7 @@ def cute_dsl_fused_moe(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
@@ -1583,6 +1620,16 @@ def cute_dsl_fused_moe(
         Optional SiTU tanh clamp for the up branch.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 4over6 recipe for the W4A4 per-token requantization of the
+        GEMM2 input (the GEMM1 input is quantized by the caller).
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off, environment ignored.
+        - :class:`NVFP44Over6Config`: that recipe. Requires ``quant_mode="w4a4"``
+          with ``per_token_scale``, otherwise :class:`ValueError`;
+          ``fc2_input_scale`` must have been built for the same recipe.
     tactic : Optional[Tuple]
         Tactic tuple, or ``None`` for auto-selection via the runtime tuner.
     localized_weights : Optional[list]
@@ -1655,9 +1702,10 @@ def cute_dsl_fused_moe(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
+    quant_mode = _canonicalize_quant_mode(quant_mode)
+    recipe_kwargs = _cute_dsl_recipe_kwargs(nvfp4_4over6, quant_mode, per_token_scale)
     _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
-    quant_mode = _canonicalize_quant_mode(quant_mode)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     if quant_mode == "w4a8":
@@ -1811,7 +1859,7 @@ def cute_dsl_fused_moe(
         )
 
     if tactic is not None:
-        return runners[0](inputs, tactic=tactic, aux_stream=aux_stream)
+        return runners[0](inputs, tactic=tactic, aux_stream=aux_stream, **recipe_kwargs)
 
     best_runner, best_tactic = tuner.choose_one(
         op_name,
@@ -1819,8 +1867,9 @@ def cute_dsl_fused_moe(
         runners[0].tuning_config,
         inputs,
         aux_stream=aux_stream,
+        **recipe_kwargs,
     )
-    call_kwargs = {"aux_stream": aux_stream}
+    call_kwargs = {"aux_stream": aux_stream, **recipe_kwargs}
     if quant_mode != "w4a16":
         call_kwargs["use_async_memset"] = not tuner.is_tuning_mode
     return best_runner(inputs, tactic=best_tactic, **call_kwargs)
@@ -1864,6 +1913,7 @@ def cute_dsl_fused_moe_nvfp4(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -1916,6 +1966,7 @@ def cute_dsl_fused_moe_nvfp4(
         localized_memset_stream=localized_memset_stream,
         localized_allow_nonlocalized=localized_allow_nonlocalized,
         autotune_use_cuda_graph=autotune_use_cuda_graph,
+        nvfp4_4over6=nvfp4_4over6,
     )
 
 

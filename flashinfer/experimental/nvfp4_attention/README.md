@@ -30,8 +30,24 @@ metadata, and `out` is the exact output passed by the caller. Tensor-map
 descriptors are encoded by the host binding and passed by value for each
 launch. The implementation does not mutate descriptors on the device.
 
+## Package layout
+
+The backend is a self-contained package. `cake_jit.py` is the registry of the
+generated program: one `MODULES` record carrying the host plan (the
+architectures it is delivered for, its launch record, the argument plan of its
+`run` entry, the grid rule a launch follows and the kernel-parameter to
+logical-argument map) and the loader glue (`record_for`, `launch_grid`,
+`launch_args`, `load`). What to compile is recorded once in `build.json`: the
+generated CUDA sources under `csrc/`, their digests and nvcc flags, one entry
+per (program, architecture). `cake_build.py` loads a prebuilt library from
+`aot/` when a builder compiled one and otherwise JIT-builds the manifest entry
+through FlashInfer from the same sources and flags.
+`scripts/check_cake_build_manifests.py` checks the manifest against the
+registry and the sources without importing the package.
+
 `cake_backend.pack_nvfp4_attention_inputs(q, k, v)` exposes the packing alone
 (any device); `tests/experimental/test_cake_nvfp4_attention.py` holds its
-bit-exact oracle and the validated shape set, and
+bit-exact oracle, the validated shape set and the manifest contract,
+`tests/experimental/test_cake_nvfp4_attention_api.py` the public entry, and
 `benchmarks/bench_cake_nvfp4_attention.py` reports preparation and attention
 timings per shape. See `examples/cake_nvfp4_attention.py` for a complete example.

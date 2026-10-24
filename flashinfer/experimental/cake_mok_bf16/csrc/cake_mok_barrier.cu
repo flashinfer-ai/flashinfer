@@ -54,8 +54,8 @@ kernel_cake_mok_barrier(unsigned int* __restrict__ local_counter, unsigned int* 
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
-    unsigned int _atomic_old_0 = atomicAdd(target_counter, ep_size);
-    unsigned int target = _atomic_old_0 + ep_size;
+    unsigned int _atomic_fetch_add_0 = atomicAdd(target_counter, ep_size);
+    unsigned int target = _atomic_fetch_add_0 + ep_size;
     asm volatile("multimem.red.release.sys.global.add.s32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(multicast_address)), "r"((int)(1)) : "memory");
     asm volatile("fence.proxy.alias;" ::: "memory");
     uint32_t _relaxed_ld_0;

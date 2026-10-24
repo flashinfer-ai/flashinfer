@@ -21,9 +21,16 @@ Run from an editable FlashInfer checkout on H100:
     python benchmarks/bench_cake_vsa_sm90.py --output /tmp/vsa-sm90-cake.json
     python benchmarks/bench_cake_vsa_sm90.py --output ... --warm-l2                    # PR #5470 regime
 
-Planning, host-to-device metadata copies, JIT compilation, input generation and output
+The Cake arm is ``backend="cake"`` of the wrapper, i.e. the self-contained package
+``flashinfer.cake_vsa_sm90_backend`` (its ``build.json`` names the compiled stages); the
+``cake_fp8`` arm is the same wrapper planned on the Sage FP8 route
+(``q_data_type=torch.float8_e4m3fn`` with the scales of ``sage_fp8_quantize_sm90``; the
+quantization runs before timing and is not part of the measured call).  Planning,
+host-to-device metadata copies, JIT compilation, input generation, quantization and output
 allocation happen before timing; the same prepared ``run`` is measured for both arms in
-alternating AB/BA order.  CUPTI measures kernel activity (a fallback to CUDA events is an
+alternating AB/BA order.  An FP8 arm is checked against the exact softmax of its dequantized
+inputs (atol = rtol = 5e-2, contract §2) and its error against the BF16 arm is reported, not
+gated; a BF16 candidate keeps the 1e-2 / 0.03 check against the baseline.  CUPTI measures kernel activity (a fallback to CUDA events is an
 error) with a cold L2 cache by default; ``--warm-l2`` reproduces the warm regime of
 FlashInfer PR #5470 and must never be mixed with cold numbers.  This is not an
 end-to-end host latency benchmark.
@@ -165,13 +172,34 @@ def make_inputs(axes, seed):
     return mask, q, k, v, scale
 
 
-def prepare(mask, backend, scale):
+FP8_ARM = "cake_fp8"
+
+
+def prepare(mask, backend, scale, q=None, k=None, v=None):
+    """A planned wrapper and the inputs its ``run`` takes: ``(wrapper, (q, k, v))``.  The ``cake_fp8`` arm
+    quantizes the BF16 inputs with the package's quantizer (outside timing) and plans the FP8 route."""
     h, mb, nb = mask.shape
-    workspace_size = 0 if backend == "cake" else 128 * 1024 * 1024
+    fp8 = backend == FP8_ARM
+    real_backend = "cake" if fp8 else backend
+    workspace_size = 0 if real_backend == "cake" else 128 * 1024 * 1024
     wrapper = VariableBlockSparseAttentionWrapper(
-        torch.empty(workspace_size, dtype=torch.uint8, device="cuda"), backend=backend
+        torch.empty(workspace_size, dtype=torch.uint8, device="cuda"),
+        backend=real_backend,
     )
     mask = mask.to("cuda")
+    dtype_kwargs = {"q_data_type": torch.bfloat16}
+    inputs = (q, k, v)
+    if fp8:
+        from flashinfer.cake_vsa_sm90 import sage_fp8_quantize_sm90
+
+        q8, k8, v8, q_scale, k_scale, v_scale = sage_fp8_quantize_sm90(q, k, v)
+        inputs = (q8, k8, v8)
+        dtype_kwargs = {
+            "q_data_type": torch.float8_e4m3fn,
+            "q_scale": q_scale,
+            "k_scale": k_scale,
+            "v_scale": v_scale,
+        }
     wrapper.plan(
         mask,
         torch.full((h, mb), 64, dtype=torch.int32, device="cuda"),
@@ -180,10 +208,32 @@ def prepare(mask, backend, scale):
         h,
         128,
         sm_scale=scale,
-        q_data_type=torch.bfloat16,
         non_blocking=False,
+        **dtype_kwargs,
     )
-    return wrapper
+    return wrapper, inputs
+
+
+def dequantized_reference(q8, k8, v8, q_scale, k_scale, v_scale, mask, scale):
+    """Exact FP32 softmax attention of the dequantized E4M3 inputs (reference (b) of the contract)."""
+    sk = k8.shape[1]
+    k_tok = k_scale[0].repeat_interleave(16, dim=-1)[:, :sk]
+    q32 = q8.float() * q_scale[0].unsqueeze(-1)
+    k32 = k8.float() * k_tok.unsqueeze(-1)
+    v32 = v8.float() * v_scale.unsqueeze(-2)
+    # one query block at a time over its selected keys: the softmax over the selected keys equals the dense row
+    # softmax with the unselected keys at -inf, without the [H, M, N] score matrix (28 GB for the largest workload)
+    out = torch.empty_like(q32)
+    mask = mask.to(q32.device)
+    offsets = torch.arange(64, device=q32.device)
+    for head in range(q32.shape[0]):
+        for qb in range(mask.shape[1]):
+            rows = slice(qb * 64, (qb + 1) * 64)
+            blocks = mask[head, qb].nonzero().flatten()
+            keys = (blocks[:, None] * 64 + offsets[None, :]).flatten()
+            scores = (q32[head, rows] @ k32[head, keys].T) * float(scale)
+            out[head, rows] = torch.softmax(scores, dim=-1) @ v32[head, keys]
+    return out
 
 
 def main():
@@ -195,7 +245,9 @@ def main():
     parser.add_argument("--pairs", type=int, default=3)
     parser.add_argument("--case", help="Run one named workload instead of all 20")
     parser.add_argument(
-        "--candidate", default="cake", help="Backend under test (default: cake)"
+        "--candidate",
+        default="cake",
+        help="Backend under test (default: cake; 'cake_fp8' = the Sage FP8 route of backend='cake')",
     )
     parser.add_argument(
         "--baseline",
@@ -230,17 +282,19 @@ def main():
     }
     for case in cases:
         mask, q, k, v, scale = make_inputs(case["axes"], args.seed)
-        wrappers = {name: prepare(mask, name, scale) for name in names}
+        prepared = {name: prepare(mask, name, scale, q, k, v) for name in names}
+        wrappers = {name: wrapper for name, (wrapper, _) in prepared.items()}
+        inputs = {name: tensors for name, (_, tensors) in prepared.items()}
         outputs = {
             name: torch.empty(
-                (q.shape[0] * q.shape[1], 1, 128), dtype=q.dtype, device=q.device
+                (q.shape[0] * q.shape[1], 1, 128), dtype=torch.bfloat16, device=q.device
             )
             for name in wrappers
         }
         calls = {
             name: (
                 lambda name=name: wrappers[name].run(
-                    q, k, v, out=outputs[name], enable_pdl=False
+                    *inputs[name], out=outputs[name], enable_pdl=False
                 )
             )
             for name in wrappers
@@ -250,12 +304,23 @@ def main():
                 call()
         torch.cuda.synchronize()
         expected, actual = outputs[args.baseline], outputs[args.candidate]
-        torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
         max_error = float((actual.float() - expected.float()).abs().max())
-        if max_error > 0.03:
-            raise AssertionError(
-                f"{case['uuid']}: maximum absolute error {max_error} > 0.03"
+        fp8_error = None
+        if args.candidate == FP8_ARM:
+            plan = wrappers[FP8_ARM]._cake_vsa_sm90_plan
+            exact = dequantized_reference(
+                *inputs[FP8_ARM], plan.q_scale, plan.k_scale, plan.v_scale, mask, scale
             )
+            torch.testing.assert_close(
+                actual.view_as(exact).float(), exact, atol=0.05, rtol=0.05
+            )
+            fp8_error = float((actual.view_as(exact).float() - exact).abs().max())
+        else:
+            torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
+            if max_error > 0.03:
+                raise AssertionError(
+                    f"{case['uuid']}: maximum absolute error {max_error} > 0.03"
+                )
         samples = {name: [] for name in wrappers}
         rounds = []
         for pair in range(args.pairs * 2):
@@ -282,6 +347,7 @@ def main():
         row = {
             **case,
             "max_abs_error": max_error,
+            "max_abs_error_vs_dequantized": fp8_error,
             "median_ms": medians,
             "speedup": medians[args.baseline] / medians[args.candidate],
             "rounds": rounds,

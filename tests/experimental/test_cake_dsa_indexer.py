@@ -1992,6 +1992,87 @@ def test_partition_knobs_do_not_change_results(knobs):
     assert ref.same_bits(base, other), f"partition knob {knobs} changed the result"
 
 
+# -- the attention-sink + local-band distribution (flashinfer-ai/flashinfer#7042) ----------------------------------
+# Small context-parallel geometries whose long units overflow the candidate buffer and run the sampled first
+# threshold (the issue's regime: the nearest key tile of every unit -- the diagonal -- holds a hot band of top-k
+# keys), judged like the random rows against the FP64 / FP32 reference and compared bitwise with the sampled
+# threshold switched off and with the forced re-stream.  Host plan, hand-evaluated from the registry policies
+# (the test asserts the host-visible parts): narrow units (l6 on sm_107a for ``cp16_16k``), ``cand_cap`` 8192,
+# ``check_period`` 16; ``cp16_16k`` (mean unit tiles 64) samples 8 tiles at stride 16 on its 125-128-tile units,
+# ``tail_30848`` (mean 239) samples 16 tiles at stride 15 / 16 on its 238-241-tile units.  The 241-tile units of
+# ``tail_30848`` satisfy ``(n_tiles - 1) % stride == 0``, so both tile orders sample the same tiles, the diagonal
+# and the sink tile included.  The 16384-token document of ``cp16_16k`` is the issue's 262144-token zigzag at 1/16
+# (``cp16_16k`` = ``cp_zigzag_rank0(16384)``: queries ``[0, 512)`` and ``[15872, 16384)``).
+SINK_GEOMETRIES = {
+    "cp16_16k": dict(seg_q_len=[512, 512], seg_k_len=[512, 16384], top_k=256),
+    "tail_30848": dict(seg_q_len=[512], seg_k_len=[30848], top_k=256),
+}
+
+
+def _longest_unit_samples(inputs, plan) -> bool:
+    """The kernel's ``sample_plan`` conditions for the longest unit, from host-visible numbers only: its key tiles
+    overflow the candidate buffer and the plan admits at least two sample tiles."""
+    tile = policy_for(arch_for(inputs.device)).tile_keys
+    tiles = -(-max(inputs.seg_k_len) // tile)
+    max_tiles = min(plan.sample_tiles_max, plan.cand_cap // tile - plan.check_period)
+    return tiles * tile + tile > plan.cand_cap and max_tiles >= 2
+
+
+@pytest.mark.parametrize("name", list(SINK_GEOMETRIES))
+def test_sink_distribution_is_exact_and_knob_invariant(name):
+    _require_program()
+    inputs = ref.make_sink_inputs(
+        **SINK_GEOMETRIES[name], seed=ref.SINK_SEED, device="cuda", label=name
+    )
+    plan = _plan(inputs)
+    assert plan.sample_tiles_max > 0 and _longest_unit_samples(inputs, plan), plan
+    base = _run(inputs)
+    verdict = _judge_ok(base, ref.select_reference(inputs))
+    assert (
+        verdict.max_fp32_error_over_bound <= 1.0
+        and verdict.max_fp64_error_over_bound <= 1.0
+    )
+    # the sink: most rows select key 0 (the issue reports 94-100 %; an iid row selects it with probability
+    # ~ top_k / visible)
+    assert float((base[0] == 0).any(dim=1).float().mean()) > 0.5
+    nosample = _run(inputs, sample_tiles_max=0)
+    assert ref.same_bits(base, nosample), (
+        "sample_tiles_max=0 changed the result on the sink distribution"
+    )
+    restream = _run(inputs, sample_shift_permille=-500)
+    assert ref.same_bits(base, restream), (
+        "the forced re-stream changed the result on the sink distribution"
+    )
+
+
+def test_sink_issue_geometry_full():
+    """The issue's call: one 262144-token document, CP16 zigzag rank 0, top-k 2048, ``max_seqlen_k`` 262144.
+    ``FLASHINFER_CAKE_DSA_INDEXER_FULL=1`` only: 2.1 G visible pairs through the matmul-order reference (minutes)."""
+    _require_program()
+    if not FULL:
+        pytest.skip("set FLASHINFER_CAKE_DSA_INDEXER_FULL=1 for the 262k sink geometry")
+    inputs = ref.make_sink_inputs(
+        [8192, 8192],
+        [8192, 262144],
+        top_k=2048,
+        seed=ref.SINK_SEED,
+        device="cuda",
+        label="Z1",
+    )
+    plan = _plan(inputs, max_seqlen_k=262144)
+    # unsplit units, 32 sample tiles, 16384-entry candidate buffers checked every 32 tiles: the plan the issue
+    # prints (the unit kind is the architecture's: wide on sm_100a, the l6 CTA pair on sm_103a)
+    assert plan.n_split == 1 and _longest_unit_samples(inputs, plan), plan
+    assert plan.sample_tiles_max == 32 and plan.cand_cap == 16384, plan
+    assert plan.check_period == 32, plan
+    base = _run(inputs, max_seqlen_k=262144)
+    _judge_ok(base, ref.select_reference(inputs))
+    nosample = _run(inputs, max_seqlen_k=262144, sample_tiles_max=0)
+    assert ref.same_bits(base, nosample)
+    unbounded = _run(inputs)
+    assert ref.same_bits(base, unbounded)
+
+
 # ---------------------------------------------------------------------------
 # Operator: robustness, graph capture, workspace, public entry
 # ---------------------------------------------------------------------------

@@ -1633,6 +1633,8 @@ def create_throughput_latency_mma_task(
         smem_kv.init_descriptor_state()
         smem_p0.init_descriptor_state()
         smem_p1.init_descriptor_state()
+        tmem_s0.init_descriptor_state()
+        tmem_s1.init_descriptor_state()
         tmem_o.init_mma_state()
 
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
@@ -1872,6 +1874,7 @@ def create_single_kv_pipe_mma_task(
         """Capture identical pipeline ownership for the two P layouts."""
         smem_q.init_descriptor_state()
         smem_kv.init_descriptor_state()
+        tmem_s.init_descriptor_state()
         tmem_o.init_mma_state()
         if swap:
             p_resource.init_descriptor_state()

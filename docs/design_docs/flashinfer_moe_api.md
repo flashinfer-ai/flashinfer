@@ -175,7 +175,7 @@ NVFP4 "4over6" is a two-candidate block-scale search inside the quantizer: next 
 
 - **One public type.** The field is `Optional[NVFP44Over6Config]`; "defer to the environment" is the default value (a private `_UNSET` sentinel that callers never spell), not a third public type. Retiring the shim later means flipping the default to `None` with no signature change.
 - **One resolution boundary.** `resolve_nvfp4_4over6()` is the only Python code that reads the variables. Below it every kernel driver takes the resolved value under the name `nvfp4_4over6_config`, so an unresolved value cannot reach a `@functools.cache`-d kernel getter unnoticed. The FFI receives a packed `int64`, decoded by `resolveNVFP4Recipe()` in `csrc/nv_internal/tensorrt_llm/kernels/nvfp4Recipe.h`.
-- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` honours a pinned recipe only with `per_token_scale=True`, the one path where it quantizes the GEMM2 input itself. `MoELayer` names the runners that do support it in its "no usable backend" error.
+- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` and `TrtllmFp4RoutedRunner` honour a pinned recipe only for NVFP4×NVFP4 with `per_token_scale=True`, the one path where each quantizes the GEMM2 input itself; `CutlassNvfp4Runner` honours it on its standard path, whose activation quantizers have 4over6 variants. `PrimsTsRunner` has no GEMM2-input requantization step (its FC1 epilogue emits NVFP4 on every tactic), so it keeps rejecting explicit values. `MoELayer` names the runners that do support it in its "no usable backend" error.
 - **Activations only.** The field governs the runtime activation quantization; weights are quantized by the caller ahead of the call. `QuantConfig.__post_init__` rejects an explicit setting when `activation` is not `QuantFormat.NVFP4`, so the mistake is named where the config is written rather than swallowed by the candidate filter.
 - **Flat and unified APIs take the same value.** `nvfp4_quantize(..., nvfp4_4over6=...)`, `make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`, `CuteDslConfig.prepare_weights(..., nvfp4_4over6=...)` and `QuantConfig.nvfp4_4over6` all accept one `NVFP44Over6Config` object.
 
@@ -922,6 +922,10 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
@@ -942,6 +946,9 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
+
+For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
+[usage, qualification and extension guide](../frost_low_latency_moe.md).
 
 This table records activation classes, not every accepted scalar value. For
 example, TRT-LLM FP8 per-tensor and b12x accept only default-scalar `SwiGLU`,

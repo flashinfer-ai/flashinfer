@@ -51,7 +51,6 @@ from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     PipelineConfig,
     TileSchedulerConfig,
-    WorkQueue,
 )
 from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
@@ -64,7 +63,6 @@ from ..._block_sparse.common import (
 )
 from ..._block_sparse.prepared import _BlockSparseRouteLayout
 from ..tensor_map import (
-    create_tensor_map_ragged_from_tensor,
     create_tensor_map_tiled,
     create_tensor_map_tiled_from_view,
 )
@@ -905,14 +903,13 @@ def _build_decode_gen_schedule(
             "pipeline_config": wq_pipeline_config,
             "name": "work_queue",
         }
-        if cfg.use_variable_seqlens_q:
-            work_queue = PackedDecodeWorkQueue(
-                cfg=cfg,
-                cu_seqlens_q=cu_seqlens_q,
-                **work_queue_kwargs,
-            )
-        else:
-            work_queue = WorkQueue(**work_queue_kwargs)
+        work_queue = PackedDecodeWorkQueue(
+            cfg=cfg,
+            cu_seqlens_q=cu_seqlens_q,
+            seqlens_kv=seqlens_kv,
+            num_heads_kv=num_heads_kv,
+            **work_queue_kwargs,
+        )
 
         schedule_token_throttle = ScheduleTokenThrottleResource(
             pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
@@ -3153,6 +3150,15 @@ def decode_gen_kernel(
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
         q_token_base = _q_group_token_base(cfg, q_group_idx)
         q_tile_is_active = q_token_base < seq_len_q
+        if cutlass.const_expr(
+            use_variable_seqlens_kv
+            or (use_native_paged_kv and not use_static_native_seqlens_kv)
+        ):
+            if cutlass.const_expr(cfg.use_pdl):
+                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+            q_tile_is_active = q_tile_is_active & (
+                Int32(g_seqlens_kv[b_idx]) > Int32(0)
+            )
 
     # Persistent block coordinates identify physical workers rather than
     # logical tiles; their WorkQueue owns the equivalent Q predicate. Split-KV
@@ -3309,8 +3315,8 @@ def decode_gen_kernel(
                 g_sage_scales=g_sage_scales,
             )
     else:
-        # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
-        # producer state, unlike a valid Q tile whose K domain is empty.
+        # Inactive requests publish no output or partials; dependent reducers
+        # use the same live-length predicate. Every physical CTA still signals PDL.
         _signal_padded_pdl_producer(cfg)
 
 
@@ -3534,9 +3540,8 @@ def fmha_decode_launch(
         )
     q_box_dims: tuple[object, ...]
     if cutlass.const_expr(cfg.use_variable_seqlens_q):
-        # Packed Q is physically [sum_q_tokens, num_heads_q, head_dim]. Flatten
-        # the head modes into Hq. Sparse Q uses this rank-3 map directly;
-        # other packed paths retain per-sequence ragged zero fill.
+        # Bound packed Q by its physical [D, Hq, total_q_tokens] allocation.
+        # Per-route Q masks handle tiles that cross into the next request.
         q_tma = cute.make_tensor(
             q_iter,
             cute.make_layout(
@@ -3559,24 +3564,12 @@ def fmha_decode_launch(
                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
             )
             q_groups = Int32(cfg.max_seq_len_q) * head_ctas_per_token
-        if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_route):
-            # A partial group may read the next sequence into inactive Q rows.
-            # QK/softmax/PV rows are independent; row masks and guarded stores
-            # discard them. Physical allocation bounds still get TMA zero fill.
-            tma_desc_q = create_tensor_map_tiled_from_view(
-                q_tma,
-                box_dims=q_box_dims,
-                stride_order=(0, 1, 2),
-                swizzle=tma_swizzle_q,
-            )
-        else:
-            tma_desc_q = create_tensor_map_ragged_from_tensor(
-                q_tma,
-                box_dims=q_box_dims,
-                ragged_dim=2,
-                stride_order=(0, 1, 2),
-                swizzle=tma_swizzle_q,
-            )
+        tma_desc_q = create_tensor_map_tiled_from_view(
+            q_tma,
+            box_dims=q_box_dims,
+            stride_order=(0, 1, 2),
+            swizzle=tma_swizzle_q,
+        )
     else:
         q_tma = cute.make_tensor(
             q_iter,

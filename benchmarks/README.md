@@ -54,8 +54,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
     - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
     - `unified_moe` - Unified MoE API comparison between the CUTLASS, cuTile, b12x and cuDNN grouped-GEMM backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
-- MOE Communication:
-    - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
+- MOE Communication: no routine yet; standalone scripts cover it. `benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py` times dispatch + combine of the `flashinfer.moe_ep` communication backends (launched with `torchrun`), and `benchmarks/moe_ep/bench_moe_ep.py` times dispatch + MoE + combine.
 - AllReduce Communication:
     - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
 - Norm:
@@ -100,7 +99,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 - Mamba (Selective State Space Models):
     - `selective_state_update` - Selective state update for Mamba layers (generation phase). Supports both single-token prediction (STP) and multi-token prediction (MTP) via `--cache_steps`. Backends: `flashinfer` (CUDA, architecture-specific kernels for base/SM90/SM100+) and `triton` (reference).
 - GDN (Gated Delta Net linear attention, SM90+):
-    - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL) and `triton` (reference).
+    - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL, generic kernels), `triton` (reference), `rubin` (the Rubin-tuned T=1 bf16-state kernel; SM107 only) and `rubin_ugpu` (`rubin` with uGPU localization: a `ugpu_state_pool`, each die updates the half of every state in its own memory).
     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
     - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
 - KDA (SM120a):
@@ -350,57 +349,6 @@ Notes:
 - FP8 MOE kernels require integer values for group parameters, while FP4 MOE kernels accept optional values.
 - CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
 
-### MoE Communication Flags (moe_a2a_dispatch_combine)
-The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication for multi-GPU expert-parallel inference. It must be launched with `mpirun`.
-
-| Flag                     | Description                                                                                                 |
-|--------------------------|-------------------------------------------------------------------------------------------------------------|
-| `--num_tokens`           | Number of tokens per rank (local batch size)                                                               |
-| `--hidden_size`          | Hidden dimension size                                                                                      |
-| `--num_experts`          | Total number of experts across all ranks                                                                   |
-| `--top_k`                | Number of experts to route each token to                                                                   |
-| `--input_dtype`          | Data type for hidden states payload: `bfloat16` (default) or `float16`                                     |
-| `--quant_dtype`          | Quantization format: `fp8` (per-tensor), `nvfp4` (block-scale FP4), `fp8_block_scale` (block-scale FP8)    |
-| `--real_math`            | Run actual MoE kernels instead of fake computation. Requires `--intermediate_size` and `--quant_dtype` to be `nvfp4` or `fp8_block_scale` |
-| `--intermediate_size`    | Intermediate FFN size. Required if `--real_math` is set                                                    |
-| `--max_num_tokens`       | Max tokens per rank for workspace allocation. Defaults to `--num_tokens`                                   |
-| `--validate`             | Run correctness validation before benchmarking using deterministic fake MoE                                |
-| `--per_phase_timing`     | Enable per-phase timing (dispatch/combine/moe_kernel). Adds slight overhead from CUDA events               |
-| `--nvtx`                 | Enable NVTX markers for Nsight Systems profiling                                                           |
-| `--use_lora`             | Carry a per-token int32 LoRA adapter ID through dispatch as an extra payload.                                                                                                                  |
-
-**Launch Examples:**
-```bash
-# Basic (no quantization)
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8
-
-# With FP8 quantization
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --quant_dtype fp8
-
-# With NVFP4 quantization and real MoE kernel
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --quant_dtype nvfp4 --real_math --intermediate_size 18432
-
-# With validation and per-phase timing
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --validate --per_phase_timing
-
-# Multi-tenant LoRA: carry per-token adapter ID through dispatch
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 2048 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --use_lora --validate
-```
-
 ### AllReduce Communication Flags (allreduce_fusion)
 The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-GPU inference. It must be launched with `mpirun`. Both oneshot and twoshot strategies are benchmarked automatically and reported side by side.
 
@@ -544,7 +492,7 @@ Applies to `gated_delta_rule_decode`, `gated_delta_rule_mtp`, and `chunk_gated_d
 | `--update_state`              | MTP only: write the final state back (`disable_state_update=False`). BF16 state always updates in-place    |
 | `--cache_intermediate_states` | MTP with `float32` state only: cache per-token intermediate states                                         |
 | `--no_qk_l2norm`              | Decode/MTP: disable in-kernel Q/K L2 normalization                                                         |
-| `--backends`                  | Decode/MTP: `flashinfer` (default), `triton`. Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
+| `--backends`                  | Decode/MTP: `flashinfer` (default), `triton`; decode with `--state_dtype bfloat16` also `rubin` and `rubin_ugpu` (SM107). Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
 
 Notes:
 - Refcheck compares against the torch reference in `tests/gdn/reference_delta_rule.py`.
@@ -588,7 +536,6 @@ Legend:
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
 | **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |
 | **unified_moe** |  | cudnn (BF16) | cudnn (BF16) | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16), cudnn (BF16, FP8) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16), cudnn (BF16, FP8) | cutlass, cudnn | cutlass, cudnn | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16), b12x (NVFP4 W4A4/W4A16), cudnn |
-| **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
 | **fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |

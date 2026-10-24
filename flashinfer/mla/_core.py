@@ -4837,7 +4837,28 @@ def prepare_cake_mla_varq_dcp_decode(
     )
 
 
-@flashinfer_experimental_api(feature="Cake dense NVFP4 MLA decode (SM100/SM103)")
+_CAKE_NVFP4_MLA_RUBIN_CAPABILITY = (10, 7)
+
+
+def _cake_nvfp4_mla_is_rubin(device: torch.device) -> bool:
+    """Whether the Cake NVFP4 MLA decode entry points route to the Rubin (SM107)
+    package for ``device``; every other device goes to the SM100 / SM103
+    package, which raises its own error for an unsupported capability."""
+    return (
+        device.type == "cuda"
+        and tuple(get_compute_capability(device)) == _CAKE_NVFP4_MLA_RUBIN_CAPABILITY
+    )
+
+
+def _cake_nvfp4_mla_check_rubin_only(cp_interleave: int) -> None:
+    if cp_interleave != 1:
+        raise ValueError(
+            "cp_interleave other than 1 is served by the Rubin (SM107) Cake NVFP4 MLA "
+            "decode only; the SM100 / SM103 package shards keys one at a time"
+        )
+
+
+@flashinfer_experimental_api(feature="Cake dense NVFP4 MLA decode (SM100/SM103/SM107)")
 def cake_mla_nvfp4_paged_decode(
     q_nope: torch.Tensor,
     q_sf: torch.Tensor,
@@ -4863,6 +4884,12 @@ def cake_mla_nvfp4_paged_decode(
     cp_rank: int = 0,
     kv_len_global: Optional[torch.Tensor] = None,
     backend: str = "cake",
+    seq_lens_host: Optional[Sequence[int]] = None,
+    kv_len_global_host: Optional[Sequence[int]] = None,
+    cum_seq_lens_q_host: Optional[Sequence[int]] = None,
+    cp_interleave: int = 1,
+    units: Optional[int] = None,
+    pairs: Optional[int] = None,
 ):
     """Dense absorbed-MLA decode over an NVFP4 paged latent cache.
 
@@ -4872,27 +4899,72 @@ def cake_mla_nvfp4_paged_decode(
     ``[num_pages, page_size, 256]`` packed E2M1, ``ckv_sf_cache``
     float8_e4m3fn ``[num_pages, page_size, 32]`` block-16 scales,
     ``kpe_cache`` float8_e4m3fn ``[num_pages, page_size, 64]`` rope channels
-    (page sizes 32 / 64 / 128 / ..., strided views of one allocation allowed),
-    decoded as ``e2m1 * sf * ckv_scale | fp8 * kpe_scale``.  The query is
-    NVFP4 too -- ``q_nope`` uint8 ``[.., 256]``, ``q_sf`` float8_e4m3fn
-    ``[.., 32]``, ``q_rope`` float8_e4m3fn ``[.., 64]``, ``q_scale`` float32
-    ``[..]`` from :func:`quantize_mla_nvfp4_query` -- as ``[batch, q_len,
-    num_heads, .]`` or packed ``[total_q, num_heads, .]`` with
-    ``cum_seq_lens_q`` / ``max_q_len`` (variable-length / MTP queries,
-    bottom-right causal against the request's last keys).  It writes BF16
-    ``out`` (``q.shape[:-1] + (512,)``) and, with ``return_lse=True``, the
-    natural-log FP32 ``lse``; decode context parallelism follows the static
-    cyclic rule (``cp_world`` / ``cp_rank`` with the per-request global
-    lengths ``kv_len_global``).  Requires compute capability 10.0 or 10.3.
-    The caller owns ``workspace_buffer`` (uint8; size from
-    ``flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend
-    .workspace_bytes`` / ``max_workspace_bytes``).  Nothing reads device
-    tensor contents on the host.  ``prepare_cake_mla_nvfp4_paged_decode``
+    (page sizes 32 / 64 / 128 / ... on SM100 / SM103, 64 on SM107; strided
+    views of one allocation allowed), decoded as ``e2m1 * sf * ckv_scale |
+    fp8 * kpe_scale``.  The query is NVFP4 too -- ``q_nope`` uint8
+    ``[.., 256]``, ``q_sf`` float8_e4m3fn ``[.., 32]``, ``q_rope``
+    float8_e4m3fn ``[.., 64]``, ``q_scale`` float32 ``[..]`` from
+    :func:`quantize_mla_nvfp4_query` -- as ``[batch, q_len, num_heads, .]``
+    or packed ``[total_q, num_heads, .]`` with ``cum_seq_lens_q`` /
+    ``max_q_len`` (variable-length / MTP queries, bottom-right causal against
+    the request's last keys).  It writes BF16 ``out`` (``q.shape[:-1] +
+    (512,)``) and, with ``return_lse=True``, the natural-log FP32 ``lse``;
+    decode context parallelism follows the static cyclic rule (``cp_world``
+    / ``cp_rank`` with the per-request global lengths ``kv_len_global``;
+    SM107 also takes ``cp_interleave``, the block of consecutive keys per
+    rank).  Requires compute capability 10.0, 10.3 or 10.7: the call routes
+    on the device's capability to ``flashinfer.experimental.
+    cake_mla_nvfp4_paged_decode`` (SM100 / SM103) or ``flashinfer.
+    experimental.cake_rubin_mla_nvfp4_decode`` (SM107).  The caller owns
+    ``workspace_buffer`` (uint8; size from the package's ``cake_backend
+    .workspace_bytes`` / ``max_workspace_bytes``).  On SM100 / SM103 nothing
+    reads device tensor contents on the host; the SM107 host plan reads the
+    KV and query lengths, from ``seq_lens_host`` / ``cum_seq_lens_q_host`` /
+    ``kv_len_global_host`` when given, else by copying the device tensors
+    (a synchronization), and takes the device's cluster counts ``units`` /
+    ``pairs`` (queried when omitted).  ``prepare_cake_mla_nvfp4_paged_decode``
     returns a launch-only runner for repeated calls with fixed bindings.  See
-    ``flashinfer/experimental/cake_mla_nvfp4_paged_decode/README.md``.
+    the two packages' ``README.md``.
     """
     if backend != "cake":
         raise ValueError("Cake NVFP4 MLA decode currently supports backend='cake'")
+    if _cake_nvfp4_mla_is_rubin(q_nope.device):
+        from ..experimental.cake_rubin_mla_nvfp4_decode.cake_backend import (
+            cake_mla_nvfp4_paged_decode as run_rubin,
+        )
+
+        return run_rubin(
+            q_nope,
+            q_sf,
+            q_rope,
+            q_scale,
+            ckv_cache,
+            ckv_sf_cache,
+            kpe_cache,
+            block_tables,
+            seq_lens,
+            workspace_buffer,
+            sm_scale=sm_scale,
+            ckv_scale=ckv_scale,
+            o_scale=o_scale,
+            out=out,
+            lse=lse,
+            return_lse=return_lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            max_seq_len=max_seq_len,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            kv_len_global=kv_len_global,
+            backend="cake",
+            seq_lens_host=seq_lens_host,
+            kv_len_global_host=kv_len_global_host,
+            cum_seq_lens_q_host=cum_seq_lens_q_host,
+            cp_interleave=cp_interleave,
+            units=units,
+            pairs=pairs,
+        )
+    _cake_nvfp4_mla_check_rubin_only(cp_interleave)
     from ..experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
         cake_mla_nvfp4_paged_decode as run,
     )
@@ -4925,7 +4997,7 @@ def cake_mla_nvfp4_paged_decode(
 
 
 @flashinfer_experimental_api(
-    feature="Prepared Cake dense NVFP4 MLA decode (SM100/SM103)"
+    feature="Prepared Cake dense NVFP4 MLA decode (SM100/SM103/SM107)"
 )
 def prepare_cake_mla_nvfp4_paged_decode(
     q_nope: torch.Tensor,
@@ -4951,20 +5023,68 @@ def prepare_cake_mla_nvfp4_paged_decode(
     cp_rank: int = 0,
     kv_len_global: Optional[torch.Tensor] = None,
     backend: str = "cake",
+    seq_lens_host: Optional[Sequence[int]] = None,
+    kv_len_global_host: Optional[Sequence[int]] = None,
+    cum_seq_lens_q_host: Optional[Sequence[int]] = None,
+    cp_interleave: int = 1,
+    units: Optional[int] = None,
+    pairs: Optional[int] = None,
 ):
     """Plan and bind one Cake dense NVFP4 MLA decode problem.
 
-    Validation, the host plan (row tile, KV split count, grids, reducer), the
-    workspace carve and every allocation happen here; the returned
-    ``CakeMlaNvfp4PagedDecode`` launches the attention kernel (and, when the
-    plan splits the KV, the merge kernel behind it) with no CUDA allocation
-    and no host synchronization, writing the caller-owned ``out`` / ``lse``.
-    Prepare a new runner when shapes, ``max_seq_len`` or the tensor bindings
-    change.  CUDA Graph ownership remains with the caller.  See
-    :func:`cake_mla_nvfp4_paged_decode` for the semantics.
+    Validation, the host plan (SM100 / SM103: row tile, KV split count,
+    grids, reducer; SM107: the work-item table and per-row key limits from
+    the host lengths), the workspace carve and every allocation happen here;
+    the returned runner launches the attention kernel (and, when the plan
+    splits the KV, the merge kernel behind it) with no CUDA allocation and no
+    host synchronization, writing the caller-owned ``out`` / ``lse``.  Prepare
+    a new runner when shapes, lengths, ``max_seq_len`` or the tensor bindings
+    change.  CUDA Graph ownership remains with the caller; a captured
+    ``launch()`` replays through the runner's workspace, so the runner and
+    ``workspace_buffer`` stay alive while the graph is replayed.  The call routes on
+    the device's compute capability (10.7: the Rubin package, which takes the
+    host length lists and ``cp_interleave`` / ``units`` / ``pairs``; 10.0 /
+    10.3: the SM100 / SM103 package).  See :func:`cake_mla_nvfp4_paged_decode`
+    for the semantics.
     """
     if backend != "cake":
         raise ValueError("Cake NVFP4 MLA decode currently supports backend='cake'")
+    if _cake_nvfp4_mla_is_rubin(q_nope.device):
+        from ..experimental.cake_rubin_mla_nvfp4_decode.cake_backend import (
+            prepare_cake_mla_nvfp4_paged_decode as prepare_rubin,
+        )
+
+        return prepare_rubin(
+            q_nope,
+            q_sf,
+            q_rope,
+            q_scale,
+            ckv_cache,
+            ckv_sf_cache,
+            kpe_cache,
+            block_tables,
+            seq_lens,
+            out,
+            workspace_buffer,
+            sm_scale=sm_scale,
+            ckv_scale=ckv_scale,
+            o_scale=o_scale,
+            lse=lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            max_seq_len=max_seq_len,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            kv_len_global=kv_len_global,
+            backend="cake",
+            seq_lens_host=seq_lens_host,
+            kv_len_global_host=kv_len_global_host,
+            cum_seq_lens_q_host=cum_seq_lens_q_host,
+            cp_interleave=cp_interleave,
+            units=units,
+            pairs=pairs,
+        )
+    _cake_nvfp4_mla_check_rubin_only(cp_interleave)
     from ..experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
         CakeMlaNvfp4PagedDecode,
     )
@@ -4994,7 +5114,9 @@ def prepare_cake_mla_nvfp4_paged_decode(
     )
 
 
-@flashinfer_experimental_api(feature="Cake NVFP4 MLA query quantization (SM100/SM103)")
+@flashinfer_experimental_api(
+    feature="Cake NVFP4 MLA query quantization (SM100/SM103/SM107)"
+)
 def quantize_mla_nvfp4_query(
     query: torch.Tensor,
     ckv_scale: float,
@@ -5011,8 +5133,16 @@ def quantize_mla_nvfp4_query(
     even) and FP8 rope ``x * kpe_scale / (q_scale * ckv_scale)``, so the rope
     product lands in the latent logit unit.  ``out`` reuses caller buffers
     (``cake_backend.mla_nvfp4_query_buffers``); the launch then allocates
-    nothing.  Requires compute capability 10.0 or 10.3.
+    nothing.  Requires compute capability 10.0, 10.3 or 10.7 (the call
+    routes on the device's capability; the two packages' quantizers are bit
+    for bit the same arithmetic).
     """
+    if _cake_nvfp4_mla_is_rubin(query.device):
+        from ..experimental.cake_rubin_mla_nvfp4_decode.cake_backend import (
+            quantize_mla_nvfp4_query as run_rubin,
+        )
+
+        return run_rubin(query, ckv_scale, kpe_scale, out=out)
     from ..experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
         quantize_mla_nvfp4_query as run,
     )

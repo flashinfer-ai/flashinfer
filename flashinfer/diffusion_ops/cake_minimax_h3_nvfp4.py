@@ -1,17 +1,41 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepared MiniMax-H3 NVFP4 (W4A4) pre-attention operation."""
+"""Prepared MiniMax-H3 NVFP4 (W4A4) pre-attention operation.
+
+Two generated programs per exact target (``sm_100a``, ``sm_103a``): the RMSNorm
++ AdaLN + NVFP4 quantize stage and the fused NVFP4 QKV GEMM whose epilogue
+applies the Q/K RMSNorm, the split-half NeoX RoPE and the destination-major
+output, one GEMM schedule per target and one program per output format:
+
+* ``out_format="nvfp4"``: E2M1 nibble pairs ``uint8 [P, M, 56 / P, 3, 64]``
+  plus swizzled-128x4 E4M3 block-16 scales
+  ``uint8 [P, round_up(M * (56 / P) * 3, 128) * 8]`` under one static global
+  encode scale (``out_global_scale``).
+* ``out_format="e4m3"``: ``float8_e4m3fn [P, M, 56 / P, 3, 128]`` with one
+  per-tensor scale per kind, ``out_q[p, m, h, kind, d] = e4m3(value *
+  f32(1 / qkv_scales[kind]))`` (round to nearest even, saturating at +-448);
+  no scale tile is written.
+
+The token count ``M`` and the destination geometry are launch parameters, so
+every destination partition count ``P`` of one format routes to the same two
+programs of its target.  Tensor maps are passed by value; no descriptor
+workspace exists.
+"""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import tvm_ffi
 
+from flashinfer.jit import cake_program
 from flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention import (
-    load_minimax_h3_nvfp4_route,
-    minimax_h3_nvfp4_route_record,
+    FUSED_E4M3_EPI8,
+    FUSED_E4M3_K96,
+    FUSED_PACK_EPI8,
+    FUSED_PACK_K96,
+    NORM,
 )
 
 _HIDDEN = 5376
@@ -26,8 +50,10 @@ _FP4_BLOCK = 16
 _ACTIVATION_SCALE_COLS = _HIDDEN // _FP4_BLOCK  # 336 E4M3 scales per row
 _ACTIVATION_PACKED_COLS = _HIDDEN // 2  # 2688 E2M1 nibble-pair bytes per row
 _OUTPUT_SCALE_COLS = _HEAD_DIM // _FP4_BLOCK  # 8 E4M3 scales per head row
-_OUTPUT_PACKED_COLS = _HEAD_DIM // 2  # 64 E2M1 nibble-pair bytes per head row
+_NVFP4_PACKED_COLS = _HEAD_DIM // 2  # 64 E2M1 nibble-pair bytes per head row
+_E4M3_PACKED_COLS = _HEAD_DIM  # 128 E4M3 bytes per head row
 _SUPPORTED_PARTITIONS = (1, 2, 4, 8)
+_SUPPORTED_FORMATS = ("nvfp4", "e4m3")
 # Fused GEMM operand geometry: the swizzled-128x4 scale layout stores one
 # 128-row x 4-K-block tile in 512 bytes; the fused kernel consumes the weight
 # scales of one 256-column tile pair per CTA pair, half per CTA.
@@ -35,8 +61,22 @@ _SCALE_TILE_BYTES = 512
 _SCALE_K_TILES = _HIDDEN // (4 * _FP4_BLOCK)  # 84 K-sets per 128-row block
 _GEMM_COLUMN_TILES = _QKV_WIDTH // 256  # 84 column tile pairs
 _GEMM_CTA_GROUP = 2
+_GEMM_BLOCK_M = 128
 _ACTIVATION_SCALE_ROWS_PER_TILE = 4
 _WEIGHT_SCALE_ROWS_PER_TILE = 8
+# Norm stage geometry: one CTA per two rows of the 128-row-aligned activation
+# scale tile (the padding rows are zeroed by the stage).
+_NORM_ROWS_PER_CTA = 2
+_NORM_ROW_ALIGNMENT = 128
+
+# The fused GEMM program of every (output format, exact target); the norm stage
+# is one program for both targets.
+_GEMM_PROGRAMS: dict[tuple[str, str], cake_program.CakeProgram] = {
+    ("nvfp4", "sm_100a"): FUSED_PACK_EPI8,
+    ("nvfp4", "sm_103a"): FUSED_PACK_K96,
+    ("e4m3", "sm_100a"): FUSED_E4M3_EPI8,
+    ("e4m3", "sm_103a"): FUSED_E4M3_K96,
+}
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -64,82 +104,127 @@ def _require_tensor(
     return value
 
 
-def _stage_workspace(
-    value: Optional[torch.Tensor],
-    *,
-    name: str,
-    record: dict,
-) -> None:
+def _stage_workspace(value: Optional[torch.Tensor], *, name: str) -> None:
     """The generated stages pass their tensor maps by value: no descriptor workspace exists.
 
     The keyword arguments are kept for API stability and must be ``None``.
     """
-    if any(str(kind) == "workspace" for kind, _name in record["arg_plan"]):
-        raise RuntimeError(
-            f"generated stage {record['name']!r} unexpectedly requires a descriptor workspace"
-        )
     if value is not None:
         raise ValueError(
             f"{name} must be None: the generated stages take their tensor maps by value"
         )
-    return None
 
 
-def _gemm_row_tiles(rule: dict, *, M: int) -> int:
+def minimax_h3_nvfp4_target(device: torch.device) -> str:
+    """Exact target (``"sm_100a"`` or ``"sm_103a"``) the programs ship for ``device``."""
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
+    target = cake_program.CAPABILITY_TARGET.get((capability[0], capability[1]))
+    if (
+        target is None
+        or target not in NORM.targets
+        or any((fmt, target) not in _GEMM_PROGRAMS for fmt in _SUPPORTED_FORMATS)
+    ):
+        raise RuntimeError(
+            "MiniMax-H3 NVFP4 pre-attention requires exact compute capability "
+            f"10.0 or 10.3, got {capability[0]}.{capability[1]}"
+        )
+    return target
+
+
+def minimax_h3_nvfp4_programs(
+    device: torch.device, out_format: str = "nvfp4"
+) -> tuple[cake_program.CakeProgram, cake_program.CakeProgram]:
+    """``(norm, gemm)``: the two generated programs of ``out_format`` on the device's exact target."""
+    if out_format not in _SUPPORTED_FORMATS:
+        raise ValueError(
+            f"out_format must be one of {_SUPPORTED_FORMATS}, got {out_format!r}"
+        )
+    target = minimax_h3_nvfp4_target(device)
+    return NORM, _GEMM_PROGRAMS[(out_format, target)]
+
+
+def _gemm_row_tiles(M: int) -> int:
     """128-row output tiles of the fused GEMM, padded to whole CTA pairs."""
-    tiles = -(-M // int(rule["block_m"]))
-    cta_group = int(rule["cta_group"])
-    return tiles + tiles % cta_group
+    tiles = -(-M // _GEMM_BLOCK_M)
+    return tiles + tiles % _GEMM_CTA_GROUP
 
 
-def _stage_launch_grid(record: dict, *, M: int, P: int) -> tuple[int, int, int]:
+def minimax_h3_nvfp4_launch_grid(stage: str, M: int) -> tuple[int, int, int]:
     """Launch grid of one generated stage for the runtime token count ``M``.
 
-    The route record carries the rule with the constants of the generated
-    program (rows per CTA, tile geometry); the token count is not part of the
-    program identity, so the grid is computed here for every call.
+    ``"norm"``: one CTA per two rows of the 128-row-aligned activation scale
+    tile.  ``"gemm"``: one CTA pair (cluster) per pair of 128-row tiles x
+    256-column tile pair; the persistent clusters claim the remaining tiles
+    through the cluster launch-control scheduler, so the grid is the whole
+    tile space.  The token count is not part of the program identity, so the
+    grid is computed here for every preparation.
     """
-    rule = record["launch_grid_rule"]
-    kind = str(rule["kind"])
-    if kind == "norm_rows":
-        # One CTA per ``rows_per_cta`` rows of the ``row_alignment``-padded
-        # activation scale tile (the padding rows are zeroed by the stage).
-        rows = _round_up(M, int(rule["row_alignment"]))
-        return (rows // int(rule["rows_per_cta"]), 1, 1)
-    if kind == "gemm_cluster_tiles":
-        # One CTA pair (cluster) per pair of row tiles x column tile pair; the
-        # persistent clusters claim the remaining tiles through the cluster
-        # launch-control scheduler, so the grid is the whole tile space.
-        row_tiles = _gemm_row_tiles(rule, M=M)
-        cta_group = int(rule["cta_group"])
-        return ((row_tiles // cta_group) * int(rule["n_tiles"]) * cta_group, 1, 1)
-    raise RuntimeError(f"generated stage has unsupported launch grid rule {kind!r}")
+    if stage == "norm":
+        rows = _round_up(int(M), _NORM_ROW_ALIGNMENT)
+        return (rows // _NORM_ROWS_PER_CTA, 1, 1)
+    if stage == "gemm":
+        row_tiles = _gemm_row_tiles(int(M))
+        return (
+            (row_tiles // _GEMM_CTA_GROUP) * _GEMM_COLUMN_TILES * _GEMM_CTA_GROUP,
+            1,
+            1,
+        )
+    raise ValueError(f"unknown stage {stage!r}; the stages are ('norm', 'gemm')")
 
 
-def _stage_call_args(
-    record: dict,
-    values: dict,
+def minimax_h3_nvfp4_rows_per_destination(M: int, P: int) -> int:
+    """Rows of 128 elements per destination: every (token, local head, kind)."""
+    return int(M) * (_HEADS // int(P)) * _KINDS
+
+
+def minimax_h3_nvfp4_output_shapes(
+    M: int, P: int, out_format: str = "nvfp4"
+) -> dict[str, Optional[tuple[tuple[int, ...], torch.dtype]]]:
+    """``{"out_q": (shape, dtype), "out_sf": (shape, dtype) | None}`` of the caller-owned outputs.
+
+    ``out_sf`` is ``None`` for ``"e4m3"``: the per-kind scales are the
+    caller's ``qkv_scales`` and the program writes no scale tile.
+    """
+    if out_format not in _SUPPORTED_FORMATS:
+        raise ValueError(
+            f"out_format must be one of {_SUPPORTED_FORMATS}, got {out_format!r}"
+        )
+    heads_per_destination = _HEADS // int(P)
+    if out_format == "nvfp4":
+        rows = minimax_h3_nvfp4_rows_per_destination(M, P)
+        return {
+            "out_q": (
+                (int(P), int(M), heads_per_destination, _KINDS, _NVFP4_PACKED_COLS),
+                torch.uint8,
+            ),
+            "out_sf": (
+                (int(P), _round_up(rows, 128) * _OUTPUT_SCALE_COLS),
+                torch.uint8,
+            ),
+        }
+    return {
+        "out_q": (
+            (int(P), int(M), heads_per_destination, _KINDS, _E4M3_PACKED_COLS),
+            torch.float8_e4m3fn,
+        ),
+        "out_sf": None,
+    }
+
+
+def _call_args(
+    program: cake_program.CakeProgram,
+    values: dict[str, Any],
     *,
-    grid: tuple[int, ...],
-) -> tuple:
-    grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-    args = []
-    for raw_kind, raw_name in record["arg_plan"]:
-        kind = str(raw_kind)
-        name = str(raw_name)
-        if kind in {"buffer", "tma_buffer", "parameter"}:
-            if name not in values:
-                raise RuntimeError(
-                    f"generated stage requires unknown argument {name!r}"
-                )
-            args.append(values[name])
-        elif kind == "grid" and name in grid_values:
-            args.append(grid_values[name])
-        else:
-            raise RuntimeError(
-                f"generated stage has unsupported argument {(kind, name)!r}"
-            )
-    return tuple(args)
+    grid: tuple[int, int, int],
+) -> tuple[Any, ...]:
+    """Positional ``run`` arguments of ``program``: its host parameters in binding order, then the grid."""
+    bound = {**values, **dict(zip(cake_program.GRID_ARGS, grid, strict=True))}
+    missing = [name for name in program.args if name not in bound]
+    if missing:
+        raise RuntimeError(
+            f"program {program.name} requires arguments {missing} the host did not bind"
+        )
+    return tuple(bound[name] for name in program.args)
 
 
 def repack_minimax_h3_qkv_weight_scales_for_fused_gemm(
@@ -180,41 +265,42 @@ class PreparedMiniMaxH3Nvfp4PreAttention:
         *,
         M: int,
         P: int,
+        out_format: str,
         eps: float,
-        norm_module,
-        gemm_module,
+        norm_run,
+        gemm_run,
         norm_args: tuple,
         gemm_args: tuple,
-        gemm_alpha: torch.Tensor,
-        gemm_weight_scales: torch.Tensor,
-        placeholders: tuple[torch.Tensor, ...],
+        derived: tuple[torch.Tensor, ...],
         out_q: torch.Tensor,
-        out_sf: torch.Tensor,
+        out_sf: Optional[torch.Tensor],
     ) -> None:
         self.M = M
         self.P = P
+        self.out_format = out_format
         self.eps = eps
-        self._norm_module = norm_module
-        self._gemm_module = gemm_module
+        self._norm_run = norm_run
+        self._gemm_run = gemm_run
         self._norm_args = norm_args
         self._gemm_args = gemm_args
         # Keeps the device operands derived at preparation (alpha, pair-ordered
-        # weight scales, unbound-debug placeholders) alive for the bound args.
-        self._gemm_alpha = gemm_alpha
-        self._gemm_weight_scales = gemm_weight_scales
-        self._placeholders = placeholders
+        # weight scales, the e4m3 out scales, unbound placeholders) alive for
+        # the bound args.
+        self._derived = derived
         self.out_q = out_q
         self.out_sf = out_sf
 
-    def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # The output scale tile pads rows to 128 per destination; the fused
-        # GEMM overwrites every live scale and this asynchronous clear makes
-        # the padding bytes deterministic. The activation scale tile is
+    def __call__(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # The NVFP4 output scale tile pads rows to 128 per destination; the
+        # fused GEMM overwrites every live scale and this asynchronous clear
+        # makes the padding bytes deterministic. The activation scale tile is
         # zero-padded inside the norm stage, so it needs no separate clear.
-        self.out_sf.zero_()
+        # The e4m3 output has no scale tile.
+        if self.out_sf is not None:
+            self.out_sf.zero_()
         with tvm_ffi.use_torch_stream():
-            self._norm_module.run(*self._norm_args)
-            self._gemm_module.run(*self._gemm_args)
+            self._norm_run(*self._norm_args)
+            self._gemm_run(*self._gemm_args)
         return self.out_q, self.out_sf
 
 
@@ -232,12 +318,14 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     rope_cos_sin: torch.Tensor,
-    out_global_scale: torch.Tensor,
     out_q: torch.Tensor,
-    out_sf: torch.Tensor,
     activation_q: torch.Tensor,
     activation_sf: torch.Tensor,
     P: int,
+    out_format: str = "nvfp4",
+    out_global_scale: Optional[torch.Tensor] = None,
+    out_sf: Optional[torch.Tensor] = None,
+    qkv_scales: Optional[torch.Tensor] = None,
     norm_descriptor_workspace: Optional[torch.Tensor] = None,
     gemm_descriptor_workspace: Optional[torch.Tensor] = None,
     debug_q_bf16: Optional[torch.Tensor] = None,
@@ -246,6 +334,15 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     eps: float = _EPS,
 ) -> PreparedMiniMaxH3Nvfp4PreAttention:
     """Validate the caller-owned tensors once and bind both stage launches.
+
+    ``out_format="nvfp4"`` takes ``out_global_scale`` (float32 ``[1]``) and
+    ``out_sf`` (uint8 ``[P, round_up(M * (56 / P) * 3, 128) * 8]``) and refuses
+    ``qkv_scales``; ``out_format="e4m3"`` takes ``qkv_scales`` (float32 ``[3]``,
+    the per-tensor scales of Q, K and V: ``out_q = e4m3(value / qkv_scales
+    [kind])``, every entry positive and finite) and refuses ``out_global_scale``
+    and ``out_sf``.  The out scales ``f32(1 / qkv_scales[kind])`` are derived at
+    preparation, like the GEMM ``alpha``; changing ``qkv_scales`` afterwards
+    requires a new prepared operation.
 
     ``norm_descriptor_workspace`` and ``gemm_descriptor_workspace`` must be
     ``None``: the generated stages pass their tensor maps by value, so no
@@ -256,6 +353,10 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     """
     if not isinstance(P, int) or isinstance(P, bool) or P not in _SUPPORTED_PARTITIONS:
         raise ValueError(f"P must be one of {_SUPPORTED_PARTITIONS}")
+    if out_format not in _SUPPORTED_FORMATS:
+        raise ValueError(
+            f"out_format must be one of {_SUPPORTED_FORMATS}, got {out_format!r}"
+        )
     if float(eps) != _EPS:
         raise ValueError(f"eps must be exactly {_EPS}")
     if not isinstance(x, torch.Tensor) or x.ndim != 2:
@@ -265,9 +366,9 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         raise ValueError("M must be positive")
     device = x.device
     heads_per_destination = _HEADS // P
-    rows_per_destination = M * heads_per_destination * _KINDS
+    rows_per_destination = minimax_h3_nvfp4_rows_per_destination(M, P)
     activation_sf_len = _round_up(M, 128) * _ACTIVATION_SCALE_COLS
-    out_sf_stride = _round_up(rows_per_destination, 128) * _OUTPUT_SCALE_COLS
+    shapes = minimax_h3_nvfp4_output_shapes(M, P, out_format)
     tensors = {
         "x": (x, (M, _HIDDEN), torch.bfloat16),
         "x_norm_weight": (x_norm_weight, (_HIDDEN,), torch.bfloat16),
@@ -289,16 +390,29 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         "q_norm_weight": (q_norm_weight, (_HEAD_DIM,), torch.bfloat16),
         "k_norm_weight": (k_norm_weight, (_HEAD_DIM,), torch.bfloat16),
         "rope_cos_sin": (rope_cos_sin, (M, _ROPE_DIM), torch.bfloat16),
-        "out_global_scale": (out_global_scale, (1,), torch.float32),
-        "out_q": (
-            out_q,
-            (P, M, heads_per_destination, _KINDS, _OUTPUT_PACKED_COLS),
-            torch.uint8,
-        ),
-        "out_sf": (out_sf, (P, out_sf_stride), torch.uint8),
+        "out_q": (out_q, *shapes["out_q"]),
         "activation_q": (activation_q, (M, _ACTIVATION_PACKED_COLS), torch.uint8),
         "activation_sf": (activation_sf, (activation_sf_len,), torch.uint8),
     }
+    if out_format == "nvfp4":
+        if out_global_scale is None or out_sf is None:
+            raise ValueError(
+                "out_global_scale and out_sf are required for out_format 'nvfp4'"
+            )
+        if qkv_scales is not None:
+            raise ValueError("qkv_scales must be None for out_format 'nvfp4'")
+        assert shapes["out_sf"] is not None
+        tensors["out_global_scale"] = (out_global_scale, (1,), torch.float32)
+        tensors["out_sf"] = (out_sf, *shapes["out_sf"])
+    else:
+        if qkv_scales is None:
+            raise ValueError("qkv_scales is required for out_format 'e4m3'")
+        if out_global_scale is not None or out_sf is not None:
+            raise ValueError(
+                "out_global_scale and out_sf must be None for out_format 'e4m3': "
+                "the per-kind scales are qkv_scales and no scale tile is written"
+            )
+        tensors["qkv_scales"] = (qkv_scales, (_KINDS,), torch.float32)
     for name, (value, shape, dtype) in tensors.items():
         _require_tensor(value, name=name, shape=shape, dtype=dtype, device=device)
     debug_present = (
@@ -311,7 +425,7 @@ def prepare_minimax_h3_nvfp4_pre_attention(
             "debug_q_bf16, debug_k_bf16, and debug_adaln_bf16 must be supplied together"
         )
     write_debug = int(all(debug_present))
-    placeholders: tuple[torch.Tensor, ...] = ()
+    derived: list[torch.Tensor] = []
     if write_debug:
         assert (
             debug_q_bf16 is not None
@@ -348,33 +462,44 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         debug_adaln_bf16 = torch.zeros((1,), dtype=torch.bfloat16, device=device)
         debug_q_words = torch.zeros((1,), dtype=torch.uint32, device=device)
         debug_k_words = debug_q_words
-        placeholders = (debug_adaln_bf16, debug_q_words)
-    route = minimax_h3_nvfp4_route_record(device, P)
-    norm_record = route["stages"]["norm_adaln_nvfp4_quantize"]
-    gemm_record = route["stages"]["qkv_nvfp4_gemm_fused_pack"]
-    _stage_workspace(
-        norm_descriptor_workspace, name="norm_descriptor_workspace", record=norm_record
-    )
-    _stage_workspace(
-        gemm_descriptor_workspace, name="gemm_descriptor_workspace", record=gemm_record
-    )
-    norm_module, gemm_module = load_minimax_h3_nvfp4_route(device, P)
+        derived += [debug_adaln_bf16, debug_q_words]
+    _stage_workspace(norm_descriptor_workspace, name="norm_descriptor_workspace")
+    _stage_workspace(gemm_descriptor_workspace, name="gemm_descriptor_workspace")
+    target = minimax_h3_nvfp4_target(device)
+    norm_program, gemm_program = minimax_h3_nvfp4_programs(device, out_format)
+    norm_run = norm_program.entry(target)
+    gemm_run = gemm_program.entry(target)
     # Operands derived once at preparation: the GEMM output scale
-    # alpha = 1 / (x_global_scale * w_global_scale) and the CTA-pair ordering
-    # of the prepacked weight scales. Changing either global scale or the
-    # weight scale bytes afterwards requires a new prepared operation; the
-    # E2M1 weight bytes themselves are read in place on every launch.
+    # alpha = 1 / (x_global_scale * w_global_scale), the CTA-pair ordering of
+    # the prepacked weight scales and, for e4m3, the per-kind out scales
+    # 1 / qkv_scales. Changing any of their sources afterwards requires a new
+    # prepared operation; the E2M1 weight bytes themselves are read in place
+    # on every launch.
     alpha = (
         (1.0 / (x_global_scale.float() * w_global_scale.float()))
         .reshape(1)
         .contiguous()
     )
     weight_scales = repack_minimax_h3_qkv_weight_scales_for_fused_gemm(qkv_weight_sf)
-    gemm_rule = gemm_record["launch_grid_rule"]
-    if str(gemm_rule["kind"]) != "gemm_cluster_tiles":
-        raise RuntimeError(
-            f"fused GEMM route has unsupported launch grid rule {gemm_rule['kind']!r}"
-        )
+    derived += [alpha, weight_scales]
+    if out_format == "nvfp4":
+        assert out_global_scale is not None and out_sf is not None
+        out_scale_arg = out_global_scale
+        out_sf_arg = out_sf
+        out_q_bytes = out_q
+        scale_stride = int(out_sf.shape[1])
+        row_bytes = _NVFP4_PACKED_COLS
+    else:
+        assert qkv_scales is not None
+        # f32(1 / qkv_scales[kind]) in the out_global_scale slot: the kernel
+        # multiplies in f32 and rounds to nearest even, saturating at +-448.
+        out_scale_arg = (1.0 / qkv_scales.double()).float().reshape(_KINDS).contiguous()
+        # out_sf is bound and never read or written (scale stride 0).
+        out_sf_arg = torch.zeros((1,), dtype=torch.uint8, device=device)
+        derived += [out_scale_arg, out_sf_arg]
+        out_q_bytes = out_q.view(torch.uint8)
+        scale_stride = 0
+        row_bytes = _E4M3_PACKED_COLS
     values = {
         "x": x,
         "x_norm_weight": x_norm_weight,
@@ -393,15 +518,13 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         "SFA": activation_sf.view(-1, _ACTIVATION_SCALE_ROWS_PER_TILE, 128),
         "SFB": weight_scales.view(-1, _WEIGHT_SCALE_ROWS_PER_TILE, 128),
         "alpha": alpha,
-        "OUTQ": out_q.reshape(
-            P, M, heads_per_destination * _KINDS, _OUTPUT_PACKED_COLS
-        ),
+        "OUTQ": out_q_bytes.reshape(P, M, heads_per_destination * _KINDS, row_bytes),
         "q_norm_weight": q_norm_weight,
         "k_norm_weight": k_norm_weight,
         "rope_cos_sin": rope_cos_sin,
-        "out_global_scale": out_global_scale,
-        "out_q": out_q,
-        "out_sf": out_sf,
+        "out_global_scale": out_scale_arg,
+        "out_q": out_q_bytes,
+        "out_sf": out_sf_arg,
         # The fused program keeps the BF16 QKV pointer of its GEMM-only
         # sibling; the pack program never writes it.
         "qkv_words": debug_q_words,
@@ -413,28 +536,27 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         # the program identity; the derived strides follow the tensor layout
         # validated above).
         "M": M,
-        "m_tiles": _gemm_row_tiles(gemm_rule, M=M),
+        "m_tiles": _gemm_row_tiles(M),
         "HEADS_PER_DESTINATION": heads_per_destination,
         "ROWS_PER_DESTINATION": rows_per_destination,
-        "SCALE_STRIDE": out_sf_stride,
+        "SCALE_STRIDE": scale_stride,
     }
-    norm_args = _stage_call_args(
-        norm_record, values, grid=_stage_launch_grid(norm_record, M=M, P=P)
+    norm_args = _call_args(
+        norm_program, values, grid=minimax_h3_nvfp4_launch_grid("norm", M)
     )
-    gemm_args = _stage_call_args(
-        gemm_record, values, grid=_stage_launch_grid(gemm_record, M=M, P=P)
+    gemm_args = _call_args(
+        gemm_program, values, grid=minimax_h3_nvfp4_launch_grid("gemm", M)
     )
     return PreparedMiniMaxH3Nvfp4PreAttention(
         M=M,
         P=P,
+        out_format=out_format,
         eps=eps,
-        norm_module=norm_module,
-        gemm_module=gemm_module,
+        norm_run=norm_run,
+        gemm_run=gemm_run,
         norm_args=norm_args,
         gemm_args=gemm_args,
-        gemm_alpha=alpha,
-        gemm_weight_scales=weight_scales,
-        placeholders=placeholders,
+        derived=tuple(derived),
         out_q=out_q,
         out_sf=out_sf,
     )
@@ -442,6 +564,11 @@ def prepare_minimax_h3_nvfp4_pre_attention(
 
 __all__ = [
     "PreparedMiniMaxH3Nvfp4PreAttention",
+    "minimax_h3_nvfp4_launch_grid",
+    "minimax_h3_nvfp4_output_shapes",
+    "minimax_h3_nvfp4_programs",
+    "minimax_h3_nvfp4_rows_per_destination",
+    "minimax_h3_nvfp4_target",
     "prepare_minimax_h3_nvfp4_pre_attention",
     "repack_minimax_h3_qkv_weight_scales_for_fused_gemm",
 ]

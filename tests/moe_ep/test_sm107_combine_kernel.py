@@ -14,4 +14,9 @@ def test_combine_repeated_launches(monkeypatch, kind, early, combine_dtype):
     from tests.moe_ep.test_sm107_kernel_boundaries import _run_case
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    _run_case(kind, 5, 3, dict(combine_dtype=combine_dtype, apply_topk_at_fc1=early))
+    _run_case(
+        kind,
+        5,
+        3,
+        dict(combine_dtype=combine_dtype, apply_routing_weights_before_fc2=early),
+    )

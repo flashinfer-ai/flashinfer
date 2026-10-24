@@ -7,6 +7,14 @@ activation, the score-scaled dY and d_gate/d_up are MXFP8 (32-element blocks
 along K), routed weights are caller-prequantized, GEMMs accumulate in FP32 on
 dequantized operands and round to BF16, and the shared expert stays BF16.
 
+The routed gate, up and dh are BF16 roundings of FP32 sums that the kernel
+accumulates in another order. Where such a sum lies within the accumulation
+band of a BF16 rounding midpoint (``_tie_candidates``), the kernel may round
+to the other BF16 neighbour; the training reference evaluates that neighbour
+too and adds the exact effect of the E4M3 code flips it causes to the
+tolerance of the gradient elements they reach. The ``1e-2 + 1e-2 * |reference|``
+gate itself is unchanged, and no allowance exists where no input is ambiguous.
+
 Backend suite: the package is imported only through
 :func:`tests.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
 wrapper is covered by ``test_mok_bf16_api.py``.
@@ -61,9 +69,51 @@ def _setup(hidden, intermediate, seed, experts=4, tokens=512, topk=2):
     return x, dy, shared, routed, scores, single_rank_schedule(routes, experts)
 
 
-def _close(a, b):
+def _close(a, b, allowance=None):
+    """Elements of ``a`` outside ``1e-2 + 1e-2 * |b|`` (plus the elementwise ``allowance`` when given)."""
     d = (a.float() - b.float()).abs()
-    return int((d > 1e-2 + 1e-2 * b.float().abs()).sum())
+    bound = 1e-2 + 1e-2 * b.float().abs()
+    if allowance is not None:
+        bound = bound + allowance
+    return int((d > bound).sum())
+
+
+def _bf16_toward(value, target):
+    """The BF16 neighbour of ``value`` (BF16) on the side of ``target``; ``value`` itself where they are equal."""
+    bits = value.view(torch.int16).to(torch.int32) & 0xFFFF
+    stepped = torch.where(target.abs() > value.float().abs(), bits + 1, bits - 1)
+    from_zero = torch.where(target < 0, 0x8001, 0x0001)
+    bits = torch.where(value == 0, from_zero, stepped)
+    bits = torch.where(
+        target == value.float(), value.view(torch.int16).to(torch.int32) & 0xFFFF, bits
+    )
+    return (
+        torch.where(bits >= 0x8000, bits - 0x10000, bits)
+        .to(torch.int16)
+        .view(torch.bfloat16)
+    )
+
+
+def _tie_candidates(value, exact, magnitude):
+    """Which BF16 GEMM outputs the kernel may round to the other neighbour, and that neighbour.
+
+    ``value`` is the reference's BF16 rounding of an FP32 sum of dequantized
+    products, ``exact`` the FP64 value of that sum and ``magnitude`` the sum
+    of the absolute products. The kernel accumulates the same products in
+    another FP32 order; the two orders differ by a few roundings of a running
+    sum bounded by ``magnitude``, each at most 2^-24 of it, so the kernel's
+    FP32 result can fall on the other side of a BF16 rounding midpoint only
+    when ``exact`` lies within a few units of ``2**-24 * magnitude`` of it.
+    The band is one unit: the observed ties sit within a quarter of a unit of
+    the midpoint, and one unit keeps the allowance to the elements that are
+    ambiguous in practice. Returns the mask of those outputs and ``value``
+    with the other neighbour substituted there.
+    """
+    other = _bf16_toward(value, exact)
+    midpoint = (value.float() + other.float()) * 0.5
+    band = 2.0**-24 * magnitude
+    ambiguous = ((exact - midpoint).abs() <= band) & (other != value)
+    return ambiguous, torch.where(ambiguous, other, value)
 
 
 def test_weight_quantizer_matches_recipe():
@@ -185,6 +235,7 @@ def _mxfp8_training(
     experts=4,
     topk=2,
     fp32_wgrad=False,
+    stats=None,
 ):
     """Mismatch counts of every returned gradient against the reference.
 
@@ -192,6 +243,16 @@ def _mxfp8_training(
     weight gradients are checked against a BF16 reference of the shared MLP.
     ``fp32_wgrad`` adds every weight gradient into nonzero FP32 starting
     accumulators; the reference adds each macrobatch's FP32 product.
+
+    The routed gate, up and dh are BF16 roundings of FP32 sums the kernel
+    accumulates in another order: where a sum lies within the accumulation
+    band of a BF16 rounding midpoint (``_tie_candidates``), the reference also
+    evaluates the other neighbour and adds the exact effect of the E4M3 code
+    flips it causes to the tolerance of the gradient elements they reach
+    (``d_scores`` needs none: one neighbour of one of ``intermediate`` terms
+    stays inside its gate). ``stats`` (a dict, optional) receives the
+    candidate counts, the strict mismatch counts without that allowance and
+    the allowance extents.
     """
     forward = MoKForwardMXFP8(swiglu_limit is not None)
     backward = MoKBackwardMXFP8(swiglu_limit is not None, fp32_wgrad)
@@ -264,14 +325,25 @@ def _mxfp8_training(
     for e, n in enumerate(s["count_values"]):
         segments.append((e, start, start + n))
         start += n
-    gate = torch.empty(actual, intermediate, **options)
-    up = torch.empty_like(gate)
-    for e, lo, hi in segments:
-        gate[lo:hi] = (x_deq[lo:hi] @ wg[e].T).bfloat16()
-        up[lo:hi] = (x_deq[lo:hi] @ wu[e].T).bfloat16()
-    act = swiglu(gate, up, swiglu_limit)
-    _, _, hqt, hst = quantize(act)
-    ht_deq = dequantize(hqt, hst)
+
+    def routed_gemm(a, weights):
+        """Per-expert ``a @ w.T``: the FP32 product the reference rounds, its FP64 value and the sum of |products|."""
+        value = torch.empty(
+            actual, weights.shape[1], device="cuda", dtype=torch.float32
+        )
+        exact = torch.empty(
+            actual, weights.shape[1], device="cuda", dtype=torch.float64
+        )
+        magnitude = torch.empty_like(value)
+        for e, lo, hi in segments:
+            value[lo:hi] = a[lo:hi] @ weights[e].T
+            exact[lo:hi] = a[lo:hi].double() @ weights[e].double().T
+            magnitude[lo:hi] = a[lo:hi].abs() @ weights[e].abs().T
+        return value, exact, magnitude
+
+    gate_f32, gate_exact, gate_magnitude = routed_gemm(x_deq, wg)
+    up_f32, up_exact, up_magnitude = routed_gemm(x_deq, wu)
+    gate, up = gate_f32.bfloat16(), up_f32.bfloat16()
     dys = torch.where(
         valid[:, None],
         (dy[token].float() * score[:, None]).bfloat16(),
@@ -279,30 +351,74 @@ def _mxfp8_training(
     )
     dq, dsc, dqt, dsct = quantize(dys)
     d_deq, dt_deq = dequantize(dq, dsc), dequantize(dqt, dsct)
-    dh = torch.empty(actual, intermediate, **options)
-    for e, lo, hi in segments:
-        dh[lo:hi] = (d_deq[lo:hi] @ wd_t[e].T).bfloat16()
-    g = dequantize(*quantize(gate, transposed=False)[:2])
-    u = dequantize(*quantize(up, transposed=False)[:2])
-    mask_g = mask_u = torch.ones_like(g)
-    if swiglu_limit is not None:
-        mask_g = (g <= swiglu_limit).float()
-        mask_u = ((u >= -swiglu_limit) & (u <= swiglu_limit)).float()
-        g, u = g.clamp(max=swiglu_limit), u.clamp(-swiglu_limit, swiglu_limit)
-    sig = torch.sigmoid(g)
-    silu = g * sig
-    dg = (((1 - silu) * sig + silu) * u * dh.float() * mask_g).bfloat16()
-    du = (silu * dh.float() * mask_u).bfloat16()
+    dh_f32, dh_exact, dh_magnitude = routed_gemm(d_deq, wd_t)
+    dh = dh_f32.bfloat16()
+
+    def routed_backward(gate, up, dh):
+        """The recipe's SwiGLU backward of BF16 gate/up/dh: dequantized E4M3
+        d_gate/d_up in both orientations, the transposed activation
+        quantization (the down weight-gradient operand) and the FP32 terms of
+        the score gradient."""
+        act = swiglu(gate, up, swiglu_limit)
+        _, _, hqt, hst = quantize(act)
+        g = dequantize(*quantize(gate, transposed=False)[:2])
+        u = dequantize(*quantize(up, transposed=False)[:2])
+        mask_g = mask_u = torch.ones_like(g)
+        if swiglu_limit is not None:
+            mask_g = (g <= swiglu_limit).float()
+            mask_u = ((u >= -swiglu_limit) & (u <= swiglu_limit)).float()
+            g, u = g.clamp(max=swiglu_limit), u.clamp(-swiglu_limit, swiglu_limit)
+        sig = torch.sigmoid(g)
+        silu = g * sig
+        dg = (((1 - silu) * sig + silu) * u * dh.float() * mask_g).bfloat16()
+        du = (silu * dh.float() * mask_u).bfloat16()
+        dgq, dgs, dgqt, dgst = quantize(dg)
+        duq, dus, duqt, dust = quantize(du)
+        return dict(
+            ht=dequantize(hqt, hst),
+            dg=dequantize(dgq, dgs),
+            du=dequantize(duq, dus),
+            dgt=dequantize(dgqt, dgst),
+            dut=dequantize(duqt, dust),
+            ds_terms=dh.float() * silu * u,
+        )
+
+    chain = routed_backward(gate, up, dh)
+    # Tie candidates: the backward re-evaluated with each GEMM-derived input
+    # rounded to its other BF16 neighbour where that rounding is ambiguous.
+    inputs = dict(gate=gate, up=up, dh=dh)
+    sums = dict(
+        gate=(gate_exact, gate_magnitude),
+        up=(up_exact, up_magnitude),
+        dh=(dh_exact, dh_magnitude),
+    )
+    alternates = []
+    for name, (exact_sum, magnitude) in sums.items():
+        ambiguous, other = _tie_candidates(inputs[name], exact_sum, magnitude)
+        count = int(ambiguous.sum())
+        if stats is not None:
+            stats[f"ambiguous_{name}"] = count
+        if count:
+            alternates.append(routed_backward(**{**inputs, name: other}))
+    allow_dw = [torch.zeros(w.shape, device="cuda") for w in routed]
+    allow_dx = torch.zeros(actual, hidden, device="cuda")
+    xt_abs, dt_abs = xt_deq.abs(), dt_deq.abs()
+    for alt in alternates:
+        delta = {k: (alt[k] - chain[k]).abs() for k in ("ht", "dg", "du", "dgt", "dut")}
+        for e, lo, hi in segments:
+            allow_dw[0][e] += delta["dgt"][:, lo:hi] @ xt_abs[:, lo:hi].T
+            allow_dw[1][e] += delta["dut"][:, lo:hi] @ xt_abs[:, lo:hi].T
+            allow_dw[2][e] += dt_abs[:, lo:hi] @ delta["ht"][:, lo:hi].T
+            allow_dx[lo:hi] += (
+                delta["dg"][lo:hi] @ wg_t[e].abs().T
+                + delta["du"][lo:hi] @ wu_t[e].abs().T
+            )
     inverse = torch.where(score > 0, 1 / score, torch.zeros_like(score))
-    ds_route = (dh.float() * silu * u).sum(-1) * inverse
-    dgq, dgs, dgqt, dgst = quantize(dg)
-    duq, dus, duqt, dust = quantize(du)
-    dg_deq, du_deq = dequantize(dgq, dgs), dequantize(duq, dus)
-    dgt_deq, dut_deq = dequantize(dgqt, dgst), dequantize(duqt, dust)
+    ds_route = chain["ds_terms"].sum(-1) * inverse
     dx_route = torch.empty(actual, hidden, **options)
     for e, lo, hi in segments:
         dx_route[lo:hi] = (
-            dg_deq[lo:hi] @ wg_t[e].T + du_deq[lo:hi] @ wu_t[e].T
+            chain["dg"][lo:hi] @ wg_t[e].T + chain["du"][lo:hi] @ wu_t[e].T
         ).bfloat16()
     if fp32_wgrad:
         dw = [value.clone() for value in initial[3:]]
@@ -315,9 +431,9 @@ def _mxfp8_training(
             if k_lo >= k_hi:
                 continue
             exact = [
-                dgt_deq[:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T,
-                dut_deq[:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T,
-                dt_deq[:, k_lo:k_hi] @ ht_deq[:, k_lo:k_hi].T,
+                chain["dgt"][:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T,
+                chain["dut"][:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T,
+                dt_deq[:, k_lo:k_hi] @ chain["ht"][:, k_lo:k_hi].T,
             ]
             for dest, part in zip(dw, exact, strict=True):
                 if fp32_wgrad:
@@ -355,19 +471,32 @@ def _mxfp8_training(
         dw_shared = [part.bfloat16() for part in dw_shared]
     expected_dx = torch.zeros_like(dx_peer)
     expected_dx[rows[valid].long()] = dx_route[valid]
+    allow_dx_peer = torch.zeros(dx_peer.shape, device="cuda")
+    allow_dx_peer[rows[valid].long()] = allow_dx[valid]
     expected_ds = torch.zeros_like(ds_peer).flatten()
     expected_ds[rows[valid].long()] = ds_route[valid]
     dx_peer, ds_peer, _, dws_gate, dw_gate, dws_up, dw_up, dws_down, dw_down = first
-    return dict(
-        dx_routed=_close(dx_peer, expected_dx),
-        d_scores=_close(ds_peer.flatten(), expected_ds),
-        dw_gate=_close(dw_gate, dw[0]),
-        dw_up=_close(dw_up, dw[1]),
-        dw_down=_close(dw_down, dw[2]),
-        dw_shared_gate=_close(dws_gate, dw_shared[0]),
-        dw_shared_up=_close(dws_up, dw_shared[1]),
-        dw_shared_down=_close(dws_down, dw_shared[2]),
+    checks = dict(
+        dx_routed=(dx_peer, expected_dx, allow_dx_peer),
+        d_scores=(ds_peer.flatten(), expected_ds, None),
+        dw_gate=(dw_gate, dw[0], allow_dw[0]),
+        dw_up=(dw_up, dw[1], allow_dw[1]),
+        dw_down=(dw_down, dw[2], allow_dw[2]),
+        dw_shared_gate=(dws_gate, dw_shared[0], None),
+        dw_shared_up=(dws_up, dw_shared[1], None),
+        dw_shared_down=(dws_down, dw_shared[2], None),
     )
+    if stats is not None:
+        for name, (a, b, allowance) in checks.items():
+            stats[f"strict_{name}"] = _close(a, b)
+            if allowance is not None:
+                bound = 1e-2 + 1e-2 * b.float().abs()
+                stats[f"allowed_{name}"] = int((allowance > 0).sum())
+                stats[f"max_allowance_{name}"] = float(allowance.max())
+                stats[f"max_allowance_over_bound_{name}"] = float(
+                    (allowance / bound).max()
+                )
+    return {name: _close(a, b, allowance) for name, (a, b, allowance) in checks.items()}
 
 
 @LIMITS
@@ -377,9 +506,8 @@ def _mxfp8_training(
 def test_mxfp8_training(swiglu_limit, hidden, intermediate, macro):
     """Fused MXFP8 forward+backward against the exact quantization-aware reference.
 
-    The reference evaluates SwiGLU backward with PyTorch transcendentals; for
-    some inputs an E4M3 block of d_gate/d_up lands on the other side of a
-    rounding boundary. This seed has no such flip. Reruns are bitwise.
+    BF16 rounding ties of the GEMM-derived gate, up and dh are covered by the
+    reference's tie candidates (``_mxfp8_training``). Reruns are bitwise.
     """
     require_gpu()
     mismatches = _mxfp8_training(swiglu_limit, hidden, intermediate, macro, seed=7000)
