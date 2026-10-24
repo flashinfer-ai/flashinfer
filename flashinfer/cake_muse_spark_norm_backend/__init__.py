@@ -90,14 +90,23 @@ def is_cake_gated_residual_next_rmsnorm_supported(
     *,
     tensor_alpha: bool = True,
     has_post_weight: bool = True,
+    rows: Optional[int] = None,
 ) -> bool:
     """Whether this package ships a program for ``device`` and the call's variant (tensor or scalar ``alpha``,
-    with or without ``post_weight``); the tensor contract is :mod:`flashinfer.norm`'s."""
+    with or without ``post_weight``) -- and, with ``rows``, one whose window admits that row count: a route's
+    windows may leave gaps where the kernel lane measured the FlashInfer kernel ahead, and no program is shipped
+    for those row counts.  The tensor contract is :mod:`flashinfer.norm`'s."""
     arch = _arch(device)
     if arch is None:
         return False
-    return _loader.route_available(
-        arch, gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight)
+    route = gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight)
+    if not _loader.route_available(arch, route):
+        return False
+    if rows is None:
+        return True
+    return any(
+        _loader.admits(_loader.MODULES[name].get("select_rule"), int(rows), arch)
+        for name in _loader.route_modules(arch, route)
     )
 
 
@@ -246,6 +255,14 @@ def cake_gated_residual_next_rmsnorm(
         )
     if rows == 0:
         return
+    if not is_cake_gated_residual_next_rmsnorm_supported(
+        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight, rows=rows
+    ):
+        # a declared gap of the route: the facade's "auto" runs the CuTe DSL kernel there
+        raise ValueError(
+            f"cake_gated_residual_next_rmsnorm: no exported program of route {route!r} on {arch} admits "
+            f"{rows} rows"
+        )
     name = _loader.selected_module(arch, route, rows)
     values = {
         "branch": branch,

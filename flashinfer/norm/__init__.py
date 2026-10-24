@@ -201,26 +201,39 @@ def _cute_gated_residual_next_rmsnorm_available(device: torch.device) -> bool:
 
 
 def _cake_gated_residual_next_rmsnorm_available(
-    device: torch.device, *, tensor_alpha: bool, has_post_weight: bool
+    device: torch.device,
+    *,
+    tensor_alpha: bool,
+    has_post_weight: bool,
+    rows: Optional[int] = None,
 ) -> bool:
     return _HAS_CAKE_FUSED_NORM and _cake_gated_residual_next_rmsnorm_supported(
-        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight
+        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight, rows=rows
     )
 
 
 def _gated_residual_next_rmsnorm_backend(
-    backend: str, device: torch.device, *, tensor_alpha: bool, has_post_weight: bool
+    backend: str,
+    device: torch.device,
+    *,
+    tensor_alpha: bool,
+    has_post_weight: bool,
+    rows: Optional[int] = None,
 ) -> Optional[str]:
     """The backend one call runs on: ``"cake"`` when the Cake package ships a
-    program for the device and the call's variant (preferred under ``"auto"``),
-    else ``"cute"`` when the CuTe DSL kernel targets the device; ``None`` when the
-    requested backend is not available."""
+    program for the device, the call's variant and (with ``rows``) its row count
+    (preferred under ``"auto"``; a row count in a gap of the package's windows
+    falls to the CuTe DSL kernel), else ``"cute"`` when the CuTe DSL kernel
+    targets the device; ``None`` when the requested backend is not available."""
     if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
         raise ValueError(
             f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
         )
     if backend != "cute" and _cake_gated_residual_next_rmsnorm_available(
-        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight
+        device,
+        tensor_alpha=tensor_alpha,
+        has_post_weight=has_post_weight,
+        rows=None if backend == "cake" else rows,
     ):
         return "cake"
     if backend != "cake" and _cute_gated_residual_next_rmsnorm_available(device):
@@ -390,9 +403,11 @@ def gated_residual_next_rmsnorm(
     backend : str
         ``"auto"`` (default) runs the Cake kernels
         (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
-        a program for the device and the call's inputs, else the CuTe DSL kernel;
-        ``"cake"`` and ``"cute"`` select one and raise ``ValueError`` when it is
-        not available. The Cake package ships programs for a tensor ``alpha``
+        a program for the device, the call's inputs and its row count (the
+        package's routes may leave row-count gaps where the CuTe DSL kernel
+        measured ahead), else the CuTe DSL kernel; ``"cake"`` and ``"cute"``
+        select one and raise ``ValueError`` when it is not available (``"cake"``
+        at a row count in a gap raises too). The Cake package ships programs for a tensor ``alpha``
         with ``post_weight`` and for a scalar ``alpha`` with or without it; a
         tensor ``alpha`` without ``post_weight`` runs its ``post_weight`` programs
         with a zero vector and ``post_gain_center = 1.0``, which is exact.
@@ -492,6 +507,7 @@ def _gated_residual_next_rmsnorm_impl(
         branch.device,
         tensor_alpha=alpha_scalar is None,
         has_post_weight=post_weight is not None,
+        rows=branch.shape[0],
     )
     if chosen == "cake":
         # The Cake programs launch without programmatic dependent launch; a scalar

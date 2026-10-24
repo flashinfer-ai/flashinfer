@@ -210,6 +210,32 @@ def test_support_follows_the_device_architecture(monkeypatch):
     assert not pkg.is_cake_gated_residual_next_rmsnorm_supported(torch.device("cpu"))
 
 
+def test_support_follows_the_row_count_through_the_route_windows(monkeypatch):
+    """With ``rows`` the predicate asks the route's windows: a row count no record admits (a gap of the route, where
+    the FlashInfer kernel measured ahead) is unsupported, so the facade's ``auto`` keeps the CuTe branch there."""
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    route = loader.route_key(OP, "alpha_tensor_pw")
+    names = loader.route_modules("sm_100a", route)
+    for rows in (1, 16, 17, 512, 100000):
+        assert pkg.is_cake_gated_residual_next_rmsnorm_supported(device, rows=rows)
+        assert loader.selected_module("sm_100a", route, rows) in names
+    gapped = {
+        "arches": ["sm_100a"],
+        "route": route,
+        "select_rule": {"kind": "rows_between", "windows": {"sm_100a": [[0, 128], [256, None]]}},
+    }
+    monkeypatch.setitem(loader.MODULES, "gapped_record", gapped)
+    monkeypatch.setitem(loader.ROUTES["sm_100a"], route, ["gapped_record"])
+    assert pkg.is_cake_gated_residual_next_rmsnorm_supported(device)
+    assert pkg.is_cake_gated_residual_next_rmsnorm_supported(device, rows=128)
+    assert pkg.is_cake_gated_residual_next_rmsnorm_supported(device, rows=257)
+    assert not pkg.is_cake_gated_residual_next_rmsnorm_supported(device, rows=129)
+    assert not pkg.is_cake_gated_residual_next_rmsnorm_supported(device, rows=256)
+    with pytest.raises(NotImplementedError, match="admits 200 rows"):
+        loader.selected_module("sm_100a", route, 200)
+
+
 def test_registry_records_reference_the_build_manifest():
     """Every ``MODULES`` record names its ``build.json`` libraries and nothing to compile: one entry per
     (library, architecture) with the kernel, binding and occupancy sources under ``csrc/``, their digests and the
