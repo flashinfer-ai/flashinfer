@@ -109,25 +109,25 @@ kernel_cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6(const __grid_constant__ CUt
             // Stage-major initialization across barrier declarations.
             mbarrier_init(smem + 204288, 66);
             mbarrier_init(smem + 204328, 1);
-            mbarrier_init(smem + 204368, 1);
+            mbarrier_init(smem + 204368, 33);
             mbarrier_init(smem + 204408, 1);
             mbarrier_init(smem + 204424, 256);
             mbarrier_init(smem + 204440, 256);
             mbarrier_init(smem + 204296, 66);
             mbarrier_init(smem + 204336, 1);
-            mbarrier_init(smem + 204376, 1);
+            mbarrier_init(smem + 204376, 33);
             mbarrier_init(smem + 204416, 1);
             mbarrier_init(smem + 204432, 256);
             mbarrier_init(smem + 204448, 256);
             mbarrier_init(smem + 204304, 66);
             mbarrier_init(smem + 204344, 1);
-            mbarrier_init(smem + 204384, 1);
+            mbarrier_init(smem + 204384, 33);
             mbarrier_init(smem + 204312, 66);
             mbarrier_init(smem + 204352, 1);
-            mbarrier_init(smem + 204392, 1);
+            mbarrier_init(smem + 204392, 33);
             mbarrier_init(smem + 204320, 66);
             mbarrier_init(smem + 204360, 1);
-            mbarrier_init(smem + 204400, 1);
+            mbarrier_init(smem + 204400, 33);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -300,6 +300,9 @@ kernel_cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6(const __grid_constant__ CUt
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((full_addr + (stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(empty_addr + (stage_2) * 8) : "memory");
                     stage_2 += 1;
                     if (stage_2 == 5) { stage_2 = 0; _phase_sf_full ^= 1; }
                 }

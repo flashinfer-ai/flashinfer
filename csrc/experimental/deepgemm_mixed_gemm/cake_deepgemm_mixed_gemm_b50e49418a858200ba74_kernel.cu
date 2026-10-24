@@ -107,13 +107,15 @@ kernel_cake_deepgemm_mixed_gemm_b50e49418a858200ba74(const __grid_constant__ CUt
         // --- pipeline 'pipe' ---
         // full: 10 barriers, init_count=66
         // sf_full: 10 barriers, init_count=1
-        // empty: 10 barriers, init_count=1
+        // empty: 10 barriers, init_count=33
         // --- pipeline 'epi_pipe' ---
         // tmem_full: 2 barriers, init_count=1
         // tmem_empty: 2 barriers, init_count=256
         // tmem_overlap: 2 barriers, init_count=256
         // Warp-cooperative initialization in physical record order.
         uint32_t _mbarrier_init_count_1_0 = 1;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(30), "r"((uint32_t)(33)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(20), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(10), "r"((uint32_t)(66)));
         mbarrier_init(smem + 212992 + lane * 8, _mbarrier_init_count_1_0);
         if (lane < 4) {
@@ -283,6 +285,9 @@ kernel_cake_deepgemm_mixed_gemm_b50e49418a858200ba74(const __grid_constant__ CUt
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((full_addr + (stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(empty_addr + (stage_2) * 8) : "memory");
                     stage_2 += 1;
                     if (stage_2 == 10) { stage_2 = 0; _phase_sf_full ^= 1; }
                 }
