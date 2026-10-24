@@ -2948,7 +2948,7 @@ class CudnnFrostMxfp8Mxfp4Config:
 class FrostLowLatencyConfig:
     """Low-token routed MoE on SM100/SM103/SM107, with FMA-only SM120 support.
 
-    SM90 supports BF16, FP16 and ordinary per-tensor FP8 FMA only.
+    SM90 supports BF16, FP16, ordinary per-tensor FP8 and DeepSeek FP8 FMA.
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
     prepared weights and numerical contract. Both are multi-kernel pipelines,
@@ -2976,6 +2976,11 @@ class FrostLowLatencyConfig:
     E4M3 weight-only mode uses BF16 inputs and intermediates, with per-expert
     FP32 weight scales. It shares the same FMA bodies, BF16 FC1 preactivation
     and ordered output combine; no activation quantization is required.
+
+    DeepSeek FP8 preserves FP32 preactivation and 128x128 weight block scales.
+    BF16 input is quantized per 128 values; prequantized E4M3 input retains
+    its supplied FP32 scales. The intermediate is dynamically quantized to
+    E4M3 before FC2; expert outputs and ordered combine follow BF16 rounding.
 
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
     and top-k at most 32. It retains BF16 activation/expert rounding and
