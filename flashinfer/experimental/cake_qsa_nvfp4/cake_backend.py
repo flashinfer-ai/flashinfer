@@ -50,10 +50,10 @@ take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
 (``aarch64``: the Grace host of a GB200 / GB300, whose eager path leaves a
 gap of several microseconds between the decode launch and the merge launch
 that costs more than the fused form's in-kernel merge tail), at ``rows <=
-FUSED_MAX_ROWS`` (8) and when the current stream is not capturing: a captured
+FUSED_MAX_ROWS`` (4) and when the current stream is not capturing: a captured
 call is replayed without that gap, so it keeps the *split* form, whose GPU
 time is the shorter one.  Everywhere else -- compute capability 8.x, an x86
-host, rows above 8, a capturing stream, a call on a device other than the
+host, rows above 4, a capturing stream, a call on a device other than the
 current one (its capture state is unreadable) -- the *split* form: the plain
 decode, then the separate merge.  The package's graph tests compare an eager
 call with its captured replay bit for bit, so the two forms agree exactly.
@@ -142,7 +142,7 @@ FUSED_CTAS_PER_SM = cake_jit.DECODE_FUSED_CTAS_PER_SM
 # and only outside a stream capture; compute capability 9.0 takes it within its capacity on every host.
 FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a")
 FUSED_HOSTS = ("aarch64",)
-FUSED_MAX_ROWS = 8
+FUSED_MAX_ROWS = 4
 HOST_MACHINE = platform.machine()
 # The program rule's long-stream bound: tiles per CTA from which an sm_80 multi-wave grid runs the whole-tile program.
 LONG_STREAM_TILES = cake_jit.DECODE_LONG_STREAM_TILES

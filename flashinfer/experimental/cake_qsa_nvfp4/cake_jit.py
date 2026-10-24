@@ -122,7 +122,7 @@ TILE_TOKENS = 64
 # ``DECODE_FUSED_CTAS_PER_SM[arch]`` x the SM count CTAs (``sm_80`` is absent:
 # its calls take the split form alone).  Within the capacity sm_90a always
 # takes the fused form; sm_100a / sm_103a take it under the host's eager rule
-# (``cake_backend.select_form``: an aarch64 host, rows <= 8, no capture).  The
+# (``cake_backend.select_form``: an aarch64 host, rows <= 4, no capture).  The
 # exporter holds the launch-bound tables to the kernel files and the fused
 # table to its host policy.
 DECODE_THREADS = {"sm_80": 128, "sm_90a": 128, "sm_100a": 512, "sm_103a": 512}

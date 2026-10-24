@@ -847,7 +847,7 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
     try:
         assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a")
         assert cake_backend.FUSED_HOSTS == ("aarch64",)
-        assert cake_backend.FUSED_MAX_ROWS == 8
+        assert cake_backend.FUSED_MAX_ROWS == 4
         capacity = [cake_backend.fused_capacity(i) for i in (800, 900, 1000, 1030)]
         assert capacity == [0, 264, 148, 152]
         for host in ("aarch64", "x86_64"):
@@ -856,19 +856,22 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
             grace = host == "aarch64"
             eager = "fused" if grace else "split"
             for index, splits_at in (
-                (1000, (33, 33, 18, 9)),
-                (1030, (33, 33, 19, 9)),
+                (1000, (33, 33, 18)),
+                (1030, (33, 33, 19)),
             ):
                 sm_count = facts[index][1]
-                for rows, splits in zip((1, 2, 4, 8), splits_at, strict=True):
+                for rows, splits in zip((1, 2, 4), splits_at, strict=True):
                     assert rows * 2 * splits <= sm_count
                     assert form(rows, 2, splits, index) == eager, (host, index, rows)
                     assert form(rows, 2, splits, index, True) == "split"
                     assert reads(rows, index) is grace
-                # Above FUSED_MAX_ROWS, with one split or above the capacity: split.
+                # Above FUSED_MAX_ROWS (rows 8 at 9 splits fit the capacity), with one
+                # split or above the capacity: split.
+                assert form(8, 2, 9, index) == "split"
                 assert form(16, 2, 4, index) == "split"
-                assert form(8, 2, 1, index) == "split"
-                assert form(8, 2, sm_count // 16 + 1, index) == "split"
+                assert form(4, 2, 1, index) == "split"
+                assert form(4, 2, sm_count // 8 + 1, index) == "split"
+                assert reads(8, index) is False
                 assert reads(16, index) is False
             # Compute capability 9.0: the fused form within 264 CTAs, whatever the host
             # or the capture state; above it the split form.
