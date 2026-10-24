@@ -617,7 +617,8 @@ The KCP kernels live beside the single-rank programs:
 
 * `cake_kcp_jit.py` -- the `MODULES` registry of the nine KCP programs (the
   fragment walks of the forward and backward state recurrences in their
-  `offset` and `tape` forms, the TF32 hi/lo transfer walk, the affine
+  `offset` and `tape` forms, the BF16x3 transfer walk (two CTAs per segment
+  and head, each over one 64-column half of the state), the affine
   merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
   `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
@@ -633,8 +634,8 @@ The KCP kernels live beside the single-rank programs:
   of a rank, the autograd `Function` and the three entry points.
 * `build.test.json` -- a `cake-build/1` manifest of the same form as
   `build.json` holding the test-only programs of `cake_kcp_jit.TEST_MODULES`
-  (the transfer walk's static `precision_mode` 1 and 2 forms and the BF16x3
-  candidate at both value widths).  `build.json` never lists them and the
+  (the TF32 hi/lo transfer walk, its static `precision_mode` 1 and 2 forms,
+  and the full-width BF16x3 walk).  `build.json` never lists them and the
   shipped route never loads them: `cake_kcp_jit.load_test` JIT-builds an
   entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
   also admits the test knobs (`precision_mode`, `transfer_walk`) of the
