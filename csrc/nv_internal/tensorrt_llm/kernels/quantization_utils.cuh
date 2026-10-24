@@ -1201,6 +1201,8 @@ struct TmaKernelTraitsTwoBytes {
   static constexpr int ROW_ITERATIONS = TMA_ROW_TILE / ROWS_PER_WARP;  // 2
   static constexpr int ELTS_PER_THREAD = 16;
   static constexpr int NUM_CONSUMER_WARPS = 8;
+  // Columns per producer step; the kernel walks n only in whole chunks.
+  static constexpr int TMA_COL_CHUNK = NUM_CONSUMER_WARPS * TMA_COL_TILE;
 
   static constexpr size_t SMEM_DATA_SIZE = NUM_STAGES * SMEM_ROWS * SMEM_COLS * sizeof(SmemType);
   static constexpr int SMEM_STAGE_SIZE = SMEM_ROWS * SMEM_COLS;
@@ -1280,6 +1282,8 @@ struct TmaKernelTraits<__nv_fp8_e4m3> {
   static constexpr int ROW_ITERATIONS = TMA_ROW_TILE / ROWS_PER_WARP;  // 2
   static constexpr int ELTS_PER_THREAD = 16;
   static constexpr int NUM_CONSUMER_WARPS = 8;
+  // Columns per producer step; the kernel walks n only in whole chunks.
+  static constexpr int TMA_COL_CHUNK = NUM_CONSUMER_WARPS * TMA_COL_TILE;
 
   static constexpr size_t SMEM_DATA_SIZE = NUM_STAGES * SMEM_ROWS * SMEM_COLS * sizeof(SmemType);
   static constexpr int SMEM_STAGE_SIZE = SMEM_ROWS * SMEM_COLS;
