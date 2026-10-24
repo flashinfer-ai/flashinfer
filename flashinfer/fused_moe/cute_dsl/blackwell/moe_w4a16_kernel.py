@@ -48,6 +48,10 @@ import cutlass.utils.mixed_input_helpers as mixed_input_utils
 from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from flashinfer.cute_dsl.sm100_dynamic_mma import (
+    compute_non_leader_cta_load_shift,
+    issue_dynamic_bf16_mma_tile,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DEFAULT_SWIGLU_ALPHA,
@@ -203,6 +207,17 @@ class Sm100W4A16GroupedGemmKernel:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        # Every autotuned W4A16 tactic has 128 accumulator rows per CTA.
+        # Other layouts keep the static path, including two-CTA M64 per
+        # CTA, whose TMEM column mapping depends on the instruction N extent.
+        self.use_dynamic_n = (
+            self.cta_tile_shape_mnk[0] == 128
+            and self.transform_a_source == tcgen05.OperandSource.TMEM
+            and self.a_major_mode == cute.nvgpu.OperandMajorMode.K
+            and self.b_major_mode == cute.nvgpu.OperandMajorMode.K
+            and self.mma_dtype == cutlass.BFloat16
+            and self.acc_dtype == cutlass.Float32
+        )
         self.mma_tiler_c = (
             self.mma_tiler[0] // self.output_m_factor,
             self.mma_tiler[1],
@@ -307,6 +322,40 @@ class Sm100W4A16GroupedGemmKernel:
             _NVFP4_SCALE_GRANULARITY_K,
             self.num_load2trans_stage,
         )
+
+    @cute.jit
+    def _issue_mma_tile(
+        self,
+        tiled_mma: cute.TiledMma,
+        accumulators: cute.Tensor,
+        a_frag_tile: cute.Tensor,
+        b_frag_tile: cute.Tensor,
+        k_tile_idx: cutlass.Int32,
+        valid_tokens: cutlass.Int32,
+    ):
+        if cutlass.const_expr(self.use_dynamic_n):
+            issue_dynamic_bf16_mma_tile(
+                acc_tensor=accumulators,
+                a_frag_tile=a_frag_tile,
+                b_frag_tile=b_frag_tile,
+                k_tile_idx=k_tile_idx,
+                valid_tokens_in_tile=valid_tokens,
+                mma_tiler_mnk=self.mma_tiler,
+                n_alignment=16 if self.use_2cta_instrs else 8,
+            )
+        else:
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile_idx != 0)
+            for kblock_idx in cutlass.range(
+                cute.size(a_frag_tile, mode=[2]), unroll_full=True
+            ):
+                cute.gemm(
+                    tiled_mma,
+                    accumulators,
+                    a_frag_tile[(None, None, kblock_idx)],
+                    b_frag_tile[(None, None, kblock_idx)],
+                    accumulators,
+                )
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
     def _setup_transform_partitions(
@@ -1438,12 +1487,26 @@ class Sm100W4A16GroupedGemmKernel:
                         griddepcontrol_launch_dependents()
 
             while work_tile.is_valid_tile:
+                activation_coord_n = work_tile.coord_n
+                if cutlass.const_expr(self.use_dynamic_n and self.use_2cta_instrs):
+                    if not is_leader_cta:
+                        # Two-CTA MMA splits B at runtime_N / 2, whereas
+                        # the TMA partition starts at allocated_N / 2.
+                        activation_coord_n += compute_non_leader_cta_load_shift(
+                            valid_tokens_in_tile=cutlass.max(
+                                1,
+                                cutlass.min(
+                                    work_tile.distance_to_boundary, self.mma_tiler[1]
+                                ),
+                            ),
+                            mma_tiler_n=self.mma_tiler[1],
+                        )
                 coord_n_offset = (
-                    (work_tile.coord_n, 0)
+                    (activation_coord_n, 0)
                     if cutlass.const_expr(
                         self.b_major_mode == cute.nvgpu.OperandMajorMode.MN
                     )
-                    else (0, work_tile.coord_n)
+                    else (0, activation_coord_n)
                 )
                 tBgB_slice = cute.make_tensor(
                     (
@@ -1731,37 +1794,26 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                     acc_pipeline.producer_acquire(acc_producer_state)
 
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    # A privately supplied empty tile still participates in
+                    # every pipeline; issue the minimum legal MMA extent.
+                    valid_tokens = cutlass.max(
+                        1,
+                        cutlass.min(work_tile.distance_to_boundary, self.mma_tiler[1]),
+                    )
                     # Mma mainloop
                     for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         trans2mma_pipeline.consumer_wait(
                             trans2mma_consumer_state, peek_trans2mma_full_status
                         )
                         b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
-                        num_kblocks = cute.size(tCrA, mode=[2])
-                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                            kblock_coord_a = (
-                                None,
-                                None,
-                                kblock_idx,
-                                trans2mma_consumer_state.index,
-                            )
-                            kblock_coord_b = (
-                                None,
-                                None,
-                                kblock_idx,
-                                b_load2mma_consumer_state.index,
-                            )
-
-                            cute.gemm(
-                                tiled_mma,
-                                tCtAcc,
-                                tCrA[kblock_coord_a],
-                                tCrB[kblock_coord_b],
-                                tCtAcc,
-                            )
-                            # Enable accumulate on tCtAcc after first kblock
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        self._issue_mma_tile(
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[(None, None, None, trans2mma_consumer_state.index)],
+                            tCrB[(None, None, None, b_load2mma_consumer_state.index)],
+                            _k_tile,
+                            valid_tokens,
+                        )
                         trans2mma_pipeline.consumer_release(trans2mma_consumer_state)
                         b_load2mma_pipeline.consumer_release(b_load2mma_consumer_state)
                         trans2mma_consumer_state.advance()
@@ -1925,6 +1977,16 @@ class Sm100W4A16GroupedGemmKernel:
             tile_info_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                # Dynamic MMA only initializes the rounded valid N columns.
+                # Their M128-per-CTA TMEM mapping is unchanged, including
+                # two-CTA MMA; omit wholly invalid capacity subtiles.
+                valid_tokens = cutlass.min(
+                    work_tile.distance_to_boundary, self.mma_tiler[1]
+                )
+                # Consume/release the accumulator even for an empty tile.
+                active_subtile_cnt = cutlass.max(
+                    1, cute.ceil_div(valid_tokens, self.epi_tile_n)
+                )
                 alpha_val = alpha[work_tile.group_idx]
                 if cutlass.const_expr(self.gated):
                     bSG_gC = bSG_gC_partitioned[(None, work_tile.cta_coord_m, None, 0)]
@@ -1980,7 +2042,9 @@ class Sm100W4A16GroupedGemmKernel:
                     gated_tTR_tAcc = gated_tTR_tAcc_base[
                         (None, None, None, None, None, acc_consumer_state.index)
                     ]
-                    gated_subtile_cnt = cute.size(gated_tTR_tAcc.shape, mode=[4])
+                    gated_subtile_cnt = cutlass.min(
+                        cute.size(gated_tTR_tAcc.shape, mode=[4]), active_subtile_cnt
+                    )
                     gated_alpha_f32 = cutlass.Float32(alpha_val)
                     swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
                     swiglu_beta = cutlass.Float32(self.swiglu_beta)
@@ -2154,7 +2218,9 @@ class Sm100W4A16GroupedGemmKernel:
                 subtile_cnt = (
                     0
                     if cutlass.const_expr(self.gated)
-                    else cute.size(tTR_tAcc.shape, mode=[3])
+                    else cutlass.min(
+                        cute.size(tTR_tAcc.shape, mode=[3]), active_subtile_cnt
+                    )
                 )
                 for subtile_idx in cutlass.range(subtile_cnt):
                     # Load accumulator from tensor memory buffer to register
