@@ -176,9 +176,9 @@ that writes the registry verifies the record against them before it is frozen.
 * **Workspace bound** (`dsa_indexer_topk_workspace_size(T, Tkv, S, top_k=,
   ratio=, device=)`): `grid_ctas x queries_per_unit x
   candidate_capacity(top_k) x 8` bytes of persistent candidate buffers for the
-  dispatched unit geometry and capacity (for example about 37 MiB at `top_k =
-  2048` with four queries per unit on 148 SMs, 74 MiB with eight queries per
-  unit or the doubled long-unit capacity) plus `T x n_split x top_k x 8` bytes
+  dispatched unit geometry and capacity (for example about 74 MiB at `top_k =
+  2048` with four queries per unit on 148 SMs at the 16384-slot capacity
+  floor, 148 MiB with eight queries per unit) plus `T x n_split x top_k x 8` bytes
   of staging when the dispatch splits the key ranges.  The bound depends on the
   call geometry; size a reused buffer for the largest bound over the
   geometries it serves.  Separate from the inputs and the two `[T, top_k]`
