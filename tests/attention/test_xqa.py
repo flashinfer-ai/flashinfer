@@ -6,6 +6,7 @@ import torch
 
 from flashinfer import xqa, xqa_mla
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.pdl import late_store
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
@@ -702,3 +703,58 @@ def test_xqa_mla(
         f"Total {total_elements} elements, only {passing_elements} ({pass_ratio:.1%}) meet tolerance criteria, "
         f"require at least {required_ratio:.1%}"
     )
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [12],
+    reason="XQA mla is only supported on SM120/SM121 GPUs",
+)
+def test_xqa_mla_pdl_waits_for_q_scale():
+    set_random_seed(0)
+    batch_size, seq_len, tokens_per_page = 1, 256, 64
+    nb_pages = batch_size * div_up(seq_len, tokens_per_page)
+    fp8 = torch.float8_e4m3fn
+    q = torch.randn(batch_size, beam_width, 128, 576, device="cuda").to(fp8)
+    cache_shape = (nb_pages, tokens_per_page, 1, 576)
+    k_cache = (torch.randn(cache_shape, device="cuda") / 4).to(fp8)
+    v_cache = (torch.randn(cache_shape, device="cuda") / 4).to(fp8)
+    page_table = torch.arange(nb_pages, dtype=torch.int32, device="cuda").view(
+        batch_size, -1
+    )
+    seq_lens = torch.full(
+        (batch_size, beam_width), seq_len, dtype=torch.uint32, device="cuda"
+    )
+    semaphores = torch.zeros(8, dtype=torch.uint32, device="cuda")
+    workspace = torch.zeros(256 << 20, dtype=torch.uint8, device="cuda")
+    q_scale_value = 0.5
+    q_scale = torch.tensor([q_scale_value], device="cuda")
+
+    def run():
+        output = torch.empty(
+            batch_size, beam_width, 128, 512, dtype=torch.bfloat16, device="cuda"
+        )
+        xqa_mla(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            seq_lens,
+            output,
+            workspace,
+            semaphores,
+            tokens_per_page,
+            q_scale=q_scale,
+            sm_count=sm_count,
+            enable_pdl=True,
+        )
+        return output
+
+    expected = run()
+
+    # The q scale is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the attention kernel.
+    q_scale.fill_(q_scale_value * 4)
+    late_store(q_scale, q_scale_value)
+    output = run()
+
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
