@@ -28,8 +28,6 @@ from tests.moe.test_frost_low_latency_mxint4_w4a16 import (
     _inputs as int_inputs,
     _decode as int_decode,
 )
-
-
 from tests.moe.test_frost_low_latency_w8a16 import _inputs as w8_inputs
 
 FACTORIES = [nv_inputs, mx_inputs, int_inputs, w8_inputs]
