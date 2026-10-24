@@ -17,6 +17,10 @@ from b12x.attention.dsa_indexer._impl import (
     build_paged_mqa_schedule_metadata,
     uses_paged_mqa_schedule,
 )
+
+# Page sizes accepted by the paged indexer surface. 32 = GLM kpool serving
+# profile (packed-contiguous route only); 64 = CUTLASS/fused routes.
+PAGED_INDEX_PAGE_SIZES = (32, 64)
 from b12x.attention.dsa_indexer.contiguous_kernel import (
     run_contiguous_logits_kernel,
 )
@@ -598,11 +602,21 @@ def _prepare_shared_paged_supertile(
             "shared paged-index supertile gather requires unit inner stride, "
             f"got stride={tuple(index_k_cache.stride())}"
         )
-    expected_width = PAGED_INDEX_PAGE_SIZE * (INDEX_HEAD_DIM + 4)
-    if int(index_k_cache.shape[1]) != expected_width:
+    # Page-size agnostic: the gather reads whole pages from the caller's
+    # cache, so the per-page record width is (page rows × record bytes) with
+    # the record layout (INDEX_HEAD_DIM data + 4 scale bytes) unchanged.
+    page_rows = int(index_k_cache.shape[1]) // (INDEX_HEAD_DIM + 4)
+    if page_rows * (INDEX_HEAD_DIM + 4) != int(index_k_cache.shape[1]):
         raise ValueError(
-            f"index_k_cache width must be {expected_width}, got {int(index_k_cache.shape[1])}"
+            "index_k_cache width is not a whole number of index pages "
+            f"(rows of {INDEX_HEAD_DIM + 4} bytes): "
+            f"{int(index_k_cache.shape[1])}"
         )
+    if page_rows not in PAGED_INDEX_PAGE_SIZES:
+        raise ValueError(
+            f"paged indexer page_rows {page_rows} not in {PAGED_INDEX_PAGE_SIZES}"
+        )
+    expected_width = page_rows * (INDEX_HEAD_DIM + 4)
 
     k_quant_bytes, k_scale_bytes = scratch.get_indexer_gather_outputs(
         row_count=supertile_tokens,
@@ -629,7 +643,7 @@ def _prepare_shared_paged_supertile(
         int(page_begin),
         int(supertile_tokens),
         block_tokens,
-        PAGED_INDEX_PAGE_SIZE,
+        page_rows,
         INDEX_HEAD_DIM,
         int(index_k_cache.stride(0)),
         _PAGED_INDEX_CACHE_DATA_BYTES,
@@ -781,10 +795,15 @@ def index_topk_fp8(
         metadata=metadata,
     )
     page_size = int(page_size)
-    if page_size != PAGED_INDEX_PAGE_SIZE:
+    route = str(getattr(binding, "route", getattr(scratch, "route", "paged_tiled")))
+    if page_size != PAGED_INDEX_PAGE_SIZE and route != "packed_contiguous":
+        # The CUTLASS paged scorer (paged_tiled) and the fused decode kernel
+        # bake a 64-token page tile into their shared-memory staging and TMA
+        # box. Only the packed-contiguous shared-prefill route is page-size
+        # agnostic (triton gather + contiguous scorer over gathered rows).
         raise ValueError(
-            f"paged indexer currently supports page_size={PAGED_INDEX_PAGE_SIZE}, "
-            f"got {page_size}"
+            f"paged indexer route {route!r} only supports "
+            f"page_size={PAGED_INDEX_PAGE_SIZE}, got {page_size}"
         )
     _validate_q_head_contract(
         q_fp8=q_fp8,

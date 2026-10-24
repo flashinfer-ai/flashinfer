@@ -7,6 +7,7 @@ import torch
 
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.attention import dsa_indexer as api
+from b12x.attention.dsa_indexer.tiled_topk import _TIE_BREAK_EPS
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for native MXFP4 indexer"
@@ -172,6 +173,12 @@ def _allocate(
 
 
 def _assert_topk(scores, output, output_scores, logical_positions=None):
+    # Mirror the kernel's key-only tie-break (column index * 2^-24) so boundary
+    # ties resolve to the same candidates; values are compared unperturbed.
+    tie = (
+        torch.arange(scores.shape[1], device=scores.device, dtype=torch.float32)
+        * _TIE_BREAK_EPS
+    )
     for row in range(scores.shape[0]):
         valid = torch.isfinite(scores[row])
         count = min(512, int(valid.sum()))
@@ -179,7 +186,8 @@ def _assert_topk(scores, output, output_scores, logical_positions=None):
         assert bool((output[row, count:] == -1).all())
         assert bool((selected[1:] > selected[:-1]).all())
         assert bool(torch.isneginf(output_scores[row, count:]).all())
-        expected = scores[row, valid].float().topk(count).values.sort().values
+        ref = scores[row].float()
+        expected = ref[(ref + tie).topk(count).indices].sort().values
         actual = output_scores[row, :count].sort().values
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         if logical_positions is None:
