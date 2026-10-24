@@ -122,6 +122,8 @@ You can follow the steps below to install FlashInfer from source code:
            flashinfer-jit-cache-provider/dist/*.whl \
            flashinfer-jit-cache/dist/*.whl
 
+   To ship only the modules one deployment uses, see :ref:`custom-jit-cache`.
+
 
 Install Nightly Build
 ^^^^^^^^^^^^^^^^^^^^^^
