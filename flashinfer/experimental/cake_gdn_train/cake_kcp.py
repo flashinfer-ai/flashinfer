@@ -2124,11 +2124,14 @@ class KcpWorkspace:
         if (
             self._tickets is None
         ):  # once per workspace: the kernels keep every word at zero afterwards
-            self._tickets = torch.zeros(
-                (len(TICKET_SITES) * TICKET_SLOT_WORDS,),
-                dtype=torch.uint32,
-                device=device,
+            # one slot of slack, then the 128-byte-aligned view: the CUDA caching allocator hands out 512-byte-aligned
+            # blocks (offset 0), the CPU allocator only 64-byte-aligned ones (offset 0 or 16 words)
+            words = len(TICKET_SITES) * TICKET_SLOT_WORDS
+            base = torch.zeros(
+                (words + TICKET_SLOT_WORDS,), dtype=torch.uint32, device=device
             )
+            skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
+            self._tickets = base[skew : skew + words]
         geometry = (int(ctx.R), int(ctx.NC_pad), int(HV), int(ctx.T_r))
         if self.geometry != geometry:
             self._tapes.clear()  # another padded geometry: the tapes are reallocated on first use
