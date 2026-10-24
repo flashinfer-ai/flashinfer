@@ -433,7 +433,6 @@ def prepare_split_w4a16_exact_fused(tensors):
 
 def split_w4a16_reference_from_tensors(
     tensors,
-    *,
     activation_type=None,
     use_fused_finalize=True,
     local_expert_offset=0,
@@ -458,12 +457,16 @@ def split_w4a16_reference_from_tensors(
     activation_type = (
         ActivationType.Swiglu if activation_type is None else activation_type
     )
-    activation = {
-        ActivationType.Swiglu: "swiglu",
-        ActivationType.GegluTanh: "geglu_tanh",
-        ActivationType.Relu2: "relu2",
-        ActivationType.Situ: "situ",
-    }[activation_type]
+    if activation_type == ActivationType.Swiglu:
+        activation = "swiglu"
+    elif activation_type == ActivationType.GegluTanh:
+        activation = "geglu_tanh"
+    elif activation_type == ActivationType.Relu2:
+        activation = "relu2"
+    elif activation_type == ActivationType.Situ:
+        activation = "situ"
+    else:
+        raise ValueError(f"Unsupported split W4A16 activation: {activation_type}")
     if situ_beta is not None:
         assert activation in ("swiglu", "situ")
         activation = "situ"
@@ -573,7 +576,7 @@ def _split_combine_kernel():
 
 
 def combine_w4a16_split_terms(
-    terms_bf16, scores_fp32, local_mask_bool, *, use_fused_finalize=False
+    terms_bf16, scores_fp32, local_mask_bool, use_fused_finalize=False
 ):
     """Combine canonical [token, slot, hidden] rows with exact split semantics.
 
@@ -657,28 +660,30 @@ def _split_activation_kernel():
         LINEAR_INV_BETA: tl.constexpr,
     ):
         index = tl.program_id(0) * 256 + tl.arange(0, 256)
-        if ACTIVATION == "relu2" or ACTIVATION == "relu":
+        if ACTIVATION == "relu2":
             value = tl.load(FC1 + index, index < N, other=0)
-            if ACTIVATION == "relu2":
-                result = tl.inline_asm_elementwise(
-                    "{ .reg .f32 r; max.f32 r, $1, 0f00000000; mul.rn.f32 $0, r, r; }",
-                    constraints="=f,f",
-                    args=[value],
-                    dtype=tl.float32,
-                    is_pure=True,
-                    pack=1,
-                )
-            else:
-                # Test-only counterfactual for the ReLU2 activation contract.
-                result = tl.inline_asm_elementwise(
-                    "max.f32 $0, $1, 0f00000000;",
-                    constraints="=f,f",
-                    args=[value],
-                    dtype=tl.float32,
-                    is_pure=True,
-                    pack=1,
-                )
-        else:
+            result = tl.inline_asm_elementwise(
+                "{ .reg .f32 r; max.f32 r, $1, 0f00000000; mul.rn.f32 $0, r, r; }",
+                constraints="=f,f",
+                args=[value],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        elif ACTIVATION == "relu":
+            # Test-only counterfactual for the ReLU2 activation contract.
+            value = tl.load(FC1 + index, index < N, other=0)
+            result = tl.inline_asm_elementwise(
+                "max.f32 $0, $1, 0f00000000;",
+                constraints="=f,f",
+                args=[value],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        elif (
+            ACTIVATION == "geglu_tanh" or ACTIVATION == "swiglu" or ACTIVATION == "situ"
+        ):
             offset = (index // I) * (2 * I) + index % I
             gate = tl.load(FC1 + offset, index < N, other=0)
             up = tl.load(FC1 + offset + I, index < N, other=0)
@@ -716,7 +721,7 @@ def _split_activation_kernel():
                     is_pure=True,
                     pack=1,
                 )
-            else:
+            elif ACTIVATION == "swiglu" or ACTIVATION == "situ":
                 if PARAMETERIZED:
                     gate, up = tl.inline_asm_elementwise(
                         """{
@@ -801,6 +806,10 @@ def _split_activation_kernel():
                     is_pure=True,
                     pack=1,
                 )
+            else:
+                tl.static_assert(False, "Unsupported gated split W4A16 activation")
+        else:
+            tl.static_assert(False, "Unsupported split W4A16 activation")
         tl.store(
             OUT + index, result.to(tl.bfloat16, fp_downcast_rounding="rtne"), index < N
         )
@@ -810,13 +819,14 @@ def _split_activation_kernel():
 
 @torch.no_grad()
 def _split_reference(
-    problem, weights, *, fc1_alpha, fc2_alpha, local_expert_offset, use_fused_finalize
+    problem, weights, fc1_alpha, fc2_alpha, local_expert_offset, use_fused_finalize
 ):
     """Single-rank split oracle from canonical gate-first/up-second weights."""
     if dist.is_initialized() and dist.get_world_size() != 1:
         raise ValueError("The split reference supports a single rank")
-    activation_kind = problem.get("activation", "swiglu")
-    assert activation_kind in ("swiglu", "geglu_tanh", "relu2", "relu", "situ")
+    activation_kind = problem["activation"]
+    if activation_kind not in ("swiglu", "geglu_tanh", "relu2", "relu", "situ"):
+        raise ValueError(f"Unsupported split W4A16 activation: {activation_kind}")
     matmul = torch.backends.cuda.matmul
     if not hasattr(matmul, "allow_bf16_reduced_precision_reduction_split_k"):
         pytest.skip("Bit-exact W4A16 oracle requires PyTorch 2.12 BF16 split-K control")
@@ -914,7 +924,6 @@ def _split_reference(
 def w4a16_reference(
     problem,
     weights,
-    *,
     fc1_alpha=None,
     fc2_alpha=None,
     fc1_norm_const=None,
@@ -943,19 +952,22 @@ def w4a16_reference(
             apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
-    if backend != "split":
+    elif backend == "split":
+        if (
+            fc1_norm_const is not None
+            or apply_routing_weights_before_fc2
+            or in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "MegaMoE-only options are not supported by backend='split'"
+            )
+        return _split_reference(
+            problem,
+            weights,
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            local_expert_offset=local_expert_offset,
+            use_fused_finalize=use_fused_finalize,
+        )
+    else:
         raise ValueError(f"Unknown W4A16 reference backend: {backend}")
-    if (
-        fc1_norm_const is not None
-        or apply_routing_weights_before_fc2
-        or in_kernel_fc2_reduce
-    ):
-        raise ValueError("MegaMoE-only options are not supported by backend='split'")
-    return _split_reference(
-        problem,
-        weights,
-        fc1_alpha=fc1_alpha,
-        fc2_alpha=fc2_alpha,
-        local_expert_offset=local_expert_offset,
-        use_fused_finalize=use_fused_finalize,
-    )

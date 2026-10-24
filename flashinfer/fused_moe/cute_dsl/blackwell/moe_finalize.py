@@ -39,7 +39,7 @@ def _fma_rn(a, b, c, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _mul_rn(a, b, *, loc=None, ip=None):
+def _mul_rn(a, b, loc=None, ip=None):
     # A separate first multiply preserves signed zero, as in MegaMoE combine.
     return cutlass.Float32(
         llvm.inline_asm(

@@ -85,7 +85,6 @@ def _align_n(x, alignment: int):
 
 @dsl_user_op
 def compute_non_leader_cta_load_shift(
-    *,
     valid_tokens_in_tile,  # Int32 SSA
     mma_tiler_n: int,
     loc: Optional[ir.Location] = None,
@@ -131,7 +130,6 @@ def bf16_static_idesc(umma_m: int) -> int:
 
 @dsl_user_op
 def _issue_bf16_atom(
-    *,
     cta_group: int,
     accumulator,
     operand_a,
@@ -160,7 +158,6 @@ def _issue_bf16_atom(
 
 @dsl_user_op
 def issue_dynamic_bf16_mma_tile(
-    *,
     acc_tensor,
     a_frag_tile,
     b_frag_tile,

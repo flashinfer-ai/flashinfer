@@ -55,6 +55,7 @@ from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import get_compute_capability
 from tests.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
+    combine_w4a16_split_terms,
     prepare_split_w4a16_exact_fused,
     split_w4a16_reference_from_tensors,
 )
@@ -189,7 +190,6 @@ _MOE_QUANT_MODE_CASES = (
 def _prepare_moe_quant_mode_inputs(
     tensors: dict,
     quant_mode: str,
-    *,
     use_fused_finalize: bool = True,
 ) -> tuple[dict, dict]:
     """Select API and reference inputs for a shared MoE test case."""
@@ -232,7 +232,7 @@ def _prepare_moe_quant_mode_inputs(
 
 
 def _compute_moe_quant_mode_reference(
-    tensors, quant_mode, *, use_fused_finalize=True, **kwargs
+    tensors, quant_mode, use_fused_finalize=True, **kwargs
 ):
     if quant_mode == "w4a16":
         # The shared oracle reads the actual packed E2M1 weights and E4M3 scale
@@ -253,17 +253,22 @@ def _compute_moe_quant_mode_reference(
             use_fused_finalize=use_fused_finalize,
             **{key: kwargs[key] for key in reference_keys if key in kwargs},
         )
-    return compute_reference_moe_fp4(**kwargs)
+    elif quant_mode == "w4a4":
+        return compute_reference_moe_fp4(**kwargs)
+    else:
+        raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
 def _assert_moe_quant_mode_reference(actual, expected, quant_mode):
     if quant_mode == "w4a16":
         assert_w4a16_bits(actual, expected)
-    else:
+    elif quant_mode == "w4a4":
         passed, percent_within, atol = check_accuracy(actual, expected)
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
+    else:
+        raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
 def test_geglu_tanh_activation_is_supported():
@@ -1759,6 +1764,75 @@ class TestAutotunerBucketConfig:
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
+    @pytest.mark.skipif(is_sm107(), reason="Requires Blackwell SM100 or SM103")
+    @pytest.mark.parametrize("input_is_expanded", [False, True])
+    def test_split_finalize_fma_contract(self, input_is_expanded):
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_finalize import moe_unpermute
+
+        pytest.importorskip("triton")
+        num_tokens, top_k, hidden_size = 8, 8, 8
+        terms = torch.full(
+            (num_tokens, top_k, hidden_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        scores = torch.full((num_tokens, top_k), float("nan"), device="cuda")
+        local = torch.zeros((num_tokens, top_k), dtype=torch.bool, device="cuda")
+
+        # The exact residual is 2**-30. Separately rounding the final multiply
+        # before the add instead produces zero. Visit all eight route slots.
+        local[0] = True
+        terms[0] = 0
+        scores[0] = 0.314159
+        terms[0, 0], scores[0, 0] = -1, 1 + 2**-7 + 2**-23
+        terms[0, 7], scores[0, 7] = 1 + 2**-7, 1 + 2**-23
+        # Both BF16 and FP32 subnormal operands are preserved, as are subnormal
+        # products; the final BF16 conversion must not silently flush them either.
+        local[1:5, 3] = True
+        terms[1, 3], scores[1, 3] = 2**-133, 2**20
+        terms[2, 3], scores[2, 3] = 2**30, 2**-140
+        terms[3, 3], scores[3, 3] = 2**-120, 2**-10
+        terms[4, 3], scores[4, 3] = -(2**-120), 2**-10
+        # Slot zero uses multiply, preserving -0. A later -0 uses FMA with +0.
+        # The all-nonlocal row remains +0 without reading its NaN inputs.
+        local[5, 0] = local[7, 3] = True
+        terms[5, 0], scores[5, 0] = -0.0, 1.0
+        terms[7, 3], scores[7, 3] = -0.0, 1.0
+        expected = torch.zeros(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        expected[0] = 2**-30
+        expected[1] = 2**-113
+        expected[2] = 2**-110
+        expected[3] = 2**-130
+        expected[4] = -(2**-130)
+        expected[5] = -0.0
+        reference = combine_w4a16_split_terms(terms, scores, local)
+        assert_w4a16_bits(reference, expected)
+
+        expanded = terms.reshape(num_tokens * top_k, hidden_size)
+        route_rows = torch.arange(num_tokens * top_k, device="cuda", dtype=torch.int32)
+        if input_is_expanded:
+            expert_output = expanded.contiguous()
+            mapping = route_rows.reshape(num_tokens, top_k)
+        else:
+            # A nonidentity permutation makes addressing errors observable too.
+            expert_output = expanded.flip(0).contiguous()
+            mapping = route_rows.flip(0).reshape(num_tokens, top_k)
+        mapping = mapping.masked_fill(~local, -1).contiguous()
+        output = torch.full_like(expected, float("nan"))
+        moe_unpermute(
+            expert_output,
+            output,
+            mapping,
+            scores,
+            num_tokens,
+            top_k,
+            input_is_expanded=input_is_expanded,
+        )
+        assert_w4a16_bits(output, reference)
+
     @pytest.mark.parametrize("use_wrapper", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
@@ -2342,7 +2416,7 @@ class TestCuteDslFusedMoeFunctional:
         _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
         if quant_mode == "w4a16":
             assert not torch.equal(result, swiglu_ref_output)
-        else:
+        elif quant_mode == "w4a4":
             geglu_error = torch.mean(torch.abs(result.float() - ref_output)).item()
             swiglu_error = torch.mean(
                 torch.abs(result.float() - swiglu_ref_output)
@@ -2351,6 +2425,8 @@ class TestCuteDslFusedMoeFunctional:
                 f"GeGLU output is not closer to GeGLU reference ({geglu_error:.4f}) "
                 f"than SwiGLU reference ({swiglu_error:.4f})"
             )
+        else:
+            raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
@@ -2438,7 +2514,7 @@ class TestCuteDslFusedMoeFunctional:
         _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
         if quant_mode == "w4a16":
             assert not torch.equal(result, swiglu_ref_output)
-        else:
+        elif quant_mode == "w4a4":
             situ_error = torch.mean(torch.abs(result.float() - ref_output)).item()
             swiglu_error = torch.mean(
                 torch.abs(result.float() - swiglu_ref_output)
@@ -2447,6 +2523,8 @@ class TestCuteDslFusedMoeFunctional:
                 f"SiTU output is not closer to SiTU reference ({situ_error:.4f}) "
                 f"than SwiGLU reference ({swiglu_error:.4f})"
             )
+        else:
+            raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_with_autotune(self, quant_mode: str):
@@ -2629,12 +2707,14 @@ class TestCuteDslFusedMoeFunctional:
         if quant_mode == "w4a16":
             assert not torch.equal(ref_output, unclamped_ref), "Clamp must bind"
             assert not torch.equal(result, unclamped_ref)
-        else:
+        elif quant_mode == "w4a4":
             # The outputs are small enough that check_accuracy's absolute floor
             # accepts an unclamped result, so also require the limit to bind and
             # the result to land far closer to the clamped reference.
             assert rel_err(ref_output, unclamped_ref) > 0.5
             assert rel_err(result, ref_output) < 0.5 * rel_err(result, unclamped_ref)
+        else:
+            raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
         _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
@@ -2903,13 +2983,16 @@ class TestCuteDslMoEWrapper:
         for i in range(1, len(results)):
             if quant_mode == "w4a16":
                 assert_w4a16_bits(results[0], results[i])
-            elif use_fused_finalize:
-                max_diff = (results[0] - results[i]).abs().max().item()
-                assert max_diff < 0.5, (
-                    f"Replay {i} differs too much: max_diff={max_diff}"
-                )
+            elif quant_mode == "w4a4":
+                if use_fused_finalize:
+                    max_diff = (results[0] - results[i]).abs().max().item()
+                    assert max_diff < 0.5, (
+                        f"Replay {i} differs too much: max_diff={max_diff}"
+                    )
+                else:
+                    assert torch.equal(results[0], results[i]), f"Replay {i} differs"
             else:
-                assert torch.equal(results[0], results[i]), f"Replay {i} differs"
+                raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
         # Verify accuracy
         ref_output = _compute_moe_quant_mode_reference(
@@ -3269,14 +3352,14 @@ class TestApiConsistency:
             assert_w4a16_bits(result_functional, reference)
             assert_w4a16_bits(result_wrapper, reference)
             assert_w4a16_bits(result_functional, result_wrapper)
-            return
-
-        # Outputs should be very close (may not be exactly equal due to different
-        # tuning paths, but should be within FP4 tolerance)
-        diff = (result_functional - result_wrapper).abs()
-        max_diff = diff.max().item()
-        # Allow small differences from autotuner path differences
-        assert max_diff < 1e-3, f"Max diff between APIs: {max_diff}"
+        elif quant_mode == "w4a4":
+            # Outputs may differ slightly because the APIs can autotune
+            # different paths, but must remain within FP4 tolerance.
+            diff = (result_functional - result_wrapper).abs()
+            max_diff = diff.max().item()
+            assert max_diff < 1e-3, f"Max diff between APIs: {max_diff}"
+        else:
+            raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
 # =============================================================================
