@@ -54,12 +54,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_RED_STRIDE 2560
 #define SMEM_TOTAL 2560
 #define THREADS 128
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(128) void
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
 kernel_cake_causal_conv1d_train_1c21c181af94e1635851(float* __restrict__ partial, void* __restrict__ dw, void* __restrict__ db, int C, int main_ctas, int n_ch_tiles, int ct_vec, int flags)
 {
     const int tid = threadIdx.x;
@@ -85,46 +86,55 @@ kernel_cake_causal_conv1d_train_1c21c181af94e1635851(float* __restrict__ partial
     const int red_addr = smem + 0;
 
     // === Task calls (declaration order) ===
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int lane_1 = tid / 4;
     int cl = tid % 4;
     int ch = bid * 4 + cl;
+    long long C64 = (long long)C;
+    long long ch64 = (long long)ch;
+    int ctc = ch / 8 / ct_vec;
+    int G = (main_ctas - ctc + n_ch_tiles - 1) / n_ch_tiles;
+    int n_trips = G + 32 - 1 >> 5;
+    int rows = (main_ctas + n_ch_tiles - 1) / n_ch_tiles;
+    long long dbias_off = (long long)rows * C64 * 4;
     float a4[4];
     #pragma unroll
     for (int e = 0; e < 4; e++) {
         a4[e] = 0.0f;
     }
     float a5 = 0.0f;
+    float pv[24];
+    float pvb[6];
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (ch < C) {
-        long long C64 = (long long)C;
-        long long ch64 = (long long)ch;
-        int ctc = ch / 8 / ct_vec;
-        int G = (main_ctas - ctc + n_ch_tiles - 1) / n_ch_tiles;
-        int n_trips = G + 32 - 1 >> 5;
-        int rows = (main_ctas + n_ch_tiles - 1) / n_ch_tiles;
-        long long dbias_off = (long long)rows * C64 * 4;
-        #pragma unroll 4
-        for (int k = 0; k < n_trips; k++) {
-            int r = lane_1 + (k << 5);
-            if (r < G) {
-                float _vec_load_0[4];
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(partial + ((long long)r * C64 + ch64) * 4);
-                    _vec_load_0[0 + 0] = _v4.x;
-                    _vec_load_0[0 + 1] = _v4.y;
-                    _vec_load_0[0 + 2] = _v4.z;
-                    _vec_load_0[0 + 3] = _v4.w;
+        #pragma unroll 1
+        for (int k0 = 0; k0 < n_trips; k0 += 6) {
+            #pragma unroll
+            for (int u = 0; u < 6; u++) {
+                int r = lane_1 + (k0 + u << 5);
+                if (r < G) {
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(partial + ((long long)r * C64 + ch64) * 4);
+                        pv[u * 4 + 0] = _v4.x;
+                        pv[u * 4 + 1] = _v4.y;
+                        pv[u * 4 + 2] = _v4.z;
+                        pv[u * 4 + 3] = _v4.w;
+                    }
+                    {
+                        pvb[u] = *reinterpret_cast<const float*>(partial + (dbias_off + (long long)r * C64 + ch64));
+                    }
                 }
-                #pragma unroll
-                for (int e_1 = 0; e_1 < 4; e_1++) {
-                    a4[e_1] = a4[e_1] + _vec_load_0[e_1];
+            }
+            #pragma unroll
+            for (int u_1 = 0; u_1 < 6; u_1++) {
+                int r_1 = lane_1 + (k0 + u_1 << 5);
+                if (r_1 < G) {
+                    #pragma unroll
+                    for (int e_1 = 0; e_1 < 4; e_1++) {
+                        a4[e_1] = a4[e_1] + pv[u_1 * 4 + e_1];
+                    }
+                    a5 += pvb[u_1];
                 }
-                float _vec_load_1[1];
-                {
-                    _vec_load_1[0] = *reinterpret_cast<const float*>(partial + (dbias_off + (long long)r * C64 + ch64));
-                }
-                a5 += _vec_load_1[0];
             }
         }
     }
@@ -180,12 +190,12 @@ kernel_cake_causal_conv1d_train_1c21c181af94e1635851(float* __restrict__ partial
             long long ch64b = (long long)ch2;
             if (chain == 4) {
                 if ((flags & 8) != 0) {
-                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (ch64b)) = __float2bfloat16_rn(total);
+                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (ch64b)) = (__nv_bfloat16)total;
                 } else {
                     *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (ch64b)) = total;
                 }
             } else if ((flags & 2) != 0) {
-                *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (ch64b * 4 + (long long)chain)) = __float2bfloat16_rn(total);
+                *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (ch64b * 4 + (long long)chain)) = (__nv_bfloat16)total;
             } else {
                 *(reinterpret_cast<float*>(reinterpret_cast<float*>(dw)) + (ch64b * 4 + (long long)chain)) = total;
             }
