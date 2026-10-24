@@ -27,7 +27,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 import torch
 import torch.nn.functional as F
 
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
 from b12x.gemm import block_fp8_linear
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.testing.reference.helpers import dequantize_grouped_nvfp4

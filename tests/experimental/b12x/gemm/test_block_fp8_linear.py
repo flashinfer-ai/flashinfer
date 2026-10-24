@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+from b12x._lib.intrinsics.reference import quant_dequant_mxfp8_torch
 from b12x.gemm import block_fp8_linear as bfl
 from b12x.gemm._shared.wo_mxfp8 import empty_dense_gemm_mnl_view
 from b12x.preparation import PreparationSession, PreparedCall

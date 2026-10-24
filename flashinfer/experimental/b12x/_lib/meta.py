@@ -10,6 +10,9 @@ namespace-import time, which must not pull torch/cutlass/triton.
 
 from __future__ import annotations
 
+# Lazy operator APIs select entrypoints; they do not supply device code.
+__b12x_source_dependencies__ = ()
+
 import importlib
 from dataclasses import dataclass, field
 from typing import Any, Literal

@@ -43,7 +43,7 @@ from b12x._lib.fp6 import (
     SF_VEC_SIZE_FP6,
     _ue8m0_scale_from_block_max,
 )
-from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes
 
 # --- schema constants --------------------------------------------------------
 

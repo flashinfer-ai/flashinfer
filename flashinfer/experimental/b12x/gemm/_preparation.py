@@ -8,7 +8,7 @@ import torch
 
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.scratch import ScratchBufferSpec
-from b12x._lib.utils import cuda_stream_to_int
+from b12x._lib.utils.device import cuda_stream_to_int
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,

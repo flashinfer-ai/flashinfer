@@ -18,16 +18,16 @@ from cutlass import Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.memory import shared_ptr_to_u32
+from b12x._lib.intrinsics.trellis import (
     packed_decode_lut_e4m3_to_e4m3x8,
     packed_decode_lut_e4m3_direct_to_e4m3x8,
-    shared_ptr_to_u32,
 )
 from b12x._lib.quant.lut_e4m3 import (
     lut_e4m3_direct_table_cpu,
     lut_e4m3_value_table_cpu,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from b12x.testing.reference.helpers import require_b12x
 
 require_b12x(allow_module_level=True)

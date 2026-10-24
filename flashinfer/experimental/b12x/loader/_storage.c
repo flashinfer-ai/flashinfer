@@ -67,9 +67,12 @@ static PyObject* py_capabilities(PyObject* self, PyObject* args) {
   return result;
 }
 
-#include "_batch.c"
+// The batch reader uses definitions from the direct reader.
+// clang-format off
 #include "_direct.c"
+#include "_batch.c"
 #include "_ple_reader.c"
+// clang-format on
 
 static PyMethodDef methods[] = {
     {"ple_reader", py_ple_reader, METH_VARARGS, NULL},

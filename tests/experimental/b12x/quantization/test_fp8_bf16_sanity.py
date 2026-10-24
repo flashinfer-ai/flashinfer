@@ -9,7 +9,7 @@ import torch
 from cutlass import Float32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.packed import (
     bfloat2_mul,
     bfloat2_to_float2_scaled,
     broadcast_f32_to_bfloat2,

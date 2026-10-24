@@ -17,7 +17,8 @@ from b12x._lib.quant.nvfp4_csf_inline import (
 )
 from b12x._lib.quant.nvfp4_csf import make_nvfp4_csf_batch
 from b12x._lib.runtime_control import kernel_resolution_guard
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from .test_nvfp4_csf import _fixture
 
 

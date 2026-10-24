@@ -16,19 +16,13 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as compile_cute
 from b12x._lib.compiler import run_compiled
-from b12x._lib.intrinsics import (
-    bfloat2_to_float2_scaled,
-    block_reduce,
-    fabs_f32,
-    fmax_f32,
-    ld_global_v4_u32,
-    pack_f32x2_to_bfloat2,
-    st_global_v4_u32,
-    warp_reduce,
-    u32_as_f32,
-)
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32, u32_as_f32
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled, pack_f32x2_to_bfloat2
+from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x._lib.program_cache import register_program_cache
 
 _THREADS = 256

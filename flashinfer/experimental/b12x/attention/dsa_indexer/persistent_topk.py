@@ -11,19 +11,17 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint32
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_add_global_i32,
-    get_ptr_as_int64,
     red_add_global_release_i32,
-    shared_ptr_to_u32,
-    spin_wait_global_ge_i32,
-    st_global_release_i32,
 )
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, shared_ptr_to_u32
+from b12x._lib.intrinsics.sync import spin_wait_global_ge_i32, st_global_release_i32
 from b12x._lib.compiler import (
     KernelCompileSpec,
     launch as b12x_launch,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,

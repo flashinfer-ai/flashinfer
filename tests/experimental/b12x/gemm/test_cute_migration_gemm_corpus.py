@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
 from b12x._lib.dense_gemm import (
     dense_gemm,
     dense_gemm_fused_quant_a,

@@ -54,7 +54,11 @@ class DirectWeightSession:
         self.native = load()
         if read_mode == "auto":
             caps = self.native.capabilities(device)
-            read_mode = "bounce" if caps["host_page_tables"] else "gds"
+            read_mode = (
+                "bounce" if os.name == "nt" or caps["host_page_tables"] else "gds"
+            )
+        if os.name == "nt" and read_mode == "gds":
+            raise ValueError("GPUDirect Storage checkpoint reads require Linux")
         if read_mode != "gds" and shared_read_group is not None:
             raise ValueError("shared checkpoint reads require the gds transport")
         self.read_mode = read_mode
@@ -239,7 +243,11 @@ class DirectWeightSession:
     def manifest(self, path):
         import torch
 
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
+        fd = (
+            self.native.direct_open(os.fspath(path))
+            if os.name == "nt"
+            else os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
+        )
         self.files.append(fd)
         if self.shared_read_group is not None:
             self.file_identities[fd] = self._file_identity(fd)
@@ -364,6 +372,67 @@ class DirectWeightSession:
                     storage = tensor.untyped_storage()
                     self.sources[storage._cdata] = (storage, entry)
                 yield prefix + entry.name, tensor
+
+    def concatenate(self, destination, sources):
+        """Queue whole checkpoint tensors consecutively into one CUDA allocation.
+
+        This batches compressed components without constructing a destination
+        view and entering a CUDA device context for every source tensor.
+        """
+        import torch
+
+        if (
+            destination.device.type != "cuda"
+            or destination.device.index != self.device
+            or not destination.is_contiguous()
+            or destination.is_neg()
+            or destination.is_conj()
+        ):
+            raise ValueError(
+                "concatenated destination requires contiguous session CUDA storage"
+            )
+        entries = []
+        for source in sources:
+            if source.device.type != "meta":
+                raise ValueError("concatenation requires registered checkpoint tensors")
+            item = self.sources.get(source.untyped_storage()._cdata)
+            if item is None:
+                raise NotImplementedError(
+                    "checkpoint routing performed an unsupported data transformation"
+                )
+            _, entry = item
+            if (
+                source._version != 0
+                or source.storage_offset() != 0
+                or source.shape != entry.shape
+                or source.dtype != entry.dtype
+                or source.dtype != destination.dtype
+                or not source.is_contiguous()
+                or source.is_neg()
+                or source.is_conj()
+            ):
+                raise NotImplementedError(
+                    f"concatenation requires an unmodified whole tensor: {entry.name}"
+                )
+            entries.append(entry)
+        total = sum(entry.nbytes for entry in entries)
+        if total != destination.nbytes:
+            raise ValueError(
+                "concatenated source bytes must exactly fill the destination"
+            )
+        pointer = destination.data_ptr()
+        records = array("Q")
+        for entry in entries:
+            if entry.nbytes:
+                records.extend(
+                    (entry.fd, entry.offset, entry.nbytes, pointer, 0, 1, 0, 0)
+                )
+                pointer += entry.nbytes
+        self.records.extend(records)
+        self.destinations.append(destination)
+        torch.autograd.graph.increment_version(destination)
+        self.payload_bytes += total
+        self.loaded_tensors += len(entries)
 
     def __call__(self, destination, source):
         import torch

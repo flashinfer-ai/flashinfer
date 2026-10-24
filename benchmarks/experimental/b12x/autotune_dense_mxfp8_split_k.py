@@ -33,7 +33,7 @@ from b12x._lib.dense_gemm import (
     _select_mxfp8_tile_k,
     dense_gemm,
 )
-from b12x._lib.utils import get_num_sm
+from b12x._lib.utils.device import get_num_sm
 
 
 BASELINE_COSINE_THRESHOLD = 0.9999

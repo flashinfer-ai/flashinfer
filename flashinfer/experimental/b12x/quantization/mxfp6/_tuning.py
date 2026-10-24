@@ -72,8 +72,8 @@ def _decode(payload: FrozenMapping) -> Mxfp6DenseConfig:
 
 TUNING = TuningContract(
     component_id="quantization.mxfp6",
-    query_schema_version=1,
-    config_schema_version=1,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(Mxfp6DenseQuery.__dataclass_fields__),
     config_fields=frozenset(Mxfp6DenseConfig.__dataclass_fields__),
     encode_query=lambda query: asdict(query),

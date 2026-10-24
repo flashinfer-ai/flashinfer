@@ -14,7 +14,7 @@ import torch
 import b12x
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x._lib.compiler import compile_cache_info
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 
 from b12x.testing.reference.helpers import (
     make_tp_moe_fp4_binding,

@@ -53,8 +53,8 @@ def _validate_config(query, config, device):
 
 TUNING = TuningContract(
     component_id="gemm.mla_query_projection",
-    query_schema_version=1,
-    config_schema_version=1,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(ProjectionQuery)),
     config_fields=frozenset({"backend"}),
     encode_query=asdict,

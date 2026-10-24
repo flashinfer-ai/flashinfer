@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from b12x._lib.fp6 import (
     FLOAT6_E2M3_MAX,
     SF_VEC_SIZE_FP6,

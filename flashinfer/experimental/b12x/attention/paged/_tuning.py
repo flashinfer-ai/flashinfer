@@ -433,8 +433,8 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="attention.gqa",
-    query_schema_version=7,
-    config_schema_version=3,
+    query_schema_version=22,
+    config_schema_version=22,
     semantic_version=1,
     candidate_contract_version=3,
     query_fields=frozenset(GqaQuery.__dataclass_fields__) - {"device"},

@@ -27,17 +27,14 @@ from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
 )
-from b12x._lib.intrinsics import (
-    align_up,
-    as_grouped_scale_view,
-    swizzle_block_scale,
-)
-from b12x._lib.utils import (
+from b12x._lib.intrinsics.math import align_up
+from b12x._lib.intrinsics.reference import as_grouped_scale_view, swizzle_block_scale
+from b12x._lib.utils.device import (
     current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
-    make_ptr,
 )
+from b12x._lib.utils.pointers import make_ptr
 from cutlass.cutlass_dsl import Int32
 from b12x.moe._shared.routing import (
     route_topk as triton_route_topk,

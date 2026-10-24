@@ -112,8 +112,9 @@ def test_packed_forced_a16_fallback_and_quantized_pin_remain_distinct():
     )
     assert TUNING.configure(query, device=device).default == BlockscaledConfig(
         mode="a16",
-        tile_n=64,
-        tile_k=64,
+        tile_m=16,
+        tile_n=128,
+        tile_k=128,
         split_k=1,
     )
     padded = replace(query, num_tokens=1, in_features=192)

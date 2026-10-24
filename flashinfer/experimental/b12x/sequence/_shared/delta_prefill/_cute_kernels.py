@@ -28,24 +28,27 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_add_shared_i32,
-    bf16_mma_m16n8k16_f32,
-    cp_async_bulk_g2s_mbar,
     ld_shared_f32,
     ld_shared_v4_f32,
+    st_shared_v4_f32,
+    st_shared_u32,
+)
+from b12x._lib.intrinsics.memory import (
+    cp_async_bulk_g2s_mbar,
     ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_trans_b16,
-    pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
     st_global_v4_u32,
-    st_shared_v4_f32,
-    st_shared_u32,
-    warp_reduce,
 )
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
+from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
+from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x._lib.program_cache import register_program_cache
 
 from .contract import Binding

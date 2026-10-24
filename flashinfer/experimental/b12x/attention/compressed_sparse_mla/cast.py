@@ -13,7 +13,8 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute, run_compiled
 from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,

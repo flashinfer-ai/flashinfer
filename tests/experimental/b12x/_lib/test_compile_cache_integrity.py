@@ -17,12 +17,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import tempfile
 from threading import RLock
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from filelock import FileLock
 
 
 LIB = Path(__file__).resolve().parents[4] / "flashinfer/experimental/b12x/_lib"
@@ -83,7 +85,7 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             )
         }
         self.modules["cutlass"].cute = self.modules["cutlass.cute"]
-        self.modules["cutlass.cute"].compile = Mock()
+        self.modules["cutlass.cute"].compile = object()
         self.modules[
             "cutlass.base_dsl.export.external_binary_module"
         ].ExternalBinaryModule = self.loader
@@ -109,6 +111,7 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             tempfile=tempfile,
             shutil=shutil,
             contextmanager=contextmanager,
+            FileLock=FileLock,
             nullcontext=nullcontext,
             suppress=suppress,
             atomic_write_bytes=integrity.atomic_write_bytes,
@@ -133,6 +136,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             _DISK_CACHE_HITS=0,
             _COMPILE_MISSES=0,
             _OFFLINE_CUTE_NO_JIT=False,
+            _install_race_fuzz=lambda: None,
+            resolve_compile_options=lambda fn, *_args: fn,
         )
         load_functions(
             LIB / "compiler.py",
@@ -314,23 +319,33 @@ class CompileCacheIntegrityTests(unittest.TestCase):
     def test_publication_fsyncs_file_before_rename_then_directory(self):
         events = []
         real_fsync, real_replace = os.fsync, os.replace
+        real_sync_directory = integrity._fsync_directory
 
         def fsync(fd):
-            events.append("fsync")
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                events.append("fsync")
             real_fsync(fd)
 
         def replace(source, target):
             events.append("replace")
             real_replace(source, target)
 
-        with patch.object(os, "fsync", fsync), patch.object(os, "replace", replace):
+        def sync_directory(path):
+            events.append("directory")
+            real_sync_directory(path)
+
+        with (
+            patch.object(os, "fsync", fsync),
+            patch.object(os, "replace", replace),
+            patch.object(integrity, "_fsync_directory", sync_directory),
+        ):
             self.module._store_cute_compile_to_disk(
                 self.key,
                 self.compiled,
                 cache_payload=(1,),
                 func=object(),
             )
-        self.assertEqual(events, ["fsync", "replace", "fsync"] * 2)
+        self.assertEqual(events, ["fsync", "replace", "directory"] * 2)
         self.assertTrue(self.available(self.program))
 
     def test_failure_before_rename_preserves_previous_file_and_cleans_temporary(self):

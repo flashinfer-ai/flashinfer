@@ -715,7 +715,7 @@ def _compact_launches(plan, caps):
         _get_compiled_mxfp8_rows_quant,
         mxfp8_rows_quant_launch_options,
     )
-    from b12x._lib.utils import get_num_sm
+    from b12x._lib.utils.device import get_num_sm
     from b12x.moe._shared.kernels.w4a8_compact_micro import (
         _compiled_direct_w4a8_compact,
     )

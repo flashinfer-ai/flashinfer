@@ -11,7 +11,7 @@ import cutlass.cute as cute
 import pytest
 import torch
 
-from b12x._lib.utils import convert_sf_from_mma_layout
+from b12x._lib.utils.scale_layout import convert_sf_from_mma_layout
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.quantization import mxfp8 as mxfp8_quant
 from b12x.gemm import blockscaled, mxfp8_linear

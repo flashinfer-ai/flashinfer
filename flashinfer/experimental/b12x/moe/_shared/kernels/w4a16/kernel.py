@@ -23,49 +23,76 @@ from b12x._lib.compiler import (
 )
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_add_global_i32,
+    ld_shared_f32,
+    ld_shared_i32_relaxed,
+    ld_shared_u32,
+    ld_shared_v4_f32,
+    red_add_global_bf16x2,
+    red_add_global_v4_f32,
+    red_add_global_release_i32,
+    red_max_global_f32_nonnegative,
+    st_global_i32,
+    st_shared_bf16_from_f32,
+    st_shared_f16_from_f32,
+    st_shared_f32,
+    st_shared_i32,
+    st_shared_u32,
+    st_shared_v4_f32,
+)
+from b12x._lib.intrinsics.conversion import pack_f32x2_to_f16x2
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import (
+    cp_async4_shared_global,
+    cp_async_u64_shared_global,
+    cp_async4_shared_global_pred,
+    get_ptr_as_int64,
+    ld_global_nc_u32,
+    ld_global_v4_f32,
+    ld_shared_u16_zx,
+    ld_shared_v2_u32,
+    ld_shared_v4_u32,
+    ldmatrix_m8n8x4_b16,
+    ldmatrix_m8n8x2_b16,
+    ld_shared_u16_offset,
+    ld_global_nc_v4_u32,
+    shared_ptr_to_u32,
+    st_global_v4_u32,
+    st_global_v4_f32,
+    st_shared_u64,
+    st_shared_v4_u32,
+)
+from b12x._lib.intrinsics.mma import (
     bf16_mma_m16n8k16_f32,
     bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
+    f16_mma_m16n8k16_f32,
+    f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
+)
+from b12x._lib.intrinsics.packed import (
     bfloat2_broadcast_lane,
     bfloat2_mul,
     bfloat2_to_float2_scaled,
     broadcast_f32_to_half2,
     broadcast_f32_to_bfloat2,
-    cp_async4_shared_global,
-    cp_async_u64_shared_global,
-    cp_async4_shared_global_pred,
-    fabs_f32,
-    fmax_f32,
-    f16_mma_m16n8k16_f32,
-    f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
     fp8x4_e4m3_to_half2x2,
     half2_to_float2_scaled,
-    get_ptr_as_int64,
     half2_mul,
-    ld_global_acquire_i32,
-    ld_global_nc_u32,
-    ld_global_v4_f32,
-    ld_shared_f32,
-    ld_shared_i32_relaxed,
-    ld_shared_u16_zx,
-    ld_shared_u32,
-    ld_shared_v2_u32,
-    ld_shared_v4_f32,
-    ld_shared_v4_u32,
-    ldmatrix_m8n8x4_b16,
-    ldmatrix_m8n8x2_b16,
     packed_dequant_e2m1x4_to_bfloat2x2,
     packed_dequant_e2m1x4_to_half2x2,
     packed_dequant_e4m3x4_to_bfloat2x2,
     packed_dequant_e4m3x4_to_half2x2,
     packed_dequant_e8m0x4_to_bfloat2x2,
     packed_dequant_e8m0x4_to_half2x2,
+    pack_f32x2_to_bfloat2,
+)
+from b12x._lib.intrinsics.reduction import warp_reduce
+from b12x._lib.intrinsics.sync import ld_global_acquire_i32, threadfence
+from b12x._lib.intrinsics.trellis import (
     packed_decode_iq2_xs_to_bfloat2x4,
     iq2_xxs_descriptor_pair,
     q8_0_pair_to_bf16x2,
-    ld_shared_u16_offset,
     packed_dequant_trellis_to_bfloat2x4,
     packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_bfloat2x4,
@@ -74,28 +101,7 @@ from b12x._lib.intrinsics import (
     packed_decode_lut_fp16_to_half2x4,
     packed_decode_lut_e4m3_to_e4m3x8,
     packed_decode_lut_e4m3_direct_to_e4m3x8,
-    ld_global_nc_v4_u32,
-    pack_f32x2_to_bfloat2,
-    pack_f32x2_to_f16x2,
-    red_add_global_bf16x2,
-    red_add_global_v4_f32,
-    red_add_global_release_i32,
-    red_max_global_f32_nonnegative,
-    shared_ptr_to_u32,
-    st_global_v4_u32,
-    st_global_i32,
-    st_global_v4_f32,
-    st_shared_bf16_from_f32,
-    st_shared_f16_from_f32,
-    st_shared_f32,
-    st_shared_i32,
-    st_shared_u32,
-    st_shared_u64,
-    st_shared_v4_f32,
-    st_shared_v4_u32,
-    threadfence,
     trellis_align_stream_u32x2,
-    warp_reduce,
 )
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
 from b12x._lib.quant.lut_e4m3 import (
@@ -114,7 +120,8 @@ from b12x.moe._shared.trellis_codebooks import (
 from b12x._lib.quant.lut_fp16 import (
     lut_fp16_segment_table,
 )
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.moe._shared.kernels.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )

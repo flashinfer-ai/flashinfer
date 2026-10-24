@@ -30,7 +30,6 @@ from b12x.attention.paged.planner import create_paged_plan
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._scratch import build_paged_attention_binding
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
-from b12x._lib import b12x_package_fingerprint
 
 
 _REFERENCE_MINIMUM_COSINE = 0.999
@@ -623,7 +622,6 @@ def _initialize_raw_sample_log(
             "commit": _git_value("rev-parse", "HEAD"),
             "branch": _git_value("branch", "--show-current"),
             "dirty_paths": _git_value("status", "--short").splitlines(),
-            "b12x_package_fingerprint": b12x_package_fingerprint(),
             "benchmark_sha256": benchmark_dependencies[
                 str(benchmark_path.relative_to(repo))
             ],

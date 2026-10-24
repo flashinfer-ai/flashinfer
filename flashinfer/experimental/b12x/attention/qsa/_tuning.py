@@ -284,8 +284,8 @@ def _encode_query(query: QsaQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="attention.qsa",
-    query_schema_version=7,
-    config_schema_version=2,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset(QsaConfig.__dataclass_fields__),
     encode_query=_encode_query,

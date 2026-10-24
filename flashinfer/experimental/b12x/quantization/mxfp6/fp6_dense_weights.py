@@ -37,7 +37,7 @@ from b12x._lib.fp6 import (
     as_grouped_mxfp6_scale_view,
     mx_gs_numerator,
 )
-from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes
 from b12x._lib.dense_gemm import dense_gemm, _DENSE_FUSED_QUANT
 
 _TILE = 128  # MX-FP6 GPU quantizer tile (M and K must be multiples of this)

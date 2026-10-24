@@ -163,7 +163,7 @@ def _use_sm120_sparse_mla(*, backend: str | None, device: torch.device) -> bool:
         )
     if device.type != "cuda":
         return False
-    from b12x._lib.intrinsics import get_sm_version
+    from b12x._lib.intrinsics.arch import get_sm_version
 
     return get_sm_version(device) >= 120
 

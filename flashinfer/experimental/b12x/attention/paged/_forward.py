@@ -20,7 +20,7 @@ from b12x._lib.compiler import (
     launch as b12x_launch,
     run_compiled,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.compile_plan import attach_programs, compile_only_launches_enabled
 from ._controls import paged_control, paged_controls, snapshot_paged_controls
 

@@ -27,24 +27,12 @@ from b12x.attention._shared.cute import (
     pipeline as cute_pipeline,
 )
 from b12x.attention._shared.cute import ops as attention_ops
-from b12x._lib.intrinsics import (
-    get_ptr_as_int64,
-    shared_ptr_to_u32,
-)
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.smem import (
     make_smem_memrange_alias,
     make_tma_aligned_payload_storage,
 )
-from b12x._lib.intrinsics import (
-    bf16_mma_m16n16k16_f32,
-    bf16_rowsum_m16k16_f32,
-    bfloat2_mul,
-    broadcast_f32_to_bfloat2,
-    cvt_bf16x2x2_to_e4m3x4,
-    cvt_bf16x2_to_e4m3x2,
-    fp8x4_e4m3_to_bfloat2x2,
-    fp8x4_e4m3_to_bfloat2x2_native_sm120,
-    fp8x4_e4m3_to_bfloat2x2_via_f16,
+from b12x._lib.intrinsics.memory import (
     ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
@@ -53,12 +41,22 @@ from b12x._lib.intrinsics import (
     ldmatrix_m8n8x4_trans_left_half_b16,
     ldmatrix_m8n8x4_trans_right_half_b16,
     ldmatrix_m16n16x1_trans_b8,
-    mxfp8_mma_m16n8k32_f32_e4m3,
+    st_global_v4_u32,
+    st_shared_v4_u32,
+)
+from b12x._lib.intrinsics.mma import bf16_mma_m16n16k16_f32, mxfp8_mma_m16n8k32_f32_e4m3
+from b12x._lib.intrinsics.packed import (
+    bf16_rowsum_m16k16_f32,
+    bfloat2_mul,
+    broadcast_f32_to_bfloat2,
+    cvt_bf16x2x2_to_e4m3x4,
+    cvt_bf16x2_to_e4m3x2,
+    fp8x4_e4m3_to_bfloat2x2,
+    fp8x4_e4m3_to_bfloat2x2_native_sm120,
+    fp8x4_e4m3_to_bfloat2x2_via_f16,
     pack_f32x2_to_bfloat2,
     frag_layout_swizzle_16b_to_8b,
     frag_layout_swizzle_16b_to_8b_trans,
-    st_global_v4_u32,
-    st_shared_v4_u32,
 )
 
 from .traits import PagedForwardTraits

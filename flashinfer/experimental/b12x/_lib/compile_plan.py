@@ -344,7 +344,7 @@ class DeferredCuTeKernel:
             )
         record_program(self.__b12x_programs__[0])
         if self._resolved is None:
-            from . import compiler
+            from b12x._lib import compiler
             from .runtime_control import raise_if_kernel_resolution_frozen
 
             program = self.__b12x_programs__[0]
@@ -505,7 +505,7 @@ def serialized_compilations():
 def _locked_triton_compile(
     compile_fn, source, target=None, options=None, _env_vars=None
 ):
-    import fcntl
+    from filelock import FileLock
     from pathlib import Path
     from triton.compiler.compiler import get_cache_manager
 
@@ -517,14 +517,8 @@ def _locked_triton_compile(
             "parallel Triton compilation requires its local persistent cache"
         )
     Path(directory).mkdir(parents=True, exist_ok=True)
-    with (Path(directory) / ".b12x-compile.lock").open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            result = compile_fn(
-                source, target=target, options=options, _env_vars=_env_vars
-            )
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with FileLock(Path(directory) / ".b12x-compile.lock"):
+        result = compile_fn(source, target=target, options=options, _env_vars=_env_vars)
     record_program(program)
     return result
 

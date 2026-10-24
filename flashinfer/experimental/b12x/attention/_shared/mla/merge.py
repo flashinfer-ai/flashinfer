@@ -13,13 +13,11 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import ld_shared_f32, st_shared_f32, store_v4_bf16x2
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v4_u32,
-    ld_shared_f32,
     shared_ptr_to_u32,
-    st_shared_f32,
-    store_v4_bf16x2,
 )
 
 from b12x.attention._shared.cute import ops as attention_ops
@@ -31,7 +29,7 @@ from b12x._lib.compiler import (
     run_compiled,
     tensor_compile_fact,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 
 from .decode_math import _exp2_approx_ftz_f32, _u32_to_f32
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM

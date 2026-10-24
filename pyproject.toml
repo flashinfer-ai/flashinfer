@@ -77,7 +77,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 
 [tool.setuptools.package-data]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
-"flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
+"flashinfer.experimental.b12x.loader" = ["*.c", "*.cpp", "*.h"]
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
 "flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]

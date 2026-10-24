@@ -67,7 +67,7 @@ TUNING = replace(
         query_type=PleEmbeddingQuery,
         backend="triton",
     ),
-    query_schema_version=3,
+    query_schema_version=22,
     validate_query=_validate_query,
 )
 

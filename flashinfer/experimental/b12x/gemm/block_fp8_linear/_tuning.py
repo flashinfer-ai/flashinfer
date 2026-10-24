@@ -85,8 +85,8 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.block_fp8_linear",
-    query_schema_version=6,
-    config_schema_version=4,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(BlockFp8LinearQuery.__dataclass_fields__),
     config_fields=dense.TUNING.config_fields,
     encode_query=lambda query: {

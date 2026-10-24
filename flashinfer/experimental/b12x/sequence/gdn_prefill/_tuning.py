@@ -257,8 +257,8 @@ def _encode_query(query: GdnPrefillQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="sequence.gdn_prefill",
-    query_schema_version=5,
-    config_schema_version=2,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset(
         {

@@ -22,7 +22,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import cuda_stream_to_int, get_num_sm
+from b12x._lib.utils.device import cuda_stream_to_int, get_num_sm
 from b12x.gemm.wo_projection._tuning import WoProjectionConfig
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache

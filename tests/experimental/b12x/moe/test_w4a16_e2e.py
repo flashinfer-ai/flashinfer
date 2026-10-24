@@ -4,8 +4,8 @@ from contextlib import ExitStack
 import pytest
 import torch
 
-from b12x._lib.intrinsics import (
-    FLOAT4_E2M1_MAX,
+from b12x._lib.intrinsics.constants import FLOAT4_E2M1_MAX
+from b12x._lib.intrinsics.reference import (
     fp4_quantize_values_torch,
     pack_grouped_fp4_values,
     swizzle_block_scale,

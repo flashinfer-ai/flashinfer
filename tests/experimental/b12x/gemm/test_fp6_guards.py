@@ -10,7 +10,7 @@ from __future__ import annotations
 import cutlass
 import pytest
 
-from b12x._lib.utils import mxfp6_packed_k_bytes, mxfp6_tile_k
+from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes, mxfp6_tile_k
 from b12x._lib.dense_gemm import DenseGemmKernel
 
 

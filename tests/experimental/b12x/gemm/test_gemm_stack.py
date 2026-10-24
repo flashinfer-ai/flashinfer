@@ -5,7 +5,7 @@ import torch
 import cutlass
 
 import b12x._lib.dense_gemm as dense_module
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
 from b12x._lib.dense_gemm import (
     DenseGemmKernel,
     _select_default_dense_gemm_plan,
