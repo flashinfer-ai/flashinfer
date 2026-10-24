@@ -839,7 +839,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "b3fc9dbb7d81db346fb3fbd3ef0ac56edc237afab1136a3942254dac408384fe",
+      "closure_sha256": "e6c333f9c34d176c0d33dc1d345f0c73d772d0ef362bb3ea3ac9a6db9878b011",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -850,8 +850,8 @@
       "nvcc_flags_if": [],
       "path": "aot/cake_gdp_f2f0c7abbf10082a6996_sm_100a.so",
       "sha256": {
-        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "e78d4591b0d24d7d5bf91f246c6af9eabb9bace48315a11bd18597399c01e17a",
-        "csrc/cake_gdp_f2f0c7abbf10082a6996_binding.cu": "36d75682cd4beef87565bb57789004c0855ae461653a3d2cb7da24eb870ce275"
+        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "1baa1ddd8cca8e3a18d50e6b9f09f41ff2a6582e30085e50425660bf513e0dcf",
+        "csrc/cake_gdp_f2f0c7abbf10082a6996_binding.cu": "1a44e6903dcd46607efb9c274fdce62f061fd9f98d9fc946d1ac7cbcb5bec72d"
       },
       "sources": [
         "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu",
@@ -860,7 +860,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "3cec95074dfcfbd87b66cd51d0d8e77e3e7ad56a1317f6e5a3109a0b9688fb63",
+      "closure_sha256": "6c1688d28975a1ab75e1347567d3436a2ac648b32c406902c237a9bde3fb9fd4",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -871,8 +871,8 @@
       "nvcc_flags_if": [],
       "path": "aot/cake_gdp_f2f0c7abbf10082a6996_sm_103a.so",
       "sha256": {
-        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "e78d4591b0d24d7d5bf91f246c6af9eabb9bace48315a11bd18597399c01e17a",
-        "csrc/cake_gdp_f2f0c7abbf10082a6996_binding.cu": "36d75682cd4beef87565bb57789004c0855ae461653a3d2cb7da24eb870ce275"
+        "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu": "1baa1ddd8cca8e3a18d50e6b9f09f41ff2a6582e30085e50425660bf513e0dcf",
+        "csrc/cake_gdp_f2f0c7abbf10082a6996_binding.cu": "1a44e6903dcd46607efb9c274fdce62f061fd9f98d9fc946d1ac7cbcb5bec72d"
       },
       "sources": [
         "csrc/cake_gdp_f2f0c7abbf10082a6996_kernel.cu",
