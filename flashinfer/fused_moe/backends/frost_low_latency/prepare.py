@@ -126,3 +126,37 @@ def _prepare_float16_weights(w1, w2, activation, dtype):
     second = torch.zeros((e, h, physical), dtype=w2.dtype, device=w2.device)
     second[:, :, :i].copy_(w2)
     return dict(w1_weight=first.view(e, branches * physical, h), w2_weight=second)
+
+
+def prepare_fp8_per_tensor_weights(w1_bf16, w2_bf16, **kwargs):
+    from ...prepare import prepare_cutlass_fp8_per_tensor_weights
+    from ...api import SwiGLU
+    from .fma.activation_config import lower_activation
+
+    activation = kwargs.get("activation") or SwiGLU()
+    lower_activation(activation)
+    view = prepare_cutlass_fp8_per_tensor_weights(w1_bf16, w2_bf16, **kwargs)
+    e, h, i = view["fc2_expert_weights"].shape
+    if h % 128 or i % 32:
+        raise ValueError("Frost FP8 requires H divisible by 128 and I by 32")
+    p = (i + 127) // 128 * 128
+    if p != i:
+        branches = 2 if activation.is_gated else 1
+        first = torch.zeros(
+            (e, branches, p, h),
+            device=view["fc1_expert_weights"].device,
+            dtype=torch.float8_e4m3fn,
+        )
+        first[:, :, :i].copy_(view["fc1_expert_weights"].reshape(e, branches, i, h))
+        second = torch.zeros(
+            (e, h, p),
+            device=view["fc2_expert_weights"].device,
+            dtype=torch.float8_e4m3fn,
+        )
+        second[:, :, :i].copy_(view["fc2_expert_weights"])
+        view = dict(
+            view,
+            fc1_expert_weights=first.view(e, branches * p, h),
+            fc2_expert_weights=second,
+        )
+    return view

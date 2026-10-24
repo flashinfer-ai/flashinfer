@@ -89,7 +89,7 @@ kernel_cake_kda_train_8d99ea1be1c1fef432a5(int* __restrict__ cu_seqlens, int num
     int* starts = reinterpret_cast<int*>(smem_raw + 64);
     const int starts_addr = smem + 64;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int tid_0 = tid;
     int lane_1 = lane;
     int warp_2 = warp;

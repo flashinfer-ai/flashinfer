@@ -14,206 +14,33 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#define CAKE_DSA_H64_TRAIN_NEED_APPROX_EXP2
+#define CAKE_DSA_H64_TRAIN_NEED_ELECT_SYNC
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_ARRIVE
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_ARRIVE_EXPECT_TX
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_INIT
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_WAIT
+#define CAKE_DSA_H64_TRAIN_NEED_TCGEN05_COMMIT
+#define CAKE_DSA_H64_TRAIN_NEED_TMA_4D_GMEM2SMEM
+#define CAKE_DSA_H64_TRAIN_NEED_TMA_STORE_4D
+#include "cake_dsa_h64_train_device.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_OFFSET 0
-#define NUM_MAIN_STAGES 1
-#define SMEM_Q_K_OFF 1024
-#define SMEM_Q_K_STAGE_BYTES 65536
-#define SMEM_Q_K_STRIDE 65536
-#define SMEM_Q_MN_OFF 1024
-#define SMEM_Q_MN_STAGE_BYTES 16384
-#define SMEM_Q_MN_STRIDE 16384
-#define SMEM_DO_K_OFF 66560
-#define SMEM_DO_K_STAGE_BYTES 65536
-#define SMEM_DO_K_STRIDE 65536
-#define SMEM_DO_MN_OFF 66560
-#define SMEM_DO_MN_STAGE_BYTES 16384
-#define SMEM_DO_MN_STRIDE 16384
-#define SMEM_K_K_OFF 132096
-#define SMEM_K_K_STAGE_BYTES 65536
-#define SMEM_K_K_STRIDE 65536
-#define SMEM_V_K_OFF 132096
-#define SMEM_V_K_STAGE_BYTES 65536
-#define SMEM_V_K_STRIDE 65536
-#define SMEM_K_MN_OFF 132096
-#define SMEM_K_MN_STAGE_BYTES 16384
-#define SMEM_K_MN_STRIDE 16384
-#define SMEM_K_BLK_OFF 132096
-#define SMEM_K_BLK_STAGE_BYTES 8192
-#define SMEM_K_BLK_STRIDE 8192
-#define SMEM_DO_BLK_OFF 66560
-#define SMEM_DO_BLK_STAGE_BYTES 8192
-#define SMEM_DO_BLK_STRIDE 8192
-#define SMEM_P_K_OFF 197632
-#define SMEM_P_K_STAGE_BYTES 8192
-#define SMEM_P_K_STRIDE 8192
-#define SMEM_DS_K_OFF 205824
-#define SMEM_DS_K_STAGE_BYTES 8192
-#define SMEM_DS_K_STRIDE 8192
-#define SMEM_DS_MN_OFF 205824
-#define SMEM_DS_MN_STAGE_BYTES 8192
-#define SMEM_DS_MN_STRIDE 8192
-#define SMEM_STATS_OFF 214016
-#define SMEM_STATS_STAGE_BYTES 512
-#define SMEM_STATS_STRIDE 512
-#define SMEM_TILE_IDX_OFF 214528
-#define SMEM_TILE_IDX_STAGE_BYTES 640
-#define SMEM_TILE_IDX_STRIDE 640
-#define SMEM_VALIDITY8_OFF 214528
-#define SMEM_VALIDITY8_STAGE_BYTES 640
-#define SMEM_VALIDITY8_STRIDE 640
-#define SMEM_VALIDITY32_OFF 214528
-#define SMEM_VALIDITY32_STAGE_BYTES 640
-#define SMEM_VALIDITY32_STRIDE 640
-#define SMEM_BLOCKS_WORD_OFF 215168
-#define SMEM_BLOCKS_WORD_STAGE_BYTES 8
-#define SMEM_BLOCKS_WORD_STRIDE 8
-#define SMEM_TOTAL 215296
-#define THREADS 640
 #define LAUNCH_MIN_BLOCKS 1
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-
-
-
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-
-
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-
-
-__device__ __forceinline__ float approx_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-
-
-
-__device__ __forceinline__ void tma_4d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.4d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4, %5}], [%6];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
-           "r"(mbar_addr) : "memory");
-}
-
-
-
-__device__ __forceinline__ void tma_store_4d(
-    const void *tmap, int x, int y, int z, int w, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2, %3, %4}], [%5];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
+#ifndef DKV_NATURAL
+#define DKV_NATURAL 0
+#endif
+#if DKV_NATURAL != 0 && DKV_NATURAL != 1
+#error "DKV_NATURAL must be 0 or 1"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_h64_nope_train_90ab03044736858291f5
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(640, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap kv_latent, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, int dkv_stride, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap kv_latent, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, int dkv_stride, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -254,46 +81,24 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
     #define dkv_b_full_addr (mbar_base + 208)
     #define dkv_b_drained_addr (mbar_base + 216)
 
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
-
     // Kernel setup ops
-    __nv_bfloat16* q_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_k_addr = smem + 1024;
-    __nv_bfloat16* q_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_mn_addr = smem + 1024;
-    __nv_bfloat16* do_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
     const int do_k_addr = smem + 66560;
-    __nv_bfloat16* do_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
     const int do_mn_addr = smem + 66560;
-    __nv_bfloat16* k_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int k_k_addr = smem + 132096;
-    __nv_bfloat16* v_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int v_k_addr = smem + 132096;
-    __nv_bfloat16* k_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int k_mn_addr = smem + 132096;
-    __nv_bfloat16* k_blk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int k_blk_addr = smem + 132096;
-    __nv_bfloat16* do_blk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
     const int do_blk_addr = smem + 66560;
-    __nv_bfloat16* p_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
     const int p_k_addr = smem + 197632;
-    __nv_bfloat16* ds_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
     const int ds_k_addr = smem + 205824;
-    __nv_bfloat16* ds_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
     const int ds_mn_addr = smem + 205824;
     float* stats = reinterpret_cast<float*>(smem_raw + 214016);
-    const int stats_addr = smem + 214016;
     int* tile_idx = reinterpret_cast<int*>(smem_raw + 214528);
-    const int tile_idx_addr = smem + 214528;
     uint8_t* validity8 = reinterpret_cast<uint8_t*>(smem_raw + 214528);
-    const int validity8_addr = smem + 214528;
     unsigned int* validity32 = reinterpret_cast<unsigned int*>(smem_raw + 214528);
-    const int validity32_addr = smem + 214528;
     int* blocks_word = reinterpret_cast<int*>(smem_raw + 215168);
-    const int blocks_word_addr = smem + 215168;
     if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_latent))) : "memory"); }
     if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dout))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_latent))) : "memory"); }
@@ -392,7 +197,6 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
             int tord = 0;
             #pragma unroll 1
             for (int tk = 0; tk < ntok; tk++) {
-                int tok = blockIdx.x + tk * gridDim.x;
                 int pw = warp;
                 int bslot = (int)((unsigned int)tk % 2);
                 int _phase_bslot = (int)((unsigned int)tk / 2 % 2);
@@ -2575,7 +2379,6 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
             int tord_2 = 0;
             #pragma unroll 1
             for (int tk_2 = 0; tk_2 < ntok_2; tk_2++) {
-                int tok_2 = blockIdx.x + tk_2 * gridDim.x;
                 int lane_0_1 = lane;
                 int w2 = (warp - 8) % 4;
                 int wg = (warp - 8) / 4;
@@ -2586,6 +2389,9 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
                 int blocks_2 = blocks_word[bslot_2];
                 mbarrier_arrive(blocks_free_addr + (bslot_2) * 8);
                 int lpos = 32 * w2 + 4 * (lane_0_1 / 4);
+#if DKV_NATURAL == 1
+                int npos = 32 * w2 + 8 * (lane_0_1 >> 2 & 3) + 4 * (lane_0_1 >> 4);
+#endif
                 #pragma unroll 1
                 for (int i_2 = tord_2; i_2 < tord_2 + blocks_2; i_2++) {
                     int slot_2 = (int)((unsigned int)i_2 % 2);
@@ -2601,6 +2407,43 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
                     keys[6] = tile_idx[slot_2 * 80 + wg * 32 + 24 + 2 * (lane_0_1 % 4)];
                     keys[7] = tile_idx[slot_2 * 80 + wg * 32 + 24 + 2 * (lane_0_1 % 4) + 1];
                     mbarrier_arrive(idx_free_addr + (slot_2) * 8);
+#if DKV_NATURAL == 1
+                    int rows_1[8];
+                    rows_1[0] = keys[0];
+                    rows_1[1] = keys[1];
+                    rows_1[2] = keys[2];
+                    rows_1[3] = keys[3];
+                    rows_1[4] = keys[4];
+                    rows_1[5] = keys[5];
+                    rows_1[6] = keys[6];
+                    rows_1[7] = keys[7];
+                    if (dkv_has_map != 0) {
+                        if (keys[0] >= 0) {
+                            rows_1[0] = dkv_dst_map[(long long)keys[0]];
+                        }
+                        if (keys[1] >= 0) {
+                            rows_1[1] = dkv_dst_map[(long long)keys[1]];
+                        }
+                        if (keys[2] >= 0) {
+                            rows_1[2] = dkv_dst_map[(long long)keys[2]];
+                        }
+                        if (keys[3] >= 0) {
+                            rows_1[3] = dkv_dst_map[(long long)keys[3]];
+                        }
+                        if (keys[4] >= 0) {
+                            rows_1[4] = dkv_dst_map[(long long)keys[4]];
+                        }
+                        if (keys[5] >= 0) {
+                            rows_1[5] = dkv_dst_map[(long long)keys[5]];
+                        }
+                        if (keys[6] >= 0) {
+                            rows_1[6] = dkv_dst_map[(long long)keys[6]];
+                        }
+                        if (keys[7] >= 0) {
+                            rows_1[7] = dkv_dst_map[(long long)keys[7]];
+                        }
+                    }
+#endif
                     int _parity_dkv_a_full = (int)((unsigned int)i_2 % 2);
                     mbarrier_wait(dkv_a_full_addr, _parity_dkv_a_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -2629,53 +2472,189 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(dkv_a_drained_addr);
+#if DKV_NATURAL == 1
+                    float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[0] : a0[2]), 4);
+                    float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[16] : a0[18]), 4);
+                    float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_0 : a0[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_1 : a0[16])), 8);
+                    float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_0) : (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_1)), 8);
+                    float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[0] : a1[2]), 4);
+                    float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[16] : a1[18]), 4);
+                    float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_4 : a1[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_5 : a1[16])), 8);
+                    float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_4) : (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_5)), 8);
+#endif
                     int key = keys[0];
                     if (key >= 0) {
+#if DKV_NATURAL == 1
+                        int row = rows_1[0];
+                        long long base = (long long)row * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_2 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_0 : a0[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_3 : (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_0))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_1 : a0[16]) : _shfl_xor_2)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_1) : _shfl_xor_3)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_6 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_4 : a1[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_7 : (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_4))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_5 : a1[16]) : _shfl_xor_6)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_5) : _shfl_xor_7)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base = (long long)key * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base])), "f"(a0[0]), "f"(a0[2]), "f"(a0[16]), "f"(a0[18]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base + 128])), "f"(a1[0]), "f"(a1[2]), "f"(a1[16]), "f"(a1[18]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[1] : a0[3]), 4);
+                    float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[17] : a0[19]), 4);
+                    float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_8 : a0[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_9 : a0[17])), 8);
+                    float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_8) : (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_9)), 8);
+                    float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[1] : a1[3]), 4);
+                    float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[17] : a1[19]), 4);
+                    float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_12 : a1[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_13 : a1[17])), 8);
+                    float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_12) : (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_13)), 8);
+#endif
                     int key_0 = keys[1];
                     if (key_0 >= 0) {
+#if DKV_NATURAL == 1
+                        int row_1 = rows_1[1];
+                        long long base_1 = (long long)row_1 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_10 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_8 : a0[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_11 : (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_8))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_9 : a0[17]) : _shfl_xor_10)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_9) : _shfl_xor_11)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_14 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_12 : a1[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_15 : (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_12))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_13 : a1[17]) : _shfl_xor_14)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_13) : _shfl_xor_15)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base_1 = (long long)key_0 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1])), "f"(a0[1]), "f"(a0[3]), "f"(a0[17]), "f"(a0[19]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1 + 128])), "f"(a1[1]), "f"(a1[3]), "f"(a1[17]), "f"(a1[19]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[4] : a0[6]), 4);
+                    float _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[20] : a0[22]), 4);
+                    float _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_16 : a0[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_17 : a0[20])), 8);
+                    float _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_16) : (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_17)), 8);
+                    float _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[4] : a1[6]), 4);
+                    float _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[20] : a1[22]), 4);
+                    float _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_20 : a1[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_21 : a1[20])), 8);
+                    float _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_20) : (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_21)), 8);
+#endif
                     int key_1 = keys[2];
                     if (key_1 >= 0) {
+#if DKV_NATURAL == 1
+                        int row_2 = rows_1[2];
+                        long long base_2 = (long long)row_2 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_18 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_16 : a0[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_19 : (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_16))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_17 : a0[20]) : _shfl_xor_18)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_17) : _shfl_xor_19)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_22 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_20 : a1[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_23 : (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_20))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_21 : a1[20]) : _shfl_xor_22)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_21) : _shfl_xor_23)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base_2 = (long long)key_1 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2])), "f"(a0[4]), "f"(a0[6]), "f"(a0[20]), "f"(a0[22]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2 + 128])), "f"(a1[4]), "f"(a1[6]), "f"(a1[20]), "f"(a1[22]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[5] : a0[7]), 4);
+                    float _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[21] : a0[23]), 4);
+                    float _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_24 : a0[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_25 : a0[21])), 8);
+                    float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_24) : (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_25)), 8);
+                    float _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[5] : a1[7]), 4);
+                    float _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[21] : a1[23]), 4);
+                    float _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_28 : a1[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_29 : a1[21])), 8);
+                    float _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_28) : (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_29)), 8);
+#endif
                     int key_2 = keys[3];
                     if (key_2 >= 0) {
+#if DKV_NATURAL == 1
+                        int row_3 = rows_1[3];
+                        long long base_3 = (long long)row_3 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_26 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_24 : a0[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_27 : (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_24))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_25 : a0[21]) : _shfl_xor_26)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_25) : _shfl_xor_27)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_30 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_28 : a1[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_31 : (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_28))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_29 : a1[21]) : _shfl_xor_30)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_29) : _shfl_xor_31)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base_3 = (long long)key_2 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3])), "f"(a0[5]), "f"(a0[7]), "f"(a0[21]), "f"(a0[23]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3 + 128])), "f"(a1[5]), "f"(a1[7]), "f"(a1[21]), "f"(a1[23]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[8] : a0[10]), 4);
+                    float _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[24] : a0[26]), 4);
+                    float _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_32 : a0[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_33 : a0[24])), 8);
+                    float _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_32) : (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_33)), 8);
+                    float _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[8] : a1[10]), 4);
+                    float _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[24] : a1[26]), 4);
+                    float _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_36 : a1[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_37 : a1[24])), 8);
+                    float _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_36) : (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_37)), 8);
+#endif
                     int key_3 = keys[4];
                     if (key_3 >= 0) {
+#if DKV_NATURAL == 1
+                        int row_4 = rows_1[4];
+                        long long base_4 = (long long)row_4 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_34 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_32 : a0[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_35 : (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_32))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_33 : a0[24]) : _shfl_xor_34)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_33) : _shfl_xor_35)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_38 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_36 : a1[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_39 : (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_36))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_37 : a1[24]) : _shfl_xor_38)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_37) : _shfl_xor_39)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base_4 = (long long)key_3 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4])), "f"(a0[8]), "f"(a0[10]), "f"(a0[24]), "f"(a0[26]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4 + 128])), "f"(a1[8]), "f"(a1[10]), "f"(a1[24]), "f"(a1[26]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[9] : a0[11]), 4);
+                    float _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[25] : a0[27]), 4);
+                    float _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_40 : a0[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_41 : a0[25])), 8);
+                    float _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_40) : (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_41)), 8);
+                    float _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[9] : a1[11]), 4);
+                    float _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[25] : a1[27]), 4);
+                    float _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_44 : a1[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_45 : a1[25])), 8);
+                    float _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_44) : (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_45)), 8);
+#endif
                     int key_4 = keys[5];
                     if (key_4 >= 0) {
+#if DKV_NATURAL == 1
+                        int row_5 = rows_1[5];
+                        long long base_5 = (long long)row_5 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_42 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_40 : a0[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_43 : (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_40))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_41 : a0[25]) : _shfl_xor_42)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_41) : _shfl_xor_43)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_46 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_44 : a1[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_47 : (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_44))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_45 : a1[25]) : _shfl_xor_46)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_45) : _shfl_xor_47)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base_5 = (long long)key_4 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5])), "f"(a0[9]), "f"(a0[11]), "f"(a0[25]), "f"(a0[27]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5 + 128])), "f"(a1[9]), "f"(a1[11]), "f"(a1[25]), "f"(a1[27]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[12] : a0[14]), 4);
+                    float _shfl_xor_49 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[28] : a0[30]), 4);
+                    float _shfl_xor_50 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_48 : a0[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_49 : a0[28])), 8);
+                    float _shfl_xor_51 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_48) : (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_49)), 8);
+                    float _shfl_xor_52 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[12] : a1[14]), 4);
+                    float _shfl_xor_53 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[28] : a1[30]), 4);
+                    float _shfl_xor_54 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_52 : a1[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_53 : a1[28])), 8);
+                    float _shfl_xor_55 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_52) : (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_53)), 8);
+#endif
                     int key_5 = keys[6];
                     if (key_5 >= 0) {
+#if DKV_NATURAL == 1
+                        int row_6 = rows_1[6];
+                        long long base_6 = (long long)row_6 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_50 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_48 : a0[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_51 : (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_48))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_49 : a0[28]) : _shfl_xor_50)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_49) : _shfl_xor_51)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_54 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_52 : a1[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_55 : (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_52))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_53 : a1[28]) : _shfl_xor_54)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_53) : _shfl_xor_55)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base_6 = (long long)key_5 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6])), "f"(a0[12]), "f"(a0[14]), "f"(a0[28]), "f"(a0[30]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6 + 128])), "f"(a1[12]), "f"(a1[14]), "f"(a1[28]), "f"(a1[30]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_56 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[13] : a0[15]), 4);
+                    float _shfl_xor_57 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[29] : a0[31]), 4);
+                    float _shfl_xor_58 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_56 : a0[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_57 : a0[29])), 8);
+                    float _shfl_xor_59 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_56) : (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_57)), 8);
+                    float _shfl_xor_60 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[13] : a1[15]), 4);
+                    float _shfl_xor_61 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[29] : a1[31]), 4);
+                    float _shfl_xor_62 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_60 : a1[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_61 : a1[29])), 8);
+                    float _shfl_xor_63 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_60) : (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_61)), 8);
+#endif
                     int key_6 = keys[7];
                     if (key_6 >= 0) {
+#if DKV_NATURAL == 1
+                        int row_7 = rows_1[7];
+                        long long base_7 = (long long)row_7 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_58 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_56 : a0[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_59 : (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_56))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_57 : a0[29]) : _shfl_xor_58)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_57) : _shfl_xor_59)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_62 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_60 : a1[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_63 : (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_60))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_61 : a1[29]) : _shfl_xor_62)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_61) : _shfl_xor_63)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base_7 = (long long)key_6 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7])), "f"(a0[13]), "f"(a0[15]), "f"(a0[29]), "f"(a0[31]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7 + 128])), "f"(a1[13]), "f"(a1[15]), "f"(a1[29]), "f"(a1[31]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
                     int _parity_dkv_b_full = (int)((unsigned int)i_2 % 2);
                     mbarrier_wait(dkv_b_full_addr, _parity_dkv_b_full);
@@ -2703,53 +2682,189 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(dkv_b_drained_addr);
+#if DKV_NATURAL == 1
+                    float _shfl_xor_64 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[0] : a0[2]), 4);
+                    float _shfl_xor_65 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[16] : a0[18]), 4);
+                    float _shfl_xor_66 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_64 : a0[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_65 : a0[16])), 8);
+                    float _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_64) : (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_65)), 8);
+                    float _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[0] : a1[2]), 4);
+                    float _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[16] : a1[18]), 4);
+                    float _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_68 : a1[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_69 : a1[16])), 8);
+                    float _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_68) : (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_69)), 8);
+#endif
                     int key2 = keys[0];
                     if (key2 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2 = rows_1[0];
+                        long long base2 = (long long)row2 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_66 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_64 : a0[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_67 : (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_64))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_65 : a0[16]) : _shfl_xor_66)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_65) : _shfl_xor_67)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_70 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_68 : a1[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_71 : (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_68))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_69 : a1[16]) : _shfl_xor_70)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_69) : _shfl_xor_71)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2 = (long long)key2 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 256])), "f"(a0[0]), "f"(a0[2]), "f"(a0[16]), "f"(a0[18]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 384])), "f"(a1[0]), "f"(a1[2]), "f"(a1[16]), "f"(a1[18]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[1] : a0[3]), 4);
+                    float _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[17] : a0[19]), 4);
+                    float _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_72 : a0[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_73 : a0[17])), 8);
+                    float _shfl_xor_75 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_72) : (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_73)), 8);
+                    float _shfl_xor_76 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[1] : a1[3]), 4);
+                    float _shfl_xor_77 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[17] : a1[19]), 4);
+                    float _shfl_xor_78 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_76 : a1[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_77 : a1[17])), 8);
+                    float _shfl_xor_79 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_76) : (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_77)), 8);
+#endif
                     int key2_7 = keys[1];
                     if (key2_7 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2_1 = rows_1[1];
+                        long long base2_1 = (long long)row2_1 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_74 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_72 : a0[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_75 : (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_72))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_73 : a0[17]) : _shfl_xor_74)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_73) : _shfl_xor_75)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_78 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_76 : a1[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_79 : (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_76))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_77 : a1[17]) : _shfl_xor_78)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_77) : _shfl_xor_79)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2_1 = (long long)key2_7 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 256])), "f"(a0[1]), "f"(a0[3]), "f"(a0[17]), "f"(a0[19]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 384])), "f"(a1[1]), "f"(a1[3]), "f"(a1[17]), "f"(a1[19]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_80 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[4] : a0[6]), 4);
+                    float _shfl_xor_81 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[20] : a0[22]), 4);
+                    float _shfl_xor_82 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_80 : a0[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_81 : a0[20])), 8);
+                    float _shfl_xor_83 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_80) : (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_81)), 8);
+                    float _shfl_xor_84 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[4] : a1[6]), 4);
+                    float _shfl_xor_85 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[20] : a1[22]), 4);
+                    float _shfl_xor_86 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_84 : a1[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_85 : a1[20])), 8);
+                    float _shfl_xor_87 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_84) : (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_85)), 8);
+#endif
                     int key2_8 = keys[2];
                     if (key2_8 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2_2 = rows_1[2];
+                        long long base2_2 = (long long)row2_2 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_82 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_80 : a0[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_83 : (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_80))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_81 : a0[20]) : _shfl_xor_82)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_81) : _shfl_xor_83)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_86 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_84 : a1[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_87 : (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_84))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_85 : a1[20]) : _shfl_xor_86)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_85) : _shfl_xor_87)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2_2 = (long long)key2_8 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 256])), "f"(a0[4]), "f"(a0[6]), "f"(a0[20]), "f"(a0[22]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 384])), "f"(a1[4]), "f"(a1[6]), "f"(a1[20]), "f"(a1[22]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_88 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[5] : a0[7]), 4);
+                    float _shfl_xor_89 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[21] : a0[23]), 4);
+                    float _shfl_xor_90 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_88 : a0[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_89 : a0[21])), 8);
+                    float _shfl_xor_91 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_88) : (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_89)), 8);
+                    float _shfl_xor_92 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[5] : a1[7]), 4);
+                    float _shfl_xor_93 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[21] : a1[23]), 4);
+                    float _shfl_xor_94 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_92 : a1[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_93 : a1[21])), 8);
+                    float _shfl_xor_95 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_92) : (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_93)), 8);
+#endif
                     int key2_9 = keys[3];
                     if (key2_9 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2_3 = rows_1[3];
+                        long long base2_3 = (long long)row2_3 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_90 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_88 : a0[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_91 : (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_88))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_89 : a0[21]) : _shfl_xor_90)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_89) : _shfl_xor_91)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_94 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_92 : a1[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_95 : (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_92))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_93 : a1[21]) : _shfl_xor_94)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_93) : _shfl_xor_95)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2_3 = (long long)key2_9 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 256])), "f"(a0[5]), "f"(a0[7]), "f"(a0[21]), "f"(a0[23]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 384])), "f"(a1[5]), "f"(a1[7]), "f"(a1[21]), "f"(a1[23]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_96 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[8] : a0[10]), 4);
+                    float _shfl_xor_97 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[24] : a0[26]), 4);
+                    float _shfl_xor_98 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_96 : a0[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_97 : a0[24])), 8);
+                    float _shfl_xor_99 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_96) : (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_97)), 8);
+                    float _shfl_xor_100 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[8] : a1[10]), 4);
+                    float _shfl_xor_101 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[24] : a1[26]), 4);
+                    float _shfl_xor_102 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_100 : a1[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_101 : a1[24])), 8);
+                    float _shfl_xor_103 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_100) : (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_101)), 8);
+#endif
                     int key2_10 = keys[4];
                     if (key2_10 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2_4 = rows_1[4];
+                        long long base2_4 = (long long)row2_4 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_98 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_96 : a0[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_99 : (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_96))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_97 : a0[24]) : _shfl_xor_98)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_97) : _shfl_xor_99)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_102 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_100 : a1[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_103 : (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_100))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_101 : a1[24]) : _shfl_xor_102)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_101) : _shfl_xor_103)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2_4 = (long long)key2_10 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 256])), "f"(a0[8]), "f"(a0[10]), "f"(a0[24]), "f"(a0[26]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 384])), "f"(a1[8]), "f"(a1[10]), "f"(a1[24]), "f"(a1[26]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_104 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[9] : a0[11]), 4);
+                    float _shfl_xor_105 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[25] : a0[27]), 4);
+                    float _shfl_xor_106 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_104 : a0[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_105 : a0[25])), 8);
+                    float _shfl_xor_107 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_104) : (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_105)), 8);
+                    float _shfl_xor_108 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[9] : a1[11]), 4);
+                    float _shfl_xor_109 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[25] : a1[27]), 4);
+                    float _shfl_xor_110 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_108 : a1[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_109 : a1[25])), 8);
+                    float _shfl_xor_111 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_108) : (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_109)), 8);
+#endif
                     int key2_11 = keys[5];
                     if (key2_11 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2_5 = rows_1[5];
+                        long long base2_5 = (long long)row2_5 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_106 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_104 : a0[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_107 : (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_104))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_105 : a0[25]) : _shfl_xor_106)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_105) : _shfl_xor_107)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_110 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_108 : a1[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_111 : (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_108))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_109 : a1[25]) : _shfl_xor_110)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_109) : _shfl_xor_111)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2_5 = (long long)key2_11 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 256])), "f"(a0[9]), "f"(a0[11]), "f"(a0[25]), "f"(a0[27]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 384])), "f"(a1[9]), "f"(a1[11]), "f"(a1[25]), "f"(a1[27]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_112 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[12] : a0[14]), 4);
+                    float _shfl_xor_113 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[28] : a0[30]), 4);
+                    float _shfl_xor_114 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_112 : a0[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_113 : a0[28])), 8);
+                    float _shfl_xor_115 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_112) : (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_113)), 8);
+                    float _shfl_xor_116 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[12] : a1[14]), 4);
+                    float _shfl_xor_117 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[28] : a1[30]), 4);
+                    float _shfl_xor_118 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_116 : a1[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_117 : a1[28])), 8);
+                    float _shfl_xor_119 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_116) : (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_117)), 8);
+#endif
                     int key2_12 = keys[6];
                     if (key2_12 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2_6 = rows_1[6];
+                        long long base2_6 = (long long)row2_6 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_114 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_112 : a0[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_115 : (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_112))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_113 : a0[28]) : _shfl_xor_114)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_113) : _shfl_xor_115)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_118 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_116 : a1[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_119 : (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_116))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_117 : a1[28]) : _shfl_xor_118)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_117) : _shfl_xor_119)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2_6 = (long long)key2_12 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 256])), "f"(a0[12]), "f"(a0[14]), "f"(a0[28]), "f"(a0[30]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 384])), "f"(a1[12]), "f"(a1[14]), "f"(a1[28]), "f"(a1[30]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
+#if DKV_NATURAL == 1
+                    float _shfl_xor_120 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[13] : a0[15]), 4);
+                    float _shfl_xor_121 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[29] : a0[31]), 4);
+                    float _shfl_xor_122 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_120 : a0[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_121 : a0[29])), 8);
+                    float _shfl_xor_123 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_120) : (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_121)), 8);
+                    float _shfl_xor_124 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[13] : a1[15]), 4);
+                    float _shfl_xor_125 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[29] : a1[31]), 4);
+                    float _shfl_xor_126 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_124 : a1[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_125 : a1[29])), 8);
+                    float _shfl_xor_127 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_124) : (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_125)), 8);
+#endif
                     int key2_13 = keys[7];
                     if (key2_13 >= 0) {
+#if DKV_NATURAL == 1
+                        int row2_7 = rows_1[7];
+                        long long base2_7 = (long long)row2_7 * (long long)dkv_stride + (long long)npos;
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_122 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_120 : a0[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_123 : (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_120))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_121 : a0[29]) : _shfl_xor_122)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_121) : _shfl_xor_123)), "l"(0x14F0000000000000ULL) : "memory");
+                        asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_126 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_124 : a1[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_127 : (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_124))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_125 : a1[29]) : _shfl_xor_126)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_125) : _shfl_xor_127)), "l"(0x14F0000000000000ULL) : "memory");
+#else
                         long long base2_7 = (long long)key2_13 * 512 + (long long)lpos;
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 256])), "f"(a0[13]), "f"(a0[15]), "f"(a0[29]), "f"(a0[31]), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 384])), "f"(a1[13]), "f"(a1[15]), "f"(a1[29]), "f"(a1[31]), "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     }
                 }
                 tord_2 = tord_2 + blocks_2;
@@ -2764,7 +2879,6 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
             int tord_3 = 0;
             #pragma unroll 1
             for (int tk_3 = 0; tk_3 < ntok_3; tk_3++) {
-                int tok_3 = blockIdx.x + tk_3 * gridDim.x;
                 int bslot_3 = (int)((unsigned int)tk_3 % 2);
                 int _phase_bslot_3 = (int)((unsigned int)tk_3 / 2 % 2);
                 mbarrier_wait(blocks_ready_addr + (bslot_3) * 8, _phase_bslot_3);
@@ -3856,7 +3970,6 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // load_main
             int ntok_4 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_4 = 0;
             #pragma unroll 1
             for (int tk_4 = 0; tk_4 < ntok_4; tk_4++) {
                 int tok_4 = blockIdx.x + tk_4 * gridDim.x;
@@ -3912,8 +4025,6 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
                     int _min_0 = ((_max_1) < (topk) ? (_max_1) : (topk));
                     active = _min_0;
                 }
-                long long row_base = (long long)indices_offset + (long long)token_2 * (long long)idx_stride;
-                int aligned4 = (int)(((idx_stride | indices_offset) & 3) == 0);
                 int bidv = tok_5;
                 long long scratch_base = (long long)bidv * (long long)topk;
                 int count = pass_counts[bidv];
@@ -3932,7 +4043,6 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
                         int slot_3 = (int)((unsigned int)(tord_5 + i_4) % 2);
                         int _phase_slot_1_1 = (int)((unsigned int)(tord_5 + i_4) / 2 % 2) ^ 1;
                         unsigned int mask = 0;
-                        int position = n * 64 + lane_0_3 * 8;
                         int values[8];
                         int cpos2 = n * 64 + lane_0_3 * 8;
                         if (count >= n * 64 + 64 && (topk & 7) == 0) {
@@ -4076,7 +4186,6 @@ kernel_cake_dsa_h64_nope_train_90ab03044736858291f5(const __grid_constant__ CUte
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // spare_main
             int ntok_6 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_6 = 0;
             #pragma unroll 1
             for (int tk_6 = 0; tk_6 < ntok_6; tk_6++) {
                 int tok_6 = blockIdx.x + tk_6 * gridDim.x;
