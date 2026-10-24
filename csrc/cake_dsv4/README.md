@@ -3,7 +3,8 @@
 Generated device kernels and TVM-FFI launchers for SM100 / SM103 behind
 `trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake")` for BF16 and FP8 E4M3
 inputs with head dimension 512 (BF16 output); `kv_cache_format="nvfp4"` selects
-the NVFP4 decode family (`run_cake_dsv4_nvfp4`; see the host module docstring).
+the NVFP4 route (`run_cake_dsv4_nvfp4`: the decode family below 128 metadata
+rows, the prefill bodies from 128 rows on; see the host module docstring).
 Select the backend explicitly; `backend="auto"` keeps the architecture-based
 selection. Programmatic dependent launch and the TRTLLM-GEN RopeQuant epilogue
 are not supported.
@@ -31,8 +32,8 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 
 | path | contents |
 | --- | --- |
-| `sm_100a/`, `sm_103a/` | one `cake_dsv4_<hash>_kernel.cu` (device code) and one `cake_dsv4_<hash>_binding.cu` (TVM-FFI launcher) per BF16 / FP8 variant whose kernel differs between the two architectures (14 per directory), plus the headers every unit of that directory includes: `cake_dsv4_device_common.cuh` (device preamble) and `cake_dsv4_host_common.cuh` (dynamic shared-memory opt-in) |
-| `common/` | sources both architectures compile: the 13 BF16 / FP8 variants whose kernel is identical on sm_100a and sm_103a (`cake_dsv4_<hash>_{kernel,binding}.cu`, named by the sm_100a hash, with their own copies of the two `cake_dsv4_*_common.cuh` headers), and the NVFP4 decode family (the `cake_dsv4_nvfp4_*_kernel.cu` units, their `*_binding.cu` launchers and the `cake_dsv4_nvfp4_{device,host}_common.cuh` headers: launch helpers, tensor-map encoders, tensor checks) |
+| `sm_100a/`, `sm_103a/` | one `cake_dsv4_<hash>_kernel.cu` (device code) and one `cake_dsv4_<hash>_binding.cu` (TVM-FFI launcher) per BF16 / FP8 variant whose kernel differs between the two architectures (14 per directory), plus the headers every unit of that directory includes: `cake_dsv4_device_common.cuh` (device preamble) and `cake_dsv4_host_common.cuh` (dynamic shared-memory opt-in); and the NVFP4 H128 prefill body `cake_dsv4_nvfp4_h128_prefill_{kernel,binding}.cu`, whose two-CTA schedule differs between the architectures |
+| `common/` | sources both architectures compile: the 13 BF16 / FP8 variants whose kernel is identical on sm_100a and sm_103a (`cake_dsv4_<hash>_{kernel,binding}.cu`, named by the sm_100a hash, with their own copies of the two `cake_dsv4_*_common.cuh` headers), and the NVFP4 decode family (the `cake_dsv4_nvfp4_decode_*` and `cake_dsv4_nvfp4_merge` units, their `*_binding.cu` launchers and the `cake_dsv4_nvfp4_{device,host}_common.cuh` headers: launch helpers, tensor-map encoders, tensor checks) and the NVFP4 H <= 64 prefill body `cake_dsv4_nvfp4_h64_prefill_{kernel,binding}.cu` with the prefill bodies' `cake_dsv4_nvfp4_prefill_{device,host}_common.cuh` (device preamble; tensor-map encoders). The NVFP4 kernel units include their device helpers from `csrc/cake_device_helpers/` |
 | `cake_dsv4_launch_sequence.cc` | host-only `run_sequence`: issues the producer and reducer launches of a two-stage route from one FFI call |
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
@@ -70,10 +71,11 @@ pytest tests/mla/test_cake_dsv4.py -q                        # routing, binding,
 pytest tests/mla/test_cake_dsv4_nvfp4_route.py -q            # NVFP4 planner, variant names, workspace (CPU)
 pytest tests/mla/test_cake_dsv4_hardening.py -q              # numerical and graph-replay checks (SM100/SM103 GPU)
 pytest tests/attention/test_sparse_mla_blackwell_dsv4_nvfp4.py -q  # NVFP4 cache ops and cake decode (GPU: SM100/SM103; cache ops also SM120/SM121)
+pytest tests/mla/test_cake_dsv4_nvfp4_prefill.py -q          # NVFP4 prefill bodies (GPU: SM100/SM103)
 ```
 
 Tolerances of the hardening checks: `atol=rtol=0.01` (BF16), `atol=rtol=0.1`
-(FP8); the NVFP4 decode test pins its own bounds.
+(FP8); the NVFP4 tests pin their own bounds (O `5e-2`, base-2 LSE `2e-2`).
 
 ## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode and prefill
 
