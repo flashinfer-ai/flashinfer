@@ -213,34 +213,35 @@ python benchmarks/bench_mxfp8_mxfp4.py \
 `benchmarks/profile_mxfp8_mxfp4_lean.py` provides focused FC1/FC2 profiling.
 Routing and attention are excluded from these measurements.
 
-### Review validation on GB300
+### Synthetic EP2 example on GB300
 
 NVIDIA GB300, synthetic EP2 workload: hidden 4096, intermediate 6400, eight experts, top-2,
-seed 42, pre-staged input. CUDA-event timing follows a 256 MiB L2 flush and GPU
-rank synchronization. Each graph contains 50 consecutive samples; report the
-median of five round medians, with each sample reduced to the slowest rank.
-Before/after/before runs use the same GPU pair and default tactics. Exact
-before/after output comparisons pass. Routing and attention are excluded.
+seed 42, pre-staged input. These dimensions form one tile-aligned synthetic
+example; they are not a public-model configuration or a representative workload
+suite. Results below are absolute latencies, not a comparison with an existing
+backend.
 
-| Tokens/rank | Before review (us) | After review (us) | Before repeat (us) |
-| --- | --- | --- | --- |
-| 32 | 69.568 | 69.008 | 67.936 |
-| 256 | 79.872 | 78.960 | 79.840 |
-| 512 | 121.136 | 121.136 | 121.152 |
-| 1024 | 151.440 | 151.360 | 151.552 |
+CUDA-event timing follows a 256 MiB L2 flush and GPU rank synchronization.
+Each graph contains 50 consecutive samples; report the median of five round
+medians, with each sample reduced to the slowest rank. Measurements use default
+tactics and exclude routing, attention, input staging, and the caller-owned
+output copy.
 
-No regression was observed in these four cases. The baseline repeat shows
-short-case timing variation; the measurements do not establish a speedup.
+| Tokens/rank | Default-tactic latency (us) |
+| --- | --- |
+| 32 | 69.008 |
+| 256 | 78.960 |
+| 512 | 121.136 |
+| 1024 | 151.360 |
 
-On the same synthetic geometry at 256 tokens/rank, the first 128-candidate
-sweep took 248.421 s and the bounded 32-candidate sweep took 65.757 s. Both
-selected the same tactic, measured at 77.824 us with cold-L2 graph timing.
-Repeating selection after clearing the profiling cache, while retaining
-compiled frontends, took 0.263 s and 0.081 s respectively. Sweep timing surrounds
+On this geometry at 256 tokens/rank, the default 32-candidate autotuning sweep
+took 65.757 s on its first invocation. The selected tactic measured 77.824 us
+with cold-L2 graph timing. Repeating selection after clearing the profiling
+cache, while retaining compiled frontends, took 0.081 s. Sweep timing surrounds
 `autotune_mxfp8_mxfp4_mega_moe` after input creation and one default launch;
 use `warmup_iters=0`, `timed_iters=3`, and `candidate_tactics` for the workload.
-The full grid remains available through `exhaustive=True` or the offline CLI's
-`--mxfp8-mxfp4-exhaustive` option. Tuning results depend on workload and policy.
+The 128-candidate grid is available through `exhaustive=True` or the offline
+CLI's `--mxfp8-mxfp4-exhaustive` option. Tuning results depend on workload and policy.
 
 ### Caller-owned output copy
 
