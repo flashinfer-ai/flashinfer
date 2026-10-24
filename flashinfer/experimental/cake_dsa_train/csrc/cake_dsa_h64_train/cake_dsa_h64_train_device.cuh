@@ -91,13 +91,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 }
 #endif
 
-#if defined(CAKE_DSA_H64_TRAIN_NEED_UNION_MMASMEMDESC)
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-#endif
-
 #if defined(CAKE_DSA_H64_TRAIN_NEED_MBARRIER_ARRIVE)
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
     asm volatile(

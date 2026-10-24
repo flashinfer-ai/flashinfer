@@ -23,65 +23,8 @@
 #define CAKE_DSA_H64_TRAIN_NEED_TCGEN05_COMMIT
 #define CAKE_DSA_H64_TRAIN_NEED_TMA_4D_GMEM2SMEM
 #define CAKE_DSA_H64_TRAIN_NEED_TMA_STORE_4D
-#define CAKE_DSA_H64_TRAIN_NEED_UNION_MMASMEMDESC
 #include "cake_dsa_h64_train_device.cuh"
 
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_OFFSET 0
-#define NUM_MAIN_STAGES 1
-#define SMEM_Q_K_OFF 1024
-#define SMEM_Q_K_STAGE_BYTES 65536
-#define SMEM_Q_K_STRIDE 65536
-#define SMEM_Q_MN_OFF 1024
-#define SMEM_Q_MN_STAGE_BYTES 16384
-#define SMEM_Q_MN_STRIDE 16384
-#define SMEM_DO_K_OFF 66560
-#define SMEM_DO_K_STAGE_BYTES 65536
-#define SMEM_DO_K_STRIDE 65536
-#define SMEM_DO_MN_OFF 66560
-#define SMEM_DO_MN_STAGE_BYTES 16384
-#define SMEM_DO_MN_STRIDE 16384
-#define SMEM_K_K_OFF 132096
-#define SMEM_K_K_STAGE_BYTES 65536
-#define SMEM_K_K_STRIDE 65536
-#define SMEM_V_K_OFF 132096
-#define SMEM_V_K_STAGE_BYTES 65536
-#define SMEM_V_K_STRIDE 65536
-#define SMEM_K_MN_OFF 132096
-#define SMEM_K_MN_STAGE_BYTES 16384
-#define SMEM_K_MN_STRIDE 16384
-#define SMEM_K_BLK_OFF 132096
-#define SMEM_K_BLK_STAGE_BYTES 8192
-#define SMEM_K_BLK_STRIDE 8192
-#define SMEM_DO_BLK_OFF 66560
-#define SMEM_DO_BLK_STAGE_BYTES 8192
-#define SMEM_DO_BLK_STRIDE 8192
-#define SMEM_P_K_OFF 197632
-#define SMEM_P_K_STAGE_BYTES 8192
-#define SMEM_P_K_STRIDE 8192
-#define SMEM_DS_K_OFF 205824
-#define SMEM_DS_K_STAGE_BYTES 8192
-#define SMEM_DS_K_STRIDE 8192
-#define SMEM_DS_MN_OFF 205824
-#define SMEM_DS_MN_STAGE_BYTES 8192
-#define SMEM_DS_MN_STRIDE 8192
-#define SMEM_STATS_OFF 214016
-#define SMEM_STATS_STAGE_BYTES 512
-#define SMEM_STATS_STRIDE 512
-#define SMEM_TILE_IDX_OFF 214528
-#define SMEM_TILE_IDX_STAGE_BYTES 640
-#define SMEM_TILE_IDX_STRIDE 640
-#define SMEM_VALIDITY8_OFF 214528
-#define SMEM_VALIDITY8_STAGE_BYTES 640
-#define SMEM_VALIDITY8_STRIDE 640
-#define SMEM_VALIDITY32_OFF 214528
-#define SMEM_VALIDITY32_STAGE_BYTES 640
-#define SMEM_VALIDITY32_STRIDE 640
-#define SMEM_BLOCKS_WORD_OFF 215168
-#define SMEM_BLOCKS_WORD_STAGE_BYTES 8
-#define SMEM_BLOCKS_WORD_STRIDE 8
-#define SMEM_TOTAL 215296
-#define THREADS 640
 #define LAUNCH_MIN_BLOCKS 1
 
 #ifndef DKV_NATURAL
@@ -138,46 +81,24 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
     #define dkv_b_full_addr (mbar_base + 208)
     #define dkv_b_drained_addr (mbar_base + 216)
 
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
-
     // Kernel setup ops
-    __nv_bfloat16* q_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_k_addr = smem + 1024;
-    __nv_bfloat16* q_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_mn_addr = smem + 1024;
-    __nv_bfloat16* do_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
     const int do_k_addr = smem + 66560;
-    __nv_bfloat16* do_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
     const int do_mn_addr = smem + 66560;
-    __nv_bfloat16* k_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int k_k_addr = smem + 132096;
-    __nv_bfloat16* v_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int v_k_addr = smem + 132096;
-    __nv_bfloat16* k_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int k_mn_addr = smem + 132096;
-    __nv_bfloat16* k_blk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int k_blk_addr = smem + 132096;
-    __nv_bfloat16* do_blk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
     const int do_blk_addr = smem + 66560;
-    __nv_bfloat16* p_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
     const int p_k_addr = smem + 197632;
-    __nv_bfloat16* ds_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
     const int ds_k_addr = smem + 205824;
-    __nv_bfloat16* ds_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
     const int ds_mn_addr = smem + 205824;
     float* stats = reinterpret_cast<float*>(smem_raw + 214016);
-    const int stats_addr = smem + 214016;
     int* tile_idx = reinterpret_cast<int*>(smem_raw + 214528);
-    const int tile_idx_addr = smem + 214528;
     uint8_t* validity8 = reinterpret_cast<uint8_t*>(smem_raw + 214528);
-    const int validity8_addr = smem + 214528;
     unsigned int* validity32 = reinterpret_cast<unsigned int*>(smem_raw + 214528);
-    const int validity32_addr = smem + 214528;
     int* blocks_word = reinterpret_cast<int*>(smem_raw + 215168);
-    const int blocks_word_addr = smem + 215168;
     if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_latent))) : "memory"); }
     if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dout))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_latent))) : "memory"); }
@@ -276,7 +197,6 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
             int tord = 0;
             #pragma unroll 1
             for (int tk = 0; tk < ntok; tk++) {
-                int tok = blockIdx.x + tk * gridDim.x;
                 int pw = warp;
                 int bslot = (int)((unsigned int)tk % 2);
                 int _phase_bslot = (int)((unsigned int)tk / 2 % 2);
@@ -1118,7 +1038,6 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
             int tord_2 = 0;
             #pragma unroll 1
             for (int tk_2 = 0; tk_2 < ntok_2; tk_2++) {
-                int tok_2 = blockIdx.x + tk_2 * gridDim.x;
                 int lane_0_1 = lane;
                 int w2 = (warp - 8) % 4;
                 int wg = (warp - 8) / 4;
@@ -1619,7 +1538,6 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
             int tord_3 = 0;
             #pragma unroll 1
             for (int tk_3 = 0; tk_3 < ntok_3; tk_3++) {
-                int tok_3 = blockIdx.x + tk_3 * gridDim.x;
                 int bslot_3 = (int)((unsigned int)tk_3 % 2);
                 int _phase_bslot_3 = (int)((unsigned int)tk_3 / 2 % 2);
                 mbarrier_wait(blocks_ready_addr + (bslot_3) * 8, _phase_bslot_3);
@@ -2711,7 +2629,6 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // load_main
             int ntok_4 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_4 = 0;
             #pragma unroll 1
             for (int tk_4 = 0; tk_4 < ntok_4; tk_4++) {
                 int tok_4 = blockIdx.x + tk_4 * gridDim.x;
@@ -3000,10 +2917,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // spare_main
             int ntok_6 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_6 = 0;
             #pragma unroll 1
             for (int tk_6 = 0; tk_6 < ntok_6; tk_6++) {
-                int tok_6 = blockIdx.x + tk_6 * gridDim.x;
             }
         }
     }

@@ -27,48 +27,8 @@
 #define CAKE_DSA_H64_TRAIN_NEED_TCGEN05_COMMIT
 #define CAKE_DSA_H64_TRAIN_NEED_TMA_STORE_4D
 #define CAKE_DSA_H64_TRAIN_NEED_TMEM_ST_X32_F32
-#define CAKE_DSA_H64_TRAIN_NEED_UNION_MMASMEMDESC
 #include "cake_dsa_h64_train_device.cuh"
 
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_OFFSET 0
-#define NUM_CLC_PIPELINE_STAGES 1
-#define NUM_SCORE_PIPE_STAGES 3
-#define SMEM_QKO_OFF 1024
-#define SMEM_QKO_STAGE_BYTES 65536
-#define SMEM_QKO_STRIDE 65536
-#define SMEM_K_DUAL_OFF 1024
-#define SMEM_K_DUAL_STAGE_BYTES 65536
-#define SMEM_K_DUAL_STRIDE 65536
-#define SMEM_V_OFF 1024
-#define SMEM_V_STAGE_BYTES 65536
-#define SMEM_V_STRIDE 65536
-#define SMEM_EXCHANGE_OFF 197632
-#define SMEM_EXCHANGE_STAGE_BYTES 16384
-#define SMEM_EXCHANGE_STRIDE 16384
-#define SMEM_PROBABILITY_OFF 214016
-#define SMEM_PROBABILITY_STAGE_BYTES 8192
-#define SMEM_PROBABILITY_STRIDE 8192
-#define SMEM_VALIDITY_OFF 222208
-#define SMEM_VALIDITY_STAGE_BYTES 24
-#define SMEM_VALIDITY_STRIDE 24
-#define SMEM_VALIDITY32_OFF 222208
-#define SMEM_VALIDITY32_STAGE_BYTES 24
-#define SMEM_VALIDITY32_STRIDE 24
-#define SMEM_STATS_OFF 222336
-#define SMEM_STATS_STAGE_BYTES 1024
-#define SMEM_STATS_STRIDE 1024
-#define SMEM_CLC_PAYLOAD_OFF 223360
-#define SMEM_CLC_PAYLOAD_STAGE_BYTES 16
-#define SMEM_CLC_PAYLOAD_STRIDE 16
-#define SMEM_LEN_CELLS_OFF 223408
-#define SMEM_LEN_CELLS_STAGE_BYTES 8
-#define SMEM_LEN_CELLS_STRIDE 8
-#define SMEM_BOUND_CELLS_OFF 223416
-#define SMEM_BOUND_CELLS_STAGE_BYTES 8
-#define SMEM_BOUND_CELLS_STRIDE 8
-#define SMEM_TOTAL 223488
-#define THREADS 320
 #define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
@@ -105,34 +65,19 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
     #define o_written_addr (mbar_base + 208)
     #define o_written_waited_addr (mbar_base + 216)
 
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
-
     // Kernel setup ops
-    __nv_bfloat16* qko = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int qko_addr = smem + 1024;
-    __nv_bfloat16* k_dual = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int k_dual_addr = smem + 1024;
-    __nv_bfloat16* v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int v_addr = smem + 1024;
     float* exchange = reinterpret_cast<float*>(smem_raw + 197632);
     const int exchange_addr = smem + 197632;
-    __nv_bfloat16* probability = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int probability_addr = smem + 214016;
     uint8_t* validity = reinterpret_cast<uint8_t*>(smem_raw + 222208);
-    const int validity_addr = smem + 222208;
     unsigned int* validity32 = reinterpret_cast<unsigned int*>(smem_raw + 222208);
-    const int validity32_addr = smem + 222208;
     float* stats = reinterpret_cast<float*>(smem_raw + 222336);
-    const int stats_addr = smem + 222336;
-    unsigned int* clc_payload = reinterpret_cast<unsigned int*>(smem_raw + 223360);
     const int clc_payload_addr = smem + 223360;
     int* len_cells = reinterpret_cast<int*>(smem_raw + 223408);
-    const int len_cells_addr = smem + 223408;
     int* bound_cells = reinterpret_cast<int*>(smem_raw + 223416);
-    const int bound_cells_addr = smem + 223416;
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_latent))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_latent))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&out))) : "memory"); }

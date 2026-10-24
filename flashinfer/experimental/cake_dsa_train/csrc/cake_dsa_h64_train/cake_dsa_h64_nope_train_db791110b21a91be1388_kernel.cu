@@ -16,12 +16,6 @@
 
 #include "cake_dsa_h64_train_device.cuh"
 
-#define NUM_MAIN_STAGES 1
-#define SMEM_STAGE_OFF 0
-#define SMEM_STAGE_STAGE_BYTES 8320
-#define SMEM_STAGE_STRIDE 8320
-#define SMEM_TOTAL 0
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
@@ -34,11 +28,6 @@ kernel_cake_dsa_h64_nope_train_db791110b21a91be1388(int* __restrict__ indices, i
     const int lane = tid % 32;
 
     __shared__ __align__(16) unsigned char smem_static_raw[8320];
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
 
     // Kernel setup ops
     int* stage = reinterpret_cast<int*>(smem_static_raw + 0);

@@ -16,8 +16,6 @@
 
 #include "cake_dsa_h64_train_device.cuh"
 
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
@@ -29,11 +27,6 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
 
     // === Task calls (declaration order) ===
     int rowi = blockIdx.x * 4 + warp;
