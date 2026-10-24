@@ -129,23 +129,25 @@ void Run(TensorView a_q, TensorView a_k_data, TensorView a_v_data, TensorView a_
   if (a_partial_lse.has_value()) check_same_device(a_partial_lse.value(), a_q, "partial_lse", "q");
   if (a_merge_counters.has_value()) check_contiguous(a_merge_counters.value(), "merge_counters");
   if (a_merge_counters.has_value()) check_same_device(a_merge_counters.value(), a_q, "merge_counters", "q");
-  TVM_FFI_CHECK((a_group_size >= 1), ValueError)
+  TVM_FFI_CHECK((a_page_div >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (page_div >= 1)";
+  TVM_FFI_CHECK((a_group_size >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (group_size >= 1)";
-  TVM_FFI_CHECK((a_group_size <= 16), ValueError)
+  TVM_FFI_CHECK((a_group_size <= 16LL), ValueError)
       << KERNEL_NAME << ": requires (group_size <= 16)";
-  TVM_FFI_CHECK((a_topk >= 1), ValueError)
+  TVM_FFI_CHECK((a_topk >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (topk >= 1)";
-  TVM_FFI_CHECK((a_num_tiles >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_tiles >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_tiles >= 1)";
-  TVM_FFI_CHECK((a_num_splits >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_splits >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_splits >= 1)";
   TVM_FFI_CHECK((a_num_splits <= a_num_tiles), ValueError)
       << KERNEL_NAME << ": requires (num_splits <= num_tiles)";
-  TVM_FFI_CHECK((a_table_width >= 1), ValueError)
+  TVM_FFI_CHECK((a_table_width >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (table_width >= 1)";
-  TVM_FFI_CHECK((a_num_blocks >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_blocks >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_blocks >= 1)";
-  TVM_FFI_CHECK((a_num_requests >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_requests >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_requests >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
