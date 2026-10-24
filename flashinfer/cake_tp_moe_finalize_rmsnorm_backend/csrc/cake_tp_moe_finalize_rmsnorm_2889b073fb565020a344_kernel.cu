@@ -50,24 +50,24 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_WARP_TAB_OFF 0
-#define SMEM_WARP_TAB_STAGE_BYTES 64
-#define SMEM_WARP_TAB_STRIDE 64
-#define SMEM_CTA_TAB_OFF 64
-#define SMEM_CTA_TAB_STAGE_BYTES 16
-#define SMEM_CTA_TAB_STRIDE 16
-#define SMEM_FLAG_OFF 80
+#define SMEM_WARP_TAB_STAGE_BYTES 128
+#define SMEM_WARP_TAB_STRIDE 128
+#define SMEM_CTA_TAB_OFF 128
+#define SMEM_CTA_TAB_STAGE_BYTES 8
+#define SMEM_CTA_TAB_STRIDE 8
+#define SMEM_FLAG_OFF 136
 #define SMEM_FLAG_STAGE_BYTES 16
 #define SMEM_FLAG_STRIDE 16
-#define SMEM_TOTAL 128
-#define THREADS 256
+#define SMEM_TOTAL 256
+#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117(__nv_bfloat16* __restrict__ gemm2, int row_stride, int rows, int* __restrict__ idx, unsigned int* __restrict__ expert_weights, int weights_fp32, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int n_tok, int slots, float eps, float gain_center, int mode, int rank, long long* __restrict__ peer_table, int* __restrict__ gen, float* __restrict__ part, unsigned int* __restrict__ ctr, unsigned long long r_mcast)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+kernel_cake_tp_moe_finalize_rmsnorm_2889b073fb565020a344(__nv_bfloat16* __restrict__ gemm2, int row_stride, int rows, int* __restrict__ idx, unsigned int* __restrict__ expert_weights, int weights_fp32, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int n_tok, int slots, float eps, float gain_center, int mode, int rank, long long* __restrict__ peer_table, int* __restrict__ gen, float* __restrict__ part, unsigned int* __restrict__ ctr, unsigned long long r_mcast)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -84,29 +84,24 @@ kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117(__nv_bfloat16* __restri
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 2;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 2;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
 
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    const int cta_rank = 0;
 
     // Kernel setup ops
     float* warp_tab = reinterpret_cast<float*>(smem_raw + 0);
     const int warp_tab_addr = smem + 0;
-    float* cta_tab = reinterpret_cast<float*>(smem_raw + 64);
-    const int cta_tab_addr = smem + 64;
-    unsigned int* flag = reinterpret_cast<unsigned int*>(smem_raw + 80);
-    const int flag_addr = smem + 80;
+    float* cta_tab = reinterpret_cast<float*>(smem_raw + 128);
+    const int cta_tab_addr = smem + 128;
+    unsigned int* flag = reinterpret_cast<unsigned int*>(smem_raw + 136);
+    const int flag_addr = smem + 136;
 
     // === Task calls (declaration order) ===
     int band = blockIdx.x;
     int g = blockIdx.y;
     int d = blockIdx.z;
-    int cta_rank_0 = cta_rank;
+    int cta_rank_1 = 0;
     int rank_i = rank;
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    int col = (band * 256 + tid) * 8;
+    int col = (band * 512 + tid) * 8;
     long long col64 = (long long)col;
     long long rank64 = (long long)rank;
     long long slot64 = (long long)g;
@@ -908,44 +903,43 @@ kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117(__nv_bfloat16* __restri
         }
         __syncthreads();
         float tot_k[2];
-        int kk_t = tid & 1;
-        float part_t = warp_tab[kk_t];
-        part_t = part_t + warp_tab[2 + kk_t];
-        part_t = part_t + warp_tab[4 + kk_t];
-        part_t = part_t + warp_tab[6 + kk_t];
-        part_t = part_t + warp_tab[8 + kk_t];
-        part_t = part_t + warp_tab[10 + kk_t];
-        part_t = part_t + warp_tab[12 + kk_t];
-        part_t = part_t + warp_tab[14 + kk_t];
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        if (tid < 2) {
-            unsigned int slot_addr = cta_tab_addr + (unsigned int)((cta_rank_0 * 2 + tid) * 4);
-            uint32_t _cluster_mapa_39;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_39) : "r"(slot_addr), "r"(0));
-            asm volatile(
-                "st.shared::cluster.f32 [%0], %1;"
-                :: "r"(_cluster_mapa_39), "f"(part_t) : "memory");
-            uint32_t _cluster_mapa_40;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_40) : "r"(slot_addr), "r"(1));
-            asm volatile(
-                "st.shared::cluster.f32 [%0], %1;"
-                :: "r"(_cluster_mapa_40), "f"(part_t) : "memory");
-        }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        tot_k[0] = cta_tab[0];
-        tot_k[0] = tot_k[0] + cta_tab[2];
-        tot_k[1] = cta_tab[1];
-        tot_k[1] = tot_k[1] + cta_tab[3];
+        tot_k[0] = warp_tab[0];
+        tot_k[0] = tot_k[0] + warp_tab[2];
+        tot_k[0] = tot_k[0] + warp_tab[4];
+        tot_k[0] = tot_k[0] + warp_tab[6];
+        tot_k[0] = tot_k[0] + warp_tab[8];
+        tot_k[0] = tot_k[0] + warp_tab[10];
+        tot_k[0] = tot_k[0] + warp_tab[12];
+        tot_k[0] = tot_k[0] + warp_tab[14];
+        tot_k[0] = tot_k[0] + warp_tab[16];
+        tot_k[0] = tot_k[0] + warp_tab[18];
+        tot_k[0] = tot_k[0] + warp_tab[20];
+        tot_k[0] = tot_k[0] + warp_tab[22];
+        tot_k[0] = tot_k[0] + warp_tab[24];
+        tot_k[0] = tot_k[0] + warp_tab[26];
+        tot_k[0] = tot_k[0] + warp_tab[28];
+        tot_k[0] = tot_k[0] + warp_tab[30];
+        tot_k[1] = warp_tab[1];
+        tot_k[1] = tot_k[1] + warp_tab[3];
+        tot_k[1] = tot_k[1] + warp_tab[5];
+        tot_k[1] = tot_k[1] + warp_tab[7];
+        tot_k[1] = tot_k[1] + warp_tab[9];
+        tot_k[1] = tot_k[1] + warp_tab[11];
+        tot_k[1] = tot_k[1] + warp_tab[13];
+        tot_k[1] = tot_k[1] + warp_tab[15];
+        tot_k[1] = tot_k[1] + warp_tab[17];
+        tot_k[1] = tot_k[1] + warp_tab[19];
+        tot_k[1] = tot_k[1] + warp_tab[21];
+        tot_k[1] = tot_k[1] + warp_tab[23];
+        tot_k[1] = tot_k[1] + warp_tab[25];
+        tot_k[1] = tot_k[1] + warp_tab[27];
+        tot_k[1] = tot_k[1] + warp_tab[29];
+        tot_k[1] = tot_k[1] + warp_tab[31];
         float pp[8];
         float acc[8];
-        float _sqrt_41;
-        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_41) : "f"(__fmaf_rn(tot_k[0], 0.00024414062f, eps)));
-        float rs0 = __frcp_rn(_sqrt_41);
+        float _sqrt_39;
+        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_39) : "f"(__fmaf_rn(tot_k[0], 0.00024414062f, eps)));
+        float rs0 = __frcp_rn(_sqrt_39);
         pp[0] = 0.0f;
         pp[1] = 0.0f;
         pp[2] = 0.0f;
@@ -997,9 +991,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117(__nv_bfloat16* __restri
         float o0_7 = yn0_7 * rs0;
         float o2_0_7 = ((mode != 0) ? o0_7 : o0_7 * gw8[7]);
         pp[7] = __fmaf_rn(o2_0_7, wk[0], pp[7]);
-        float _sqrt_42;
-        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_42) : "f"(__fmaf_rn(tot_k[1], 0.00024414062f, eps)));
-        float rs1 = __frcp_rn(_sqrt_42);
+        float _sqrt_40;
+        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_40) : "f"(__fmaf_rn(tot_k[1], 0.00024414062f, eps)));
+        float rs1 = __frcp_rn(_sqrt_40);
         float _unpack_bf16_13[8];
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
@@ -1073,8 +1067,8 @@ kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117(__nv_bfloat16* __restri
         __syncthreads();
         if (tid == 0) {
             asm volatile("fence.acq_rel.gpu;" ::: "memory");
-            unsigned int _atomic_fetch_add_43 = atomicAdd(&ctr[g * 8 + band], 1);
-            flag[0] = _atomic_fetch_add_43;
+            unsigned int _atomic_fetch_add_41 = atomicAdd(&ctr[g * 8 + band], 1);
+            flag[0] = _atomic_fetch_add_41;
         }
         __syncthreads();
         unsigned int arrived = flag[0];
@@ -1187,12 +1181,12 @@ kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117(__nv_bfloat16* __restri
             uint32_t _packed16_sanitize_8[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_52 = static_cast<uint32_t>(out8_bf16[_p16s_word]);
-                uint32_t _p16s_lo_52 = _p16s_carrier_52 & 0x0000ffffu;
-                uint32_t _p16s_hi_52 = (_p16s_carrier_52 >> 16) & 0x0000ffffu;
-                if (_p16s_lo_52 == 0x00008000u) _p16s_lo_52 = 0u;
-                if (_p16s_hi_52 == 0x00008000u) _p16s_hi_52 = 0u;
-                _packed16_sanitize_8[_p16s_word] = _p16s_lo_52 | (_p16s_hi_52 << 16);
+                uint32_t _p16s_carrier_50 = static_cast<uint32_t>(out8_bf16[_p16s_word]);
+                uint32_t _p16s_lo_50 = _p16s_carrier_50 & 0x0000ffffu;
+                uint32_t _p16s_hi_50 = (_p16s_carrier_50 >> 16) & 0x0000ffffu;
+                if (_p16s_lo_50 == 0x00008000u) _p16s_lo_50 = 0u;
+                if (_p16s_hi_50 == 0x00008000u) _p16s_hi_50 = 0u;
+                _packed16_sanitize_8[_p16s_word] = _p16s_lo_50 | (_p16s_hi_50 << 16);
             }
             unsigned long long mc = r_mcast + (unsigned long long)((r_cur + rank64 * 4096) * 2);
             asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<float*>(mc)), "r"(_packed16_sanitize_8[0]), "r"(_packed16_sanitize_8[1]), "r"(_packed16_sanitize_8[2]), "r"(_packed16_sanitize_8[3]) : "memory");
@@ -1214,7 +1208,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_dd814fb239560ab24117(__nv_bfloat16* __restri
         reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(output + ((long long)tok_push * 4096 + col64)))[0] = reinterpret_cast<int4*>(row4)[0];
     }
     int gn_next = ((gn == 2) ? 0 : gn + 1);
-    if (tid == 0 && cta_rank_0 == 0) {
+    if (tid == 0 && cta_rank_1 == 0) {
         *(reinterpret_cast<int*>(gen + gidx) + (0)) = gn_next;
     }
 }
