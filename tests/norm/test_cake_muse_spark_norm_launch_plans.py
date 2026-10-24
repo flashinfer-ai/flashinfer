@@ -114,6 +114,40 @@ def test_a_repeated_gated_residual_rmsnorm_call_reuses_its_plan(plans):
     assert len(selections) == 4
 
 
+def test_a_same_rows_other_hidden_size_takes_the_slow_path(plans):
+    """The plan key carries the row count, not the hidden size: a later call with the admitted row count and
+    another hidden size (or, for the sigmoid gate, the same strides and fewer columns) must not reuse the plan."""
+    module, launched, selections = plans
+    branch, residual, _, alpha, beta, out = _gated_inputs(64)
+    pkg.cake_gated_residual_rmsnorm(branch, residual, None, alpha, beta, out, eps=1e-5)
+    assert len(selections) == 1 and len(launched) == 1
+    narrow = torch.zeros(64, HIDDEN_SIZE // 2, dtype=torch.bfloat16)
+    narrow_f32 = torch.zeros(64, HIDDEN_SIZE // 2, dtype=torch.float32)
+    with pytest.raises(ValueError, match=r"branch must be \[rows, 8192\]"):
+        pkg.cake_gated_residual_rmsnorm(
+            narrow,
+            narrow_f32,
+            None,
+            alpha,
+            beta,
+            torch.empty_like(narrow_f32),
+            eps=1e-5,
+        )
+    assert len(selections) == 1 and len(launched) == 1
+    tokens, heads = 64, 128
+    x = torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16)
+    gate = torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16)
+    pkg.cake_rmsnorm_sigmoid_gate(x, gate, eps=1e-5)
+    assert len(selections) == 2 and len(launched) == 2
+    # the same token and head strides with half the columns: the plan's key matches, the contract does not
+    half = slice(None, HEAD_DIM // 2)
+    with pytest.raises(
+        ValueError, match=r"must be \[tokens, 64\] or \[tokens, heads, 64\]"
+    ):
+        pkg.cake_rmsnorm_sigmoid_gate(x[:, :, half], gate[:, :, half], eps=1e-5)
+    assert len(selections) == 2 and len(launched) == 2
+
+
 def test_a_plan_orders_its_arguments_like_the_loader(plans):
     module, launched, selections = plans
     branch, residual, weight, alpha, beta, out = _gated_inputs(64, weight=True)
