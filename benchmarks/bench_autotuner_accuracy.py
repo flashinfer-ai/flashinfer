@@ -773,9 +773,21 @@ def main():
                 )
                 continue
             for op, (runners, config, inputs, kwargs) in captured.items():
-                row = sweep_captured_op(
-                    op, runners, config, inputs, kwargs, args, tuner, grid_label
-                )
+                try:
+                    row = sweep_captured_op(
+                        op, runners, config, inputs, kwargs, args, tuner, grid_label
+                    )
+                except MeasurementUnavailable as exc:
+                    print(f"\n{grid_label}: MEASUREMENT UNAVAILABLE: {exc}")
+                    report["shapes"].append(
+                        {
+                            "api": api_name,
+                            "op": op,
+                            spec["axis"]: pt,
+                            "error": f"MeasurementUnavailable: {exc}",
+                        }
+                    )
+                    continue
                 if row is not None:
                     row["api"] = api_name
                     row[spec["axis"]] = pt

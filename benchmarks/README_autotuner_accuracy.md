@@ -100,4 +100,7 @@ The existing exhaustive-oracle mode remains available without
 `--graph-selection-study`. Explicit measurements now use
 `prepare_tactic_profile` / `profile_tactic` under the requested context, so graph,
 eager and L2 overrides are applied. A missing/disabled CUPTI route raises instead
-of mislabeling event fallback as CUPTI evidence.
+of mislabeling event fallback as CUPTI evidence. Exhaustive sweeps record these
+unavailable measurements as error rows and continue to the next shape; those
+rows must not be scored as valid results. Graph-study failures still stop the
+study.

@@ -210,3 +210,47 @@ def test_unavailable_cupti_cannot_be_scored_as_an_oracle(monkeypatch):
             MeasurementPolicy(_timer="cupti"),
             3,
         )
+
+
+def test_exhaustive_report_preserves_unavailable_and_valid_shapes(
+    monkeypatch, tmp_path
+):
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    module = _harness()
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["study", "--ops", "bmm_fp8", "--grid", "1", "2", "--out", str(output)],
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(name="test", major=9, minor=0),
+    )
+    monkeypatch.setitem(module.OPS, "bmm_fp8", {"axis": "m", "build": lambda *a: None})
+    monkeypatch.setattr(
+        module, "capture_choose_one_calls", lambda _: {"op": ([], None, [], {})}
+    )
+    visited = []
+
+    def sweep(*args):
+        visited.append(args[-1])
+        if len(visited) == 1:
+            raise module.MeasurementUnavailable("no finite oracle candidates")
+        return {"op": "op", "valid": 1}
+
+    monkeypatch.setattr(module, "sweep_captured_op", sweep)
+    module.main()
+    rows = json.loads(output.read_text())["shapes"]
+    assert visited == ["bmm_fp8 m=1", "bmm_fp8 m=2"]
+    assert rows[0] == {
+        "api": "bmm_fp8",
+        "op": "op",
+        "m": 1,
+        "error": "MeasurementUnavailable: no finite oracle candidates",
+    }
+    assert rows[1] == {"api": "bmm_fp8", "op": "op", "m": 2, "valid": 1}
