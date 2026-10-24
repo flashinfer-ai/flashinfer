@@ -13,12 +13,12 @@ Note: The `replay` command is tested in tests/utils/test_logging_replay.py along
 the other logging/replay functionality tests, since it's tightly coupled with that feature.
 """
 
+import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
-import zipfile
 
 from packaging.version import Version
 import pytest
@@ -41,9 +41,26 @@ def _mock_jit_cache_provider_inventory(monkeypatch, *provider_tags):
     )
 
 
+_SHIM_METADATA = """\
+Metadata-Version: 2.4
+Name: flashinfer-jit-cache
+Version: 0.4.1+cu134
+Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
+Requires-Dist: flashinfer-jit-cache-sm107f==0.4.1+cu134
+
+"""
+
+
+def _write_shim_metadata(target_dir, metadata=_SHIM_METADATA):
+    dist_info = Path(target_dir) / "flashinfer_jit_cache-0.4.1+cu134.dist-info"
+    dist_info.mkdir(parents=True)
+    (dist_info / "METADATA").write_text(metadata)
+
+
 @pytest.fixture(autouse=True)
 def _default_pip_installer(monkeypatch):
     monkeypatch.setattr("flashinfer.__main__.which", lambda _name: None)
+    monkeypatch.setattr("flashinfer.__main__.find_spec", lambda _name: object())
 
 
 @pytest.mark.parametrize(
@@ -99,6 +116,52 @@ def test_pip_install_cmd_selects_installer_without_execution(
     ]
 
 
+def test_pip_install_cmd_requires_pip_or_uv(monkeypatch):
+    import click
+
+    import flashinfer.__main__ as main
+
+    monkeypatch.setattr(main, "find_spec", lambda _name: None)
+
+    with pytest.raises(click.ClickException, match="Neither pip nor uv"):
+        main._get_pip_install_cmd()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["install-cubin-wheel"],
+        ["install-jit-cache-wheel", "--cuda-version", "13.4"],
+        ["install-jit-cache-wheel", "--cuda-version", "13.4", "--sm", "sm80"],
+        ["download-kernels", "--cuda-version", "13.4"],
+        ["download-kernels", "--cuda-version", "13.4", "--sm", "sm80"],
+    ],
+)
+def test_installer_commands_use_uv_without_pip(monkeypatch, args):
+    """Every install subprocess must go through the selected installer, so uv
+    environments without pip keep working."""
+    import flashinfer.__main__ as main
+
+    monkeypatch.setattr(main, "__version__", "0.4.1")
+    monkeypatch.setattr(main, "which", lambda _name: "/tools/uv")
+    monkeypatch.setattr(main, "find_spec", lambda _name: None)
+    recorded = []
+
+    def mock_run(cmd, **_kwargs):
+        recorded.append(cmd)
+        if "--target" in cmd:
+            _write_shim_metadata(cmd[cmd.index("--target") + 1])
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", mock_run)
+
+    _test_cmd_helper(args)
+
+    assert recorded
+    for cmd in recorded:
+        assert cmd[:5] == ["/tools/uv", "pip", "install", "--python", sys.executable]
+
+
 def test_pip_install_cmd_does_not_import_pip(monkeypatch, tmp_path):
     import flashinfer.__main__ as main
 
@@ -107,6 +170,7 @@ def test_pip_install_cmd_does_not_import_pip(monkeypatch, tmp_path):
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.delitem(sys.modules, "pip", raising=False)
+    monkeypatch.setattr(main, "find_spec", importlib.util.find_spec)
     monkeypatch.setattr(main.sys, "prefix", str(tmp_path))
     monkeypatch.setattr(main, "which", lambda _name: "/tools/uv")
 
@@ -421,25 +485,15 @@ def test_select_jit_cache_provider_tags_keeps_heterogeneous_targets():
 def test_read_jit_cache_provider_tags_from_shim_metadata(tmp_path):
     from flashinfer.__main__ import _read_jit_cache_provider_tags
 
-    wheel = tmp_path / "flashinfer_jit_cache-0.4.1+cu134-py3-none-any.whl"
-    metadata = """\
-Metadata-Version: 2.4
-Name: flashinfer-jit-cache
-Version: 0.4.1+cu134
-Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
-Requires-Dist: flashinfer-jit-cache-sm107f==0.4.1+cu134
+    _write_shim_metadata(tmp_path)
 
-"""
-    with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("flashinfer_jit_cache-0.4.1.dist-info/METADATA", metadata)
-
-    assert _read_jit_cache_provider_tags(wheel, "0.4.1+cu134") == (
+    assert _read_jit_cache_provider_tags(tmp_path, "0.4.1+cu134") == (
         "sm107f",
         "sm80",
     )
 
 
-def test_get_available_jit_cache_provider_tags_downloads_only_shim(monkeypatch):
+def test_get_available_jit_cache_provider_tags_installs_only_shim(monkeypatch):
     import flashinfer.__main__ as flashinfer_main
 
     recorded = {}
@@ -447,17 +501,7 @@ def test_get_available_jit_cache_provider_tags_downloads_only_shim(monkeypatch):
     def mock_run(cmd, **kwargs):
         recorded["cmd"] = cmd
         recorded["kwargs"] = kwargs
-        destination = Path(cmd[cmd.index("--dest") + 1])
-        wheel = destination / "flashinfer_jit_cache-0.4.1+cu134-py3-none-any.whl"
-        metadata = """\
-Metadata-Version: 2.4
-Name: flashinfer-jit-cache
-Version: 0.4.1+cu134
-Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
-
-"""
-        with zipfile.ZipFile(wheel, "w") as archive:
-            archive.writestr("flashinfer_jit_cache-0.4.1.dist-info/METADATA", metadata)
+        _write_shim_metadata(cmd[cmd.index("--target") + 1])
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(flashinfer_main.subprocess, "run", mock_run)
@@ -467,7 +511,8 @@ Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
         "0.4.1+cu134",
         "https://example.invalid/cu134",
         nightly=False,
-    ) == ("sm80",)
+    ) == ("sm107f", "sm80")
+    assert recorded["cmd"][:4] == [sys.executable, "-m", "pip", "install"]
     assert "--no-deps" in recorded["cmd"]
     assert "--only-binary=:all:" in recorded["cmd"]
     assert recorded["cmd"][-2:] == [
