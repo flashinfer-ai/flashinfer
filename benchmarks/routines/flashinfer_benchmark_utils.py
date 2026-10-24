@@ -124,6 +124,8 @@ output_column_dict = {
         "temperature",
         "num_speculate_tokens",
         "filter_apply_order",
+        "per_row_top_k",
+        "top_k_max",
         "max_len",
         "num_rows",
     ],
