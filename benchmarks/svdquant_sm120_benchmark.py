@@ -31,8 +31,7 @@ TuningL2 = Literal["operator", "warm", "cold"]
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-# SVDQ_BENCH_BACKENDS overrides the compared set (comma-separated), e.g. to add
-# the native-cutlass / native-cublaslt baselines; the first entry is the
+# SVDQ_BENCH_BACKENDS overrides the compared set (comma-separated); the first entry is the
 # accuracy reference and the speedup denominator.
 BACKENDS: Final[tuple[Backend, ...]] = tuple(
     os.environ.get("SVDQ_BENCH_BACKENDS", "cute-dsl,cutlass-sm120,auto").split(",")
@@ -238,13 +237,6 @@ def build_case(
 def make_call(
     case: Case, operation: Operation, backend: Backend, enable_pdl: bool
 ) -> Call:
-    if backend.startswith("native-"):
-        from svdquant_sm120_native import native_call, native_operands
-
-        launch, _ = native_call(
-            backend, native_operands(case), quantize=operation == "linear"
-        )
-        return Call(launch, ())
     operands: tuple[torch.Tensor, ...]
     match operation:
         case "gemm":

@@ -147,20 +147,11 @@ def run_operation(
         torch.cuda.synchronize()
         tuning_time_s[backend] = time.perf_counter() - tuning_started
     with tuning_context(policy, tuning=False):
-        # Native omits smoothing and LoRA, so it is compared only with itself.
-        svdq = [b for b in BACKENDS if not b.startswith("native-")]
-        native = [b for b in BACKENDS if b.startswith("native-")]
-        reference = calls[svdq[0]]()
+        reference = calls[BACKENDS[0]]()
         accuracies = {
             backend: asdict(compare_outputs(reference, calls[backend]()))
-            for backend in svdq[1:]
+            for backend in BACKENDS[1:]
         }
-        if len(native) > 1:
-            native_reference = calls[native[0]]().clone()
-            for backend in native[1:]:
-                accuracies[backend] = asdict(
-                    compare_outputs(native_reference, calls[backend]())
-                )
         graph_calls = (
             1
             if options.cold_l2
