@@ -56,6 +56,11 @@ def plans(monkeypatch):
     loader.cluster_capacity.cache_clear()  # nothing the stub module answered survives this test
 
 
+def _scalars(args):
+    """The non-tensor entries of a launch's positional arguments."""
+    return [a for a in args if not isinstance(a, torch.Tensor)]
+
+
 def _gated_inputs(rows, weight=False):
     branch = torch.zeros(rows, HIDDEN_SIZE, dtype=torch.bfloat16)
     residual = torch.zeros(rows, HIDDEN_SIZE, dtype=torch.float32)
@@ -78,7 +83,7 @@ def test_a_repeated_gated_residual_rmsnorm_call_reuses_its_plan(plans):
     name = loader.selected_module(ARCH, route, 64)
     assert [n for n, _ in launched] == [name] * 3
     # every launch carries the call's own scalars and tensors
-    assert 1e-3 in launched[1][1] and 1e-3 not in launched[0][1]
+    assert 1e-3 in _scalars(launched[1][1]) and 1e-3 not in _scalars(launched[0][1])
     assert any(t is out for t in launched[0][1] if isinstance(t, torch.Tensor))
     # the mode-0 weight slot is unread: branch itself keeps the BF16 tensor ABI
     assert sum(t is branch for t in launched[0][1] if isinstance(t, torch.Tensor)) == 2
@@ -144,8 +149,8 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     assert len(selections) == 1 and len(launched) == 3
     name = loader.selected_module(ARCH, pkg.rmsnorm_sigmoid_gate_route(), tokens, heads)
     assert [n for n, _ in launched] == [name] * 3
-    args = launched[0][1]
-    assert gate.stride(0) in args and x.stride(0) in args and tokens in args
+    scalars = _scalars(launched[0][1])
+    assert gate.stride(0) in scalars and x.stride(0) in scalars and tokens in scalars
     # the token stride is part of the signature: a contiguous gate is another plan
     pkg.cake_rmsnorm_sigmoid_gate(x, gate.contiguous(), eps=1e-5)
     assert len(selections) == 3  # the plan's selection plus this test's own call above
