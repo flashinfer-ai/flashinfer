@@ -32,7 +32,7 @@ from tests.moe.test_frost_low_latency_nvfp4 import reference as nvfp4_reference
 
 
 def make_case(fmt, tokens, finalize, seed):
-    _require_gpu()
+    _require_gpu(allow_sm120=True)
     torch.manual_seed(seed)
     activation = SwiGLU()
     if fmt == QuantFormat.BF16:
@@ -138,6 +138,9 @@ PATHS = [
 def test_warm_ffi_fresh_bindings_and_concurrent_streams(
     fmt, tactic, tokens, finalize, monkeypatch
 ):
+    _require_gpu(allow_sm120=True)
+    if torch.cuda.get_device_capability() == (12, 0) and not isinstance(tactic, tuple):
+        pytest.skip("SM120 supports Frost FMA tactics only")
     first, a, reference_a = make_case(fmt, tokens, finalize, 9301)
     second, b, reference_b = make_case(fmt, tokens, finalize, 9302)
     first.forward(a, tactic)
@@ -207,6 +210,9 @@ def test_warm_ffi_fresh_bindings_and_concurrent_streams(
 
 @pytest.mark.parametrize("fmt,tactic", PATHS)
 def test_compiled_entry_does_not_retain_call_storage(fmt, tactic):
+    _require_gpu(allow_sm120=True)
+    if torch.cuda.get_device_capability() == (12, 0) and not isinstance(tactic, tuple):
+        pytest.skip("SM120 supports Frost FMA tactics only")
     runner, inputs, reference = make_case(fmt, 1, True, 9401)
     refs = [weakref.ref(v) for v in inputs if isinstance(v, torch.Tensor)]
     runner.forward(inputs, tactic)
