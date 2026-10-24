@@ -1,0 +1,213 @@
+{
+  "quint_version": "0.33.0",
+  "apalache_version": "0.62.1",
+  "cases": {
+    "twoshot-tlc-2r1h": {
+      "file": "twoshot.qnt",
+      "module": "twoshot_release_2r1h",
+      "backend": "tlc",
+      "invariant": "safety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "twoshot-tlc-2r2h": {
+      "file": "twoshot.qnt",
+      "module": "twoshot_release_2r2h",
+      "backend": "tlc",
+      "invariant": "safety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "twoshot-apalache-3r1h": {
+      "file": "twoshot.qnt",
+      "module": "twoshot_release_3r1h",
+      "backend": "apalache",
+      "invariant": "sourceSafe",
+      "max_steps": 6,
+      "expected": "pass"
+    },
+    "ring-tlc-4r1h": {
+      "file": "ring.qnt",
+      "module": "ring_4r_two_origins",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-apalache-4origins": {
+      "file": "ring.qnt",
+      "module": "ring_4r1h",
+      "backend": "apalache",
+      "invariant": "sourceSafe",
+      "max_steps": 6,
+      "expected": "pass"
+    },
+    "ring-tlc-ack-chain": {
+      "file": "ring.qnt",
+      "module": "ring_ack_chain",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-mixed-directions": {
+      "file": "ring.qnt",
+      "module": "ring_mixed_directions",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-no-service": {
+      "file": "ring.qnt",
+      "module": "ring_without_service",
+      "backend": "tlc",
+      "invariant": "noProtocolDeadlock",
+      "expected": "counterexample"
+    },
+    "ring-tlc-failed-rank": {
+      "file": "ring.qnt",
+      "module": "ring_failed_rank",
+      "backend": "tlc",
+      "invariant": "noProtocolDeadlock",
+      "step": "faultStep",
+      "expected": "counterexample"
+    },
+    "twoshot-apalache-no-release": {
+      "file": "ownership_schedule.qnt",
+      "module": "ownership_schedule_without_release",
+      "backend": "apalache",
+      "invariant": "sourceSafe",
+      "max_steps": 18,
+      "expected": "counterexample"
+    },
+    "twoshot-apalache-with-release": {
+      "file": "ownership_schedule.qnt",
+      "module": "ownership_schedule_with_release",
+      "backend": "apalache",
+      "invariant": "sourceSafe",
+      "max_steps": 18,
+      "expected": "pass"
+    },
+    "ring-tlc-reuse": {
+      "file": "ring.qnt",
+      "module": "ring_reuse_one_origin",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-two-rails": {
+      "file": "ring.qnt",
+      "module": "ring_two_rails_one_origin",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-4r2h-prefix6": {
+      "file": "ring_prefix.qnt",
+      "module": "ring_prefix6",
+      "backend": "tlc",
+      "invariant": "sourceSafe,counterBound",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-one-origin": {
+      "file": "ring_window2_one_origin.qnt",
+      "module": "ring_window2_one_origin",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-two-origins": {
+      "file": "ring_window2_two_origins.qnt",
+      "module": "ring_window2_two_origins",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-ack-chain": {
+      "file": "ring_window2_ack_chain.qnt",
+      "module": "ring_window2_ack_chain",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-two-rails": {
+      "file": "ring_window2_two_rails.qnt",
+      "module": "ring_window2_two_rails",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-no-reuse-wait": {
+      "file": "ring_window2_no_reuse_wait.qnt",
+      "module": "ring_window2_no_reuse_wait",
+      "backend": "tlc",
+      "invariant": "sourceSafe",
+      "expected": "counterexample"
+    }
+  },
+  "optional_cases": {
+    "twoshot-apalache-unrestricted-no-release": {
+      "file": "twoshot.qnt",
+      "module": "twoshot_without_release",
+      "backend": "apalache",
+      "invariant": "sourceSafe",
+      "max_steps": 24,
+      "expected": "counterexample"
+    },
+    "ring-apalache-reuse": {
+      "file": "ring.qnt",
+      "module": "ring_reuse",
+      "backend": "apalache",
+      "invariant": "healthySafety",
+      "max_steps": 20,
+      "expected": "pass"
+    },
+    "twoshot-apalache-3r1h-depth12": {
+      "file": "twoshot.qnt",
+      "module": "twoshot_release_3r1h",
+      "backend": "apalache",
+      "invariant": "safety",
+      "max_steps": 12,
+      "expected": "pass"
+    },
+    "ring-apalache-4origins-depth12": {
+      "file": "ring.qnt",
+      "module": "ring_4r1h",
+      "backend": "apalache",
+      "invariant": "healthySafety",
+      "max_steps": 12,
+      "expected": "pass"
+    },
+    "ring-apalache-4r2h-depth12": {
+      "file": "ring.qnt",
+      "module": "ring_4r2h",
+      "backend": "apalache",
+      "invariant": "healthySafety",
+      "max_steps": 12,
+      "expected": "pass"
+    },
+    "ring-tlc-4origins": {
+      "file": "ring.qnt",
+      "module": "ring_4r1h",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-apalache-4r2h": {
+      "file": "ring.qnt",
+      "module": "ring_4r2h",
+      "backend": "apalache",
+      "invariant": "sourceSafe",
+      "max_steps": 6,
+      "expected": "pass"
+    }
+  }
+}
