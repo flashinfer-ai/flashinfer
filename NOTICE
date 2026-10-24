@@ -30,3 +30,9 @@ SPDX header: 59 files under the MIT License (licenses/LICENSE.cudnn-frontend-MIT
 and one under "Apache-2.0 AND MIT". The pinned revision, the per-file digests and the declared patches
 are listed in that directory's VENDOR.md and VENDOR_MANIFEST.json.
 Source: https://github.com/NVIDIA/cudnn-frontend/tree/d8b0a7ed56cd8e62bc1e05f367f339624f6dbb4e
+
+The SM120 DSA indexer's single-CTA decode selection
+(flashinfer/experimental/sm120_dsa_indexer/csrc/decode_select_row.cuh) is
+adapted from SGLang's DeepSeek-V4 top-k (TopKRegister and
+coarse_bin_lower_bound), Copyright 2023-2024 SGLang Team, under Apache-2.0.
+Source: https://github.com/sgl-project/sglang (python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh)
