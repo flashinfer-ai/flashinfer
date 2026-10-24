@@ -16,3 +16,22 @@
 
 #define FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE
 #include "trtllm_fused_moe_routing_custom.cuh"
+
+namespace moe::dev::routing::routingCustom {
+
+bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
+  bool const useNoOpSoftmaxScores = data.mPtrScores != nullptr &&
+                                    data.mPreprocessType == RoutingPreprocessType::None &&
+                                    data.mPostprocessType == RoutingPostprocessType::Softmax;
+  if (useNoOpSoftmaxScores) {
+    return launchClusterKernelForPolicy<ClusterBlockDim1024, NoOpPreprocess, SoftmaxPostprocess>(
+        data, stream);
+  }
+
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
+                        /*smemSize=*/0,  // No dynamic smem
+                        stream);
+  return queryPolicyHasCompiledTier(data);
+}
+
+}  // namespace moe::dev::routing::routingCustom
