@@ -9,6 +9,9 @@ skipped — so the GEMM result is unchanged.
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.config as dense_config
+
+
 import pytest
 import torch
 
@@ -231,13 +234,12 @@ def test_fused_quant_preserves_per_row_scaling(monkeypatch):
     covered by test_small_m_linear_end_to_end_bit_exact; this test owns the
     m>1 inertness contract.
     """
-    import b12x._lib.dense_gemm as _dense_mod
     from b12x.quantization.mxfp6 import fp6_dense_weights as fdw
 
     # BOTH globals. The kernel reads the dense_gemm one; patching only the
     # weights module leaves the prologue off and the test passes vacuously.
     monkeypatch.setattr(fdw, "_DENSE_FUSED_QUANT", True)
-    monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", True)
+    monkeypatch.setattr(dense_config, "_DENSE_FUSED_QUANT", True)
 
     torch.manual_seed(7)
     w = fdw.quantize_dense_weight_to_fp6(

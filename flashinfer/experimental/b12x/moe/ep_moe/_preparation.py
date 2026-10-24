@@ -12,7 +12,7 @@ from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from b12x.moe._shared.kernels.w4a16.host import select_route_block_size_m
-from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_fused_moe
+from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import compile_w4a16_fused_moe
 from ..fused_moe._impl import B12XFP4ExpertWeights, plan_b12x_fp4_moe_weights
 from ._impl import EPExpertMap, EPMoEFP4Binding, EPMoEScratchCaps, _materialize_layout
 from ._tuning import EpMoeConfig, EpMoeQuery, TUNING

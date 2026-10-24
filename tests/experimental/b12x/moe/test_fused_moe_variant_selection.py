@@ -1,5 +1,12 @@
 """Host-only selection rules for prepared fused-MoE variants and W4A16 launches."""
 
+import b12x._lib.compiler as _module__lib_compiler
+import b12x._lib.utils.device as _module__lib_utils_device
+import b12x.moe._shared.kernels.w4a16.kernel.config as w4a16_config
+import b12x.moe._shared.kernels.w4a16.kernel.direct_launch as w4a16_direct_launch
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+
+
 from dataclasses import replace
 from inspect import signature
 from types import SimpleNamespace
@@ -44,7 +51,7 @@ def test_trellis_direct_table_preserves_cooperative_residency(
     expected,
     shared_limit,
 ):
-    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -83,11 +90,40 @@ def test_trellis_direct_table_preserves_cooperative_residency(
         trellis_decode_table=mode,
     )
     assert kernel.trellis_direct_lut == expected
+    assert kernel.lut_e4m3_smem
     assert kernel.shared_words * 4 <= kernel.fc1.max_shared_mem
     if expected:
         assert kernel.blocks_per_sm == 1
-        assert kernel.lut_e4m3_smem
         assert kernel.fc1.trellis_direct_lut and kernel.fc2.trellis_direct_lut
+
+
+@pytest.mark.parametrize("layout", ("packed", "modelopt", "iq2_xs", "iq2_xxs", "q8_0"))
+def test_non_trellis_layout_does_not_stage_trellis_table(monkeypatch, layout):
+    from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("B12X_LUT_E4M3_SMEM", "1")
+    kernel = W4A16FusedMoeKernel(
+        size_m=128,
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_experts=256,
+        top_k=9,
+        activation="relu2",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        fc1_tile_n=128,
+        fc1_tile_k=128,
+        fc2_tile_n=128,
+        fc2_tile_k=128,
+        moe_block_size=16,
+        max_m_blocks=1024,
+        weight_layout=layout,
+        scale_format=layout if layout in {"iq2_xs", "iq2_xxs", "q8_0"} else "e4m3_k16",
+    )
+    assert not kernel.lut_e4m3_smem
+    assert not kernel.fc1.lut_e4m3_smem
+    assert not kernel.fc2.lut_e4m3_smem
 
 
 class _Variant:
@@ -132,44 +168,41 @@ def test_shared_40_workload_reuses_experts_across_distinct_topk_rows(
 
 
 @pytest.mark.parametrize(
-    "tokens,topk,experts,expected_unique",
-    (
-        (2, 6, 256, [12, 10, 7, 6, 6]),
-        (6, 6, 256, [36, 29, 22, 14, 7]),
-        (8, 6, 256, [48, 38, 29, 19, 10]),
-        (6, 6, 6, [6, 6, 6, 6, 6]),
-        (6, 6, 12, [12, 12, 12, 12, 7]),
-    ),
+    "tokens,topk,experts",
+    ((1, 8, 288), (8, 6, 384), (128, 6, 384), (4096, 8, 288), (6, 6, 6)),
 )
-def test_verifier_tuning_corpus_spans_sharing_without_duplicate_token_routes(
-    tokens,
-    topk,
-    experts,
-    expected_unique,
-):
-    """A fixed mean must not collapse every trial to the same expert count."""
+def test_tuning_routes_cover_distinct_valid_scenarios(tokens, topk, experts):
     from b12x.moe.fused_moe.workloads import make_tuning_routes
 
     ids = make_tuning_routes(tokens, topk, experts, device="cpu")
-    assert ids.shape == (5, tokens, topk)
+    assert ids.shape == (6, tokens, topk)
     assert ids.dtype == torch.int32
-    assert [pattern.unique().numel() for pattern in ids] == expected_unique
-    assert all(row.unique().numel() == topk for pattern in ids for row in pattern)
     assert ids.min() >= 0 and ids.max() < experts
+    assert (ids.sort(dim=-1).values.diff(dim=-1) > 0).all()
     torch.testing.assert_close(
-        ids,
-        make_tuning_routes(tokens, topk, experts, device="cpu"),
+        ids, make_tuning_routes(tokens, topk, experts, device="cpu")
+    )
+    assert not torch.equal(
+        ids, make_tuning_routes(tokens, topk, experts, device="cpu", seed=999)
     )
 
 
-@pytest.mark.parametrize("tokens", (1, 9, 128))
-def test_nonverifier_tuning_routes_retain_cyclic_coverage(tokens):
-    from b12x.moe.fused_moe.workloads import make_routing_ids, make_tuning_routes
+def test_statistical_routes_separate_popularity_and_token_correlation():
+    from b12x.moe.fused_moe.workloads import make_routing_ids
 
-    torch.testing.assert_close(
-        make_tuning_routes(tokens, 6, 256, device="cpu"),
-        make_routing_ids(tokens, 6, 256, workload="disjoint").unsqueeze(0),
-    )
+    ids = {
+        name: make_routing_ids(4096, 8, 288, workload=name)
+        for name in ("diffuse", "skewed", "correlated")
+    }
+    counts = {
+        name: torch.bincount(routes.flatten().long(), minlength=288).float()
+        for name, routes in ids.items()
+    }
+    assert counts["skewed"].std() > 1.8 * counts["diffuse"].std()
+    groups = ids["correlated"].reshape(-1, 4, 8)
+    within = (groups[:, 0, :, None] == groups[:, 1, None, :]).any(-1).float().mean()
+    across = (groups[:-1, 0, :, None] == groups[1:, 0, None, :]).any(-1).float().mean()
+    assert within > 2 * across
 
 
 def test_variant_for_preserves_exact_counts_and_reuses_prefill_capacity():
@@ -186,13 +219,17 @@ def test_capacity_state_binds_the_planned_variant_with_the_live_activations():
     variants = {count: _Variant(count) for count in (4, 128)}
     state = _FusedMoeCapacityState(variants)
     activations = torch.empty(11, 16)
-    count, kwargs = state.bind(a=activations, topk_ids=None)
+    count, kwargs = state.bind(
+        a=activations, topk_ids=torch.zeros(11, 2, dtype=torch.int32)
+    )
     assert count == 128
     assert kwargs["a"] is activations
     with pytest.raises(TypeError):
         state.bind(a=torch.empty(11))
     with pytest.raises(ValueError, match="exceeds prepared MoE capacity 128"):
-        state.bind(a=torch.empty(129, 16))
+        state.bind(
+            a=torch.empty(129, 16), topk_ids=torch.zeros(129, 2, dtype=torch.int32)
+        )
 
 
 def test_a16_capacity_covers_unlisted_counts_without_crossing_cutoff():
@@ -208,11 +245,16 @@ def test_a16_capacity_covers_unlisted_counts_without_crossing_cutoff():
         (64, 64),
         (127, 128),
     ):
-        count, _ = state.bind(a=torch.empty(rows, 16))
+        count, _ = state.bind(
+            a=torch.empty(rows, 16), topk_ids=torch.zeros(rows, 2, dtype=torch.int32)
+        )
         assert count == expected
     for rows in (0, 129):
         with pytest.raises(ValueError):
-            state.bind(a=torch.empty(rows, 16))
+            state.bind(
+                a=torch.empty(rows, 16),
+                topk_ids=torch.zeros(rows, 2, dtype=torch.int32),
+            )
 
 
 @pytest.mark.parametrize(
@@ -292,8 +334,10 @@ def _launches(*, direct, route_pack, route_mode="auto"):
         packed_mapped="packed_mapped",
         direct="direct" if direct else None,
         direct_mapped="direct_mapped" if direct else None,
-        topk_sum="topk_sum",
-        mapped_topk_sum="mapped_topk_sum",
+        topk_sum={dtype: "topk_sum" for dtype in (torch.int32, torch.int64)},
+        mapped_topk_sum={
+            dtype: "mapped_topk_sum" for dtype in (torch.int32, torch.int64)
+        },
         route_pack=route_pack,
     )
 
@@ -324,7 +368,7 @@ def test_w4a16_select_preserves_exact_direct_and_dynamic_packed_routes(route_mod
         route_ids_dtype=torch.int64,
         has_route_map=True,
         activation_amax=None,
-    ) == ("packed_mapped", "topk_sum", "route_pack")
+    ) == ("packed_mapped", "mapped_topk_sum", "route_pack")
     with pytest.raises(RuntimeError, match="requested=9, prepared=8"):
         launches.select(
             tokens=9,
@@ -357,7 +401,7 @@ def test_native_w4a16_selects_retained_micro_and_keeps_packed_boundary(dtype):
     )
     assert launches.select(**{**exact, "has_route_map": True}) == (
         "packed_mapped",
-        "topk_sum",
+        "mapped_topk_sum",
         "route_pack",
     )
     assert launches.select(**{**exact, "activation_amax": object()}) == (
@@ -376,11 +420,10 @@ def test_native_launch_metadata_tracks_capacity_when_packed_program_is_cached(
     monkeypatch,
 ):
     from b12x._lib.compile_plan import ProgramKey, program_keys
-    from b12x.moe._shared.kernels.w4a16 import kernel
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(kernel, "current_cuda_stream", lambda: None)
-    monkeypatch.setattr(kernel, "_FUSED_CACHE", {})
+    monkeypatch.setattr(_module__lib_utils_device, "current_cuda_stream", lambda: None)
+    monkeypatch.setattr(w4a16_fused_launch, "_FUSED_CACHE", {})
     compiled = []
 
     def compile_fused(*args, **kwargs):
@@ -401,11 +444,13 @@ def test_native_launch_metadata_tracks_capacity_when_packed_program_is_cached(
             ),
         )
 
-    monkeypatch.setattr(kernel, "b12x_compile", compile_fused)
-    monkeypatch.setattr(kernel, "_compile_w4a16_small_m_direct", compile_direct)
+    monkeypatch.setattr(_module__lib_compiler, "b12x_compile", compile_fused)
+    monkeypatch.setattr(
+        w4a16_direct_launch, "_compile_w4a16_small_m_direct", compile_direct
+    )
     packed_specializations = {}
     for m in (1, 2, 4, 8, 9, 8, 1):
-        launch = kernel.compile_w4a16_fused_moe(
+        launch = w4a16_fused_launch.compile_w4a16_fused_moe(
             size_m=m,
             hidden_size=256,
             intermediate_size=256,
@@ -417,7 +462,7 @@ def test_native_launch_metadata_tracks_capacity_when_packed_program_is_cached(
             moe_block_size=8,
             max_m_blocks=32,
             sms=188,
-            max_shared_mem=kernel._DEFAULT_MAX_SHARED_MEM,
+            max_shared_mem=w4a16_config._DEFAULT_MAX_SHARED_MEM,
             weight_layout="modelopt",
             force_tile_config=(128, 128, 128, 128),
         )

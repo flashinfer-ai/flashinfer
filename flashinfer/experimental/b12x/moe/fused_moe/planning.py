@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
-import os
 from dataclasses import dataclass, replace
 from enum import Enum
 
@@ -17,13 +16,12 @@ from ._impl import (
     prepare_b12x_fp4_moe_weights,
     prepare_b12x_trellis_v2_weights,
     prepare_b12x_iq2_xs_weights,
-    prepare_b12x_x4t_weights,
 )
 from .config import TrellisConfig
 from .source import PackedSource, TrellisSource, WeightSource
 from .trellis_layout import TrellisStaging
 from .weights import (
-    CsfScalePlanes,
+    CsfBlockPlanes,
     Nvfp4CsfWeights,
     PackedWeights,
     Mxfp4CsfWeights,
@@ -43,7 +41,6 @@ class ActivationMode(str, Enum):
     A16 = "a16"
     A8 = "a8"
     A4 = "a4"
-    AUTO = "auto"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -54,14 +51,20 @@ class ActivationSpec:
     independently of BF16/FP16 public inputs. None retains the I/O dtype.
     Only the FP16 full-rotation implementation is supported explicitly.
 
-    ``a16_max_tokens`` forces A16 up to an inclusive token capacity; zero
+    ``a16_max_tokens`` forces A16 up to an inclusive token capacity, except
+    for an explicit hybrid ``bind(a4_prefill=True)`` selection; zero
     disables the constraint. Larger calls retain ``mode``.
+
+    ``swiglu_clamp_after_silu`` clamps SiLU(gate) instead of gate before
+    multiplying by the symmetrically clamped up branch. It specializes the
+    A4 and A16 kernels at compile time; the default clamps gate before SiLU.
     """
 
     mode: ActivationMode
     nonlinearity: str
     io_dtype: torch.dtype
     swiglu_limit: float | None = None
+    swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     rotation_dtype: torch.dtype | None = None
@@ -76,6 +79,15 @@ class ActivationSpec:
             raise TypeError("rotation_dtype must be torch.float16 or None")
         if type(self.a16_max_tokens) is not int or self.a16_max_tokens < 0:
             raise ValueError("a16_max_tokens must be a nonnegative integer")
+        if type(self.swiglu_clamp_after_silu) is not bool:
+            raise TypeError("swiglu_clamp_after_silu must be a boolean")
+        if self.swiglu_clamp_after_silu and (
+            self.nonlinearity != "silu"
+            or self.mode not in (ActivationMode.A4, ActivationMode.A16)
+        ):
+            raise ValueError(
+                "post-SiLU clamping requires SiLU with A4 or A16 activations"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -99,8 +111,12 @@ class WeightPlanConstraints:
     """Integration requirements that constrain B12X preparation policy."""
 
     required_packing: WeightPacking | None = None
+    # "csf" compresses native FP4 block scales losslessly while preparing them.
+    scale_compression: str | None = None
 
     def __post_init__(self) -> None:
+        if self.scale_compression not in (None, "csf"):
+            raise ValueError("scale_compression must be None or 'csf'")
         if self.required_packing is not None:
             object.__setattr__(
                 self,
@@ -118,6 +134,7 @@ class WeightPlan:
     geometry: MoEGeometry
     prepared_format: PreparedWeightFormat
     _impl: MoEWeightPreparationPlan
+    scale_compression: str | None = None
 
 
 def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
@@ -243,9 +260,26 @@ def plan_weights(
         source = TrellisSource(config=source)
     if activation.rotation_dtype is not None and not isinstance(source, TrellisSource):
         raise ValueError("rotation_dtype is only valid for trellis weights")
+    if constraints.scale_compression is not None and not (
+        isinstance(source, PackedSource)
+        and is_gated_moe_activation(activation.nonlinearity)
+        and (
+            (
+                source.format.value == "fp4_e8m0_k32"
+                and activation.mode in (ActivationMode.A8, ActivationMode.A16)
+            )
+            or (
+                source.format.value == "modelopt_nvfp4"
+                and activation.mode in (ActivationMode.A4, ActivationMode.A16)
+            )
+        )
+        and (not activation.a16_max_tokens or activation.mode is ActivationMode.A16)
+    ):
+        raise ValueError(
+            "CSF scale compression requires gated native MXFP4 A8/A16 or NVFP4 A4/A16"
+        )
 
     if isinstance(source, PackedSource):
-        automatic = activation.mode is ActivationMode.AUTO
         if activation.a16_max_tokens and (
             source.format.value != "modelopt_nvfp4"
             or activation.io_dtype is not torch.bfloat16
@@ -253,30 +287,9 @@ def plan_weights(
             raise ValueError(
                 "A16 token cutoff requires BF16 inputs and ModelOpt NVFP4 weights"
             )
-        if automatic and (
-            source.format.value != "modelopt_nvfp4"
-            or activation.io_dtype is not torch.bfloat16
-            or activation.nonlinearity != "silu"
-        ):
-            raise ValueError(
-                "automatic MoE precision requires BF16 inputs, SiLU, and ModelOpt NVFP4 weights"
-            )
-        if automatic and constraints.required_packing not in {
-            None,
-            WeightPacking.SOURCE_NATIVE,
-        }:
-            raise ValueError(
-                "automatic MoE precision requires source-native weight storage"
-            )
-        if automatic and source.w13_layout.value != "w13":
-            raise ValueError("automatic MoE precision requires up/gate W13 row order")
-        recipe = _packed_recipe(
-            source, ActivationMode.A4 if automatic else activation.mode
-        )
+        recipe = _packed_recipe(source, activation.mode)
         shared_a16 = activation.a16_max_tokens > 0 and recipe != "w4a16"
         requested_layout = None
-        if automatic:
-            requested_layout = WeightPacking.SOURCE_NATIVE.value
         if recipe == "w4a16" and constraints.required_packing is not None:
             if constraints.required_packing not in {
                 WeightPacking.SOURCE_NATIVE,
@@ -290,13 +303,7 @@ def plan_weights(
                 )
             requested_layout = constraints.required_packing.value
         raw_plan = plan_b12x_fp4_moe_weights(
-            quant_modes=(
-                ("nvfp4", "w4a16")
-                if automatic
-                else (recipe, "w4a16")
-                if shared_a16
-                else recipe
-            ),
+            quant_modes=(recipe, "w4a16") if shared_a16 else recipe,
             source_format=source.format.value,
             activation=activation.nonlinearity,
             params_dtype=activation.io_dtype,
@@ -380,6 +387,7 @@ def plan_weights(
             constraints=constraints,
         ),
         _impl=raw_plan,
+        scale_compression=constraints.scale_compression,
     )
 
 
@@ -393,8 +401,14 @@ def prepare_weights(
     | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
+    scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> PreparedExperts:
-    """Materialize the in-memory representation selected by ``plan_weights``."""
+    """Materialize the in-memory representation selected by ``plan_weights``.
+
+    A plan with ``scale_compression="csf"`` takes native ``PackedWeights`` and
+    two caller-owned ``scale_scratch`` expansion buffers, which serialized layers
+    may share; the prepared experts retain only compressed scales.
+    """
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
@@ -404,346 +418,24 @@ def prepare_weights(
         raise ValueError(
             "device and staging are only supported for trellis preparation"
         )
-    if isinstance(weights, Nvfp4CsfWeights):
-        from b12x._lib.quant.nvfp4_csf import (
-            Nvfp4CsfDecoder,
-            make_nvfp4_csf_batch,
-            repack_nvfp4_csf_batch,
-        )
+    if plan.scale_compression is not None:
+        from ._csf_preparation import prepare_online_csf_weights
 
-        if (
-            not isinstance(plan.source, PackedSource)
-            or plan.source.format.value != "modelopt_nvfp4"
-            or plan.source.w13_layout.value != "w13"
-            or plan.activation.mode not in (ActivationMode.A4, ActivationMode.A16)
-            or (
-                plan.activation.mode is ActivationMode.A16
-                and plan.prepared_format.packing is not WeightPacking.MMA_PACKED
-            )
-            or plan.activation.a16_max_tokens
+        return prepare_online_csf_weights(plan, weights, scale_scratch)
+    if scale_scratch is not None:
+        raise ValueError("scale_scratch requires a scale_compression plan")
+    if isinstance(weights, (Nvfp4CsfWeights, Mxfp4CsfWeights)):
+        from b12x.loader._csf_source import CsfSource
+
+        if not all(
+            isinstance(source, (CsfBlockPlanes, CsfSource))
+            for source in (weights.w13_scales, weights.w2_scales)
         ):
-            raise ValueError(
-                "NVFP4-CSF requires native ModelOpt NVFP4 A4/A16 in up/gate order"
-            )
-        geometry = plan.geometry
-        planes = tuple(
-            make_nvfp4_csf_batch(
-                plane.fixed,
-                plane.exceptions,
-                rows=rows,
-                columns=columns,
-                device=weights.packed.w13.device,
-            )
-            if isinstance(plane, CsfScalePlanes)
-            else plane
-            for plane, rows, columns in (
-                (
-                    weights.w13_scales,
-                    2 * geometry.intermediate_size,
-                    geometry.hidden_size // 16,
-                ),
-                (
-                    weights.w2_scales,
-                    geometry.hidden_size,
-                    geometry.intermediate_size // 16,
-                ),
-            )
-        )
-        if plan.activation.mode is ActivationMode.A16:
-            from b12x.moe._shared.kernels.w4a16.prepare import (
-                _nvfp4_compute_scale_factor,
-                _process_nvfp4_packed_scales,
-            )
+            raise TypeError("Compressed expert weights require CSF checkpoint sources")
+        from ._csf_preparation import prepare_csf_block_weights
 
-            # Standard W4A16 preparation chooses one scale normalization per
-            # projection and packs weights/scales into its MMA layout. Expand
-            # one layer in shared scratch to retain that exact preparation law.
-            source_scales = (
-                weights.packed.w13_block_scales,
-                weights.packed.w2_block_scales,
-            )
-            staging_decoder = Nvfp4CsfDecoder.prepare(*planes, *source_scales)
-            ids = torch.arange(
-                plan.geometry.num_experts,
-                dtype=torch.int32,
-                device=weights.packed.w13.device,
-            )
-            staging_decoder.decode(ids, *source_scales)
-            factors = tuple(
-                _nvfp4_compute_scale_factor(t, plan.activation.io_dtype)
-                for t in source_scales
-            )
-        prepared = prepare_weights(plan=plan, weights=weights.packed)
-        if plan.activation.mode is ActivationMode.A16:
-            representation = prepared._impl.representation
-            packed = representation.value
-            outputs = (
-                source_scales[0].view_as(packed.w13_scale),
-                source_scales[1].view_as(packed.w2_scale),
-            )
-            tables = []
-            for factor in factors:
-                alphabet = torch.arange(
-                    256, dtype=torch.uint8, device=weights.packed.w13.device
-                ).view(torch.float8_e4m3fn)
-                alphabet = (
-                    alphabet[:, None]
-                    .expand(256, 4)
-                    .contiguous()
-                    .to(plan.activation.io_dtype)
-                )
-                tables.append(
-                    _process_nvfp4_packed_scales(alphabet, scale_factor=factor)
-                    .view(torch.uint8)[:, 0]
-                    .contiguous()
-                )
-            planes = tuple(
-                repack_nvfp4_csf_batch(plane, row_rotation=rotation, value_lut=table)
-                for plane, rotation, table in zip(
-                    planes, (plan.geometry.intermediate_size, 0), tables, strict=True
-                )
-            )
-            if _w4a16_stage_scales(plan.geometry):
-                # Keep the compressed planes as stage-readable storage. Calls
-                # planned up to the stage-scale token limit rebuild each
-                # pipeline stage's scales in shared memory, with no expansion
-                # pass before the layer. Larger calls expand their routed
-                # experts into the shared scratch first, from the same storage.
-                from b12x._lib.quant.nvfp4_csf_packed import (
-                    PackedCsfPlane,
-                    build_packed_csf_scales,
-                )
-
-                stored = tuple(build_packed_csf_scales(plane) for plane in planes)
-                expander = Nvfp4CsfDecoder.prepare(
-                    *(PackedCsfPlane.of(scales) for scales in stored), *outputs
-                )
-                expanded = replace(packed, w13_scale=outputs[0], w2_scale=outputs[1])
-                packed = replace(
-                    packed,
-                    w13_scale=stored[0].storage,
-                    w2_scale=stored[1].storage,
-                    scale_format="e4m3_k16_csf",
-                )
-                plan = replace(
-                    plan, _impl=replace(plan._impl, w4a16_compressed_scales=True)
-                )
-                return PreparedExperts(
-                    plan=plan,
-                    _impl=replace(
-                        prepared._impl,
-                        plan=plan._impl,
-                        representation=replace(representation, value=packed),
-                        w1_blockscale=stored[0].storage,
-                        w2_blockscale=stored[1].storage,
-                        nvfp4_csf=expander,
-                        w4a16_expanded=expanded,
-                    ),
-                )
-            packed = replace(packed, w13_scale=outputs[0], w2_scale=outputs[1])
-            prepared = replace(
-                prepared,
-                _impl=replace(
-                    prepared._impl,
-                    representation=replace(representation, value=packed),
-                    w1_blockscale=outputs[0],
-                    w2_blockscale=outputs[1],
-                ),
-            )
-        inline = None
-        if (
-            plan.activation.mode is ActivationMode.A4
-            and plan.activation.nonlinearity == "silu"
-            and plan.geometry.intermediate_size % 64 == 0
-            and plan.geometry.hidden_size % 128 == 0
-        ):
-            from b12x._lib.quant.nvfp4_csf_inline import prepare_inline_scales
-
-            inline = tuple(prepare_inline_scales(plane) for plane in planes)
-            # Both execution paths own views of one fixed stream. Only the
-            # exception index differs between whole-plane and tile reads.
-            planes = tuple(
-                replace(
-                    plane,
-                    fixed=value.storage[1024 : 1024 + plane.fixed.numel()].view_as(
-                        plane.fixed
-                    ),
-                )
-                for plane, value in zip(planes, inline, strict=True)
-            )
-            plan = replace(plan, _impl=replace(plan._impl, nvfp4_inline_scales=True))
-        decoder = Nvfp4CsfDecoder.prepare(
-            *planes,
-            prepared._impl.w1_blockscale,
-            prepared._impl.w2_blockscale,
-            inline_scales=inline,
-        )
-        return PreparedExperts(
-            plan=plan,
-            _impl=replace(
-                prepared._impl,
-                plan=plan._impl,
-                nvfp4_csf=replace(decoder, inline_scales=inline),
-            ),
-        )
-    if isinstance(weights, Mxfp4CsfWeights):
-        if (
-            not isinstance(plan.source, PackedSource)
-            or plan.source.format.value != "fp4_e8m0_k32"
-            or plan.activation.mode not in (ActivationMode.A16, ActivationMode.A8)
-            or (
-                plan.activation.mode is ActivationMode.A16
-                and plan.prepared_format.packing
-                not in {WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE}
-            )
-        ):
-            raise ValueError(
-                "MXFP4-CSF requires native MXFP4 with uniform A16 or A8 activations"
-            )
-        from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
-
-        geometry = plan.geometry
-        rotation = (
-            geometry.intermediate_size if plan.source.w13_layout.value == "w13" else 0
-        )
-        planes = tuple(
-            make_x4t_scale_batch(
-                plane.fixed,
-                plane.exceptions,
-                rows=rows,
-                columns=columns,
-                device=weights.w13.device,
-                exception_task_rows=64,
-                exception_row_rotation=row_rotation,
-            )
-            if isinstance(plane, CsfScalePlanes)
-            else plane
-            for plane, rows, columns, row_rotation in (
-                (
-                    weights.w13_scales,
-                    2 * geometry.intermediate_size,
-                    geometry.hidden_size // 32,
-                    rotation,
-                ),
-                (
-                    weights.w2_scales,
-                    geometry.hidden_size,
-                    geometry.intermediate_size // 32,
-                    0,
-                ),
-            )
-        )
-        weights = replace(weights, w13_scales=planes[0], w2_scales=planes[1])
-        if plan.activation.mode is ActivationMode.A8:
-            from b12x._lib.quant.mxfp4_csf import (
-                Mxfp4CsfDecoder,
-                repack_mxfp4_csf_batch,
-            )
-            from b12x._lib.quant.x4t_scales import decode_x4t_scales
-
-            if (
-                not isinstance(plan.source, PackedSource)
-                or plan.source.format.value != "fp4_e8m0_k32"
-                or plan.activation.a16_max_tokens
-            ):
-                raise ValueError("MXFP4-CSF A8 requires a uniform MXFP4/MXFP8 plan")
-            e, h, n = (
-                plan.geometry.num_experts,
-                plan.geometry.hidden_size,
-                plan.geometry.intermediate_size,
-            )
-            planes = (weights.w13_scales, weights.w2_scales)
-            source_scales = (
-                weights.w13_scale_scratch.view(e, 2 * n, h // 32),
-                weights.w2_scale_scratch.view(e, h, n // 32),
-            )
-            ids = torch.arange(e, dtype=torch.int32, device=weights.w13.device)
-            for plane, output in zip(planes, source_scales, strict=True):
-                decode_x4t_scales(plane, ids, output)
-            unit = torch.ones(e, dtype=torch.float32, device=weights.w13.device)
-            packed = PackedWeights(
-                w13=weights.w13,
-                w2=weights.w2,
-                w13_block_scales=source_scales[0],
-                w2_block_scales=source_scales[1],
-                w13_global_scales=unit,
-                w2_global_scales=unit,
-            )
-            prepared = prepare_weights(plan=plan, weights=packed)
-            representation = prepared._impl.representation
-            native = representation.value
-            outputs = []
-            for buffer, scales in zip(
-                (weights.w13_scale_scratch, weights.w2_scale_scratch),
-                (native.w13_sfb, native.w2_sfb),
-                strict=True,
-            ):
-                if (
-                    buffer.numel() * buffer.element_size()
-                    != scales.numel() * scales.element_size()
-                ):
-                    raise ValueError(
-                        "MXFP4-CSF A8 scratch must match the prepared scale storage"
-                    )
-                output = buffer.view(-1).view(scales.dtype).view_as(scales)
-                output.copy_(scales)
-                outputs.append(output)
-            native = replace(native, w13_sfb=outputs[0], w2_sfb=outputs[1])
-            prepared = replace(
-                prepared,
-                _impl=replace(
-                    prepared._impl,
-                    representation=replace(representation, value=native),
-                    w1_blockscale=outputs[0],
-                    w2_blockscale=outputs[1],
-                ),
-            )
-            if _w4a8_csf_inline(plan):
-                # The scratch now holds every expert's native scales. Keep them
-                # as inline storage that the compact W4A8 kernels read per
-                # pipeline stage. Larger planned capacities expand this storage
-                # into the shared scratch before execution.
-                from b12x._lib.quant.mxfp4_csf_inline import build_mxfp4_csf_inline
-
-                inline = tuple(
-                    build_mxfp4_csf_inline(
-                        output.view(torch.uint8).view(e, -1),
-                        rows=rows,
-                        columns=columns,
-                        group_rows=group,
-                    )
-                    for output, rows, columns, group in (
-                        (outputs[0], 2 * n, h // 32, n),
-                        (outputs[1], h, n // 32, h),
-                    )
-                )
-                plan = replace(plan, _impl=replace(plan._impl, w4a8_csf_inline=True))
-                return PreparedExperts(
-                    plan=plan,
-                    _impl=replace(
-                        prepared._impl, plan=plan._impl, mxfp4_csf_inline=inline
-                    ),
-                )
-            rotation = n if plan.source.w13_layout.value == "w31" else 0
-            native_planes = tuple(
-                repack_mxfp4_csf_batch(
-                    plane,
-                    compact=n % 128 == 64,
-                    group_rows=group,
-                    row_rotation=rot,
-                )
-                for plane, group, rot in zip(planes, (n, h), (rotation, 0), strict=True)
-            )
-            decoder = Mxfp4CsfDecoder.prepare(
-                *native_planes,
-                prepared._impl.w1_blockscale,
-                prepared._impl.w2_blockscale,
-            )
-            return PreparedExperts(
-                plan=plan, _impl=replace(prepared._impl, mxfp4_csf=decoder)
-            )
-        prepared = prepare_b12x_x4t_weights(plan=plan._impl, weights=weights)
-    elif (
+        return prepare_csf_block_weights(plan, weights)
+    if (
         isinstance(plan.source, PackedSource)
         and plan.source.format.value in BLOCK_CODECS
     ):
@@ -788,7 +480,41 @@ def prepare_weights(
             )
         input_scale = weights.input_scale
         intermediate_scale = weights.intermediate_scale
-        if plan.activation.mode is ActivationMode.A16:
+        from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+            a4_prefill_enabled,
+            a4_prefill_supported,
+        )
+
+        keep_activation_scales = (
+            plan.activation.mode is ActivationMode.A16
+            and a4_prefill_enabled()
+            and a4_prefill_supported(
+                prepared_layout=plan._impl.w4a16_weight_layout or "packed",
+                scale_format=plan._impl.w4a16_scale_format or "e4m3_k16",
+                activation=plan.activation.nonlinearity,
+                is_gated=plan.activation.nonlinearity == "silu",
+                swiglu_limit=plan.activation.swiglu_limit,
+                dtype=plan.activation.io_dtype,
+                hidden_size=plan.geometry.hidden_size,
+                intermediate_size=plan.geometry.intermediate_size,
+            )
+            and input_scale is not None
+            and intermediate_scale is not None
+            and all(
+                bool((torch.isfinite(scale) & (scale > 0)).all())
+                for scale in (input_scale, intermediate_scale)
+            )
+            # Unit scales are the uncalibrated W4A16 placeholder.
+            and not all(
+                bool((scale == 1).all()) for scale in (input_scale, intermediate_scale)
+            )
+        )
+        if keep_activation_scales:
+            # Shared input quantization uses the widest calibrated expert range.
+            input_scale = (
+                input_scale.detach().reshape(-1).amin().reshape(1).contiguous()
+            )
+        if plan.activation.mode is ActivationMode.A16 and not keep_activation_scales:
             input_scale = torch.ones(
                 plan.geometry.num_experts,
                 dtype=torch.float32,
@@ -823,34 +549,9 @@ def prepare_weights(
             a1_gscale=input_scale,
             a2_gscale=intermediate_scale,
         )
+        if keep_activation_scales:
+            prepared = replace(prepared, a4_prefill_scales=True)
     return PreparedExperts(plan=plan, _impl=prepared)
-
-
-def _w4a8_csf_inline(plan: WeightPlan) -> bool:
-    """Whether compact W4A8 experts read MXFP4-CSF scales inline.
-
-    Compact (N64) W4A8 execution runs the compact micro and split M16 kernels
-    only; all of them read inline storage. B12X_W4A8_CSF_INLINE=0 keeps the
-    per-call expansion of the routed experts' scales into scratch.
-    """
-    return (
-        os.environ.get("B12X_W4A8_CSF_INLINE", "1") != "0"
-        and plan.activation.nonlinearity == "silu"
-        and plan.geometry.intermediate_size % 128 == 64
-    )
-
-
-def _w4a16_stage_scales(geometry) -> bool:
-    """Whether W4A16 keeps NVFP4-CSF scales as stage-readable storage.
-
-    Stages cover whole 128-row slabs of four-k-group atoms in both projections.
-    B12X_W4A16_CSF_INLINE=0 keeps the per-layer expansion pass.
-    """
-    return (
-        os.environ.get("B12X_W4A16_CSF_INLINE", "1") != "0"
-        and geometry.hidden_size % 128 == 0
-        and geometry.intermediate_size % 64 == 0
-    )
 
 
 __all__ = [

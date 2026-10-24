@@ -8,7 +8,7 @@ import torch
 from b12x._lib.compile_plan import load_programs
 from b12x._lib.runtime_control import kernel_resolution_guard
 import b12x.moe._shared.kernels.w4a16.route_pack as route_pack_module
-from b12x.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
+from b12x.moe._shared.kernels.w4a16.kernel.execution import pack_topk_routes_by_expert
 from b12x.moe._shared.kernels.w4a16.host import (
     route_block_sizes_for_capacity,
     route_pack_capacity,

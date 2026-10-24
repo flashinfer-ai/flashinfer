@@ -57,6 +57,7 @@ def plan_execution(
     routing: RoutingSpec | None = None,
     invocation: FrozenMapping = FrozenMapping(),
     override=None,
+    scale_expansion=None,
 ):
     """Return a composite declaration, never an executable plan or warmup handle."""
     from ._preparation import plan
@@ -67,6 +68,7 @@ def plan_execution(
         routing=routing,
         invocation=invocation,
         override=override,
+        scale_expansion=scale_expansion,
     )
 
 

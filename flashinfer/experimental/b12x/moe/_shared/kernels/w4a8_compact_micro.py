@@ -57,7 +57,6 @@ def _layout(
         ("a_mma_scales", _ceil_div(cap, 128) * _ceil_div(k, 128) * 512),
         ("projections", cap * topk * 2 * n * 2),
         ("intermediate", rows * n_padded + rows * n_tiles * 4),
-        ("route_output", cap * topk * k * 2),
     )
     offset = 0
     result: dict[str, tuple[int, int]] = {}
@@ -93,7 +92,6 @@ class _DirectW4A8CompactLaunch:
         down_scale_count: int,
         swiglu_limit: float | None,
         fast_math: bool,
-        csf_inline: bool = False,
     ):
         self.capacity = max_tokens
         self.topk = num_topk
@@ -102,10 +100,10 @@ class _DirectW4A8CompactLaunch:
         self.experts = experts
         self.input_scale_count = input_scale_count
         self.down_scale_count = down_scale_count
-        # Inline MXFP4-CSF: both scale operands are compressed inline storage.
-        self.csf_inline = bool(csf_inline)
         self.projection = W4A8CompactMicroProjectionKernel(
-            k, n, num_topk, csf_inline=self.csf_inline
+            k,
+            n,
+            num_topk,
         )
         self.activation = W4A8CompactMicroActivationKernel(
             n,
@@ -117,9 +115,9 @@ class _DirectW4A8CompactLaunch:
             source_tile_m=1,
             deterministic_output=True,
             direct_routes=True,
+            fused_topk=num_topk,
             n64_repacked=self.n % 128 == 64,
             n64_tail=self.n % 128 == 64,
-            csf_inline=self.csf_inline,
         )
 
     @cute.jit
@@ -137,7 +135,7 @@ class _DirectW4A8CompactLaunch:
         input_scale_ptr: cute.Pointer,
         w2_ptr: cute.Pointer,
         w2_scales_ptr: cute.Pointer,
-        route_output_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
         alpha2_ptr: cute.Pointer,
         down_scale_ptr: cute.Pointer,
         num_pairs: Int32,
@@ -191,9 +189,9 @@ class _DirectW4A8CompactLaunch:
         down_scale = cute.make_tensor(
             down_scale_ptr, cute.make_layout((self.down_scale_count,))
         )
-        route_output = cute.make_tensor(
-            route_output_ptr,
-            cute.make_ordered_layout((pairs, self.k), order=(1, 0)),
+        output = cute.make_tensor(
+            output_ptr,
+            cute.make_ordered_layout((self.capacity, self.k), order=(1, 0)),
         )
         self.projection(
             packed_a,
@@ -219,7 +217,7 @@ class _DirectW4A8CompactLaunch:
             intermediate,
             w2,
             w2_scales,
-            route_output,
+            output,
             token_map,
             token_weights,
             topk_ids,
@@ -249,7 +247,6 @@ def _compiled_direct_w4a8_compact(
     down_scale_count: int,
     swiglu_limit: float | None,
     fast_math: bool,
-    csf_inline: bool = False,
 ):
     launch = _DirectW4A8CompactLaunch(
         max_tokens=max_tokens,
@@ -261,7 +258,6 @@ def _compiled_direct_w4a8_compact(
         down_scale_count=down_scale_count,
         swiglu_limit=swiglu_limit,
         fast_math=fast_math,
-        csf_inline=csf_inline,
     )
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
@@ -283,7 +279,6 @@ def _compiled_direct_w4a8_compact(
             down_scale_count,
             swiglu_limit,
             fast_math,
-            *(("csf_inline",) if csf_inline else ()),
         ),
     )
     return b12x_compile(
@@ -308,7 +303,7 @@ def _compiled_direct_w4a8_compact(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a8.compact_micro",
-            2,
+            4,
             (
                 device_index,
                 max_tokens,
@@ -321,7 +316,6 @@ def _compiled_direct_w4a8_compact(
                 down_scale_count,
                 swiglu_limit,
                 fast_math,
-                *(("csf_inline",) if csf_inline else ()),
             ),
         ),
     )
@@ -338,6 +332,7 @@ def _as_bytes(scratch: torch.Tensor) -> torch.Tensor:
 def launch_w4a8_compact_micro(
     *,
     scratch: torch.Tensor,
+    output: torch.Tensor,
     a: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -356,9 +351,8 @@ def launch_w4a8_compact_micro(
     _prepared_kernel=None,
     _prepared_quantize=None,
     max_active_clusters: int | None = None,
-    csf_inline: bool = False,
 ) -> torch.Tensor:
-    """Run quantized projections, routed activation, and direct FC2 from fixed scratch."""
+    """Run compact W4A8 projections and ordered route reduction into output."""
     if max_active_clusters is not None and max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
     if a.dtype != torch.bfloat16 or a.ndim != 2 or not a.is_contiguous():
@@ -397,7 +391,6 @@ def launch_w4a8_compact_micro(
     scale_mma = region("a_mma_scales")
     intermediate = region("intermediate")
     projections = region("projections")
-    route = region("route_output").view(torch.bfloat16).view(cap * num_topk, k)
     if _prepared_quantize is None:
         quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
     else:
@@ -415,7 +408,6 @@ def launch_w4a8_compact_micro(
         down_scale.numel(),
         swiglu_limit,
         fast_math,
-        csf_inline,
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)
@@ -436,14 +428,14 @@ def launch_w4a8_compact_micro(
         _ptr(cutlass.Float32, input_scale),
         _ptr(cutlass.Uint32, w2),
         _ptr(cutlass.Uint32, w2_scales),
-        _ptr(cutlass.BFloat16, route),
+        _ptr(cutlass.BFloat16, output),
         _ptr(cutlass.Float32, alpha2),
         _ptr(cutlass.Float32, down_scale),
         num_tokens * int(num_topk),
         0 if max_active_clusters is None else max_active_clusters,
         current_cuda_stream(),
     )
-    return route.narrow(0, 0, num_tokens * int(num_topk))
+    return output
 
 
 __all__ = ["micro_scratch_nbytes", "launch_w4a8_compact_micro"]

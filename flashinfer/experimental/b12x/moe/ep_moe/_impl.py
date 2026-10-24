@@ -526,7 +526,7 @@ def _run_bound_ep_moe(binding: EPMoEFP4Binding) -> torch.Tensor:
             )
         topk_ids = binding.route_ids_i32[:route_count].view_as(topk_ids)
         topk_ids.copy_(binding.topk_ids)
-    from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+    from b12x.moe._shared.kernels.w4a16.kernel.execution import run_w4a16_moe
 
     return run_w4a16_moe(
         binding.a,

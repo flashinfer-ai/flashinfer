@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 
 from ..._lib.gating import default_is_supported
-from ...moe._shared.kernels.w4a16.kernel import clear_w4a16_kernel_cache
+from b12x.moe._shared.kernels.w4a16.kernel.execution import clear_w4a16_kernel_cache
 from ...moe._shared.kernels.w4a16.prepare import (
     PreparedTrellis256DenseWeight,
     prepare_trellis256_dense_weight,

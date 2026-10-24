@@ -25,14 +25,14 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
+from b12x._lib.intrinsics.reference import _fp4_encode_nibbles
+from b12x._lib.intrinsics.packed import broadcast_f32_to_half2
 from b12x._lib.intrinsics.conversion import (
     e2m1x8_mul_residual_to_e4m3x8,
     e2m1x8_to_e4m3x8,
     fp8_e4m3_to_f32,
 )
 from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
-from b12x._lib.intrinsics.packed import broadcast_f32_to_half2
-from b12x._lib.intrinsics.reference import _fp4_encode_nibbles
 from b12x._lib.intrinsics.trellis import packed_decode_trellis_mul1_e4m3_to_e4m3x8
 
 from b12x.testing.reference.helpers import require_b12x

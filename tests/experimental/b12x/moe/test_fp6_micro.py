@@ -41,13 +41,13 @@ from b12x.moe._shared.kernels.mxfp6_moe import moe_mxfp6_quantize_input_block_co
 # against b12x.moe.fused_moe (quant_mode="w6a8_mx") once the run path
 # lands. The decode/scale/quant primitive tests below remain live.
 try:
-    from b12x.moe._shared.kernels.micro import (
+    from b12x.moe._shared.kernels.micro.config import (
         MXFP6_BLOCK_SIZE,
         _MAX_DIRECT_K_SEGMENTS,
         _mxfp6_micro_k_segments_for_k,
         _mxfp6_micro_shapes_ok,
-        MoEMicroKernelBackend,
     )
+    from b12x.moe._shared.kernels.micro.kernel import MoEMicroKernelBackend
     from b12x.moe._shared.kernels.silu import MoEMicroKernelSilu
 
     _HAS_FP6_MICRO = True

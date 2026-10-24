@@ -291,8 +291,6 @@ _E64 = {"experts": 64, "hidden": 2048, "intermediate": 768, "top_k": 8}
 _QWEN = {"experts": 16, "hidden": 2560, "intermediate": 640, "top_k": 10}
 _E32 = {"experts": 32, "hidden": 2048, "intermediate": 512, "top_k": 4}
 
-_DYNAMIC_RACE = "NVFP4 dynamic MoE differs under contention at M16/M32 tiles; root cause under investigation"
-
 CASES = {
     "moe_w4a16": [
         {**_GLM16, "m": 9},
@@ -304,12 +302,8 @@ CASES = {
         {**_E64, "m": 4},  # direct top-k routes
     ],
     "moe_dynamic": [
-        # NVFP4 at M16/M32 dynamic tiles (these two) differs in 3-12% of
-        # contended replays on GB10 and never on quiet ones; the default atomic
-        # scatter shows the same corruption against a tolerance. NVFP4 M128
-        # tiles, W4A8 and W8A8 pass.
-        {**_E64, "m": 64, "mode": "nvfp4", "xfail": _DYNAMIC_RACE},
-        {**_E64, "m": 256, "mode": "nvfp4", "xfail": _DYNAMIC_RACE},
+        {**_E64, "m": 64, "mode": "nvfp4"},
+        {**_E64, "m": 256, "mode": "nvfp4"},
         {**_E32, "m": 512, "mode": "nvfp4"},
         {**_E64, "m": 64, "mode": "w4a8_nvfp4"},
         {**_QWEN, "m": 64, "mode": "w8a8_mx"},
