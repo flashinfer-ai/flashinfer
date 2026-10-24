@@ -115,10 +115,45 @@ Linear attention
 cuDNN's fused SM100 linear-attention engines, reachable either directly or as
 ``backend="cudnn"`` on :func:`flashinfer.chunk_gated_delta_rule`,
 :func:`flashinfer.chunk_gated_delta_rule2`,
-:func:`flashinfer.chunk_gated_delta_product` and
-:func:`flashinfer.recurrent_kda`. ``"cudnn"`` is never selected implicitly for
-GDN or KDA, both of which have FlashInfer kernels of their own; GDN-2 and GDP
-have none, so their ``"auto"`` resolves here.
+:func:`flashinfer.chunk_gated_delta_product`,
+:func:`flashinfer.recurrent_kda` and, for Mamba-2,
+:func:`flashinfer.mamba.ssd_combined_fwd` /
+:class:`flashinfer.mamba.SSDCombined`, whose ``"auto"`` resolves here
+wherever the engine serves the call. GDN-2 and GDP have no FlashInfer kernel of
+their own, so their ``"auto"`` always resolves here. GDN and KDA do, and their
+``"auto"`` resolves to cuDNN for every contract the cuDNN entry serves
+(precomputed or raw gates, in-kernel or caller-side normalization, bfloat16 or
+float16 activations, a float32, bfloat16 or float16 state, int32 or int64 offsets,
+caller-owned or allocated buffers) inside the measured SM100 / SM103 region
+kept on ``_prefer_cudnn_gdn_prefill`` and ``_prefer_cudnn_kda_prefill``. For
+GDN that region is every call the engine serves: the 2026-10-14 (B, H) x T
+sweep found cuDNN's kernels faster or within 2 percent of FlashInfer's own
+route on 203 of 232 cells and 1 to 15 us behind on the rest, all of them 2k to
+8k tokens per sequence. For KDA it is up to 24 (head, sequence) tiles from a
+mean sequence length of 8k, and every call above FlashInfer's small-BH
+boundary (2 x tiles > SM count), where cuDNN ties the CuTe DSL kernels; the
+32- and 64-tile band stays with the small-BH kernels, which measured 4 to 25
+percent faster there at every length, and 4k calls stay native (cuDNN won
+0.81 to 0.82 on 4 to 8 tiles but lost 1.07 to 1.10 on 16). Both regions
+come from GB200 kernel sums and CUDA-graph replay (2026-10-13 and 10-14), with
+cuDNN taken wherever it is faster or within about 5 percent. Both engines
+serve K and V head dims of 64 or 128 in any pairing, while FlashInfer's own GDN
+and KDA kernels serve 128 x 128 only, so a call with a 64-wide K or V head has
+no native route and ``"auto"`` takes cuDNN for it at every shape the engine
+serves. Mamba-2's engine serves ``headdim == 64`` with ``dstate == 128`` only.
+Explicit CP, checkpoints and speculative decode stay native. A state-pool
+call (a contiguous pool addressed by contiguous int32 slots, with its output
+pool for GDN) follows the same policy as its compact form: measured on GB200
+(2026-10-15), cuDNN's pool path costs what its dense path costs, while
+FlashInfer's pool routes forgo small-BH (KDA) or run the CuTe DSL kernel
+(GDN); since small-BH declines pools, a KDA pool above 24 tiles is cuDNN's
+outright (the 64-tile pool cells measured 0.94 to 0.96 of the native pool
+route). KDA's caller-normalized q/k and post-sigmoid beta follow the policy
+too; its precomputed log-space gate stays native, since only the in-kernel
+gate carries the bound the engine's chunk decay needs. A build decline falls
+back to the native route before anything executes. An explicit ``backend``
+argument is the only override of that choice. Auto-selected cuDNN leaves a
+supplied KDA ``prefill_workspace`` unused; the native fallback uses it.
 
 These wrappers gate on one thing only: cudnn-frontend 1.29+ with the
 ``cutedsl`` extra, the release whose ``graph.gdn`` / ``graph.gdn2`` /
@@ -129,17 +164,24 @@ compiles itself. Every other requirement, including the SM100 family
 relations, belongs to the engine, which declines a graph it cannot serve (the
 per-engine reason is logged by the frontend; the raised
 ``cudnnGraphNotSupportedError`` itself is generic). Arguments
-FlashInfer has that cuDNN's entry points do not -- state checkpointing, indexed
-state pools, the context-parallel delta rule, speculative decode -- are
-rejected by the routing layer before the call.
+FlashInfer has that cuDNN's entry points do not -- state checkpointing, the
+context-parallel delta rule, speculative decode, KDA's
+unbounded softplus gate (``lower_bound=None`` with ``use_gate_in_kernel``; the
+engine's gate is ``lower_bound * sigmoid(...)``) -- are rejected by the routing
+layer before the call.
 
 The recurrent state crosses this boundary untransposed. FlashInfer holds it
 V-major as ``[N, H, V, K]`` and so does cuDNN, so ``initial_state`` and
 ``output_state`` buffers are passed straight through. cuDNN's ops take the
-state in float32 or bfloat16 and return ``final_state`` in whichever was
+state in float32, bfloat16 or float16 and return ``final_state`` in whichever was
 given, so a bfloat16 state pool crosses with no copy at all. The GDN and GDP
 forget gates are linear-space alpha at this boundary and cross as
 ``gate_domain="linear"``; the GDN-2 and KDA gates are log-space on both sides.
+Mamba-2 crosses its raw ``dt`` and ``A`` as is, with ``dt_softplus`` and
+``dt_limit`` as the node's ``dt_softplus`` / ``dt_min`` / ``dt_max``
+attributes; it needs cudnn-frontend 1.32+, the release whose ``graph.mamba2``
+node exists, serves ``headdim == 64`` and ``dstate == 128``, and has no
+selective ``checkpoint_*`` capture (that stays with the Cake backend).
 
 .. autosummary::
     :toctree: ../generated
@@ -148,3 +190,4 @@ forget gates are linear-space alpha at this boundary and cross as
     cudnn_chunk_gated_delta_rule
     cudnn_chunk_gated_delta_rule2
     cudnn_recurrent_kda
+    cudnn_ssd_combined_fwd

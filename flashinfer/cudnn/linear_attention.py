@@ -169,6 +169,22 @@ def _linear_attention_auto_available() -> bool:
         return False
 
 
+def _mamba2_auto_available() -> bool:
+    """The Mamba-2 node floor: frontend 1.32+ with CuTe DSL 4.7+."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.version import InvalidVersion, Version
+
+    if not CUDNN_AVAILABLE:
+        return False
+    try:
+        return Version(cudnn.__version__) >= Version("1.32") and (
+            Version(version("nvidia-cutlass-dsl")) >= Version("4.7")
+        )
+    except (AttributeError, InvalidVersion, PackageNotFoundError):
+        return False
+
+
 def _check_cudnn_frontend(feature: str, minimum=_MIN_FRONTEND_VERSION) -> None:
     """Fail fast on a frontend that has no linear-attention graph node."""
     if not CUDNN_AVAILABLE:
@@ -215,6 +231,9 @@ class UIDs(Enum):
 
     A_LOG_UID = 150  # Safe-gate log decay rate
     DT_BIAS_UID = 151  # Safe-gate bias
+    A_UID = 152  # Mamba-2 per-head decay rate
+    D_UID = 153  # Mamba-2 skip connection
+    Z_UID = 154  # Mamba-2 output gate
 
     INITIAL_STATE_UID = 200  # Incoming recurrent state
     STATE_INDICES_UID = 201  # Sequence-to-pool row mapping
@@ -248,6 +267,12 @@ def _la_graph_key_fn(
     gate_domain: str = "log",
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
+    a: Optional[torch.Tensor] = None,
+    d: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    dt_softplus: bool = True,
+    dt_min: float = 0.0,
+    dt_max: Optional[float] = None,
 ):
     def layout(t):
         return None if t is None else (t.shape, t.stride(), t.dtype)
@@ -277,6 +302,12 @@ def _la_graph_key_fn(
         gate_domain,
         overwrite_initial_state,
         layout(state_indices),
+        layout(a),
+        layout(d),
+        layout(z),
+        dt_softplus,
+        dt_min,
+        dt_max,
     )
 
 
@@ -308,6 +339,12 @@ if CUDNN_AVAILABLE:
         gate_domain: str = "log",
         overwrite_initial_state: bool = False,
         state_indices: Optional[torch.Tensor] = None,
+        a: Optional[torch.Tensor] = None,
+        d: Optional[torch.Tensor] = None,
+        z: Optional[torch.Tensor] = None,
+        dt_softplus: bool = True,
+        dt_min: float = 0.0,
+        dt_max: Optional[float] = None,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
@@ -344,6 +381,9 @@ if CUDNN_AVAILABLE:
             cudnn_state_indices = declare(
                 state_indices, "state_indices", UIDs.STATE_INDICES_UID
             )
+            cudnn_a = declare(a, "a", UIDs.A_UID)
+            cudnn_d = declare(d, "d", UIDs.D_UID)
+            cudnn_z = declare(z, "z", UIDs.Z_UID)
 
             ports = dict(
                 q=cudnn_q,
@@ -374,10 +414,38 @@ if CUDNN_AVAILABLE:
             if family == "gdp":
                 attrs["num_householder"] = num_householder
             attrs["gate_domain"] = gate_domain
+            if family == "mamba2":
+                # Mamba-2 in the delta-rule vocabulary: q = C, k = B, v = x,
+                # g = the raw dt and a = A. No erase gate, no scale.
+                ports = dict(
+                    q=cudnn_q,
+                    k=cudnn_k,
+                    v=cudnn_v,
+                    g=cudnn_g,
+                    a=cudnn_a,
+                    cu_seqlens=cudnn_cu_seqlens,
+                    initial_state=cudnn_initial_state,
+                    dt_bias=cudnn_dt_bias,
+                    d=cudnn_d,
+                    z=cudnn_z,
+                )
+                if cudnn_state_indices is not None:
+                    ports["state_indices"] = cudnn_state_indices
+                attrs = dict(
+                    output_final_state=final_state is not None,
+                    dt_softplus=dt_softplus,
+                    dt_min=dt_min,
+                    dt_max=dt_max,
+                    batch_invariant=batch_invariant,
+                    name=family,
+                )
             if overwrite_initial_state:
                 attrs["overwrite_initial_state"] = True
 
-            O, fs, _checkpoints = getattr(graph, family)(**ports, **attrs)
+            if family == "mamba2":
+                O, fs, _checkpoints, _pre_gate = graph.mamba2(**ports, **attrs)
+            else:
+                O, fs, _checkpoints = getattr(graph, family)(**ports, **attrs)
 
             O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
                 list(o.shape)
@@ -407,6 +475,9 @@ if CUDNN_AVAILABLE:
                     (UIDs.W_UID, w),
                     (UIDs.A_LOG_UID, a_log),
                     (UIDs.DT_BIAS_UID, dt_bias),
+                    (UIDs.A_UID, a),
+                    (UIDs.D_UID, d),
+                    (UIDs.Z_UID, z),
                     (UIDs.INITIAL_STATE_UID, initial_state),
                     (UIDs.FINAL_STATE_UID, final_state),
                     (UIDs.STATE_INDICES_UID, state_indices),
@@ -473,6 +544,12 @@ def _run_la_graph(
     gate_domain: str = "log",
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
+    a: Optional[torch.Tensor] = None,
+    d: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    dt_softplus: bool = True,
+    dt_min: float = 0.0,
+    dt_max: Optional[float] = None,
 ) -> Optional[torch.Tensor]:
     try:
         graph, _ = _build_la_graph(
@@ -499,6 +576,12 @@ def _run_la_graph(
             gate_domain=gate_domain,
             overwrite_initial_state=overwrite_initial_state,
             state_indices=state_indices,
+            a=a,
+            d=d,
+            z=z,
+            dt_softplus=dt_softplus,
+            dt_min=dt_min,
+            dt_max=dt_max,
         )
     except (cudnn.cudnnGraphNotSupportedError, NotImplementedError) as exc:
         exc.__dict__["_fi_la_build_unsupported"] = True
@@ -510,13 +593,19 @@ def _run_la_graph(
         assert final_state is not None
         final_state = torch.empty_like(final_state)
 
-    buffers: tuple[torch.Tensor, ...] = (q, k, v, g, beta, cu_seqlens, o)
+    # Mamba-2 has no erase gate: beta is None and skipped, as in the graph.
+    buffers: tuple[torch.Tensor, ...] = tuple(
+        t for t in (q, k, v, g, beta, cu_seqlens, o) if t is not None
+    )
     if w is not None:
         buffers += (w,)
     if a_log is not None:
         buffers += (a_log,)
     if dt_bias is not None:
         buffers += (dt_bias,)
+    for extra in (a, d, z):
+        if extra is not None:
+            buffers += (extra,)
     if initial_state is not None:
         buffers += (initial_state,)
     if final_state is not None:
@@ -610,9 +699,9 @@ def _validate_la_state_pool(
             )
         if pool.shape[0] <= 0 or pool.device != device:
             raise ValueError(f"{name} must be a nonempty pool on q's device")
-        if pool.dtype not in (torch.float32, torch.bfloat16):
+        if pool.dtype not in (torch.float32, torch.bfloat16, torch.float16):
             raise ValueError(
-                f"cuDNN linear attention {name} must have dtype float32 or bfloat16"
+                f"cuDNN linear attention {name} must have dtype float32, bfloat16 or float16"
             )
         if (
             pool.stride()[1:] != (v_dim * head_dim, head_dim, 1)
@@ -698,7 +787,8 @@ def cudnn_chunk_gated_delta_rule(
     Parameters
     ----------
     q, k, v : torch.Tensor
-        ``[total_seq_len, num_q_heads / num_k_heads / num_v_heads, 128]``,
+        ``[total_seq_len, num_q_heads / num_k_heads, K]`` and
+        ``[total_seq_len, num_v_heads, V]`` with K and V each 64 or 128,
         packed. Strides are passed through to cuDNN, so only the innermost dim
         has to be contiguous.
     g : torch.Tensor, optional
@@ -713,8 +803,8 @@ def cudnn_chunk_gated_delta_rule(
         Query scale; ``1 / sqrt(head_dim)`` when ``None`` or ``0.0``, matching
         the native GDN path.
     initial_state, output_state : torch.Tensor, optional
-        State ``[num_seqs, num_sab_heads, 128, 128]``, V-major, float32 or
-        bfloat16. cuDNN uses the same layout, so these pass through
+        State ``[num_seqs, num_sab_heads, V, K]``, V-major, float32,
+        bfloat16 or float16. cuDNN uses the same layout, so these pass through
         untransposed and ``output_state`` is written in place by the kernel.
         Without ``state_indices``, ``output_state`` must not alias ``initial_state``: the engines split
         one sequence across CTAs, so the chunk-0 CTA reading the incoming
@@ -730,7 +820,7 @@ def cudnn_chunk_gated_delta_rule(
         Normalize Q/K with additive epsilon ``1e-6`` and round to the input
         dtype inside the frontend, matching the public GDN API.
     output : torch.Tensor, optional
-        Pre-allocated ``[total_seq_len, num_o_heads, 128]``, written in place
+        Pre-allocated ``[total_seq_len, num_o_heads, V]``, written in place
         by the kernel.
     batch_invariant : bool
         Disable the split-K partition so the reduction order, and hence the
@@ -918,7 +1008,7 @@ def cudnn_chunk_gated_delta_product(
         matching the native GDN path.
     initial_state, output_state : torch.Tensor, optional
         State ``[num_seqs, num_sab_heads, head_size, head_size]``, V-major,
-        float32 or bfloat16. Without ``state_indices``, ``output_state`` must
+        float32, bfloat16 or float16. Without ``state_indices``, ``output_state`` must
         not alias ``initial_state``; see :func:`cudnn_chunk_gated_delta_rule`.
     output_final_state : bool
         Return the outgoing recurrent state alongside the output; when unset
@@ -1064,25 +1154,26 @@ def cudnn_chunk_gated_delta_rule2(
     Parameters
     ----------
     q, k, v : torch.Tensor
-        ``[total_seq_len, num_q_heads / num_k_heads / num_v_heads, 128]``,
+        ``[total_seq_len, num_q_heads / num_k_heads, K]`` and
+        ``[total_seq_len, num_v_heads, V]`` with K and V each 64 or 128,
         packed.
     g : torch.Tensor, optional
         Channel-wise forget gate as the natural-log decay, shape
-        ``[total_seq_len, num_sab_heads, 128]``, passed to cuDNN as is
+        ``[total_seq_len, num_sab_heads, K]``, passed to cuDNN as is
         (``gate_domain="log"``) at ``g``'s own dtype, which cuDNN reads at
         float32, bfloat16 or float16. All-zeros when ``None``.
     beta : torch.Tensor, optional
-        Channel-wise erase gate ``[total_seq_len, num_sab_heads, 128]``,
+        Channel-wise erase gate ``[total_seq_len, num_sab_heads, K]``,
         converted to ``q.dtype``. All-ones when ``None``.
     w : torch.Tensor, optional
-        Channel-wise write gate ``[total_seq_len, num_sab_heads, 128]``,
+        Channel-wise write gate ``[total_seq_len, num_sab_heads, V]``,
         converted to ``q.dtype``. All-ones when ``None``.
     scale : float, optional
         Query scale; ``1 / sqrt(head_dim)`` when ``None`` or ``0.0``, matching
         the native GDN path.
     initial_state, output_state : torch.Tensor, optional
-        State ``[num_seqs, num_sab_heads, 128, 128]``, V-major, float32 or
-        bfloat16. Without ``state_indices``, ``output_state`` must not alias
+        State ``[num_seqs, num_sab_heads, V, K]``, V-major, float32,
+        bfloat16 or float16. Without ``state_indices``, ``output_state`` must not alias
         ``initial_state``; see
         :func:`cudnn_chunk_gated_delta_rule`.
     output_final_state : bool
@@ -1093,7 +1184,7 @@ def cudnn_chunk_gated_delta_rule2(
     use_qk_l2norm_in_kernel : bool
         Fuse the q/k L2 normalization into the kernel.
     output : torch.Tensor, optional
-        Pre-allocated ``[total_seq_len, num_o_heads, 128]``.
+        Pre-allocated ``[total_seq_len, num_o_heads, V]``.
     batch_invariant : bool
         Disable the split-K partition; see
         :func:`cudnn_chunk_gated_delta_rule`.
@@ -1229,10 +1320,10 @@ def cudnn_recurrent_kda(
     Parameters
     ----------
     q, k, v : torch.Tensor
-        ``[1, total_tokens, H, 128]`` or ``[total_tokens, H, 128]``, bfloat16
-        or float16.
+        ``[1, total_tokens, H, K]`` or ``[total_tokens, H, K]`` for q and k,
+        ``[..., HV, V]`` for v, K and V each 64 or 128, bfloat16 or float16.
     g : torch.Tensor
-        Channel-wise gate ``[..., total_tokens, HV, 128]``. Log-space unless
+        Channel-wise gate ``[..., total_tokens, HV, K]``. Log-space unless
         ``use_gate_in_kernel``, in which case it is the raw pre-activation and
         cuDNN applies the safe-gate transform from ``A_log`` / ``dt_bias`` /
         ``lower_bound``. float32, bfloat16 or float16; cuDNN takes all three
@@ -1260,10 +1351,15 @@ def cudnn_recurrent_kda(
         Read ``beta`` as logits and apply the sigmoid in the kernel.
     lower_bound : float, optional
         Safe-gate lower bound, forwarded as cuDNN's ``gate_lower_bound``.
+        Required with ``use_gate_in_kernel``: cuDNN's in-kernel gate is
+        ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` and it has no
+        unbounded softplus form, so ``None`` raises ``NotImplementedError``
+        instead of running the bounded gate. A softplus model passes its
+        log-space gate as ``g`` with ``use_gate_in_kernel=False``.
     cu_seqlens : torch.Tensor
         ``[num_seqs + 1]`` int32 or int64. Required.
     initial_state, output_state : torch.Tensor, optional
-        State ``[num_seqs, HV, 128, 128]``, V-major, float32 or bfloat16.
+        State ``[num_seqs, HV, V, K]``, V-major, float32, bfloat16 or float16.
         Following the Cake and CuTe DSL prefill backends, ``initial_state`` is
         advanced to the final state whenever one is given and no separate
         ``output_state`` is supplied, independently of
@@ -1279,7 +1375,7 @@ def cudnn_recurrent_kda(
         Contiguous int32 ``[num_seqs]`` slots in recurrent state pools,
         requiring cuDNN frontend 1.31+ and ordinary packed prefill.
         Pools have shape ``[N_pool, HV, V, K]`` with dense inner rows and
-        a 16-byte aligned slot stride, in float32 or bfloat16. Slot ids
+        a 16-byte aligned slot stride, in float32, bfloat16 or float16. Slot ids
         must be unique and in range; their values are not read back.
         Selected input rows advance in place unless a separate
         ``output_state`` pool is supplied, even when ``output_final_state``
@@ -1299,6 +1395,13 @@ def cudnn_recurrent_kda(
     if use_gate_in_kernel and (A_log is None or dt_bias is None):
         raise ValueError(
             "cudnn_recurrent_kda: use_gate_in_kernel requires both A_log and dt_bias"
+        )
+    if use_gate_in_kernel and lower_bound is None:
+        raise NotImplementedError(
+            "cudnn_recurrent_kda: cuDNN's in-kernel KDA gate is "
+            "lower_bound * sigmoid(exp(A_log) * (g + dt_bias)); the unbounded "
+            "softplus gate (lower_bound=None) is not served. Pass a negative "
+            "lower_bound, or a precomputed log-space g with use_gate_in_kernel=False."
         )
 
     out_shape = tuple(v.shape)
@@ -1410,3 +1513,255 @@ def cudnn_recurrent_kda(
             initial_state.copy_(final_state)
             final_state = initial_state
     return output.reshape(out_shape), final_state if output_final_state else None
+
+
+# One ``[0, S, 2S, ...]`` boundary tensor per dense Mamba-2 call shape and device.
+_ssd_dense_offsets: dict = {}
+
+
+def _ssd_dense_cu_seqlens(
+    batch: int, seqlen: int, device: torch.device
+) -> torch.Tensor:
+    key = (get_device_index(device), batch, seqlen)
+    offsets = _ssd_dense_offsets.get(key)
+    if offsets is None:
+        offsets = torch.arange(batch + 1, dtype=torch.int32, device=device) * seqlen
+        _ssd_dense_offsets[key] = offsets
+    return offsets
+
+
+@flashinfer_api
+def cudnn_ssd_combined_fwd(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    dt_softplus: bool = False,
+    dt_limit: tuple[float, float] = (0.0, float("inf")),
+    initial_states: Optional[torch.Tensor] = None,
+    seq_idx: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    return_final_states: bool = True,
+    num_seqs: Optional[int] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    final_states: Optional[torch.Tensor] = None,
+    batch_invariant: bool = False,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    r"""Mamba-2 SSD combined forward on cuDNN's fused SM100 engine.
+
+    Argument meanings match :meth:`flashinfer.mamba.SSDCombined.run`. Mamba-2
+    is the gated delta rule without the erase term: one per-token scalar
+    ``dt`` is both the decay exponent and the write strength,
+
+    .. math::
+
+        dt_t &= \mathrm{clamp}(\mathrm{softplus}(dt_t + dt\_bias), dt_{min}, dt_{max}) \\
+        S_t &= e^{A\, dt_t} S_{t-1} + dt_t\, B_t \otimes x_t \\
+        y_t &= C_t^\top S_t + D x_t \quad (\cdot\; z_t\, \sigma(z_t))
+
+    with the softplus applied only under ``dt_softplus``. In cuDNN's
+    delta-rule vocabulary ``C`` is ``q``, ``B`` is ``k``, ``x`` is ``v`` and the
+    raw ``dt`` is the gate.
+
+    Requires cudnn-frontend 1.32.0+ with the ``cutedsl`` extra. The engine
+    serves ``headdim == 64`` and ``dstate == 128`` on the SM100 family and
+    declines everything else it cannot run.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        ``[batch, seqlen, nheads, headdim]``, bfloat16 or float16. Packed
+        varlen calls carry ``batch == 1``.
+    dt : torch.Tensor
+        ``[batch, seqlen, nheads]`` step sizes, raw (pre-softplus) when
+        ``dt_softplus`` is set; float32, bfloat16 or float16.
+    A : torch.Tensor
+        ``[nheads]`` negative decay rates, float32.
+    B, C : torch.Tensor
+        ``[batch, seqlen, ngroups, dstate]`` at ``x``'s dtype; ``nheads`` must be
+        a multiple of ``ngroups``.
+    D : torch.Tensor, optional
+        Skip connection ``[nheads]`` or ``[nheads, headdim]`` (``[nheads, 1]`` is
+        read as per head).
+    z : torch.Tensor, optional
+        Output gate like ``x``; ``y *= z sigmoid(z)`` is fused.
+    dt_bias : torch.Tensor, optional
+        ``[nheads]``, added to ``dt`` before the softplus.
+    dt_softplus : bool
+        Apply the softplus to ``dt + dt_bias``.
+    dt_limit : tuple[float, float]
+        Inclusive clamp of the processed step size; ``inf`` is unbounded.
+    initial_states : torch.Tensor, optional
+        ``[num_seqs, nheads, headdim, dstate]`` (``[batch, ...]`` for a dense
+        call), float32, bfloat16 or float16. A zero state when ``None``.
+    seq_idx, chunk_indices, chunk_offsets : torch.Tensor, optional
+        The CuTe backend's packed-varlen form. ``seq_idx`` ``[1, seqlen]``
+        holds non-decreasing in-range sequence IDs; the boundaries are derived
+        from it on the device (an out-of-range ID is clamped, which keeps the
+        call memory-safe and leaves those tokens' outputs undefined).
+        ``chunk_indices`` / ``chunk_offsets`` are accepted for call
+        compatibility and not read: the engine derives its chunk tables from
+        ``cu_seqlens``.
+    out : torch.Tensor, optional
+        Caller-owned contiguous token-major ``[batch, seqlen, nheads, headdim]``.
+    return_final_states : bool
+        Return the per-sequence final state; when unset no state is written.
+    num_seqs : int, optional
+        Sequence count for a ``seq_idx`` call without ``initial_states``.
+    cu_seqlens : torch.Tensor, optional
+        ``[num_seqs + 1]`` int32 or int64 token offsets, the packed-varlen form
+        the engine takes directly.
+    final_states : torch.Tensor, optional
+        Caller-owned ``[num_seqs, nheads, headdim, dstate]`` final-state buffer
+        at the state dtype.
+    batch_invariant : bool
+        Disable the split-K partition; see
+        :func:`cudnn_chunk_gated_delta_rule`.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, Optional[torch.Tensor]]
+        ``(out, final_states)``; ``final_states`` is ``None`` unless
+        ``return_final_states``.
+    """
+    _check_cudnn_frontend("ssd_combined_fwd", (1, 32))
+    if x.dim() != 4 or B.dim() != 4 or C.dim() != 4 or dt.dim() != 3:
+        raise ValueError(
+            "cudnn_ssd_combined_fwd: x, B and C are [batch, seqlen, heads, dim] "
+            "and dt is [batch, seqlen, heads]"
+        )
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise NotImplementedError(
+            f"cudnn_ssd_combined_fwd: x, B, C and z must be bfloat16 or float16, got {x.dtype}"
+        )
+    batch, seqlen, num_heads, head_dim = x.shape
+    num_groups, state_dim = B.shape[2], B.shape[3]
+    total = batch * seqlen
+    if (cu_seqlens is not None or seq_idx is not None) and batch != 1:
+        raise ValueError("cudnn_ssd_combined_fwd: packed-varlen calls carry batch == 1")
+    if cu_seqlens is not None:
+        if cu_seqlens.dtype not in (torch.int32, torch.int64) or cu_seqlens.dim() != 1:
+            raise ValueError(
+                "cudnn_ssd_combined_fwd: cu_seqlens must be a 1-D int32 or int64 tensor"
+            )
+        count = cu_seqlens.shape[0] - 1
+        if num_seqs is not None and num_seqs != count:
+            raise ValueError(
+                f"cudnn_ssd_combined_fwd: num_seqs ({num_seqs}) disagrees with cu_seqlens ({count})"
+            )
+    elif seq_idx is not None:
+        if tuple(seq_idx.shape) != (batch, seqlen):
+            raise ValueError(
+                f"cudnn_ssd_combined_fwd: seq_idx must be [batch, seqlen], got {tuple(seq_idx.shape)}"
+            )
+        count = (
+            num_seqs
+            if num_seqs is not None
+            else initial_states.shape[0]
+            if initial_states is not None
+            else None
+        )
+        if count is None:
+            raise ValueError(
+                "cudnn_ssd_combined_fwd: a seq_idx call needs initial_states or "
+                "num_seqs for the sequence count"
+            )
+        # Per-sequence token counts, then their prefix sum: the boundaries of
+        # non-decreasing IDs, derived on the device without a host sync. An
+        # out-of-range ID is clamped so the call stays memory-safe; those
+        # tokens' outputs are then undefined, as on the Cake backend.
+        counts = torch.zeros(count, dtype=torch.int32, device=x.device)
+        counts.scatter_add_(
+            0,
+            seq_idx.reshape(-1).long().clamp_(0, count - 1),
+            torch.ones(total, dtype=torch.int32, device=x.device),
+        )
+        cu_seqlens = torch.zeros(count + 1, dtype=torch.int32, device=x.device)
+        cu_seqlens[1:] = counts.cumsum(0)
+    else:
+        count = batch
+        cu_seqlens = _ssd_dense_cu_seqlens(batch, seqlen, x.device)
+    del chunk_indices, chunk_offsets
+    if initial_states is not None and initial_states.shape[0] != count:
+        raise ValueError(
+            f"cudnn_ssd_combined_fwd: initial_states holds {initial_states.shape[0]} "
+            f"rows for {count} sequences"
+        )
+    state_dtype = (
+        initial_states.dtype
+        if initial_states is not None
+        else final_states.dtype
+        if final_states is not None
+        else torch.bfloat16
+    )
+    if state_dtype not in (torch.bfloat16, torch.float32, torch.float16):
+        raise NotImplementedError(
+            f"cudnn_ssd_combined_fwd: the state is carried at bfloat16, float32 or float16, got {state_dtype}"
+        )
+    if D is not None and D.dim() == 2 and D.shape[1] == 1:
+        D = D[:, 0]
+
+    x_thd = x.reshape(total, num_heads, head_dim)
+    b_thd = B.reshape(total, num_groups, state_dim)
+    c_thd = C.reshape(total, num_groups, state_dim)
+    dt_thd = dt.reshape(total, num_heads)
+    z_thd = None if z is None else z.reshape(total, num_heads, head_dim)
+    if out is None:
+        out = torch.empty(
+            batch, seqlen, num_heads, head_dim, dtype=x.dtype, device=x.device
+        )
+    elif tuple(out.shape) != tuple(x.shape) or out.dtype != x.dtype:
+        raise ValueError(
+            "cudnn_ssd_combined_fwd: out must match x's shape and dtype, got "
+            f"{tuple(out.shape)} {out.dtype}"
+        )
+    elif not out.is_contiguous():
+        raise ValueError("cudnn_ssd_combined_fwd: out must be contiguous")
+    o_thd = out.view(total, num_heads, head_dim)
+
+    final = None
+    if return_final_states:
+        shape = (count, num_heads, head_dim, state_dim)
+        if final_states is None:
+            final_states = torch.empty(shape, dtype=state_dtype, device=x.device)
+        elif tuple(final_states.shape) != shape or final_states.dtype != state_dtype:
+            raise ValueError(
+                f"cudnn_ssd_combined_fwd: final_states must be {shape} at {state_dtype}, "
+                f"got {tuple(final_states.shape)} {final_states.dtype}"
+            )
+        final = final_states
+    dt_min = float(dt_limit[0])
+    dt_max = None if math.isinf(float(dt_limit[1])) else float(dt_limit[1])
+
+    final = _run_la_graph(
+        "mamba2",
+        c_thd,
+        b_thd,
+        x_thd,
+        dt_thd,
+        None,
+        cu_seqlens,
+        o_thd,
+        a=A,
+        dt_bias=dt_bias,
+        d=D,
+        z=z_thd,
+        initial_state=initial_states,
+        final_state=final,
+        scale=1.0,
+        use_qk_l2norm=False,
+        use_beta_sigmoid=False,
+        safe_gate=False,
+        gate_lower_bound=None,
+        batch_invariant=bool(batch_invariant),
+        dt_softplus=bool(dt_softplus),
+        dt_min=dt_min,
+        dt_max=dt_max,
+    )
+    return out, final if return_final_states else None
