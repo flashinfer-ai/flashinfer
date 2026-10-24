@@ -236,6 +236,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_muse_spark_norm_1aab303bce601c44d1bf": {
         "arches": [
             "sm_100a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -381,6 +382,12 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         1,
                         64,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        0,
+                        256,
                     ],
                 ],
             },
@@ -552,6 +559,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -703,6 +711,12 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         512,
                         1536,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        512,
+                        None,
                     ],
                 ],
             },
@@ -1333,6 +1347,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -1483,6 +1498,12 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_103a": [
                     [
                         0,
+                        None,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        255,
                         None,
                     ],
                 ],
@@ -1966,6 +1987,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_muse_spark_norm_bf9fcec05cbfa3d03bde": {
         "arches": [
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2115,6 +2137,12 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         256,
                         None,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        256,
+                        4096,
                     ],
                 ],
             },
@@ -2432,6 +2460,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_muse_spark_norm_d12f249b80e1a32b7893": {
         "arches": [
             "sm_100a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2579,6 +2608,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         16,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        0,
+                        512,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -2587,6 +2622,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2706,6 +2742,13 @@ MODULES: dict[str, dict[str, Any]] = {
                         None,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        16,
+                        1024,
+                        None,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -2714,6 +2757,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2843,6 +2887,13 @@ MODULES: dict[str, dict[str, Any]] = {
                         1024,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        32,
+                        0,
+                        9,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -2851,6 +2902,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2970,6 +3022,18 @@ MODULES: dict[str, dict[str, Any]] = {
                         None,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        128,
+                        1024,
+                        None,
+                    ],
+                    [
+                        32,
+                        1024,
+                        None,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -2978,6 +3042,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3097,6 +3162,13 @@ MODULES: dict[str, dict[str, Any]] = {
                         1024,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        16,
+                        0,
+                        1024,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -3105,6 +3177,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3224,6 +3297,13 @@ MODULES: dict[str, dict[str, Any]] = {
                         8,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        128,
+                        1,
+                        2,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -3232,6 +3312,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3351,6 +3432,13 @@ MODULES: dict[str, dict[str, Any]] = {
                         None,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        128,
+                        256,
+                        1024,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -3359,6 +3447,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3503,6 +3592,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         16,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        1,
+                        16,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -3511,6 +3606,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3653,6 +3749,16 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         0,
                         16,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        1,
+                        16,
+                    ],
+                    [
+                        32,
+                        64,
                     ],
                 ],
             },
@@ -3823,6 +3929,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3967,6 +4074,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         128,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        64,
+                        128,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -3975,6 +4088,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4119,6 +4233,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         16,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        1,
+                        16,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -4127,6 +4247,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4271,6 +4392,16 @@ MODULES: dict[str, dict[str, Any]] = {
                         2048,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        128,
+                        256,
+                    ],
+                    [
+                        8192,
+                        None,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -4279,6 +4410,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4423,6 +4555,16 @@ MODULES: dict[str, dict[str, Any]] = {
                         64,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        0,
+                        1,
+                    ],
+                    [
+                        16,
+                        32,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -4431,6 +4573,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4575,6 +4718,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         2048,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        8192,
+                        None,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -4583,6 +4732,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4727,6 +4877,16 @@ MODULES: dict[str, dict[str, Any]] = {
                         16,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        1,
+                        16,
+                    ],
+                    [
+                        32,
+                        64,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -4735,6 +4895,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4877,6 +5038,16 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         16,
                         64,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        0,
+                        1,
+                    ],
+                    [
+                        16,
+                        32,
                     ],
                 ],
             },
@@ -5047,6 +5218,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5191,6 +5363,12 @@ MODULES: dict[str, dict[str, Any]] = {
                         128,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        64,
+                        128,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -5199,6 +5377,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5341,6 +5520,12 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         255,
                         2048,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        8192,
+                        None,
                     ],
                 ],
             },
@@ -5511,6 +5696,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5655,6 +5841,16 @@ MODULES: dict[str, dict[str, Any]] = {
                         64,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        0,
+                        1,
+                    ],
+                    [
+                        16,
+                        32,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -5663,6 +5859,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5807,6 +6004,16 @@ MODULES: dict[str, dict[str, Any]] = {
                         2048,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        128,
+                        256,
+                    ],
+                    [
+                        8192,
+                        None,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -5815,6 +6022,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5956,6 +6164,12 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_103a": [
                     [
                         64,
+                        128,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        32,
                         128,
                     ],
                 ],
@@ -6127,6 +6341,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6271,6 +6486,16 @@ MODULES: dict[str, dict[str, Any]] = {
                         64,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        0,
+                        1,
+                    ],
+                    [
+                        16,
+                        32,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -6279,6 +6504,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6423,6 +6649,1103 @@ MODULES: dict[str, dict[str, Any]] = {
                         128,
                     ],
                 ],
+                "sm_107a": [
+                    [
+                        32,
+                        128,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_4e76b0cecea57bf56f1f": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "weight",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "mode": 1,
+            "threads": 1024,
+            "split": 1,
+            "exchange": False,
+            "cluster": 1,
+            "vec": 8,
+            "epilogue": "direct",
+            "persistent": True,
+            "min_blocks": 0,
+            "pdl": True,
+            "rsqrt_approx": False,
+            "fold": "chain",
+            "packed": False,
+            "hoist": False,
+            "pfold": "chain",
+            "branch_first": False,
+            "pdl_late": False,
+            "pdl_wait_top": False,
+            "pdl_launch_top": False,
+            "prologue_h": False,
+            "grid_y": False,
+            "dyn_cluster": False,
+            "index32": False,
+            "x_hint": "evict_first",
+            "w_hint": "read_only",
+            "s_hint": "evict_first",
+            "ab_hint": "read_only",
+            "o_hint": "none",
+            "stage_buffers": 2,
+            "carveout": None,
+            "packed_widen": "shift_mask",
+            "planes_smem": "none",
+            "planes_path": "cp_async",
+            "x_words": False,
+            "rows_per_cta": 1,
+            "plane_width": 256,
+            "out_width": 256,
+            "residual_first": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "kind": "persistent_rows",
+            "row_ctas": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_4e76b0cecea57bf56f1f",
+        "launch": {
+            "block": (
+                1024,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 384,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_4e76b0cecea57bf56f1f",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "beta": "beta",
+            "branch": "branch",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "out": "out",
+            "residual": "residual",
+            "weight": "weight",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_rmsnorm",
+        "route": "gated_residual_rmsnorm_mode1_pdl",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        256,
+                        8192,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_5331c269cc13461d7edd": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 16,
+            "g_nc": True,
+            "order": "heads",
+            "interleave": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "heads",
+            "rows_per_cta": 32,
+            "tcluster": 16,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_5331c269cc13461d7edd",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                16,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_5331c269cc13461d7edd",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        8,
+                        64,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_63d4a52e896aa2237252": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 2,
+            "width": 128,
+            "pdl": False,
+            "tail": "clamp",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 64,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_63d4a52e896aa2237252",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_63d4a52e896aa2237252",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        64,
+                        256,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_96fc60d0b38e67b4085a": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "weight",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "mode": 0,
+            "threads": 1024,
+            "split": 1,
+            "exchange": False,
+            "cluster": 1,
+            "vec": 8,
+            "epilogue": "direct",
+            "persistent": True,
+            "min_blocks": 0,
+            "pdl": False,
+            "rsqrt_approx": False,
+            "fold": "chain",
+            "packed": False,
+            "hoist": False,
+            "pfold": "chain",
+            "branch_first": False,
+            "pdl_late": False,
+            "pdl_wait_top": False,
+            "pdl_launch_top": False,
+            "prologue_h": False,
+            "grid_y": False,
+            "dyn_cluster": False,
+            "index32": False,
+            "x_hint": "evict_first",
+            "w_hint": "read_only",
+            "s_hint": "evict_first",
+            "ab_hint": "read_only",
+            "o_hint": "none",
+            "stage_buffers": 2,
+            "carveout": None,
+            "packed_widen": "shift_mask",
+            "planes_smem": "none",
+            "planes_path": "cp_async",
+            "x_words": False,
+            "rows_per_cta": 1,
+            "plane_width": 256,
+            "out_width": 256,
+            "residual_first": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "kind": "persistent_rows",
+            "row_ctas": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_96fc60d0b38e67b4085a",
+        "launch": {
+            "block": (
+                1024,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 384,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_96fc60d0b38e67b4085a",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "beta": "beta",
+            "branch": "branch",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "out": "out",
+            "residual": "residual",
+            "weight": "weight",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_rmsnorm",
+        "route": "gated_residual_rmsnorm_mode0",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        256,
+                        8192,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_b174718f7be21bb8a5d9": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "next_weight",
+            ],
+            [
+                "buffer",
+                "post_weight",
+            ],
+            [
+                "buffer",
+                "residual_out",
+            ],
+            [
+                "buffer",
+                "ffn_input",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "post_eps",
+            ],
+            [
+                "parameter",
+                "next_eps",
+            ],
+            [
+                "parameter",
+                "post_gain_center",
+            ],
+            [
+                "parameter",
+                "next_gain_center",
+            ],
+            [
+                "parameter",
+                "alpha_value",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "cluster": 1,
+            "threads": 512,
+            "vec": 16,
+            "persistent": True,
+            "prefetch": True,
+            "prefetch_depth": 1,
+            "resident": True,
+            "exit_sync": False,
+            "tensor_alpha": False,
+            "post_weight": False,
+            "pdl": False,
+            "rsqrt_approx": False,
+            "min_blocks": 0,
+            "load_order": "vectors_first",
+            "l2_hint": None,
+            "packed": True,
+            "wait_form": "acquire_cluster",
+            "issue_order": "source",
+            "reload_fp32": False,
+            "expect_hoist": False,
+            "store_all_lanes": False,
+            "tma_stages": 0,
+            "pdl_launch": "statistic",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "kind": "persistent_rows",
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_b174718f7be21bb8a5d9",
+        "launch": {
+            "block": (
+                512,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_b174718f7be21bb8a5d9",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "alpha_value": "alpha_value",
+            "beta": "beta",
+            "branch": "branch",
+            "ffn_input": "ffn_input",
+            "next_eps": "next_eps",
+            "next_gain_center": "next_gain_center",
+            "next_weight": "next_weight",
+            "post_eps": "post_eps",
+            "post_gain_center": "post_gain_center",
+            "post_weight": "post_weight",
+            "residual": "residual",
+            "residual_out": "residual_out",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_next_rmsnorm",
+        "route": "gated_residual_next_rmsnorm_alpha_scalar_nopw",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        4096,
+                        None,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_bd0b88e124a14b9ebfad": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "weight",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "mode": 0,
+            "threads": 1024,
+            "split": 1,
+            "exchange": False,
+            "cluster": 1,
+            "vec": 8,
+            "epilogue": "direct",
+            "persistent": True,
+            "min_blocks": 0,
+            "pdl": True,
+            "rsqrt_approx": False,
+            "fold": "chain",
+            "packed": False,
+            "hoist": False,
+            "pfold": "chain",
+            "branch_first": False,
+            "pdl_late": False,
+            "pdl_wait_top": False,
+            "pdl_launch_top": False,
+            "prologue_h": False,
+            "grid_y": False,
+            "dyn_cluster": False,
+            "index32": False,
+            "x_hint": "evict_first",
+            "w_hint": "read_only",
+            "s_hint": "evict_first",
+            "ab_hint": "read_only",
+            "o_hint": "none",
+            "stage_buffers": 2,
+            "carveout": None,
+            "packed_widen": "shift_mask",
+            "planes_smem": "none",
+            "planes_path": "cp_async",
+            "x_words": False,
+            "rows_per_cta": 1,
+            "plane_width": 256,
+            "out_width": 256,
+            "residual_first": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "kind": "persistent_rows",
+            "row_ctas": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_bd0b88e124a14b9ebfad",
+        "launch": {
+            "block": (
+                1024,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 384,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_bd0b88e124a14b9ebfad",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "beta": "beta",
+            "branch": "branch",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "out": "out",
+            "residual": "residual",
+            "weight": "weight",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_rmsnorm",
+        "route": "gated_residual_rmsnorm_mode0_pdl",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        256,
+                        8192,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_c5d257cc5d4813c1f6b9": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 8,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 16,
+            "tcluster": 8,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_c5d257cc5d4813c1f6b9",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                8,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_c5d257cc5d4813c1f6b9",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        32,
+                        64,
+                        256,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_c9753c6cab93c6f53ea2": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "weight",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "parameter",
+                "gain_center",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "mode": 1,
+            "threads": 1024,
+            "split": 1,
+            "exchange": False,
+            "cluster": 1,
+            "vec": 8,
+            "epilogue": "direct",
+            "persistent": True,
+            "min_blocks": 0,
+            "pdl": False,
+            "rsqrt_approx": False,
+            "fold": "chain",
+            "packed": False,
+            "hoist": False,
+            "pfold": "chain",
+            "branch_first": False,
+            "pdl_late": False,
+            "pdl_wait_top": False,
+            "pdl_launch_top": False,
+            "prologue_h": False,
+            "grid_y": False,
+            "dyn_cluster": False,
+            "index32": False,
+            "x_hint": "evict_first",
+            "w_hint": "read_only",
+            "s_hint": "evict_first",
+            "ab_hint": "read_only",
+            "o_hint": "none",
+            "stage_buffers": 2,
+            "carveout": None,
+            "packed_widen": "shift_mask",
+            "planes_smem": "none",
+            "planes_path": "cp_async",
+            "x_words": False,
+            "rows_per_cta": 1,
+            "plane_width": 256,
+            "out_width": 256,
+            "residual_first": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "kind": "persistent_rows",
+            "row_ctas": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_c9753c6cab93c6f53ea2",
+        "launch": {
+            "block": (
+                1024,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 384,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_c9753c6cab93c6f53ea2",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "beta": "beta",
+            "branch": "branch",
+            "eps": "eps",
+            "gain_center": "gain_center",
+            "out": "out",
+            "residual": "residual",
+            "weight": "weight",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_rmsnorm",
+        "route": "gated_residual_rmsnorm_mode1",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        256,
+                        8192,
+                    ],
+                ],
             },
         },
         "workspace_rule": None,
@@ -6535,6 +7858,59 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_5ebfb652bfe6015751dd",
             "cake_muse_spark_norm_f6edd44fd70a28073981",
             "cake_muse_spark_norm_872355d5e0c6833781eb",
+            "cake_muse_spark_norm_bae562353f29b537b12c",
+            "cake_muse_spark_norm_27404a7a958868e9c746",
+        ],
+    },
+    "sm_107a": {
+        "gated_residual_next_rmsnorm_alpha_scalar_nopw": [
+            "cake_muse_spark_norm_1aab303bce601c44d1bf",
+            "cake_muse_spark_norm_bf9fcec05cbfa3d03bde",
+            "cake_muse_spark_norm_b174718f7be21bb8a5d9",
+        ],
+        "gated_residual_next_rmsnorm_alpha_scalar_pw": [
+            "cake_muse_spark_norm_a412dc78e8a6e35982a1",
+        ],
+        "gated_residual_next_rmsnorm_alpha_tensor_pw": [
+            "cake_muse_spark_norm_d12f249b80e1a32b7893",
+            "cake_muse_spark_norm_61c0e3739fd566fc4823",
+        ],
+        "gated_residual_rmsnorm_mode0": [
+            "cake_muse_spark_norm_e4067dd3b6842fa089a9",
+            "cake_muse_spark_norm_1cd221dc235a25c6ef14",
+            "cake_muse_spark_norm_95298d67edf21a7f0c54",
+            "cake_muse_spark_norm_96fc60d0b38e67b4085a",
+            "cake_muse_spark_norm_65d9966b792f76934fe2",
+        ],
+        "gated_residual_rmsnorm_mode0_pdl": [
+            "cake_muse_spark_norm_5e9ca5bb1e4471cce3ff",
+            "cake_muse_spark_norm_688a50645a4e00669789",
+            "cake_muse_spark_norm_3f8b7179529819e938b5",
+            "cake_muse_spark_norm_bd0b88e124a14b9ebfad",
+            "cake_muse_spark_norm_96ba3336cf97f5be5841",
+        ],
+        "gated_residual_rmsnorm_mode1": [
+            "cake_muse_spark_norm_6a387e4b7299123352f4",
+            "cake_muse_spark_norm_4725afe7cdd93a93ff86",
+            "cake_muse_spark_norm_c6478d985959ea0426a6",
+            "cake_muse_spark_norm_584407b9521564b8200f",
+            "cake_muse_spark_norm_c9753c6cab93c6f53ea2",
+        ],
+        "gated_residual_rmsnorm_mode1_pdl": [
+            "cake_muse_spark_norm_ad3d24641a423a260dea",
+            "cake_muse_spark_norm_01c5629ce7bb10cbedd5",
+            "cake_muse_spark_norm_ffbfde93a6d276795e1d",
+            "cake_muse_spark_norm_b886dd6347cac2b58cf3",
+            "cake_muse_spark_norm_4e76b0cecea57bf56f1f",
+        ],
+        "rmsnorm_sigmoid_gate_bf16": [
+            "cake_muse_spark_norm_d44057239aa83441d784",
+            "cake_muse_spark_norm_5331c269cc13461d7edd",
+            "cake_muse_spark_norm_63d4a52e896aa2237252",
+            "cake_muse_spark_norm_f6edd44fd70a28073981",
+            "cake_muse_spark_norm_872355d5e0c6833781eb",
+            "cake_muse_spark_norm_5ebfb652bfe6015751dd",
+            "cake_muse_spark_norm_c5d257cc5d4813c1f6b9",
             "cake_muse_spark_norm_bae562353f29b537b12c",
             "cake_muse_spark_norm_27404a7a958868e9c746",
         ],
