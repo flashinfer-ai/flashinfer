@@ -237,6 +237,7 @@ class GdnReplayMtpUmmaRubin:
         hv_io: Optional[int] = None,
         min_blocks: int = _MIN_BLOCKS_PER_SM,
         small_b: bool = False,
+        parts: int = 1,
     ):
         assert 1 <= T <= 8
         assert hv % h == 0 and 1 <= hv // h <= HPK, (h, hv)
@@ -258,6 +259,14 @@ class GdnReplayMtpUmmaRubin:
         self.h_io = h if h_io is None else h_io
         self.hv_io = hv if hv_io is None else hv_io
         assert self.h_io >= h and self.hv_io >= hv and self.hv_io * h == self.h_io * hv
+        # parts > 1: the state and rings are uGPU buffers [pool, parts, heads / parts, ...]
+        # (ugpu_ucache_buffers) and this one launch runs every part's heads: the kernel views
+        # each buffer's (part, head) modes as one head mode of shape (heads / parts, parts), so
+        # head j addresses part j // (heads / parts) -- the same bytes as the per-part launches
+        # (non-persistent kernel only)
+        self.parts = int(parts)
+        assert self.parts >= 1 and h % self.parts == 0 and hv % self.parts == 0
+        assert self.parts == 1 or (not persistent and self.h_io == h)
         # u ring dtype (bf16 / fp16): read and appended through dtype-aware conversions.
         # The k ring is bf16 by construction (the Gram runs bf16 mma.sync on it).
         self.u_bf16 = u_bf16
@@ -360,6 +369,17 @@ class GdnReplayMtpUmmaRubin:
             assert self.split and self.vsmem and self.nsub == 1
 
     @cute.jit
+    def _fuse_parts(self, x: cute.Tensor):
+        """[pool, parts, heads / parts, ...] -> [pool, (heads / parts, parts), ...]: one head
+        mode, head j -> (j % (heads / parts), j // (heads / parts)) (parts > 1 only)."""
+        sh, st = x.layout.shape, x.layout.stride
+        lay = cute.make_layout(
+            (sh[0], (sh[2], sh[1]), *sh[3:]),
+            stride=(st[0], (st[2], st[1]), *st[3:]),
+        )
+        return cute.make_tensor(x.iterator, lay)
+
+    @cute.jit
     def _make_state_tma(self, state: cute.Tensor, op):
         """TMA atom for one 16 KB state stage: a value head's 128 V rows x one 64-element K half,
         128B-swizzled (the readout UMMA's A operand)."""
@@ -372,6 +392,17 @@ class GdnReplayMtpUmmaRubin:
                 stride=(0, 0, elems, (1, V_DIM * elems), V_DIM * elems),
             ),
         )
+        if cutlass.const_expr(self.parts > 1):
+            # (part, head) of the fused head mode take two TMA dimensions: K stays one
+            # dimension (the half is a coordinate offset) to keep the descriptor at 5
+            info = cpasync.make_tiled_tma_atom(
+                op, state, smem_layout, cta_tiler=(1, 1, V_DIM, elems)
+            )
+            return cpasync.TmaInfo(
+                info.atom,
+                cute.logical_divide(info.tma_tensor, (None, None, None, elems)),
+                info.smem_layout,
+            )
         return cpasync.make_tiled_tma_atom(
             op,
             cute.logical_divide(state, (None, None, None, elems)),
@@ -405,6 +436,11 @@ class GdnReplayMtpUmmaRubin:
         stream,
     ):
         """Non-persistent launch: one CTA per (key head x head slice, batch row)."""
+        if cutlass.const_expr(self.parts > 1):
+            state = self._fuse_parts(state)
+            k_cache = self._fuse_parts(k_cache)
+            u_cache = self._fuse_parts(u_cache)
+            g_cache = self._fuse_parts(g_cache)
         tma_ld = self._make_state_tma(state, cpasync.CopyBulkTensorTileG2SOp())
         tma_st = self._make_state_tma(state, cpasync.CopyBulkTensorTileS2GOp())
         kern = (
@@ -4235,17 +4271,41 @@ class GdnReplayMtpUmmaRubin:
         h_io: Optional[int] = None,
         hv_io: Optional[int] = None,
         min_blocks: int = _MIN_BLOCKS_PER_SM,
+        parts: int = 1,
     ):
         """Compile one specialisation for ``device``'s architecture (callers use ``_get_kernel``).
         ``h_io`` / ``hv_io``: head counts of the input / output tensors' token rows (see
         ``__init__``); q / k / v / a / b / out are then head-slice views with those strides.
-        ``min_blocks``: the non-persistent launch bound's CTAs per SM (see ``_launch``)."""
+        ``min_blocks``: the non-persistent launch bound's CTAs per SM (see ``_launch``).
+        ``parts`` > 1: the state and rings are 5-D uGPU buffers (see ``__init__``)."""
         h_io = h if h_io is None else h_io
         hv_io = hv if hv_io is None else hv_io
         batch = cute.sym_int()
         pool = cute.sym_int()
         ft = U.make_fake_tensor_lead_dyn
         uring = BFloat16 if u_bf16 else Float16
+
+        def fs(
+            dtype, heads, inner, div
+        ):  # state / ring: [pool, heads, *inner] or 5-D parts
+            if parts == 1:
+                return ft(dtype, (pool, heads, *inner), div)
+            dense = [1]
+            for d in reversed(inner[1:]):
+                dense.insert(0, dense[0] * d)
+            hstride = dense[0] * inner[0]
+            return cute.runtime.make_fake_tensor(
+                dtype,
+                (pool, parts, heads // parts, *inner),
+                stride=(
+                    cute.sym_int64(divisibility=div),
+                    cute.sym_int64(divisibility=div),
+                    hstride,
+                    *dense,
+                ),
+                assumed_align=max(div * dtype.width // 8, 1),
+            )
+
         args = [
             ft(BFloat16, (batch, T, h, K_DIM), 8, (T, h_io, K_DIM)),  # q
             ft(BFloat16, (batch, T, h, K_DIM), 8, (T, h_io, K_DIM)),  # k
@@ -4254,11 +4314,11 @@ class GdnReplayMtpUmmaRubin:
             ft(BFloat16, (batch, T, hv), 1, (T, hv_io)),  # b
             ft(Float32, (hv,), 1),  # A_log (fp32)
             ft(Float32, (hv,), 1),  # dt_bias (fp32)
-            ft(Float16, (pool, hv, V_DIM, K_DIM), 8),  # state
+            fs(Float16, hv, (V_DIM, K_DIM), 8),  # state
             ft(Int32, (batch,), 1),  # state indices
-            ft(BFloat16, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring (bf16)
-            ft(uring, (pool, hv, RING_SLOTS, V_DIM), 8),  # u ring (bf16 / fp16)
-            ft(Float32, (pool, hv, RING_SLOTS), 1),  # g ring
+            fs(BFloat16, h, (RING_SLOTS, K_DIM), 8),  # k ring (bf16)
+            fs(uring, hv, (RING_SLOTS, V_DIM), 8),  # u ring (bf16 / fp16)
+            fs(Float32, hv, (RING_SLOTS,), 1),  # g ring
             ft(Int32, (batch,), 1),  # hist_len
             ft(Int32, (batch,), 1),  # cache_base
             ft(Int32, (batch,), 1),  # row order
@@ -4284,6 +4344,7 @@ class GdnReplayMtpUmmaRubin:
             hv_io,
             min_blocks,
             small_b,
+            parts,
         )
         opts = gdn_compile_options(device, cute.EnableTVMFFI(True))
         if persistent:
@@ -4317,6 +4378,7 @@ def _get_kernel(
     h_io: Optional[int] = None,
     hv_io: Optional[int] = None,
     min_blocks: int = _MIN_BLOCKS_PER_SM,
+    parts: int = 1,
 ):
     """The compiled kernel for this specialisation on ``device``'s architecture: one per
     (compile target, parameters, _SMALL_B_BUILD_CC); batch and pool sizes are dynamic."""
@@ -4338,6 +4400,7 @@ def _get_kernel(
         h_io,
         hv_io,
         min_blocks,
+        parts,
     )
     fn = _KERNELS.get(key)
     if fn is None:
@@ -4355,6 +4418,7 @@ def _get_kernel(
             h_io,
             hv_io,
             min_blocks,
+            parts,
         )
         _KERNELS[key] = fn
     return fn
@@ -5167,14 +5231,19 @@ def _launch(
     flush_min,
     h_io,
     hv_io,
+    parts=1,
 ):
     """One kernel launch over q's key heads on the current stream: all of them, or a uGPU
     head slice (q / k / v / a / b / output: head-slice views of the ``h_io`` / ``hv_io``-head
     tensors; state and rings: the slice's own parts; ``hv_base``: its first value head).
+    ``parts`` > 1: all heads of 5-D uGPU state and rings in one launch (non-persistent).
     Picks the persistent or the non-persistent kernel and the heads per CTA."""
     B, H, HV = q.shape[0], q.shape[2], v.shape[2]
     hpk = HV // H
     nsm = int(num_sms) if num_sms is not None else target.num_sms
+    if parts > 1:
+        assert not persistent and grid_override is None
+        persistent = False
     if persistent is None:
         persistent = _pz_auto(
             T, hpk, heads_per_cta, H * B, num_sms, grid_override, target, flush_hint
@@ -5279,6 +5348,7 @@ def _launch(
         h_io,
         hv_io,
         min_blocks=min_blocks,
+        parts=parts,
     )
     if persistent:
         ctr = (
@@ -5307,10 +5377,64 @@ def _launch(
 # equal to one launch over the whole pool.
 
 # Eager calls below this many (batch x value-head) states are host-bound: the per-die fork /
-# join costs more host time than the die-local traffic saves, so they run the per-die launches
-# back to back on the current stream (each over the whole GPU). Under CUDA graph capture the
-# per-die streams are always used: replay has no host cost.
+# join costs more host time than the die-local traffic saves, so they run as one fused launch
+# (sm_107a) or the per-die launches back to back on the current stream (each over the whole GPU).
+# Under CUDA graph capture the per-die streams are used above the fused launch's rows
+# (_UGPU_FUSED_MAX_ITEMS).
 _UGPU_EAGER_MIN_STATES = 8192
+
+# Launch path of a uGPU call (see _ugpu_path): "dies" = one launch per die on its green-context
+# stream (forked / joined), "seq" = the per-die launches back to back on the current stream
+# (each over the whole GPU), "fused" = ONE launch over every part's heads on the whole GPU (the
+# kernel addresses the 5-D buffers' parts itself), "streams" = the per-die launches forked onto
+# two ordinary streams (each over the whole GPU). _UGPU_PATH_OVERRIDE (benchmarks / tests)
+# forces one for every call.
+_UGPU_PATH_OVERRIDE: Optional[str] = None
+# Few rows: the fused launch while the (key head, row) items per SM of the whole GPU, H x B /
+# num_sms, are at most _UGPU_FUSED_MAX_ITEMS[T] (sm_107a, 4 value heads per key head: the measured
+# shape; Rubin H = 16 on 212 SMs: B <= 12 at T = 1 / 2, B <= 8 at T = 3-5, B <= 4 at T = 6-8):
+# there the per-die launches' fork / join, the second launch and die 1's later start cost more
+# than the die-local traffic saves. Fused vs per-die launches (CUPTI step time, interleaved, Rubin
+# VR200, slide flush rates; flush rows first, random order and no flush rows) within the caps:
+# serving-like L2 (one CUDA graph over 36 state pools, q / k / v hot) 1.02-1.20x at B >= 2 and
+# within 2.3 % at B = 1; warm L2 1.05-1.13x; the L2 cleared before every step 0.97-1.10x. Above
+# them the cross-die traffic costs more: serving-like 1-4 % slower at T = 4 / 5 from B = 12 and at
+# T = 6-8 from B = 8; with the L2 cleared 3-14 % slower from B = 16 (hence 12 at T = 1 / 2, where
+# serving-like L2 still had the fused launch 1-6 % faster up to B = 20-24).
+_UGPU_FUSED_CC = ((10, 7),)
+_UGPU_FUSED_MAX_ITEMS = {
+    1: 0.95,
+    2: 0.95,
+    3: 0.65,
+    4: 0.65,
+    5: 0.65,
+    6: 0.35,
+    7: 0.35,
+    8: 0.35,
+}
+
+
+def _ugpu_path(
+    B, H, HV, T, num_sms, target, capturing, persistent, grid_override
+) -> str:
+    """Launch path of a uGPU call (see _UGPU_PATH_OVERRIDE): "fused" for few rows on
+    _UGPU_FUSED_CC (and for every small eager call there), else "dies" under graph capture and for
+    eager calls of at least _UGPU_EAGER_MIN_STATES states, else "seq"."""
+    if _UGPU_PATH_OVERRIDE is not None:
+        return _UGPU_PATH_OVERRIDE
+    nsm = int(num_sms) if num_sms is not None else target.num_sms
+    fused_ok = (
+        (target.major, target.minor) in _UGPU_FUSED_CC
+        and HV == HPK * H  # the measured shape (4 value heads per key head)
+        and not persistent
+        and grid_override is None
+    )
+    n_items, max_items = H * B, _UGPU_FUSED_MAX_ITEMS[T] * nsm
+    if fused_ok and n_items <= max_items:
+        return "fused"
+    if capturing or B * HV >= _UGPU_EAGER_MIN_STATES:
+        return "dies"
+    return "fused" if fused_ok else "seq"
 
 
 @functools.cache
@@ -5335,6 +5459,12 @@ def _ugpu_streams(device_index: int):
         torch.device("cuda", device_index)
     )
     return streams, [int(r.sm.smCount) for r in resources]
+
+
+@functools.cache
+def _ugpu_plain_streams(device_index: int, n: int):
+    """n ordinary (whole-GPU) streams for the "streams" uGPU path (cached)."""
+    return [torch.cuda.Stream(device=device_index) for _ in range(n)]
 
 
 def _ugpu_buffers_ok(h0, k_cache, u_cache, g_cache, n, H, HV) -> bool:
@@ -5377,8 +5507,9 @@ def _launch_ugpu(
     common,
 ):
     """uGPU buffers: part t (key heads [t H / n, (t + 1) H / n)) on locality domain t's SMs,
-    one launch per part forked from and joined back to the current stream. Without n
-    locality domains (older drivers expose one), and for small eager calls
+    one launch per part forked from and joined back to the current stream. For few rows on
+    sm_107a (_ugpu_path), one launch over every part on the whole GPU instead. Without n
+    locality domains (older drivers expose one), and for small eager calls elsewhere
     (``_UGPU_EAGER_MIN_STATES``), the launches run back to back on the current stream."""
     B, H, HV = q.shape[0], q.shape[2], v.shape[2]
     hl, hvl = H // n, HV // n
@@ -5416,11 +5547,52 @@ def _launch_ugpu(
             _pz_arena_topup(
                 q.device
             )  # for the per-die persistent launches of a later capture
-        if B * HV < _UGPU_EAGER_MIN_STATES and not capturing:
+        path = _ugpu_path(
+            B,
+            H,
+            HV,
+            common["T"],
+            num_sms,
+            common["target"],
+            capturing,
+            common["persistent"],
+            common["grid_override"],
+        )
+        if path == "fused" and (
+            common["persistent"] or common["grid_override"] is not None
+        ):
+            path = "seq"  # the fused launch is non-persistent only
+        if path == "seq":
             for t in range(n):
                 part(t, num_sms)
             return
+        if path == "fused":
+            _launch(
+                q,
+                k,
+                v,
+                a,
+                b,
+                a32,
+                dt32,
+                h0,
+                k_cache,
+                u_cache,
+                g_cache,
+                output,
+                0,
+                num_sms,
+                None,
+                **tensors,
+                **common,
+                parts=n,
+            )
+            return
         main = torch.cuda.current_stream()
+        if path == "streams":
+            streams, sm_counts = _ugpu_plain_streams(q.device.index, n), [num_sms] * n
+        else:
+            assert path == "dies", path
         fork = torch.cuda.Event()
         fork.record(main)
         joins = []
@@ -5463,8 +5635,11 @@ def ugpu_ucache_buffers(
     runs the key heads of part ``t`` -- with their value heads -- on die ``t``'s SMs, one
     launch per die, so no state or ring byte crosses the die-to-die link, whatever the batch
     order and slot indices. That is for CUDA-graph captured decode (make one eager call before
-    capture); eager calls with ``B * HV < 8192`` are host-bound and run the per-die launches
-    back to back on the current stream. Results are bitwise equal to the usual buffers'.
+    capture). Calls with few rows (Rubin, H = 16: B <= 12 at T = 1 / 2, 8 at T = 3-5, 4 at T >= 6) run one
+    launch over both dies' heads on the whole GPU instead (latency-bound: the per-die launches'
+    fork / join and second launch cost more than the cross-die traffic), and eager calls with
+    ``B * HV < 8192`` are host-bound and run that launch too (elsewhere: the per-die launches
+    back to back on the current stream). Results are bitwise equal to the usual buffers'.
 
     The buffers are uninitialized and come from
     :func:`flashinfer.green_ctx.empty_per_locality_domain`, outside PyTorch's caching

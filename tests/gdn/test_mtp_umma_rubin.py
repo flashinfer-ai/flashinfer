@@ -576,6 +576,8 @@ def test_auto_heads_per_cta_ugpu_dies(monkeypatch):
     if M._ugpu_streams(dev)[1] != [106, 106]:
         pytest.skip("the boundaries below are for 106-SM dies")
     monkeypatch.setattr(M, "_UGPU_EAGER_MIN_STATES", 0)
+    # the per-die launches at every B (few rows otherwise take the fused launch: test_ugpu_path_rule)
+    monkeypatch.setattr(M, "_UGPU_FUSED_CC", ())
     seen, rule_args = [], []
     real_kernel, real_rule = M._get_kernel, M.auto_heads_per_cta
 
@@ -1264,6 +1266,130 @@ def test_heads_per_cta_bit_identical(T, mode):
             got = _pz_call(case, fm, row_order=ro, **kw, **sr)
             for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
                 assert torch.equal(x, y), (kw, ro is not None, name)
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+@pytest.mark.parametrize("mode", ["none", "philox5", "lcg"])
+@pytest.mark.parametrize("layout", ["view", "parts"])
+def test_ugpu_paths_bit_identical(T, mode, layout):
+    """Every uGPU launch path (one launch over both parts' heads, per-part launches back to back,
+    on two ordinary streams, on the dies' green contexts): same bits as the 4-D buffers, eager and
+    replayed from a CUDA graph."""
+    _skip_if_no_rubin_build()
+    M = _rubin_mod()
+    sr = _sr_kw(mode)
+    B = 23
+    case, fm = _pz_case(T, 990 + 7 * T, _ugpu_pattern(B, 990 + T))
+    ref = _pz_call(case, fm, **sr)
+    paths = ["fused", "seq", "streams"]
+    if M._locality_domains(torch.cuda.current_device()) == 2:
+        paths.append("dies")
+    try:
+        for path in paths:
+            M._UGPU_PATH_OVERRIDE = path
+            for kw in (
+                dict(heads_per_cta=1),
+                dict(heads_per_cta=2),
+                dict(heads_per_cta=4),
+                dict(heads_per_cta=None),
+            ):
+                got = _ugpu_call(case, fm, layout=layout, **kw, **sr)
+                for name, x, y in zip(
+                    ("y", "pool", "k", "u", "g"), ref, got, strict=True
+                ):
+                    assert torch.equal(x, y), (path, kw, name)
+            # captured
+            q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+            bufs = [_ugpu_split(x.clone(), 2, layout) for x in (pool, kc, uc, gc)]
+            out = torch.full(v.shape, -7.0, dtype=torch.bfloat16, device=DEV)
+
+            def call():
+                _umma()(
+                    A_log,
+                    a,
+                    dt_bias,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=b,
+                    initial_state_source=bufs[0],
+                    initial_state_indices=idx,
+                    k_cache=bufs[1],
+                    u_cache=bufs[2],
+                    g_cache=bufs[3],
+                    hist_len=hl,
+                    cache_base=cb,
+                    scale=SCALE,
+                    flush_min=fm,
+                    restart_hist_on_flush=False,
+                    output=out,
+                    **sr,
+                )
+
+            call()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                call()
+            for _ in range(2):
+                for x, x0 in zip(bufs, (pool, kc, uc, gc), strict=True):
+                    x.copy_(_ugpu_split(x0, 2, "view"))
+                out.fill_(-7.0)
+                torch.cuda.synchronize()
+                g.replay()
+                torch.cuda.synchronize()
+                got = [_pz_bits(x) for x in [out] + [_ugpu_logical(y) for y in bufs]]
+                for name, x, y in zip(
+                    ("y", "pool", "k", "u", "g"), ref, got, strict=True
+                ):
+                    assert torch.equal(x, y), (path, "graph", name)
+    finally:
+        M._UGPU_PATH_OVERRIDE = None
+
+
+def test_ugpu_path_rule():
+    """_ugpu_path: one fused launch for few rows on sm_107a (H x B <= _UGPU_FUSED_MAX_ITEMS[T] x
+    SMs: B <= 12 / 8 / 4 at T = 1-2 / 3-5 / 6-8 on 212 SMs; every small eager call), the per-die
+    green-context launches
+    above it under capture; sm_100a, 2 or 3 value heads per key head and persistent /
+    grid_override calls keep the old paths."""
+    M = _rubin_mod()
+    from flashinfer.gdn_kernels.device_target import GdnDeviceTarget
+
+    rubin = GdnDeviceTarget(0, "sm_107a", 10, 7, 212, True)
+    b200 = GdnDeviceTarget(0, "sm_100a", 10, 0, 148, True)
+
+    def p(B, T, tgt, capturing, persistent=None, grid_override=None, HV=64):
+        return M._ugpu_path(
+            B, 16, HV, T, None, tgt, capturing, persistent, grid_override
+        )
+
+    assert M._UGPU_PATH_OVERRIDE is None
+    assert [p(B, 4, rubin, True) for B in (1, 8, 9, 64)] == [
+        "fused",
+        "fused",
+        "dies",
+        "dies",
+    ]
+    for T, last in ((1, 12), (2, 12), (3, 8), (5, 8), (6, 4), (7, 4), (8, 4)):
+        assert [p(B, T, rubin, True) for B in (last, last + 1)] == ["fused", "dies"], T
+    assert [p(B, 4, rubin, False) for B in (64, 127, 128)] == ["fused", "fused", "dies"]
+    assert p(8, 4, rubin, True, persistent=True) == "dies"
+    assert p(8, 4, rubin, False, persistent=True) == "seq"
+    assert p(8, 4, rubin, True, grid_override=3) == "dies"
+    assert [p(8, 4, b200, c) for c in (True, False)] == ["dies", "seq"]
+    # 4 value heads per key head only (the measured shape)
+    assert [p(8, 4, rubin, c, HV=hv) for c in (True, False) for hv in (32, 48)] == [
+        "dies",
+        "dies",
+        "seq",
+        "seq",
+    ]
+    try:
+        M._UGPU_FUSED_CC = ()
+        assert [p(8, 4, rubin, c) for c in (True, False)] == ["dies", "seq"]
+    finally:
+        M._UGPU_FUSED_CC = ((10, 7),)
 
 
 def test_ugpu_buffers_graph():
