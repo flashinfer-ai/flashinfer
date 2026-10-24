@@ -264,7 +264,7 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         (
             kernels._get_compiled_all_gather_heads,
             "comm.pcie.dcp_a2a.all_gather_heads",
-            12,
+            13,
         ),
     )
     for launcher, identity, version in identities:

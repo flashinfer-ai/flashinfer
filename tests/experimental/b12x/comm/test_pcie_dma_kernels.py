@@ -79,13 +79,21 @@ def test_dequant_accum_dispatch_preserves_legacy_padding_and_accepts_nine(
     legacy = dma_kernels.DmaKernels(ipc=None)
     legacy.install(
         dma_kernels.DmaLaunchers(
-            set_flag=object(), wait_flag=object(), add=(), dequant_accum=fake_legacy
+            set_flag=object(),
+            wait_flag=object(),
+            add=(),
+            wait_add=(),
+            dequant_accum=fake_legacy,
         )
     )
     tp10 = dma_kernels.DmaKernels(ipc=None)
     tp10.install(
         dma_kernels.DmaLaunchers(
-            set_flag=object(), wait_flag=object(), add=(), dequant_accum=fake_tp10
+            set_flag=object(),
+            wait_flag=object(),
+            add=(),
+            wait_add=(),
+            dequant_accum=fake_tp10,
         )
     )
     legacy._dequant_accum(

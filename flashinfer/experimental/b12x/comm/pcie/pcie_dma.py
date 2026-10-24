@@ -33,7 +33,7 @@ SUPPORTED_DTYPES = {
     torch.float16: 1,
     torch.float32: 2,
 }
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
+SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
 FLAG_STRIDE = 128
 FLAG_SLOTS = 256
 MAX_PIECES = 8
@@ -178,6 +178,7 @@ class PCIeDmaAllReduce:
         max_bytes: int,
         ext_module=None,
         fp8: Optional[str] = None,
+        ipc=None,
     ) -> None:
         # Kept only as a source-compatible keyword for callers that used to
         # inject the removed C++ extension.  Device work is always CuTe DSL.
@@ -194,8 +195,12 @@ class PCIeDmaAllReduce:
         if self.device.type != "cuda":
             raise ValueError("PCIe ring allreduce requires a CUDA device")
         self.max_bytes = int(max_bytes)
-        self._ipc = CudaRTLibrary()
-        self._ipc.cudaSetDevice(self.device.index or 0)
+        # Callers may supply the shared-memory allocator, e.g. VMM storage
+        # that an exporter retains at recorded addresses.
+        if ipc is None:
+            ipc = CudaRTLibrary()
+            ipc.cudaSetDevice(self.device.index or 0)
+        self._ipc = ipc
         self._kernels = _load_kernels(self._ipc)
         self._closed = False
         self._eager_replays: dict[
@@ -222,6 +227,7 @@ class PCIeDmaAllReduce:
         self._wait_counters = torch.zeros(
             FLAG_SLOTS, dtype=torch.int32, device=self.device
         )
+        self._wait_done = torch.zeros(FLAG_SLOTS, dtype=torch.int32, device=self.device)
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._flag_stream = torch.cuda.Stream(device=self.device)
         # Separate CE/flag streams for the a2a broadcast phase so allgather
@@ -607,10 +613,13 @@ class PCIeDmaAllReduce:
                         self._flag_ptr(nxt, slot(k, p)),
                         self._counter_ptr(self._send_counters, slot(k, p)),
                     )
-                kernels.dma_wait_flag(
+                wait = (
                     self._flag_ptr(rank, slot(k, p)),
                     self._counter_ptr(self._wait_counters, slot(k, p)),
+                    self._counter_ptr(self._wait_done, slot(k, p)),
                 )
+                if not reduce_phase or compressed_reduce:
+                    kernels.dma_wait_flag(*wait[:2])
                 if reduce_phase:
                     if compressed_reduce:
                         payload = fp8_scratch_piece(rank, k, p)
@@ -632,6 +641,7 @@ class PCIeDmaAllReduce:
                             scratch_piece(rank, k, p),
                             piece_elems,
                             dtype_code,
+                            wait=wait,
                         )
                 elif compressed_step:
                     payload = fp8_scratch_piece(rank, k, p)
@@ -690,6 +700,21 @@ class PCIeDmaAllReduce:
             self._kernels.dma_copy(scratch, scratch, 16)
             for dtype_code, elems in ((0, 8), (1, 8), (2, 4)):
                 self._kernels.dma_add(scratch, scratch, scratch, elems, dtype_code)
+                self._kernels.dma_set_flag(
+                    flag, self._counter_ptr(self._send_counters, slot)
+                )
+                self._kernels.dma_add(
+                    scratch,
+                    scratch,
+                    scratch,
+                    elems,
+                    dtype_code,
+                    wait=(
+                        flag,
+                        self._counter_ptr(self._wait_counters, slot),
+                        self._counter_ptr(self._wait_done, slot),
+                    ),
+                )
             if self._fp8:
                 if self._fp8_stage is None or self._fp8_stage.numel() < 512:
                     raise RuntimeError(

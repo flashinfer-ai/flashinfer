@@ -16,6 +16,51 @@ from b12x.comm.pcie._tuning import PcieQuery, TUNING
 from b12x.preparation import FrozenMapping
 
 
+@pytest.mark.parametrize(
+    "factory,args",
+    [
+        ("get_oneshot_launcher", ("bfloat16", 2, 0, True, False, 0, "pull", 256, 0)),
+        (
+            "get_fused_oneshot_launcher",
+            ("bfloat16", 2, 0, "stage_pull", False, False, False, 0, 256, 0),
+        ),
+    ],
+)
+def test_oneshot_planning_memo_is_evicted_before_in_process_compile(
+    monkeypatch, factory, args
+):
+    from b12x._lib.compile_plan import (
+        DeferredCuTeKernel,
+        ProgramKey,
+        evict_planning_artifacts,
+    )
+    from b12x.comm.pcie import _oneshot_cute as kernels
+
+    program = ProgramKey("cute", f"test-{factory}")
+    deferred = DeferredCuTeKernel(program, ("test", factory))
+    compiled = Mock(__b12x_programs__=(program,), __b12x_dependencies__=())
+    compile_kernel = Mock(side_effect=(deferred, compiled))
+    monkeypatch.setattr(kernels, "b12x_compile", compile_kernel)
+    monkeypatch.setattr(kernels, "make_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+    monkeypatch.setattr(
+        kernels, "raise_if_kernel_resolution_frozen", lambda *args, **kwargs: None
+    )
+    launcher = getattr(kernels, factory)
+    launcher.cache_clear()
+    try:
+        planned = launcher(*args)
+        assert launcher(*args) is planned
+        assert compile_kernel.call_count == 1
+        evict_planning_artifacts((program,))
+        ready = launcher(*args)
+        assert ready is not planned
+        assert ready.__b12x_dependencies__ == (compiled,)
+        assert compile_kernel.call_count == 2
+    finally:
+        launcher.cache_clear()
+
+
 @pytest.mark.parametrize("world", [9, 10, 12])
 @pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
 @pytest.mark.parametrize("operation", ["all_gather_heads", "lse_reduce_scatter"])
@@ -204,3 +249,44 @@ def test_dcp_compile_factory_retains_eager_and_graph_programs(operation):
     launchers = compile_dcp_surface(payload, ordinal)
     assert set(program_keys(launchers)) == set(description.programs)
     load_programs(launchers)
+
+
+def test_dcp_materialization_resolves_graph_program_before_capture(monkeypatch):
+    from types import SimpleNamespace
+
+    from b12x._lib import compiler
+    from b12x._lib.compile_plan import DeferredCuTeKernel, ProgramKey
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.comm.pcie import _dcp_preparation as preparation
+
+    kernels = {
+        slot: DeferredCuTeKernel(
+            ProgramKey("cute", f"dcp-materialize-{slot}"), ("dcp", slot)
+        )
+        for slot in (False, True)
+    }
+    monkeypatch.setattr(preparation, "compile_dcp_surface", lambda *args: kernels)
+    monkeypatch.setattr(compiler, "_memory_cache_get", lambda key: None)
+    monkeypatch.setattr(compiler, "_memory_cache_put", lambda *args: None)
+    loaded = []
+
+    def load(key):
+        loaded.append(key)
+        return lambda: key
+
+    monkeypatch.setattr(compiler, "_load_cute_compile_from_disk", load)
+    query = PcieQuery(
+        surface="DcpAllToAll.all_gather_heads",
+        world_size=2,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(),
+        setup=FrozenMapping(),
+    )
+    runtime = SimpleNamespace(rank=0, world_size=2, device=torch.device("cuda:0"))
+    declaration = preparation.plan(query, runtime=runtime)
+    state = declaration._materialize(None, SimpleNamespace(ordinal=0))
+    with kernel_resolution_guard("prepared capture"):
+        assert state.launcher(False)() == "dcp-materialize-False"
+        assert state.launcher(True)() == "dcp-materialize-True"
+    assert len(loaded) == 2

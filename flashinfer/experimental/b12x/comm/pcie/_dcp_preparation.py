@@ -14,6 +14,7 @@ from typing import Mapping
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.compile_plan import load_programs
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping,
@@ -298,7 +299,9 @@ def plan(
         raise ValueError("DCP invocation semantics belong in PcieQuery")
 
     def materialize(selection, device):
-        launchers = compile_dcp_surface(TUNING.encode_query(query), device.ordinal)
+        launchers = load_programs(
+            compile_dcp_surface(TUNING.encode_query(query), device.ordinal)
+        )
         return _DcpExecutionState(query, runtime, MappingProxyType(dict(launchers)))
 
     resident = int(getattr(runtime, "_slot_bytes", 0)) * 2
