@@ -38,6 +38,23 @@ from flashinfer.testing import bench_gpu_time_with_cupti
 from tests.moe.test_frost_low_latency_bf16 import _inputs, _reference
 
 
+def _require_cupti():
+    """Fail closed instead of silently changing the declared timing/cache mode."""
+    try:
+        from cupti import cupti
+
+        installed = version("cupti-python")
+    except ImportError as exc:
+        raise RuntimeError(
+            "This benchmark requires cupti-python >= 13; CUDA-event fallback would invalidate its cold-cache labels"
+        ) from exc
+    if int(installed.split(".")[0]) < 13 or not callable(
+        getattr(cupti, "activity_enable", None)
+    ):
+        raise RuntimeError("This benchmark requires working cupti-python >= 13")
+    return installed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, choices=(4, 8), default=4)
@@ -55,6 +72,7 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    cupti_version = _require_cupti()
     if torch.cuda.get_device_capability() not in ((9, 0), (12, 0)):
         raise RuntimeError("This benchmark qualifies Hopper SM90 and SM120")
     t, h, i, e, k = args.tokens, 2048, 512, 512, 10
@@ -119,6 +137,7 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "software": {
             "torch": torch.__version__,
+            "cupti": cupti_version,
             "cuda": torch.version.cuda,
             "cutlass_dsl": version("nvidia-cutlass-dsl"),
             "tvm_ffi": version("apache-tvm-ffi"),
