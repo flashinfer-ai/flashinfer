@@ -111,6 +111,27 @@ def _get_master_addr():
     return "localhost"
 
 
+def get_world_size_from_env():
+    """Get the world size that init_torch_distributed_from_mpi() uses.
+
+    Unlike init_torch_distributed_from_mpi(), this never creates a process
+    group. Tests should check their minimum world size with it and skip
+    *before* initializing torch.distributed: a default process group created
+    by a skipped test is only destroyed at the end of the pytest session
+    (tests/comm/conftest.py), and breaks any later test in the same process
+    that initializes its own default process group.
+
+    Returns:
+        int: world size of the existing default process group, otherwise the
+        launcher's world size (SLURM, torchrun or MPI).
+    """
+    if dist.is_initialized():
+        return dist.get_world_size()
+
+    _, world_size, _ = _get_rank_info_from_env()
+    return world_size
+
+
 def init_torch_distributed_from_mpi():
     """Initialize torch.distributed using environment rank info.
 
