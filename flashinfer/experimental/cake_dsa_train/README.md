@@ -189,9 +189,10 @@ context-parallel window):
 
 A program may register natural-layout variants of the main stage
 (`bwd_main_natural`, and `bwd_main_pass_natural` next to the key-range-pass
-form): the same kernel traced with a drain that transposes each key's FP32
-contributions across lanes and `red.global.add`s them at their natural
-position straight into the caller's packed rows (`dkv_acc` through
+form): the same kernel source compiled with `-DDKV_NATURAL=1`, whose drain
+transposes each key's FP32 contributions across lanes and `red.global.add`s
+them at their natural position straight into the caller's packed rows
+(`dkv_acc` through
 `dkv_dst_map`).  Such a binding has no FP32 accumulators, no zero fill and no
 `bwd_cast` launch (`dsa_train_workspace_size(..., dkv_acc=True)` is smaller by
 `S * 2304` B, the runner's `dkv_direct` is set).  The lane transpose costs the
@@ -545,8 +546,10 @@ reports that gap).
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`, written by the export): one entry per `<library>_<arch>`
-  (fourteen libraries x three architectures) with its translation units, digests,
-  nvcc flags (`--use_fast_math` per stage), closure digest and `aot/<name>.so`
+  (fourteen libraries x three architectures over ten kernel sources, four of
+  them compiled a second time with `-DDKV_NATURAL=1`) with its translation
+  units, digests, nvcc flags (`--use_fast_math` per stage, plus the natural
+  variants' specialization defines), closure digest and `aot/<name>.so`
   path.  `cake_build.load_library(name)` loads the prebuilt library when
   `aot/` holds it (next to the builder's `aot/build_info.json` sidecar, which
   must agree with the library's exported `build_cuda_version()`) and otherwise
@@ -562,11 +565,15 @@ reports that gap).
   (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
-  one pair per library (the main stage and its key-range-pass form each with a
-  natural-layout variant; the delta, compaction and cast pairs serve both
+  one pair per kernel (the main stage and its key-range-pass form each carry
+  their natural-layout variant as the compile-line specialization
+  `DKV_NATURAL=1` of the same pair, under the variant's own kernel symbol and
+  binding namespace; the delta, compaction and cast pairs serve both
   programs), shared by `sm_100a`, `sm_103a` and `sm_107a` and
-  compiled once per architecture (`.clang-format` disables formatting: the sources are
-  identity-checked by the digests in `build.json`).
+  compiled once per library and architecture (`.clang-format` disables formatting: the sources are
+  identity-checked by the digests in `build.json`).  The four shared pairs,
+  the registry leaves of the natural stages and their `build.json` entries are
+  a hand fold of exported files; the next export regenerates them.
 
 ## Status
 

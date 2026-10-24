@@ -118,7 +118,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_main_natural": {
-            "library": "cake_dsa_h64_train_726ceb6d3890375e922d",
+            "library": "cake_dsa_h64_train_e29d165e3abca62c430b_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],
@@ -151,7 +151,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_main_pass_natural": {
-            "library": "cake_dsa_h64_train_76061910b68bb0506c5e",
+            "library": "cake_dsa_h64_train_d6a7bc0b3aa5b7084667_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],
@@ -263,7 +263,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_main_natural": {
-            "library": "cake_dsa_h64_nope_train_4ef6557b664950985182",
+            "library": "cake_dsa_h64_nope_train_d7b52eccaf718555e88f_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],
@@ -296,7 +296,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_main_pass_natural": {
-            "library": "cake_dsa_h64_nope_train_bf83fa2a070687feb74c",
+            "library": "cake_dsa_h64_nope_train_90ab03044736858291f5_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],

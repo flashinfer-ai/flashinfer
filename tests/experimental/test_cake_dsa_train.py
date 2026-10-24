@@ -3018,17 +3018,16 @@ def test_binding_run_signatures_match_the_stage_argument_lists(program):
     record = cake_jit.record(program)
     root = Path(cake_jit.__file__).parent
     pattern = re.compile(r"\bvoid\s+Run\s*\(([^)]*)\)\s*\{", re.S)
+    entries = {e["name"]: e for e in cake_build.manifest()["libraries"]}
     pending = []
     for stage in cake_jit.registered_stages(program):
-        binding = (
-            root
-            / "csrc"
-            / "cake_dsa_h64_train"
-            / f"{record[stage]['library']}_binding.cu"
-        )
-        if not binding.is_file():
+        name = cake_jit.library_name(stage, record["arches"][0], program)
+        sources = entries[name]["sources"] if name in entries else []
+        bindings = [root / s for s in sources if s.endswith("_binding.cu")]
+        if len(bindings) != 1 or not bindings[0].is_file():
             pending.append(stage)
             continue
+        binding = bindings[0]
         found = pattern.findall(binding.read_text())
         assert len(found) == 1, binding
         params = [p.strip().split()[-1] for p in found[0].split(",")]

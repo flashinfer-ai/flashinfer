@@ -22,14 +22,22 @@
 #include "cake_ffi_checks.h"
 
 #include <cstdint>
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667
+#endif
+#ifndef CAKE_PROGRAM_SHIM
+#define CAKE_PROGRAM_SHIM cake_binding_kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667
+#endif
+#define CAKE_STR_(x) #x
+#define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts);
+extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts);
 
-namespace cake_binding_kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667 {
+namespace CAKE_PROGRAM_SHIM {
 
 using tvm::ffi::TensorView;
 
-constexpr const char* KERNEL_NAME = "kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667";
+constexpr const char* KERNEL_NAME = CAKE_STR(CAKE_PROGRAM_KERNEL);
 
 void CheckCuda(cudaError_t status, const char* what) {
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
@@ -413,7 +421,7 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorVi
     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
       CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
-      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667), cudaFuncAttributeMaxDynamicSharedMemorySize, 231680), "cudaFuncSetAttribute");
+      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), cudaFuncAttributeMaxDynamicSharedMemorySize, 231680), "cudaFuncSetAttribute");
       prepared_devices |= device_bit;
     }
   }
@@ -459,11 +467,11 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorVi
   config.blockDim = dim3(640, 1, 1);
   config.dynamicSmemBytes = 231680;
   config.stream = stream;
-  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667), kernel_args),
+  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kernel_args),
             "cudaLaunchKernelExC");
 }
 
 }  // namespace cake_binding_kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_dsa_h64_train_d6a7bc0b3aa5b7084667::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
