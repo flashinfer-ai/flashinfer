@@ -184,6 +184,117 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
     assert narrow and all(t[2] for t in narrow), narrow
 
 
+def _skip_if_batch_invariant_uncovered():
+    # Batch-invariant autotuning covers the SM100/SM103 cute-dsl runners; the
+    # SM107 runner list (whose low-M default may split K) is not covered yet.
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("batch-invariant autotuning does not cover SM107 yet")
+
+
+def test_mm_mxfp8_cute_dsl_batch_invariant_tactics():
+    """Split-K tactics (offered only for M <= 32) are the cute-dsl runner's only
+    batch-variant ones; JSON-loaded (list) tactics are classified the same."""
+    _skip_if_unsupported("cute-dsl")
+    for m in (1, 8, 27, 32, 128):
+        tactics = _mxfp8_cute_dsl_tactics(m, 6144, k=6144)
+        runner = gemm_base._cute_dsl_gemm_mxfp8_runner(
+            *get_compute_capability(torch.device("cuda")), True, torch.bfloat16
+        )
+        assert runner.is_batch_invariant_tactic(-1)
+        for t in tactics:
+            expected = t[4] == 1
+            assert runner.is_batch_invariant_tactic(t) is expected, t
+            assert (
+                runner.is_batch_invariant_tactic([list(t[0]), list(t[1]), *t[2:]])
+                is expected
+            )
+        if m <= 32:
+            assert any(t[4] > 1 for t in tactics), m
+
+
+@pytest.mark.parametrize("k,n", [(6144, 2048), (2048, 2048), (6144, 6144)])
+def test_mm_mxfp8_cute_dsl_batch_invariant_untuned_default(k, n):
+    """Without any tuning, the mode makes runners[0] (the untuned default) a
+    runner whose fallback does not split K, so small-M rows match large-M rows."""
+    from flashinfer.autotuner import (
+        get_autotune_batch_invariant,
+        set_autotune_batch_invariant,
+    )
+
+    _skip_if_unsupported("cute-dsl")
+    _skip_if_batch_invariant_uncovered()
+    major, minor = get_compute_capability(torch.device("cuda"))
+    torch.manual_seed(0)
+    x = torch.randn(4096, k, device="cuda")
+    x = (x * torch.exp(1.5 * torch.randn(k, device="cuda"))).to(torch.bfloat16)
+    w = (0.02 * torch.randn(n, k, device="cuda")).to(torch.bfloat16)
+    w_q, w_s = mxfp8_quantize(w, is_sf_swizzled_layout=True)
+
+    def quant(m):
+        return mxfp8_quantize(x[:m].contiguous(), is_sf_swizzled_layout=True)
+
+    def run(m):
+        a_q, a_s = quant(m)
+        return mm_mxfp8(a_q, w_q.T, a_s, w_s, backend="cute-dsl")
+
+    def default_runner(m):
+        a_q, a_s = quant(m)
+        out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        inputs = [a_q, w_q.T, a_s, w_s, torch.bfloat16, out, None]
+        return gemm_base._cute_dsl_mxfp8_runners(
+            major, minor, True, torch.bfloat16, inputs
+        )[0]
+
+    saved = get_autotune_batch_invariant()
+    AutoTuner.get().clear_cache()
+    try:
+        set_autotune_batch_invariant(True)
+        for m in (1, 5, 8, 13, 27, 32):
+            assert default_runner(m).is_batch_invariant_tactic(-1), m
+        large = run(4096)
+        for m in (1, 5, 8, 13, 27, 32):
+            assert torch.equal(run(m), large[:m]), m
+    finally:
+        set_autotune_batch_invariant(saved)
+        AutoTuner.get().clear_cache()
+
+
+@pytest.mark.parametrize("k,n", [(6144, 6144), (6144, 2048)])
+def test_mm_mxfp8_cute_dsl_batch_invariant_autotune(k, n):
+    """Under batch-invariant autotuning, rows computed in a small-M call (a
+    prefix-cache extend) are bit-identical to the same rows inside a large-M
+    call, whichever tactics the tuner picked."""
+    from flashinfer.autotuner import (
+        get_autotune_batch_invariant,
+        set_autotune_batch_invariant,
+    )
+
+    _skip_if_unsupported("cute-dsl")
+    _skip_if_batch_invariant_uncovered()
+    torch.manual_seed(0)
+    x = torch.randn(4096, k, device="cuda")
+    x = (x * torch.exp(1.5 * torch.randn(k, device="cuda"))).to(torch.bfloat16)
+    w = (0.02 * torch.randn(n, k, device="cuda")).to(torch.bfloat16)
+    w_q, w_s = mxfp8_quantize(w, is_sf_swizzled_layout=True)
+
+    def run(m):
+        a_q, a_s = mxfp8_quantize(x[:m].contiguous(), is_sf_swizzled_layout=True)
+        return mm_mxfp8(a_q, w_q.T, a_s, w_s, backend="cute-dsl")
+
+    saved = get_autotune_batch_invariant()
+    set_autotune_batch_invariant(True)
+    AutoTuner.get().clear_cache()
+    try:
+        with autotune(True, tuning_buckets=(8, 16, 32, 4096), round_up=True):
+            run(8)  # profiles every bucket
+            large = run(4096)
+            for m in (1, 5, 13, 27, 32):
+                assert torch.equal(run(m), large[:m]), m
+    finally:
+        set_autotune_batch_invariant(saved)
+        AutoTuner.get().clear_cache()
+
+
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024])
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 2560, 3200])
