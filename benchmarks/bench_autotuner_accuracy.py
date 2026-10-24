@@ -533,7 +533,7 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
                         raise RuntimeError(
                             "selection produced no cached winner; refusing to score fallback as tuning"
                         )
-                # Capture lookup uses the same policy identity as the search.
+                # Keep the search policy active for any nested lookup in capture.
                 with autotune_v2(
                     mode="replay", persistent_cache=False, measurement_policy=policy
                 ):
