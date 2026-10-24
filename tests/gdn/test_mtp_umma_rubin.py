@@ -100,11 +100,12 @@ def test_auto_heads_per_cta_rubin_caps():
     of CTA slots, hpc = 2 while the hpc = 2 grid fits 1.5 waves at T >= 2 (1.75 with LCG or
     Philox of at most 6 rounds), 2.4 (flush rows first, partial-device launch) / 2.7 waves at
     T = 1; Philox with more than 6 rounds: 2.75 / 2.5 waves (T = 1 / T = 2-4) with flush rows
-    first on a partial-device launch, 4.5 / 2.1 (T <= 4 / T >= 5) on a partial-device launch
-    without them, 3.6 on a whole-device launch at T <= 4, else the 1.75 of stochastic rounding;
-    no flush rows: 0.65 / 0.8 waves, cap2 one wave at T = 1 and on whole-device launches at
-    T = 2-4 (odd heads per key: one hpc = 1 wave at T >= 5). Without T: the 8-wave cap whatever
-    the hint and rounding (also the base file's policy test, run here against this build)."""
+    first on a partial-device launch, 8 / 4.5 / 2.1 (T = 1 / T = 2-4 / T >= 5) on a
+    partial-device launch without them, 3.6 on a whole-device launch at T <= 4, else the 1.75
+    of stochastic rounding; no flush rows: 0.65 / 0.8 waves, cap2 one wave at T = 1 and on
+    whole-device launches at T = 2-4 (odd heads per key: one hpc = 1 wave at T >= 5). Without
+    T: the 8-wave cap whatever the hint and rounding (also the base file's policy test, run here
+    against this build)."""
     f = _rubin_mod().auto_heads_per_cta
     die = (8, 106)  # one die of a Rubin uGPU launch: key heads and SMs (424 CTA slots)
     assert [f(b, *die) for b in (13, 14, 212, 213)] == [1, 2, 2, 4]
@@ -137,13 +138,15 @@ def test_auto_heads_per_cta_rubin_caps():
                 got = [f(b, *die, 4, 1, hint, sr, rounds) for b in (13, 14, 71, 72)]
                 assert got == [1, 2, 2, 4], (hint, sr, rounds)
     # Philox with 10 rounds on a die: with flush rows first hpc = 2 to 72 rows (T = 1) / 66
-    # (T = 2-4) / 46 (T >= 5); without them to 119 (T <= 4) / 55 (T >= 5)
+    # (T = 2-4) / 46 (T >= 5); without them to 212 (T = 1) / 119 (T = 2-4) / 55 (T >= 5)
     assert [f(b, *die, 4, 1, "flush_first", "philox", 10) for b in (72, 73)] == [2, 4]
     for T in (2, 3, 4):
         got = [f(b, *die, 4, T, "flush_first", "philox", 10) for b in (13, 14, 66, 67)]
         assert got == [1, 2, 2, 4], T
-    for T in (1, 2, 3, 4):
-        for hint in (None, "some"):
+    for hint in (None, "some"):
+        got = [f(b, *die, 4, 1, hint, "philox", 10) for b in (13, 14, 128, 212, 213)]
+        assert got == [1, 2, 2, 2, 4], hint
+        for T in (2, 3, 4):
             got = [f(b, *die, 4, T, hint, "philox", 10) for b in (13, 14, 96, 119, 120)]
             assert got == [1, 2, 2, 2, 4], (T, hint)
     for T in (5, 6, 7, 8):
@@ -169,6 +172,7 @@ def test_auto_heads_per_cta_rubin_caps():
             assert got == [2, 4], (T, rounds)
         got = [f(b, *die, 4, 1, "flush_first", "philox", rounds) for b in (72, 73)]
         assert got == [2, 4], rounds
+        assert [f(b, *die, 4, 1, None, "philox", rounds) for b in (212, 213)] == [2, 4]
         assert [f(b, *die, 4, 5, None, "philox", rounds) for b in (55, 56)] == [2, 4]
         assert [
             f(b, *die, 4, 5, "flush_first", "philox", rounds) for b in (46, 47)
@@ -220,8 +224,8 @@ def test_auto_heads_per_cta_rubin_caps():
 
 
 def test_persistent_auto_items():
-    """_pz_auto's minimum (key head, row) items per CTA slot (CPU only): one item with
-    flush_hint "none" (H = 8 on a 106-SM die: B >= 53), 8 otherwise (B >= 424); never on a
+    """_pz_auto's minimum (key head, row) items per CTA slot (CPU only): 3 items with
+    flush_hint "none" (H = 8 on a 106-SM die: B >= 159), 8 otherwise (B >= 424); never on a
     whole-device launch, at T = 1, with fewer heads per CTA or with grid_override."""
     from types import SimpleNamespace
 
@@ -232,7 +236,7 @@ def test_persistent_auto_items():
         return M._pz_auto(T, 4, hpc, 8 * B, nsm, grid, target, hint)
 
     for T in (2, 4, 8):
-        assert [auto(T, b, "none") for b in (52, 53)] == [False, True], T
+        assert [auto(T, b, "none") for b in (53, 158, 159)] == [False, False, True], T
         for hint in (None, "some", "flush_first"):
             assert [auto(T, b, hint) for b in (423, 424)] == [False, True], (T, hint)
     assert not auto(1, 4096, "none")
@@ -302,7 +306,7 @@ def test_auto_heads_per_cta_ugpu_dies(monkeypatch):
     """uGPU buffers on Rubin: _launch_ugpu's per-die launches (8 of the 16 key heads on one
     die's 106 SMs, a partial-device launch, so "flush_first" moves the caps) pick hpc = 4 from
     B = 64 at T = 1 with "flush_first" (72 without), from 73 (T = 1) / 67 (T = 2-4) / 47
-    (T >= 5) with Philox-10 and "flush_first" (120 / 56 without), from 40 at T >= 2 with round
+    (T >= 5) with Philox-10 and "flush_first" (213 / 120 / 56 without), from 40 at T >= 2 with round
     to nearest, from 47 with Philox-6 (Philox-7: the Philox-10 caps), and without flush rows
     from 27 at T = 1 and 22 at T = 2; the same bits as the 4-D buffers with 4 heads per CTA.
     Eager calls this small normally run the per-die launches back to back on the whole device;
@@ -344,7 +348,8 @@ def test_auto_heads_per_cta_ugpu_dies(monkeypatch):
         (2, 67, "flush_first", "philox10", 4),
         (4, 67, None, "philox10", 2),  # no hint: hpc = 2 up to 119 rows
         (4, 119, None, "philox10", 2),
-        (1, 120, None, "philox10", 4),
+        (1, 128, None, "philox10", 2),  # T = 1, no hint: the 8-wave cap
+        (3, 120, None, "philox10", 4),
         (8, 47, "flush_first", "philox10", 4),
         (8, 55, None, "philox10", 2),  # T >= 5, no hint: hpc = 2 up to 55 rows
         (8, 56, None, "philox10", 4),
