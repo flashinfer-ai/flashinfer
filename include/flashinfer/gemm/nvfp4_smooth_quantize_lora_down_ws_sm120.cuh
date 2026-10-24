@@ -168,16 +168,14 @@ __device__ __forceinline__ void mma_bf16_16816(float* d, std::uint32_t a0, std::
 // Compile-time configuration. Warp roles: warp 0 produces, the next
 // QuantWarps quantize, the last DownWarpsM * DownWarpsN compute LoRA-down
 // (each owning TileM / DownWarpsM rows and Rank / DownWarpsN columns).
-template <int TileM_, int TileK_, int Stages_, int QuantWarps_, int DownWarpsM_, int DownWarpsN_,
-          bool WithDown_>
+template <int TileM_, int TileK_, int Stages_, int QuantWarps_, int DownWarpsM_, int DownWarpsN_>
 struct WsConfig {
   static constexpr int kTileM = TileM_;
   static constexpr int kTileK = TileK_;
   static constexpr int kStages = Stages_;
   static constexpr int kQuantWarps = QuantWarps_;
-  static constexpr bool kWithDown = WithDown_;
-  static constexpr int kDownWarpsM = WithDown_ ? DownWarpsM_ : 0;
-  static constexpr int kDownWarpsN = WithDown_ ? DownWarpsN_ : 0;
+  static constexpr int kDownWarpsM = DownWarpsM_;
+  static constexpr int kDownWarpsN = DownWarpsN_;
   static constexpr int kDownWarps = kDownWarpsM * kDownWarpsN;
   static constexpr int kWarps = 1 + kQuantWarps + kDownWarps;
   static constexpr int kThreads = kWarps * 32;
@@ -189,7 +187,7 @@ struct WsConfig {
   static constexpr int kXSubBytes = kTileM * 64 * 2;
   static constexpr int kBSubBytes = kRank * 64 * 2;
   static constexpr int kXBytes = kTileM * kTileK * 2;
-  static constexpr int kBBytes = WithDown_ ? kRank * kTileK * 2 : 0;
+  static constexpr int kBBytes = kRank * kTileK * 2;
   static constexpr int kPqsBytes = kTileK * 2;
   static constexpr int kStageBytes = (kXBytes + kBBytes + kPqsBytes + 1023) / 1024 * 1024;
   static constexpr int kBarrierBytes = 2 * kStages * 8;
@@ -200,14 +198,13 @@ struct WsConfig {
   // or for K32 tiles 16-bit, SF store and a contiguous run of xq).
   static constexpr int kSfPerItem = 4;
   static constexpr int kItemsPerRow = kSfPerTile / kSfPerItem;
-  static constexpr int kWarpRows = WithDown_ ? kTileM / DownWarpsM_ : 16;
+  static constexpr int kWarpRows = kTileM / DownWarpsM_;
   static constexpr int kMBlocks = kWarpRows / 16;
-  static constexpr int kWarpCols = WithDown_ ? kRank / DownWarpsN_ : 16;
+  static constexpr int kWarpCols = kRank / DownWarpsN_;
   static constexpr int kFrags = kWarpCols / 8;
   static_assert(kTileK % 64 == 0, "rows are 128-byte swizzle lines per K64 sub-tile");
   static_assert(kSfPerTile % kSfPerItem == 0);
-  static_assert(!WithDown_ ||
-                (kTileM % (16 * DownWarpsM_) == 0 && kRank % (16 * DownWarpsN_) == 0));
+  static_assert(kTileM % (16 * DownWarpsM_) == 0 && kRank % (16 * DownWarpsN_) == 0);
   static_assert(kTileM % 16 == 0);
   static_assert(kXBytes % 1024 == 0 && kBBytes % 1024 == 0);
 };
@@ -261,9 +258,7 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
     std::uint64_t const keep_policy = make_l2_policy_evict_last();
     if (lane == 0) {
       asm volatile("prefetch.tensormap [%0];\n" : : "l"(reinterpret_cast<std::uint64_t>(&x_map)));
-      if constexpr (Cfg::kWithDown) {
-        asm volatile("prefetch.tensormap [%0];\n" : : "l"(reinterpret_cast<std::uint64_t>(&b_map)));
-      }
+      asm volatile("prefetch.tensormap [%0];\n" : : "l"(reinterpret_cast<std::uint64_t>(&b_map)));
     }
     int it = 0;
     for (int chunk = row_begin; chunk < row_end; chunk += kTileM) {
@@ -286,13 +281,11 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
           tma_load_2d(stage + sub * Cfg::kXSubBytes + rb * Cfg::kBoxRows * 128, &x_map,
                       k0 + sub * 64, chunk + rb * Cfg::kBoxRows, &full_bar[s], x_policy);
         }
-        if constexpr (Cfg::kWithDown) {
-          // L2T is K-major [Rank][K]: one box of 128 rows x 64 k per sub-tile.
-          if (lane >= 32 - Cfg::kSub) {
-            int const sub = lane - (32 - Cfg::kSub);
-            tma_load_2d(stage + Cfg::kXBytes + sub * Cfg::kBSubBytes, &b_map, k0 + sub * 64, 0,
-                        &full_bar[s], keep_policy);
-          }
+        // L2T is K-major [Rank][K]: one box of 128 rows x 64 k per sub-tile.
+        if (lane >= 32 - Cfg::kSub) {
+          int const sub = lane - (32 - Cfg::kSub);
+          tma_load_2d(stage + Cfg::kXBytes + sub * Cfg::kBSubBytes, &b_map, k0 + sub * 64, 0,
+                      &full_bar[s], keep_policy);
         }
         if (lane == 32 - Cfg::kSub - 1) {
           bulk_copy_g2s(stage + Cfg::kXBytes + Cfg::kBBytes, pre_quant_scale + k0, kTileK * 2,
@@ -371,7 +364,7 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
         if (lane == 0) mbar_arrive(&empty_bar[s]);
       }
     }
-  } else if constexpr (Cfg::kWithDown) {
+  } else {
     // ---------------------------------------------------------------- down
     constexpr int kMBlocks = Cfg::kMBlocks;
     constexpr int kFrags = Cfg::kFrags;
@@ -512,13 +505,12 @@ inline int ws_device_sm_count() {
 
 // grid_mode 0: one CTA per SM (capped by the 16-row units); 1: as many CTAs as
 // TileM chunks, capped by the SM count.
-template <int TileM, int TileK, int Stages, int QuantWarps, int DownWarpsM, int DownWarpsN,
-          bool WithDown>
+template <int TileM, int TileK, int Stages, int QuantWarps, int DownWarpsM, int DownWarpsN>
 inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
                                     float const* global_scale, void* xq, void* sf,
                                     void const* l2t_kmajor, void* down, int m, int k, int grid_mode,
                                     cudaStream_t stream) {
-  using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN, WithDown>;
+  using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN>;
   if constexpr (Cfg::kSmemBytes > 99 * 1024) {
     return cudaErrorInvalidValue;
   } else {
@@ -587,31 +579,16 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
   int const layout = packed_tiling / 1000;
   int const stages = packed_tiling / 100 % 10;
   int const quant_warps = packed_tiling % 100;
-  // grid_mode bit 0x100 (SVDQ_WS_ABLATIONS builds only) runs the quantize-only
-  // ablation: no B copies, no down warps, down left unwritten.
-  bool const quant_only = (grid_mode & 0x100) != 0;
-  grid_mode &= 0xff;
-#if defined(SVDQ_WS_ABLATIONS)
-#define FI_SVDQ_WS_QUANT_ONLY(TM, TK, ST, QW, DM, DN)                                         \
-  if (quant_only) {                                                                           \
-    return ws::launch_ws_kernel<TM, TK, ST, QW, DM, DN, false>(                               \
-        x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, stream); \
-  }
-#else
-  if (quant_only) return cudaErrorInvalidValue;
-#define FI_SVDQ_WS_QUANT_ONLY(TM, TK, ST, QW, DM, DN)
-#endif
-#define FI_SVDQ_WS_CASE(TM, TK, ST, QW, DL)                                                     \
-  if (tile_m == (TM) && tile_k == (TK) && stages == (ST) && quant_warps == (QW) &&              \
-      layout == (DL)) {                                                                         \
-    FI_SVDQ_WS_QUANT_ONLY(TM, TK, ST, QW, (DL) == 2 ? 1 : 2, (DL) == 0 ? 4 : 8)                 \
-    return ws::launch_ws_kernel < TM, TK, ST, QW, (DL) == 2 ? 1 : 2, (DL) == 0 ? 4 : 8,         \
-           true > (x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, \
-                   stream);                                                                     \
+#define FI_SVDQ_WS_CASE(TM, TK, ST, QW, DL)                                                   \
+  if (tile_m == (TM) && tile_k == (TK) && stages == (ST) && quant_warps == (QW) &&            \
+      layout == (DL)) {                                                                       \
+    return ws::launch_ws_kernel < TM, TK, ST, QW, (DL) == 2 ? 1 : 2,                          \
+           (DL) == 0 ? 4                                                                      \
+                     : 8 > (x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, \
+                            grid_mode, stream);                                               \
   }
   FI_SVDQ_RANK128_WS_TILINGS(FI_SVDQ_WS_CASE)
 #undef FI_SVDQ_WS_CASE
-#undef FI_SVDQ_WS_QUANT_ONLY
   return cudaErrorInvalidValue;
 }
 
