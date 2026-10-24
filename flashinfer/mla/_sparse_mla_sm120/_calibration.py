@@ -89,6 +89,10 @@ _SCHEMA_VERSION = 3
 # per-bucket profile records. Ordinary profiles carry variants 0..4 and exact-T
 # entries. This unreleased schema is not shared with older development checkouts.
 
+# DeepSeek-V4.1 in its footer and inline-scale placements: same routes,
+# precisions and extra caches, independent profiles.
+_DSV4_1_FAMILIES = ("dsv4_1", "dsv4_1_inline")
+
 _CALIBRATION_MODELS = {
     family: model for model, family in MODEL_FAMILIES.items() if family != "glm_nsa"
 }
@@ -117,6 +121,7 @@ def _model_type_for_family(family: str) -> int:
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
         _MODEL_TYPE_DSV4_1,
+        _MODEL_TYPE_DSV4_1_INLINE,
         _MODEL_TYPE_DOTS3_SWA,
         _MODEL_TYPE_GLM53_NOPE,
     )
@@ -124,6 +129,7 @@ def _model_type_for_family(family: str) -> int:
     return {
         "dsv4": _MODEL_TYPE_DSV4,
         "dsv4_1": _MODEL_TYPE_DSV4_1,
+        "dsv4_1_inline": _MODEL_TYPE_DSV4_1_INLINE,
         "dots3_swa": _MODEL_TYPE_DOTS3_SWA,
         "glm53_nope": _MODEL_TYPE_GLM53_NOPE,
         # dsv3_2 and glm_nsa share the dsv3_2-kernel call path, which re-maps
@@ -420,9 +426,9 @@ def _initialize_fp8_pool(cache: torch.Tensor, family: str, page_size: int) -> No
         exponents = torch.randint(
             -3, 1, (pages, page_size, count), device=cache.device, generator=generator
         )
-        if facts["inline_scale"]:
+        if scale_bytes == 4 * count:  # FP32 scales (always inline)
             scales.copy_(torch.exp2(exponents.float()).view(torch.uint8))
-        else:
+        else:  # UE8M0 bytes, inline or in a padded footer row
             scales[..., :count].copy_((exponents + 127).to(torch.uint8))
         if rope:
             values = (
@@ -1623,6 +1629,7 @@ def crossover_grid_complete(device: torch.device, family: str) -> bool:
     key_spaces = {
         "dsv4": (("dsv4", _DECODE_DSV4_CALIBRATION_GRID),),
         "dsv4_1": (("dsv4_1", _DECODE_DSV4_1_CALIBRATION_GRID),),
+        "dsv4_1_inline": (("dsv4_1_inline", _DECODE_DSV4_1_CALIBRATION_GRID),),
         "dsv3_2": (
             ("dsv3_2", _DECODE_DSV3_2_CALIBRATION_GRID),
             ("glm_nsa", _DECODE_DSV3_2_CALIBRATION_GRID),
@@ -1702,6 +1709,7 @@ def profile_layout(
         extra_page_stride_bytes=_profile_page_pitch(extra_page, extra_bpt)
         if extra_topk
         else 0,
+        extra_row_stride_bytes=extra_bpt if extra_topk else 0,
         indices_stride=topk,
         extra_indices_stride=extra_topk,
         lse_stride=heads,
@@ -1751,11 +1759,15 @@ class _OrdinaryRequest:
             "has_attn_sink",
         ):
             values[name] = bool(values[name])
-        if self.family == "dsv4_1":
+        if self.family in _DSV4_1_FAMILIES:
             values["compute_precision"] = (
                 "bf16" if self.compute_precision == "bf16" else "fp8"
             )
         return {"strategy": _TIMING_PROTOCOL, **values}
+
+    @property
+    def inline_scale(self) -> bool:
+        return self.family == "dsv4_1_inline"
 
     @property
     def key(self) -> str:
@@ -1766,7 +1778,7 @@ class _OrdinaryRequest:
             raise ValueError("unsupported ordinary family")
         if self.compute_precision not in ("default", "fp8", "bf16"):
             raise ValueError("unsupported compute_precision")
-        if self.family != "dsv4_1" and (
+        if self.family not in _DSV4_1_FAMILIES and (
             self.compute_precision != "default" or self.extra_kv_fp4
         ):
             raise ValueError("explicit precision and extra FP4 require DSV4.1")
@@ -1780,7 +1792,7 @@ class _OrdinaryRequest:
                 f"requires 1<=num_heads<={facts['max_heads']}, "
                 f"topk>={facts['min_topk']}, and positive page size"
             )
-        if self.extra_topk and self.family not in ("dsv4", "dsv4_1"):
+        if self.extra_topk and self.family not in ("dsv4", *_DSV4_1_FAMILIES):
             raise ValueError("extra cache is unsupported by this family")
         if self.extra_topk < 0 or (self.extra_topk > 0 and self.extra_page_size <= 0):
             raise ValueError("extra cache requires positive topk and page size")
@@ -1855,7 +1867,8 @@ def _profile_pool(
                         .clamp_(-1, 1)
                         .to(torch.bfloat16)
                     )
-                    packed = dsv41_fp4_quantize_pack_sparse_mla_cache(latent)
+                    inline = {"inline_scale": True} if request.inline_scale else {}
+                    packed = dsv41_fp4_quantize_pack_sparse_mla_cache(latent, **inline)
                     cache[start : start + count].copy_(packed.view(count, page * bpt))
                     del latent, packed
             return cache, pages * page
@@ -2218,6 +2231,7 @@ def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...]]]:
     return {
         "dsv4": (_CALIBRATION_HEADS, tuple(sorted(_DECODE_DSV4_TOPKS))),
         "dsv4_1": (_CALIBRATION_HEADS, (_DECODE_DSV4_1_TOPK,)),
+        "dsv4_1_inline": (_CALIBRATION_HEADS, (_DECODE_DSV4_1_TOPK,)),
         "dsv3_2": (_CALIBRATION_HEADS, v32_topks),
         "glm_nsa": (_CALIBRATION_HEADS, v32_topks),
         "glm53_nope": (
@@ -2346,8 +2360,9 @@ def calibrate_sparse_mla_sm120(
         runtime kernel argument).
     families : Optional[tuple[str, ...]]
         Subset of ``{"dsv4", "dsv3_2", "glm_nsa", "glm53_nope",
-        "dots3_swa", "dsv4_1"}``; defaults to all, including DSV4.1 single
-        FP8 only. ``dsv3_2`` and ``glm_nsa`` share analytical constants,
+        "dots3_swa", "dsv4_1", "dsv4_1_inline"}``; defaults to all, including
+        DSV4.1 single FP8 only in both scale placements (``dsv4_1`` footer,
+        ``dsv4_1_inline`` FlashMLA inline-scale records). ``dsv3_2`` and ``glm_nsa`` share analytical constants,
         but their measured configuration profiles are independent.
     force : bool
         Re-measure complete units; failed measurements retain old profiles.
@@ -2359,7 +2374,8 @@ def calibrate_sparse_mla_sm120(
     extra_topk : int
         Extra-cache candidate capacity, zero for a single cache.
     extra_kv_fp4 : bool
-        Quantize the extra DSV4.1 cache with the existing FP4 packer.
+        Quantize the extra DSV4.1 cache with the existing FP4 packer (inline
+        records for ``dsv4_1_inline``).
     has_topk_length, has_extra_topk_length, has_attn_sink : bool
         Presence flags. Samples use full-capacity lengths and a finite zero sink.
         Secondary caches require a family that supports them (DSV4 or DSV4.1).
@@ -2452,7 +2468,9 @@ def calibrate_sparse_mla_sm120(
         if profile["status"] == "failed":
             failed.append(f"{profile['request']['family']}: {profile['error']}")
         persisted = persisted and profile["persisted"]
-    cpb_families = sorted({_CPB_FAMILY_ALIAS.get(f, f) for f in fams if f != "dsv4_1"})
+    cpb_families = sorted(
+        {_CPB_FAMILY_ALIAS.get(f, f) for f in fams if f not in _DSV4_1_FAMILIES}
+    )
     for cpb_family in cpb_families:
         if any(
             p["status"] == "failed"

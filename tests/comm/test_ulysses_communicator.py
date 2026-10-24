@@ -107,6 +107,11 @@ def _forbid_ipc_and_jit(monkeypatch):
     monkeypatch.setattr(vllm_ar_mod, "meta_size", _boom)
     # merged module binds gen at import: patch the local binding
     monkeypatch.setattr(ulysses_mod, "gen_ulysses_a2a_module", _boom)
+    # the Cake package route of the NVLink path: decided, built and bound only
+    # inside the NVLink init transaction
+    monkeypatch.setattr(ulysses_mod, "_cake_nvlink_route", _boom)
+    monkeypatch.setattr(ulysses_mod, "_cake_nvlink_warm", _boom)
+    monkeypatch.setattr(ulysses_mod, "_cake_nvlink_handle", _boom)
 
 
 def _patch_probe_mesh(monkeypatch, world_size):
@@ -225,6 +230,21 @@ def test_w1_passthrough_no_copy(gloo_pg, monkeypatch):
     x = torch.randn(2, 8, 4, 16, dtype=torch.float16, device="cuda")
     assert comm.scatter_heads(x) is x
     assert comm.gather_heads(x) is x
+    comm.close()
+
+
+@requires_cuda
+def test_nvlink_kernel_is_none_without_an_armed_nvlink_backend(gloo_pg, monkeypatch):
+    # the NVLink kernel route exists only behind an armed NVLink backend
+    _forbid_ipc_and_jit(monkeypatch)
+    comm = _make_w1(gloo_pg, monkeypatch)
+    assert comm.nvlink_kernel is None
+    comm.close()
+    assert comm.nvlink_kernel is None
+    comm = UlyssesCommunicator(
+        gloo_pg, max_elems=1024, dtype=torch.float16, backend="nccl"
+    )
+    assert comm.nvlink_kernel is None
     comm.close()
 
 
@@ -514,6 +534,23 @@ def _correctness_body(rank, world_size, group, backend):
         assert comm.backend == backend, (
             f"expected backend {backend}, got {comm.backend} ({comm.fallback_reason})"
         )
+        if backend == "nvlink":
+            # and the NVLink kernel must be the one this device and dtype
+            # route to: the Cake package where it delivers, else portable
+            ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+            expected_kernel = (
+                "cake"
+                if ulysses_mod._cake_nvlink_route(
+                    torch.cuda.current_device(), dtype, world_size
+                )
+                is not None
+                else "portable"
+            )
+            assert comm.nvlink_kernel == expected_kernel, (
+                f"expected the {expected_kernel} NVLink kernel, got {comm.nvlink_kernel}"
+            )
+        else:
+            assert comm.nvlink_kernel is None
         for B, S_local, H, D in CORRECTNESS_SHAPES:
             torch.manual_seed(1234 + rank)
             x = torch.randn(B, S_local, H, D, dtype=dtype, device="cuda")

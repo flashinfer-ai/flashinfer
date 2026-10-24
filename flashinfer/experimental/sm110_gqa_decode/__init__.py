@@ -46,13 +46,13 @@ def decode(
 def prepare_for_launch(
     inputs: dict[str, Any], num_splits: int | None = None
 ) -> dict[str, Any]:
-    from .prepared import prepare_for_launch as prepare
+    from .backend import prepare_for_launch as prepare
 
     return prepare(inputs, num_splits=num_splits)
 
 
 def launch_prepared(prepared: dict[str, Any]) -> torch.Tensor:
-    from .prepared import launch_prepared as launch
+    from .backend import launch_prepared as launch
 
     return launch(prepared)
 

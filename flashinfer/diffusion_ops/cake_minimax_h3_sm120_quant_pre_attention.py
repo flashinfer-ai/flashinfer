@@ -30,6 +30,7 @@ MINIMAX_H3_NUM_HEADS = 56
 MINIMAX_H3_HEAD_DIM = 128
 MINIMAX_H3_QKV_WIDTH = MINIMAX_H3_NUM_HEADS * 3 * MINIMAX_H3_HEAD_DIM  # 21504
 MINIMAX_H3_ROPE_DIM = 96
+MINIMAX_H3_ADALN_ROWS = 9  # the fused norm/AdaLN kernels index a fixed 9-row table
 MINIMAX_H3_SF_BLOCK = 16
 MINIMAX_H3_DEFAULT_EPS = 1.0e-5
 MINIMAX_H3_MAX_ROWS = 1 << 24
@@ -121,25 +122,19 @@ def _check_common(
     _require(
         "x_norm_weight", x_norm_weight, torch.bfloat16, (MINIMAX_H3_HIDDEN,), device
     )
-    if (
-        adaln_scale.ndim != 2
-        or adaln_scale.shape[1] != MINIMAX_H3_HIDDEN
-        or adaln_scale.shape[0] < 1
-    ):
-        raise ValueError(f"adaln_scale must be [rows, {MINIMAX_H3_HIDDEN}]")
-    adaln_rows = int(adaln_scale.shape[0])
+    # The norm/AdaLN kernels index a fixed 9-row table (MINIMAX_H3_ADALN_ROWS).
     _require(
         "adaln_scale",
         adaln_scale,
         torch.bfloat16,
-        (adaln_rows, MINIMAX_H3_HIDDEN),
+        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
         device,
     )
     _require(
         "adaln_shift",
         adaln_shift,
         torch.bfloat16,
-        (adaln_rows, MINIMAX_H3_HIDDEN),
+        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
         device,
     )
     _require("adaln_index", adaln_index, torch.int32, (rows,), device)
@@ -534,6 +529,7 @@ def minimax_h3_fp8_pre_attention(
 
         n   = bf16(rmsnorm(x, eps) * x_norm_weight)
         a   = bf16(adaln_shift[i] + n * bf16(1 + adaln_scale[i]))    # i = adaln_index[t]
+        a[i outside [0, 9)] = 0                                      # device-side guard
         a_q = e4m3(a / s_t),  s_t = amax_t(|a|) / 448                 # per-token activation scale
         y   = bf16(a_q @ qkv_weight_q^T * s_t * qkv_weight_scale)     # [M, 56 heads x (Q, K, V) x 128]
         q   = rope(bf16(rmsnorm(y_q, eps) * q_norm_weight)),  k likewise with k_norm_weight,  v = y_v
@@ -549,9 +545,11 @@ def minimax_h3_fp8_pre_attention(
     x_norm_weight : torch.Tensor
         BF16 ``[5376]`` pre-norm weight.
     adaln_scale, adaln_shift : torch.Tensor
-        BF16 ``[rows, 5376]`` AdaLN modulation tables.
+        BF16 ``[9, 5376]`` AdaLN modulation tables (``MINIMAX_H3_ADALN_ROWS`` rows: the fused
+        kernels index a fixed 9-row table).
     adaln_index : torch.Tensor
-        Int32 ``[M]`` indices selecting one AdaLN modulation row per token.
+        Int32 ``[M]`` indices selecting one AdaLN modulation row per token; a token whose index
+        lies outside ``[0, 9)`` gets a zero modulated activation.
     qkv_weight_q, qkv_weight_scale : torch.Tensor
         ``float8_e4m3fn [21504, 5376]`` and FP32 ``[21504]`` from :func:`quantize_minimax_h3_qkv_weight_fp8`.
         Output column ``h * 384 + kind * 128 + d`` is channel ``d`` of head ``h`` for ``kind`` 0 = Q, 1 = K, 2 = V.
@@ -709,9 +707,11 @@ def minimax_h3_nvfp4_pre_attention(
     x_norm_weight : torch.Tensor
         BF16 ``[5376]`` pre-norm weight.
     adaln_scale, adaln_shift : torch.Tensor
-        BF16 ``[rows, 5376]`` AdaLN modulation tables.
+        BF16 ``[9, 5376]`` AdaLN modulation tables (``MINIMAX_H3_ADALN_ROWS`` rows: the fused
+        kernels index a fixed 9-row table).
     adaln_index : torch.Tensor
-        Int32 ``[M]`` indices selecting one AdaLN modulation row per token.
+        Int32 ``[M]`` indices selecting one AdaLN modulation row per token; a token whose index
+        lies outside ``[0, 9)`` gets a zero modulated activation.
     qkv_weight_q, qkv_weight_sf : torch.Tensor
         Outputs of :func:`quantize_minimax_h3_qkv_weight_nvfp4`.
     qkv_weight_global_scale : Scalar
@@ -846,6 +846,7 @@ def minimax_h3_nvfp4_pre_attention(
 
 
 __all__ = [
+    "MINIMAX_H3_ADALN_ROWS",
     "MINIMAX_H3_DEFAULT_EPS",
     "MINIMAX_H3_HEAD_DIM",
     "MINIMAX_H3_HIDDEN",

@@ -470,9 +470,6 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.element_offset = 1
             self.epi_loop_size = self.epi_tile_n
 
-        # copy_size is in bytes for cp.reduce.async.bulk instruction
-        self.copy_size = self.cta_tile_shape_mnk[1] * (self.c_dtype.width // 8)
-
     def _is_interleaved_utccp(self) -> bool:
         """Enable interleaving UTCCP for Bkeep-Breuse case for 4xFP4 kernel."""
         return self.a_dtype.width == 4 and self.b_dtype.width == 4 and self.enable_breuse
@@ -1624,29 +1621,41 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
                         token_idx = expanded_idx // self.topK
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
-
-                        # sC row index: m_iter_idx * 128 + epi_tidx
-                        sC_row = m_iter_idx * 128 + epi_tidx
-
-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
+                        valid_columns = cutlass.min(
+                            cutlass.Int64(c.shape[1]) - coord_n,
+                            cutlass.Int64(self.cta_tile_shape_mnk[1]),
+                        )
+                        if valid_columns > 0:
+                            scatter_out_offset = cute.domain_offset(
+                                (token_idx, coord_n, 0), c
                             )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
+                            sC_row = m_iter_idx * 128 + epi_tidx
+                            # Bound the transfer to this shard, as in Blackwell.
+                            valid_copy_size = cutlass.Int32(
+                                valid_columns * (self.c_dtype.width // 8)
                             )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
+                            if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                # The next tile reuses sC. Finish the async reductions' reads
+                # before any epilogue thread overwrites its shared rows.
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()
                 # ============================================================
                 # END OF NEW CODE

@@ -473,7 +473,6 @@ CTA_GROUP = 2
 BLOCK_K = 64
 FRONT_R_TILES = (NUM_EXPERTS + BLOCK_N - 1) // BLOCK_N  # 4
 FRONT_L_TILES = LATENT // BLOCK_N  # 14
-TAIL_N_TILES = HIDDEN // BLOCK_N  # 28
 TAIL_EPI_WARPS = 8  # prefill tail GEMM epilogue warps (fused norm: one latent row each)
 GROUP_M = 16
 NORM_THREADS = 128
@@ -684,10 +683,6 @@ def tail_gemm_config(M: int, tp: int) -> tuple[int, int, bool]:
 
 def tail_gemm_num_stages(M: int, tp: int) -> int:
     return tail_gemm_config(M, tp)[0]
-
-
-def tail_gemm_block_n(M: int, tp: int) -> int:
-    return tail_gemm_config(M, tp)[1]
 
 
 def tail_gemm_final_ts(M: int, tp: int) -> bool:

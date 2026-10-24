@@ -710,3 +710,34 @@ def test_mm_mxfp8_runner_routes_to_disk_cache(monkeypatch, m, n, k, tactic):
     assert kwargs["cache_module_name"] == "mm_mxfp8"
     assert kwargs["disk_kernel_name_fn"] is _mxfp8_blockscaled_kernel_disk_name
     assert kwargs["cache_key_files_fn"] is _blockscaled_mxfp8_gemm_cache_key_files
+
+
+# ---------------------------------------------------------------------------
+# SM107 FP8 groupwise GEMM (flashinfer/gemm/kernels/gemm_fp8_groupwise_sm107.py)
+# ---------------------------------------------------------------------------
+
+from flashinfer.gemm.kernels.gemm_fp8_groupwise_sm107 import (  # noqa: E402
+    _kernel_disk_name as _sm107_fp8_groupwise_name,
+)
+
+SM107_FP8_GROUPWISE_NAME_BASELINE = {
+    "use_2cta": False,
+    "c_dtype_name": "bfloat16",
+    "max_active_clusters": 208,
+}
+SM107_FP8_GROUPWISE_NAME_PERTURBED = {
+    "use_2cta": True,
+    "c_dtype_name": "float32",
+    "max_active_clusters": 104,
+}
+
+
+@pytest.mark.parametrize("param", sorted(SM107_FP8_GROUPWISE_NAME_BASELINE))
+def test_sm107_fp8_groupwise_kernel_name_varies_with_every_argument(param):
+    baseline_name = _sm107_fp8_groupwise_name(**SM107_FP8_GROUPWISE_NAME_BASELINE)
+    kwargs = dict(SM107_FP8_GROUPWISE_NAME_BASELINE)
+    kwargs[param] = SM107_FP8_GROUPWISE_NAME_PERTURBED[param]
+    perturbed_name = _sm107_fp8_groupwise_name(**kwargs)
+    assert perturbed_name != baseline_name, param
+    for name in (baseline_name, perturbed_name):
+        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name

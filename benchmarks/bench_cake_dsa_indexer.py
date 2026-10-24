@@ -30,10 +30,27 @@ peaked variant):
 * ``S1`` .. ``S8`` one causal document with ``Q = N`` in 8k .. 1M keys,
   ``S4_peaked``; ``C1`` / ``C2`` context-parallel tails (4096 queries over 64k /
   128k keys); ``C3`` eight packed 2048 x 32768 segments; ``V1`` (``ratio = 2``),
-  ``V2`` (top-k 256), ``V3`` (top-k 4096) at ``N = 65536``.
+  ``V2`` (top-k 256), ``V3`` (top-k 4096) at ``N = 65536``;
+* the attention-sink + local-band rows of flashinfer-ai/flashinfer#7042
+  (``tests/test_helpers/cake_dsa_indexer_reference.make_sink_inputs``, the
+  issue's generator): ``Z1`` one 262144-token document, context-parallel
+  zigzag rank 0 of 16 (queries ``[0, 8192)`` and ``[253952, 262144)``, the
+  issue's call), ``Z1k4096`` / ``Z1k256`` its top-k variants, ``Z2`` eight 32k
+  documents (full causal) and ``Z2cp`` their zigzag rank-0 halves, ``Z3`` a
+  packed batch of 4k .. 64k documents and ``Z3cp`` its zigzag halves,
+  ``P1sink`` the recorded ``P1`` geometry, ``S4sink`` / ``S6sink`` one 64k /
+  262k causal document.  ``--rows iid`` / ``--rows sink`` name the two groups.
 
 Arms (``--arms``): ``cake`` (this backend, a prepared runner over caller-owned
-outputs and workspace), ``chunked_pipeline`` (a reconstruction of the current
+outputs and workspace), ``cake_nosample`` (the same runner with
+``sample_tiles_max=0``: the sampled first threshold off, same programs, same
+bits), ``cake_main`` / ``cake_main_nosample`` (a second copy of the package
+loaded from ``--main-package DIR``, e.g. the ``flashinfer/experimental/cake_dsa_indexer``
+directory of a FlashInfer main checkout, in the same process: the package is
+self-contained -- relative imports, ``Path(__file__)`` manifest, JIT names
+salted by its own closure digests -- so both versions run on the same input
+tensors), ``cake_aa`` / ``cake_main_aa`` (the same arm prepared a second time:
+the in-process A/A band), ``chunked_pipeline`` (a reconstruction of the current
 training-stack path: chunked BF16 coarse scoring, coarse top-``(K + 256)`` with
 ``flashinfer.top_k``, candidate gather, FP32 rescoring, sorting, padding) and
 ``materialized_fp32`` (exact FP32 scores materialized per memory-bounded query
@@ -42,10 +59,15 @@ chunk, ``flashinfer.top_k``, ascending-id ordering).  Both compositions use
 and the CUB backend with ``tie_break=LARGE`` above (the deterministic path is
 limited to 2048); they are speed references, not contract-exact oracles (their
 tie handling at signed zeros and their candidate margin differ from the
-contract).
+contract).  Every pair of arms is compared bitwise (ids and score bits) on
+every row and the verdicts are recorded (``same_bits``), together with a
+SHA-256 of each arm's ids and score bits for cross-process comparisons.
 
 Timing: ``flashinfer.testing.bench_gpu_time`` with CUPTI activity tracing and a
 cold L2 between iterations (per-iteration GPU span of the whole operator).
+Without ``cupti-python >= 13`` that timer silently falls back to CUDA events;
+``--cupti-required`` turns the fallback into a failure and the JSON records
+which timer ran (``timer``).
 Every row is measured in three paired phases -- the arms in the given order
 (``AB``), in reverse order (``BA``) and interleaved one call at a time
 (``IL``) -- and the medians of each phase and of all samples are reported
@@ -59,10 +81,16 @@ Usage::
 
     python benchmarks/bench_cake_dsa_indexer.py [--rows P1 S2 ...] [--arms cake,chunked_pipeline,materialized_fp32]
         [--reps 20] [--strided-k] [--verify] [--json out.json]
+    python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_nosample,cake_main,cake_main_nosample
+        --main-package /path/to/main/flashinfer/experimental/cake_dsa_indexer --cupti-required --json out.json
 """
 
 import argparse
 import contextlib
+import hashlib
+import importlib
+import importlib.util
+import itertools
 import json
 import os
 import statistics
@@ -131,7 +159,12 @@ def _row(
     seed=7570,
     reps=20,
     note="",
+    dist="iid",
+    bound_seqlen=False,
 ):
+    """``dist``: ``"iid"`` (``make_random_inputs``) or ``"sink"`` (``make_sink_inputs``); ``bound_seqlen`` passes
+    ``max_seqlen_k = max(seg_k)`` to the backend as the issue's call does (it sizes the rank finalize's bitmap pool
+    only; bits are identical with and without it)."""
     return dict(
         seg_q=list(seg_q),
         seg_k=list(seg_k),
@@ -142,6 +175,8 @@ def _row(
         seed=seed,
         reps=reps,
         note=note,
+        dist=dist,
+        bound_seqlen=bound_seqlen,
     )
 
 
@@ -190,6 +225,56 @@ ROWS["C3"] = _row([2048] * 8, [32768] * 8, seed=7593, note="packed 8 x (2048 x 3
 ROWS["V1"] = _row([65536], [32768], ratio=2, seed=7601, note="N = 65536, ratio 2")
 ROWS["V2"] = _row([65536], [65536], top_k=256, seed=7602, note="N = 65536, top-k 256")
 ROWS["V3"] = _row([65536], [65536], top_k=4096, seed=7603, note="N = 65536, top-k 4096")
+IID_ROWS = list(ROWS)
+
+
+def cp_zigzag_rank0(length, parts=16):
+    """Rank 0 of a ``parts``-way context-parallel zigzag split of one ``length``-token document: the query chunks
+    ``[0, c)`` and ``[length - c, length)`` with ``c = length // (2 parts)``, each attending its causal key prefix
+    (``seg_q = [c, c]``, ``seg_k = [c, length]``: the second segment's offset ``length - c`` by the ``Lk - Lq`` rule)."""
+    c = length // (2 * parts)
+    return [c, c], [c, length]
+
+
+def _sink(seg_q, seg_k, **kw):
+    kw.setdefault("seed", ref.SINK_SEED)
+    kw.setdefault("bound_seqlen", True)
+    return _row(seg_q, seg_k, dist="sink", **kw)
+
+
+_Z1_Q, _Z1_K = cp_zigzag_rank0(262144)
+ROWS["Z1"] = _sink(_Z1_Q, _Z1_K, note="#7042 repro: 262k document, CP16 zigzag rank 0")
+ROWS["Z1k4096"] = _sink(_Z1_Q, _Z1_K, top_k=4096, note="Z1 with top-k 4096")
+ROWS["Z1k256"] = _sink(_Z1_Q, _Z1_K, top_k=256, note="Z1 with top-k 256")
+ROWS["Z2"] = _sink(
+    [32768] * 8, [32768] * 8, reps=7, note="8 x 32k documents, full causal"
+)
+ROWS["Z2cp"] = _sink(
+    [v for _ in range(8) for v in cp_zigzag_rank0(32768)[0]],
+    [v for _ in range(8) for v in cp_zigzag_rank0(32768)[1]],
+    note="8 x 32k documents, CP16 zigzag rank 0",
+)
+_PACK = (4096, 6144, 8192, 12288, 16384, 24576, 32768, 65536)
+ROWS["Z3"] = _sink(
+    list(_PACK), list(_PACK), note="packed 4k-64k documents, full causal"
+)
+ROWS["Z3cp"] = _sink(
+    [v for n in _PACK for v in cp_zigzag_rank0(n)[0]],
+    [v for n in _PACK for v in cp_zigzag_rank0(n)[1]],
+    note="packed 4k-64k documents, CP16 zigzag rank 0",
+)
+ROWS["P1sink"] = _sink(
+    _lengths(P1_CU_SEQLENS_Q),
+    _lengths(P1_CU_SEQLENS_K),
+    note="recorded P1 geometry with sink statistics",
+)
+ROWS["S4sink"] = _sink(
+    [65536], [65536], note="one 64k causal document, sink statistics"
+)
+ROWS["S6sink"] = _sink(
+    [262144], [262144], note="one 262k causal document, sink statistics"
+)
+SINK_ROWS = [n for n in ROWS if n not in IID_ROWS]
 ROWS["smoke"] = _row(
     [200, 300, 500],
     [200, 3000, 1000],
@@ -207,10 +292,33 @@ ROWS["smoke_p1"] = _row(
     note="P1 pattern / 16",
 )
 DEFAULT_ROWS = [n for n in ROWS if not n.startswith("smoke")]
+ROW_GROUPS = {"iid": IID_ROWS, "sink": SINK_ROWS, "all": DEFAULT_ROWS}
+
+
+def expand_rows(names):
+    """``--rows`` with the group names ``iid`` / ``sink`` / ``all`` expanded, in order, without repeats."""
+    out = []
+    for name in names:
+        for row in ROW_GROUPS.get(name, [name]):
+            if row not in out:
+                out.append(row)
+    return out
 
 
 def build_inputs(name: str, device, strided_k: bool):
     row = ROWS[name]
+    if row["dist"] == "sink":
+        if strided_k:
+            raise SystemExit(f"--strided-k is not supported for the sink row {name}")
+        return ref.make_sink_inputs(
+            row["seg_q"],
+            row["seg_k"],
+            top_k=row["top_k"],
+            seed=row["seed"],
+            device=device,
+            q_causal_offsets=row["offsets"],
+            label=name,
+        )
     return ref.make_random_inputs(
         row["seg_q"],
         row["seg_k"],
@@ -223,6 +331,77 @@ def build_inputs(name: str, device, strided_k: bool):
         k_row_stride=ref.TRAINER_KEY_ROW_STRIDE if strided_k else None,
         label=name,
     )
+
+
+# ---------------------------------------------------------------------------
+# A second copy of the package (the FI-main baseline) in the same process
+# ---------------------------------------------------------------------------
+
+MAIN_PACKAGE_NAME = "cake_dsa_indexer_main"
+_MAIN = {"backend": None, "path": None}
+
+
+def load_package_copy(directory: Path, name: str = MAIN_PACKAGE_NAME):
+    """Import the package rooted at ``directory`` (its ``__init__.py``) under the module name ``name``.
+
+    The package imports only relatively (``from . import cake_build``, ``from .cake_jit import ...``), resolves its
+    manifest and sources through ``Path(__file__)`` and names its JIT libraries ``<entry>_<closure_sha256[:20]>``,
+    so a copy under another module name coexists with the installed package: each copy JIT-compiles its own
+    sources (digest-verified against its own ``build.json``) through the local FlashInfer toolchain.  Two entries
+    with the same closure digest and identical sources share one cached library (harmless); the same closure with
+    different sources would reuse a stale library, which :func:`check_manifest_pair` refuses up front.
+    """
+    directory = Path(directory).resolve()
+    init = directory / "__init__.py"
+    if not init.is_file():
+        raise SystemExit(f"--main-package {directory} has no __init__.py")
+    if not (directory / "build.json").is_file():
+        raise SystemExit(f"--main-package {directory} has no build.json")
+    spec = importlib.util.spec_from_file_location(
+        name, init, submodule_search_locations=[str(directory)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return importlib.import_module(f"{name}.cake_backend")
+
+
+def _manifest_entries(directory: Path) -> tuple[dict, dict]:
+    """``(name -> entry, generator)`` of the ``build.json`` under ``directory``."""
+    document = json.loads((Path(directory) / "build.json").read_text(encoding="utf-8"))
+    entries = {entry["name"]: entry for entry in document["libraries"]}
+    return entries, document.get("generator", {})
+
+
+def check_manifest_pair(candidate: Path, main: Path) -> dict:
+    """Entries whose closure digest is equal in both manifests but whose source digests differ: such a pair would
+    reuse one JIT library for two programs.  Returns the summary (shared / changed / collisions)."""
+    cand, cand_gen = _manifest_entries(candidate)
+    base, base_gen = _manifest_entries(main)
+    shared = sorted(set(cand) & set(base))
+    same_closure = [
+        n for n in shared if cand[n]["closure_sha256"] == base[n]["closure_sha256"]
+    ]
+    collisions = [n for n in same_closure if cand[n]["sha256"] != base[n]["sha256"]]
+    changed = [n for n in shared if n not in same_closure]
+    return dict(
+        candidate=str(candidate),
+        main=str(main),
+        candidate_generator=cand_gen,
+        main_generator=base_gen,
+        entries_candidate=len(cand),
+        entries_main=len(base),
+        shared=len(shared),
+        unchanged_closure=len(same_closure),
+        changed_closure=changed,
+        closure_collisions=collisions,
+    )
+
+
+def main_backend():
+    if _MAIN["backend"] is None:
+        raise RuntimeError("the cake_main arms need --main-package DIR")
+    return _MAIN["backend"]
 
 
 # ---------------------------------------------------------------------------
@@ -434,13 +613,53 @@ class Arm:
         raise NotImplementedError
 
 
+def row_extra(inputs) -> dict:
+    """Backend keywords a row adds beyond ``inputs.kwargs()`` (``max_seqlen_k`` for the bounded sink rows)."""
+    row = ROWS.get(inputs.label)
+    if row is not None and row["bound_seqlen"]:
+        return {"max_seqlen_k": max(row["seg_k"])}
+    return {}
+
+
+def plan_record(backend, inputs, knobs: dict) -> dict:
+    """The host plan of ``backend`` for ``inputs`` under ``knobs`` (the record of truth of what each arm ran)."""
+    plan = backend.plan_dsa_indexer_topk(
+        inputs.num_queries,
+        inputs.num_keys,
+        inputs.num_segments,
+        top_k=inputs.top_k,
+        ratio=inputs.ratio,
+        device=inputs.device,
+        **row_extra(inputs),
+        **knobs,
+    )
+    return dict(
+        scan_key=plan.scan_key,
+        merge_key=plan.merge_key,
+        finalize_key=plan.finalize_key,
+        kind=plan.kind,
+        block_q=int(plan.block_q),
+        n_split=int(plan.n_split),
+        grid_ctas=int(plan.grid_ctas),
+        cand_cap=int(plan.cand_cap),
+        check_period=int(plan.check_period),
+        sample_tiles_max=int(plan.sample_tiles_max),
+        sample_shift_permille=int(plan.sample_shift_permille),
+        sample_fit=bool(plan.sample_fit),
+    )
+
+
 class CakeArm(Arm):
     name = "cake"
 
-    def __init__(self, inputs):
+    def __init__(self, inputs, *, backend=None, knobs=None, name=None):
         super().__init__(inputs)
+        self.backend = cake_backend if backend is None else backend
+        self.knobs = dict(knobs or {})
+        if name is not None:
+            self.name = name
         dev = inputs.device
-        self.workspace_bytes = cake_backend.dsa_indexer_workspace_size(
+        self.workspace_bytes = self.backend.dsa_indexer_workspace_size(
             inputs.num_queries,
             inputs.num_keys,
             inputs.num_segments,
@@ -457,13 +676,16 @@ class CakeArm(Arm):
         self.scores = torch.empty(
             (inputs.num_queries, inputs.top_k), dtype=torch.float32, device=dev
         )
-        self.runner = cake_backend.prepare_dsa_indexer_topk(
+        self.plan = plan_record(self.backend, inputs, self.knobs)
+        self.runner = self.backend.prepare_dsa_indexer_topk(
             inputs.q,
             inputs.k,
             inputs.w,
             inputs.cu_seqlens_q,
             inputs.cu_seqlens_k,
             **inputs.kwargs(),
+            **row_extra(inputs),
+            **self.knobs,
             workspace_buffer=self.workspace,
             indices=self.indices,
             scores=self.scores,
@@ -487,7 +709,34 @@ class MaterializedArm(Arm):
         return materialized_fp32(self.inputs)
 
 
-ARMS = {cls.name: cls for cls in (CakeArm, ChunkedPipelineArm, MaterializedArm)}
+NOSAMPLE = {"sample_tiles_max": 0}
+
+
+def _cake(name, backend=None, knobs=None):
+    def make(inputs):
+        return CakeArm(
+            inputs,
+            backend=main_backend() if backend == "main" else None,
+            knobs=knobs,
+            name=name,
+        )
+
+    return make
+
+
+# name -> factory(inputs) -> Arm.  ``cake_aa`` / ``cake_main_aa`` prepare the same arm a second time (the in-process
+# A/A band); the ``_nosample`` arms run the same programs with the sampled first threshold off.
+ARMS = {
+    "cake": _cake("cake"),
+    "cake_nosample": _cake("cake_nosample", knobs=NOSAMPLE),
+    "cake_aa": _cake("cake_aa"),
+    "cake_main": _cake("cake_main", backend="main"),
+    "cake_main_nosample": _cake("cake_main_nosample", backend="main", knobs=NOSAMPLE),
+    "cake_main_aa": _cake("cake_main_aa", backend="main"),
+    ChunkedPipelineArm.name: ChunkedPipelineArm,
+    MaterializedArm.name: MaterializedArm,
+}
+MAIN_ARMS = ("cake_main", "cake_main_nosample", "cake_main_aa")
 
 
 # ---------------------------------------------------------------------------
@@ -495,17 +744,58 @@ ARMS = {cls.name: cls for cls in (CakeArm, ChunkedPipelineArm, MaterializedArm)}
 # ---------------------------------------------------------------------------
 
 
+FALLBACK_TEXT = "Falling back to CUDA events"  # flashinfer/testing/utils.py, bench_gpu_time_with_cupti
+TIMER = {"required": False, "fallbacks": 0, "calls": 0}
+
+
 def gpu_times(fn, reps, warmup):
-    return [
-        float(t)
-        for t in bench_gpu_time(
+    """Per-iteration GPU spans (ms); records whether CUPTI or the CUDA-event fallback timed them."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        times = bench_gpu_time(
             fn,
             dry_run_iters=warmup,
             repeat_iters=reps,
             enable_cupti=True,
             cold_l2_cache=True,
         )
-    ]
+    TIMER["calls"] += 1
+    fallback = [w for w in caught if FALLBACK_TEXT in str(w.message)]
+    if fallback:
+        TIMER["fallbacks"] += 1
+        message = str(fallback[0].message)
+        if TIMER["required"]:
+            raise SystemExit(f"--cupti-required: {message}")
+        if TIMER["fallbacks"] == 1:
+            print(f"WARNING: {message}", flush=True)
+    for w in caught:
+        if FALLBACK_TEXT not in str(w.message) and not issubclass(
+            w.category, ExperimentalWarning
+        ):
+            warnings.warn_explicit(
+                w.message, w.category, w.filename, w.lineno, source=w.source
+            )
+    return [float(t) for t in times]
+
+
+def timer_record() -> dict:
+    return dict(
+        name="cupti" if TIMER["fallbacks"] == 0 else "cuda_events_fallback",
+        fallback_calls=TIMER["fallbacks"],
+        calls=TIMER["calls"],
+        required=TIMER["required"],
+    )
+
+
+def result_digest(out) -> dict:
+    """SHA-256 of the ids and of the score bits of one ``(indices, scores)`` result (cross-process identity)."""
+    ids, scores = out
+    ids_bytes = ids.contiguous().cpu().numpy().tobytes()
+    bits_bytes = scores.contiguous().view(torch.int32).cpu().numpy().tobytes()
+    return dict(
+        ids_sha256=hashlib.sha256(ids_bytes).hexdigest(),
+        score_bits_sha256=hashlib.sha256(bits_bytes).hexdigest(),
+    )
 
 
 def wall_ms(fn, reps):
@@ -538,6 +828,11 @@ def measure_row(name, inputs, arms, args):
         try:
             prepared[arm_name] = ARMS[arm_name](inputs)
         except Exception as exc:  # noqa: BLE001 - report the arm as unavailable, keep the others
+            if arm_name.startswith("cake"):
+                # a comparison without one of its cake arms is not the A/B the row set exists for
+                raise SystemExit(
+                    f"[{name}] {arm_name}: {type(exc).__name__}: {exc}"
+                ) from exc
             print(
                 f"  [{name}] {arm_name}: unavailable ({type(exc).__name__}: {exc})",
                 flush=True,
@@ -578,7 +873,27 @@ def measure_row(name, inputs, arms, args):
             structure_failures=ref.structure_failures(inputs, *outputs[arm_name])[:3],
         )
         record["gpu_ms"]["all"] = statistics.median(every)
+        record["digest"] = result_digest(outputs[arm_name])
+        if isinstance(arm, CakeArm):
+            record["plan"] = arm.plan
+            record["knobs"] = arm.knobs
+            record["package"] = (
+                "main" if arm.backend is not cake_backend else "candidate"
+            )
         result["arms"][arm_name] = record
+    # bitwise identity of every pair of arms (ids and score bits): the contract says every cake arm agrees
+    result["same_bits"] = {
+        f"{a}|{b}": ref.same_bits(outputs[a], outputs[b])
+        for a, b in itertools.combinations(outputs, 2)
+    }
+    cake_pairs = [
+        key
+        for key in result["same_bits"]
+        if all(part.startswith("cake") for part in key.split("|"))
+    ]
+    result["all_cake_arms_identical"] = (
+        all(result["same_bits"][key] for key in cake_pairs) if cake_pairs else None
+    )
     if "cake" in outputs:
         for arm_name, out in outputs.items():
             if arm_name != "cake":
@@ -632,6 +947,18 @@ def print_row(result):
         print(
             f"  [{result['row']}] coarse-only GB200 reference latency quoted by the request: {result['reference_gb200_ms']} ms"
         )
+    same = result.get("same_bits", {})
+    cake_pairs = [
+        key for key in same if all(p.startswith("cake") for p in key.split("|"))
+    ]
+    if cake_pairs:
+        identical = sum(same[key] for key in cake_pairs)
+        differing = [key for key, v in same.items() if not v]
+        tail = f"; DIFFER {differing}" if differing else ""
+        print(
+            f"  [{result['row']}] same_bits: {identical}/{len(cake_pairs)} cake pairs identical{tail}",
+            flush=True,
+        )
 
 
 def main():
@@ -642,7 +969,7 @@ def main():
         "--rows",
         nargs="*",
         default=DEFAULT_ROWS,
-        help=f"rows to measure (default: all regression rows; also {', '.join(n for n in ROWS if n.startswith('smoke'))})",
+        help=f"rows to measure (default: all regression rows, iid and sink; the group names iid / sink / all expand; also {', '.join(n for n in ROWS if n.startswith('smoke'))})",
     )
     parser.add_argument(
         "--arms",
@@ -666,15 +993,63 @@ def main():
         action="store_true",
         help="judge every arm against the FP64 / FP32 reference (small rows)",
     )
+    parser.add_argument(
+        "--main-package",
+        default=None,
+        help="directory of a second copy of the package (e.g. a FlashInfer main checkout's flashinfer/experimental/cake_dsa_indexer) for the cake_main arms",
+    )
+    parser.add_argument(
+        "--cupti-required",
+        action="store_true",
+        help="fail when flashinfer.testing.bench_gpu_time falls back from CUPTI to CUDA events",
+    )
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
     warnings.simplefilter("ignore", ExperimentalWarning)
+    TIMER["required"] = bool(args.cupti_required)
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = [a for a in arms if a not in ARMS]
     if unknown:
         raise SystemExit(f"unknown arms {unknown}; known: {sorted(ARMS)}")
+    if len(set(arms)) != len(arms):
+        raise SystemExit(
+            f"an arm may be named once; use cake_aa / cake_main_aa for an A/A pair: {arms}"
+        )
+    args.rows = expand_rows(args.rows)
+    unknown_rows = [r for r in args.rows if r not in ROWS]
+    if unknown_rows:
+        raise SystemExit(
+            f"unknown rows {unknown_rows}; known: {sorted(ROWS)} and the groups {sorted(ROW_GROUPS)}"
+        )
+    candidate_dir = Path(cake_backend.__file__).resolve().parent
+    packages = {
+        "candidate": dict(
+            path=str(candidate_dir), generator=_manifest_entries(candidate_dir)[1]
+        )
+    }
+    if args.main_package is not None:
+        main_dir = Path(args.main_package).resolve()
+        if main_dir == candidate_dir:
+            raise SystemExit(
+                f"--main-package {main_dir} is the installed package itself"
+            )
+        pair = check_manifest_pair(candidate_dir, main_dir)
+        if pair["closure_collisions"]:
+            raise SystemExit(
+                f"--main-package: {len(pair['closure_collisions'])} entries keep the main closure digest with changed sources (a stale JIT library would be shared): {pair['closure_collisions'][:5]}"
+            )
+        _MAIN["backend"] = load_package_copy(main_dir)
+        _MAIN["path"] = str(main_dir)
+        packages["main"] = dict(path=str(main_dir), generator=pair["main_generator"])
+        packages["manifest_pair"] = pair
+        print(
+            f"main package {main_dir}: {pair['shared']} shared entries, {len(pair['changed_closure'])} with a changed closure",
+            flush=True,
+        )
+    elif any(a in MAIN_ARMS for a in arms):
+        raise SystemExit("the cake_main arms need --main-package DIR")
     print(
         f"{props.name} ({props.multi_processor_count} SMs, cc {props.major}.{props.minor}), rows {args.rows}, arms {arms}"
     )
@@ -695,11 +1070,21 @@ def main():
         results.append(result)
         del inputs
         torch.cuda.empty_cache()
+    print(f"timer: {timer_record()}", flush=True)
     if args.json:
         Path(args.json).write_text(
             json.dumps(
                 dict(
-                    device=props.name, sms=props.multi_processor_count, results=results
+                    device=props.name,
+                    sms=props.multi_processor_count,
+                    results=results,
+                    timer=timer_record(),
+                    packages=packages,
+                    torch=torch.__version__,
+                    flashinfer=str(Path(flashinfer.__file__).resolve().parent),
+                    arms=arms,
+                    warmup=args.warmup,
+                    reps=args.reps,
                 ),
                 indent=1,
             )

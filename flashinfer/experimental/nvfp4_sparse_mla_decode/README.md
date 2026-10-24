@@ -128,7 +128,7 @@ slower than this one): 15.6 against 17.0 us at 20 tokens, 17.8 against 17.3 at 2
 ## Validation status
 
 - B300 (SM103, CUDA 13.0, driver 580.173.02): on a fresh JIT build of this module on top of FlashInfer `main`
-  (13122fcf), all 93 tests in `tests/experimental/test_nvfp4_sparse_mla_decode.py` pass, including every cluster size,
+  (13122fcf), the tests in `tests/experimental/test_nvfp4_sparse_mla_decode.py` pass, including every cluster size,
   padded indices and CUDA-graph replay, and `examples/experimental/nvfp4_sparse_mla_decode.py` reports 0.25 %
   relative error. The largest relative error against the exact FP32 reference is 0.29 % over 5 to 64 tokens and three
   padding patterns.
@@ -147,19 +147,34 @@ output directly; a cluster merges its fp32 partials `(O, m, l)` through distribu
 owning 8-dim output group `G`. By design every e2m1 x e4m3 product is formed exactly in f16, S and O accumulate
 in fp32 and P is f16; the acceptance run below confirms the tolerance of the tests.
 
-- Cluster sizes 1, 2, 3, 4, 5, 6 and 8: one JIT module per (architecture, `C`), registered in `cake_jit.py`;
-  the sm_100a and sm_103a programs of a cluster size render to the same text, so each is one shared
-  kernel + binding source pair under `csrc/cake_nvfp4_sparse_mla_decode/`, compiled per architecture.
+- Cluster sizes 1, 2, 3, 4, 5, 6 and 8: one generated program per cluster size, delivered for sm_100a and
+  sm_103a and compiled per architecture (`cake_jit.MODULES`, one record per program).
   `num_ctas_per_token=7` is rejected (`ValueError`), not re-planned.
 - Plan (`cake_backend.plan_ctas`): the largest of 8, 6, 5, 4, 3, 2 that gives every CTA a full 32-key stage and
   leaves no CTA without keys (`is_valid_split`; 512 keys skip 5), whose `num_tokens` clusters are co-resident
-  in one wave (`cudaOccupancyMaxActiveClusters` of each module, queried once per device), otherwise the smallest
-  such split in several waves; 1 when no split qualifies. `keys_per_cta = ceil(topk / C)` rounded up to a
-  multiple of 32, at most 2048. A forced split that leaves a CTA without keys is rejected.
+  in one wave (`cudaOccupancyMaxActiveClusters` through each program's `max_active_clusters` entry, queried once
+  per device), otherwise the smallest such split in several waves; 1 when no split qualifies.
+  `keys_per_cta = ceil(topk / C)` rounded up to a multiple of 32, at most 2048. A forced split that leaves a CTA
+  without keys is rejected.
 - Dynamic shared memory 192,256 bytes (`C = 1`) or 226,816 bytes (`C > 1`), the schedule's pool plus its mbarriers: one CTA per SM.
 - `cake_backend.prepare_nvfp4_sparse_mla_decode(...)` returns a runner that launches without allocation (CUDA
-  Graph safe); `cake_backend.generated_program_available(device)` reports whether the program is registered in
-  the checkout. The tests and the benchmark skip the arm otherwise.
+  Graph safe); `cake_backend.generated_program_available(device)` reports whether the program is delivered for
+  the device. The tests and the benchmark skip the arm otherwise.
+
+### Package layout
+
+The generated backend is a self-contained package beside the hand-written kernel. `cake_jit.py` is the
+registry of the generated program: one `MODULES` record per cluster size carrying the host plan (the
+architectures it is delivered for, its launch record, the argument plan of its `run` entry, the
+`tokens_by_cluster` grid rule, the kernel-parameter to logical-argument map, the planner's stage constants and
+the name of its occupancy entry) and the loader glue (`record_for`, `select_module`, `launch_grid`,
+`launch_args`, `load`). What to compile is recorded once in `build.json`: per program, the kernel, binding and
+occupancy-query units under `csrc/cake_nvfp4_sparse_mla_decode/`, their digests and nvcc flags, one entry per
+(program, architecture). `cake_build.py` loads a prebuilt library from `aot/` when a builder compiled one and
+otherwise JIT-builds the manifest entry through FlashInfer from the same sources and flags.
+`scripts/check_cake_build_manifests.py` checks the manifest against the registry and the sources without
+importing the package. The hand-written `backend="cuda"` sources (`csrc/nvfp4_sparse_mla_decode.cu`,
+`.cuh`, `nvfp4_sparse_mla_decode_jit_binding.cu`) stay at the root of `csrc/`, compiled by `jit.py`.
 
 Cold-L2 microseconds per launch, CUDA kernel (`backend="cuda"`) against the generated program (`backend="cake"`) on the
 same inputs, 16 heads, request-shaped indices (`suffix` rows: short contexts, the tail of every third token empty), eager

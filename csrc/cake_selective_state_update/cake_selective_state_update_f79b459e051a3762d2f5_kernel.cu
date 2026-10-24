@@ -472,6 +472,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_selective_state_updat
               }
             }
           }
+          __syncwarp();
           if (elect_sync()) {
             if (cohort == 0) {
               mbarrier_arrive(state_empty_0_addr + (barrier_state_stage) * 8);

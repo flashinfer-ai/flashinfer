@@ -112,7 +112,7 @@ def route_for_shape(m: int, n: int, k: int) -> str:
     if k > 0 and k % K_BLOCK == 0:
         if (k // K_BLOCK) % 4:
             return DEEPK_C2_KG1_ROUTE
-        if (m == 16384 and n in {2048, 4096}) or (m, n, k) == (4096, 2048, 4096):
+        if m == 16384 and n in {2048, 4096}:
             return DEEPK_N256_ROUTE
         if n == 256 or m == 4096:
             return DEEPK_C2_AB6_SCALE1_ROUTE

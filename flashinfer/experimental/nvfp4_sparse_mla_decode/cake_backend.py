@@ -26,11 +26,12 @@ them in 32-key stages with 8 math warps, 4 softmax warps and 2 loader warps,
 and either writes the normalized output directly (``C = 1``) or pushes its
 fp32 partial ``(O, m, l)`` through distributed shared memory to the cluster
 peers that own the 8-dim output groups, which merge and store.  ``C`` is one of
-1, 2, 3, 4, 5, 6 or 8 -- one physical module per (architecture, ``C``) -- and
-is planned per launch from the driver's one-wave cluster capacity unless the
-caller forces it with ``num_ctas_per_token``.  Nothing is allocated at launch
-(only the optional output), so a prepared runner is CUDA Graph safe.  See
-``README.md`` in this package.
+1, 2, 3, 4, 5, 6 or 8 -- one program per cluster size, delivered for both
+architectures (``cake_jit.MODULES``) -- and is planned per launch from the
+driver's one-wave cluster capacity unless the caller forces it with
+``num_ctas_per_token``.  Nothing is allocated at launch (only the optional
+output), so a prepared runner is CUDA Graph safe.  See ``README.md`` in this
+package.
 """
 
 from __future__ import annotations
@@ -45,10 +46,14 @@ import tvm_ffi
 
 from .backend import NUM_HEADS, V_HEAD_DIM, _check_inputs
 from .cake_jit import (
+    ARCH_BY_CAPABILITY,
     ARCHES,
     CLUSTER_SIZES,
     MODULES,
-    load_nvfp4_sparse_mla_decode_cake_module,
+    arch_for_capability,
+    launch_args,
+    launch_grid,
+    load,
     registered_clusters,
     select_module,
 )
@@ -72,7 +77,7 @@ __all__ = [
     "prepare_nvfp4_sparse_mla_decode",
 ]
 
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+SUPPORTED_COMPUTE_CAPABILITIES = dict(ARCH_BY_CAPABILITY)
 assert set(SUPPORTED_COMPUTE_CAPABILITIES.values()) == set(ARCHES)
 
 # Generated-kernel constants (copied from the program that the export renders;
@@ -90,8 +95,9 @@ PLAN_CTAS = (8, 6, 5, 4, 3, 2)
 assert tuple(sorted((1, *PLAN_CTAS))) == CLUSTER_SIZES
 LOG2E = math.log2(math.e)
 
-# Exact keyword set of the generated program's ``run`` entry (bound by the
-# export's argument plan); ``grid`` is expanded to ``grid_x/y/z``.
+# Exact keyword set of the generated program's ``run`` entry (bound through the
+# record's ``arg_plan`` under its ``logical`` names); ``grid`` is expanded to
+# ``grid_x/y/z``.
 MAIN_KWARGS = (
     "q",
     "kv",
@@ -158,8 +164,8 @@ def is_valid_split(topk: int, num_ctas: int) -> bool:
 
 
 def _device_arch(device: torch.device | int) -> str:
-    capability = torch.cuda.get_device_capability(device)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    capability = tuple(torch.cuda.get_device_capability(device))
+    arch = arch_for_capability(capability)
     if arch is None:
         raise ValueError(
             "the generated NVFP4 sparse MLA decode program requires compute capability "
@@ -171,13 +177,13 @@ def _device_arch(device: torch.device | int) -> str:
 def generated_program_available(
     device: torch.device, num_ctas: Optional[int] = None
 ) -> bool:
-    """True when this checkout registers the program for ``device``.
+    """True when this checkout delivers the program for ``device``.
 
-    With ``num_ctas`` the check names the module of that cluster size; without
-    it every cluster size of the program must be registered (the automatic plan
+    With ``num_ctas`` the check names the program of that cluster size; without
+    it every cluster size of the program must be delivered (the automatic plan
     may select any of them).
     """
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    arch = arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
     if arch is None:
         return False
     registered = registered_clusters(arch)
@@ -187,11 +193,11 @@ def generated_program_available(
 
 
 def _max_active_clusters(module: Any, record: dict[str, Any], device_index: int) -> int:
-    launch = record["main"]["launch"]
+    launch = record["launch"]
     block = [int(v) for v in launch["block"]] + [1, 1, 1]
     cluster = [int(v) for v in launch["cluster"]] + [1, 1, 1]
     return int(
-        module.max_active_clusters(
+        getattr(module, record["occupancy_entry"])(
             int(device_index),
             block[0],
             block[1],
@@ -209,38 +215,41 @@ def _max_active_clusters(module: Any, record: dict[str, Any], device_index: int)
 def cluster_capacity_for(device_index: int) -> Dict[int, int]:
     """``{cluster size: co-resident clusters}`` of the device for the program's split sizes.
 
-    Asks each registered split's own module (``cudaOccupancyMaxActiveClusters``
-    with that module's launch configuration), so the first automatic plan on a
-    device builds every :data:`PLAN_CTAS` module.
+    Asks each split's own library (its ``max_active_clusters`` entry, the
+    ``cudaOccupancyMaxActiveClusters`` of that program's launch configuration),
+    so the first automatic plan on a device builds every :data:`PLAN_CTAS`
+    library.
     """
     arch = _device_arch(device_index)
     capacity: Dict[int, int] = {}
     with torch.cuda.device(device_index):
         for c in PLAN_CTAS:
             name = select_module(arch, c)
-            module = load_nvfp4_sparse_mla_decode_cake_module(name, "main")
+            module = load(name, arch)
             capacity[c] = _max_active_clusters(module, MODULES[name], device_index)
     return capacity
 
 
 def _check_launch_record(record: dict[str, Any], num_ctas: int) -> None:
-    """The registry's launch resources must be the generated-kernel constants this host side assumes."""
-    launch = record["main"]["launch"]
+    """The registry's launch record must be the generated-kernel constants this host side assumes."""
+    launch = record["launch"]
     expected = {
-        "block": [THREADS, 1, 1],
-        "cluster": [1, num_ctas, 1],
+        "block": (THREADS, 1, 1),
+        "cluster": (1, num_ctas, 1),
         "cooperative": False,
         "dynamic_smem_bytes": SMEM_BYTES if num_ctas == 1 else SMEM_BYTES_CLUSTER,
+        "use_pdl": False,
     }
     actual = {
-        "block": [int(v) for v in launch["block"]],
-        "cluster": [int(v) for v in launch["cluster"]],
+        "block": tuple(int(v) for v in launch["block"]),
+        "cluster": tuple(int(v) for v in launch["cluster"]),
         "cooperative": bool(launch["cooperative"]),
         "dynamic_smem_bytes": int(launch["dynamic_smem_bytes"]),
+        "use_pdl": launch["use_pdl"],
     }
     if actual != expected:
         raise RuntimeError(
-            f"registered launch resources {actual} of the cluster-size-{num_ctas} module "
+            f"registered launch record {actual} of the cluster-size-{num_ctas} program "
             f"differ from the generated-kernel constants {expected}"
         )
 
@@ -292,9 +301,9 @@ def prepare_nvfp4_sparse_mla_decode(
     """Validate the inputs, plan the cluster size and bind the launch.
 
     Every allocation happens here (only the optional ``out``); the returned
-    runner launches with none.  The JIT module of the selected cluster size
-    (and, for the automatic plan, of every planned size) is built and loaded
-    here, so prepare outside CUDA Graph capture.
+    runner launches with none.  The library of the selected cluster size (and,
+    for the automatic plan, of every planned size) is built and loaded here,
+    so prepare outside CUDA Graph capture.
     """
     _check_inputs(query, kv_cache, indices, out)
     device = query.device
@@ -340,10 +349,9 @@ def prepare_nvfp4_sparse_mla_decode(
     module_name = select_module(arch, num_ctas)
     record = MODULES[module_name]
     _check_launch_record(record, num_ctas)
-    physical = record["main"]
     with torch.cuda.device(device_index):
-        module = load_nvfp4_sparse_mla_decode_cake_module(module_name, "main")
-    grid = (num_tokens, num_ctas, 1)
+        module = load(module_name, arch)
+    grid = launch_grid(record, num_tokens=num_tokens)
     main_kwargs = dict(
         q=query.view(torch.int32),
         kv=kv_cache.view(-1),
@@ -356,12 +364,9 @@ def prepare_nvfp4_sparse_mla_decode(
         grid=grid,
     )
     assert tuple(main_kwargs) == MAIN_KWARGS
-    grid_dims = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-    arguments = tuple(
-        grid_dims[name] if kind == "grid" else main_kwargs[name]
-        for kind, name in physical["arg_plan"]
-    )
-    entry = getattr(module, physical["ffi_entry"])
+    # The record's argument plan over ``main_kwargs`` under its logical names, then the grid axes.
+    arguments = launch_args(record, main_kwargs, grid)
+    entry = getattr(module, record["ffi_entry"])
     return NVFP4SparseMLADecodeCakeRunner(
         module_name, arch, num_ctas, kpc, grid, out, entry, arguments
     )

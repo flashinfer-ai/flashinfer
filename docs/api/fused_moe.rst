@@ -68,6 +68,39 @@ are designed to co-exist, and neither supersedes the other.
     .. automethod:: __init__
     .. automethod:: __call__
 
+Frost low-latency backend
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``FrostLowLatencyConfig`` is an explicit candidate for SM100/SM103/SM107.
+It admits at most two tokens by default; ``max_num_tokens`` may be raised to
+8. Prepare another backend view to allow fallback beyond that ceiling.
+Precomputed routing is required; routing from logits, shared experts and
+expert-parallel communication are outside this backend.
+
+Supported weight/input pairs are MXFP4/MXFP8, MXFP8/MXFP8, BF16/BF16 and
+NVFP4/NVFP4. All four pairs accept SwiGLU, SwiGLUStep, SiTU, GeGLU,
+GeGLUTanh, ReLU, ReLU2, SiLU, GELU and Identity. SwiGLU alpha/beta/limit
+and SwiGLUStep limit are configurable; other activations require defaults.
+Pass the same activation to weight preparation and ``MoEConfig``.
+
+MX uses one prepared weight view for Tensor Core and FMA tactics, with
+FP32 activation followed by MXFP8 requantization. BF16 and NVFP4 use FMA,
+round the activation and expert results to BF16, and combine with ordered
+separate FP32 multiplication and addition. FMA requires top-k at most 32.
+NVFP4 additionally requires H divisible by 512 and I by 128 and does not
+support the 4over6 recipe. Use ``prepare_nvfp4_weights`` with canonical BF16
+source weights; input quantization is shared with
+``TrtllmFp4Config.prepare_activations``.
+
+These are multi-kernel pipelines. The MX Tensor Core path uses PDL between
+its fused projection/activation/quantizer and down projection. Prepare and
+warm up before CUDA Graph capture. CuTe DSL 4.8 or newer is required.
+
+.. autosummary::
+    :toctree: ../generated
+
+    FrostLowLatencyConfig
+
 cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
@@ -236,12 +269,13 @@ Multi-LoRA MoE (BGMV)
 Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
 top of a Mixture-of-Experts layer (shrink + expand).
 
-:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
-SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
-32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
-3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
-"specialized"``; everything else the runtime-hidden generic bundles,
-``plan.variant == "generic"``); the output has one owner per token, so replays
+:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100, SM103
+and SM107 devices the generated Cake programs serve one LoRA slice with rank 8,
+16, 32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688
+and 3072 at rank 32 use the specialized measured bodies at 32 to 1024 tokens on
+SM100, SM103 and SM107, ``plan.variant == "specialized"``; everything else, SM90
+included, the runtime-hidden generic bundles, ``plan.variant == "generic"``);
+the output has one owner per token, so replays
 are bitwise reproducible. Arbitrary pair order (for example expert-sorted
 dispatch) is served through a token->pair route index that the shrink kernels
 publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
@@ -315,6 +349,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
+    trtllm_fused_moe_workspace_size
 
 AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
 --------------------------------------------

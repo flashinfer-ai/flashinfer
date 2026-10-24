@@ -2725,6 +2725,11 @@ kernel_minimax_h3_sm120_varlen_attention_fp8(const __grid_constant__ CUtensorMap
         }
         __syncthreads();
     }
+    // Group 0 closes the ping-pong: group 1's pre-arrive puts its arrivals on barrier 1 one round ahead, so its last
+    // arrival forms a round no group-0 sync joins; one more sync completes it before the CTA exits.
+    if (warp < 4) {
+        asm volatile("barrier.sync 1, 256;" ::: "memory");
+    }
 
     // Cleanup
     __syncthreads();

@@ -25,7 +25,7 @@
 
 #include <cstdint>
 
-#include "cake_msa_nvfp4_decode_host_common.cuh"
+#include "blackwell_msa/cake_blackwell_msa_host_common.cuh"
 
 extern "C" __global__ void kernel_cake_msa_nvfp4_decode_f789cce307344c958485(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ task_kind, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages);
 

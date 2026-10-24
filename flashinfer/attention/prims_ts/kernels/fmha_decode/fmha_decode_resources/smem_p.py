@@ -42,9 +42,8 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import (
-    INT32_SCORE_BIAS,
-)
+from ....sage.int32_scores import INT32_SCORE_BIAS
+from ....sage.modes import SageScoreScaling
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     _route_is_proxy,
@@ -461,11 +460,13 @@ class SmemPResource(DecodeGenResourceBase):
         # returns dequantized scores (one scale per score) scales by
         # ``c * sfQ`` alone and carries no bias; any other loads the tile's
         # words in place, a fragment ahead like the scores.
-        dequantized: Constexpr[bool] = cfg.sage_scores_dequantized()
+        dequantized: Constexpr[bool] = (
+            cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
+        )
         uses_words: Constexpr[bool] = cfg.use_sage_attention and not dequantized
         groups: Constexpr[int] = cfg.sage_k_groups_per_fragment()
         # A mixed plan's proxy tile comes back from the max pass dequantized
-        # (``FmhaDecodeConfig.sage_scores_dequantized``), so its multipliers
+        # (``FmhaDecodeConfig.sage_score_scaling``), so its multipliers
         # are ``c * sfQ`` alone, with no INT32 bias, in place of the exact
         # words.
         replaces_proxy_words: Constexpr[bool] = uses_words and cfg.sage_mixed_k_geometry

@@ -63,27 +63,12 @@ __global__ void kernel_flashinfer_blackwell_softmax_cached_c1_t4(float* x, float
                                                                  int vocab_size, int chunk_elements,
                                                                  int parameter_kind,
                                                                  float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c1_t8(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_c2_t4(float* x, float* parameter,
                                                                  float* output, int rows,
                                                                  int vocab_size, int chunk_elements,
                                                                  int parameter_kind,
                                                                  float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c2_t8(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_c4_t4(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c4_t8(float* x, float* parameter,
                                                                  float* output, int rows,
                                                                  int vocab_size, int chunk_elements,
                                                                  int parameter_kind,

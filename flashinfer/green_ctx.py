@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+import weakref
 from typing import List, Tuple
+
 import torch
 
 try:
@@ -27,6 +30,7 @@ except ImportError as e:
         "Please install cuda-python that matches your CUDA version."
     ) from e
 
+from .api_logging import flashinfer_api
 from .cuda_utils import checkCudaErrors
 from .utils import get_compute_capability, round_up
 
@@ -293,3 +297,237 @@ def split_device_green_ctx_by_sm_count(
                 f"Please reduce the requested SM counts or use fewer partitions."
             ) from e
         raise
+
+
+# ---------------------------------------------------------------------------
+# uGPU localization: locality domains (dies) of multi-die GPUs such as Rubin
+# ---------------------------------------------------------------------------
+
+
+def _indexed(dev) -> torch.device:
+    """``dev`` as a ``torch.device`` with an explicit index (``"cuda"`` -> current device)."""
+    dev = torch.device(dev)
+    if dev.index is None:
+        dev = torch.device(dev.type, torch.cuda.current_device())
+    return dev
+
+
+@flashinfer_api
+def get_locality_domain_count(dev: torch.device) -> int:
+    r"""Number of locality domains (uGPUs, one per die) of ``dev``.
+
+    Args:
+        dev: The CUDA device (``"cuda"`` without an index means the current device).
+
+    Returns:
+        The number of locality domains: 2 on Rubin VR200, 1 when the device or the
+        installed driver / cuda-python does not expose locality domains.
+    """
+    attr = getattr(
+        driver.CUdevice_attribute, "CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT", None
+    )
+    if attr is None:
+        return 1
+    dev = _indexed(dev)
+    try:
+        return max(
+            1,
+            int(checkCudaErrors(driver.cuDeviceGetAttribute(attr, get_cudevice(dev)))),
+        )
+    except RuntimeError:
+        return 1
+
+
+@flashinfer_api
+def split_device_green_ctx_by_locality_domain(
+    dev: torch.device, backfill: bool = True
+) -> Tuple[List[torch.Stream], List[CUdevResource]]:
+    r"""
+    Create one green context per locality domain (uGPU) of ``dev`` and return its stream
+    and ``CUdevResource``, in domain order. A kernel launched on stream ``i`` runs only on
+    domain ``i``'s SMs, so together with memory placed in that domain
+    (:func:`empty_per_locality_domain`) its DRAM traffic stays on the die.
+
+    Args:
+        dev: The device to split.
+        backfill: If ``True`` (default), each group gets ``num_SMs // num_domains`` SMs and
+            the driver completes a domain's group with SMs that belong to no domain (on
+            Rubin VR200: 100 native SMs + 6 of the 12 remaining ones per die, so all 212
+            SMs work). If ``False``, each group holds its domain's native SMs only.
+
+    Returns:
+        streams: One ``torch.Stream`` per locality domain.
+        resources: The matching ``CUdevResource`` objects (``.sm.smCount`` is the SM count).
+
+    Raises:
+        RuntimeError: if the device has fewer than two locality domains.
+    """
+    dev = _indexed(dev)
+    num_domains = get_locality_domain_count(dev)
+    if num_domains < 2:
+        raise RuntimeError(
+            f"{dev} exposes {num_domains} locality domain(s); uGPU localization needs at "
+            "least two (e.g. Rubin) and a driver / cuda-python with the locality-domain API"
+        )
+    cu_dev = get_cudevice(dev)
+    resource = get_device_resource(cu_dev)
+    params = []
+    for i in range(num_domains):
+        p = driver.CU_DEV_SM_RESOURCE_GROUP_PARAMS()
+        p.smCount = resource.sm.smCount // num_domains if backfill else 0
+        p.coscheduledSmCount = 2
+        flags = int(
+            driver.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
+        )
+        if backfill:
+            flags |= int(
+                driver.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_BACKFILL
+            )
+        p.flags = flags
+        p.localityDomainId = i
+        params.append(p)
+    groups = checkCudaErrors(
+        driver.cuDevSmResourceSplit(num_domains, resource, 0, params)
+    )[0]
+    groups = list(groups)
+    # torch tags an external stream with the current device: make that dev
+    with torch.cuda.device(dev):
+        return create_green_ctx_streams(cu_dev, groups), groups
+
+
+class _LocalizedAllocation:
+    """Owner of an :func:`empty_per_locality_domain` mapping; torch keeps it alive."""
+
+    def __init__(self, ptr: int, nbytes: int, typestr: str):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": typestr,
+            "data": (ptr, False),
+            "version": 3,
+        }
+
+
+# Allocations whose tensors died while a CUDA graph was being captured: their release (which
+# synchronizes the device) waits for the next allocation or release outside capture.
+_deferred_releases: list = []
+
+
+def _release_localized(dev_index: int, ptr: int, va_bytes: int, chunks) -> None:
+    torch.cuda.synchronize(dev_index)
+    for offset, size, handle in chunks:
+        checkCudaErrors(driver.cuMemUnmap(ptr + offset, size))
+        checkCudaErrors(driver.cuMemRelease(handle))
+    checkCudaErrors(driver.cuMemAddressFree(ptr, va_bytes))
+
+
+def _release_deferred() -> None:
+    # A device synchronize during stream capture would invalidate the capture
+    if torch.cuda.is_current_stream_capturing():
+        return
+    while _deferred_releases:
+        _release_localized(*_deferred_releases.pop())
+
+
+def _unmap_localized(dev_index: int, ptr: int, va_bytes: int, chunks) -> None:
+    """Finalizer of an :func:`empty_per_locality_domain` tensor (runs from garbage collection)."""
+    _deferred_releases.append((dev_index, ptr, va_bytes, chunks))
+    _release_deferred()
+
+
+@flashinfer_api
+def empty_per_locality_domain(
+    part_shape: Tuple[int, ...], dtype: torch.dtype, dev: torch.device
+) -> torch.Tensor:
+    r"""
+    Allocate an uninitialized tensor of shape ``[num_domains, *part_shape]`` whose part ``i``
+    lives in locality domain ``i``'s memory (one virtual address range over per-domain
+    physical memory). Each part is contiguous; the stride of dim 0 is the part size rounded
+    up to the allocation granularity.
+
+    The memory comes from the CUDA driver (``cuMemCreate`` / ``cuMemMap``), not from PyTorch's
+    caching allocator: it does not count in ``torch.cuda.memory_allocated()`` and cannot be
+    reused by other tensors. It is released when the tensor and all its views are freed (after
+    a device synchronize; if that happens during CUDA graph capture, at the next allocation or
+    release outside capture).
+
+    Example: :func:`flashinfer.gdn_decode.ugpu_state_pool` builds a GDN state pool from two
+    parts, so that each die reads and writes only its own half of every state.
+
+    Args:
+        part_shape: Shape of one part.
+        dtype: Element type.
+        dev: CUDA device with at least two locality domains.
+
+    Returns:
+        The tensor.
+    """
+    dev = _indexed(dev)
+    num_domains = get_locality_domain_count(dev)
+    if num_domains < 2:
+        raise RuntimeError(
+            f"{dev} exposes {num_domains} locality domain(s); empty_per_locality_domain "
+            "needs at least two"
+        )
+    _release_deferred()
+    cu_dev = get_cudevice(dev)
+    elem = torch.tensor([], dtype=dtype).element_size()
+    part_elems = math.prod(part_shape)
+
+    def prop_for(domain: int):
+        prop = driver.CUmemAllocationProp()
+        prop.type = driver.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.location.type = (
+            driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
+        )
+        prop.location.localized.deviceId = int(cu_dev)
+        prop.location.localized.localityDomainId = domain
+        return prop
+
+    gran = int(
+        checkCudaErrors(
+            driver.cuMemGetAllocationGranularity(
+                prop_for(0),
+                driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+            )
+        )
+    )
+    part_bytes = max(round_up(part_elems * elem, gran), gran)
+    va_bytes = num_domains * part_bytes
+    ptr = int(checkCudaErrors(driver.cuMemAddressReserve(va_bytes, 0, 0, 0)))
+    chunks = []
+    try:
+        for i in range(num_domains):
+            handle = checkCudaErrors(driver.cuMemCreate(part_bytes, prop_for(i), 0))
+            try:
+                checkCudaErrors(
+                    driver.cuMemMap(ptr + i * part_bytes, part_bytes, 0, handle, 0)
+                )
+            except BaseException:
+                driver.cuMemRelease(handle)
+                raise
+            chunks.append((i * part_bytes, part_bytes, handle))
+        access = driver.CUmemAccessDesc()
+        access.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        access.location.id = int(cu_dev)
+        access.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        checkCudaErrors(driver.cuMemSetAccess(ptr, va_bytes, [access], 1))
+    except BaseException:
+        # unwind (e.g. out of memory in the second domain): nothing has used the mapping yet
+        for offset, size, handle in chunks:
+            driver.cuMemUnmap(ptr + offset, size)
+            driver.cuMemRelease(handle)
+        driver.cuMemAddressFree(ptr, va_bytes)
+        raise
+    owner = _LocalizedAllocation(ptr, va_bytes, "|u1")
+    weakref.finalize(
+        owner, _unmap_localized, dev.index, ptr, va_bytes, chunks
+    ).atexit = False
+    flat = torch.as_tensor(owner, device=dev).view(dtype)
+    inner = []
+    stride = 1
+    for size in reversed(part_shape):
+        inner.append(stride)
+        stride *= size
+    return torch.as_strided(
+        flat, (num_domains, *part_shape), (part_bytes // elem, *reversed(inner))
+    )

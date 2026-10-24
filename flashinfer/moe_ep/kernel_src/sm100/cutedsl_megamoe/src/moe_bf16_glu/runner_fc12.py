@@ -4,6 +4,7 @@
 Host driver for the MegaMoE BF16 GLU fused fc1+fc2 kernel.
 """
 
+
 import argparse
 import os
 import sys
@@ -79,7 +80,9 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
                 f"got {problem.intermediate}."
             )
         if problem.hidden % 32 != 0:
-            raise ValueError(f"hidden must be a multiple of 32; got {problem.hidden}.")
+            raise ValueError(
+                f"hidden must be a multiple of 32; got {problem.hidden}."
+            )
         # BF16 currently only supports the (M=256, N=256) mma tile with
         # 2-CTA instructions.
         m, n, _k = impl.mma_tiler_mnk
@@ -99,7 +102,6 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         if self.impl.generate_c:
             return 128
         from moe_nvfp4_swapab.epilogue import EpilogueTokenTile
-
         return EpilogueTokenTile
 
     # ------------------------------------------------------------------
@@ -123,7 +125,9 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
             n = 1
             for s in shape:
                 n *= s
-            bits = torch.randint(-32768, 32768, (n,), dtype=torch.int16, device="cuda")
+            bits = torch.randint(
+                -32768, 32768, (n,), dtype=torch.int16, device="cuda"
+            )
             nan_inf = (bits & 0x7F80) == 0x7F80
             bits = torch.where(nan_inf, bits & ~0x0080, bits)
             return bits.view(torch.bfloat16).reshape(shape)
@@ -193,8 +197,7 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         fc2_output_bytes = torch.full(
             (data_total_rows, hidden * problem.fc2_output_dtype.itemsize),
             0xFF,
-            dtype=torch.uint8,
-            device="cuda",
+            dtype=torch.uint8, device="cuda",
         )
         self.fc2_output = fc2_output_bytes.view(problem.fc2_output_dtype).reshape(
             data_total_rows, hidden
@@ -242,33 +245,27 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         valid_tokens_per_expert: List[int],
         data_total_rows: int,
     ) -> None:
-        """Allocate BF16 tensors with correct shape / stride but no data init."""
+        """Allocate BF16 tensors with correct shape / stride but no data init.
+        """
         problem = self.problem
         hidden = problem.hidden
         intermediate = problem.intermediate
         experts = problem.experts
 
         self.activation = torch.empty(
-            (data_total_rows, hidden),
-            dtype=torch.bfloat16,
-            device="cuda",
+            (data_total_rows, hidden), dtype=torch.bfloat16, device="cuda",
         )
         self.fc1_weight = torch.empty(
-            (experts, intermediate, hidden),
-            dtype=torch.bfloat16,
-            device="cuda",
+            (experts, intermediate, hidden), dtype=torch.bfloat16, device="cuda",
         ).permute(0, 2, 1)
         self.fc2_weight = torch.empty(
-            (experts, hidden, intermediate // 2),
-            dtype=torch.bfloat16,
+            (experts, hidden, intermediate // 2), dtype=torch.bfloat16,
             device="cuda",
         ).permute(0, 2, 1)
 
         # -- topk_scores --
         self.topk_scores = torch.empty(
-            (data_total_rows,),
-            dtype=torch.float32,
-            device="cuda",
+            (data_total_rows,), dtype=torch.float32, device="cuda",
         )
 
         # -- fc2_output --
@@ -335,8 +332,7 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         # as ``_alloc_fc2_output``).
         ref_bytes = torch.zeros(
             (data_total_rows, problem.hidden * problem.fc2_output_dtype.itemsize),
-            dtype=torch.uint8,
-            device="cuda",
+            dtype=torch.uint8, device="cuda",
         )
         self.fc2_output_ref = ref_bytes.view(problem.fc2_output_dtype).reshape(
             data_total_rows, problem.hidden
@@ -374,7 +370,9 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
             )
 
             # Raw pre-SwiGLU gate+up snapshot (kernel c_dtype is BFloat16).
-            self._ref_fc1_gateup_per_expert[expert_idx] = fc1_fp32.to(torch.bfloat16)
+            self._ref_fc1_gateup_per_expert[expert_idx] = fc1_fp32.to(
+                torch.bfloat16
+            )
             self._ref_fc1_q_per_expert[expert_idx] = fc1_bf16
 
             fc2_fp32 = self._apply_topk_post_fc2(fc2_fp32, topk_slice)
@@ -418,8 +416,9 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         )
         cluster_tile_tokens = per_cta_tile_m * self.impl.cluster_shape_mnk[0]
         counter_slots_upper = (
-            data_total_rows + cluster_tile_tokens - 1
-        ) // cluster_tile_tokens + experts
+            (data_total_rows + cluster_tile_tokens - 1) // cluster_tile_tokens
+            + experts
+        )
 
         fc1_output_byte_count = data_total_rows * intermediate_downproj * 2  # BF16
         fc1_done_counter_byte_count = counter_slots_upper * 4
@@ -438,8 +437,9 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
 
         # -- fc1_done_counter: Int32 1D, zero-init (host responsibility,
         # done by the workspace zero-alloc in run_kernel).
-        fc1_done_counter_torch = ws[offset : offset + fc1_done_counter_byte_count].view(
-            torch.int32
+        fc1_done_counter_torch = (
+            ws[offset : offset + fc1_done_counter_byte_count]
+            .view(torch.int32)
         )
         offset += fc1_done_counter_byte_count
 
@@ -477,19 +477,19 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         import cutlass.utils as utils
 
         required = (
-            self.activation,
-            self.fc1_weight,
-            self.fc2_weight,
-            self.topk_scores,
-            self.fc2_output,
-            self.offs,
+            self.activation, self.fc1_weight, self.fc2_weight,
+            self.topk_scores, self.fc2_output, self.offs,
         )
         if any(t is None for t in required):
             raise RuntimeError("run_kernel requires generate_inputs first.")
 
         # Cluster size + max_active_clusters + group_hint default fill.
-        cluster_size = self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        cluster_size = (
+            self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
+        )
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
         group_hint = self.impl.group_hint
         if group_hint is None:
             group_hint = max_active_clusters
@@ -713,7 +713,10 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         Both sides are BF16 rounded from fp32 SwiGLU results; residual
         disagreement is fp32 accumulation order inside the fc1 GEMM.
         """
-        if self._ws_fc1_output_torch is None or not self._ref_fc1_q_per_expert:
+        if (
+            self._ws_fc1_output_torch is None
+            or not self._ref_fc1_q_per_expert
+        ):
             print("[fc1 phase ablation] skipped (workspace or ref not populated)")
             return
 
@@ -733,9 +736,7 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
                 kq.float().cpu(),
                 ref_q.float().cpu(),
                 name=f"fc1_expert{e}",
-                atol=1e-2,
-                rtol=1e-2,
-                max_mismatches=5,
+                atol=1e-2, rtol=1e-2, max_mismatches=5,
             )
         print("=" * 60)
 
@@ -770,12 +771,9 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
             kernel_c = c[doff[e] : doff[e] + v_e].float().cpu()
             ref_c = ref.float().cpu()
             compare_and_report_mismatches(
-                kernel_c,
-                ref_c,
+                kernel_c, ref_c,
                 name=f"c_output_expert{e}",
-                atol=1e-5,
-                rtol=1e-2,
-                max_mismatches=5,
+                atol=1e-5, rtol=1e-2, max_mismatches=5,
             )
         if not any_checked:
             print("  (no valid tokens routed to any expert)")
@@ -790,16 +788,13 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         data_offsets = self.data_physical_offsets
 
         for name in (
-            "activation",
-            "fc1_weight",
-            "fc2_weight",
-            "topk_scores",
-            "fc2_output",
-            "workspace",
+            "activation", "fc1_weight", "fc2_weight",
+            "topk_scores", "fc2_output", "workspace",
         ):
             t = getattr(self, name)
             print(
-                f"{name}: shape={tuple(t.shape)}  stride={t.stride()}  dtype={t.dtype}"
+                f"{name}: shape={tuple(t.shape)}  "
+                f"stride={t.stride()}  dtype={t.dtype}"
             )
         print(f"offs (valid cumsum): {self.offs.cpu().tolist()}")
         print(f"  valid_tokens_per_expert: {valid_tokens}")
@@ -824,55 +819,41 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # -- BF16-only Problem --
     parser.add_argument(
-        "--kind",
-        type=str,
-        default="bf16",
+        "--kind", type=str, default="bf16",
         choices=["bf16"],
         help="Data element format: bf16 (BF16 A/B operands).",
     )
     parser.add_argument(
-        "--flag_batch",
-        type=int,
-        default=1,
+        "--flag_batch", type=int, default=1,
         help="dispatch_pull release-flag batch size; 1 == per-token "
         "baseline, larger amortizes the device fence over more tokens.",
     )
     parser.add_argument(
-        "--token_back_mode",
-        type=str,
-        default="epi_warps",
+        "--token_back_mode", type=str, default="epi_warps",
         choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
         help="Where the cross-rank fc2 push-back runs: epi_warps (epilogue "
-        "STG redirect, default), standalone_warps (dedicated warps 12-15), "
-        "or reuse_dispatch_warps (dispatch warps 8-11).",
+             "STG redirect, default), standalone_warps (dedicated warps 12-15), "
+             "or reuse_dispatch_warps (dispatch warps 8-11).",
     )
     parser.add_argument(
-        "--epi_flag_batch",
-        type=str,
-        default="1,1",
+        "--epi_flag_batch", type=str, default="1,1",
         help="Done-counter publish batching as 'fc1,fc2' (e.g. '2,4'). "
-        "Each component must be in [1, 32].",
+             "Each component must be in [1, 32].",
     )
     parser.add_argument(
-        "--gate_up_clamp",
-        type=float,
-        default=None,
+        "--gate_up_clamp", type=float, default=None,
         help="DeepSeek-V4 swiglu_limit: clamp gate/up pre-activations before SiLU.",
     )
     parser.add_argument(
-        "--generate_c",
-        action="store_true",
-        default=False,
+        "--generate_c", action="store_true", default=False,
         help="Save raw fc1 accumulator (gate+up, Float32) to a separate C tensor "
-        "before SwiGLU.  Allocates extra SMEM; reduces AB pipeline stages.",
+             "before SwiGLU.  Allocates extra SMEM; reduces AB pipeline stages.",
     )
     parser.add_argument(
-        "--use_stg_fc1",
-        action="store_true",
-        default=False,
+        "--use_stg_fc1", action="store_true", default=False,
         help="Write fc1 BF16 output directly to GMEM via STG (RMEM→GMEM) "
-        "instead of the default R2S+TMA path.  Eliminates sD SMEM staging; "
-        "may increase AB pipeline stages.",
+             "instead of the default R2S+TMA path.  Eliminates sD SMEM staging; "
+             "may increase AB pipeline stages.",
     )
 
     return parser

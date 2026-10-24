@@ -572,6 +572,52 @@ def test_prefill_state_indices_without_final_state(backend, use_cp):
     assert torch.equal(packed_output, indexed_output)
 
 
+def test_prefill_state_indices_read_only_pool_scratch_spans_pool(monkeypatch):
+    """SM90 stores every final state, to row state_indices[i] when indexed, so
+    the scratch it gets for a read-only pool must span the pool. A compact
+    [num_seqs, ...] scratch took writes past its end that only faulted when
+    the next page happened to be unmapped."""
+    import flashinfer.gdn_prefill as gdn_prefill
+
+    device = torch.device("cuda")
+    if get_compute_capability(device)[0] != 9:
+        pytest.skip("checks the SM90 dispatch")
+    H, D = 16, 128
+    seq_lens = [64, 512]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=4
+    )
+    slots = [3, 0]
+    pool = _make_pool(init_state, slots, 5, 96, init_state.dtype, device)
+    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+
+    seen = []
+
+    def record(output, output_state, *args, state_indices=None):
+        seen.append((tuple(output_state.shape), state_indices))
+
+    monkeypatch.setattr(gdn_prefill, "chunk_gated_delta_rule_sm90", record)
+    for initial_state in (pool, None):
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            use_cp=False,
+            backend="flashinfer",
+            max_seqlen=max(seq_lens),
+        )
+    (pool_shape, pool_indices), (no_pool_shape, no_pool_indices) = seen
+    assert pool_shape == tuple(pool.shape) and pool_indices is state_indices
+    # Nothing to read or write through: the slot ids are dropped.
+    assert no_pool_shape == (len(seq_lens), H, D, D) and no_pool_indices is None
+
+
 @pytest.mark.parametrize("backend,use_cp", BACKEND_CP_CASES)
 def test_prefill_state_indices_none_is_default(backend, use_cp):
     """state_indices=None must reproduce the packed path exactly (default)."""

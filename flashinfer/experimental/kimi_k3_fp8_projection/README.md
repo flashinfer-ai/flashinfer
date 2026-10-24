@@ -101,17 +101,32 @@ activation bit-exact vs the DeepGEMM recipe; see
 `tests/experimental/test_cake_kimi_k3_fp8_projection.py`.
 
 Benchmark: `python benchmarks/bench_cake_kimi_k3_fp8_projection.py [--cupti]`
-times the 198 representative rows (22 families x `M in {1, 8, 64, 256, 512,
-1024, 2048, 4096, 16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
+times the 132 representative rows (22 families x `M in {1, 8, 64, 256, 4096,
+16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
 `per_token_group_quant_8bit` + `gemm_fp8_nt_groupwise` chains (`cutlass` sm1 /
 sm2, `trtllm`, `cutile`) on the same weight.
 
 Generated sources live under `csrc/cake_kimi_k3_fp8_projection/`: one kernel
-and one launcher source per program for both architectures (the
+source per program or lever family and one launcher source per launcher text
+(54 launcher sources for the 107 programs) for both architectures (the
 architecture-specific lowering sits behind `__CUDA_ARCH__` guards; the JIT
 compiles each source with the flags of the device it runs on), the shared
-device-helper and host-helper headers, and nothing else. `cake_jit.py`
-registers them (`MODULES`: one record per program; `KERNELS`: logical kernel
-key -> program and compile-line defines, e.g. the three quantization widths
-are one program with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake
-generated-program export; nothing there is hand-written.
+device-helper header, the host-helper header
+(`cake_kimi_k3_fp8_projection_host_common.cuh`: the dynamic-shared-memory
+opt-in and the receipt / chain text every launcher includes verbatim inside
+its namespace), and nothing else. A program that differs from a sibling only
+by a prefetch lever or by the raster group width shares the sibling's kernel
+source and selects its lever value (`-DCAKE_LEVER_*` or `-DGROUP_M`) on the
+compile line; programs whose exported launcher text differs only in the
+kernel symbol and the launcher namespace share one launcher source. A program
+that builds a shared source names its own kernel symbol and launcher
+namespace (`-DCAKE_PROGRAM_KERNEL`, `-DCAKE_PROGRAM_SHIM`) on the compile
+line; a source's defaults select the program it was exported for.
+`cake_jit.py` registers them (`MODULES`: one record per program, expanded
+from one row per program and the five named argument plans of `ARG_PLANS`;
+`KERNELS`: logical kernel key -> program and compile-line defines, e.g. the
+three quantization widths are one program with `-DQUANT_UNITS=1|2|4`). Both
+are written by the Cake generated-program export; the shared kernel and
+launcher sources, the hoisted host header, the `-D` entries of the records
+that use them and the row form of `MODULES` are a hand fold of the exported
+files, pending regeneration by the export.

@@ -463,6 +463,8 @@ def _canonical_arm(candidate):
 _RAW_DECODE_CASES = (
     ("rows_bf16", 2, torch.bfloat16, "stp_hd64_rows_bf16"),
     ("paired_bf16", 64, torch.bfloat16, "stp_paired_rows"),
+    # 16 x 64 program heads: inside the sm_100a four-CTA residency band (6.9 per SM).
+    ("paired_bf16_four_cta", 16, torch.bfloat16, "stp_paired_rows"),
     ("rows_fp32", 8, torch.float32, "stp_hd64_rows_fp32"),
 )
 
@@ -623,20 +625,18 @@ def test_paired_heads_per_cta_follows_the_work_and_arch() -> None:
     assert (
         cake._paired_heads_per_cta(20 * 64, sms, "sm_120a") == 2
     )  # no band for other archs
+    three = ("stp_paired_rows", (("LAUNCH_MIN_BLOCKS", 3),))
+    four = ("stp_paired_rows", (("LAUNCH_MIN_BLOCKS", 4),))
+    assert cake._paired_rows_program(8 * 64, sms, "sm_100a") == three  # 3.5 per SM
     assert (
-        cake._paired_rows_program(8 * 64, sms, "sm_100a") == "stp_paired_rows"
-    )  # 3.5 per SM
-    assert (
-        cake._paired_rows_program(16 * 64, sms, "sm_100a") == "stp_paired_rows_mb4"
+        cake._paired_rows_program(16 * 64, sms, "sm_100a") == four
     )  # 6.9: inside the B200 band
+    assert cake._paired_rows_program(32 * 64, sms, "sm_100a") == four  # 13.8
     assert (
-        cake._paired_rows_program(32 * 64, sms, "sm_100a") == "stp_paired_rows_mb4"
-    )  # 13.8
-    assert (
-        cake._paired_rows_program(64 * 64, sms, "sm_100a") == "stp_paired_rows"
+        cake._paired_rows_program(64 * 64, sms, "sm_100a") == three
     )  # 27.7: above the band
     assert (
-        cake._paired_rows_program(16 * 64, 152, "sm_103a") == "stp_paired_rows"
+        cake._paired_rows_program(16 * 64, 152, "sm_103a") == three
     )  # no band on GB300
 
 
@@ -1036,25 +1036,67 @@ def test_jit_names_stay_within_the_file_name_limit() -> None:
         cake.define_digest(raw)
         in cake.MODULES[cake.PROGRAMS["mtp_cache_c4_t6"]]["instantiations"]
     )
+    # The paired row-major route composes the same define tuples as the table on both residency
+    # schedules (16 x 64 program heads inside the sm_100a band, 64 x 64 above it).
+    paired = cake.MODULES[cake.PROGRAMS["stp_paired_rows"]]["instantiations"]
+    program, residency = cake._paired_rows_program(16 * 64, 148, "sm_100a")
+    assert (program, residency) == ("stp_paired_rows", (("LAUNCH_MIN_BLOCKS", 4),))
+    band = (
+        cake.direct_defines(8, 512)
+        + cake.batch_abi_defines(torch.bfloat16, torch.int32, True, 2)
+        + residency
+    )
+    assert cake.define_digest(band) in paired
+    _, residency = cake._paired_rows_program(64 * 64, 148, "sm_100a")
+    assert residency == (("LAUNCH_MIN_BLOCKS", 3),)
+    above = (
+        cake.direct_defines(8, 2048)
+        + cake.batch_abi_defines(torch.float32, torch.int64, True, 2)
+        + residency
+    )
+    assert cake.define_digest(above) in paired
 
 
 def test_aot_table_names_every_delivered_build() -> None:
-    """The AOT specifications are exactly the loader's build specifications, one per program instantiation."""
+    """The AOT specifications are exactly the loader's build specifications: one per program instantiation
+    a route of the architecture selects."""
+    default = cake._PAIRED_ROWS_MIN_BLOCKS
     for arch in ("sm_100a", "sm_103a"):
         expected = set()
         for module, record in cake.MODULES.items():
             for values in (record["instantiations"] or {"": {}}).values():
                 defines = tuple((name, int(values[name])) for name in record["defines"])
+                if (
+                    values.get("LAUNCH_MIN_BLOCKS", default) != default
+                    and arch not in cake._PAIRED_ROWS_MIN_BLOCKS_BANDS
+                ):
+                    continue  # the four-CTA residency band exists on sm_100a only
                 expected.add(cake.jit_spec(module, arch, defines).name)
         specs = cake.gen_cake_selective_state_update_modules(arch)
         assert len(specs) == len(expected)
         assert {spec.name for spec in specs} == expected
+    # The two LAUNCH_MIN_BLOCKS=4 instantiations of the paired row-major program are built for
+    # sm_100a alone; every other build is shared by both architectures.
+    module = cake.PROGRAMS["stp_paired_rows"]
+    four_cta = [
+        digest
+        for digest, values in cake.MODULES[module]["instantiations"].items()
+        if values["LAUNCH_MIN_BLOCKS"] == 4
+    ]
+    assert len(four_cta) == 2
+    built = {
+        arch: {spec.name for spec in cake.gen_cake_selective_state_update_modules(arch)}
+        for arch in ("sm_100a", "sm_103a")
+    }
+    for digest in four_cta:
+        assert f"{module}_sm_100a_{digest}" in built["sm_100a"]
+        assert f"{module}_sm_103a_{digest}" not in built["sm_103a"]
+    assert len(built["sm_100a"]) == len(built["sm_103a"]) + 2
 
 
 def test_registry_names_every_program() -> None:
     assert set(cake.PROGRAMS) == {
         "stp_paired_rows",
-        "stp_paired_rows_mb4",
         "stp_hd64_rows_bf16",
         "stp_hd64_rows_fp32",
         "stp_fp32_identity",

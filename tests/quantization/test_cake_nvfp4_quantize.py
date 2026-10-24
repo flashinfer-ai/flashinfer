@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import glob
 import re
+from pathlib import Path
 
 import pytest
 import torch
@@ -23,12 +25,19 @@ from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import (
     ARCHES,
+    ARG_PLANS,
     DEFINITIONS,
     KERNELS,
     MODULES,
     gen_cake_nvfp4_per_token_module,
     kernel_definitions,
     kernel_module_name,
+)
+from tests.test_helpers.cake_nvfp4_per_token import (
+    VALIDATED_F16_INPUT_ROWS,
+    VALIDATED_OFF_MATRIX_QUANTIZE_K,
+    VALIDATED_QUANTIZE_K,
+    required_kernel_keys,
 )
 
 FLT_MAX = 3.4028234663852886e38
@@ -214,7 +223,7 @@ def test_quant_plan_grid_and_keys():
 
 # Row lengths of the validated matrix and dense token counts around every
 # dispatch boundary (single row, one wave, two CTAs per SM, the many-CTA split).
-REACHABLE_K = cb.VALIDATED_QUANTIZE_K + cb.VALIDATED_OFF_MATRIX_QUANTIZE_K
+REACHABLE_K = VALIDATED_QUANTIZE_K + VALIDATED_OFF_MATRIX_QUANTIZE_K
 REACHABLE_M = tuple(range(1, 33)) + (
     *range(48, 160, 4),
     *range(160, 600, 16),
@@ -244,7 +253,7 @@ def test_f16_quantizer_shapes_match_the_validated_f16_rows():
     """fp16 activations are generated for the validated fp16 rows (K = 7168 at
     256 threads, scale not folded); every other fp16 shape names its missing
     program instead of mis-dispatching."""
-    for m in cb.VALIDATED_F16_INPUT_ROWS:
+    for m in VALIDATED_F16_INPUT_ROWS:
         _registered(cb.quant_plan(m, 7168, False, False, "sm_100a", 148), "sm_100a")
     unregistered = 0
     for k in REACHABLE_K:
@@ -262,11 +271,12 @@ def test_f16_quantizer_shapes_match_the_validated_f16_rows():
 
 
 def test_static_k_programs_are_built_with_their_compile_line_definition():
-    """A program whose delivered source declares K_STATIC a downstream specialization
-    must never be compiled without it: the source carries the name value-free behind an
-    #error guard, so every build of it has to come from a kernel key whose definitions
-    the registry resolves.  The JIT spec of each such key must carry -DK_STATIC=<K> and
-    name the value, so the two widths of one program do not share a build directory."""
+    """A program reached through a static-K key must never be compiled without the
+    definition: every build of it has to come from a kernel key whose definitions the
+    registry resolves (its own source either carries the name value-free behind an
+    #error guard or defaults it to the runtime form).  The JIT spec of each such key
+    must carry -DK_STATIC=<K> and name the value, so the two widths of one program do
+    not share a build directory."""
     specialized = {
         name
         for name in MODULES
@@ -304,14 +314,222 @@ def test_static_k_programs_are_built_with_their_compile_line_definition():
 
 @pytest.mark.parametrize("arch", cb.ARCHES)
 def test_required_kernel_keys_are_registered_when_programs_exist(arch):
-    required = cb.required_kernel_keys(arch)
+    required = required_kernel_keys(arch)
     assert any(key.startswith("quant:") for key in required)
     assert any(key.startswith("gemm:") for key in required)
     if arch in KERNELS:
         missing = sorted(set(required) - set(KERNELS[arch]))
         assert not missing, f"{arch} lacks {missing}"
         for module_name in KERNELS[arch].values():
-            assert arch in MODULES[module_name]["arches"]
+            record = MODULES[module_name]
+            assert record["arg_plan"] in ARG_PLANS, (module_name, record["arg_plan"])
+            assert arch in record["closure_sha256"], (module_name, arch)
+
+
+_PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
+_PROGRAM_KERNEL_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_KERNEL (\w+)$", re.M)
+_KNOB_DEFAULT = re.compile(r"^#define (CAKE_[A-Z0-9_]+) (\S+)$", re.M)
+_TMA_POLICY = {"L": "0x14F0000000000000ULL", "F": "0x12F0000000000000ULL", None: "0"}
+
+
+def _knobs_of_key(key):
+    """Knob values the shared sources must see for ``key`` (its name grammar)."""
+    m = re.match(r"quant:t(\d+)_b(\d+)_mb(\d+)_(bf16|f16)(_fold)?(_sl)?", key)
+    if m:
+        threads, blocks, min_blocks = (int(g) for g in m.groups()[:3])
+        return {
+            "CAKE_Q_THREADS": str(threads),
+            "CAKE_Q_MIN_BLOCKS": str(min_blocks),
+            "CAKE_Q_BPT": str(blocks),
+            "CAKE_Q_WORDS": str(8 * blocks),
+            "CAKE_Q_WARPS": str(threads // 32),
+            "CAKE_Q_BLOCK": f"{threads}u",
+            "CAKE_FOLD": "1" if m.group(5) else "0",
+            "CAKE_STORE_EVICT_LAST": "1" if m.group(6) else "0",
+        }
+    m = re.match(
+        r"gemm:.*?_(bf16|f16)(?:_a([LF]))?(?:_b([LF]))?(?:_l2\d+b)?(?:_g(\d+))?", key
+    )
+    assert m, key
+    return {
+        "CAKE_OUT_F16": "1" if m.group(1) == "f16" else "0",
+        "CAKE_A_POLICY": _TMA_POLICY[m.group(2)],
+        "CAKE_B_POLICY": _TMA_POLICY[m.group(3)] if m.group(3) else None,
+        "CAKE_RASTER_GROUP": m.group(4) or "0",
+    }
+
+
+def test_shared_kernel_sources_keep_distinct_symbols_and_knobs():
+    # Knob twins build from one kernel translation unit: the record whose source
+    # it is defines the symbol through the file's ``CAKE_PROGRAM_KERNEL`` default,
+    # every other record names its own symbol on the compile line.  All programs
+    # of one architecture load into one process, so every record must still
+    # produce ``kernel_<record>``; and the knob values the record's compile line
+    # and the source's defaults select must be the ones its kernel keys name.
+    # The kernel source is read where the loader's JIT spec resolves it.
+    symbols = {}
+    for name, record in MODULES.items():
+        kernel_source = record["sources"][0]
+        assert kernel_source.endswith("_kernel.cu"), (name, kernel_source)
+        spec = gen_cake_nvfp4_per_token_module(name, record["arches"][0])
+        text = spec.sources[0].read_text()
+        flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        defaults = _PROGRAM_KERNEL_DEFAULT.findall(text)
+        assert len(flags) <= 1 and len(defaults) <= 1, (name, flags, defaults)
+        if flags:
+            symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
+        elif defaults:
+            symbol = defaults[0]
+        else:
+            symbol = f"kernel_{name}"
+        if name not in kernel_source:
+            assert flags and defaults, (name, kernel_source)
+        assert f"{symbol}(" in text or "CAKE_PROGRAM_KERNEL(" in text, name
+        assert symbol == f"kernel_{name}", (name, symbol)
+        symbols[name] = symbol
+        declared = {
+            knob: value
+            for knob, value in _KNOB_DEFAULT.findall(text)
+            if knob not in ("CAKE_PROGRAM_KERNEL", "CAKE_INF")
+        }
+        given = dict(
+            f[2:].split("=", 1)
+            for f in record["compile_flags"]
+            if f.startswith("-DCAKE_") and not f.startswith("-DCAKE_PROGRAM_")
+        )
+        # CAKE_Q_BLOCK is the launch-block knob of the shared bf16 quantizer
+        # binding, not of the kernel source; its value must be the kernel's
+        # thread count with the unsigned suffix (pinned by _knobs_of_key).
+        assert set(given) <= set(declared) | {"CAKE_Q_BLOCK"}, (name, given, declared)
+        effective = {**declared, **given}
+        keys = {k for table in KERNELS.values() for k, n in table.items() if n == name}
+        for key in keys if effective else ():
+            expected = _knobs_of_key(key)
+            for knob, value in effective.items():
+                assert expected.get(knob) == value, (name, key, knob, value)
+    assert len(set(symbols.values())) == len(MODULES)
+
+
+def test_generated_sources_are_declared_as_package_data():
+    """A non-editable install carries the sources the loader resolves next to
+    cake_jit.py: every kernel and binding named by MODULES and the two family
+    headers they include.  pyproject.toml sets include-package-data = false, so
+    only the package-data globs of this package put them into a wheel."""
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if not pyproject.is_file():
+        pytest.skip("pyproject.toml is only available in source-tree test runs")
+    key = '"flashinfer.experimental.cake_nvfp4_per_token" = ['
+    text = pyproject.read_text(encoding="utf-8")
+    assert key in text, "pyproject.toml has no package-data entry for the package"
+    globs = re.findall(r'"([^"]*)"', text.split(key, 1)[1].split("]", 1)[0])
+    package_root = Path(cb.__file__).resolve().parent
+    shipped = {
+        path
+        for pattern in globs
+        for path in glob.glob(pattern, root_dir=package_root, recursive=True)
+        if (package_root / path).is_file()
+    }
+    needed = {f"csrc/{rel}" for record in MODULES.values() for rel in record["sources"]}
+    needed |= {
+        "csrc/cake_nvfp4_per_token/cake_nvfp4_per_token_device_common.cuh",
+        "csrc/cake_nvfp4_per_token/cake_nvfp4_per_token_host_common.cuh",
+    }
+    assert needed <= shipped, sorted(needed - shipped)
+
+
+_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
+_PROGRAM_SHIM_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_SHIM (\w+)$", re.M)
+_PROGRAM_EXPORT_LINE = "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);"
+_BINDING_NAMESPACE = re.compile(r"^namespace (\w+) \{$", re.M)
+
+
+def _check_conditions(text):
+    # The condition of every TVM_FFI_CHECK( in ``text`` as the preprocessor
+    # stringizes it: balanced parentheses, string literals skipped, multi-line.
+    conditions = []
+    for match in re.finditer(r"\bTVM_FFI_CHECK\(", text):
+        start = match.end()
+        depth, quoted, i = 1, False, start
+        while depth and i < len(text):
+            char = text[i]
+            if quoted:
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            i += 1
+        assert depth == 0, text[start : start + 80]
+        conditions.append(text[start : i - 1])
+    return conditions
+
+
+def test_shared_binding_sources_keep_distinct_namespaces():
+    # Programs whose exported binding text differs only in the kernel symbol and
+    # the host-shim namespace (the bf16 quantizer: also in the CTA width) build
+    # one binding translation unit: the record whose source it is selects both
+    # through the file's defaults, every other record names its own on the
+    # compile line.  Every record must still export ``run`` from its own
+    # namespace, declare and launch its own kernel symbol, and give the binding
+    # only knob values its kernel source declares, plus the launch-block knob of
+    # the shared bf16 quantizer binding, which must spell the kernel's thread
+    # count.
+    csrc = Path(cb.__file__).resolve().parent / "csrc"
+    namespaces = {}
+    for name, record in MODULES.items():
+        binding_source = record["sources"][1]
+        assert binding_source.endswith("_binding.cu"), (name, binding_source)
+        text = (csrc / binding_source).read_text()
+        assert _BINDING_NAMESPACE.findall(text) == ["CAKE_PROGRAM_SHIM"], name
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+        assert _PROGRAM_EXPORT_LINE in text, name
+        # TVM_FFI_CHECK stringizes its condition unexpanded: a kernel symbol in
+        # a check condition would be spelt as the macro name in the message.
+        for condition in _check_conditions(text):
+            assert "CAKE_PROGRAM_" not in condition, (name, condition)
+        shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
+        assert len(shim_defaults) == 1, (name, shim_defaults)
+        shim_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
+        ]
+        kernel_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, record)
+        namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
+        if name in binding_source:
+            assert namespace in (None, shim_defaults[0]), (name, namespace)
+            namespace = shim_defaults[0]
+        else:
+            assert namespace is not None, (name, record["compile_flags"])
+            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
+        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
+        namespaces[name] = namespace
+        kernel_text = (csrc / record["sources"][0]).read_text()
+        binding_knobs = {
+            knob: value
+            for knob, value in _KNOB_DEFAULT.findall(text)
+            if not knob.startswith("CAKE_PROGRAM_")
+        }
+        kernel_knobs = dict(_KNOB_DEFAULT.findall(kernel_text))
+        assert set(binding_knobs) <= set(kernel_knobs) | {"CAKE_Q_BLOCK"}, name
+        if "CAKE_Q_BLOCK" in binding_knobs:
+            given = dict(
+                f[2:].split("=", 1)
+                for f in record["compile_flags"]
+                if f.startswith("-DCAKE_Q_")
+            )
+            threads = given.get("CAKE_Q_THREADS", kernel_knobs["CAKE_Q_THREADS"])
+            block = given.get("CAKE_Q_BLOCK", binding_knobs["CAKE_Q_BLOCK"])
+            assert block == f"{threads}u", (name, block, threads)
+    assert len(set(namespaces.values())) == len(MODULES)
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +638,8 @@ def _check_against_reference(x, gs_inv, out_scale, fp4, sf, scale):
     assert bool(((decoded - ref_codes).abs() <= quantum * 1.001).all())
 
 
-# The validated matrix (cake_backend.validated_problems): bf16 activations on
+# The validated matrix (validated_problems in tests/test_helpers/
+# cake_nvfp4_per_token.py): bf16 activations on
 # every K x M x fold; fp16 activations on the validated fp16 rows of K=7168 only.
 _QUANT_CASES = (
     [
@@ -429,7 +648,7 @@ _QUANT_CASES = (
         for k in (7168, 16384)
         for m in (1, 17, 130, 257, 4097)
     ]
-    + [(m, 7168, torch.float16, False) for m in cb.VALIDATED_F16_INPUT_ROWS]
+    + [(m, 7168, torch.float16, False) for m in VALIDATED_F16_INPUT_ROWS]
     # Row lengths outside the measured families and the token counts between tiles.
     + [
         (m, k, torch.bfloat16, False)

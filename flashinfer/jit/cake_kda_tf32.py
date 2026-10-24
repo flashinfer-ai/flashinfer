@@ -3,7 +3,9 @@
 One kernel source serves both architectures where the generated bodies agree
 (architecture-specific lowering sits under exact ``__CUDA_ARCH__`` guards); each
 architecture still compiles its own module. Argument plans and factory kwargs are
-stored once and expanded into ``MODULES`` / ``FACTORIES`` at import.
+stored once and expanded into ``MODULES`` / ``FACTORIES`` at import. The host
+binding of every module is rendered from ``cake_kda_prefill_binding`` into the
+generated-source directory when its JIT spec is created.
 """
 
 from functools import cache
@@ -12,7 +14,9 @@ from pathlib import Path
 import torch
 
 from . import env as jit_env
+from .cake_kda_prefill_binding import render_kda_prefill_binding
 from .core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .utils import write_if_different
 
 ARCHES = ("sm_100a", "sm_103a")
 _NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
@@ -334,7 +338,10 @@ ARG_PLANS = {
 }
 
 # module name -> (family directory, source digest, architectures, argument plan,
-# TMA descriptor workspace bytes). Sources are csrc/kda/<dir>/cake_kda_<dir>_<digest>_{kernel,binding}.cu.
+# TMA descriptor workspace bytes). The kernel body is
+# csrc/kda/<dir>/cake_kda_<dir>_<digest>_kernel.cu unless _M128_FOLDS or
+# _TF32_FOLDS maps the module onto a shared body; render_binding() renders its
+# host binding.
 _MODULE_ROWS = {
     "cake_kda_bf16_02c6dae5d13691ae05c3": (
         "bf16",
@@ -934,15 +941,346 @@ _MODULE_ROWS = {
 }
 
 
-def _module_record(directory, digest, arches, plan, tma_workspace_bytes):
+# Fused-M128 kernel bodies shared by several modules. The former kernel
+# sources of the modules listed under one body differed only in the lines
+# that the listed schedule flags select, so that body keeps those lines
+# behind #if blocks and every module of the fold compiles it with
+# -DCAKE_KDA_KERNEL_SYMBOL=<its own kernel symbol> and -DCAKE_KDA_<FLAG>=0/1
+# per flag (1 when the module's _FACTORY_ROWS entry sets the flag). A flag
+# that every member sets together with a listed one selects no text of its
+# own and is not listed. body digest -> (flags, {module -> flags set}).
+_M128_FOLDS = {
+    "7e2e6ee2298c5db04889ef1104e834ad93dec65ab462f9c53fe0603aaa1cdde0": (
+        (
+            "AFFINE_MAIN_INDEXED_INITIAL",
+            "N32_FT_SLAB",
+            "N32_PREDICTION_FIRST",
+            "PAIR_PACKED_BETA",
+            "PDL_PUBLISH_FINAL_STATE",
+            "PDL_WAIT_INITIAL_STATE_F32",
+            "SCALAR_BETA",
+        ),
+        {
+            "cake_kda_bf16_2064d4aca94aef841cf8": (),
+            "cake_kda_bf16_2b5f2c6b7cfc10ffa244": (
+                "N32_FT_SLAB",
+                "PDL_WAIT_INITIAL_STATE_F32",
+            ),
+            "cake_kda_bf16_4ab394a09c63f264d7bd": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "N32_FT_SLAB",
+                "PDL_PUBLISH_FINAL_STATE",
+                "SCALAR_BETA",
+            ),
+            "cake_kda_bf16_50c0f288f4c8d7ca03a8": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "N32_FT_SLAB",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+            "cake_kda_bf16_5be344cbddc29563f1ee": ("SCALAR_BETA",),
+            "cake_kda_bf16_7386cf449b08cfe77567": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "N32_FT_SLAB",
+                "PAIR_PACKED_BETA",
+                "PDL_PUBLISH_FINAL_STATE",
+                "SCALAR_BETA",
+            ),
+            "cake_kda_bf16_9556ac079590cd311172": (
+                "PAIR_PACKED_BETA",
+                "SCALAR_BETA",
+            ),
+            "cake_kda_bf16_c410d3932af8bc84666e": ("N32_PREDICTION_FIRST",),
+            "cake_kda_bf16_db50c13c6d4aa462575c": (
+                "N32_FT_SLAB",
+                "PAIR_PACKED_BETA",
+                "PDL_WAIT_INITIAL_STATE_F32",
+                "SCALAR_BETA",
+            ),
+            "cake_kda_bf16_f66adfecf2022fc198b6": (
+                "N32_FT_SLAB",
+                "PDL_WAIT_INITIAL_STATE_F32",
+                "SCALAR_BETA",
+            ),
+        },
+    ),
+    "bc1d9243080ec7944715f1471491b5d4b65cccb570f720a4c7ffc9943eb40bf8": (
+        (
+            "AFFINE_MAIN_INDEXED_INITIAL",
+            "AFFINE_OPERATOR_EXPORT",
+            "N32_FT_SLAB",
+            "PAIR_PACKED_BETA",
+            "PDL_PUBLISH_FINAL_STATE",
+            "PDL_WAIT_INITIAL_STATE_F32",
+        ),
+        {
+            "cake_kda_bf16_15be1db8a50ee4d9fd16": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "AFFINE_OPERATOR_EXPORT",
+                "N32_FT_SLAB",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+            "cake_kda_bf16_496bf5563f7746744ffe": ("PAIR_PACKED_BETA",),
+            "cake_kda_bf16_893740628d53688ac269": (),
+            "cake_kda_bf16_b52b37142605bb183504": (
+                "N32_FT_SLAB",
+                "PAIR_PACKED_BETA",
+                "PDL_WAIT_INITIAL_STATE_F32",
+            ),
+            "cake_kda_bf16_c7c8fcf8dd88d37499d3": (
+                "N32_FT_SLAB",
+                "PDL_WAIT_INITIAL_STATE_F32",
+            ),
+            "cake_kda_bf16_cb22ba3c5cee4d5fa5fd": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "AFFINE_OPERATOR_EXPORT",
+                "N32_FT_SLAB",
+                "PAIR_PACKED_BETA",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+            "cake_kda_bf16_fb073f88984adc2962a9": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "N32_FT_SLAB",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+            "cake_kda_bf16_fc66c809d573029352f7": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "N32_FT_SLAB",
+                "PAIR_PACKED_BETA",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+        },
+    ),
+    "0c7f31828dd9e93e3d5522907aa28fabf2b9d410431924dd9355aaa96132173b": (
+        (
+            "AFFINE_MAIN_INDEXED_INITIAL",
+            "PAIR_PACKED_BETA",
+            "PDL_PUBLISH_FINAL_STATE",
+            "PDL_WAIT_INITIAL_STATE_F32",
+        ),
+        {
+            "cake_kda_bf16_14d1b3745aa9f0079482": (
+                "PAIR_PACKED_BETA",
+                "PDL_WAIT_INITIAL_STATE_F32",
+            ),
+            "cake_kda_bf16_8e9c0962021058a3005d": ("PDL_WAIT_INITIAL_STATE_F32",),
+            "cake_kda_bf16_c528a0e1a9896ea82166": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+            "cake_kda_bf16_d1ce1e4b43672482991c": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "PAIR_PACKED_BETA",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+        },
+    ),
+    "c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77df25b1": (
+        ("PAIR_PACKED_BETA",),
+        {
+            "cake_kda_bf16_03ea50d078dbf34830bb": (),
+            "cake_kda_bf16_eeb61146f150d9e0d825": ("PAIR_PACKED_BETA",),
+        },
+    ),
+    "4a2354a3ebea77e12c8f0596f295444041ea67d8558c96d0cea41444efc99b6d": (
+        ("SCALAR_BETA",),
+        {
+            "cake_kda_bf16_5639519f5c942ed86e4f": (),
+            "cake_kda_bf16_f74a288bb51b335a1ccf": ("SCALAR_BETA",),
+        },
+    ),
+    "d5fd10ada12686e56a75ad17c67fa1c5e59dd3b18093b887914010f754f6f778": (
+        ("PAIR_PACKED_BETA",),
+        {
+            "cake_kda_bf16_5926ccfc26ae75ec8391": ("PAIR_PACKED_BETA",),
+            "cake_kda_bf16_e3cd435a92ef7a053b72": (),
+        },
+    ),
+    "fe0a65e1b6040161f67f802f7ff38b7b9d89e03c24664d8fe2f0e13826735185": (
+        (
+            "AFFINE_MAIN_INDEXED_INITIAL",
+            "PDL_PUBLISH_FINAL_STATE",
+            "PDL_WAIT_INITIAL_STATE_F32",
+        ),
+        {
+            "cake_kda_bf16_73414b477c864609350c": ("PDL_WAIT_INITIAL_STATE_F32",),
+            "cake_kda_bf16_d22df3843e4ae69e26a7": (
+                "AFFINE_MAIN_INDEXED_INITIAL",
+                "PDL_PUBLISH_FINAL_STATE",
+            ),
+        },
+    ),
+    "c5b575af972ee37a9e12927304f0b9466edb84a2bf843598e8f7171c767a578b": (
+        ("PAIR_PACKED_BETA",),
+        {
+            "cake_kda_bf16_82dff1c305abe6367034": ("PAIR_PACKED_BETA",),
+            "cake_kda_bf16_acd84ad6d68fb21576b7": (),
+        },
+    ),
+}
+_M128_FOLD_OF = {
+    name: (body, flags, enabled)
+    for body, (flags, members) in _M128_FOLDS.items()
+    for name, enabled in members.items()
+}
+
+
+# TF32 kernel bodies shared by several modules; the sibling of _M128_FOLDS for
+# knobs that carry a value. The former kernel sources of the modules listed
+# under one body differed only in the lines that the listed knobs select, so
+# that body keeps those lines behind #if blocks and every module of the fold
+# compiles it with the compile definitions CAKE_KDA_KERNEL_SYMBOL=<its own
+# kernel symbol> and CAKE_KDA_<KNOB>=<value> per knob. A knob is a factory kwarg
+# of the module's _FACTORY_ROWS row: booleans as 0/1, value_rows 64/128,
+# affine_factor_cache 0/1. Each body carries this statement, which applies to
+# this table too:
+# Generated by Cake for FlashInfer: loader of the kda_tf32 kernels. The Cake exporter rewrites this file; change its producer instead.
+# As in _M128_FOLDS, a kwarg that every member sets together with a listed knob
+# selects no text of its own and is not listed. Such co-varying kwargs are, for
+# body 361d3bf4...: affine_main_indexed_initial, pdl_publish_final_state and
+# round_tf32_operands (True exactly for the affine_factor_cache == 1 member),
+# and for body 83d5b769...: affine_map_output and pdl_publish_final_state
+# (True) with pdl_wait_initial_state_f32 and write_checkpoints (False) exactly
+# for the affine_map_only member (the rows of cake_kda_tf32_380f74127da276b25cf1
+# also differ in unbounded_softplus and active_beta_f32, those of
+# cake_kda_tf32_ff7bf41421e07fc5a457 in active_beta_f32: kwargs the kernel
+# text does not depend on). A module therefore joins a body only when its
+# whole row of kwargs matches a member's, not just the knob values.
+# body digest -> (knobs, {module -> {knob -> value}}).
+_TF32_FOLDS = {
+    "de0b648b181aea585317a33cbb59f25b403246d990627eb3e6cdab1a9c874ab0": (
+        ("compact_output", "split_prediction", "write_checkpoints"),
+        {
+            "cake_kda_tf32_1c5969b9cc4b5ffb2477": {
+                "compact_output": 0,
+                "split_prediction": 0,
+                "write_checkpoints": 1,
+            },
+            "cake_kda_tf32_20fe382d8e26baba025f": {
+                "compact_output": 0,
+                "split_prediction": 0,
+                "write_checkpoints": 0,
+            },
+            "cake_kda_tf32_688090ae18b66d4aae0f": {
+                "compact_output": 0,
+                "split_prediction": 1,
+                "write_checkpoints": 0,
+            },
+            "cake_kda_tf32_d4bf3dee30e8e3c2fb80": {
+                "compact_output": 0,
+                "split_prediction": 1,
+                "write_checkpoints": 1,
+            },
+            "cake_kda_tf32_d8cb0becd1d3911b0b8d": {
+                "compact_output": 1,
+                "split_prediction": 0,
+                "write_checkpoints": 1,
+            },
+        },
+    ),
+    "4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316847ff": (
+        ("active_beta_f32",),
+        {
+            "cake_kda_tf32_064455c977597cb9ed09": {"active_beta_f32": 1},
+            "cake_kda_tf32_32cd512ec43c2530f170": {"active_beta_f32": 0},
+        },
+    ),
+    "12803094a6532d7d485f52f8a46877b86249c37c80feaf014cbf182dc84dc5b8": (
+        ("active_beta_f32", "write_checkpoints"),
+        {
+            "cake_kda_tf32_0fd45fbaac397bbacead": {
+                "active_beta_f32": 0,
+                "write_checkpoints": 0,
+            },
+            "cake_kda_tf32_4374d24862aa57344e4f": {
+                "active_beta_f32": 0,
+                "write_checkpoints": 1,
+            },
+            "cake_kda_tf32_9a6496ea94cd4302f8cd": {
+                "active_beta_f32": 1,
+                "write_checkpoints": 0,
+            },
+            "cake_kda_tf32_c48c48b5db0e008fd946": {
+                "active_beta_f32": 1,
+                "write_checkpoints": 1,
+            },
+        },
+    ),
+    "361d3bf46ffa5ba381c2162a42b355cfbfa8ffeb0159d19ca01557f27c0810a0": (
+        ("affine_factor_cache", "value_rows"),
+        {
+            "cake_kda_tf32_3a4f2589ba67a3e6401c": {
+                "affine_factor_cache": 0,
+                "value_rows": 128,
+            },
+            "cake_kda_tf32_a755dd9542165c5ee3c9": {
+                "affine_factor_cache": 0,
+                "value_rows": 64,
+            },
+            "cake_kda_tf32_baf76efae0b1113677ea": {
+                "affine_factor_cache": 1,
+                "value_rows": 128,
+            },
+        },
+    ),
+    "095bd9aa2cdee2c2c4c385bbd6b06a7f08910cb4e066922e5a9cd01a42a9d321": (
+        ("write_checkpoints",),
+        {
+            "cake_kda_tf32_110a02399894fe49f121": {"write_checkpoints": 1},
+            "cake_kda_tf32_e21b8a42c1cf4a1b7326": {"write_checkpoints": 0},
+        },
+    ),
+    "1b9a9cf31e75651065d599f14529afb60899a3e29b045529c44ad98d91618ec8": (
+        ("write_checkpoints",),
+        {
+            "cake_kda_tf32_8bd403eee9a4578a3f2a": {"write_checkpoints": 0},
+            "cake_kda_tf32_a6e1e706ef047611b36d": {"write_checkpoints": 1},
+        },
+    ),
+    "3d86251533a484c214da6dbd74f67a85119edf8c03d8c7ecad2cbef7f423a1b0": (
+        ("write_checkpoints",),
+        {
+            "cake_kda_tf32_116b3374286bc679aa2a": {"write_checkpoints": 0},
+            "cake_kda_tf32_1c5791474807c70f0769": {"write_checkpoints": 1},
+        },
+    ),
+    "83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad6a705": (
+        ("affine_map_only",),
+        {
+            "cake_kda_tf32_380f74127da276b25cf1": {"affine_map_only": 0},
+            "cake_kda_tf32_ff7bf41421e07fc5a457": {"affine_map_only": 1},
+        },
+    ),
+    "cf85be937c60c2f43b0cc374c2e4ac8e19bf9f973962d7224a0094d93786c258": (
+        ("value_rows",),
+        {
+            "cake_kda_tf32_656dad29691bf799ad49": {"value_rows": 64},
+            "cake_kda_tf32_9f57d4b208cc67725a80": {"value_rows": 128},
+        },
+    ),
+}
+_TF32_FOLD_OF = {
+    name: (body, knobs, values)
+    for body, (knobs, members) in _TF32_FOLDS.items()
+    for name, values in members.items()
+}
+
+
+def _module_record(name, directory, digest, arches, plan, tma_workspace_bytes):
     stem = f"cake_kda_{directory}_{digest}"
+    body = digest
+    defines = []
+    if name in _M128_FOLD_OF:
+        body, flags, enabled = _M128_FOLD_OF[name]
+        defines = [f"-DCAKE_KDA_KERNEL_SYMBOL=kernel_{stem}"]
+        defines += [f"-DCAKE_KDA_{flag}={int(flag in enabled)}" for flag in flags]
+    elif name in _TF32_FOLD_OF:
+        body, knobs, values = _TF32_FOLD_OF[name]
+        defines = [f"-DCAKE_KDA_KERNEL_SYMBOL=kernel_{stem}"]
+        defines += [f"-DCAKE_KDA_{knob.upper()}={values[knob]}" for knob in knobs]
     return {
         "arches": arches,
-        "sources": [
-            f"csrc/kda/{directory}/{stem}_kernel.cu",
-            f"csrc/kda/{directory}/{stem}_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
+        "sources": [f"csrc/kda/{directory}/cake_kda_{directory}_{body}_kernel.cu"],
+        "compile_flags": ["--use_fast_math", *defines],
         "ffi_entry": "run",
         "arg_plan": [list(slot) for slot in ARG_PLANS[plan]],
         "tma_workspace_bytes": tma_workspace_bytes,
@@ -950,7 +1288,7 @@ def _module_record(directory, digest, arches, plan, tma_workspace_bytes):
     }
 
 
-MODULES = {name: _module_record(*row) for name, row in _MODULE_ROWS.items()}
+MODULES = {name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()}
 
 # Factory specializations per schedule family. A row is
 # (positional args, kwarg-signature index, kwargs that differ from the family
@@ -1918,6 +2256,19 @@ def _source_path(relative):
     return Path(__file__).resolve().parents[2] / relative
 
 
+def render_binding(name):
+    """Render the tvm-ffi host binding of one module."""
+    directory, digest, _arches, plan, tma_workspace_bytes = _MODULE_ROWS[name]
+    return render_kda_prefill_binding(
+        name,
+        directory=directory,
+        digest=digest,
+        plan=plan,
+        arg_plan=ARG_PLANS[plan],
+        tma_workspace_bytes=tma_workspace_bytes,
+    )
+
+
 @cache
 def spec(name, arch):
     record = MODULES[name]
@@ -1927,12 +2278,19 @@ def spec(name, arch):
     if not include.is_dir():
         include = Path(__file__).resolve().parents[2] / "include"
     sources = [_source_path(path) for path in record["sources"]]
+    spec_name = f"{record['cache_name']}_{arch}"
+    binding = (
+        jit_env.FLASHINFER_GEN_SRC_DIR
+        / spec_name
+        / f"{record['cache_name']}_binding.cu"
+    )
+    write_if_different(binding, render_binding(name))
     return gen_jit_spec(
-        name=f"{record['cache_name']}_{arch}",
-        sources=sources,
+        name=spec_name,
+        sources=[*sources, binding],
         extra_cuda_cflags=[*_NVCC_FLAGS[arch], *record["compile_flags"]],
         extra_include_paths=[
-            sources[-1].parent,
+            sources[0].parent,
             _source_path(_SHIM_HEADER).parent,
             _source_path("csrc/tvm_ffi_utils.h").parent,
             include,

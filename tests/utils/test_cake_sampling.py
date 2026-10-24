@@ -1695,12 +1695,14 @@ def test_coarse_sample_build_matches_default_build():
 
 
 def test_spec_sample_build_matches_default_build():
-    """Every streaming variant ships a speculative-sample twin (`_sp`, launch_flags bit 6): its first register chunk
-    doubles as the sample (no separate sampled read), the exact passes and fallbacks are the same, and the slab /
-    samples / renorm are bitwise identical to the default build on adversarial rows for every k regime.  The bit is
-    rejected on register-resident variants and together with bits 3 / 4; the host sets it for every ept-16 stream and
-    for ept-32 streams at one chunk, two chunks on a cluster of 8, or at least 16 register chunks per CTA, and never
-    together with bit 4."""
+    """Every streaming variant whose launches can take the plain speculative sample ships a speculative-sample twin
+    (`_sp`, launch_flags bit 6): its first register chunk doubles as the sample (no separate sampled read), the exact
+    passes and fallbacks are the same, and the slab / samples / renorm are bitwise identical to the default build on
+    adversarial rows for every k regime.  The bit is rejected on register-resident variants and together with
+    bits 3 / 4; the host sets it for every ept-16 stream and for ept-32 streams at one chunk, two chunks on a cluster
+    of 8, or at least 16 register chunks per CTA, and never together with bit 4.  The (8, 16) stream takes the sample
+    only on the capabilities of `_SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES`, where every multi-CTA ept-16 launch takes the
+    leader-push form of the build (bit 9 precedence), so its plain `_sp` build is never launched and is not built."""
     _require_supported_device()
     import flashinfer.cake_sampling as cs
 
@@ -1719,8 +1721,16 @@ def test_spec_sample_build_matches_default_build():
         and not v["coarse_push"]
         and not v["leader_push"]
     }
-    streams = [(c, e) for (c, e, st) in defaults if st]
+    streams = [(c, e) for (c, e, st) in defaults if st and (c, e) != (8, 16)]
     assert [(v["cluster"], v["ept"]) for v in spec] == streams
+    # (8, 16) keeps the speculative sample through its leader-push forms (`_sp_lp` / `_sp_lp_l1`), so the policy
+    # (`_spec_sample_flag` asks `_stage1_has_spec_sample`) is unchanged; only the plain `_sp` build is not shipped
+    assert cs._stage1_has_spec_sample(8, 16, True)
+    assert not any(
+        (v["cluster"], v["ept"]) == (8, 16)
+        for v in man["stage1"]
+        if v["spec_sample"] and not v["leader_push"]
+    )
     assert all(
         v["stream"]
         and v["fused_tail"]
@@ -2166,8 +2176,8 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     man = load_manifest()
     kcap = int(man["fused_block_tail_kcap"])
     assert kcap == int(man["slab_entries"])
-    # The whole-CTA tail is a separate build (`_bt` twin) of every variant with the two-warp tail; the default
-    # build (taken by every launch without bit 3) never carries it.
+    # The whole-CTA tail is a separate build (`_bt` twin) of the variants the host can fuse it into (the cluster-8
+    # streams, `_fuse_block_tail`); the default build (taken by every launch without bit 3) never carries it.
     defaults = [
         v
         for v in man["stage1"]
@@ -2279,11 +2289,17 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     assert not cs._fuse_block_tail(4, 8, 16, True, 148, 64, False)
     assert not cs._fuse_block_tail(4, 8, 16, True, 148, kcap + 1, False)
     assert not cs._fuse_block_tail(4, 8, 16, True, 148, 1000, True)
-    # round 7 ships the `_bt` twin of every variant built with the two-warp tail (lever (b)); B200 and GB300 run it
-    # for the cluster-8 streams at k > 768, round 8 adds H100 (graph-replay A/B 0.93-0.99), the other capabilities
-    # keep the chain until their graph-replay A/B is recorded
+    # the `_bt` twin ships for the fused-tail variants the host can fuse: `_fuse_block_tail` takes bit 3 only for a
+    # stream of at least _BLOCK_TAIL_MIN_CLUSTER CTAs, so the resident and cluster < 8 twins were never launched and
+    # are not built.  B200 and GB300 run it for the cluster-8 streams at k > 768, round 8 adds H100 (graph-replay A/B
+    # 0.93-0.99), the other capabilities keep the chain until their graph-replay A/B is recorded
+    assert twins
     assert [(v["cluster"], v["ept"], bool(v["stream"])) for v in twins] == [
-        (v["cluster"], v["ept"], bool(v["stream"])) for v in defaults if v["fused_tail"]
+        (v["cluster"], v["ept"], bool(v["stream"]))
+        for v in defaults
+        if v["fused_tail"]
+        and v["stream"]
+        and v["cluster"] >= cs._BLOCK_TAIL_MIN_CLUSTER
     ]
     assert {
         cc: cs._block_tail_for_capability(cc)
@@ -2616,8 +2632,8 @@ def test_module_identity_is_sealed_over_its_inputs():
 
 
 def test_coarse_push_build_matches_default_build():
-    """Round 8, lever L-G(d): the streaming variants whose cluster runs the two-level select ship the pushed-coarse-sums
-    form of their default build (`_lg`, launch_flags bit 8 on a two-launch chain).  Each CTA stores its coarse histogram
+    """Round 8, lever L-G(d): the ept-32 streaming variant whose cluster runs the two-level select ships the
+    pushed-coarse-sums form of its default build (`_lg`, launch_flags bit 8 on a two-launch chain).  Each CTA stores its coarse histogram
     sums into every CTA's shared memory so the select reads them locally; slab, count, samples and renorm are bitwise
     identical to the default build on adversarial rows.  The host sets bit 8 only for chains on compute capability
     9.0 / 10.3; the module rejects it with a sample / tail flag, with bit 0, or on a register-resident variant."""
@@ -2661,8 +2677,9 @@ def test_coarse_push_build_matches_default_build():
         not cs._stage1_has_coarse_push(c, e, True) for c, e in plain - set(cells)
     )
     # policy: bit 8 on a chain without a sample build, only on 9.0 / 10.3 and only on the ept-32 build (round 8:
-    # the GB300 four-chunk ept-16 chains ran 1.4-5.6 % slower with it)
-    assert {e >= cs._COARSE_PUSH_MIN_EPT for _, e in cells} == {False, True}
+    # the GB300 four-chunk ept-16 chains ran 1.4-5.6 % slower with it), so only the ept-32 `_lg` build is shipped
+    assert {e >= cs._COARSE_PUSH_MIN_EPT for _, e in cells} == {True}
+    assert not cs._stage1_has_coarse_push(8, 16, True)
     for c, e in cells:
         expect = cs._FLAG_COARSE_PUSH if e >= cs._COARSE_PUSH_MIN_EPT else 0
         assert cs._coarse_push_flag(c, e, True, 0, (9, 0)) == expect
@@ -2771,8 +2788,8 @@ def test_coarse_push_build_matches_default_build():
 
 
 def test_slab_tail_build_matches_spec_build():
-    """Round 8, lever L-B: every streaming variant ships the slab-tail forms of its coarse- and speculative-sample builds
-    (`_cs_lb` / `_sp_lb`, launch_flags bit 7 with bit 0 and bit 4 / 6).  A fused launch's selected pairs are pushed into
+    """Round 8, lever L-B: the streaming variants whose fused sample launches can take bit 7 ship the slab-tail forms of
+    their coarse- and speculative-sample builds (`_cs_lb` / `_sp_lb`, launch_flags bit 7 with bit 0 and bit 4 / 6).  A fused launch's selected pairs are pushed into
     rank 0's shared-memory slab and the two-warp tail reads them there; the slab row, samples, renorm and count are
     bitwise identical to the plain sample build on adversarial rows.  The host sets bit 7 only for fused sample-build
     launches on compute capability 10.0 / 10.3; the module rejects it without bit 4 / 6 or without bit 0."""
@@ -2786,12 +2803,31 @@ def test_slab_tail_build_matches_spec_build():
         v["stream"] and v["fused_tail"] and not v["fused_block_tail"] for v in slab
     )
     assert all(v["coarse_sample"] != v["spec_sample"] for v in slab)
-    spec_plain = [
-        v
+    streams = [
+        (v["cluster"], v["ept"])
         for v in man["stage1"]
-        if v["spec_sample"] and not v["slab_tail"] and not v["leader_push"]
+        if v["stream"]
+        and not (
+            v["fused_block_tail"]
+            or v["coarse_sample"]
+            or v["spec_sample"]
+            or v["coarse_push"]
+            or v["leader_push"]
+        )
     ]
-    streams = [(v["cluster"], v["ept"]) for v in spec_plain]
+    # the slab-tail form is built only where a fused sample launch can take bit 7 (`_SLAB_TAIL_SPEC_CAPABILITIES`):
+    # there every ept-16 stream takes the speculative sample (no coarse-sample slab tail at ept 16), every multi-CTA
+    # ept-16 launch and every one-chunk ept-32 launch take the leader-push form instead (bit 9 precedence), and an
+    # ept-32 stream takes the speculative sample at one chunk, at two chunks on a cluster of 8 or at >= 16 chunks
+    # (above _SLAB_TAIL_MAX_CHUNKS), which leaves the cluster-1 and the cluster-8 speculative slab tails
+    slab_streams = {
+        "coarse_sample": [(c, e) for c, e in streams if e >= 32],
+        "spec_sample": [(1, 16), (1, 32), (8, 32)],
+    }
+    samples = (
+        ("spec_sample", cs._FLAG_SPEC_SAMPLE),
+        ("coarse_sample", cs._FLAG_COARSE_SAMPLE),
+    )
     for twin, suffix in (("spec_sample", "s_sp_lb"), ("coarse_sample", "s_cs_lb")):
         plain = [
             (v["cluster"], v["ept"])
@@ -2799,22 +2835,30 @@ def test_slab_tail_build_matches_spec_build():
             if v[twin] and not v["slab_tail"] and not v["leader_push"]
         ]
         with_slab = [v for v in man["stage1"] if v[twin] and v["slab_tail"]]
-        assert (
-            plain == streams
-            and [(v["cluster"], v["ept"]) for v in with_slab] == streams
-        )
+        assert set(plain) <= set(streams)
+        assert [(v["cluster"], v["ept"]) for v in with_slab] == slab_streams[twin]
         assert all(v["symbol"].endswith(suffix) for v in with_slab)
     assert all(
         not v["symbol"].endswith("_lb") for v in man["stage1"] if not v["slab_tail"]
     )
-    assert all(cs._stage1_has_slab_tail(c, e, True, False) for c, e in streams)
-    assert all(cs._stage1_has_slab_tail(c, e, True, True) for c, e in streams)
+    for c, e in streams:
+        assert cs._stage1_has_slab_tail(c, e, True, False) == (
+            (c, e) in slab_streams["spec_sample"]
+        )
+        assert cs._stage1_has_slab_tail(c, e, True, True) == (
+            (c, e) in slab_streams["coarse_sample"]
+        )
     # policy: bit 7 with either sample build, only on 10.0 / 10.3 and only for rows of at most
-    # _SLAB_TAIL_MAX_CHUNKS register chunks per CTA (round 8: the 8-16-chunk cluster-1 rows lost 1-2 % with it)
+    # _SLAB_TAIL_MAX_CHUNKS register chunks per CTA (round 8: the 8-16-chunk cluster-1 rows lost 1-2 % with it);
+    # a variant without the build never takes the bit
     for c, e in streams:
         short = cs._THREADS * e * c * cs._SLAB_TAIL_MAX_CHUNKS  # exactly the bound
         long = short + 1  # one more chunk
-        for sample in (cs._FLAG_SPEC_SAMPLE, cs._FLAG_COARSE_SAMPLE):
+        for twin, sample in samples:
+            if (c, e) not in slab_streams[twin]:
+                assert cs._slab_tail_flag(c, e, True, sample, 1, (10, 0)) == 0
+                assert cs._slab_tail_flag(c, e, True, sample, short, (10, 3)) == 0
+                continue
             assert (
                 cs._slab_tail_flag(c, e, True, sample, short, (10, 0))
                 == cs._FLAG_SLAB_TAIL
@@ -2854,10 +2898,11 @@ def test_slab_tail_build_matches_spec_build():
         )
         for c, e in streams:
             s1 = (c, e, True)
-            for (k, p), sample in itertools.product(
-                ((10, 0.9), (kcap, 0.5), (k_row, 1e-6), (1, 1.0)),
-                (cs._FLAG_SPEC_SAMPLE, cs._FLAG_COARSE_SAMPLE),
+            for (k, p), (twin, sample) in itertools.product(
+                ((10, 0.9), (kcap, 0.5), (k_row, 1e-6), (1, 1.0)), samples
             ):
+                if (c, e) not in slab_streams[twin]:
+                    continue
                 spec_f = _run(
                     probs,
                     k,
@@ -2902,7 +2947,7 @@ def test_slab_tail_build_matches_spec_build():
     vals, idxs, cnt = _ws(2)
     out2 = torch.empty(2, device="cuda", dtype=torch.int32)
     stream = torch.cuda.current_stream().cuda_stream
-    c0, e0 = streams[0]
+    c0, e0 = slab_streams["spec_sample"][0]
     for flags, c, e, st in (
         (cs._FLAG_FUSE_TAIL | cs._FLAG_SLAB_TAIL, c0, e0, 1),
         (cs._FLAG_SPEC_SAMPLE | cs._FLAG_SLAB_TAIL, c0, e0, 1),
@@ -3074,8 +3119,9 @@ def test_one_wave_c1_repick_policy():
 
 
 def test_leader_push_build_matches_pull_build():
-    """Round 9, lever L-P: every multi-CTA streaming variant ships the leader-push exchange form of its default, coarse-sample
-    and speculative-sample builds (`_lp` / `_cs_lp` / `_sp_lp`, launch_flags bit 9).  Every CTA stores its compacted candidate
+    """Round 9, lever L-P: the multi-CTA streaming variants whose launches can take the leader push ship the exchange form
+    of their builds (`_lp` / `_cs_lp` / `_sp_lp`, launch_flags bit 9): the plain default form on the ept-16 streams only, and
+    no form on the (2, 32) stream (see the manifest asserts below).  Every CTA stores its compacted candidate
     list into rank 0's receive buffer and its length into every CTA before the single exchange barrier; the fused slab,
     count, samples and renorm are bitwise identical to the pull form, and a chain's global slab holds the same exact candidate
     set (positions differ: concatenation order vs the per-CTA thread-major collect) with bitwise-identical stage-2/3 outputs.  The host sets bit 9 on compute capability 10.3 / 10.7 for any ept-16
@@ -3108,9 +3154,21 @@ def test_leader_push_build_matches_pull_build():
             if v["stream"] and v["cluster"] > 1
         }
     )
+    # the forms ship where a launch can take bit 9 (an ept-32 stream only on a one-chunk row): the plain `_lp` only on
+    # the ept-16 streams, because a one-chunk fused ept-32 launch always carries a sample build and the ranking never
+    # puts an ept-32 stream first on a one-chunk two-launch row; no form on the (2, 32) stream, which the ranking never
+    # picks on a one-chunk row at all
+    lead_default = [(c, e) for c, e in multi if e < cs._LEADER_PUSH_WIDE_EPT]
+    lead_sample = [(c, e) for c, e in multi if (c, e) != (2, 32)]
+    assert lead_default and lead_sample
     for c, e in multi:
-        for coarse, spec in ((False, False), (True, False), (False, True)):
-            assert cs._stage1_has_leader_push(c, e, True, coarse, spec)
+        assert cs._stage1_has_leader_push(c, e, True, False, False) == (
+            (c, e) in lead_default
+        )
+        for coarse, spec in ((True, False), (False, True)):
+            assert cs._stage1_has_leader_push(c, e, True, coarse, spec) == (
+                (c, e) in lead_sample
+            )
     for v in man["stage1"]:
         if not v["stream"] or v["cluster"] == 1:
             assert not cs._stage1_has_leader_push(
@@ -3218,6 +3276,21 @@ def test_leader_push_build_matches_pull_build():
             "165 KB streaming variants exceed this device's shared-memory opt-in"
         )
     module = load_cake_sampling_module()
+    # the pull form of a sample build is its plain `_cs` / `_sp` kernel; where that kernel is not shipped (the (8, 16)
+    # speculative sample: its launches always take the leader push) the default build is the reference, since the
+    # sample builds are bitwise identical to it (test_coarse_sample_build_matches_default_build,
+    # test_spec_sample_build_matches_default_build)
+    plain_sample = {
+        (
+            v["cluster"],
+            v["ept"],
+            cs._FLAG_COARSE_SAMPLE if v["coarse_sample"] else cs._FLAG_SPEC_SAMPLE,
+        )
+        for v in man["stage1"]
+        if v["stream"]
+        and (v["coarse_sample"] or v["spec_sample"])
+        and not (v["leader_push"] or v["slab_tail"])
+    }
     for vocab, batch in ((151937, 3), (262144, 2)):
         probs = _probs(batch, vocab)
         pn = probs.cpu().numpy()
@@ -3230,8 +3303,21 @@ def test_leader_push_build_matches_pull_build():
                 (50, cs._FLAG_FUSE_TAIL | cs._FLAG_SPEC_SAMPLE),
                 (1000, cs._FLAG_EARLY_TRIGGER),
             ):
+                shipped = (
+                    lead_sample
+                    if base_flags & (cs._FLAG_COARSE_SAMPLE | cs._FLAG_SPEC_SAMPLE)
+                    else lead_default
+                )
+                if (c, e) not in shipped:
+                    continue
+                sample = base_flags & (cs._FLAG_COARSE_SAMPLE | cs._FLAG_SPEC_SAMPLE)
+                pull_flags = (
+                    base_flags
+                    if not sample or (c, e, sample) in plain_sample
+                    else base_flags & ~sample
+                )
                 outs = []
-                for flags in (base_flags, base_flags | cs._FLAG_LEADER_PUSH):
+                for flags in (pull_flags, base_flags | cs._FLAG_LEADER_PUSH):
                     vals = torch.empty(batch, SLAB, device="cuda")
                     idxs = torch.empty(batch, SLAB, device="cuda", dtype=torch.int32)
                     cnt = torch.empty(batch, device="cuda", dtype=torch.int32)
@@ -3386,8 +3472,8 @@ def _assert_fused_outputs_bitwise(a, b, where):
 
 
 def test_local_select_build_matches_leader_push_build():
-    """Round 10, lever L1: every multi-CTA streaming variant ships the CTA-local select form of its leader-push coarse- and
-    speculative-sample builds (`_cs_lp_l1` / `_sp_lp_l1`, launch_flags bit 10 with bits 0, 9 and 4 / 6).  Each CTA picks
+    """Round 10, lever L1: every multi-CTA streaming variant with a leader-push sample build (all but (2, 32)) ships the
+    CTA-local select form of it (`_cs_lp_l1` / `_sp_lp_l1`, launch_flags bit 10 with bits 0, 9 and 4 / 6).  Each CTA picks
     its filter bucket from its own sample, so the cluster-wide coarse-histogram round disappears and the leader push is the
     only cluster round; slab, count, samples and renorm are bitwise identical to the cluster-wide select.  The host sets bit
     10 on a fused leader-push launch only for the smallest top-k (compute capability 10.3 up to 32, 10.0 up to 20); the
@@ -3422,9 +3508,13 @@ def test_local_select_build_matches_leader_push_build():
         }
     )
     assert multi
+    # no leader-push build on the (2, 32) stream (never ranked first on a one-chunk row), hence no local-select form
+    local_streams = [(c, e) for c, e in multi if (c, e) != (2, 32)]
+    assert local_streams
     for c, e in multi:
-        assert cs._stage1_has_local_select(c, e, True, True, False)
-        assert cs._stage1_has_local_select(c, e, True, False, True)
+        shipped = (c, e) in local_streams
+        assert cs._stage1_has_local_select(c, e, True, True, False) == shipped
+        assert cs._stage1_has_local_select(c, e, True, False, True) == shipped
         assert not cs._stage1_has_local_select(c, e, True, False, False)
     for v in man["stage1"]:
         if not v["stream"] or v["cluster"] == 1:
@@ -3648,7 +3738,7 @@ def test_local_select_build_matches_leader_push_build():
         pn[0, (np.arange(1500) * 11) % vocab] = np.float32(2**-12)
         pn[1, [3, 5000]] = np.inf
         probs.copy_(torch.tensor(pn, device="cuda"))
-        for c, e in multi:
+        for c, e in local_streams:
             for k, base_flags in (
                 (10, fused_cs),
                 (1, fused_sp),
@@ -3663,8 +3753,8 @@ def test_local_select_build_matches_leader_push_build():
 
 
 def test_int_tail_build_matches_block_tail_build():
-    """Round 10, lever L3-T: every streaming variant built with the whole-CTA tail ships its integer-tested form (`_bt_tia`,
-    launch_flags bit 11 with bit 3): the tail's f64 target product, cut tests and sample tests run as the stage-2/3 integer
+    """Round 10, lever L3-T: the (8, 16) stream, the only whole-CTA-tail build that compute capability 10.3 dispatches, ships
+    its integer-tested form (`_bt_tia`, launch_flags bit 11 with bit 3): the tail's f64 target product, cut tests and sample tests run as the stage-2/3 integer
     emulation.  Slab, count, samples and renorm are bitwise identical to the f64 tail; the host sets bit 11 on compute
     capability 10.3 only, and the module rejects it without bit 3 or on a register-resident variant."""
     _require_supported_device()
@@ -3697,15 +3787,19 @@ def test_int_tail_build_matches_block_tail_build():
             if v["stream"] and v["fused_block_tail"] and not v["int_tail"]
         }
     )
-    assert sorted({(v["cluster"], v["ept"]) for v in itail}) == block_streams
+    # 10.3 (the only int-tail capability) caps the whole-CTA tail at 196608 entries, and up to there the ranking puts the
+    # ept-16 stream first, so the (8, 32) `_bt` build is never dispatched with bit 11 and ships no `_bt_tia` form
+    itail_streams = sorted({(v["cluster"], v["ept"]) for v in itail})
+    assert block_streams == [(8, 16), (8, 32)] and itail_streams == [(8, 16)]
     for c, e in block_streams:
-        assert cs._stage1_has_int_tail(c, e, True)
+        assert cs._stage1_has_int_tail(c, e, True) == ((c, e) in itail_streams)
     for v in man["stage1"]:
         if not v["stream"]:
             assert not cs._stage1_has_int_tail(v["cluster"], v["ept"], False)
     # policy: whole-CTA-tail launches on compute capability 10.3 only
     assert frozenset({(10, 3)}) == cs._INT_TAIL_CAPABILITIES
-    for c, e in block_streams:
+    assert cs._int_tail_flag(8, 32, True, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3)) == 0
+    for c, e in itail_streams:
         assert (
             cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3))
             == cs._FLAG_INT_TAIL
@@ -3758,7 +3852,7 @@ def test_int_tail_build_matches_block_tail_build():
         pn[1, [3, 5000]] = np.inf
         pn[-1, : vocab // 2] = 0.0
         probs.copy_(torch.tensor(pn, device="cuda"))
-        for c, e in block_streams:
+        for c, e in itail_streams:
             for k, p in ((1000, 0.9), (200, 1e-6), (kcap, 1.0), (65, 0.5)):
                 a = _radix_topk_outputs(
                     module, probs, k, c, e, cs._FLAG_FUSE_BLOCK_TAIL, p=p

@@ -53,7 +53,7 @@ lists every logical kernel the plan rule can select per architecture (the
 GEMM tile / PDL census, the attention-form census over single segments up to
 70016 tokens and the exported rows, the merge kernels).  The export registers
 the programs its rows launch: the 22 rows of the evaluation contract (the
-acceptance denominator) plus six export-only *coverage* rows
+acceptance denominator) plus seven export-only *coverage* rows
 (`COVERAGE_ROW_GRIDS`; validated bitwise against the source tower, not part
 of the acceptance geomean) that reach the keys no contract row exercises
 (half-N twins at token counts outside the rows, the plain two-tile form on
@@ -65,9 +65,9 @@ binary.
 
 Programmatic dependent launch: the registered programs follow the Cake
 production PDL default (`KIMI_K3_VISION_TOWER_PDL`, on since the round-2
-route), so every binding launches its kernel with the
-programmatic-stream-serialization attribute (owned by the generated binding,
-not by this host code): the kernel
+route), so the shared launcher launches every kernel with the
+programmatic-stream-serialization attribute (owned by the generated launcher
+source, not by this host code): the kernel
 runs its mbarrier / TMEM prologue while the previous launch drains, waits on
 `griddepcontrol.wait` before touching a route buffer and signals
 `launch_dependents` before its epilogue. The host launch sequence is the same
@@ -133,13 +133,32 @@ allocation in `launch()`. Benchmark against the HF torch chain with the
 FlashInfer ragged BF16 attention route:
 `benchmarks/bench_cake_kimi_k3_vision_tower.py`.
 
-The generated sources under `csrc/cake_kimi_k3_vision_tower/` and the
-`MODULES` / `ARG_PLANS` / `KERNELS` registries in `cake_jit.py` are written by
-the Cake generated-program export; do not edit them by hand. One source pair
-is one program, built for every architecture it lists (`MODULES[name]["arches"]`)
-with FlashInfer's exact `sm100a` / `sm103a` flag set of the device it runs on;
-the attention kernels are separate programs per architecture (SM103 drains the
-scores with `tcgen05.ld.red`), and the plain one-tile / two-tile-split attention
-forms exist on SM103 only because the plan rule selects them there alone. On a
-device without a registered program the entry points raise
+The generated sources under `csrc/cake_kimi_k3_vision_tower/` are Cake exporter
+output; the five attention sources described below and the shared host
+launcher are hand-folded pending exporter support. The export writes one
+kernel source and one host binding per program; the 76 bindings are one
+launcher, `cake_kimi_k3_vision_tower_launcher.cu`, plus the parameterised
+TMA-descriptor encoder `cake_kimi_k3_vision_tower_tma_encode.cuh`, whose text
+is selected by per-program compile definitions (kernel symbol, host-shim
+namespace, argument plan, dynamic shared memory, block and cluster extents,
+`B` TMA box, position-table map). `cake_jit.py` registers the programs in a
+form that is also hand-folded pending exporter support: one `_PROGRAMS` row
+per program (architectures, compile flags, argument plan), one `_LAUNCH` row
+per program (the launch values above; `launch_definitions(name)` composes the
+definitions), the five `ARG_PLANS`, and the `KERNELS` table both architectures
+share plus the per-architecture entries (4 SM103-only keys), expanded into
+`MODULES` / `KERNELS` at import. A program's JIT library is named after a
+content hash of its sources, architecture and compile flags (the launch
+definitions included), so this registry form rebuilds every program once and
+an edited source or launch value never reuses a cached library. One kernel
+source plus the shared launcher is one program, built for every architecture
+it lists (`MODULES[name]["arches"]`) with FlashInfer's exact `sm100a` /
+`sm103a` flag set of the device it runs on.
+The five attention forms both architectures share (`ring3`, `ring3:split`,
+`ring3:wide`, `tiles2`, `tiles2:wide`) are one source each with compile-time
+architecture arms (`#if __CUDA_ARCH__ == 1000`: SM100 text first, then the
+SM103 text, which drains the scores with `tcgen05.ld.red`), so their SM100
+build carries the SM103 kernel symbol; the plain one-tile / two-tile-split
+attention forms exist on SM103 only because the plan rule selects them there
+alone. On a device without a registered program the entry points raise
 `NotImplementedError`.

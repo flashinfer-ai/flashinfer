@@ -61,11 +61,28 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   the portable cluster size; the generated program sets the non-portable
   cluster-size attribute on that kernel before launching it, and preparation
   requires the driver to admit at least one such cluster on the device.
-- One source per kernel serves both architectures (architecture-specific
-  lines sit behind `__CUDA_ARCH__` guards) and both route block alignments
-  (`-DBLOCK_M=8` / `-DBLOCK_M=16` on the compile line); the registry in
-  `cake_jit.py` lists each program once and maps the per-architecture
-  dispatch keys to it.
+- Every kernel source serves both architectures (the architecture-specific
+  lines of the L, LP and M arms sit behind `__CUDA_ARCH__` guards) and both
+  route block alignments (`-DBLOCK_M=8` / `-DBLOCK_M=16` on the compile
+  line). The registry in `cake_jit.py` lists each program (a kernel source
+  with its launcher) once and maps the per-architecture dispatch keys to
+  it; the L, LP and M arms keep one program per architecture, and the two
+  programs of such an arm compile the same kernel source, the SM103
+  program selecting its own kernel symbol through the `CAKE_PROGRAM_KERNEL`
+  compile definition.
+- The four- and eight-token cluster kernels are one kernel source: the
+  eight-token program compiles it with the compile definitions `ROWS=8` (the
+  cluster size) and `CAKE_PROGRAM_KERNEL=<its kernel symbol>`; without them
+  the source is the four-token kernel. Each of the two programs keeps its own
+  registry record and kernel symbol (the record's `compile_flags` carries the
+  definitions).
+- Programs of one launcher shape share one host launcher source: the seven
+  cooperative plan-builder programs (arms L, LP, M and GW), the two-, four- and
+  eight-token cluster programs and the Q4S / Q4SP pair. A shared launcher names
+  its kernel `CAKE_PROGRAM_KERNEL`, its host-shim namespace `CAKE_PROGRAM_SHIM`
+  and the launch value its programs differ in (the dynamic shared memory
+  `CAKE_BINDING_SMEM` or the cluster size `CAKE_BINDING_CLUSTER`) and does not
+  build without them; each record's `compile_flags` carries its values.
 - Nothing is planned on the host and nothing is allocated at launch: a
   prepared runner (or a CUDA Graph capturing it) replays for new `logits` /
   `bias` values written into the same buffers.

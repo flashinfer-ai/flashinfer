@@ -215,17 +215,24 @@ class MiniMaxH3Nvfp4PreAttention:
     All outputs, intermediate tensors, and workspaces are supplied by the
     caller. Preparation resolves the exact SM100a or SM103a route: a norm +
     AdaLN + NVFP4 quantization stage followed by one fused tcgen05 NVFP4 QKV
-    GEMM whose epilogue applies the Q/K RMSNorm, RoPE and destination-major
-    NVFP4 packing; no BF16 QKV projection is materialized. :meth:`run`
-    performs no tensor allocation and can be captured by a CUDA Graph after
-    preparation.
+    GEMM whose epilogue applies the Q/K RMSNorm, RoPE and the destination-major
+    output; no BF16 QKV projection is materialized. :meth:`run` performs no
+    tensor allocation and can be captured by a CUDA Graph after preparation.
+
+    ``out_format`` selects the output: ``"nvfp4"`` (the default) packs E2M1
+    nibble pairs ``uint8 [P, M, 56 / P, 3, 64]`` with swizzled-128x4 E4M3
+    block-16 scales ``out_sf`` under the static ``out_global_scale``;
+    ``"e4m3"`` writes ``float8_e4m3fn [P, M, 56 / P, 3, 128]`` with one
+    per-tensor scale per kind from ``qkv_scales`` (float32 ``[3]``:
+    ``out_q = e4m3(value / qkv_scales[kind])``, round to nearest even,
+    saturating at +-448) and no scale tile (``out_sf`` is ``None``).
 
     The tensors passed to :meth:`run` must be the same objects supplied here.
     Their contents may be updated between launches, including on independent
     CUDA streams. The GEMM ``alpha`` operand (from ``x_global_scale`` and
-    ``w_global_scale``) and the CTA-pair ordering of ``qkv_weight_sf`` are
-    derived once at preparation; changing those values afterwards requires a
-    new instance.
+    ``w_global_scale``), the CTA-pair ordering of ``qkv_weight_sf`` and the
+    e4m3 out scales (from ``qkv_scales``) are derived once at preparation;
+    changing those values afterwards requires a new instance.
     """
 
     def __init__(
@@ -243,12 +250,14 @@ class MiniMaxH3Nvfp4PreAttention:
         q_norm_weight: torch.Tensor,
         k_norm_weight: torch.Tensor,
         rope_cos_sin: torch.Tensor,
-        out_global_scale: torch.Tensor,
         out_q: torch.Tensor,
-        out_sf: torch.Tensor,
         activation_q: torch.Tensor,
         activation_sf: torch.Tensor,
         P: int,
+        out_format: str = "nvfp4",
+        out_global_scale: Optional[torch.Tensor] = None,
+        out_sf: Optional[torch.Tensor] = None,
+        qkv_scales: Optional[torch.Tensor] = None,
         norm_descriptor_workspace: Optional[torch.Tensor] = None,
         gemm_descriptor_workspace: Optional[torch.Tensor] = None,
         debug_q_bf16: Optional[torch.Tensor] = None,
@@ -277,12 +286,14 @@ class MiniMaxH3Nvfp4PreAttention:
             "k_norm_weight": k_norm_weight,
             "rope_cos_sin": rope_cos_sin,
             "out_global_scale": out_global_scale,
+            "qkv_scales": qkv_scales,
             "out_q": out_q,
             "out_sf": out_sf,
             "debug_q_bf16": debug_q_bf16,
             "debug_k_bf16": debug_k_bf16,
             "debug_adaln_bf16": debug_adaln_bf16,
         }
+        self.out_format = out_format
         self._prepared = prepare_minimax_h3_nvfp4_pre_attention(
             x=x,
             x_norm_weight=x_norm_weight,
@@ -296,12 +307,14 @@ class MiniMaxH3Nvfp4PreAttention:
             q_norm_weight=q_norm_weight,
             k_norm_weight=k_norm_weight,
             rope_cos_sin=rope_cos_sin,
-            out_global_scale=out_global_scale,
             out_q=out_q,
-            out_sf=out_sf,
             activation_q=activation_q,
             activation_sf=activation_sf,
             P=P,
+            out_format=out_format,
+            out_global_scale=out_global_scale,
+            out_sf=out_sf,
+            qkv_scales=qkv_scales,
             norm_descriptor_workspace=norm_descriptor_workspace,
             gemm_descriptor_workspace=gemm_descriptor_workspace,
             debug_q_bf16=debug_q_bf16,
@@ -326,13 +339,14 @@ class MiniMaxH3Nvfp4PreAttention:
         q_norm_weight: torch.Tensor,
         k_norm_weight: torch.Tensor,
         rope_cos_sin: torch.Tensor,
-        out_global_scale: torch.Tensor,
         out_q: torch.Tensor,
-        out_sf: torch.Tensor,
+        out_global_scale: Optional[torch.Tensor] = None,
+        out_sf: Optional[torch.Tensor] = None,
+        qkv_scales: Optional[torch.Tensor] = None,
         debug_q_bf16: Optional[torch.Tensor] = None,
         debug_k_bf16: Optional[torch.Tensor] = None,
         debug_adaln_bf16: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the prepared pipeline into the caller-owned output tensors.
 
         Parameters
@@ -359,15 +373,22 @@ class MiniMaxH3Nvfp4PreAttention:
             BF16 Q and K RMSNorm weights with shape ``[128]``.
         rope_cos_sin : torch.Tensor
             BF16 split-half NeoX RoPE values with shape ``[M, 96]``.
-        out_global_scale : torch.Tensor
-            Float32 NVFP4 global encode scale shared by the Q/K/V outputs,
-            shape ``[1]``.
         out_q : torch.Tensor
-            Caller-owned E2M1 nibble-pair uint8 output with shape
-            ``[P, M, 56 / P, 3, 64]``.
-        out_sf : torch.Tensor
+            Caller-owned destination-major output: E2M1 nibble-pair uint8 with
+            shape ``[P, M, 56 / P, 3, 64]`` for ``out_format="nvfp4"``,
+            ``float8_e4m3fn`` with shape ``[P, M, 56 / P, 3, 128]`` for
+            ``out_format="e4m3"``.
+        out_global_scale : torch.Tensor, optional
+            Float32 NVFP4 global encode scale shared by the Q/K/V outputs,
+            shape ``[1]``; required for ``"nvfp4"``, ``None`` for ``"e4m3"``.
+        out_sf : torch.Tensor, optional
             Caller-owned swizzled-128x4 E4M3 uint8 output scales with shape
-            ``[P, round_up(M * (56 / P) * 3, 128) * 8]``.
+            ``[P, round_up(M * (56 / P) * 3, 128) * 8]``; required for
+            ``"nvfp4"``, ``None`` for ``"e4m3"``.
+        qkv_scales : torch.Tensor, optional
+            Float32 per-tensor scales of Q, K and V with shape ``[3]`` (every
+            entry positive and finite): ``out_q = e4m3(value / qkv_scales
+            [kind])``; required for ``"e4m3"``, ``None`` for ``"nvfp4"``.
         debug_q_bf16, debug_k_bf16, debug_adaln_bf16 : torch.Tensor, optional
             Optional caller-owned BF16 debug outputs: the post-RoPE Q and K
             values with shape ``[M, 56, 128]`` and the exact stage-1 AdaLN
@@ -375,8 +396,9 @@ class MiniMaxH3Nvfp4PreAttention:
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor]
-            The same ``(out_q, out_sf)`` objects supplied by the caller.
+        tuple[torch.Tensor, Optional[torch.Tensor]]
+            The same ``(out_q, out_sf)`` objects supplied by the caller
+            (``out_sf`` is ``None`` for ``out_format="e4m3"``).
 
         Notes
         -----
@@ -398,6 +420,7 @@ class MiniMaxH3Nvfp4PreAttention:
             "k_norm_weight": k_norm_weight,
             "rope_cos_sin": rope_cos_sin,
             "out_global_scale": out_global_scale,
+            "qkv_scales": qkv_scales,
             "out_q": out_q,
             "out_sf": out_sf,
             "debug_q_bf16": debug_q_bf16,

@@ -31,10 +31,12 @@ largest padded row count seen; ``prepare_all_gather_matmul`` sizes it once
 for ``max_rows`` and the returned launcher then serves every ``M`` up to that
 capacity without another collective. Calls with at most 512 padded local
 rows at world sizes 4 and 8 whose ``N`` is within the route's width ceiling
-(``loader.sm_push_max_cols``: 10240 at 128 padded rows, 4096 at 512) replace
-the copy-engine pushes with one SM push kernel chained to the main kernel
-through programmatic dependent launch; wider GEMMs overlap the copy-engine
-pushes instead.
+(``loader.sm_push_max_cols``: 10240 at 128 padded rows, 4096 at 512), and the
+calls in the device architecture's SM push bands
+(``loader.SM_PUSH_BANDS_BY_ARCH``: on ``sm_103a`` the eight-rank calls of
+exactly 1024 padded rows with ``N <= 1619``), replace the copy-engine pushes
+with one SM push kernel chained to the main kernel through programmatic
+dependent launch; wider GEMMs overlap the copy-engine pushes instead.
 Every symmetric rendezvous is checked against the tensor it was returned
 for: torch's NVSHMEM allocator before pytorch#192579 hands a new allocation
 at a freed address the freed buffer's cached handle, and the backend
@@ -130,13 +132,21 @@ class _Workspace:
     rank: int
     world_size: int
     device_index: int
+    # Exported architecture of the device (``loader.device_facts``): the readiness
+    # pad view and the SM push ticket counters are sized by the words per rank row
+    # the architecture's readiness slice table needs at this pitch
+    # (``loader.push_signal_slots``).
+    arch: str
     pitch: int = 0
     scratch: Optional[torch.Tensor] = None
     scratch_handle: Any = None
     comm_stream: Optional[torch.cuda.Stream] = None
-    # Flat per-rank readiness pad: ``world_size * max_chunks`` uint32 words.
+    # Flat per-rank readiness pad: ``world_size * signal_slots`` uint32 words.
     signal_pad: Optional[torch.Tensor] = None
     max_chunks: int = 0
+    # Readiness words per rank row of this generation (``max_chunks`` without a
+    # readiness slice row at or under the pitch).
+    signal_slots: int = 0
     # Rank slices of every peer's scratch in push order (cached remote views)
     # and the same addresses as the sequence's peer table.
     peer_scratch: tuple[torch.Tensor, ...] = ()
@@ -180,8 +190,11 @@ class _Workspace:
                     dtype=torch.int64,
                     device=self.device_index,
                 ),
+                # One self-resetting ticket per (peer, chunk) -- per (peer, chunk, slice) on a readiness
+                # slice row of the device's architecture: as many per peer as the readiness pad holds
+                # words per rank row at this pitch (``signal_slots``).
                 torch.zeros(
-                    (self.world_size - 1) * self.max_chunks,
+                    (self.world_size - 1) * self.signal_slots,
                     dtype=torch.uint32,
                     device=self.device_index,
                 ),
@@ -460,10 +473,23 @@ def _clear_allocation(
     if what == "barrier flag":
         tensor.zero_()
     else:
-        max_chunks = loader.chunk_plan(pitch)[2]
         handle.get_signal_pad(
-            call.rank, (call.world_size * max_chunks,), torch.uint32, 0
+            call.rank,
+            (_readiness_words(call.world_size, pitch, call.arch),),
+            torch.uint32,
+            0,
         ).zero_()
+
+
+def _readiness_words(world_size: int, pitch: int, arch: str) -> int:
+    """Words of a rank's readiness pad a workspace of ``pitch`` rows per peer addresses: one per
+    (rank, chunk), or per (rank, chunk, slice) at the readiness slice rows of the world size on
+    ``arch`` the pitch can serve -- ``world_size`` times the largest words-per-rank-row count any
+    call up to the pitch publishes (``loader.push_signal_slots``)."""
+
+    return world_size * loader.push_signal_slots(
+        pitch, world_size=world_size, arch=arch
+    )
 
 
 def _publish_flags(
@@ -491,6 +517,7 @@ def _workspace(call: _Call, group: dist.ProcessGroup, dtype: torch.dtype) -> _Wo
                 rank=call.rank,
                 world_size=call.world_size,
                 device_index=call.device_index,
+                arch=call.arch,
             )
             _WORKSPACES[key] = workspace
     if workspace.rank != call.rank or workspace.world_size != call.world_size:
@@ -512,9 +539,19 @@ def _publish_scratch(
 
     had_push_tables = workspace.push_buffers is not None
     max_chunks = loader.chunk_plan(pitch)[2]
-    signal_pad = handle.get_signal_pad(
-        call.rank, (call.world_size * max_chunks,), torch.uint32, 0
+    signal_slots = loader.push_signal_slots(
+        pitch, world_size=call.world_size, arch=call.arch
     )
+    readiness_words = call.world_size * signal_slots
+    # A readiness slice row at or under the pitch widens every rank row past the one-word
+    # chunk count: the pad must hold the widened view (an error, never a narrower view).
+    if signal_slots > max_chunks and readiness_words * 4 > int(handle.signal_pad_size):
+        raise RuntimeError(
+            f"the symmetric-memory signal pad ({int(handle.signal_pad_size)} bytes) cannot hold "
+            f"{readiness_words} readiness words ({call.world_size} ranks x {signal_slots} words per "
+            f"rank row, the readiness slice rows at or under {pitch} rows per peer included)"
+        )
+    signal_pad = handle.get_signal_pad(call.rank, (readiness_words,), torch.uint32, 0)
     peers = _peer_order(call.rank, call.world_size)
     peer_scratch = tuple(
         handle.get_remote_tensor(peer, scratch.shape, scratch.dtype)[call.rank]
@@ -536,6 +573,7 @@ def _publish_scratch(
     workspace.scratch_handle = handle
     workspace.signal_pad = signal_pad
     workspace.max_chunks = max_chunks
+    workspace.signal_slots = signal_slots
     workspace.peer_scratch = peer_scratch
     workspace.peer_scratch_ptrs = tvm_ffi.Shape(
         tuple(int(view.data_ptr()) for view in peer_scratch)
@@ -648,10 +686,12 @@ def _prepare_session(
                 call.arch,
             )
         # The SM push route's device tables are resolved now (when any row
-        # count of this group and width can take that route: the ceiling is
-        # widest at 128 padded rows) so a captured call allocates nothing.
-        sm_push = loader.uses_sm_push(
-            rows=loader.BLOCK_M, world_size=call.world_size, cols=call.n
+        # count of this group and width can take that route on this device's
+        # architecture: the base rule at its widest ceiling, 128 padded rows,
+        # or one of the architecture's bands) so a captured call allocates
+        # nothing.
+        sm_push = loader.sm_push_reachable(
+            world_size=call.world_size, cols=call.n, arch=call.arch
         )
         if (
             sm_push
@@ -752,6 +792,7 @@ def _launch(
             rows=rows,
             world_size=call.world_size,
             cols=call.n,
+            arch=call.arch,
         )
         if capturing and sm_push and workspace.push_buffers is None:
             # A caller error, not a failed collective: nothing was submitted.
@@ -759,6 +800,17 @@ def _launch(
                 "Cake all-gather matmul SM push tables are not materialized; "
                 "prepare the launcher eagerly before CUDA-graph capture"
             )
+        # Readiness words per (peer, chunk) of this call's SM push (the loader's
+        # table row of exactly this world size and padded row count on the
+        # device's architecture; 1 off the table and on the copy-engine route):
+        # the host sequence launches the per-K-slice twins itself -- the push twin
+        # of the call's launch and the main twin of its width and form -- and the
+        # clear below covers that many words.
+        push_kslices = (
+            loader.push_kslices(m_pad, world_size=call.world_size, arch=call.arch)
+            if sm_push
+            else 1
+        )
         if capturing:
             # The graph bakes this generation's addresses on every rank; the
             # workspace must not grow from now on (see _prepare_session).
@@ -794,12 +846,27 @@ def _launch(
                 dtype_name=call.dtype_name,
                 b_layout=call.b_layout,
             )
+            # Form of the main program for this call ("cg1", "cg2", or a spill-wave
+            # N-split pair form when the loader's point table names this class and
+            # shape); every pair form launches clusters of two CTAs on an even
+            # grid, and the host sequence takes the form as a positional code.
+            form = loader.main_form(
+                rows,
+                call.n,
+                world_size=world_size,
+                arch=call.arch,
+                dtype_name=call.dtype_name,
+                b_layout=call.b_layout,
+                block_n=block_n,
+            )
+            form_code = loader.main_form_code(form)
             grid_x, grid_y, grid_z = loader.main_grid(
                 rows,
                 call.n,
                 world_size=world_size,
                 sm_count=facts.sm_count,
                 block_n=block_n,
+                form=form,
             )
             if sm_push:
                 # The SM push kernel and the main kernel run on the caller's
@@ -824,6 +891,7 @@ def _launch(
                     grid_y,
                     grid_z,
                     block_n,
+                    form_code,
                     main_handle,
                     workspace.comm_handle,
                 )
@@ -853,11 +921,14 @@ def _launch(
                     grid_y,
                     grid_z,
                     block_n,
+                    form_code,
                     main_handle,
                     workspace.comm_handle,
                 )
             if capturing:
-                _clear_readiness(workspace, world_size * loader.chunk_plan(rows)[2])
+                _clear_readiness(
+                    workspace, world_size * loader.chunk_plan(rows)[2] * push_kslices
+                )
             state.next_phase = 1 - phase
             if not capturing:
                 _remember_tail(state, main_handle, call.device_index)

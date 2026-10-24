@@ -7,7 +7,6 @@ import torch
 
 from flashinfer.moe_ep import tune
 
-
 _GEOMETRY = [
     "--hidden",
     "7168",
@@ -77,9 +76,14 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
         ["--arch", "sm100", "--dtype", "bf16", "--no-do-finalize"],
-        ["--arch", "sm107", "--no-apply-topk-in-fc1"],
+        ["--arch", "sm107", "--no-apply-routing-weights-before-fc2"],
         ["--arch", "sm100", "--no-do-finalize", "--allow-nondeterministic"],
-        ["--arch", "sm100", "--no-apply-topk-in-fc1", "--allow-nondeterministic"],
+        [
+            "--arch",
+            "sm100",
+            "--no-apply-routing-weights-before-fc2",
+            "--allow-nondeterministic",
+        ],
         ["--arch", "sm100", "--no-do-finalize", "--combine-dtype", "nvfp4"],
     ],
 )
@@ -89,12 +93,24 @@ def test_unsupported_tuner_options_fail_before_import(options, dispatched, capsy
     assert capsys.readouterr().err
 
 
+def test_v1_cache_option_is_rejected(dispatched, capsys):
+    with pytest.raises(SystemExit) as exc:
+        tune.main([*_GEOMETRY, "--autotune-cache", "cache.json"])
+    assert exc.value.code == 2
+    assert not dispatched
+    assert "unrecognized arguments: --autotune-cache" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "options,do_finalize",
     [([], True), (["--do-finalize"], True), (["--no-do-finalize"], False)],
 )
+@pytest.mark.parametrize(
+    "routing_option",
+    ["--no-apply-routing-weights-before-fc2", "--no-apply-topk-in-fc1"],
+)
 def test_finalization_and_routing_options_reach_nvfp4_tuner(
-    monkeypatch, options, do_finalize
+    monkeypatch, options, do_finalize, routing_option
 ):
     received = []
     monkeypatch.setattr(
@@ -108,12 +124,12 @@ def test_finalization_and_routing_options_reach_nvfp4_tuner(
             "--arch",
             "sm100",
             *options,
-            "--no-apply-topk-in-fc1",
+            routing_option,
         ]
     )
     (args,) = received
     assert args.do_finalize == do_finalize
-    assert not args.apply_topk_in_fc1
+    assert not args.apply_routing_weights_before_fc2
 
 
 def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):

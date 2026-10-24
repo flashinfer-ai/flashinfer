@@ -31,7 +31,11 @@ gated_residual_rmsnorm_h8192.json
 gated_residual_next_rmsnorm_h8192.json
 gated_residual_next_rmsnorm_scalar_alpha_h8192.json
 fused_add_rmsnorm_quant_h7168.json
+fmha_v2_prefill_deepseek_h96_d128.json
+fmha_v2_prefill_deepseek_h20_d256.json
 fmha_v2_prefill_sm120_h4_d128.json
+fmha_v2_prefill_sm120_h96_d128.json
+fmha_v2_prefill_sm120_h20_d256.json
 gdn_decode_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
@@ -125,6 +129,7 @@ rmsnorm_h7168.json
 rmsnorm_sigmoid_gate_nh32_h64.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
+silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -136,6 +141,7 @@ top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
 trtllm_bf16_routed_moe_topk2_e8_h1024.json
 trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3.json
+trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3_r4o61.json
 trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
 trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
@@ -204,10 +210,12 @@ from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
+    fmha_v2_prefill_deepseek,
     fmha_v2_prefill_sm120,
 )
 from flashinfer.utils import is_sm100a_supported
 from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
+from tests.utils_fp8 import to_float8
 
 # Public MoELayer pack schemas, including all four Frost quantization formats.
 generate_moe_layer_traces(SAVE_DIR)
@@ -505,6 +513,7 @@ from flashinfer.quantization.fp4_quantization import (
 from flashinfer.quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 
 quant_M, quant_K = 128, 4096
@@ -605,6 +614,12 @@ with contextlib.suppress(Exception):
     grouped_a = torch.randn(2, 256, quant_K, dtype=torch.bfloat16, device=device)
     grouped_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
     mxfp8_grouped_quantize(grouped_a, grouped_mask)
+
+# Fused SiLU + mul + masked MXFP8 (SM100+): [B, M, 2K] -> masked grouped GEMM layout.
+with contextlib.suppress(Exception):
+    experts_a = torch.randn(2, 256, 2 * quant_K, dtype=torch.bfloat16, device=device)
+    experts_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
+    silu_and_mul_mxfp8_experts_quantize(experts_a, experts_mask)
 
 # ── Single-request attention (non-batched) ───────────────────────────────────
 sa_Hq, sa_Hk, sa_D, sa_KV = 32, 8, 128, 256
@@ -2073,6 +2088,19 @@ flashinfer.prims_ts_fp4_block_scale_routed_moe.fi_trace(
     topk_ids=_pts_moe_packed_topk,
     **_pts_moe_fp4_common,
 )
+from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: E402
+    NVFP44Over6Config,
+)
+
+# An explicit 4over6 recipe adds the derived nvfp4_4over6 axis (r4o6 + wire
+# code, 1 for the default recipe); the definitions above leave it unset and so
+# carry no such axis.
+flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe.fi_trace(
+    topk_ids=_pts_moe_packed_topk,
+    per_token_scale=torch.ones(_pts_moe_T, dtype=torch.float32, device=device),
+    nvfp4_4over6=NVFP44Over6Config(),
+    **_pts_moe_fp4_common,
+)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 files = sorted(SAVE_DIR.glob("*.json"))
@@ -2840,7 +2868,7 @@ with contextlib.suppress(Exception):
     )
 
 # ── SM120 FP8 self-attention with separate Q/K/V ─────────────────────────────
-if torch.cuda.get_device_capability() == (12, 0):
+if torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
     _fmha_B, _fmha_S, _fmha_H, _fmha_D = 1, 128, 4, 128
     _fmha_shape = (_fmha_B, _fmha_S, _fmha_H, _fmha_D)
     _fmha_q = torch.randn(_fmha_shape, dtype=torch.bfloat16, device=device)
@@ -2875,6 +2903,71 @@ if torch.cuda.get_device_capability() == (12, 0):
         scale_bmm1_d=_fmha_scale_bmm1_d,
         scale_bmm2_d=_fmha_scale_bmm2_d,
         causal=True,
+    )
+
+    # GLM-4.7 has 96 query heads and 8 KV heads, each with head dimension 128.
+    _glm47_q, _glm47_q_scale = to_float8(
+        torch.randn((1, 128, 96, 128), dtype=torch.bfloat16, device=device)
+    )
+    _glm47_k, _glm47_k_scale = to_float8(
+        torch.randn((1, 128, 8, 128), dtype=torch.bfloat16, device=device)
+    )
+    _glm47_v, _glm47_v_scale = to_float8(
+        torch.randn((1, 128, 8, 128), dtype=torch.bfloat16, device=device)
+    )
+    _glm47_bmm1_scale = (_glm47_q_scale * _glm47_k_scale).item() / (128**0.5)
+    _glm47_bmm2_scale = _glm47_v_scale.item()
+    fmha_v2_prefill_deepseek(
+        _glm47_q,
+        _glm47_k,
+        _glm47_v,
+        torch.empty((1, 128, 96, 128), dtype=torch.bfloat16, device=device),
+        num_heads=96,
+        head_dim=128,
+        seq_len=128,
+        scale_softmax=1.0,
+        scale_bmm1=_glm47_bmm1_scale,
+        scale_bmm2=_glm47_bmm2_scale,
+        scale_bmm1_d=torch.tensor(
+            [_glm47_bmm1_scale], dtype=torch.float32, device=device
+        ),
+        scale_bmm2_d=torch.tensor(
+            [_glm47_bmm2_scale], dtype=torch.float32, device=device
+        ),
+    )
+
+    # MLA context uses expanded per-head Q/K/V, not the compressed latent cache.
+    _glm47_flash_shape = (1, 128, 20, 256)
+    _glm47_flash_q, _glm47_flash_q_scale = to_float8(
+        torch.randn(_glm47_flash_shape, dtype=torch.bfloat16, device=device)
+    )
+    _glm47_flash_k, _glm47_flash_k_scale = to_float8(
+        torch.randn(_glm47_flash_shape, dtype=torch.bfloat16, device=device)
+    )
+    _glm47_flash_v, _glm47_flash_v_scale = to_float8(
+        torch.randn(_glm47_flash_shape, dtype=torch.bfloat16, device=device)
+    )
+    _glm47_flash_bmm1_scale = (_glm47_flash_q_scale * _glm47_flash_k_scale).item() / (
+        256**0.5
+    )
+    _glm47_flash_bmm2_scale = _glm47_flash_v_scale.item()
+    fmha_v2_prefill_deepseek(
+        _glm47_flash_q,
+        _glm47_flash_k,
+        _glm47_flash_v,
+        torch.empty(_glm47_flash_shape, dtype=torch.bfloat16, device=device),
+        num_heads=20,
+        head_dim=256,
+        seq_len=128,
+        scale_softmax=1.0,
+        scale_bmm1=_glm47_flash_bmm1_scale,
+        scale_bmm2=_glm47_flash_bmm2_scale,
+        scale_bmm1_d=torch.tensor(
+            [_glm47_flash_bmm1_scale], dtype=torch.float32, device=device
+        ),
+        scale_bmm2_d=torch.tensor(
+            [_glm47_flash_bmm2_scale], dtype=torch.float32, device=device
+        ),
     )
 
 # ── Minimax Sparse Attention (MSA) numeric ops (SM120/SM121) ─────────────────

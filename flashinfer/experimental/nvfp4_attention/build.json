@@ -1,0 +1,81 @@
+{
+  "arch_flags": {
+    "sm_103a": [
+      "-gencode=arch=compute_103a,code=sm_103a"
+    ]
+  },
+  "common": {
+    "include_dirs": [
+      "csrc"
+    ],
+    "link": {
+      "cudart": "shared",
+      "host_linker": "c++",
+      "tvm_ffi_symbols": "resolved at load; do not pass --no-undefined"
+    },
+    "link_flags": [
+      "-shared",
+      "-lcudart",
+      "-lcuda"
+    ],
+    "nvcc_flags": [
+      "-std=c++17",
+      "-O3",
+      "-DNDEBUG",
+      "--compiler-options=-fPIC",
+      "--expt-relaxed-constexpr",
+      "-Xfatbin=-compress-all",
+      "--compress-mode=size"
+    ],
+    "nvcc_flags_if": [
+      {
+        "cuda": ">=12.8",
+        "flags": [
+          "-static-global-template-stub=false"
+        ]
+      }
+    ],
+    "requires": {
+      "cuda_toolkit": {
+        "min": "12.9"
+      },
+      "tvm_ffi": {
+        "include_dirs": [
+          "tvm_ffi.libinfo.find_include_path()",
+          "tvm_ffi.libinfo.find_dlpack_include_path()"
+        ],
+        "python": "apache-tvm-ffi>=0.1.11,<0.2"
+      }
+    }
+  },
+  "generator": {
+    "cake_revision": "ec8ee046ea9f8691145091f7fff60fe83f024376",
+    "cuda": "13.4.92",
+    "rendered_at": "2026-10-20T23:25:25Z"
+  },
+  "libraries": [
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "455324b9e60b70f4c26222956321bb9b1462750883c0676d1cc902a3d7a6231a",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_nvfp4_attention_aeef857fb82e9e29a633_sm_103a",
+      "nvcc_flags": [
+        "--use_fast_math"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_nvfp4_attention_aeef857fb82e9e29a633_sm_103a.so",
+      "sha256": {
+        "csrc/cake_nvfp4_attention_aeef857fb82e9e29a633_binding.cu": "c481465f6a83dd0e03afe1fd8952119b415fa6acffcd743777b0b23c916f78c8",
+        "csrc/cake_nvfp4_attention_aeef857fb82e9e29a633_kernel.cu": "26f90f207bdb649ed278916fded5c34604052dab9d10bd64f5da3e7a81a4d4d3"
+      },
+      "sources": [
+        "csrc/cake_nvfp4_attention_aeef857fb82e9e29a633_kernel.cu",
+        "csrc/cake_nvfp4_attention_aeef857fb82e9e29a633_binding.cu"
+      ]
+    }
+  ],
+  "package": "flashinfer.experimental.nvfp4_attention",
+  "schema": "cake-build/1"
+}

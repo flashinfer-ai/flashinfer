@@ -20,6 +20,7 @@ import torch
 from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import KERNELS
+from tests.test_helpers.cake_nvfp4_per_token import required_kernel_keys
 
 GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
 
@@ -186,7 +187,7 @@ def test_gemm_plan_geometry():
     plan = _registered(cb.gemm_plan(257, 2112, 7168, False, "sm_100a", 148), "sm_100a")
     assert "half_m" not in plan.tactic and plan.tok_tile == 256
     plan = _registered(cb.gemm_plan(128, 18432, 7168, False, "sm_100a", 148), "sm_100a")
-    assert plan.w_tiles == 144 and plan.amc == 1 and plan.grid == 144
+    assert plan.w_tiles == 144 and plan.grid == 144
     plan = _registered(cb.gemm_plan(8, 28672, 8192, False, "sm_100a", 148), "sm_100a")
     assert plan.num_tiles == 224 and plan.grid == 224  # min(2 x 148, 224)
     plan = _registered(cb.gemm_plan(8, 18432, 7168, True, "sm_103a", 152), "sm_103a")
@@ -304,6 +305,18 @@ def test_gemm_plan_geometry():
             148,
             tactic={**cb.default_tactic(8, 2112, 7168, 148), "split_k": 1},
         )
+    # An explicit override with a key no tactic uses is rejected by name instead
+    # of being planned without it (the plan above would otherwise ignore it).
+    with pytest.raises(ValueError, match="unknown tactic keys: amc"):
+        cb.gemm_plan(
+            128,
+            18432,
+            7168,
+            False,
+            "sm_100a",
+            148,
+            tactic={**cb.default_tactic(128, 18432, 7168, 148), "amc": 2},
+        )
 
 
 def test_cake_is_registered_but_never_auto_selected():
@@ -315,7 +328,7 @@ def test_cake_is_registered_but_never_auto_selected():
 
 @pytest.mark.parametrize("arch", cb.ARCHES)
 def test_required_gemm_keys_registered_when_programs_exist(arch):
-    required = [k for k in cb.required_kernel_keys(arch) if k.startswith("gemm:")]
+    required = [k for k in required_kernel_keys(arch) if k.startswith("gemm:")]
     assert required
     if arch in KERNELS:
         missing = sorted(set(required) - set(KERNELS[arch]))

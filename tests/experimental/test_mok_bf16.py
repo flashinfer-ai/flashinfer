@@ -5,21 +5,30 @@
 Covers the fused forward/backward (ring replay, empty experts, variable
 widths, CUDA Graph replay), clamped SwiGLU, FP32 weight-gradient
 accumulation, GLM-5.3-Flash local expert counts, context-only recompute,
-every exported scheduler layout and the epilogues.
+every exported scheduler layout and the epilogues, plus the host-only
+communication-split tables, resolvers and configuration switches.
+
+Backend suite: the package is imported only through
+:func:`tests.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
+wrapper is covered by ``test_mok_bf16_api.py``.
 """
 
 import pytest
 import torch
 
-from flashinfer.experimental.cake_mok_bf16._kernels import (
-    SCHEDULER_LAYOUTS,
-    MoKBackward,
-    MoKEpilogues,
-    MoKForward,
-    MoKRecompute,
-    MoKScheduler,
-)
 from tests.experimental._mok_reference import require_gpu, single_rank_schedule
+from tests.test_helpers.cake_package import cake_package
+
+kernels = cake_package("cake_mok_bf16", "_kernels")
+api = cake_package("cake_mok_bf16", "api")
+backend = cake_package("cake_mok_bf16", "backend")
+MoKConfig = cake_package("cake_mok_bf16", "workspace").MoKConfig
+SCHEDULER_LAYOUTS = kernels.SCHEDULER_LAYOUTS
+MoKBackward = kernels.MoKBackward
+MoKEpilogues = kernels.MoKEpilogues
+MoKForward = kernels.MoKForward
+MoKRecompute = kernels.MoKRecompute
+MoKScheduler = kernels.MoKScheduler
 
 GEOMETRIES = ((256, 256, 768), (512, 512, 768), (512, 256, 1536))
 
@@ -430,7 +439,7 @@ def test_epilogues(topk, tokens, hidden):
 def test_count_routed_load_matches_a_reference_count():
     """Host-only: the per-rank load histogram counts the valid gathered ids by
     owning rank and ignores padding (-1) and out-of-range ids."""
-    from flashinfer.experimental.cake_mok_bf16.backend import count_routed_load
+    count_routed_load = backend.count_routed_load
 
     ep_size, local_experts = 4, 3
     routes = torch.tensor(
@@ -475,7 +484,7 @@ def test_count_routed_load_matches_a_reference_count():
 def test_select_comm_split_decision_table():
     """Host-only: the imbalance-aware split is a pure function of the observed
     per-rank loads, ``hot`` when max load >= threshold x mean load, else ``base``."""
-    from flashinfer.experimental.cake_mok_bf16.backend import select_comm_split
+    select_comm_split = backend.select_comm_split
 
     base, hot = (20, 24), (24, 28)
     assert select_comm_split([100, 100, 100, 100], base, hot, 1.5) == base  # 1.0
@@ -522,8 +531,6 @@ def test_imbalance_comm_sms_auto_follows_the_device(
     the fixed split (``None``)."""
     from types import SimpleNamespace
 
-    from flashinfer import mok
-
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: capability
@@ -533,7 +540,7 @@ def test_imbalance_comm_sms_auto_follows_the_device(
         "get_device_properties",
         lambda device=None: SimpleNamespace(multi_processor_count=sm_count),
     )
-    assert mok.resolve_imbalance_comm_sms(precision) == expected
+    assert api.resolve_imbalance_comm_sms(precision) == expected
 
 
 def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
@@ -542,39 +549,36 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     malformed arguments are rejected before any collective."""
     import inspect
 
-    from flashinfer import mok
-    from flashinfer.experimental.cake_mok_bf16.workspace import MoKConfig
-
     config = MoKConfig()
     assert config.imbalance_comm_sms is None
     assert config.imbalance_threshold == 4.0
-    facade = inspect.signature(mok.create_mok_bf16_workspace).parameters
+    facade = inspect.signature(api.create_mok_bf16_workspace).parameters
     assert facade["imbalance_comm_sms"].default == "auto"
     assert facade["imbalance_threshold"].default == "auto"
     # The measured rows and thresholds (backend README); a change here is a
     # shipping change. The backend default is the BF16 threshold.
-    assert mok.IMBALANCE_COMM_SMS == {
+    assert api.IMBALANCE_COMM_SMS == {
         (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}}
     }
-    assert mok.IMBALANCE_THRESHOLDS == {"bf16": 4.0, "mxfp8": 2.7}
-    assert mok.IMBALANCE_THRESHOLDS["bf16"] == mok.IMBALANCE_THRESHOLD
-    assert mok.resolve_imbalance_threshold("bf16") == config.imbalance_threshold
-    assert mok.resolve_imbalance_threshold("mxfp8") == 2.7
+    assert api.IMBALANCE_THRESHOLDS == {"bf16": 4.0, "mxfp8": 2.7}
+    assert api.IMBALANCE_THRESHOLDS["bf16"] == api.IMBALANCE_THRESHOLD
+    assert api.resolve_imbalance_threshold("bf16") == config.imbalance_threshold
+    assert api.resolve_imbalance_threshold("mxfp8") == 2.7
     with pytest.raises(ValueError, match="precision must be one of"):
-        mok.resolve_imbalance_comm_sms("fp8")
+        api.resolve_imbalance_comm_sms("fp8")
     with pytest.raises(ValueError, match="precision must be one of"):
-        mok.resolve_imbalance_threshold("fp8")
+        api.resolve_imbalance_threshold("fp8")
     kwargs = dict(
         group=None, device=None, num_local_tokens=512, hidden_size=256, topk=2
     )
     with pytest.raises(ValueError, match='"auto"'):
-        mok.create_mok_bf16_workspace(imbalance_comm_sms="fast", **kwargs)
+        api.create_mok_bf16_workspace(imbalance_comm_sms="fast", **kwargs)
     with pytest.raises(ValueError, match='"auto"'):
-        mok.create_mok_bf16_workspace(imbalance_threshold="fast", **kwargs)
+        api.create_mok_bf16_workspace(imbalance_threshold="fast", **kwargs)
     with pytest.raises(ValueError, match="pair"):
-        mok.create_mok_bf16_workspace(imbalance_comm_sms=(24,), **kwargs)
+        api.create_mok_bf16_workspace(imbalance_comm_sms=(24,), **kwargs)
     with pytest.raises(ValueError, match="precision must be one of"):
-        mok.create_mok_bf16_workspace(precision="fp8", **kwargs)
+        api.create_mok_bf16_workspace(precision="fp8", **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -597,8 +601,6 @@ def test_comm_sms_auto_follows_the_device_and_group(
     row keep the factory split (``None``)."""
     from types import SimpleNamespace
 
-    from flashinfer import mok
-
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: capability
@@ -608,7 +610,7 @@ def test_comm_sms_auto_follows_the_device_and_group(
         "get_device_properties",
         lambda device=None: SimpleNamespace(multi_processor_count=sm_count),
     )
-    assert mok.resolve_comm_sms(precision, ep_size) == expected
+    assert api.resolve_comm_sms(precision, ep_size) == expected
 
 
 def test_comm_sms_factory_defaults_are_unchanged():
@@ -617,18 +619,16 @@ def test_comm_sms_factory_defaults_are_unchanged():
     are rejected before any collective."""
     import inspect
 
-    from flashinfer import mok
-
-    facade = inspect.signature(mok.create_mok_bf16_workspace).parameters
+    facade = inspect.signature(api.create_mok_bf16_workspace).parameters
     assert facade["fwd_num_comm_sms"].default == 40
     assert facade["bwd_num_comm_sms"].default == 40
-    assert mok.COMM_SMS == {(10, 3): {152: {"mxfp8": {8: (44, 36)}}}}
+    assert api.COMM_SMS == {(10, 3): {152: {"mxfp8": {8: (44, 36)}}}}
     with pytest.raises(ValueError, match="precision must be one of"):
-        mok.resolve_comm_sms("fp8", 8)
+        api.resolve_comm_sms("fp8", 8)
     with pytest.raises(ValueError, match="ep_size must be a positive"):
-        mok.resolve_comm_sms("mxfp8", 0)
+        api.resolve_comm_sms("mxfp8", 0)
     with pytest.raises(ValueError, match='both be "auto"'):
-        mok.create_mok_bf16_workspace(
+        api.create_mok_bf16_workspace(
             group=None,
             device=None,
             num_local_tokens=512,
@@ -637,3 +637,56 @@ def test_comm_sms_factory_defaults_are_unchanged():
             fwd_num_comm_sms="auto",
             bwd_num_comm_sms=40,
         )
+
+
+def test_comm_split_log_prints_each_split_change(capsys):
+    """``MoKConfig.comm_split_log`` prints one stderr line per rank each time the
+    imbalance-aware split of the next launch changes; the default is silent and
+    the switch never changes the decision itself."""
+    require_gpu()
+    import dataclasses
+    from types import SimpleNamespace
+
+    assert MoKConfig().comm_split_log is False
+    quiet = MoKConfig(
+        fwd_num_comm_sms=4,
+        bwd_num_comm_sms=4,
+        imbalance_comm_sms=(6, 6),
+        imbalance_threshold=1.5,
+    )
+    loud = dataclasses.replace(quiet, comm_split_log=True)
+    assert loud.comm_split_log is True
+    ep_size, experts = 4, 4
+    functional = backend.MoKFunctional(ep_size, experts, 2)
+    # Gathered expert ids for the (4, 4) diagnostic layout: one id per expert
+    # (every rank owns four routed rows, max/mean load 1), then the same number
+    # of ids all on rank 0's experts (max/mean load 4, above the threshold).
+    balanced = torch.arange(ep_size * experts, device="cuda", dtype=torch.int32)
+    skewed = balanced % experts
+    prefix = "[cake_mok_bf16 rank 0] communication split -> "
+    expected_lines = [
+        prefix + "(4, 4) (max/mean routed load 1.000)",
+        prefix + "(6, 6) (max/mean routed load 4.000)",
+    ]
+    workspaces = []  # keep every stand-in alive: the adapter keys its state by id
+    for config, expected in ((quiet, []), (loud, expected_lines)):
+        workspace = SimpleNamespace(
+            ep_rank=0, ep_size=ep_size, all_gather_top_experts_buffer=balanced
+        )
+        workspaces.append(workspace)
+        capsys.readouterr()
+        splits = []
+        for routes in (balanced, skewed):
+            workspace.all_gather_top_experts_buffer = routes
+            functional._observe_load(workspace, config)
+            torch.cuda.synchronize()
+            splits.append(functional._comm_split(config, workspace))
+            # The same observation again: the split is unchanged, so no line.
+            splits.append(functional._comm_split(config, workspace))
+        assert splits == [(4, 4), (4, 4), (6, 6), (6, 6)]
+        lines = [
+            line
+            for line in capsys.readouterr().err.splitlines()
+            if "communication split" in line
+        ]
+        assert lines == expected

@@ -88,4 +88,9 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
 
 
 def run_tuning(args) -> int:
+    """Dispatch offline MXFP8 tuning to the requested inference or GenPhase path."""
+    if args.kernel_variant == "genphase":
+        from .genphase_tuner import run_tuning as run_genphase_tuning
+
+        return run_genphase_tuning(args)
     return _run_tuning(args, tune_one)

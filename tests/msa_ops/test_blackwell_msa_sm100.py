@@ -413,6 +413,24 @@ CASES = [
     pytest.param(
         _attention_case(
             "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=4,
+            seqlen_q=2,
+            kv_lens=[1024, 896, 768, 640],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=61,
+            force_fused=True,
+        ),
+        id="decode-paged-uniform-fp8-q2",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
             q_dtype="float16",
             kv_dtype="float16",
             kv_layout="paged",
@@ -546,6 +564,58 @@ CASES = [
         ),
         id="decode-paged-bf16-m16-ragged",
     ),
+    # Persistent K-major prefill route: paged GQA-16 above 64 pages, paged
+    # GQA-8 at 64 pages (captured) and flat GQA-16 above 64 KV blocks, every
+    # batch with a request below the long route's 8192-query threshold.
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[700, 300],
+            kv_lens=[8320, 8300],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=71,
+        ),
+        id="prefill-paged-bf16-gqa16-kmaj-persistent",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[900, 300],
+            kv_lens=[8192, 7000],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=73,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-bf16-gqa8-kmaj-persistent-graph",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="flat_varlen",
+            q_lens=[1024],
+            kv_lens=[8320],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=75,
+        ),
+        id="prefill-flat-bf16-gqa16-kmaj-persistent",
+    ),
 ]
 
 
@@ -576,6 +646,11 @@ def _dtype(name: str) -> torch.dtype:
         "bfloat16": torch.bfloat16,
         _FP8: torch.float8_e4m3fn,
     }[name]
+
+
+def _output_dtype(q: torch.Tensor) -> torch.dtype:
+    """Uniform FP8 Q/K/V decode returns BF16; every other route returns q's dtype."""
+    return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
 
 
 def _indptr(lengths: list[int], device: torch.device) -> torch.Tensor:
@@ -900,7 +975,7 @@ def _reference_attention(inputs: dict[str, Any]) -> tuple[torch.Tensor, ...]:
         temperature_lse[batch, :q_len] for batch, q_len in enumerate(q_lens)
     ]
     return (
-        torch.cat(out_rows).to(q.dtype),
+        torch.cat(out_rows).to(_output_dtype(q)),
         torch.cat(lse_rows),
         torch.cat(temperature_rows),
     )
@@ -1040,7 +1115,7 @@ def test_sm100_sm103_msa_public_api_correctness(case: dict[str, Any]) -> None:
 
     expected = _reference_attention(inputs)
     assert actual[0].shape == inputs["q"].shape
-    assert actual[0].dtype == inputs["q"].dtype
+    assert actual[0].dtype == _output_dtype(inputs["q"])
     output_tolerance = 0.1 if inputs["kv_dtype"] == _FP8 else 0.01
     torch.testing.assert_close(
         actual[0], expected[0], atol=output_tolerance, rtol=output_tolerance

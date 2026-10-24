@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-#include "cake_deepgemm_dense_mqa_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_23fd530901062703f5d1(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens);
 

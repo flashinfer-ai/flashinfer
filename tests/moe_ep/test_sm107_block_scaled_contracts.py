@@ -160,12 +160,14 @@ def _workspace():
     ws.config = _config()
     ws.device = torch.device("cpu")
     ws._destroyed = False
+    ws._tuning_state = block_scaled.AutoTuningState()
     ws._compiled = mock.Mock()
     # Model a kernel that requires launch-side clearing. Native masked BF16
     # reducers opt out via this capability; quantized combine still clears.
     ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws._launch_key = None
     ws._launch_kwargs = None
+    ws._routing_checks = {}
     ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b: {"weights": (a, b)})
     ws.topk_idx = torch.tensor([[0, 1], [2, -1], [-1, -1], [-1, -1]])
     ws._pre_reduced_activation = torch.full((4, 2, 128), 7.0)
@@ -270,7 +272,11 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
     assert lookup_knobs(**key) is None
     assert lookup_knobs(**key, allow_nondeterministic=True) == knobs
     assert (
-        lookup_knobs(**key, allow_nondeterministic=True, apply_topk_at_fc1=False)
+        lookup_knobs(
+            **key,
+            allow_nondeterministic=True,
+            apply_routing_weights_before_fc2=False,
+        )
         is None
     )
     data = json.loads(path.read_text())
@@ -501,7 +507,9 @@ def test_no_dist_rejects_multirank(monkeypatch):
 
 
 def test_ikr_requires_early_weighting():
-    with pytest.raises(ValueError, match="apply_topk_at_fc1"):
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
         dataclasses.replace(
-            _config(), reduce_topk_in_kernel=True, apply_topk_at_fc1=False
+            _config(),
+            reduce_topk_in_kernel=True,
+            apply_routing_weights_before_fc2=False,
         )

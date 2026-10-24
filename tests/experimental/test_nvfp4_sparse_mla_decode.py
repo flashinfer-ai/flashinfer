@@ -12,22 +12,44 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Tests of the experimental NVFP4 sparse MLA decode package (SM100 / SM103): the
+host planners of both implementations, the kernels against an exact reference
+through the public ``flashinfer.mla.nvfp4_sparse_mla_decode`` entry (both
+backends), the host plan of the generated program's registry records and the
+``build.json`` contract of its package.
 """
 
 import math
+import re
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
 
-from flashinfer.experimental.nvfp4_sparse_mla_decode import cake_backend
-from flashinfer.experimental.nvfp4_sparse_mla_decode.backend import (
-    HEAD_DIM,
-    NUM_HEADS,
-    ROW_BYTES,
-    V_HEAD_DIM,
-    is_valid_config,
-    select_num_ctas,
+from flashinfer.experimental import nvfp4_sparse_mla_decode as pkg
+from flashinfer.experimental.nvfp4_sparse_mla_decode import backend as cuda_backend
+from flashinfer.experimental.nvfp4_sparse_mla_decode import cake_backend, cake_build
+from flashinfer.experimental.nvfp4_sparse_mla_decode import cake_jit as loader
+
+HEAD_DIM = cuda_backend.HEAD_DIM
+NUM_HEADS = cuda_backend.NUM_HEADS
+ROW_BYTES = cuda_backend.ROW_BYTES
+V_HEAD_DIM = cuda_backend.V_HEAD_DIM
+is_valid_config = cuda_backend.is_valid_config
+select_num_ctas = cuda_backend.select_num_ctas
+
+# The generated kernel's parameters in ``run`` order: the host vocabulary of every record.
+PARAMETERS = (
+    "q",
+    "kv",
+    "indices",
+    "out",
+    "topk",
+    "keys_per_cta",
+    "qk_scale",
+    "out_scale",
 )
 
 E2M1_VALUES = (
@@ -87,14 +109,14 @@ def _decode(*args, backend="cuda", **kwargs):
 
 
 def _require_backend(backend: str, num_ctas=None) -> None:
-    """Skip when the generated program for this device is not registered in the checkout."""
+    """Skip when the generated program is not delivered for this device."""
     if backend != "cake":
         return
     device = torch.device("cuda", torch.cuda.current_device())
     if not cake_backend.generated_program_available(device, num_ctas):
         which = "every cluster size" if num_ctas is None else f"cluster size {num_ctas}"
         pytest.skip(
-            f"no generated NVFP4 sparse MLA decode program ({which}) registered for this device"
+            f"no generated NVFP4 sparse MLA decode program ({which}) delivered for this device"
         )
 
 
@@ -312,6 +334,137 @@ def test_cake_admits_its_cluster_sizes(num_ctas):
 def test_cake_rejects_splits(topk, num_ctas):
     # 7 is not a variant of the program; 512 keys over 5 CTAs round to 128 per CTA and leave the fifth empty
     assert not cake_backend.is_valid_split(topk, num_ctas)
+
+
+# ---------------------------------------------------------------- the host plan and the build manifest (no GPU needed)
+
+
+def test_host_plan_of_the_records():
+    assert loader.ARCHES == ("sm_100a", "sm_103a") and loader.ARCH_BY_CAPABILITY == {
+        (10, 0): "sm_100a",
+        (10, 3): "sm_103a",
+    }
+    assert loader.arch_for_capability((10, 0)) == "sm_100a"
+    assert loader.arch_for_capability((10, 3)) == "sm_103a"
+    assert loader.arch_for_capability((12, 0)) is None
+    assert loader.arch_for_capability((10,)) is None
+    assert loader.CLUSTER_SIZES == (1, 2, 3, 4, 5, 6, 8) == cake_backend.CLUSTER_SIZES
+    assert len(loader.MODULES) == len(loader.CLUSTER_SIZES)
+    for arch in loader.ARCHES:
+        assert loader.registered_clusters(arch) == set(loader.CLUSTER_SIZES)
+    assert loader.registered_clusters("sm_120a") == set()
+    for cluster in loader.CLUSTER_SIZES:
+        name = loader.record_for(cluster)
+        record = loader.MODULES[name]
+        assert record["cluster"] == cluster
+        for arch in loader.ARCHES:
+            assert loader.select_module(arch, cluster) == name
+            assert loader.library_name(name, arch) == f"{name}_{arch}"
+        with pytest.raises(RuntimeError, match="not delivered for sm_120a"):
+            loader.library_name(name, "sm_120a")
+        # The grid: one cluster of ``cluster`` CTAs per token, along the y axis.
+        assert loader.launch_grid(record, num_tokens=12) == (12, cluster, 1)
+        assert loader.launch_grid(record, num_tokens=1) == (1, cluster, 1)
+    with pytest.raises(RuntimeError, match="delivers 0 programs of cluster size 7"):
+        loader.record_for(7)
+    with pytest.raises(NotImplementedError, match="cluster size 7"):
+        loader.select_module("sm_100a", 7)
+    with pytest.raises(NotImplementedError, match="sm_120a"):
+        loader.select_module("sm_120a", 4)
+    record = loader.MODULES[loader.record_for(4)]
+    with pytest.raises(ValueError, match="positive token count"):
+        loader.launch_grid(record, num_tokens=0)
+    with pytest.raises(
+        ValueError, match="unknown Cake NVFP4 sparse MLA decode grid rule"
+    ):
+        loader.launch_grid(
+            {"grid_rule": {"kind": "linear"}, "cluster": 4}, num_tokens=1
+        )
+    # The argument plan: ``main_kwargs`` by logical name, then the grid axes.
+    values = {key: object() for kind, key in record["arg_plan"] if kind != "grid"}
+    args = loader.launch_args(record, values, (24, 4, 1))
+    assert args[-3:] == (24, 4, 1)
+    assert args[:-3] == tuple(
+        values[key] for kind, key in record["arg_plan"] if kind != "grid"
+    )
+    with pytest.raises(ValueError, match="needs logical argument 'topk'"):
+        loader.launch_args(
+            record, {k: v for k, v in values.items() if k != "topk"}, (2, 4, 1)
+        )
+
+
+def test_registry_records_reference_the_build_manifest():
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
+
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel, binding and
+    occupancy-query sources under ``csrc/cake_nvfp4_sparse_mla_decode/`` of this
+    package, their digests, a closure digest and the program's
+    ``--use_fast_math``; the registry itself records the host plan only.
+    """
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == pkg.__name__
+    assert set(manifest["arch_flags"]) == set(loader.ARCHES) == {"sm_100a", "sm_103a"}
+    assert manifest["common"]["requires"]["cuda_toolkit"]["min"]
+    libraries = cake_build.libraries_by_name()
+    package = Path(cake_build.__file__).parent
+    referenced = set()
+    clusters = set()
+    for name, record in loader.MODULES.items():
+        assert record["library"] == record["kernel"] == name
+        assert re.fullmatch(r"cake_nvfp4_sparse_mla_decode_[0-9a-f]{20}", name)
+        assert record["kernel_symbol"] == f"kernel_{name}"
+        assert record["ffi_entry"] == "run"
+        assert record["occupancy_entry"] == "max_active_clusters"
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert list(record["arches"]) == list(loader.ARCHES), name
+        cluster = record["cluster"]
+        assert cluster in loader.CLUSTER_SIZES and cluster not in clusters, name
+        clusters.add(cluster)
+        assert record["build"] == {"cluster": cluster}
+        assert record["keys_per_stage"] == cake_backend.STAGE_KEYS
+        assert record["max_keys_per_cta"] == cake_backend.MAX_KEYS_PER_CTA
+        launch = record["launch"]
+        assert launch["cooperative"] is False and launch["use_pdl"] is False
+        assert tuple(launch["block"]) == (cake_backend.THREADS, 1, 1)
+        assert tuple(launch["cluster"]) == (1, cluster, 1)
+        assert launch["dynamic_smem_bytes"] == (
+            cake_backend.SMEM_BYTES if cluster == 1 else cake_backend.SMEM_BYTES_CLUSTER
+        )
+        assert record["grid_rule"] == {"kind": "tokens_by_cluster"}
+        assert record["workspace_rule"] is None
+        parameters = [key for kind, key in record["arg_plan"] if kind != "grid"]
+        assert tuple(parameters) == PARAMETERS
+        assert record["logical"] == {key: key for key in parameters}
+        assert [key for kind, key in record["arg_plan"] if kind == "grid"] == [
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ]
+        for arch in record["arches"]:
+            library = loader.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            units = f"csrc/cake_nvfp4_sparse_mla_decode/{record['library']}"
+            assert entry["sources"] == [
+                f"{units}_kernel.cu",
+                f"{units}_binding.cu",
+                f"{units}_occupancy.cu",
+            ]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (package / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert entry["nvcc_flags"] == ["--use_fast_math"], library
+            assert re.fullmatch(r"\d+\.\d+", entry["min_cuda"]), library
+    assert clusters == set(loader.CLUSTER_SIZES)
+    assert referenced == set(libraries)
+    assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
 
 # ---------------------------------------------------------------- kernels (SM100)

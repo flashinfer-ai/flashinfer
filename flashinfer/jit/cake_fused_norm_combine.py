@@ -16,8 +16,8 @@ limitations under the License.
 JIT loader of the Cake eight-peer fused norm-combine (SM100 / SM103).
 
 Three generated programs, one per dispatch band: a CUDA device translation
-unit plus a tvm-ffi launcher each, compiled together once into one fatbin
-that carries a cubin for every supported build target
+unit each plus the shared tvm-ffi launcher, compiled together once into one
+fatbin that carries a cubin for every supported build target
 (``FLASHINFER_CUDA_ARCH_LIST`` when set, otherwise the visible devices). The
 persistent program additionally compiles ``OCCUPANCY_SOURCE``, which exports
 the kernel's co-resident CTA capacity query. ``VARIANTS``, ``COMPILE_FLAGS``,
@@ -43,9 +43,10 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "parallel_lamport": {
         "module": "cake_fused_norm_combine_bf16_84f760a61c7d96e11441",
         "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_84f760a61c7d96e11441",
+        "shim": "cake_host_shim_dcbbcf0d40780709",
         "sources": [
             "csrc/cake_fused_norm_combine/cake_fused_norm_combine_bf16_84f760a61c7d96e11441_kernel.cu",
-            "csrc/cake_fused_norm_combine/cake_fused_norm_combine_bf16_84f760a61c7d96e11441_binding.cu",
+            "csrc/cake_fused_norm_combine/cake_fused_norm_combine_binding.cu",
         ],
         "block": 320,
         "dynamic_smem_bytes": 10496,
@@ -54,9 +55,10 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "owner_lamport": {
         "module": "cake_fused_norm_combine_bf16_2da1ef49a067e64f946f",
         "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_2da1ef49a067e64f946f",
+        "shim": "cake_host_shim_18cddaeb355b2b2d",
         "sources": [
             "csrc/cake_fused_norm_combine/cake_fused_norm_combine_bf16_2da1ef49a067e64f946f_kernel.cu",
-            "csrc/cake_fused_norm_combine/cake_fused_norm_combine_bf16_2da1ef49a067e64f946f_binding.cu",
+            "csrc/cake_fused_norm_combine/cake_fused_norm_combine_binding.cu",
         ],
         "block": 160,
         "dynamic_smem_bytes": 128,
@@ -65,9 +67,10 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "owner_lamport_pipelined": {
         "module": "cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8",
         "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8",
+        "shim": "cake_host_shim_a11d09420e324b42",
         "sources": [
             "csrc/cake_fused_norm_combine/cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8_kernel.cu",
-            "csrc/cake_fused_norm_combine/cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8_binding.cu",
+            "csrc/cake_fused_norm_combine/cake_fused_norm_combine_binding.cu",
         ],
         "block": 160,
         "dynamic_smem_bytes": 128,
@@ -295,19 +298,29 @@ def spec(variant: str) -> JitSpec:
     row = VARIANTS[variant]
     flags = [*nvcc_flags(), *COMPILE_FLAGS]
     sources = [_source_path(relative) for relative in row["sources"]]
+    cooperative = row["grid_rule"]["kind"] == "co_resident"
+    # The shared launcher is compiled against this program's kernel symbol, host
+    # namespace, block, dynamic shared memory and launch attributes.
     # Keyed as ``gen_jit_spec`` declares it (``Mapping[str | Path, ...]``);
     # ``Mapping`` is invariant in its key type, so a ``dict[Path, ...]`` would not do.
-    by_source: Optional[dict[str | Path, list[str]]] = None
-    if row["grid_rule"]["kind"] == "co_resident":
+    by_source: dict[str | Path, list[str]] = {
+        sources[1]: [
+            *flags,
+            f"-DCAKE_FUSED_NORM_COMBINE_KERNEL={row['kernel_symbol']}",
+            f"-DCAKE_FUSED_NORM_COMBINE_SHIM={row['shim']}",
+            f"-DCAKE_FUSED_NORM_COMBINE_BLOCK={row['block']}u",
+            f"-DCAKE_FUSED_NORM_COMBINE_DYN_SMEM={row['dynamic_smem_bytes']}u",
+            f"-DCAKE_FUSED_NORM_COMBINE_COOPERATIVE={int(cooperative)}",
+        ]
+    }
+    if cooperative:
         # The occupancy query is compiled against this program's kernel symbol.
         occupancy = _source_path(OCCUPANCY_SOURCE)
         sources.append(occupancy)
-        by_source = {
-            occupancy: [
-                *flags,
-                f"-DCAKE_FUSED_NORM_COMBINE_KERNEL={row['kernel_symbol']}",
-            ]
-        }
+        by_source[occupancy] = [
+            *flags,
+            f"-DCAKE_FUSED_NORM_COMBINE_KERNEL={row['kernel_symbol']}",
+        ]
     return gen_jit_spec(
         name=row["module"],
         sources=sources,

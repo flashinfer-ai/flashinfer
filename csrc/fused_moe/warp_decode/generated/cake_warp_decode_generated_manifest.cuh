@@ -120,57 +120,52 @@ inline constexpr bool kConfiguresDynamicSharedMemory = true;
 inline constexpr int32_t kMaximumLaunchCount = 4;
 inline constexpr size_t kWorkspaceAlignment = 256;
 inline constexpr size_t kDefaultDynamicSharedMemoryBytes = 48u * 1024u;
-inline constexpr size_t kMaximumAuthoredDynamicSharedMemoryBytes = 219776u;
-inline constexpr char kGeneratedSourceSha256[] = "f39d56d7873c21143889f4a0a4fa7a4739aa0b6c925a8580ecd297ee9647279d";
 
 struct UInt3 { uint32_t x, y, z; };
 struct KernelSpec {
   const char* symbol;
-  const char* kind;
   UInt3 block;
   UInt3 cluster;
   size_t dynamic_smem_bytes;
   bool cooperative;
   bool spread_cluster;
   bool programmatic_dependent_launch;
-  const char* tensor_map_abi;
-  const char* grid[3];
 };
 inline constexpr KernelSpec kKernelSpecs[] = {
-  {"kernel_cake_warp_decode_0686b950e5dc33f7f54f", "route_pack_generic", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_3aa297e8ff45f1333ec9", "fc1_swiglu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_7d6f94378c1107da3804", "fc1_swiglu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_6aee17fe7c1c9a9fbc4f", "fc1_swiglu_oa_static_early_sfb", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_345efbf7077827bc328e", "fc1_swiglu_oa_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_f4eb1d54caa22ccfeb83", "fc1_swiglu_oa_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a57e715fd2682ae22fe1", "fc1_swiglu_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_514c77f65f72ffd8d0a5", "fc1_silu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_2d89b2ccfa19074dd9fb", "fc1_silu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_958ca99134107b938d76", "fc1_situ_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_c6e324e2d43c0e98cca8", "fc2_sm100_source_k256", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_5c23234a34054124f4ce", "fc2_sm100_refined_k256_direct", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_b451f69ab3b063de0072", "fc2_sm100_refined_k256", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_0aeb22c5851fb0a20bfb", "fc2_sm100_k512_stage5_u2_valid_k64_group256_early_accumulator_direct", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a3292d8194689829d62c", "finalize_direct_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_9ace9f7e5e0c273ae879", "finalize_direct_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_61f9c98fb7c8656ae154", "finalize_packed_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_de0e5a68a49864417599", "fc2_sm100_k512_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_8acc0c77f5b6d2888496", "fc2_sm100_k512_stage5_early_accumulator_mma_u2_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_5312a73885ff3541a6b6", "fc1_swiglu_oa_early_sfb_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_56ddbbdf57cdb02ccd29", "finalize_direct_t128_k16", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_045dba6ecaaa5f878a96", "finalize_direct_t64_k16", {64, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 64)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_fc64115f77142914c771", "finalize_direct_t64_k16_loop16", {64, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 64)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_8388b2049117830020f2", "finalize_packed_t128_k8", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_f5eac8f9332dd5595fce", "finalize_packed_t256_k8", {256, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 256)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_a11aa740b9780f90e7ee", "finalize_packed_t128_k10", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_6b5216f21144ca9c3cec", "fc1_swiglu_a_tma_merged_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_ebcaf3ae004497a9132f", "fc1_swiglu_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_7f06ba61ca2fcfe503d1", "fc1_swiglu_early_sfb_a_tma_merged_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a4ab70bb923f293f6c03", "fc2_sm100_k512_valid_k64_prefetch_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_2dd7cc6dccb82323247b", "fc2_sm100_refined_k256_workfeed_prefetch_fused_pack", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_2355e31771baf48971ec", "fc2_sm100_k512_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_510ad9e9035da24674b6", "fc1_swiglu_fused_pack_evict_first_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_b0e329ce4c715a895df4", "fc2_sm100_refined_k256_workfeed_prefetch_fused_pack_evict_first", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_0686b950e5dc33f7f54f", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true},
+  {"kernel_cake_warp_decode_3aa297e8ff45f1333ec9", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
+  {"kernel_cake_warp_decode_7d6f94378c1107da3804", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_6aee17fe7c1c9a9fbc4f", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
+  {"kernel_cake_warp_decode_345efbf7077827bc328e", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_f4eb1d54caa22ccfeb83", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_a57e715fd2682ae22fe1", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_514c77f65f72ffd8d0a5", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
+  {"kernel_cake_warp_decode_2d89b2ccfa19074dd9fb", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_958ca99134107b938d76", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
+  {"kernel_cake_warp_decode_c6e324e2d43c0e98cca8", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
+  {"kernel_cake_warp_decode_5c23234a34054124f4ce", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
+  {"kernel_cake_warp_decode_b451f69ab3b063de0072", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
+  {"kernel_cake_warp_decode_0aeb22c5851fb0a20bfb", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_a3292d8194689829d62c", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_9ace9f7e5e0c273ae879", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_61f9c98fb7c8656ae154", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_de0e5a68a49864417599", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true},
+  {"kernel_cake_warp_decode_8acc0c77f5b6d2888496", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_5312a73885ff3541a6b6", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_56ddbbdf57cdb02ccd29", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_045dba6ecaaa5f878a96", {64, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_fc64115f77142914c771", {64, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_8388b2049117830020f2", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_f5eac8f9332dd5595fce", {256, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_a11aa740b9780f90e7ee", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_6b5216f21144ca9c3cec", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_ebcaf3ae004497a9132f", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true},
+  {"kernel_cake_warp_decode_7f06ba61ca2fcfe503d1", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true},
+  {"kernel_cake_warp_decode_a4ab70bb923f293f6c03", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true},
+  {"kernel_cake_warp_decode_2dd7cc6dccb82323247b", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
+  {"kernel_cake_warp_decode_2355e31771baf48971ec", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true},
+  {"kernel_cake_warp_decode_510ad9e9035da24674b6", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true},
+  {"kernel_cake_warp_decode_b0e329ce4c715a895df4", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
 };
 static_assert(sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]) == 34);
 
@@ -379,21 +374,12 @@ inline TensorLayout DenseLayout(const void* data, std::initializer_list<int64_t>
   return layout;
 }
 
-// Each generated kernel has one preparation flag, including the last table entry.
-inline constexpr size_t kKernelCount = sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]);
-struct DeviceState { bool ready; int32_t sm_count; bool allow_nonportable[kKernelCount]; };
+struct DeviceState { bool ready; int32_t sm_count; };
 inline std::array<DeviceState, 64>& DeviceStates() {
   static std::array<DeviceState, 64> states{};
   return states;
 }
 inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
-inline bool NeedsNonPortableSmem(int kernel) {
-  int device = -1;
-  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64 || kernel < 0 || static_cast<size_t>(kernel) >= kKernelCount)
-    return false;
-  std::lock_guard<std::mutex> lock(DeviceMutex());
-  return DeviceStates()[device].allow_nonportable[kernel];
-}
 
 inline bool EncodeTensorMap_1_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2204,7 +2190,7 @@ inline void VisitKernel_0(const KernelArgs_0& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(0), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_0, &args};
   visitor(launch, context);
 }
@@ -2286,7 +2272,7 @@ inline void VisitKernel_1(const KernelArgs_1& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(1), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_1, &args};
   visitor(launch, context);
 }
@@ -2374,7 +2360,7 @@ inline void VisitKernel_2(const KernelArgs_2& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(2), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_2, &args};
   visitor(launch, context);
 }
@@ -2456,7 +2442,7 @@ inline void VisitKernel_3(const KernelArgs_3& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(3), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_3, &args};
   visitor(launch, context);
 }
@@ -2544,7 +2530,7 @@ inline void VisitKernel_4(const KernelArgs_4& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(4), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_4, &args};
   visitor(launch, context);
 }
@@ -2632,7 +2618,7 @@ inline void VisitKernel_5(const KernelArgs_5& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(5), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_5, &args};
   visitor(launch, context);
 }
@@ -2720,7 +2706,7 @@ inline void VisitKernel_6(const KernelArgs_6& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(6), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_6, &args};
   visitor(launch, context);
 }
@@ -2802,7 +2788,7 @@ inline void VisitKernel_7(const KernelArgs_7& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(7), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_7, &args};
   visitor(launch, context);
 }
@@ -2890,7 +2876,7 @@ inline void VisitKernel_8(const KernelArgs_8& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(8), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_8, &args};
   visitor(launch, context);
 }
@@ -2975,7 +2961,7 @@ inline void VisitKernel_9(const KernelArgs_9& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(9), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_9, &args};
   visitor(launch, context);
 }
@@ -3048,7 +3034,7 @@ inline void VisitKernel_10(const KernelArgs_10& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(10), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_10, &args};
   visitor(launch, context);
 }
@@ -3121,7 +3107,7 @@ inline void VisitKernel_11(const KernelArgs_11& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(11), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_11, &args};
   visitor(launch, context);
 }
@@ -3194,7 +3180,7 @@ inline void VisitKernel_12(const KernelArgs_12& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(12), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_12, &args};
   visitor(launch, context);
 }
@@ -3267,7 +3253,7 @@ inline void VisitKernel_13(const KernelArgs_13& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(13), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_13, &args};
   visitor(launch, context);
 }
@@ -3316,7 +3302,7 @@ inline void VisitKernel_14(const KernelArgs_14& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(14), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_14, &args};
   visitor(launch, context);
 }
@@ -3365,7 +3351,7 @@ inline void VisitKernel_15(const KernelArgs_15& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(15), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_15, &args};
   visitor(launch, context);
 }
@@ -3414,7 +3400,7 @@ inline void VisitKernel_16(const KernelArgs_16& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(16), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_16, &args};
   visitor(launch, context);
 }
@@ -3487,7 +3473,7 @@ inline void VisitKernel_17(const KernelArgs_17& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(17), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_17, &args};
   visitor(launch, context);
 }
@@ -3560,7 +3546,7 @@ inline void VisitKernel_18(const KernelArgs_18& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(18), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_18, &args};
   visitor(launch, context);
 }
@@ -3648,7 +3634,7 @@ inline void VisitKernel_19(const KernelArgs_19& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(19), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_19, &args};
   visitor(launch, context);
 }
@@ -3697,7 +3683,7 @@ inline void VisitKernel_20(const KernelArgs_20& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(20), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_20, &args};
   visitor(launch, context);
 }
@@ -3746,7 +3732,7 @@ inline void VisitKernel_21(const KernelArgs_21& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(21), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_21, &args};
   visitor(launch, context);
 }
@@ -3795,7 +3781,7 @@ inline void VisitKernel_22(const KernelArgs_22& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(22), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_22, &args};
   visitor(launch, context);
 }
@@ -3844,7 +3830,7 @@ inline void VisitKernel_23(const KernelArgs_23& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(23), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_23, &args};
   visitor(launch, context);
 }
@@ -3893,7 +3879,7 @@ inline void VisitKernel_24(const KernelArgs_24& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(24), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_24, &args};
   visitor(launch, context);
 }
@@ -3942,7 +3928,7 @@ inline void VisitKernel_25(const KernelArgs_25& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(25), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_25, &args};
   visitor(launch, context);
 }
@@ -4030,7 +4016,7 @@ inline void VisitKernel_26(const KernelArgs_26& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(26), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_26, &args};
   visitor(launch, context);
 }
@@ -4148,7 +4134,7 @@ inline void VisitKernel_27(const KernelArgs_27& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(27), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_27, &args};
   visitor(launch, context);
 }
@@ -4266,7 +4252,7 @@ inline void VisitKernel_28(const KernelArgs_28& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(28), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_28, &args};
   visitor(launch, context);
 }
@@ -4351,7 +4337,7 @@ inline void VisitKernel_29(const KernelArgs_29& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(29), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_29, &args};
   visitor(launch, context);
 }
@@ -4436,7 +4422,7 @@ inline void VisitKernel_30(const KernelArgs_30& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(30), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_30, &args};
   visitor(launch, context);
 }
@@ -4521,7 +4507,7 @@ inline void VisitKernel_31(const KernelArgs_31& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(31), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_31, &args};
   visitor(launch, context);
 }
@@ -4639,7 +4625,7 @@ inline void VisitKernel_32(const KernelArgs_32& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(32), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_32, &args};
   visitor(launch, context);
 }
@@ -4724,7 +4710,7 @@ inline void VisitKernel_33(const KernelArgs_33& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(33), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_33, &args};
   visitor(launch, context);
 }
@@ -4833,9 +4819,6 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
   error = cudaDeviceGetAttribute(&state.sm_count, cudaDevAttrMultiProcessorCount, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MultiProcessorCount");
   if (state.sm_count <= 0) return detail::Invalid("EnsureDeviceReady SM count");
-  int portable_max = 0;
-  error = cudaDeviceGetAttribute(&portable_max, cudaDevAttrMaxSharedMemoryPerBlock, device_id);
-  if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlock");
   int optin_max = 0;
   error = cudaDeviceGetAttribute(&optin_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlockOptin");
@@ -4879,7 +4862,6 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
     const size_t requested = kKernelSpecs[kernel].dynamic_smem_bytes;
     if (requested > static_cast<size_t>(optin_max))
       return detail::Invalid("EnsureDeviceReady shared memory exceeds opt-in ceiling");
-    state.allow_nonportable[kernel] = requested > static_cast<size_t>(portable_max);
     if (requested <= kDefaultDynamicSharedMemoryBytes) continue;
     error = cudaFuncSetAttribute(functions[kernel], cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(requested));
@@ -4903,18 +4885,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       inv.workspace == nullptr) return;
   detail::WorkspaceView ws{};
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws) || inv.workspace_bytes < ws.bytes) return;
-  if (inv.prepared_intermediate || inv.prepared_intermediate_scale) {
-    if (!warp_decode::UsesOwnedInputScratch(inv.shape, schedule) ||
-        !inv.prepared_intermediate || !inv.prepared_intermediate_scale) return;
-    ws.intermediate = static_cast<uint8_t*>(inv.prepared_intermediate);
-    ws.intermediate_scale = static_cast<uint8_t*>(inv.prepared_intermediate_scale);
-  }
-  if (inv.prepared_partials) {
-    if (!warp_decode::UsesOwnedPartialScratch(inv.shape, schedule) ||
-        (warp_decode::UsesOwnedInputScratch(inv.shape, schedule) &&
-         (!inv.prepared_intermediate || !inv.prepared_intermediate_scale))) return;
-    ws.partials = static_cast<uint16_t*>(inv.prepared_partials);
-  }
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return;
   { std::lock_guard<std::mutex> lock(detail::DeviceMutex());
@@ -5046,29 +5016,13 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   if (fused_pack && (ws.pack_ready == nullptr || ws.fc1_done_counter == nullptr || ws.fc2_done_counter == nullptr)) return;
   int route_kernel = -1;
   if (schedule.route_layout == warp_decode::RouteLayout::kGpuPacked && !fused_pack) {
-    route_kernel = schedule.route_packer == warp_decode::RoutePacker::kE64Scan1 ? -1
-        : schedule.route_packer == warp_decode::RoutePacker::kE64Scan2 ? -1
-        : 0;
+    route_kernel = 0;
     if (!prepare(route_kernel)) return;
   }
   const bool silu = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiLU;
   const bool situ = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiTU;
   const bool swiglu_oa = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSwiGLUParameterized;
-  const bool q30_sm103_t10 = false
-      && (inv.shape.num_tokens == 9 || inv.shape.num_tokens == 10) && inv.shape.hidden_size == 2048
-      && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
-  const bool q35_sm103_t16 = false
-      && inv.shape.num_tokens == 16 && inv.shape.hidden_size == 2048
-      && inv.shape.intermediate_size == 512 && inv.shape.num_experts == 256
-      && inv.shape.local_num_experts == 256 && inv.shape.top_k == 8;
-  const bool q30_t11_mma_u2 = false
-      && inv.shape.num_tokens == 11 && inv.shape.hidden_size == 2048
-      && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
-  const bool q30_sm100_t2_t5_t8_merged_a = (true
-      ? (inv.shape.num_tokens == 2 || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9)
-      : (inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9))
+  const bool q30_sm100_t2_t5_t8_merged_a = (inv.shape.num_tokens == 2 || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9)
       && !silu && !situ && !swiglu_oa
       && schedule.fc1 == warp_decode::Fc1Schedule::kPersistent
       && schedule.route_layout == warp_decode::RouteLayout::kDirect
@@ -5102,28 +5056,12 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       : schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 1
       : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed ? -1
       : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? 6
-      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentPaddedScaleDeviceWorkfeed ? -1
       : q30_sm100_t2_t5_t8_merged_a ? 26
       : 2;
   if (!prepare(fc1_kernel)) return;
   // The plain device-workfeed FC1 and its fused route-pack clone share every downstream choice.
   const bool fc1_swiglu_workfeed = fc1_kernel == 6
       || fc1_kernel == 27;
-  const bool early_fc2_accumulator = false
-      && fc1_kernel == 2
-      && schedule.route_layout == warp_decode::RouteLayout::kDirect
-      && inv.shape.num_tokens == 8 && inv.shape.hidden_size == 2048
-      && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
-  const bool fc2_workfeed_prefetch = false
-      && ((fc1_swiglu_workfeed
-           || false)
-          && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-          && inv.shape.num_tokens >= 10 && inv.shape.num_tokens <= 19
-          && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
-          && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
-          && inv.shape.top_k == 8
-          || (fc1_swiglu_workfeed && sharded_packed_k256_prefetch));
   const bool q30_sm100_fc12 = true
       && (fc1_kernel == -1
           || fc1_kernel == 28)
@@ -5159,25 +5097,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.num_tokens == 5 && inv.shape.hidden_size == 6144
       && inv.shape.intermediate_size == 3072 && inv.shape.num_experts == 128
       && inv.shape.local_num_experts == 128 && inv.shape.top_k == 4;
-  const bool q30_sm103_t21_valid_k64 = false
-      && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && inv.shape.num_tokens == 21 && inv.shape.hidden_size == 2048
-      && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
-  const bool fc2_stage5_early_accumulator = false
-      && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && ((inv.shape.num_tokens == 5 && inv.shape.hidden_size == 6144 && inv.shape.intermediate_size == 3072
-           && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128 && inv.shape.top_k == 4)
-          || ((inv.shape.num_tokens == 15 || inv.shape.num_tokens == 16) && inv.shape.hidden_size == 2048
-              && inv.shape.intermediate_size == 512 && inv.shape.num_experts == 256
-              && inv.shape.local_num_experts == 256 && inv.shape.top_k == 8));
-  const bool fc2_direct_mma_u2 = false
-      && fc1_kernel == 26
-      && schedule.route_layout == warp_decode::RouteLayout::kDirect
-      && (inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9)
-      && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
-      && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
-      && inv.shape.top_k == 8;
   // Fused route-pack clones of the row's canonical device-workfeed FC2 (Q30 rows only).
   const int fused_fc2_kernel = !fused_pack ? -1
       : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256
@@ -5186,10 +5105,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       : -1;
   const int fc2_kernel = fused_pack ? fused_fc2_kernel : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256
       ? (q30_t7_direct ? 11 : q30_t8_grouped ? 13 : q30_sm100_fc12 && (inv.shape.num_tokens == 13 || inv.shape.num_tokens == 14 || inv.shape.num_tokens == 15 || inv.shape.num_tokens == 16 || inv.shape.num_tokens == 17 || ((inv.shape.num_tokens >= 20 && inv.shape.num_tokens <= 28) || inv.shape.num_tokens == 29 || inv.shape.num_tokens == 30 || inv.shape.num_tokens == 31)) ? -1 : m3_t1_refined ? 12 : 10)
-      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed ? (q30_sm100_fc12 ? -1 : -1)
       : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512DeviceWorkfeed ? (m3_sm100_t5_early_accumulator ? 18 : 17)
-      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512Stage5DeviceWorkfeed ? (fc2_stage5_early_accumulator ? -1 : -1)
-      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK768K96PaddedScale ? -1
       : -1;
   if (!prepare(fc2_kernel)) return;
   const bool fixed_k3_top_k = fc1_kernel == 9
@@ -5199,7 +5115,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.hidden_size == 3584 && inv.shape.intermediate_size == 3072
       && inv.shape.num_experts == 896 && inv.shape.local_num_experts == 896
       && inv.shape.top_k == 16;
-  const bool fixed_q8_top_k = (fc1_kernel == 6 || q35_sm103_t16)
+  const bool fixed_q8_top_k = fc1_kernel == 6
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
       && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4
       && (inv.shape.num_tokens == 32
@@ -5245,16 +5161,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
       && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
       && inv.shape.top_k == 8;
-  const bool q30_sm103_fixed8 = false
-      && fc1_swiglu_workfeed
-      && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed
-      && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4
-      && (inv.shape.num_tokens == 20 || inv.shape.num_tokens == 21
-          || inv.shape.num_tokens == 23 || inv.shape.num_tokens == 24 || inv.shape.num_tokens == 25)
-      && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
-      && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
-      && inv.shape.top_k == 8;
   const bool q30_t18_finalize256 = q30_sm100_fixed8
       && inv.shape.num_tokens == 18;
   const int finalize_threads = q30_t18_finalize256 ? 256 : k3_finalize64 ? 64 : schedule.finalize_threads;
@@ -5262,7 +5168,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       : k3_finalize_loop16 ? 22
       : k3_finalize64 ? 21
       : fixed_k3_top_k ? 20
-      : (q30_sm100_fc12 || q30_sm100_fixed8 || q30_sm103_fixed8 || q30_sm103_t10 || fixed_q8_top_k || m2_fixed8 || sharded_fixed8) ? 23
+      : (q30_sm100_fc12 || q30_sm100_fixed8 || fixed_q8_top_k || m2_fixed8 || sharded_fixed8) ? 23
       : (fixed_q397_top_k || sharded_fixed10) ? 25
       : schedule.finalize_threads == 32
       ? (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 14 : -1)
@@ -5357,57 +5263,52 @@ inline constexpr bool kConfiguresDynamicSharedMemory = true;
 inline constexpr int32_t kMaximumLaunchCount = 4;
 inline constexpr size_t kWorkspaceAlignment = 256;
 inline constexpr size_t kDefaultDynamicSharedMemoryBytes = 48u * 1024u;
-inline constexpr size_t kMaximumAuthoredDynamicSharedMemoryBytes = 219776u;
-inline constexpr char kGeneratedSourceSha256[] = "f39d56d7873c21143889f4a0a4fa7a4739aa0b6c925a8580ecd297ee9647279d";
 
 struct UInt3 { uint32_t x, y, z; };
 struct KernelSpec {
   const char* symbol;
-  const char* kind;
   UInt3 block;
   UInt3 cluster;
   size_t dynamic_smem_bytes;
   bool cooperative;
   bool spread_cluster;
   bool programmatic_dependent_launch;
-  const char* tensor_map_abi;
-  const char* grid[3];
 };
 inline constexpr KernelSpec kKernelSpecs[] = {
-  {"kernel_cake_warp_decode_0686b950e5dc33f7f54f", "route_pack_generic", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_31a3880ae8e28c314b6e", "route_pack_e64_scan1", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_3754ea7477cc2b195d70", "route_pack_e64_scan2", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_3aa297e8ff45f1333ec9", "fc1_swiglu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_7d6f94378c1107da3804", "fc1_swiglu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_345efbf7077827bc328e", "fc1_swiglu_oa_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_5312a73885ff3541a6b6", "fc1_swiglu_oa_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a57e715fd2682ae22fe1", "fc1_swiglu_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_57d9c60cbe65cd74f52d", "fc1_swiglu_early_sfb_a_tma_merged_mma_u2_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_ca90fcc9f37486b6d2af", "fc1_swiglu_padded_sfc_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_514c77f65f72ffd8d0a5", "fc1_silu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_2d89b2ccfa19074dd9fb", "fc1_silu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_958ca99134107b938d76", "fc1_situ_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_5c23234a34054124f4ce", "fc2_sm103_refined_k256", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_de0e5a68a49864417599", "fc2_sm103_k512_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_af89090fc3cdb3814f96", "fc2_sm103_k512_stage5_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_8acc0c77f5b6d2888496", "fc2_sm103_k512_stage5_early_accumulator_mma_u2_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_e2e6dc8e54d3325b2362", "fc2_sm103_k768_k96", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_b3500b8b821383793dfd", "fc2_sm103_k768_k96_padded_sfb_cp", {384, 1, 1}, {1, 1, 1}, 196736u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a3292d8194689829d62c", "finalize_direct_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_ae864980eb4b1aa0e8c1", "finalize_packed_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_9ace9f7e5e0c273ae879", "finalize_direct_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_61f9c98fb7c8656ae154", "finalize_packed_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_55b2995635e0b6aa2b52", "fc1_swiglu_early_sfb_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_16387cc0de2abce13ade", "finalize_direct_t128_k16", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_8388b2049117830020f2", "finalize_packed_t128_k8", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_a11aa740b9780f90e7ee", "finalize_packed_t128_k10", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_510ad9e9035da24674b6", "fc1_swiglu_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_5304d683b9d7578df0b1", "fc1_swiglu_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_707580ee046c8424e63f", "fc1_swiglu_early_sfb_a_tma_merged_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_6a78714a458f2b53e363", "fc2_sm103_k512_stage5_valid_k64_prefetch_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_b0e329ce4c715a895df4", "fc2_sm103_refined_k256_workfeed_prefetch_fused_pack", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_372605d6f63db4b97d71", "fc2_sm103_k512_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_c5afe5ba09998bcee409", "fc2_sm103_k512_valid_k64_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_0686b950e5dc33f7f54f", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true},
+  {"kernel_cake_warp_decode_31a3880ae8e28c314b6e", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true},
+  {"kernel_cake_warp_decode_3754ea7477cc2b195d70", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true},
+  {"kernel_cake_warp_decode_3aa297e8ff45f1333ec9", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
+  {"kernel_cake_warp_decode_7d6f94378c1107da3804", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_345efbf7077827bc328e", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_5312a73885ff3541a6b6", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_a57e715fd2682ae22fe1", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_57d9c60cbe65cd74f52d", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_ca90fcc9f37486b6d2af", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_514c77f65f72ffd8d0a5", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
+  {"kernel_cake_warp_decode_2d89b2ccfa19074dd9fb", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_958ca99134107b938d76", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
+  {"kernel_cake_warp_decode_5c23234a34054124f4ce", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
+  {"kernel_cake_warp_decode_de0e5a68a49864417599", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true},
+  {"kernel_cake_warp_decode_af89090fc3cdb3814f96", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_8acc0c77f5b6d2888496", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_e2e6dc8e54d3325b2362", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
+  {"kernel_cake_warp_decode_b3500b8b821383793dfd", {384, 1, 1}, {1, 1, 1}, 196736u, false, false, true},
+  {"kernel_cake_warp_decode_a3292d8194689829d62c", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_ae864980eb4b1aa0e8c1", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_9ace9f7e5e0c273ae879", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_61f9c98fb7c8656ae154", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_55b2995635e0b6aa2b52", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_16387cc0de2abce13ade", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_8388b2049117830020f2", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_a11aa740b9780f90e7ee", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true},
+  {"kernel_cake_warp_decode_510ad9e9035da24674b6", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true},
+  {"kernel_cake_warp_decode_5304d683b9d7578df0b1", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true},
+  {"kernel_cake_warp_decode_707580ee046c8424e63f", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true},
+  {"kernel_cake_warp_decode_6a78714a458f2b53e363", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
+  {"kernel_cake_warp_decode_b0e329ce4c715a895df4", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true},
+  {"kernel_cake_warp_decode_372605d6f63db4b97d71", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true},
+  {"kernel_cake_warp_decode_c5afe5ba09998bcee409", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true},
 };
 static_assert(sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]) == 34);
 
@@ -5616,21 +5517,12 @@ inline TensorLayout DenseLayout(const void* data, std::initializer_list<int64_t>
   return layout;
 }
 
-// Each generated kernel has one preparation flag, including the last table entry.
-inline constexpr size_t kKernelCount = sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]);
-struct DeviceState { bool ready; int32_t sm_count; bool allow_nonportable[kKernelCount]; };
+struct DeviceState { bool ready; int32_t sm_count; };
 inline std::array<DeviceState, 64>& DeviceStates() {
   static std::array<DeviceState, 64> states{};
   return states;
 }
 inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
-inline bool NeedsNonPortableSmem(int kernel) {
-  int device = -1;
-  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64 || kernel < 0 || static_cast<size_t>(kernel) >= kKernelCount)
-    return false;
-  std::lock_guard<std::mutex> lock(DeviceMutex());
-  return DeviceStates()[device].allow_nonportable[kernel];
-}
 
 inline bool EncodeTensorMap_3_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -7448,7 +7340,7 @@ inline void VisitKernel_0(const KernelArgs_0& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(0), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_0, &args};
   visitor(launch, context);
 }
@@ -7515,7 +7407,7 @@ inline void VisitKernel_1(const KernelArgs_1& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(1), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_1, &args};
   visitor(launch, context);
 }
@@ -7582,7 +7474,7 @@ inline void VisitKernel_2(const KernelArgs_2& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(2), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_2, &args};
   visitor(launch, context);
 }
@@ -7664,7 +7556,7 @@ inline void VisitKernel_3(const KernelArgs_3& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(3), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_3, &args};
   visitor(launch, context);
 }
@@ -7752,7 +7644,7 @@ inline void VisitKernel_4(const KernelArgs_4& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(4), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_4, &args};
   visitor(launch, context);
 }
@@ -7840,7 +7732,7 @@ inline void VisitKernel_5(const KernelArgs_5& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(5), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_5, &args};
   visitor(launch, context);
 }
@@ -7928,7 +7820,7 @@ inline void VisitKernel_6(const KernelArgs_6& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(6), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_6, &args};
   visitor(launch, context);
 }
@@ -8016,7 +7908,7 @@ inline void VisitKernel_7(const KernelArgs_7& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(7), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_7, &args};
   visitor(launch, context);
 }
@@ -8104,7 +7996,7 @@ inline void VisitKernel_8(const KernelArgs_8& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(8), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_8, &args};
   visitor(launch, context);
 }
@@ -8192,7 +8084,7 @@ inline void VisitKernel_9(const KernelArgs_9& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(9), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_9, &args};
   visitor(launch, context);
 }
@@ -8274,7 +8166,7 @@ inline void VisitKernel_10(const KernelArgs_10& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(10), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_10, &args};
   visitor(launch, context);
 }
@@ -8362,7 +8254,7 @@ inline void VisitKernel_11(const KernelArgs_11& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(11), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_11, &args};
   visitor(launch, context);
 }
@@ -8447,7 +8339,7 @@ inline void VisitKernel_12(const KernelArgs_12& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(12), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_12, &args};
   visitor(launch, context);
 }
@@ -8520,7 +8412,7 @@ inline void VisitKernel_13(const KernelArgs_13& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(13), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_13, &args};
   visitor(launch, context);
 }
@@ -8593,7 +8485,7 @@ inline void VisitKernel_14(const KernelArgs_14& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(14), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_14, &args};
   visitor(launch, context);
 }
@@ -8666,7 +8558,7 @@ inline void VisitKernel_15(const KernelArgs_15& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(15), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_15, &args};
   visitor(launch, context);
 }
@@ -8739,7 +8631,7 @@ inline void VisitKernel_16(const KernelArgs_16& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(16), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_16, &args};
   visitor(launch, context);
 }
@@ -8812,7 +8704,7 @@ inline void VisitKernel_17(const KernelArgs_17& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(17), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_17, &args};
   visitor(launch, context);
 }
@@ -8885,7 +8777,7 @@ inline void VisitKernel_18(const KernelArgs_18& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(18), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_18, &args};
   visitor(launch, context);
 }
@@ -8934,7 +8826,7 @@ inline void VisitKernel_19(const KernelArgs_19& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(19), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_19, &args};
   visitor(launch, context);
 }
@@ -8983,7 +8875,7 @@ inline void VisitKernel_20(const KernelArgs_20& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(20), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_20, &args};
   visitor(launch, context);
 }
@@ -9032,7 +8924,7 @@ inline void VisitKernel_21(const KernelArgs_21& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(21), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_21, &args};
   visitor(launch, context);
 }
@@ -9081,7 +8973,7 @@ inline void VisitKernel_22(const KernelArgs_22& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(22), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_22, &args};
   visitor(launch, context);
 }
@@ -9169,7 +9061,7 @@ inline void VisitKernel_23(const KernelArgs_23& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(23), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_23, &args};
   visitor(launch, context);
 }
@@ -9218,7 +9110,7 @@ inline void VisitKernel_24(const KernelArgs_24& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(24), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_24, &args};
   visitor(launch, context);
 }
@@ -9267,7 +9159,7 @@ inline void VisitKernel_25(const KernelArgs_25& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(25), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_25, &args};
   visitor(launch, context);
 }
@@ -9316,7 +9208,7 @@ inline void VisitKernel_26(const KernelArgs_26& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(26), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_26, &args};
   visitor(launch, context);
 }
@@ -9434,7 +9326,7 @@ inline void VisitKernel_27(const KernelArgs_27& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(27), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_27, &args};
   visitor(launch, context);
 }
@@ -9552,7 +9444,7 @@ inline void VisitKernel_28(const KernelArgs_28& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(28), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_28, &args};
   visitor(launch, context);
 }
@@ -9670,7 +9562,7 @@ inline void VisitKernel_29(const KernelArgs_29& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(29), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_29, &args};
   visitor(launch, context);
 }
@@ -9755,7 +9647,7 @@ inline void VisitKernel_30(const KernelArgs_30& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(30), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_30, &args};
   visitor(launch, context);
 }
@@ -9840,7 +9732,7 @@ inline void VisitKernel_31(const KernelArgs_31& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(31), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_31, &args};
   visitor(launch, context);
 }
@@ -9925,7 +9817,7 @@ inline void VisitKernel_32(const KernelArgs_32& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(32), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_32, &args};
   visitor(launch, context);
 }
@@ -10010,7 +9902,7 @@ inline void VisitKernel_33(const KernelArgs_33& args, dim3 grid,
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(33), spec.cooperative, spec.spread_cluster,
+      spec.cooperative, spec.spread_cluster,
       &SubmitKernel_33, &args};
   visitor(launch, context);
 }
@@ -10107,9 +9999,6 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
   error = cudaDeviceGetAttribute(&state.sm_count, cudaDevAttrMultiProcessorCount, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MultiProcessorCount");
   if (state.sm_count <= 0) return detail::Invalid("EnsureDeviceReady SM count");
-  int portable_max = 0;
-  error = cudaDeviceGetAttribute(&portable_max, cudaDevAttrMaxSharedMemoryPerBlock, device_id);
-  if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlock");
   int optin_max = 0;
   error = cudaDeviceGetAttribute(&optin_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlockOptin");
@@ -10153,7 +10042,6 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
     const size_t requested = kKernelSpecs[kernel].dynamic_smem_bytes;
     if (requested > static_cast<size_t>(optin_max))
       return detail::Invalid("EnsureDeviceReady shared memory exceeds opt-in ceiling");
-    state.allow_nonportable[kernel] = requested > static_cast<size_t>(portable_max);
     if (requested <= kDefaultDynamicSharedMemoryBytes) continue;
     error = cudaFuncSetAttribute(functions[kernel], cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(requested));
@@ -10171,18 +10059,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       inv.workspace == nullptr) return;
   detail::WorkspaceView ws{};
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws) || inv.workspace_bytes < ws.bytes) return;
-  if (inv.prepared_intermediate || inv.prepared_intermediate_scale) {
-    if (!warp_decode::UsesOwnedInputScratch(inv.shape, schedule) ||
-        !inv.prepared_intermediate || !inv.prepared_intermediate_scale) return;
-    ws.intermediate = static_cast<uint8_t*>(inv.prepared_intermediate);
-    ws.intermediate_scale = static_cast<uint8_t*>(inv.prepared_intermediate_scale);
-  }
-  if (inv.prepared_partials) {
-    if (!warp_decode::UsesOwnedPartialScratch(inv.shape, schedule) ||
-        (warp_decode::UsesOwnedInputScratch(inv.shape, schedule) &&
-         (!inv.prepared_intermediate || !inv.prepared_intermediate_scale))) return;
-    ws.partials = static_cast<uint16_t*>(inv.prepared_partials);
-  }
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return;
   { std::lock_guard<std::mutex> lock(detail::DeviceMutex());
@@ -10335,23 +10211,13 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.num_tokens == 11 && inv.shape.hidden_size == 2048
       && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
       && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
-  const bool q30_sm100_t2_t5_t8_merged_a = (false
-      ? (inv.shape.num_tokens == 2 || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9)
-      : (inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9))
+  const bool q30_sm100_t2_t5_t8_merged_a = (inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9)
       && !silu && !situ && !swiglu_oa
       && schedule.fc1 == warp_decode::Fc1Schedule::kPersistent
       && schedule.route_layout == warp_decode::RouteLayout::kDirect
       && inv.shape.hidden_size == 2048
       && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
       && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
-  const bool m3_t1_static_early_sfb = false
-      && swiglu_oa && schedule.fc1 == warp_decode::Fc1Schedule::kStatic
-      && schedule.route_layout == warp_decode::RouteLayout::kDirect
-      && inv.shape.num_tokens == 1 && inv.shape.hidden_size == 6144
-      && inv.shape.intermediate_size == 3072 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 4;
-  // Sharded per-partition slices stream their fused route-pack kernels evict-first (sm_100a clones).
-  const bool sharded_evict_first = fused_pack && false;
   // Sharded per-partition slices: fused route-pack FC1 + metadata-prefetch K256 FC2 + model-top-k finalizer.
   const bool sharded_packed_k256_prefetch = fused_pack
       && schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed
@@ -10363,7 +10229,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed ? (q30_sm103_t10 ? 29 : -1)
       : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? (q30_t11_mma_u2 ? 28 : 27)
       : -1;
-  const int fc1_kernel = fused_pack ? fused_fc1_kernel : m3_t1_static_early_sfb ? -1 : situ ? 12 : silu
+  const int fc1_kernel = fused_pack ? fused_fc1_kernel : situ ? 12 : silu
       ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 10 : 11)
       : swiglu_oa ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? -1
           : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? 6
@@ -10393,41 +10259,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
           && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
           && inv.shape.top_k == 8
           || (fc1_swiglu_workfeed && sharded_packed_k256_prefetch));
-  const bool q30_sm100_fc12 = false
-      && (fc1_kernel == -1
-          || fc1_kernel == -1)
-      && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && (schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed
-          || ((inv.shape.num_tokens == 13 || inv.shape.num_tokens == 14 || inv.shape.num_tokens == 15 || inv.shape.num_tokens == 16 || inv.shape.num_tokens == 17 || ((inv.shape.num_tokens >= 20 && inv.shape.num_tokens <= 28) || inv.shape.num_tokens == 29 || inv.shape.num_tokens == 30 || inv.shape.num_tokens == 31))
-              && schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256))
-      && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4
-      && ((inv.shape.num_tokens >= 10 && inv.shape.num_tokens <= 12) || inv.shape.num_tokens == 13 || inv.shape.num_tokens == 14 || inv.shape.num_tokens == 15 || inv.shape.num_tokens == 16 || inv.shape.num_tokens == 17 || ((inv.shape.num_tokens >= 20 && inv.shape.num_tokens <= 28) || inv.shape.num_tokens == 29 || inv.shape.num_tokens == 30 || inv.shape.num_tokens == 31))
-      && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
-      && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
-      && inv.shape.top_k == 8;
-  const bool q30_t7_direct = false
-      && inv.shape.num_tokens == 7 && inv.shape.hidden_size == 2048
-      && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8
-      && schedule.route_layout == warp_decode::RouteLayout::kDirect
-      && schedule.fc1 == warp_decode::Fc1Schedule::kPersistent;
-  const bool q30_t8_grouped = false
-      && (inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9) && inv.shape.hidden_size == 2048
-      && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8
-      && schedule.route_layout == warp_decode::RouteLayout::kDirect
-      && schedule.fc1 == warp_decode::Fc1Schedule::kPersistent;
-  const bool m3_t1_refined = false
-      && swiglu_oa && schedule.fc1 == warp_decode::Fc1Schedule::kStatic
-      && schedule.route_layout == warp_decode::RouteLayout::kDirect
-      && inv.shape.num_tokens == 1 && inv.shape.hidden_size == 6144
-      && inv.shape.intermediate_size == 3072 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 4;
-  const bool m3_sm100_t5_early_accumulator = false
-      && fc1_kernel == -1
-      && inv.shape.num_tokens == 5 && inv.shape.hidden_size == 6144
-      && inv.shape.intermediate_size == 3072 && inv.shape.num_experts == 128
-      && inv.shape.local_num_experts == 128 && inv.shape.top_k == 4;
   const bool q30_sm103_t21_valid_k64 = true
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
       && inv.shape.num_tokens == 21 && inv.shape.hidden_size == 2048
@@ -10455,7 +10286,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       : -1;
   const int fc2_kernel = fused_pack ? fused_fc2_kernel : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256
       ? (fc2_direct_mma_u2 ? -1 : fc2_workfeed_prefetch ? -1 : early_fc2_accumulator ? -1 : 13)
-      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed ? (q30_sm103_t10 ? -1 : q30_sm103_t21_valid_k64 ? -1 : -1)
+      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed ? -1
       : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512DeviceWorkfeed ? 14
       : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512Stage5DeviceWorkfeed ? (fc2_stage5_early_accumulator ? 16 : 15)
       : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK768K96PaddedScale ? 18
@@ -10492,28 +10323,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.num_experts == 512 && inv.shape.local_num_experts == 512;
   const bool sharded_fixed8 = sharded_packed_k256_prefetch && inv.shape.top_k == 8;
   const bool sharded_fixed10 = sharded_packed_k256_prefetch && inv.shape.top_k == 10;
-  const bool k3_finalize64 = false
-      && fixed_k3_top_k && inv.shape.num_tokens >= 1 && inv.shape.num_tokens <= 16;
-  const bool k3_finalize_loop16 = k3_finalize64
-      && (inv.shape.num_tokens == 3 || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 6
-          || inv.shape.num_tokens == 7 || inv.shape.num_tokens == 8 || inv.shape.num_tokens == 9
-          || inv.shape.num_tokens == 10 || inv.shape.num_tokens == 15);
-  const bool m2_fixed8 = false
-      && (inv.shape.num_tokens == 27 || inv.shape.num_tokens == 28 || inv.shape.num_tokens == 30 || inv.shape.num_tokens == 32)
-      && inv.shape.hidden_size == 3072
-      && inv.shape.intermediate_size == 1536 && inv.shape.num_experts == 256
-      && inv.shape.local_num_experts == 256 && inv.shape.top_k == 8
-      && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4;
-  const bool q30_sm100_fixed8 = false
-      && fc1_swiglu_workfeed
-      && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed
-      && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4
-      && (inv.shape.num_tokens == 18 || inv.shape.num_tokens == 19)
-      && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
-      && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
-      && inv.shape.top_k == 8;
   const bool q30_sm103_fixed8 = true
       && fc1_swiglu_workfeed
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
@@ -10524,14 +10333,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
       && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
       && inv.shape.top_k == 8;
-  const bool q30_t18_finalize256 = q30_sm100_fixed8
-      && inv.shape.num_tokens == 18;
-  const int finalize_threads = q30_t18_finalize256 ? 256 : k3_finalize64 ? 64 : schedule.finalize_threads;
-  const int finalize_kernel = q30_t18_finalize256 ? -1
-      : k3_finalize_loop16 ? -1
-      : k3_finalize64 ? -1
-      : fixed_k3_top_k ? 24
-      : (q30_sm100_fc12 || q30_sm100_fixed8 || q30_sm103_fixed8 || q30_sm103_t10 || q30_sm103_t8_fused_k256 || fixed_q8_top_k || m2_fixed8 || sharded_fixed8) ? 25
+  const int finalize_threads = schedule.finalize_threads;
+  const int finalize_kernel = fixed_k3_top_k ? 24
+      : (q30_sm103_fixed8 || q30_sm103_t10 || q30_sm103_t8_fused_k256 || fixed_q8_top_k || sharded_fixed8) ? 25
       : (fixed_q397_top_k || sharded_fixed10) ? 26
       : schedule.finalize_threads == 32
       ? (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 19 : 20)

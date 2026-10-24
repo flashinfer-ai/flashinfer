@@ -36,7 +36,6 @@ from flashinfer.diffusion_ops import (
     minimax_h3_out_proj,
     minimax_h3_out_proj_mxfp8,
     minimax_h3_out_proj_nvfp4,
-    minimax_h3_out_proj_reference,
     prepare_minimax_h3_o_weight_mxfp8,
     prepare_minimax_h3_o_weight_nvfp4,
 )
@@ -55,15 +54,18 @@ from flashinfer.diffusion_ops.minimax_h3_out_proj import (
     NVFP4_PACKED_COLS,
     NVFP4_SF_COLS,
     NVFP4_SF_K_TILES,
-    _reference_from_operands,
     _weight_scale_tiles,
     minimax_h3_nvfp4_alpha,
     minimax_h3_nvfp4_global_scale,
-    minimax_h3_unpack_attn_out,
     mxfp8_activation_scale_workspace_bytes,
     nvfp4_activation_scale_workspace_bytes,
 )
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.minimax_h3_out_proj_reference import (
+    _reference_from_operands,
+    minimax_h3_out_proj_reference,
+    minimax_h3_unpack_attn_out,
+)
 
 ATOL = 1e-2
 RTOL = 1e-2
