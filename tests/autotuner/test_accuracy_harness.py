@@ -210,6 +210,49 @@ def test_graph_study_does_not_hide_bad_shared_output(monkeypatch):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_graph_study_rejects_invalidated_retained_control(monkeypatch):
+    from flashinfer.autotuner import TunableRunner
+
+    module = _harness()
+
+    class Runner(TunableRunner):
+        def __init__(self):
+            self.bias = torch.ones(4, device="cuda")
+            self.output = torch.empty_like(self.bias)
+            self.prepared = False
+
+        def __hash__(self):
+            return hash(type(self))
+
+        def get_valid_tactics(self, inputs, profile):
+            if not self.prepared:
+                # Preparation reuses storage held by the old graph. Later
+                # graphs bind the new bias and still produce correct output.
+                self.bias.zero_()
+                self.bias = torch.ones_like(self.bias)
+                self.prepared = True
+            return [0]
+
+        def forward(self, inputs, tactic=-1, **kwargs):
+            return torch.add(inputs[0], self.bias, out=self.output)
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner, inputs, tactic, config, **kw: 1.0 if tactic == 0 else 2.0,
+    )
+    with pytest.raises(AssertionError):
+        module.graph_selection_study(
+            "test.invalidated_control",
+            [Runner()],
+            TuningConfig(),
+            [torch.ones(4, device="cuda")],
+            {},
+            _study_args(),
+        )
+
+
 def test_unavailable_cupti_cannot_be_scored_as_an_oracle(monkeypatch):
     import importlib
 

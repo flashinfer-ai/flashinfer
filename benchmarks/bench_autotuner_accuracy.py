@@ -521,12 +521,12 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
 
             tuner._profile_single_kernel = record
             with use_isolated_tuner(AutoTuner()):
-                before, reference = capture_tactic_graph(
+                before, before_output = capture_tactic_graph(
                     runners[0], inputs, -1, kwargs, args.warmup
                 )
                 reference = tree_map(
                     lambda x: x.detach().clone() if isinstance(x, torch.Tensor) else x,
-                    reference,
+                    before_output,
                 )
             with use_isolated_tuner(tuner):
                 with autotune_v2(persistent_cache=False, measurement_policy=policy):
@@ -565,16 +565,16 @@ def graph_selection_study(op, runners, config, inputs, kwargs, args):
             )
             # Different tactics can bind the same caller-owned output buffer.
             # Replay and check each graph before another graph overwrites it.
-            chosen.replay()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(
-                chosen_output, reference, rtol=args.rtol, atol=args.atol
-            )
-            after.replay()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(
-                after_output, reference, rtol=args.rtol, atol=args.atol
-            )
+            for graph, output in (
+                (before, before_output),
+                (chosen, chosen_output),
+                (after, after_output),
+            ):
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    output, reference, rtol=args.rtol, atol=args.atol
+                )
             medians = {key: statistics.median(value) for key, value in samples.items()}
             rows.append(
                 {
