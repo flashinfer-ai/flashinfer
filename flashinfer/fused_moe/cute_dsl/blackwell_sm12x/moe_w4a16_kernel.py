@@ -117,6 +117,7 @@ _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
 _NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
+    "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
 }
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
@@ -657,7 +658,11 @@ class W4A16GemmKernel:
         # k32 scale cadence (two K16 rows share one scale group). Shared by the
         # native E8M0 K/32 path and the NF3 e4m3-style K/32 path; the scale
         # DECODE stays keyed on scale_format_e8m0_k32 (e4m3_k32 uses the e4m3
-        # decode arm, its 2**116 compensation lives in the global_scale tensor).
+        # decode arm). The arms compensate differently: the E8M0 arm folds its
+        # launch-side global compensation here via _E8M0_K32_FP16_GLOBAL_
+        # COMPENSATION (2**7) / _E8M0_K32_BF16_GLOBAL_COMPENSATION (2**119),
+        # while the e4m3 arm's 2**116 is already folded into the global_scale
+        # tensor the checkpoint ships.
         self.scale_k32 = scale_format in ("e8m0_k32", "e4m3_k32")
         # NF3 codebook prmt pools (host-computed compile-time constants injected
         # into the device dequant). Only consumed by the nf3_2p1 path; cheap to
@@ -5022,7 +5027,8 @@ def _normalize_scale_format(scale_format: str) -> str:
         return _SCALE_FORMATS[scale_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "scale_format must be one of 'e4m3_k16' or 'e8m0_k32', "
+            "scale_format must be one of 'e4m3_k16', 'e4m3_k32', or "
+            "'e8m0_k32', "
             f"got {scale_format!r}"
         ) from exc
 

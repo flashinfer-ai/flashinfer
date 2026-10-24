@@ -11,7 +11,7 @@ import hashlib
 import os
 import weakref
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -3830,13 +3830,30 @@ _Sm120Workspace = Union[
 # depends only on the counts, and EP callers pass expert_map per call.
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
 
+# Workspaces replaced by a capacity growth. A captured CUDA graph may still
+# reference the replaced buffers, so they are parked here instead of being
+# freed; releasing one mid-replay surfaces as cudaErrorIllegalAddress. The
+# list is FIFO-bounded and clear_sm120_moe_caches() releases everything.
+_RETIRED_WORKSPACES: List[_Sm120Workspace] = []
+_RETIRED_WORKSPACES_MAX = 8
+
+# Workspaces a captured CUDA graph may still replay. A cache hit served
+# during capture is baked into the graph as raw buffer addresses, so its
+# strong reference must survive later capacity growth and FIFO eviction.
+# Graph lifetime is not observable here, so the pin is kept for the
+# process lifetime (bounded by the number of captured geometries).
+_GRAPH_PINNED_WORKSPACES: List[_Sm120Workspace] = []
+
 
 def clear_sm120_moe_caches() -> None:
     """Release every module-level SM12x MoE cache.
 
-    References held by callers are unaffected.
+    References held by callers are unaffected. Graph-pinned workspaces
+    (see ``_GRAPH_PINNED_WORKSPACES``) are likewise retained: a captured
+    CUDA graph may replay their buffers after this call.
     """
     _WORKSPACE_CACHE.clear()
+    _RETIRED_WORKSPACES.clear()
     _WEIGHT_CACHE.clear()
     _W4A16_WEIGHT_CACHE.clear()
     _PADDED_SCALE_CACHE.clear()
@@ -3975,6 +3992,11 @@ def _get_cached_workspace(
         tile_m,
     )
     cached = _WORKSPACE_CACHE.get(cache_key)
+    if cached is not None and _is_cuda_graph_capturing():
+        # This workspace may be baked into the graph being captured; pin it
+        # so a later capacity growth cannot free its buffers mid-replay.
+        if cached not in _GRAPH_PINNED_WORKSPACES:
+            _GRAPH_PINNED_WORKSPACES.append(cached)
 
     if cached is not None:
         if isinstance(cached, Sm120DynamicMoEWorkspace):
@@ -4010,6 +4032,15 @@ def _get_cached_workspace(
         activation=activation,
     )
 
+    # A capacity growth replaces the cached workspace; a captured CUDA graph
+    # may still reference the replaced buffers, so park the old workspace in
+    # _RETIRED_WORKSPACES instead of dropping the last reference to it. FIFO
+    # eviction is graph-safe: a workspace served during capture keeps its
+    # strong reference in _GRAPH_PINNED_WORKSPACES and is never freed.
+    if cached is not None:
+        _RETIRED_WORKSPACES.append(cached)
+        if len(_RETIRED_WORKSPACES) > _RETIRED_WORKSPACES_MAX:
+            _RETIRED_WORKSPACES.pop(0)
     _WORKSPACE_CACHE[cache_key] = workspace
     return workspace
 
