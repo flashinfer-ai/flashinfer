@@ -95,6 +95,9 @@ _COMMON = dict(
     candidate_slack=128,
     cand_mult_rule=[384.0, 8],
     cand_cap_floor=8192,
+    candidate_multiplier_unsampled=4,
+    cand_mult_rule_unsampled=[384.0, 8],
+    cand_cap_floor_unsampled=8192,
     split_max=32,
     split_min_range_tiles=64,
     snake_default=False,
@@ -619,6 +622,9 @@ def test_policy_record_round_trip_and_validation():
         dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
         dict(far_sample=-1),
         dict(far_sample=True),
+        dict(candidate_multiplier_unsampled=0),  # the unsampled capacity values
+        dict(cand_mult_rule_unsampled=384),
+        dict(cand_cap_floor_unsampled=8192.5),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
@@ -649,6 +655,28 @@ def test_policy_capacity_period_and_finalize():
     assert p.cand_cap_multiplier_for(8192, 1048576, 1, 1, 2048) == 8
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 256) == 32
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 4096) == 4
+    # the unsampled capacity values stand in when the sampled first threshold is off
+    raised = DispatchPolicy.from_record(
+        dict(p.record(), candidate_multiplier=16, cand_cap_floor=16384)
+    )
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 256, sampled=False) == 32
+    geometry = dict(
+        num_queries=65536, num_keys=65536, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    sampled = cake_policy.select_program(raised, **geometry)
+    unsampled = cake_policy.select_program(raised, sample_tiles_max=0, **geometry)
+    assert sampled.cand_cap == 32768 and sampled.sample_tiles_max > 0
+    assert unsampled.cand_cap == 8192 and unsampled.sample_tiles_max == 0
+    assert (
+        unsampled.cand_cap
+        == cake_policy.select_program(p, sample_tiles_max=0, **geometry).cand_cap
+    )
+    assert (unsampled.scan_key, unsampled.n_split) == (
+        sampled.scan_key,
+        sampled.n_split,
+    )
     # right-sized finalize programs for small top_k, 256 threads up to 2048, 512 above
     assert [p.finalize_threads_for(k) for k in (1, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 4096)] == [
         32, 32, 64, 64, 128, 128, 256, 256, 512, 512,

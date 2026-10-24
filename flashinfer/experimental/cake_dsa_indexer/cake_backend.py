@@ -814,7 +814,8 @@ def prepare_dsa_indexer_topk(
     count), ``candidate_multiplier`` (candidate buffer per query in multiples
     of ``top_k``), ``check_period`` (key tiles between selection-trigger
     checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
-    threshold; ``0`` disables sampling), ``far_sample`` (``1``: the sampled first
+    threshold; ``0`` disables sampling and sizes the candidate buffers by the
+    record's unsampled capacity values), ``far_sample`` (``1``: the sampled first
     threshold of the ascending-tile-order scan programs ranks the far sample
     tiles only, leaving out the sample tile nearest the diagonal; ``0``: every
     sample tile; the descending-order and wide programs ignore it) and
