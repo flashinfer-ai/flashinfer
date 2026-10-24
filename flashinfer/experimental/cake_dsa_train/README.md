@@ -574,6 +574,12 @@ reports that gap).
   identity-checked by the digests in `build.json`).  The four shared pairs,
   the registry leaves of the natural stages and their `build.json` entries are
   a hand fold of exported files; the next export regenerates them.
+  The kernel units take their shared preamble (ABI types, the tensor-map
+  descriptor types, `make_warp_uniform`, `<math_constants.h>`) and their
+  device helpers from `cake_dsa_h64_train_device.cuh`, naming the helpers
+  they need through `CAKE_DSA_H64_TRAIN_NEED_*` defines before the include;
+  this header is part of the same hand fold, ships with the sources and is
+  covered by no `build.json` digest.
 
 ## Status
 
