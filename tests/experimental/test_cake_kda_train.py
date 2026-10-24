@@ -4379,8 +4379,15 @@ def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
     the groups follow the whole problem's rule, the forward scatters their blocks into the saved states by chain
     rank, the backward gathers them (``light_states`` as pass 2 alone), everything bit for bit."""
     lengths, heads = (40000, 20000, 20000, 1000), 4
-    S, N = sum(lengths), len(lengths)
     sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    # The size rule is S >= SEG_SAVE_MIN_TOKENS_PER_SEG * NSEG with NSEG = the SM count here, so on a device
+    # with more SMs than this pack covers (216 on some sm_107a boards) the first document grows until the
+    # plan saves the states; the last document alone stays below the rule.
+    for _ in range(64):
+        if cake_backend.plan(sum(lengths), len(lengths), heads, sm, arch).seg_save:
+            break
+        lengths = (lengths[0] + 4096, *lengths[1:])
+    S, N = sum(lengths), len(lengths)
     p = cake_backend.plan(S, N, heads, sm, arch)
     assert p.recur == "seg" and p.seg_save and p.light_path == "light_states"
     assert not cake_backend.plan(1000, 1, heads, sm, arch).seg_save
