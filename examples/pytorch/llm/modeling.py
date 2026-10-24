@@ -1,0 +1,504 @@
+"""FlashInfer end-to-end LLM example: Llama / Qwen dense decoder.
+
+Reference/verification code, not a serving engine: it strings FlashInfer's
+serving-path ops together the way an inference framework would — paged KV
+cache (`append_paged_kv_cache`), batched prefill/decode attention wrappers,
+RoPE (`apply_rope_pos_ids_inplace`), RMSNorm (`rmsnorm` /
+`fused_add_rmsnorm`), and SwiGLU (`silu_and_mul`) — in plain PyTorch, loading
+weights directly from a Hugging Face checkpoint's safetensors. See
+`docs/design_docs/e2e_pytorch_llm_examples.md` for the rationale.
+
+Supported HF `model_type`s: `llama`, `qwen2`, `qwen3` (dense). The three
+share one skeleton (RMSNorm -> GQA attention with RoPE -> SwiGLU FFN); the
+deltas are Qwen3's per-head q/k norm, Qwen2's QKV bias, and Llama-3.1-style
+RoPE scaling.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import math
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import torch
+
+import flashinfer
+import flashinfer.fused_moe  # noqa: F401  (subpackage attribute access)
+
+SUPPORTED_MODEL_TYPES = ("llama", "qwen2", "qwen3", "qwen3_moe")
+
+
+@dataclasses.dataclass
+class ModelConfig:
+    model_type: str
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    rms_norm_eps: float
+    rope_theta: float
+    tie_word_embeddings: bool
+    rope_scaling: Optional[dict]
+    eos_token_ids: List[int]
+    # MoE fields (qwen3_moe); None/0 for dense models.
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    norm_topk_prob: bool = False
+    decoder_sparse_step: int = 1
+    mlp_only_layers: tuple = ()
+
+    @property
+    def is_moe(self) -> bool:
+        return self.num_experts > 0
+
+    def is_sparse_layer(self, layer_idx: int) -> bool:
+        # Mirrors transformers' Qwen3MoeDecoderLayer selection logic.
+        return (
+            self.num_experts > 0
+            and layer_idx not in self.mlp_only_layers
+            and (layer_idx + 1) % self.decoder_sparse_step == 0
+        )
+
+    @classmethod
+    def from_hf_config(cls, cfg: dict) -> "ModelConfig":
+        model_type = cfg["model_type"]
+        if model_type not in SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"Unsupported model_type {model_type!r}; this example supports "
+                f"{SUPPORTED_MODEL_TYPES}"
+            )
+        # transformers v5 nests rope config under "rope_parameters"; older
+        # checkpoints use top-level "rope_theta" + optional "rope_scaling".
+        rope_params = cfg.get("rope_parameters") or {}
+        rope_theta = rope_params.get("rope_theta", cfg.get("rope_theta", 1e4))
+        rope_scaling = cfg.get("rope_scaling")
+        if rope_params.get("rope_type", "default") != "default":
+            rope_scaling = rope_params
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+            if rope_type not in ("llama3", "default"):
+                raise ValueError(
+                    f"Unsupported rope_scaling {rope_scaling!r}; this example "
+                    "supports null, 'default', and 'llama3' scaling"
+                )
+        eos = cfg.get("eos_token_id")
+        if eos is None:
+            eos_token_ids = []
+        elif isinstance(eos, int):
+            eos_token_ids = [eos]
+        else:
+            eos_token_ids = list(eos)
+        return cls(
+            model_type=model_type,
+            hidden_size=cfg["hidden_size"],
+            intermediate_size=cfg["intermediate_size"],
+            num_hidden_layers=cfg["num_hidden_layers"],
+            num_attention_heads=cfg["num_attention_heads"],
+            num_key_value_heads=cfg.get(
+                "num_key_value_heads", cfg["num_attention_heads"]
+            ),
+            head_dim=cfg.get(
+                "head_dim", cfg["hidden_size"] // cfg["num_attention_heads"]
+            ),
+            vocab_size=cfg["vocab_size"],
+            rms_norm_eps=cfg["rms_norm_eps"],
+            rope_theta=rope_theta,
+            tie_word_embeddings=cfg.get("tie_word_embeddings", False),
+            rope_scaling=rope_scaling,
+            eos_token_ids=eos_token_ids,
+            # "num_local_experts" is the transformers-v5 serialization.
+            num_experts=cfg.get("num_experts", cfg.get("num_local_experts", 0)),
+            num_experts_per_tok=cfg.get("num_experts_per_tok", 0),
+            moe_intermediate_size=cfg.get("moe_intermediate_size", 0),
+            norm_topk_prob=cfg.get("norm_topk_prob", False),
+            decoder_sparse_step=cfg.get("decoder_sparse_step", 1),
+            mlp_only_layers=tuple(cfg.get("mlp_only_layers", ()) or ()),
+        )
+
+
+def resolve_checkpoint_dir(model_id_or_path: str) -> Path:
+    """Return a local directory containing config.json + safetensors.
+
+    Accepts either a local path or a Hugging Face model id (downloads
+    config/tokenizer/safetensors via huggingface_hub, honoring HF_HOME).
+    """
+    local = Path(model_id_or_path)
+    if local.is_dir():
+        return local
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            model_id_or_path,
+            allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.txt"],
+        )
+    )
+
+
+def _load_state_dict(ckpt_dir: Path) -> Dict[str, torch.Tensor]:
+    from safetensors.torch import load_file
+
+    index_file = ckpt_dir / "model.safetensors.index.json"
+    if index_file.exists():
+        with open(index_file) as f:
+            shard_names = sorted(set(json.load(f)["weight_map"].values()))
+    else:
+        shard_names = [p.name for p in sorted(ckpt_dir.glob("*.safetensors"))]
+    if not shard_names:
+        raise FileNotFoundError(f"No safetensors found under {ckpt_dir}")
+    state_dict: Dict[str, torch.Tensor] = {}
+    for shard in shard_names:
+        state_dict.update(load_file(ckpt_dir / shard))
+    return state_dict
+
+
+class DecoderLayerWeights:
+    """Per-layer weights, sharded at load time when tp_size > 1 (TEP style:
+    attention heads and dense-FFN intermediate are tensor-parallel; MoE
+    experts are expert-parallel across the same ranks)."""
+
+    def __init__(
+        self,
+        sd: Dict[str, torch.Tensor],
+        i: int,
+        device,
+        dtype,
+        config: "ModelConfig",
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ):
+        p = f"model.layers.{i}."
+
+        def get(name: str, required: bool = True) -> Optional[torch.Tensor]:
+            key = p + name
+            if key not in sd:
+                if required:
+                    raise KeyError(f"Missing weight {key}")
+                return None
+            return sd[key].to(device=device, dtype=dtype)
+
+        def shard(t: Optional[torch.Tensor], dim: int) -> Optional[torch.Tensor]:
+            if t is None or tp_size == 1:
+                return t
+            return t.chunk(tp_size, dim=dim)[tp_rank].contiguous()
+
+        self.input_layernorm = get("input_layernorm.weight")
+        self.post_attention_layernorm = get("post_attention_layernorm.weight")
+        # Column-parallel QKV (head-contiguous rows), row-parallel o_proj.
+        self.q_proj = shard(get("self_attn.q_proj.weight"), 0)
+        self.k_proj = shard(get("self_attn.k_proj.weight"), 0)
+        self.v_proj = shard(get("self_attn.v_proj.weight"), 0)
+        self.o_proj = shard(get("self_attn.o_proj.weight"), 1)
+        # Qwen2-family checkpoints carry QKV bias; Llama/Qwen3 do not.
+        self.q_bias = shard(get("self_attn.q_proj.bias", required=False), 0)
+        self.k_bias = shard(get("self_attn.k_proj.bias", required=False), 0)
+        self.v_bias = shard(get("self_attn.v_proj.bias", required=False), 0)
+        # Qwen3 per-head q/k RMSNorm over head_dim: replicated (shape [head_dim]).
+        self.q_norm = get("self_attn.q_norm.weight", required=False)
+        self.k_norm = get("self_attn.k_norm.weight", required=False)
+        self.is_sparse = config.is_sparse_layer(i)
+        if self.is_sparse:
+            self.gate_proj = self.up_proj = self.down_proj = None
+            # Router is replicated; every rank computes the global routing.
+            self.moe_gate = get("mlp.gate.weight")  # [num_experts, hidden]
+            # Expert-parallel: this rank holds experts
+            # [tp_rank * E/tp, (tp_rank+1) * E/tp).
+            experts_per_rank = config.num_experts // tp_size
+            expert_start = tp_rank * experts_per_rank
+            w31, w2 = [], []
+            for j in range(expert_start, expert_start + experts_per_rank):
+                ep = f"{p}mlp.experts.{j}."
+                gate = sd[ep + "gate_proj.weight"].to(device=device, dtype=dtype)
+                up = sd[ep + "up_proj.weight"].to(device=device, dtype=dtype)
+                down = sd[ep + "down_proj.weight"].to(device=device, dtype=dtype)
+                # cutlass_fused_moe fc1 ("w31") layout: up_proj (w3) stacked
+                # above gate_proj (w1); the kernel computes
+                # silu(x @ w1.T) * (x @ w3.T) internally.
+                w31.append(torch.cat([up, gate], dim=0))
+                w2.append(down)
+            self.moe_w31 = torch.stack(w31).contiguous()  # [E_local, 2*I, H]
+            self.moe_w2 = torch.stack(w2).contiguous()  # [E_local, H, I]
+        else:
+            self.moe_gate = self.moe_w31 = self.moe_w2 = None
+            # Column-parallel gate/up, row-parallel down.
+            self.gate_proj = shard(get("mlp.gate_proj.weight"), 0)
+            self.up_proj = shard(get("mlp.up_proj.weight"), 0)
+            self.down_proj = shard(get("mlp.down_proj.weight"), 1)
+
+
+class FlashInferLLM:
+    """Dense Llama/Qwen-family decoder over a paged KV cache.
+
+    The model itself is stateless w.r.t. sequences: all per-request state
+    (page tables, sequence lengths) lives in the caller-provided
+    :class:`PagedKVCache` and the planned attention wrapper.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        state_dict: Dict[str, torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ):
+        self.config = config
+        self.device = device
+        self.dtype = dtype
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        if tp_size > 1:
+            if config.num_attention_heads % tp_size:
+                raise ValueError("num_attention_heads must divide by tp_size")
+            if config.num_key_value_heads % tp_size:
+                raise ValueError("num_key_value_heads must divide by tp_size")
+            if config.intermediate_size % tp_size:
+                raise ValueError("intermediate_size must divide by tp_size")
+            if config.is_moe and config.num_experts % tp_size:
+                raise ValueError("num_experts must divide by tp_size (TP=EP)")
+        self.num_local_qo_heads = config.num_attention_heads // tp_size
+        self.num_local_kv_heads = config.num_key_value_heads // tp_size
+        self.embed_tokens = state_dict["model.embed_tokens.weight"].to(
+            device=device, dtype=dtype
+        )
+        self.final_norm = state_dict["model.norm.weight"].to(device=device, dtype=dtype)
+        if config.tie_word_embeddings or "lm_head.weight" not in state_dict:
+            self.lm_head = self.embed_tokens
+        else:
+            self.lm_head = state_dict["lm_head.weight"].to(device=device, dtype=dtype)
+        self.layers = [
+            DecoderLayerWeights(state_dict, i, device, dtype, config, tp_size, tp_rank)
+            for i in range(config.num_hidden_layers)
+        ]
+
+    def _maybe_all_reduce(self, t: torch.Tensor) -> torch.Tensor:
+        """Sum partial results across the TP=EP group (no-op when tp_size==1)."""
+        if self.tp_size > 1:
+            torch.distributed.all_reduce(t)
+        return t
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_id_or_path: str,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ) -> "FlashInferLLM":
+        ckpt_dir = resolve_checkpoint_dir(model_id_or_path)
+        with open(ckpt_dir / "config.json") as f:
+            config = ModelConfig.from_hf_config(json.load(f))
+        # Every rank reads the full state dict and slices its shard — fine
+        # for verification-scale models; a real loader would shard reads.
+        state_dict = _load_state_dict(ckpt_dir)
+        return cls(config, state_dict, device, dtype, tp_size, tp_rank)
+
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor):
+        cfg = self.config
+        scaling = cfg.rope_scaling
+        if (
+            scaling is not None
+            and scaling.get("rope_type", scaling.get("type")) == "llama3"
+        ):
+            flashinfer.apply_llama31_rope_pos_ids_inplace(
+                q,
+                k,
+                pos_ids,
+                interleave=False,
+                rope_scale=scaling["factor"],
+                rope_theta=cfg.rope_theta,
+                low_freq_factor=scaling["low_freq_factor"],
+                high_freq_factor=scaling["high_freq_factor"],
+                old_context_len=scaling["original_max_position_embeddings"],
+            )
+        else:
+            flashinfer.apply_rope_pos_ids_inplace(
+                q, k, pos_ids, interleave=False, rope_theta=cfg.rope_theta
+            )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,  # (nnz,) int64, tokens packed over the batch
+        pos_ids: torch.Tensor,  # (nnz,) int32, absolute position per token
+        attn_wrapper,  # planned prefill or decode wrapper
+        kv_cache: "PagedKVCache",
+        batch_indices: torch.Tensor,  # (nnz,) int32, request of each token
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        last_token_rows: torch.Tensor,  # (batch,) int64 rows to compute logits for
+    ) -> torch.Tensor:
+        """One forward step (prefill or decode). Returns (batch, vocab) fp32 logits."""
+        cfg = self.config
+        nnz = input_ids.shape[0]
+        num_q, num_kv, hd = (
+            self.num_local_qo_heads,
+            self.num_local_kv_heads,
+            cfg.head_dim,
+        )
+        x = torch.nn.functional.embedding(input_ids, self.embed_tokens)
+        residual: Optional[torch.Tensor] = None
+        for i, w in enumerate(self.layers):
+            if residual is None:
+                residual = x
+                x = flashinfer.rmsnorm(x, w.input_layernorm, cfg.rms_norm_eps)
+            else:
+                flashinfer.fused_add_rmsnorm(
+                    x, residual, w.input_layernorm, cfg.rms_norm_eps
+                )
+            q = torch.nn.functional.linear(x, w.q_proj, w.q_bias).view(nnz, num_q, hd)
+            k = torch.nn.functional.linear(x, w.k_proj, w.k_bias).view(nnz, num_kv, hd)
+            v = torch.nn.functional.linear(x, w.v_proj, w.v_bias).view(nnz, num_kv, hd)
+            if w.q_norm is not None:
+                q = flashinfer.rmsnorm(q, w.q_norm, cfg.rms_norm_eps)
+                k = flashinfer.rmsnorm(k, w.k_norm, cfg.rms_norm_eps)
+            self._apply_rope(q, k, pos_ids)
+            flashinfer.append_paged_kv_cache(
+                k,
+                v,
+                batch_indices,
+                pos_ids,
+                kv_cache.layer_view(i),
+                kv_indices,
+                kv_indptr,
+                kv_last_page_len,
+                kv_layout="NHD",
+            )
+            attn = attn_wrapper.run(q, kv_cache.layer_view(i))
+            attn = torch.nn.functional.linear(attn.reshape(nnz, num_q * hd), w.o_proj)
+            self._maybe_all_reduce(attn)
+            flashinfer.fused_add_rmsnorm(
+                attn, residual, w.post_attention_layernorm, cfg.rms_norm_eps
+            )
+            if w.is_sparse:
+                # Router in model dtype, softmax in fp32 — mirrors the HF
+                # Qwen3MoeSparseMoeBlock reference implementation.
+                router_logits = torch.nn.functional.linear(attn, w.moe_gate)
+                routing_weights = torch.softmax(router_logits.float(), dim=-1)
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, cfg.num_experts_per_tok, dim=-1
+                )
+                if cfg.norm_topk_prob:
+                    routing_weights = routing_weights / routing_weights.sum(
+                        dim=-1, keepdim=True
+                    )
+                # Expert-parallel: global routing on every rank, local expert
+                # slice here; partial outputs are summed across ranks.
+                x = flashinfer.fused_moe.cutlass_fused_moe(
+                    attn,
+                    selected_experts.to(torch.int),
+                    routing_weights,
+                    w.moe_w31,
+                    w.moe_w2,
+                    self.dtype,
+                    quant_scales=None,
+                    ep_size=self.tp_size,
+                    ep_rank=self.tp_rank,
+                )[0]
+                self._maybe_all_reduce(x)
+            else:
+                gate_up = torch.cat(
+                    [
+                        torch.nn.functional.linear(attn, w.gate_proj),
+                        torch.nn.functional.linear(attn, w.up_proj),
+                    ],
+                    dim=-1,
+                )
+                x = torch.nn.functional.linear(
+                    flashinfer.silu_and_mul(gate_up), w.down_proj
+                )
+                self._maybe_all_reduce(x)
+        # Final residual add + norm, only then project the rows we sample from.
+        flashinfer.fused_add_rmsnorm(x, residual, self.final_norm, cfg.rms_norm_eps)
+        hidden = x[last_token_rows]
+        return torch.nn.functional.linear(hidden, self.lm_head).float()
+
+
+class PagedKVCache:
+    """Paged KV cache + page tables for a fixed batch of requests.
+
+    Layout is NHD: per layer ``[max_pages, 2, page_size, num_kv_heads,
+    head_dim]``. Pages are handed out from a bump allocator; all index
+    tensors are int32 as required by the FlashInfer kernels.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        max_pages: int,
+        page_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+        num_kv_heads: Optional[int] = None,  # local count under TP
+    ):
+        self.page_size = page_size
+        self.device = device
+        self.kv_data = torch.zeros(
+            config.num_hidden_layers,
+            max_pages,
+            2,
+            page_size,
+            num_kv_heads or config.num_key_value_heads,
+            config.head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self.max_pages = max_pages
+        self._next_free_page = 0
+        self.page_tables: List[List[int]] = []
+        self.seq_lens: List[int] = []
+
+    def layer_view(self, layer: int) -> torch.Tensor:
+        return self.kv_data[layer]
+
+    def add_request(self) -> int:
+        self.page_tables.append([])
+        self.seq_lens.append(0)
+        return len(self.page_tables) - 1
+
+    def _alloc_page(self) -> int:
+        if self._next_free_page >= self.max_pages:
+            raise RuntimeError(
+                f"Out of KV pages (max_pages={self.max_pages}); increase the "
+                "page budget for this prompt/generation length"
+            )
+        page = self._next_free_page
+        self._next_free_page += 1
+        return page
+
+    def extend(self, request: int, num_new_tokens: int) -> None:
+        """Grow request's page table to hold num_new_tokens more tokens."""
+        self.seq_lens[request] += num_new_tokens
+        needed_pages = math.ceil(self.seq_lens[request] / self.page_size)
+        table = self.page_tables[request]
+        while len(table) < needed_pages:
+            table.append(self._alloc_page())
+
+    def page_table_tensors(self):
+        """Return (kv_indptr, kv_indices, kv_last_page_len) int32 tensors."""
+        indptr = [0]
+        for t in self.page_tables:
+            indptr.append(indptr[-1] + len(t))
+        kv_indptr = torch.tensor(indptr, dtype=torch.int32, device=self.device)
+        kv_indices = torch.tensor(
+            [p for t in self.page_tables for p in t],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        kv_last_page_len = torch.tensor(
+            [(sl - 1) % self.page_size + 1 for sl in self.seq_lens],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return kv_indptr, kv_indices, kv_last_page_len
+
+    def seq_lens_tensor(self) -> torch.Tensor:
+        return torch.tensor(self.seq_lens, dtype=torch.int32, device=self.device)
