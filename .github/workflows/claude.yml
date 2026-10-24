@@ -46,6 +46,19 @@ jobs:
             ACTOR="${{ github.actor }}"
           fi
 
+          # Fork support: allow fork owners to use their own credentials
+          if [[ "${{ github.repository }}" != "flashinfer-ai/flashinfer" ]]; then
+            if [[ "$ACTOR" == "${{ github.repository_owner }}" ]]; then
+              echo "✅ Fork owner $ACTOR authorized (using own credentials)"
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              echo "❌ $ACTOR is not the fork owner"
+              echo "authorized=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           echo "Checking if $ACTOR is a member of $ORG/$TEAM team..."
 
           # Verify token is set
