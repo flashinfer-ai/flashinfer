@@ -61,15 +61,33 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedSub(int64_t a, int64_t b) {
+  int64_t difference;
+  if (__builtin_sub_overflow(a, b, &difference)) NoInt64(a, "-", b);
+  return difference;
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
+int64_t CDiv(int64_t a, int64_t b) {
+  if (b == 0 || (a == INT64_MIN && b == -1)) NoInt64(a, "/", b);
+  return a / b;
 }
 
 int64_t ExactDiv(int64_t a, int64_t b) {
-  TVM_FFI_CHECK(a % NonZero(b) == 0, ValueError)
-      << KERNEL_NAME << ": a descriptor formula divides " << a << " by " << b << ", which is not exact";
-  return a / b;
+  const int64_t quotient = CDiv(a, b);
+  TVM_FFI_CHECK(a % b == 0, ValueError)
+      << KERNEL_NAME << ": a host check divides " << a << " by " << b << ", which is not exact";
+  return quotient;
 }
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
@@ -91,8 +109,8 @@ CUtensorMap EncodeTma_A(const TensorView& t) {
   int64_t d1 = t.size(-1);
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
-  cuuint64_t global_dim[4] = {Extent(128, "A"), Extent(d2, "A"), Extent(ExactDiv(d1, 128), "A"), Extent(outer2, "A")};
-  cuuint64_t global_strides[3] = {Stride(d1, "A"), Stride(128, "A"), Stride((d2 * d1), "A")};
+  cuuint64_t global_dim[4] = {Extent(128LL, "A"), Extent(d2, "A"), Extent(ExactDiv(d1, 128LL), "A"), Extent(outer2, "A")};
+  cuuint64_t global_strides[3] = {Stride(d1, "A"), Stride(128LL, "A"), Stride(CheckedMul(d2, d1), "A")};
   cuuint32_t box_dim[4] = {128u, 128u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
@@ -116,8 +134,8 @@ CUtensorMap EncodeTma_B(const TensorView& t) {
   CheckUnitInnerStride(t, "B");
   int64_t d1 = t.size(-1);
   int64_t s2 = t.stride(-2) * 1;
-  cuuint64_t global_dim[4] = {Extent(d1, "B"), Extent(256, "B"), Extent(2147483648LL, "B"), Extent(2147483648LL, "B")};
-  cuuint64_t global_strides[3] = {Stride(s2, "B"), Stride((34359738368LL - s2), "B"), Stride(s2, "B")};
+  cuuint64_t global_dim[4] = {Extent(d1, "B"), Extent(256LL, "B"), Extent(2147483648LL, "B"), Extent(2147483648LL, "B")};
+  cuuint64_t global_strides[3] = {Stride(s2, "B"), Stride(CheckedSub(34359738368LL, s2), "B"), Stride(s2, "B")};
   cuuint32_t box_dim[4] = {128u, 128u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
@@ -201,8 +219,8 @@ CUtensorMap EncodeTma_C(const TensorView& t) {
   CheckUnitInnerStride(t, "C");
   int64_t d1 = t.size(-1);
   int64_t s2 = t.stride(-2) * 2;
-  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(256, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
-  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride((68719476736LL - s2), "C"), Stride(s2, "C")};
+  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(256LL, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
+  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride(CheckedSub(68719476736LL, s2), "C"), Stride(s2, "C")};
   cuuint32_t box_dim[4] = {64u, 64u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
@@ -273,6 +291,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, Ten
   check_same_device(a_scale_c, a_A, "scale_c", "A");
   check_contiguous(a_token_sf, "token_sf");
   check_same_device(a_token_sf, a_A, "token_sf", "A");
+  TVM_FFI_CHECK((a_K_tiles >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (K_tiles >= 1)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

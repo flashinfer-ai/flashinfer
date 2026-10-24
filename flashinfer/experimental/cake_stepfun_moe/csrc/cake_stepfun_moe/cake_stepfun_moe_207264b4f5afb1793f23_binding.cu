@@ -22,7 +22,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_stepfun_moe_207264b4f5afb1793f23(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+extern "C" __global__ void kernel_cake_stepfun_moe_207264b4f5afb1793f23(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 
 namespace cake_binding_kernel_cake_stepfun_moe_207264b4f5afb1793f23 {
 
@@ -61,15 +61,33 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedSub(int64_t a, int64_t b) {
+  int64_t difference;
+  if (__builtin_sub_overflow(a, b, &difference)) NoInt64(a, "-", b);
+  return difference;
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
+int64_t CDiv(int64_t a, int64_t b) {
+  if (b == 0 || (a == INT64_MIN && b == -1)) NoInt64(a, "/", b);
+  return a / b;
 }
 
 int64_t ExactDiv(int64_t a, int64_t b) {
-  TVM_FFI_CHECK(a % NonZero(b) == 0, ValueError)
-      << KERNEL_NAME << ": a descriptor formula divides " << a << " by " << b << ", which is not exact";
-  return a / b;
+  const int64_t quotient = CDiv(a, b);
+  TVM_FFI_CHECK(a % b == 0, ValueError)
+      << KERNEL_NAME << ": a host check divides " << a << " by " << b << ", which is not exact";
+  return quotient;
 }
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
@@ -91,8 +109,8 @@ CUtensorMap EncodeTma_A(const TensorView& t) {
   int64_t d1 = t.size(-1);
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
-  cuuint64_t global_dim[4] = {Extent(128, "A"), Extent(d2, "A"), Extent(ExactDiv(d1, 128), "A"), Extent(outer2, "A")};
-  cuuint64_t global_strides[3] = {Stride(d1, "A"), Stride(128, "A"), Stride((d2 * d1), "A")};
+  cuuint64_t global_dim[4] = {Extent(128LL, "A"), Extent(d2, "A"), Extent(ExactDiv(d1, 128LL), "A"), Extent(outer2, "A")};
+  cuuint64_t global_strides[3] = {Stride(d1, "A"), Stride(128LL, "A"), Stride(CheckedMul(d2, d1), "A")};
   cuuint32_t box_dim[4] = {128u, 128u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
@@ -116,8 +134,8 @@ CUtensorMap EncodeTma_B(const TensorView& t) {
   CheckUnitInnerStride(t, "B");
   int64_t d1 = t.size(-1);
   int64_t s2 = t.stride(-2) * 1;
-  cuuint64_t global_dim[4] = {Extent(d1, "B"), Extent(8, "B"), Extent(2147483648LL, "B"), Extent(2147483648LL, "B")};
-  cuuint64_t global_strides[3] = {Stride(s2, "B"), Stride((34359738368LL - s2), "B"), Stride(s2, "B")};
+  cuuint64_t global_dim[4] = {Extent(d1, "B"), Extent(8LL, "B"), Extent(2147483648LL, "B"), Extent(2147483648LL, "B")};
+  cuuint64_t global_strides[3] = {Stride(s2, "B"), Stride(CheckedSub(34359738368LL, s2), "B"), Stride(s2, "B")};
   cuuint32_t box_dim[4] = {128u, 8u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
@@ -199,8 +217,8 @@ CUtensorMap EncodeTma_C(const TensorView& t) {
   CheckUnitInnerStride(t, "C");
   int64_t d1 = t.size(-1);
   int64_t s2 = t.stride(-2) * 2;
-  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(8, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
-  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride((68719476736LL - s2), "C"), Stride(s2, "C")};
+  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(8LL, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
+  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride(CheckedSub(68719476736LL, s2), "C"), Stride(s2, "C")};
   cuuint32_t box_dim[4] = {64u, 8u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
@@ -218,7 +236,7 @@ CUtensorMap EncodeTma_C(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, TensorView a_C, TensorView a_tile_expert, TensorView a_tile_mn_limit, TensorView a_num_non_exiting_ctas, TensorView a_scale_c, int64_t a_M_out, int64_t a_K, int64_t a_grid_m, int64_t a_grid_n, int64_t a_K_tiles, TensorView a_token_sf, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, TensorView a_C, TensorView a_tile_expert, TensorView a_tile_mn_limit, TensorView a_num_non_exiting_ctas, TensorView a_work_counter, TensorView a_scale_c, int64_t a_grid_m, int64_t a_grid_n, int64_t a_K_tiles, TensorView a_token_sf, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_A, "A");
@@ -237,14 +255,10 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, Ten
   check_dtype(a_tile_mn_limit, DLDataType{kDLInt, 32, 1}, "tile_mn_limit");
   check_cuda_tensor(a_num_non_exiting_ctas, "num_non_exiting_ctas");
   check_dtype(a_num_non_exiting_ctas, DLDataType{kDLInt, 32, 1}, "num_non_exiting_ctas");
+  check_cuda_tensor(a_work_counter, "work_counter");
+  check_dtype(a_work_counter, DLDataType{kDLInt, 32, 1}, "work_counter");
   check_cuda_tensor(a_scale_c, "scale_c");
   check_dtype(a_scale_c, DLDataType{kDLFloat, 32, 1}, "scale_c");
-  TVM_FFI_CHECK(a_M_out >= -2147483648LL && a_M_out <= 2147483647LL, ValueError)
-      << KERNEL_NAME << ": 'M_out' = " << a_M_out
-      << " is outside the i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(a_K >= -2147483648LL && a_K <= 2147483647LL, ValueError)
-      << KERNEL_NAME << ": 'K' = " << a_K
-      << " is outside the i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(a_grid_m >= -2147483648LL && a_grid_m <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'grid_m' = " << a_grid_m
       << " is outside the i32 range [-2147483648, 2147483647]";
@@ -267,10 +281,14 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, Ten
   check_same_device(a_tile_mn_limit, a_A, "tile_mn_limit", "A");
   check_contiguous(a_num_non_exiting_ctas, "num_non_exiting_ctas");
   check_same_device(a_num_non_exiting_ctas, a_A, "num_non_exiting_ctas", "A");
+  check_contiguous(a_work_counter, "work_counter");
+  check_same_device(a_work_counter, a_A, "work_counter", "A");
   check_contiguous(a_scale_c, "scale_c");
   check_same_device(a_scale_c, a_A, "scale_c", "A");
   check_contiguous(a_token_sf, "token_sf");
   check_same_device(a_token_sf, a_A, "token_sf", "A");
+  TVM_FFI_CHECK((a_K_tiles >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (K_tiles >= 1)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
@@ -296,21 +314,24 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, Ten
   void* v_tile_expert = DataPtr(a_tile_expert);
   void* v_tile_mn_limit = DataPtr(a_tile_mn_limit);
   void* v_num_non_exiting_ctas = DataPtr(a_num_non_exiting_ctas);
+  void* v_work_counter = DataPtr(a_work_counter);
   void* v_scale_c = DataPtr(a_scale_c);
-  int32_t v_M_out = static_cast<int32_t>(a_M_out);
-  int32_t v_K = static_cast<int32_t>(a_K);
   int32_t v_grid_m = static_cast<int32_t>(a_grid_m);
   int32_t v_grid_n = static_cast<int32_t>(a_grid_n);
   int32_t v_K_tiles = static_cast<int32_t>(a_K_tiles);
   void* v_token_sf = DataPtr(a_token_sf);
-  void* kernel_args[] = {&v_A, &v_B, &v_SFA, &v_SFB, &v_C, &v_tile_expert, &v_tile_mn_limit, &v_num_non_exiting_ctas, &v_scale_c, &v_M_out, &v_K, &v_grid_m, &v_grid_n, &v_K_tiles, &v_token_sf};
+  void* kernel_args[] = {&v_A, &v_B, &v_SFA, &v_SFB, &v_C, &v_tile_expert, &v_tile_mn_limit, &v_num_non_exiting_ctas, &v_work_counter, &v_scale_c, &v_grid_m, &v_grid_n, &v_K_tiles, &v_token_sf};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(512, 1, 1);
   config.dynamicSmemBytes = 199040;
   config.stream = stream;
-  cudaLaunchAttribute attrs[1] = {};
-  int n = 0;
+  cudaLaunchAttribute attrs[2] = {};
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 1;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  int n = 1;
   if (a_enable_pdl) {
     attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[n].val.programmaticStreamSerializationAllowed = 1;

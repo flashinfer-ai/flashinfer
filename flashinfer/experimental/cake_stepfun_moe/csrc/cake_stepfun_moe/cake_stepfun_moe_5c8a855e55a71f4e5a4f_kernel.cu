@@ -19,10 +19,12 @@
 #include "cake_stepfun_moe_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 16
+#define TMEM_NCOLS 32
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_K_PIPE_STAGES 6
-#define NUM_OUT_PIPE_STAGES 1
+#define NUM_MMA_PIPE_STAGES 2
+#define NUM_WORK_PIPE_STAGES 3
+#define NUM_THROTTLE_PIPE_STAGES 3
 #define SMEM_SMEM_A_OFF 1024
 #define SMEM_SMEM_A_STAGE_BYTES 32768
 #define SMEM_SMEM_A_STRIDE 32768
@@ -32,10 +34,11 @@
 #define SMEM_EPI_STAGING_OFF 222208
 #define SMEM_EPI_STAGING_STAGE_BYTES 1024
 #define SMEM_EPI_STAGING_STRIDE 1024
-#define SMEM_TOTAL 223232
+#define SMEM_WORK_RESPONSE_OFF 223232
+#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
+#define SMEM_WORK_RESPONSE_STRIDE 16
+#define SMEM_TOTAL 223360
 #define THREADS 256
-#define BLOCK_N 16
-#define BLOCK_K 256
 #define LAUNCH_MIN_BLOCKS 1
 
 
@@ -48,7 +51,7 @@ __device__ __forceinline__ float mul_f32_rn_ftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_tiles, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int grid_m, int max_tiles, int K_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -68,11 +71,20 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
     #define b_full_addr (mbar_base + 48)
     #define k_done_addr (mbar_base + 96)
     #define mma_full_addr (mbar_base + 144)
+    #define mma_free_addr (mbar_base + 160)
+    #define work_full_addr (mbar_base + 176)
+    #define work_empty_addr (mbar_base + 200)
+    #define throttle_full_addr (mbar_base + 224)
+    #define throttle_empty_addr (mbar_base + 248)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 1;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 1;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
 
-    const int cta_rank = 0;
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -81,51 +93,60 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
     const int smem_b_addr = smem + 197632;
     uint16_t* epi_staging = reinterpret_cast<uint16_t*>(smem_raw + 222208);
     const int epi_staging_addr = smem + 222208;
+    unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 223232);
+    const int work_response_addr = smem + 223232;
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&C))) : "memory");
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    if (__syncthreads_and(((int)blockIdx.y >> 1) + ((int)blockIdx.y & 1) * (grid_n - 1 - 2 * ((int)blockIdx.y >> 1)) >= num_non_exiting_ctas[0])) return;
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    int _vec_load_0[1];
+    {
+        uint32_t _scalar_bits_0;
+        asm volatile("ld.global.b32 %0, [%1];"
+            : "=r"(_scalar_bits_0) : "l"((const void*)(num_tiles + (0))) : "memory");
+        _vec_load_0[0] = (int32_t)_scalar_bits_0;
+    }
+    unsigned int num_live = (unsigned int)_vec_load_0[0];
+    unsigned int first = (unsigned int)bid;
+    unsigned int first_m = first % (unsigned int)grid_m;
+    unsigned int first_n = first / (unsigned int)grid_m;
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 19 barriers)
-    // Mbarriers at smem_raw[0..152)
+    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 34 barriers)
+    // Mbarriers at smem_raw[0..272)
 
     if (warp == 0) {
-        uint32_t leader = elect_sync();
-        if (leader) {
-            // --- pipeline 'k_pipe' ---
-            // a_full: 6 barriers, init_count=1
-            mbarrier_init(smem + 0, 1);
-            mbarrier_init(smem + 8, 1);
-            mbarrier_init(smem + 16, 1);
-            mbarrier_init(smem + 24, 1);
-            mbarrier_init(smem + 32, 1);
-            mbarrier_init(smem + 40, 1);
-            // b_full: 6 barriers, init_count=1
-            mbarrier_init(smem + 48, 1);
-            mbarrier_init(smem + 56, 1);
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
-            // k_done: 6 barriers, init_count=1
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 104, 1);
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
-            // --- pipeline 'out_pipe' ---
-            // mma_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 144, 1);
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        // --- pipeline 'k_pipe' ---
+        // a_full: 6 barriers, init_count=1
+        // b_full: 6 barriers, init_count=1
+        // k_done: 6 barriers, init_count=1
+        // --- pipeline 'mma_pipe' ---
+        // mma_full: 2 barriers, init_count=1
+        // mma_free: 2 barriers, init_count=128
+        // --- pipeline 'work_pipe' ---
+        // work_full: 3 barriers, init_count=1
+        // work_empty: 3 barriers, init_count=256
+        // --- pipeline 'throttle_pipe' ---
+        // throttle_full: 3 barriers, init_count=32
+        // throttle_empty: 3 barriers, init_count=32
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 32;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(28), "r"((uint32_t)(256)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(25), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(22), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(20), "r"((uint32_t)(1)));
+        mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
+        if (lane < 2) {
+            mbarrier_init(smem + 256 + lane * 8, 32);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
-    __syncwarp();
+    __syncthreads();
 
-    // TMEM alloc (32 columns, 16 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 152);
+    // TMEM alloc (32 columns, 32 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 272);
     if (warp == 0) {
-        int _tmem_hold = smem + 152;
+        int _tmem_hold = smem + 272;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -138,236 +159,175 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
-
-    // ---- Role: epilogue ----
-    if (warp <= 3) {
-        { // epilogue_main
-            asm volatile("griddepcontrol.wait;" ::: "memory");
-            const int warp_0 = warp;
-            const int lane_1 = lane;
-            const int tmem_lane_base = warp % 4 * 32;
-            int n_tile = ((int)blockIdx.y >> 1) + ((int)blockIdx.y & 1) * (grid_n - 1 - 2 * ((int)blockIdx.y >> 1));
-            int m_tile = blockIdx.x;
-            int expert = tile_expert[n_tile];
-            int valid_rows = tile_mn_limit[n_tile] - n_tile * BLOCK_N;
-            float sc = scale_c[expert];
-            float sg = scale_gate[expert];
-            float cl = clamp_limit[expert];
-            float neg_cl;
-            asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(neg_cl) : "f"(0.0f), "f"(cl));
-            float quad[4] = {0};
-            float fused;
-            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(fused) : "f"(1.442695f), "f"(sg));
-            unsigned int _phase_mma_full_0 = 0;
-            mbarrier_wait(mma_full_addr, _phase_mma_full_0);
-            _phase_mma_full_0 ^= 1;
-            asm volatile("tcgen05.fence::after_thread_sync;");
-            float _tmem_load_0[8];
-            asm volatile(
-                "tcgen05.ld.sync.aligned.16x256b.x2.b32"
-                " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7]))
-                : "r"(taddr + (unsigned int)(tmem_lane_base << 16)));
-            asm volatile("tcgen05.wait::ld.sync.aligned;");
-            float _tmem_load_1[8];
-            asm volatile(
-                "tcgen05.ld.sync.aligned.16x256b.x2.b32"
-                " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[7]))
-                : "r"(taddr + (unsigned int)(tmem_lane_base + 16 << 16)));
-            asm volatile("tcgen05.wait::ld.sync.aligned;");
-            int base_row = warp_0 * 16 + lane_1 / 4 * 2;
-            asm volatile("cp.async.bulk.wait_group.read 0;");
-            asm volatile("tcgen05.fence::before_thread_sync;");
-            asm volatile("barrier.sync 7, 128;" ::: "memory");
-            for (int token_group = 0; token_group < 2; token_group++) {
-                int token0 = lane_1 % 4 * 2 + token_group * 8;
-                int token1 = token0 + 1;
-                float x0_00 = _tmem_load_0[token_group * 4];
-                float x0_01 = _tmem_load_0[token_group * 4 + 1];
-                float x1_00 = _tmem_load_0[token_group * 4 + 2];
-                float x1_01 = _tmem_load_0[token_group * 4 + 3];
-                float x0_10 = _tmem_load_1[token_group * 4];
-                float x0_11 = _tmem_load_1[token_group * 4 + 1];
-                float x1_10 = _tmem_load_1[token_group * 4 + 2];
-                float x1_11 = _tmem_load_1[token_group * 4 + 3];
-                float _max_0;
-                asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_0) : "f"(x0_00), "f"(neg_cl));
-                float x0c_00;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_00) : "f"(_max_0), "f"(cl));
-                float _max_1;
-                asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_1) : "f"(x0_01), "f"(neg_cl));
-                float x0c_01;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_01) : "f"(_max_1), "f"(cl));
-                float _max_2;
-                asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_2) : "f"(x0_10), "f"(neg_cl));
-                float x0c_10;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_10) : "f"(_max_2), "f"(cl));
-                float _max_3;
-                asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_3) : "f"(x0_11), "f"(neg_cl));
-                float x0c_11;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_11) : "f"(_max_3), "f"(cl));
-                float lin_00;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_00) : "f"(x0c_00), "f"(sg), "f"(0.0f));
-                float lin_01;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_01) : "f"(x0c_01), "f"(sg), "f"(0.0f));
-                float lin_10;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_10) : "f"(x0c_10), "f"(sg), "f"(0.0f));
-                float lin_11;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_11) : "f"(x0c_11), "f"(sg), "f"(0.0f));
-                float _sub_6;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_6) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_00, fused)));
-                float _exp2_5 = approx_exp2(_sub_6);
-                float _add_4;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_4) : "f"(1.0f), "f"(_exp2_5));
-                float sig_00 = approx_rcp(_add_4);
-                float _sub_9;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_9) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_01, fused)));
-                float _exp2_8 = approx_exp2(_sub_9);
-                float _add_7;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_7) : "f"(1.0f), "f"(_exp2_8));
-                float sig_01 = approx_rcp(_add_7);
-                float _sub_12;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_12) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_10, fused)));
-                float _exp2_11 = approx_exp2(_sub_12);
-                float _add_10;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_10) : "f"(1.0f), "f"(_exp2_11));
-                float sig_10 = approx_rcp(_add_10);
-                float _sub_15;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_15) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_11, fused)));
-                float _exp2_14 = approx_exp2(_sub_15);
-                float _add_13;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_13) : "f"(1.0f), "f"(_exp2_14));
-                float sig_11 = approx_rcp(_add_13);
-                float act_00;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_00) : "f"(mul_f32_rn_ftz(x1_00, sig_00)), "f"(cl));
-                float act_01;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_01) : "f"(mul_f32_rn_ftz(x1_01, sig_01)), "f"(cl));
-                float act_10;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_10) : "f"(mul_f32_rn_ftz(x1_10, sig_10)), "f"(cl));
-                float act_11;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_11) : "f"(mul_f32_rn_ftz(x1_11, sig_11)), "f"(cl));
-                float y_00;
-                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_00) : "f"(lin_00), "f"(act_00));
-                float y_10;
-                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_10) : "f"(lin_10), "f"(act_10));
-                float y_01;
-                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_01) : "f"(lin_01), "f"(act_01));
-                float y_11;
-                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_11) : "f"(lin_11), "f"(act_11));
-                quad[0] = mul_f32_rn_ftz(y_00, sc);
-                quad[1] = mul_f32_rn_ftz(y_10, sc);
-                quad[2] = mul_f32_rn_ftz(y_01, sc);
-                quad[3] = mul_f32_rn_ftz(y_11, sc);
-                unsigned int _fp8_0[1];
-                {
-                    uint32_t _packed;
-                    asm volatile("{\n\t"
-                        ".reg .b16 _lo;\n\t"
-                        ".reg .b16 _hi;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                        "mov.b32 %0, {_lo, _hi};\n\t"
-                        "}"
-                        : "=r"(_packed) : "f"(quad[0]), "f"(quad[1]),
-                                           "f"(quad[2]), "f"(quad[3]));
-                    _fp8_0[0] = _packed;
-                }
-                int off0 = token0 * 64 + base_row;
-                int off1 = token1 * 64 + base_row;
-                int swz0 = off0 ^ (off0 >> 7 & 3) << 4;
-                int swz1 = off1 ^ (off1 >> 7 & 3) << 4;
-                epi_staging[swz0 >> 1] = _fp8_0[0] & 65535;
-                epi_staging[swz1 >> 1] = _fp8_0[0] >> 16;
-            }
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            asm volatile("barrier.sync 7, 128;" ::: "memory");
-            if (warp == 0) {
-                if (elect_sync()) {
-                    int padding_rows = (16 - valid_rows % 16) % 16;
-                    tma_store_4d((&C), m_tile * 64, padding_rows, 1073741824, n_tile * 16 - padding_rows + 1073741824, epi_staging_addr);
-                }
-            }
-            asm volatile("cp.async.bulk.commit_group;");
-            asm volatile("cp.async.bulk.wait_group.read 0;");
-            asm volatile("barrier.sync 7, 128;" ::: "memory");
-        }
+    if (warp >= 4 && warp <= 7) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
-    // ---- Role: load_b ----
-    if (warp == 4) {
-        { // load_b_main
-            asm volatile("griddepcontrol.wait;" ::: "memory");
+
+    // ---- Role: load_a ----
+    if (warp == 5) {
+        { // load_a_main
+            unsigned int live_tiles = num_live * (unsigned int)grid_m;
             unsigned int stage = 0;
-            int n_tile_1 = ((int)blockIdx.y >> 1) + ((int)blockIdx.y & 1) * (grid_n - 1 - 2 * ((int)blockIdx.y >> 1));
-            int routed[16];
-            for (int slot = 0; slot < 16; slot++) {
-                routed[slot] = route_map[n_tile_1 * 16 + slot];
-            }
+            unsigned int work_stage = 0;
+            unsigned int throttle_stage = 0;
+            unsigned int valid = (unsigned int)(first < live_tiles);
+            unsigned int m_tile = first_m;
+            unsigned int n_tile = first_n;
+            unsigned int _phase_throttle_empty = 1;
             unsigned int _phase_k_done = 1;
+            unsigned int _phase_work_full = 0;
             #pragma unroll 1
-            for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
-                mbarrier_wait(k_done_addr + (stage) * 8, _phase_k_done);
-                if (elect_sync()) {
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096, (&B), iter_k * BLOCK_K, routed[0], routed[1], routed[2], routed[3], b_full_addr + (stage) * 8);
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096 + 512, (&B), iter_k * BLOCK_K, routed[4], routed[5], routed[6], routed[7], b_full_addr + (stage) * 8);
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096 + 1024, (&B), iter_k * BLOCK_K, routed[8], routed[9], routed[10], routed[11], b_full_addr + (stage) * 8);
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096 + 1536, (&B), iter_k * BLOCK_K, routed[12], routed[13], routed[14], routed[15], b_full_addr + (stage) * 8);
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096 + 2048, (&B), iter_k * BLOCK_K + 128, routed[0], routed[1], routed[2], routed[3], b_full_addr + (stage) * 8);
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096 + 2560, (&B), iter_k * BLOCK_K + 128, routed[4], routed[5], routed[6], routed[7], b_full_addr + (stage) * 8);
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096 + 3072, (&B), iter_k * BLOCK_K + 128, routed[8], routed[9], routed[10], routed[11], b_full_addr + (stage) * 8);
-                    tma_gather4_gmem2smem(smem_b_addr + stage * 4096 + 3584, (&B), iter_k * BLOCK_K + 128, routed[12], routed[13], routed[14], routed[15], b_full_addr + (stage) * 8);
-                    mbarrier_arrive_expect_tx(b_full_addr + (stage) * 8, 4096);
+            for (unsigned int _tile = 0; _tile < (unsigned int)grid_m * (unsigned int)max_tiles; _tile++) {
+                if (valid == 0) {
+                    break;
                 }
+                int _vec_load_1[1];
+                {
+                    uint32_t _scalar_bits_0;
+                    asm volatile("ld.global.b32 %0, [%1];"
+                        : "=r"(_scalar_bits_0) : "l"((const void*)(tile_expert + (n_tile))) : "memory");
+                    _vec_load_1[0] = (int32_t)_scalar_bits_0;
+                }
+                int expert = _vec_load_1[0];
+                unsigned int _max_0 = ((n_tile) > (1) ? (n_tile) : (1));
+                int _vec_load_2[1];
+                {
+                    uint32_t _scalar_bits_1;
+                    asm volatile("ld.global.b32 %0, [%1];"
+                        : "=r"(_scalar_bits_1) : "l"((const void*)(tile_expert + (_max_0 - 1))) : "memory");
+                    _vec_load_2[0] = (int32_t)_scalar_bits_1;
+                }
+                int before = _vec_load_2[0];
+                unsigned int _min_0 = ((n_tile + 1) < ((unsigned int)max_tiles - 1) ? (n_tile + 1) : ((unsigned int)max_tiles - 1));
+                int _vec_load_3[1];
+                {
+                    uint32_t _scalar_bits_2;
+                    asm volatile("ld.global.b32 %0, [%1];"
+                        : "=r"(_scalar_bits_2) : "l"((const void*)(tile_expert + (_min_0))) : "memory");
+                    _vec_load_3[0] = (int32_t)_scalar_bits_2;
+                }
+                int after = _vec_load_3[0];
+                unsigned int shared = 0;
+                if (n_tile > 0) {
+                    if (before == expert) {
+                        shared = 1;
+                    }
+                }
+                if (num_live > n_tile + 1) {
+                    if (after == expert) {
+                        shared = 1;
+                    }
+                }
+                mbarrier_wait(throttle_empty_addr + (throttle_stage) * 8, _phase_throttle_empty);
+                mbarrier_arrive(throttle_full_addr + (throttle_stage) * 8);
+                throttle_stage += 1;
+                if (throttle_stage == 3) { throttle_stage = 0; _phase_throttle_empty ^= 1; }
+                #pragma unroll 1
+                for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
+                    mbarrier_wait(k_done_addr + (stage) * 8, _phase_k_done);
+                    if (elect_sync()) {
+                        if (shared != 0) {
+                            tma_4d_gmem2smem(smem_a_addr + stage * 32768, (&A), 0, m_tile * 128, iter_k * 2, expert, a_full_addr + (stage) * 8);
+                        } else {
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_a_addr + stage * 32768), "l"((&A)), "r"(0), "r"(m_tile * 128), "r"(iter_k * 2), "r"(expert),
+                                   "r"(a_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                        }
+                        if (shared != 0) {
+                            tma_4d_gmem2smem(smem_a_addr + stage * 32768 + 16384, (&A), 0, m_tile * 128, iter_k * 2 + 1, expert, a_full_addr + (stage) * 8);
+                        } else {
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_a_addr + stage * 32768 + 16384), "l"((&A)), "r"(0), "r"(m_tile * 128), "r"(iter_k * 2 + 1), "r"(expert),
+                                   "r"(a_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                        }
+                        mbarrier_arrive_expect_tx(a_full_addr + (stage) * 8, 32768);
+                    }
+                    stage += 1;
+                    if (stage == 6) { stage = 0; _phase_k_done ^= 1; }
+                }
+                mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
+                int index = work_stage * 4;
+                unsigned int valid_0 = work_response[index];
+                unsigned int m_tile_1 = work_response[index + 1];
+                unsigned int n_tile_2 = work_response[index + 2];
+                mbarrier_arrive(work_empty_addr + (work_stage) * 8);
+                work_stage += 1;
+                if (work_stage == 3) { work_stage = 0; _phase_work_full ^= 1; }
+                valid = valid_0;
+                m_tile = m_tile_1;
+                n_tile = n_tile_2;
+            }
+            #pragma unroll 1
+            for (int _ = 0; _ < 6; _++) {
+                mbarrier_wait(k_done_addr + (stage) * 8, _phase_k_done);
                 stage += 1;
                 if (stage == 6) { stage = 0; _phase_k_done ^= 1; }
             }
         }
     }
-    // ---- Role: load_a ----
-    if (warp == 5) {
-        { // load_a_main
-            asm volatile("griddepcontrol.wait;" ::: "memory");
+    // ---- Role: load_b ----
+    if (warp == 4) {
+        { // load_b_main
+            unsigned int live_tiles_1 = num_live * (unsigned int)grid_m;
             unsigned int stage_1 = 0;
-            int m_tile_1 = blockIdx.x;
-            int n_tile_2 = ((int)blockIdx.y >> 1) + ((int)blockIdx.y & 1) * (grid_n - 1 - 2 * ((int)blockIdx.y >> 1));
-            int expert_1 = tile_expert[n_tile_2];
-            int sole_reader = 1;
-            int bound = num_non_exiting_ctas[0];
-            if (bound > n_tile_2 + 1) {
-                if (tile_expert[n_tile_2 + 1] == expert_1) {
-                    sole_reader = 0;
-                }
-            }
-            if (n_tile_2 > 0) {
-                if (tile_expert[n_tile_2 - 1] == expert_1) {
-                    sole_reader = 0;
-                }
-            }
+            unsigned int work_stage_1 = 0;
+            unsigned int valid_1 = (unsigned int)(first < live_tiles_1);
+            unsigned int m_tile_2 = first_m;
+            unsigned int n_tile_1 = first_n;
+            int routed[16];
             unsigned int _phase_k_done_1 = 1;
+            unsigned int _phase_work_full_1 = 0;
             #pragma unroll 1
-            for (int iter_k_1 = 0; iter_k_1 < K_tiles; iter_k_1++) {
-                mbarrier_wait(k_done_addr + (stage_1) * 8, _phase_k_done_1);
-                if (elect_sync()) {
-                    if (sole_reader == 1) {
-                        asm volatile(
-                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                            :: "r"(smem_a_addr + stage_1 * 32768), "l"((&A)), "r"(0), "r"(m_tile_1 * 128), "r"(iter_k_1 * 2), "r"(expert_1),
-                               "r"(a_full_addr + (stage_1) * 8), "l"(0x12F0000000000000ULL) : "memory");
-                    } else {
-                        tma_4d_gmem2smem(smem_a_addr + stage_1 * 32768, (&A), 0, m_tile_1 * 128, iter_k_1 * 2, expert_1, a_full_addr + (stage_1) * 8);
-                    }
-                    if (sole_reader == 1) {
-                        asm volatile(
-                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                            :: "r"(smem_a_addr + stage_1 * 32768 + 16384), "l"((&A)), "r"(0), "r"(m_tile_1 * 128), "r"(iter_k_1 * 2 + 1), "r"(expert_1),
-                               "r"(a_full_addr + (stage_1) * 8), "l"(0x12F0000000000000ULL) : "memory");
-                    } else {
-                        tma_4d_gmem2smem(smem_a_addr + stage_1 * 32768 + 16384, (&A), 0, m_tile_1 * 128, iter_k_1 * 2 + 1, expert_1, a_full_addr + (stage_1) * 8);
-                    }
-                    mbarrier_arrive_expect_tx(a_full_addr + (stage_1) * 8, 32768);
+            for (unsigned int _tile_1 = 0; _tile_1 < (unsigned int)grid_m * (unsigned int)max_tiles; _tile_1++) {
+                if (valid_1 == 0) {
+                    break;
                 }
+                for (int slot = 0; slot < 16; slot++) {
+                    int _vec_load_4[1];
+                    {
+                        uint32_t _scalar_bits_0;
+                        asm volatile("ld.global.b32 %0, [%1];"
+                            : "=r"(_scalar_bits_0) : "l"((const void*)(route_map + (n_tile_1 * 16 + (unsigned int)slot))) : "memory");
+                        _vec_load_4[0] = (int32_t)_scalar_bits_0;
+                    }
+                    routed[slot] = _vec_load_4[0];
+                }
+                #pragma unroll 1
+                for (int iter_k_1 = 0; iter_k_1 < K_tiles; iter_k_1++) {
+                    mbarrier_wait(k_done_addr + (stage_1) * 8, _phase_k_done_1);
+                    if (elect_sync()) {
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096, (&B), iter_k_1 * 256, routed[0], routed[1], routed[2], routed[3], b_full_addr + (stage_1) * 8);
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096 + 512, (&B), iter_k_1 * 256, routed[4], routed[5], routed[6], routed[7], b_full_addr + (stage_1) * 8);
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096 + 1024, (&B), iter_k_1 * 256, routed[8], routed[9], routed[10], routed[11], b_full_addr + (stage_1) * 8);
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096 + 1536, (&B), iter_k_1 * 256, routed[12], routed[13], routed[14], routed[15], b_full_addr + (stage_1) * 8);
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096 + 2048, (&B), iter_k_1 * 256 + 128, routed[0], routed[1], routed[2], routed[3], b_full_addr + (stage_1) * 8);
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096 + 2560, (&B), iter_k_1 * 256 + 128, routed[4], routed[5], routed[6], routed[7], b_full_addr + (stage_1) * 8);
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096 + 3072, (&B), iter_k_1 * 256 + 128, routed[8], routed[9], routed[10], routed[11], b_full_addr + (stage_1) * 8);
+                        tma_gather4_gmem2smem(smem_b_addr + stage_1 * 4096 + 3584, (&B), iter_k_1 * 256 + 128, routed[12], routed[13], routed[14], routed[15], b_full_addr + (stage_1) * 8);
+                        mbarrier_arrive_expect_tx(b_full_addr + (stage_1) * 8, 4096);
+                    }
+                    stage_1 += 1;
+                    if (stage_1 == 6) { stage_1 = 0; _phase_k_done_1 ^= 1; }
+                }
+                mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
+                int index_1 = work_stage_1 * 4;
+                unsigned int valid_0_1 = work_response[index_1];
+                unsigned int m_tile_1_1 = work_response[index_1 + 1];
+                unsigned int n_tile_2_1 = work_response[index_1 + 2];
+                mbarrier_arrive(work_empty_addr + (work_stage_1) * 8);
+                work_stage_1 += 1;
+                if (work_stage_1 == 3) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
+                valid_1 = valid_0_1;
+                m_tile_2 = m_tile_1_1;
+                n_tile_1 = n_tile_2_1;
+            }
+            #pragma unroll 1
+            for (int __1 = 0; __1 < 6; __1++) {
+                mbarrier_wait(k_done_addr + (stage_1) * 8, _phase_k_done_1);
                 stage_1 += 1;
                 if (stage_1 == 6) { stage_1 = 0; _phase_k_done_1 ^= 1; }
             }
@@ -376,51 +336,325 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
     // ---- Role: mma ----
     if (warp == 6) {
         { // mma_main
+            unsigned int live_tiles_2 = num_live * (unsigned int)grid_m;
             unsigned int stage_2 = 0;
+            unsigned int acc_stage = 0;
+            unsigned int work_stage_2 = 0;
+            unsigned int valid_2 = (unsigned int)(first < live_tiles_2);
+            unsigned int m_tile_3 = 0;
+            unsigned int n_tile_3 = 0;
+            unsigned int _phase_mma_free = 1;
             unsigned int _phase_a_full = 0;
-            unsigned int _phase_b_full = 0;
+            unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
-            for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
-                mbarrier_wait(a_full_addr + (stage_2) * 8, _phase_a_full);
-                mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_b_full);
-                asm volatile("tcgen05.fence::after_thread_sync;");
-                int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_0, _mma_b_lo_0, tmem_accum, 134479888, ((((iter_k_2 == 0) ? 1 : 0)) ? 0 : 1), 0x40004040U, 0x40004040U);
-                int _mma_a_lo_1 = make_warp_uniform((((smem_a_addr + 32) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_1 = make_warp_uniform((((smem_b_addr + 32) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_1, _mma_b_lo_1, tmem_accum, 134479888, 1, 0x40004040U, 0x40004040U);
-                int _mma_a_lo_2 = make_warp_uniform((((smem_a_addr + 64) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_2 = make_warp_uniform((((smem_b_addr + 64) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_2, _mma_b_lo_2, tmem_accum, 134479888, 1, 0x40004040U, 0x40004040U);
-                int _mma_a_lo_3 = make_warp_uniform((((smem_a_addr + 96) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_3 = make_warp_uniform((((smem_b_addr + 96) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_3, _mma_b_lo_3, tmem_accum, 134479888, 1, 0x40004040U, 0x40004040U);
-                int _mma_a_lo_4 = make_warp_uniform((((smem_a_addr + 16384) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_4 = make_warp_uniform((((smem_b_addr + 2048) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_4, _mma_b_lo_4, tmem_accum, 134479888, 1, 0x40004040U, 0x40004040U);
-                int _mma_a_lo_5 = make_warp_uniform((((smem_a_addr + 16416) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_5 = make_warp_uniform((((smem_b_addr + 2080) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_5, _mma_b_lo_5, tmem_accum, 134479888, 1, 0x40004040U, 0x40004040U);
-                int _mma_a_lo_6 = make_warp_uniform((((smem_a_addr + 16448) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_6 = make_warp_uniform((((smem_b_addr + 2112) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_6, _mma_b_lo_6, tmem_accum, 134479888, 1, 0x40004040U, 0x40004040U);
-                int _mma_a_lo_7 = make_warp_uniform((((smem_a_addr + 16480) >> 4) & 0x3FFF) + (stage_2) * 2048);
-                int _mma_b_lo_7 = make_warp_uniform((((smem_b_addr + 2144) >> 4) & 0x3FFF) + (stage_2) * 256);
-                mma_ss_step(_mma_a_lo_7, _mma_b_lo_7, tmem_accum, 134479888, 1, 0x40004040U, 0x40004040U);
-                if (iter_k_2 + 1 == K_tiles) {
-                    elect_commit2(k_done_addr + (stage_2) * 8, mma_full_addr);
-                } else {
-                    elect_commit(k_done_addr + (stage_2) * 8);
+            for (unsigned int _tile_2 = 0; _tile_2 < (unsigned int)grid_m * (unsigned int)max_tiles; _tile_2++) {
+                if (valid_2 == 0) {
+                    break;
                 }
-                stage_2 += 1;
-                if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+                mbarrier_wait(mma_free_addr + (acc_stage) * 8, _phase_mma_free);
+                #pragma unroll 1
+                for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
+                    mbarrier_wait(a_full_addr + (stage_2) * 8, _phase_a_full);
+                    mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_a_full);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_0, _mma_b_lo_0, (tmem_accum + (acc_stage * 16)), 134479888, ((((iter_k_2 == 0) ? 1 : 0)) ? 0 : 1), 0x40004040U, 0x40004040U);
+                    int _mma_a_lo_1 = make_warp_uniform((((smem_a_addr + 32) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_1 = make_warp_uniform((((smem_b_addr + 32) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_1, _mma_b_lo_1, (tmem_accum + (acc_stage * 16)), 134479888, 1, 0x40004040U, 0x40004040U);
+                    int _mma_a_lo_2 = make_warp_uniform((((smem_a_addr + 64) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_2 = make_warp_uniform((((smem_b_addr + 64) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_2, _mma_b_lo_2, (tmem_accum + (acc_stage * 16)), 134479888, 1, 0x40004040U, 0x40004040U);
+                    int _mma_a_lo_3 = make_warp_uniform((((smem_a_addr + 96) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_3 = make_warp_uniform((((smem_b_addr + 96) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_3, _mma_b_lo_3, (tmem_accum + (acc_stage * 16)), 134479888, 1, 0x40004040U, 0x40004040U);
+                    int _mma_a_lo_4 = make_warp_uniform((((smem_a_addr + 16384) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_b_addr + 2048) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_4, _mma_b_lo_4, (tmem_accum + (acc_stage * 16)), 134479888, 1, 0x40004040U, 0x40004040U);
+                    int _mma_a_lo_5 = make_warp_uniform((((smem_a_addr + 16416) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_5 = make_warp_uniform((((smem_b_addr + 2080) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_5, _mma_b_lo_5, (tmem_accum + (acc_stage * 16)), 134479888, 1, 0x40004040U, 0x40004040U);
+                    int _mma_a_lo_6 = make_warp_uniform((((smem_a_addr + 16448) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_6 = make_warp_uniform((((smem_b_addr + 2112) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_6, _mma_b_lo_6, (tmem_accum + (acc_stage * 16)), 134479888, 1, 0x40004040U, 0x40004040U);
+                    int _mma_a_lo_7 = make_warp_uniform((((smem_a_addr + 16480) >> 4) & 0x3FFF) + (stage_2) * 2048);
+                    int _mma_b_lo_7 = make_warp_uniform((((smem_b_addr + 2144) >> 4) & 0x3FFF) + (stage_2) * 256);
+                    mma_ss_step(_mma_a_lo_7, _mma_b_lo_7, (tmem_accum + (acc_stage * 16)), 134479888, 1, 0x40004040U, 0x40004040U);
+                    if (iter_k_2 + 1 == K_tiles) {
+                        elect_commit2(k_done_addr + (stage_2) * 8, mma_full_addr + (acc_stage) * 8);
+                    } else {
+                        elect_commit(k_done_addr + (stage_2) * 8);
+                    }
+                    stage_2 += 1;
+                    if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; }
+                }
+                acc_stage += 1;
+                if (acc_stage == 2) { acc_stage = 0; _phase_mma_free ^= 1; }
+                mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
+                int index_2 = work_stage_2 * 4;
+                unsigned int valid_0_2 = work_response[index_2];
+                unsigned int m_tile_1_2 = work_response[index_2 + 1];
+                unsigned int n_tile_2_2 = work_response[index_2 + 2];
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                mbarrier_arrive(work_empty_addr + (work_stage_2) * 8);
+                work_stage_2 += 1;
+                if (work_stage_2 == 3) { work_stage_2 = 0; _phase_work_full_2 ^= 1; }
+                valid_2 = valid_0_2;
+                m_tile_3 = m_tile_1_2;
+                n_tile_3 = n_tile_2_2;
             }
         }
     }
-    // ---- Role: padding ----
+    // ---- Role: epilogue ----
+    if (warp <= 3) {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 160;");
+        { // epilogue_main
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            unsigned int live_tiles_3 = num_live * (unsigned int)grid_m;
+            const int warp_0 = warp;
+            const int lane_1 = lane;
+            const int tmem_lane_base = warp % 4 * 32;
+            unsigned int acc_stage_1 = 0;
+            unsigned int work_stage_3 = 0;
+            unsigned int valid_3 = (unsigned int)(first < live_tiles_3);
+            unsigned int m_tile_4 = first_m;
+            unsigned int n_tile_4 = first_n;
+            float quad[4] = {0};
+            unsigned int _phase_mma_full = 0;
+            unsigned int _phase_work_full_3 = 0;
+            #pragma unroll 1
+            for (unsigned int _tile_3 = 0; _tile_3 < (unsigned int)grid_m * (unsigned int)max_tiles; _tile_3++) {
+                if (valid_3 == 0) {
+                    break;
+                }
+                int _vec_load_5[1];
+                {
+                    uint32_t _scalar_bits_0;
+                    asm volatile("ld.global.b32 %0, [%1];"
+                        : "=r"(_scalar_bits_0) : "l"((const void*)(tile_expert + (n_tile_4))) : "memory");
+                    _vec_load_5[0] = (int32_t)_scalar_bits_0;
+                }
+                int expert_1 = _vec_load_5[0];
+                int _vec_load_6[1];
+                {
+                    uint32_t _scalar_bits_1;
+                    asm volatile("ld.global.b32 %0, [%1];"
+                        : "=r"(_scalar_bits_1) : "l"((const void*)(tile_mn_limit + (n_tile_4))) : "memory");
+                    _vec_load_6[0] = (int32_t)_scalar_bits_1;
+                }
+                int valid_rows = _vec_load_6[0] - (int)n_tile_4 * 16;
+                float sc = scale_c[expert_1];
+                float sg = scale_gate[expert_1];
+                float cl = clamp_limit[expert_1];
+                float neg_cl;
+                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(neg_cl) : "f"(0.0f), "f"(cl));
+                float fused;
+                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(fused) : "f"(1.442695f), "f"(sg));
+                mbarrier_wait(mma_full_addr + (acc_stage_1) * 8, _phase_mma_full);
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                unsigned int acc_offset = acc_stage_1 * 16;
+                float _tmem_load_0[8];
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.16x256b.x2.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7]))
+                    : "r"(taddr + (unsigned int)(tmem_lane_base << 16) + acc_offset));
+                asm volatile("tcgen05.wait::ld.sync.aligned;");
+                float _tmem_load_1[8];
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.16x256b.x2.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[7]))
+                    : "r"(taddr + (unsigned int)(tmem_lane_base + 16 << 16) + acc_offset));
+                asm volatile("tcgen05.wait::ld.sync.aligned;");
+                int base_row = warp_0 * 16 + lane_1 / 4 * 2;
+                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                asm volatile("barrier.sync 7, 128;" ::: "memory");
+                for (int token_group = 0; token_group < 2; token_group++) {
+                    int token0 = lane_1 % 4 * 2 + token_group * 8;
+                    int token1 = token0 + 1;
+                    float x0_00 = _tmem_load_0[token_group * 4];
+                    float x0_01 = _tmem_load_0[token_group * 4 + 1];
+                    float x1_00 = _tmem_load_0[token_group * 4 + 2];
+                    float x1_01 = _tmem_load_0[token_group * 4 + 3];
+                    float x0_10 = _tmem_load_1[token_group * 4];
+                    float x0_11 = _tmem_load_1[token_group * 4 + 1];
+                    float x1_10 = _tmem_load_1[token_group * 4 + 2];
+                    float x1_11 = _tmem_load_1[token_group * 4 + 3];
+                    float _max_2;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_2) : "f"(x0_00), "f"(neg_cl));
+                    float x0c_00;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_00) : "f"(_max_2), "f"(cl));
+                    float _max_3;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_3) : "f"(x0_01), "f"(neg_cl));
+                    float x0c_01;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_01) : "f"(_max_3), "f"(cl));
+                    float _max_4;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_4) : "f"(x0_10), "f"(neg_cl));
+                    float x0c_10;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_10) : "f"(_max_4), "f"(cl));
+                    float _max_5;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_5) : "f"(x0_11), "f"(neg_cl));
+                    float x0c_11;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_11) : "f"(_max_5), "f"(cl));
+                    float lin_00;
+                    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_00) : "f"(x0c_00), "f"(sg), "f"(0.0f));
+                    float lin_01;
+                    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_01) : "f"(x0c_01), "f"(sg), "f"(0.0f));
+                    float lin_10;
+                    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_10) : "f"(x0c_10), "f"(sg), "f"(0.0f));
+                    float lin_11;
+                    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_11) : "f"(x0c_11), "f"(sg), "f"(0.0f));
+                    float _sub_8;
+                    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_8) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_00, fused)));
+                    float _exp2_7 = approx_exp2(_sub_8);
+                    float _add_6;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_6) : "f"(1.0f), "f"(_exp2_7));
+                    float sig_00 = approx_rcp(_add_6);
+                    float _sub_11;
+                    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_11) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_01, fused)));
+                    float _exp2_10 = approx_exp2(_sub_11);
+                    float _add_9;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_9) : "f"(1.0f), "f"(_exp2_10));
+                    float sig_01 = approx_rcp(_add_9);
+                    float _sub_14;
+                    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_14) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_10, fused)));
+                    float _exp2_13 = approx_exp2(_sub_14);
+                    float _add_12;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(1.0f), "f"(_exp2_13));
+                    float sig_10 = approx_rcp(_add_12);
+                    float _sub_17;
+                    asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_17) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_11, fused)));
+                    float _exp2_16 = approx_exp2(_sub_17);
+                    float _add_15;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_15) : "f"(1.0f), "f"(_exp2_16));
+                    float sig_11 = approx_rcp(_add_15);
+                    float act_00;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_00) : "f"(mul_f32_rn_ftz(x1_00, sig_00)), "f"(cl));
+                    float act_01;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_01) : "f"(mul_f32_rn_ftz(x1_01, sig_01)), "f"(cl));
+                    float act_10;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_10) : "f"(mul_f32_rn_ftz(x1_10, sig_10)), "f"(cl));
+                    float act_11;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_11) : "f"(mul_f32_rn_ftz(x1_11, sig_11)), "f"(cl));
+                    float y_00;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_00) : "f"(lin_00), "f"(act_00));
+                    float y_10;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_10) : "f"(lin_10), "f"(act_10));
+                    float y_01;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_01) : "f"(lin_01), "f"(act_01));
+                    float y_11;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_11) : "f"(lin_11), "f"(act_11));
+                    quad[0] = mul_f32_rn_ftz(y_00, sc);
+                    quad[1] = mul_f32_rn_ftz(y_10, sc);
+                    quad[2] = mul_f32_rn_ftz(y_01, sc);
+                    quad[3] = mul_f32_rn_ftz(y_11, sc);
+                    unsigned int _fp8_0[1];
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(quad[0]), "f"(quad[1]),
+                                               "f"(quad[2]), "f"(quad[3]));
+                        _fp8_0[0] = _packed;
+                    }
+                    int off0 = token0 * 64 + base_row;
+                    int off1 = token1 * 64 + base_row;
+                    int swz0 = off0 ^ (off0 >> 7 & 3) << 4;
+                    int swz1 = off1 ^ (off1 >> 7 & 3) << 4;
+                    epi_staging[swz0 >> 1] = _fp8_0[0] & 65535;
+                    epi_staging[swz1 >> 1] = _fp8_0[0] >> 16;
+                }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile("barrier.sync 7, 128;" ::: "memory");
+                if (warp == 0) {
+                    if (elect_sync()) {
+                        int padding_rows = (16 - valid_rows % 16) % 16;
+                        tma_store_4d((&C), m_tile_4 * 64, padding_rows, 1073741824, n_tile_4 * 16 - (unsigned int)padding_rows + 1073741824, epi_staging_addr);
+                    }
+                }
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("barrier.sync 7, 128;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                mbarrier_arrive(mma_free_addr + (acc_stage_1) * 8);
+                acc_stage_1 += 1;
+                if (acc_stage_1 == 2) { acc_stage_1 = 0; _phase_mma_full ^= 1; }
+                mbarrier_wait(work_full_addr + (work_stage_3) * 8, _phase_work_full_3);
+                int index_3 = work_stage_3 * 4;
+                unsigned int valid_0_3 = work_response[index_3];
+                unsigned int m_tile_1_3 = work_response[index_3 + 1];
+                unsigned int n_tile_2_3 = work_response[index_3 + 2];
+                mbarrier_arrive(work_empty_addr + (work_stage_3) * 8);
+                work_stage_3 += 1;
+                if (work_stage_3 == 3) { work_stage_3 = 0; _phase_work_full_3 ^= 1; }
+                valid_3 = valid_0_3;
+                m_tile_4 = m_tile_1_3;
+                n_tile_4 = n_tile_2_3;
+            }
+            asm volatile("cp.async.bulk.wait_group.read 0;");
+        }
+    }
+    // ---- Role: work_id ----
     if (warp == 7) {
-        // idle — no tasks assigned
+        { // work_id_main
+            unsigned int live_tiles_4 = num_live * (unsigned int)grid_m;
+            unsigned int work_stage_4 = 0;
+            unsigned int throttle_stage_1 = 0;
+            unsigned int valid_4 = (unsigned int)(first < live_tiles_4);
+            unsigned int m_tile_5 = 0;
+            unsigned int n_tile_5 = 0;
+            unsigned int _phase_throttle_full = 0;
+            unsigned int _phase_work_empty = 1;
+            #pragma unroll 1
+            for (unsigned int _tile_4 = 0; _tile_4 < (unsigned int)grid_m * (unsigned int)max_tiles; _tile_4++) {
+                if (valid_4 == 0) {
+                    break;
+                }
+                mbarrier_wait(throttle_full_addr + (throttle_stage_1) * 8, _phase_throttle_full);
+                mbarrier_arrive(throttle_empty_addr + (throttle_stage_1) * 8);
+                throttle_stage_1 += 1;
+                if (throttle_stage_1 == 3) { throttle_stage_1 = 0; _phase_throttle_full ^= 1; }
+                mbarrier_wait(work_empty_addr + (work_stage_4) * 8, _phase_work_empty);
+                if (elect_sync()) {
+                    int _atomic_fetch_add_0 = atomicAdd(work_counter, 1);
+                    unsigned int claim = (unsigned int)_atomic_fetch_add_0 + (unsigned int)num_bids;
+                    int index_4 = work_stage_4 * 4;
+                    work_response[index_4] = (unsigned int)(claim < live_tiles_4);
+                    work_response[index_4 + 1] = claim % (unsigned int)grid_m;
+                    work_response[index_4 + 2] = claim / (unsigned int)grid_m;
+                    work_response[index_4 + 3] = 0;
+                    mbarrier_arrive(work_full_addr + (work_stage_4) * 8);
+                }
+                __syncwarp();
+                mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_empty ^ 1);
+                int index_5 = work_stage_4 * 4;
+                unsigned int valid_0_4 = work_response[index_5];
+                unsigned int m_tile_1_4 = work_response[index_5 + 1];
+                unsigned int n_tile_2_4 = work_response[index_5 + 2];
+                mbarrier_arrive(work_empty_addr + (work_stage_4) * 8);
+                work_stage_4 += 1;
+                if (work_stage_4 == 3) { work_stage_4 = 0; _phase_work_empty ^= 1; }
+                valid_4 = valid_0_4;
+                m_tile_5 = m_tile_1_4;
+                n_tile_5 = n_tile_2_4;
+            }
+            if (elect_sync()) {
+                __threadfence();
+                int retired = atomicAdd(work_counter + 1, 1);
+                if (retired == num_bids - 1) {
+                    __threadfence();
+                    work_counter[0] = 0;
+                    work_counter[1] = 0;
+                }
+            }
+        }
     }
 
     // Cleanup

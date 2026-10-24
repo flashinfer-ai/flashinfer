@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ clamp_limit);
+extern "C" __global__ void kernel_cake_stepfun_moe_3cec6179da3b3834f473(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_tiles, int* __restrict__ work_counter, int K, int grid_m, int max_tiles, int K_tiles, float* __restrict__ clamp_limit);
 
 namespace cake_binding_kernel_cake_stepfun_moe_3cec6179da3b3834f473 {
 
@@ -60,6 +60,17 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   int64_t product = 1;
   for (int axis = 0; axis < t.ndim() - trailing; ++axis) product *= t.size(axis);
   return product;
+}
+
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedSub(int64_t a, int64_t b) {
+  int64_t difference;
+  if (__builtin_sub_overflow(a, b, &difference)) NoInt64(a, "-", b);
+  return difference;
 }
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
@@ -111,8 +122,8 @@ CUtensorMap EncodeTma_C(const TensorView& t) {
   CheckUnitInnerStride(t, "C");
   int64_t d1 = t.size(-1);
   int64_t s2 = t.stride(-2) * 2;
-  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(16, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
-  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride((68719476736LL - s2), "C"), Stride(s2, "C")};
+  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(16LL, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
+  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride(CheckedSub(68719476736LL, s2), "C"), Stride(s2, "C")};
   cuuint32_t box_dim[4] = {64u, 16u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
@@ -130,7 +141,7 @@ CUtensorMap EncodeTma_C(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_route_map, TensorView a_tile_expert, TensorView a_tile_mn_limit, TensorView a_num_non_exiting_ctas, int64_t a_M_out, int64_t a_K, int64_t a_grid_m, int64_t a_grid_n, int64_t a_K_tiles, TensorView a_clamp_limit, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_route_map, TensorView a_tile_expert, TensorView a_tile_mn_limit, TensorView a_num_tiles, TensorView a_work_counter, int64_t a_K, int64_t a_grid_m, int64_t a_max_tiles, int64_t a_K_tiles, TensorView a_clamp_limit, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_A, "A");
@@ -145,19 +156,18 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_route_map,
   check_dtype(a_tile_expert, DLDataType{kDLInt, 32, 1}, "tile_expert");
   check_cuda_tensor(a_tile_mn_limit, "tile_mn_limit");
   check_dtype(a_tile_mn_limit, DLDataType{kDLInt, 32, 1}, "tile_mn_limit");
-  check_cuda_tensor(a_num_non_exiting_ctas, "num_non_exiting_ctas");
-  check_dtype(a_num_non_exiting_ctas, DLDataType{kDLInt, 32, 1}, "num_non_exiting_ctas");
-  TVM_FFI_CHECK(a_M_out >= -2147483648LL && a_M_out <= 2147483647LL, ValueError)
-      << KERNEL_NAME << ": 'M_out' = " << a_M_out
-      << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_num_tiles, "num_tiles");
+  check_dtype(a_num_tiles, DLDataType{kDLInt, 32, 1}, "num_tiles");
+  check_cuda_tensor(a_work_counter, "work_counter");
+  check_dtype(a_work_counter, DLDataType{kDLInt, 32, 1}, "work_counter");
   TVM_FFI_CHECK(a_K >= -2147483648LL && a_K <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'K' = " << a_K
       << " is outside the i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(a_grid_m >= -2147483648LL && a_grid_m <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'grid_m' = " << a_grid_m
       << " is outside the i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(a_grid_n >= -2147483648LL && a_grid_n <= 2147483647LL, ValueError)
-      << KERNEL_NAME << ": 'grid_n' = " << a_grid_n
+  TVM_FFI_CHECK(a_max_tiles >= -2147483648LL && a_max_tiles <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'max_tiles' = " << a_max_tiles
       << " is outside the i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(a_K_tiles >= -2147483648LL && a_K_tiles <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'K_tiles' = " << a_K_tiles
@@ -173,11 +183,13 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_route_map,
   check_same_device(a_tile_expert, a_A, "tile_expert", "A");
   check_contiguous(a_tile_mn_limit, "tile_mn_limit");
   check_same_device(a_tile_mn_limit, a_A, "tile_mn_limit", "A");
-  check_contiguous(a_num_non_exiting_ctas, "num_non_exiting_ctas");
-  check_same_device(a_num_non_exiting_ctas, a_A, "num_non_exiting_ctas", "A");
+  check_contiguous(a_num_tiles, "num_tiles");
+  check_same_device(a_num_tiles, a_A, "num_tiles", "A");
+  check_contiguous(a_work_counter, "work_counter");
+  check_same_device(a_work_counter, a_A, "work_counter", "A");
   check_contiguous(a_clamp_limit, "clamp_limit");
   check_same_device(a_clamp_limit, a_A, "clamp_limit", "A");
-  TVM_FFI_CHECK((a_K_tiles >= 1), ValueError)
+  TVM_FFI_CHECK((a_K_tiles >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (K_tiles >= 1)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
@@ -202,21 +214,25 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_route_map,
   void* v_route_map = DataPtr(a_route_map);
   void* v_tile_expert = DataPtr(a_tile_expert);
   void* v_tile_mn_limit = DataPtr(a_tile_mn_limit);
-  void* v_num_non_exiting_ctas = DataPtr(a_num_non_exiting_ctas);
-  int32_t v_M_out = static_cast<int32_t>(a_M_out);
+  void* v_num_tiles = DataPtr(a_num_tiles);
+  void* v_work_counter = DataPtr(a_work_counter);
   int32_t v_K = static_cast<int32_t>(a_K);
   int32_t v_grid_m = static_cast<int32_t>(a_grid_m);
-  int32_t v_grid_n = static_cast<int32_t>(a_grid_n);
+  int32_t v_max_tiles = static_cast<int32_t>(a_max_tiles);
   int32_t v_K_tiles = static_cast<int32_t>(a_K_tiles);
   void* v_clamp_limit = DataPtr(a_clamp_limit);
-  void* kernel_args[] = {&v_A, &v_B, &v_C, &v_route_map, &v_tile_expert, &v_tile_mn_limit, &v_num_non_exiting_ctas, &v_M_out, &v_K, &v_grid_m, &v_grid_n, &v_K_tiles, &v_clamp_limit};
+  void* kernel_args[] = {&v_A, &v_B, &v_C, &v_route_map, &v_tile_expert, &v_tile_mn_limit, &v_num_tiles, &v_work_counter, &v_K, &v_grid_m, &v_max_tiles, &v_K_tiles, &v_clamp_limit};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(384, 1, 1);
   config.dynamicSmemBytes = 224384;
   config.stream = stream;
-  cudaLaunchAttribute attrs[1] = {};
-  int n = 0;
+  cudaLaunchAttribute attrs[2] = {};
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 1;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  int n = 1;
   if (a_enable_pdl) {
     attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[n].val.programmaticStreamSerializationAllowed = 1;

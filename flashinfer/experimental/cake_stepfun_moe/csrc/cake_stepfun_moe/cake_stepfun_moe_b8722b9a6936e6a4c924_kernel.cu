@@ -379,18 +379,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00;
                 out_pair[1] = value10;
                 if (token0 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_0[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_0[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
                 }
                 out_pair[0] = value01;
                 out_pair[1] = value11;
                 if (token1 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_1[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
                 }
                 int token0_0 = lane_1 % 4 * 2 + 8;
                 int token1_1 = token0_0 + 1;
@@ -482,18 +488,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00_27;
                 out_pair[1] = value10_28;
                 if (token0_0 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0_0) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_2[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_2[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0_0) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
                 }
                 out_pair[0] = value01_29;
                 out_pair[1] = value11_30;
                 if (token1_1 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1_1) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_3[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_3[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1_1) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
                 }
                 int token0_31 = lane_1 % 4 * 2 + 16;
                 int token1_32 = token0_31 + 1;
@@ -585,18 +597,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00_58;
                 out_pair[1] = value10_59;
                 if (token0_31 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0_31) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_4[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_4[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0_31) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
                 }
                 out_pair[0] = value01_60;
                 out_pair[1] = value11_61;
                 if (token1_32 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1_32) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_5[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_5[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1_32) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
                 }
                 int token0_62 = lane_1 % 4 * 2 + 24;
                 int token1_63 = token0_62 + 1;
@@ -688,18 +706,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00_89;
                 out_pair[1] = value10_90;
                 if (token0_62 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0_62) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_6[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_6[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0_62) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
                 }
                 out_pair[0] = value01_91;
                 out_pair[1] = value11_92;
                 if (token1_63 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1_63) * M_out + tok_feature)))[0]) = _pk;
+                    unsigned int _packed_7[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_7[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1_63) * M_out + tok_feature))[0] = reinterpret_cast<unsigned*>(_packed_7)[0];
                 }
                 int acc_offset_93 = acc_stage * 64 + 32;
                 float _tmem_load_2[16];
@@ -811,18 +835,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00_123;
                 out_pair[1] = value10_124;
                 if (token0_96 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0_96) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_8[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_8[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0_96) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_8)[0];
                 }
                 out_pair[0] = value01_125;
                 out_pair[1] = value11_126;
                 if (token1_97 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1_97) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_9[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_9[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1_97) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_9)[0];
                 }
                 int token0_127 = lane_1 % 4 * 2 + 8 + 32;
                 int token1_128 = token0_127 + 1;
@@ -914,18 +944,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00_154;
                 out_pair[1] = value10_155;
                 if (token0_127 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0_127) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_10[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_10[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0_127) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_10)[0];
                 }
                 out_pair[0] = value01_156;
                 out_pair[1] = value11_157;
                 if (token1_128 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1_128) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_11[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_11[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1_128) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_11)[0];
                 }
                 int token0_158 = lane_1 % 4 * 2 + 16 + 32;
                 int token1_159 = token0_158 + 1;
@@ -1017,18 +1053,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00_185;
                 out_pair[1] = value10_186;
                 if (token0_158 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0_158) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_12[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_12[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0_158) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_12)[0];
                 }
                 out_pair[0] = value01_187;
                 out_pair[1] = value11_188;
                 if (token1_159 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1_159) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_13[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_13[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1_159) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_13)[0];
                 }
                 int token0_189 = lane_1 % 4 * 2 + 24 + 32;
                 int token1_190 = token0_189 + 1;
@@ -1120,18 +1162,24 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 out_pair[0] = value00_216;
                 out_pair[1] = value10_217;
                 if (token0_189 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token0_189) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_14[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_14[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token0_189) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_14)[0];
                 }
                 out_pair[0] = value01_218;
                 out_pair[1] = value11_219;
                 if (token1_190 < valid_rows) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(out_pair[0 + 0], out_pair[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(C + ((tok_slot_base + token1_190) * M_out + tok_feature_95)))[0]) = _pk;
+                    unsigned int _packed_15[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_pair[_lp*2 + 0], out_pair[_lp*2+1 + 0]));
+                        _packed_15[_lp] = *(uint32_t*)&_bf2;
                     }
+                    reinterpret_cast<unsigned*>(C + ((tok_slot_base + token1_190) * M_out + tok_feature_95))[0] = reinterpret_cast<unsigned*>(_packed_15)[0];
                 }
                 asm volatile(
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
@@ -1209,7 +1257,6 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
             const int tmem_lane_base_1 = warp % 4 * 32;
             unsigned int word[2];
             unsigned int _phase_sfb_full = 0;
-            unsigned int _phase_k_done = 1;
             unsigned int _phase_work_full_1 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_1 = 0; _tile_iter_1 < grid_m / 2 * grid_n; _tile_iter_1++) {
@@ -1219,7 +1266,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 #pragma unroll 1
                 for (int _iter_k = 0; _iter_k < K_tiles; _iter_k++) {
                     mbarrier_wait(sfb_full_addr + (stage) * 8, _phase_sfb_full);
-                    mbarrier_wait(k_done_addr + (stage) * 8, _phase_k_done);
+                    mbarrier_wait(k_done_addr + (stage) * 8, _phase_sfb_full ^ 1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     for (int reg = 0; reg < 2; reg++) {
                         const int logical_lane = lane_0 + reg * 32;
@@ -1309,7 +1356,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                         :: "r"((tmem_sfb_full_addr + (stage) * 8) & 0xFEFFFFFF) : "memory");
                     mbarrier_arrive(sfb_free_addr + (stage) * 8);
                     stage += 1;
-                    if (stage == 4) { stage = 0; _phase_sfb_full ^= 1; _phase_k_done ^= 1; }
+                    if (stage == 4) { stage = 0; _phase_sfb_full ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
                 uint32_t _clc_valid_5 = 0;
@@ -1383,7 +1430,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
             int route_base = 0;
             int routed[8];
             unsigned int cta_mask = 1 << cta_rank;
-            unsigned int _phase_k_done_1 = 1;
+            unsigned int _phase_k_done = 1;
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_2 = 0; _tile_iter_2 < grid_m / 2 * grid_n; _tile_iter_2++) {
@@ -1400,7 +1447,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 }
                 #pragma unroll 1
                 for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
-                    mbarrier_wait(k_done_addr + (stage_1) * 8, _phase_k_done_1);
+                    mbarrier_wait(k_done_addr + (stage_1) * 8, _phase_k_done);
                     if (elect_sync()) {
                         tma_gather4_gmem2smem_mc_cta2(smem_b_addr + stage_1 * 8192 + (unsigned int)(warp_local * 512), (&B), iter_k * 256, routed[0], routed[1], routed[2], routed[3], ((b_full_addr + (stage_1) * 8) & 0xFEFFFFFF), cta_mask);
                         tma_gather4_gmem2smem_mc_cta2(smem_b_addr + stage_1 * 8192 + 4096 + (unsigned int)(warp_local * 512), (&B), iter_k * 256 + 128, routed[0], routed[1], routed[2], routed[3], ((b_full_addr + (stage_1) * 8) & 0xFEFFFFFF), cta_mask);
@@ -1415,7 +1462,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                         }
                     }
                     stage_1 += 1;
-                    if (stage_1 == 4) { stage_1 = 0; _phase_k_done_1 ^= 1; }
+                    if (stage_1 == 4) { stage_1 = 0; _phase_k_done ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
                 uint32_t _clc_valid_1 = 0;
@@ -1590,7 +1637,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
             unsigned int n_tile_4 = blockIdx.y;
             unsigned int cta_mask_1 = 1 << cta_rank;
             unsigned int _phase_throttle_empty = 1;
-            unsigned int _phase_k_done_2 = 1;
+            unsigned int _phase_k_done_1 = 1;
             unsigned int _phase_work_full_4 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_4 = 0; _tile_iter_4 < grid_m / 2 * grid_n; _tile_iter_4++) {
@@ -1606,7 +1653,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                 }
                 #pragma unroll 1
                 for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
-                    mbarrier_wait(k_done_addr + (stage_3) * 8, _phase_k_done_2);
+                    mbarrier_wait(k_done_addr + (stage_3) * 8, _phase_k_done_1);
                     if (elect_sync()) {
                         asm volatile(
                             "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
@@ -1623,7 +1670,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                             :: "r"((a_full_addr + (stage_3) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                     }
                     stage_3 += 1;
-                    if (stage_3 == 4) { stage_3 = 0; _phase_k_done_2 ^= 1; }
+                    if (stage_3 == 4) { stage_3 = 0; _phase_k_done_1 ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_full_4);
                 uint32_t _clc_valid_0 = 0;
@@ -1786,7 +1833,6 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
     if (warp == 22) {
         { // copy_sfa_main
             unsigned int _phase_sfa_full = 0;
-            unsigned int _phase_k_done_3 = 1;
             unsigned int _phase_work_full_6 = 0;
             if (cta_rank == 0) {
                 unsigned int stage_5 = 0;
@@ -1801,7 +1847,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                     #pragma unroll 1
                     for (int _iter_k_1 = 0; _iter_k_1 < K_tiles; _iter_k_1++) {
                         mbarrier_wait(sfa_full_addr + (stage_5) * 8, _phase_sfa_full);
-                        mbarrier_wait(k_done_addr + (stage_5) * 8, _phase_k_done_3);
+                        mbarrier_wait(k_done_addr + (stage_5) * 8, _phase_sfa_full ^ 1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         uint32_t _elected_0 = elect_sync();
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1895,7 +1941,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                         elect_commit_cg2_local(tmem_sfa_full_addr + (stage_5) * 8);
                         elect_commit_cg2_multicast(sfa_free_addr + (stage_5) * 8, (uint16_t)(3));
                         stage_5 += 1;
-                        if (stage_5 == 4) { stage_5 = 0; _phase_sfa_full ^= 1; _phase_k_done_3 ^= 1; }
+                        if (stage_5 == 4) { stage_5 = 0; _phase_sfa_full ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_6) * 8, _phase_work_full_6);
                     uint32_t _clc_valid_4 = 0;
@@ -1963,9 +2009,6 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
         { // mma_main
             unsigned int _phase_mma_free = 1;
             unsigned int _phase_a_full = 0;
-            unsigned int _phase_b_full = 0;
-            unsigned int _phase_tmem_sfa_full = 0;
-            unsigned int _phase_tmem_sfb_full = 0;
             unsigned int _phase_work_full_7 = 0;
             if (cta_rank == 0) {
                 unsigned int stage_6 = 0;
@@ -1982,9 +2025,9 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                     #pragma unroll 1
                     for (int iter_k_4 = 0; iter_k_4 < K_tiles; iter_k_4++) {
                         mbarrier_wait(a_full_addr + (stage_6) * 8, _phase_a_full);
-                        mbarrier_wait(b_full_addr + (stage_6) * 8, _phase_b_full);
-                        mbarrier_wait(tmem_sfa_full_addr + (stage_6) * 8, _phase_tmem_sfa_full);
-                        mbarrier_wait(tmem_sfb_full_addr + (stage_6) * 8, _phase_tmem_sfb_full);
+                        mbarrier_wait(b_full_addr + (stage_6) * 8, _phase_a_full);
+                        mbarrier_wait(tmem_sfa_full_addr + (stage_6) * 8, _phase_a_full);
+                        mbarrier_wait(tmem_sfb_full_addr + (stage_6) * 8, _phase_a_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_6) * 2048;
                         int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_6) * 512;
@@ -2079,7 +2122,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                             elect_commit_cg2_multicast(mma_full_addr + (acc_stage_1) * 8, (uint16_t)(3));
                         }
                         stage_6 += 1;
-                        if (stage_6 == 4) { stage_6 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; _phase_tmem_sfa_full ^= 1; _phase_tmem_sfb_full ^= 1; }
+                        if (stage_6 == 4) { stage_6 = 0; _phase_a_full ^= 1; }
                     }
                     acc_stage_1 += 1;
                     if (acc_stage_1 == 2) { acc_stage_1 = 0; _phase_mma_free ^= 1; }
@@ -2150,10 +2193,8 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
             asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int work_stage_8 = 0;
             unsigned int throttle_stage_1 = 0;
-            unsigned int fast_stage = 0;
             unsigned int _phase_throttle_full = 0;
             unsigned int _phase_work_empty = 1;
-            unsigned int _phase_work_full_8 = 0;
             unsigned int _phase_fast_ready = 0;
             if (cta_rank == 0) {
                 #pragma unroll 1
@@ -2181,7 +2222,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                             :: "r"(work_response_addr + work_stage_8 * 16 + 0 * 16), "r"(work_full_addr + work_stage_8 * 8)
                             : "memory");
                     }
-                    mbarrier_wait(work_full_addr + (work_stage_8) * 8, _phase_work_full_8);
+                    mbarrier_wait(work_full_addr + (work_stage_8) * 8, _phase_work_empty ^ 1);
                     uint32_t _clc_valid_8 = 0;
                     asm volatile(
                         "{\n\t"
@@ -2231,7 +2272,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                         "}"
                         :: "r"(work_empty_addr + work_stage_8 * 8), "r"(0) : "memory");
                     work_stage_8 += 1;
-                    if (work_stage_8 == 3) { work_stage_8 = 0; _phase_work_empty ^= 1; _phase_work_full_8 ^= 1; }
+                    if (work_stage_8 == 3) { work_stage_8 = 0; _phase_work_empty ^= 1; }
                     if (bounded_valid_8 == 0) {
                         if (_clc_valid_8 != 0) {
                             if (_clc_ctaid_17 >= (unsigned int)num_non_exiting_ctas[0]) {
@@ -2242,19 +2283,20 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                                 __syncwarp();
                                 #pragma unroll 1
                                 for (unsigned int _drain_iter = 0; _drain_iter < grid_m / 2 * grid_n; _drain_iter++) {
+                                    __syncwarp();
                                     if (elect_sync()) {
-                                        mbarrier_arrive_expect_tx(fast_ready_addr + (fast_stage) * 8, 64);
+                                        mbarrier_arrive_expect_tx(fast_ready_addr, 64);
                                         for (int slot_idx = 0; slot_idx < 4; slot_idx++) {
                                             asm volatile(
                                                 "fence.proxy.async.shared::cta;\n\t"
                                                 "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                                     ".mbarrier::complete_tx::bytes.b128"
                                                     " [%0], [%1];"
-                                                :: "r"(fast_response_addr + fast_stage * 64 + slot_idx * 16), "r"(fast_ready_addr + fast_stage * 8)
+                                                :: "r"(fast_response_addr + 0 * 64 + slot_idx * 16), "r"(fast_ready_addr + 0 * 8)
                                                 : "memory");
                                         }
                                     }
-                                    mbarrier_wait(fast_ready_addr + (fast_stage) * 8, _phase_fast_ready);
+                                    mbarrier_wait(fast_ready_addr, _phase_fast_ready);
                                     uint32_t _clc_valid_9 = 0;
                                     asm volatile(
                                         "{\n\t"
@@ -2265,7 +2307,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                                         "selp.u32 %0, 1, 0, p1;\n\t"
                                         "}\n"
                                         : "=r"(_clc_valid_9)
-                                        : "r"(fast_response_addr + fast_stage * 64 + 0 * 16)
+                                        : "r"(fast_response_addr + 0 * 64 + 0 * 16)
                                         : "memory");
                                     uint32_t _clc_valid_10 = 0;
                                     asm volatile(
@@ -2277,7 +2319,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                                         "selp.u32 %0, 1, 0, p1;\n\t"
                                         "}\n"
                                         : "=r"(_clc_valid_10)
-                                        : "r"(fast_response_addr + fast_stage * 64 + 1 * 16)
+                                        : "r"(fast_response_addr + 0 * 64 + 1 * 16)
                                         : "memory");
                                     uint32_t _clc_valid_11 = 0;
                                     asm volatile(
@@ -2289,7 +2331,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                                         "selp.u32 %0, 1, 0, p1;\n\t"
                                         "}\n"
                                         : "=r"(_clc_valid_11)
-                                        : "r"(fast_response_addr + fast_stage * 64 + 2 * 16)
+                                        : "r"(fast_response_addr + 0 * 64 + 2 * 16)
                                         : "memory");
                                     uint32_t _clc_valid_12 = 0;
                                     asm volatile(
@@ -2301,7 +2343,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                                         "selp.u32 %0, 1, 0, p1;\n\t"
                                         "}\n"
                                         : "=r"(_clc_valid_12)
-                                        : "r"(fast_response_addr + fast_stage * 64 + 3 * 16)
+                                        : "r"(fast_response_addr + 0 * 64 + 3 * 16)
                                         : "memory");
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                     _phase_fast_ready ^= 1;
@@ -2323,13 +2365,13 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
             unsigned int work_stage_9 = 0;
             unsigned int m_tile_8 = blockIdx.x;
             unsigned int n_tile_8 = blockIdx.y;
-            unsigned int _phase_work_full_9 = 0;
+            unsigned int _phase_work_full_8 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_9 = 0; _tile_iter_9 < grid_m / 2 * grid_n; _tile_iter_9++) {
                 if (m_tile_8 >= (unsigned int)grid_m || n_tile_8 >= (unsigned int)grid_n) {
                     break;
                 }
-                mbarrier_wait(work_full_addr + (work_stage_9) * 8, _phase_work_full_9);
+                mbarrier_wait(work_full_addr + (work_stage_9) * 8, _phase_work_full_8);
                 uint32_t _clc_valid_13 = 0;
                 asm volatile(
                     "{\n\t"
@@ -2379,7 +2421,7 @@ kernel_cake_stepfun_moe_b8722b9a6936e6a4c924(const __grid_constant__ CUtensorMap
                     "}"
                     :: "r"(work_empty_addr + work_stage_9 * 8), "r"(0) : "memory");
                 work_stage_9 += 1;
-                if (work_stage_9 == 3) { work_stage_9 = 0; _phase_work_full_9 ^= 1; }
+                if (work_stage_9 == 3) { work_stage_9 = 0; _phase_work_full_8 ^= 1; }
                 if (bounded_valid_9 == 0) {
                     break;
                 }
