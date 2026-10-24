@@ -455,6 +455,9 @@ def test_unit_blocks_carry_the_stage_facts():
             )
             assert unit["per_token"] is families[unit["family"]]["per_token"]
             assert unit["weight_layout"] == families[unit["family"]]["weight_layout"]
+            assert unit["grid_rule"] in ("tiles", "resident"), program
+            if unit["grid_rule"] == "resident":
+                assert unit["stage"] == "fc1" or unit["split_k"] == 1, program
             if unit["stage"] == "fc1":
                 assert unit["output_rows_per_cta"] == ref.FC1_OUTPUT_ROWS_PER_CTA
             else:
@@ -1353,7 +1356,8 @@ def test_unfinalized_outputs_follow_the_native_layout(precision, weights_cache):
 @pytest.mark.parametrize("precision", PRECISIONS)
 def test_cuda_graph_replay_equals_eager(precision, num_tokens, weights_cache):
     """A prepared launch captured in a CUDA graph (after one eager launch) replays the eager bytes,
-    on the first and on the second replay."""
+    on the first and on the second replay, and leaves every resident unit's work counter zeroed
+    (no launch resets it)."""
     family = ref.PRECISION_FAMILY[precision]
     device, _arch = _require_device(family)
     weights = _weights(weights_cache, family, 0, device)
@@ -1371,6 +1375,12 @@ def test_cuda_graph_replay_equals_eager(precision, num_tokens, weights_cache):
             assert torch.equal(tensor, expected), (
                 f"{precision} T={num_tokens}: replay {replay} differs"
             )
+        for name, counter in launch.buffers.items():
+            if name.endswith("_work_counter"):
+                assert counter.tolist() == [0, 0], (
+                    f"{precision} T={num_tokens}: {name} is {counter.tolist()} after "
+                    f"replay {replay}"
+                )
 
 
 # ---------------------------------------------------------------------------------------------
