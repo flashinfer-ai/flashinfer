@@ -2609,7 +2609,9 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
         )
         # no hand-off without reuse_recompute_tapes: on a verified torch the recompute still skips #5; elsewhere it
         # launches #5 as a plain (non hand-off) forward
-        assert _launches(seen, "fwd_o") == ([False] if _verified_torch(kcp) else [False, False])
+        assert _launches(seen, "fwd_o") == (
+            [False] if _verified_torch(kcp) else [False, False]
+        )
         assert kcp.LAST_CALL["bwd"]["tapes_source"] == "replay"
         assert _skip_delta(kcp, before) == delta
         seen.clear()
