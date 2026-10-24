@@ -975,7 +975,7 @@ H100 tests 301 for T1 and 351 for T8. It includes every advertised stage pair
 for all supported native blocks and gather/sorted modes, plus the default.
 Frost tests all 16 FC1/FC2 column pairs. Selected tactics are frozen before four
 ABBA validation blocks; separate warm CUDA-event graph chains confirm the
-ranking. A/A ratios in these records are within 0.6% of one. This is a full
+ranking. A/A ratios in these records are within 0.9% of one. This is a full
 advertised search for these conditions, not a claim that all possible native
 kernel configurations have been searched.
 
