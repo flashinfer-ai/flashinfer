@@ -4398,10 +4398,11 @@ ROUTES: dict[str, dict[str, list[str]]] = {
 # GB300 (``sm_103a``).  Every architecture is compiled with its exact
 # ``-gencode`` flag set (``build.json`` ``arch_flags``); there is no family
 # fallback.
-ARCHES = ("sm_100a", "sm_103a")
+ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
 }
 HIDDEN_SIZE = 4096
 TOPK = 8
