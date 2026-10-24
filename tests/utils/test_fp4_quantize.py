@@ -63,6 +63,8 @@ BATCH_SHAPES = [
     (3, 256, 128),
     (1, 120, 64),
     (128, 2048, 2048),
+    # TMA path (m >= 1024, k % 512 == 0) with a partial last 16-row tile per batch
+    (4, 1040, 1024),
 ]
 SEEDS = [42]
 CUDA_DEVICES = ["cuda:0"]
