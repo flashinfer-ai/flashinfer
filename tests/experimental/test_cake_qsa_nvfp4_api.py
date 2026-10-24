@@ -19,8 +19,10 @@ flashinfer public-API tests of the Cake QSA NVFP4 sparse paged attention
 The backend suite ``test_cake_qsa_nvfp4.py`` exercises the package.  This file covers
 what needs flashinfer itself: the ``backend`` keyword of
 ``flashinfer.sparse.qsa_sparse_paged_attention`` -- ``backend="cake"`` reaches the
-package with every operand, the default keeps the existing implementation, an unknown
-value is refused -- one device run of the route against the package, bit for bit, and
+package with every operand, the default ``"auto"`` is the package on SM80 through SM90
+and the existing implementation elsewhere, ``"default"`` keeps the existing
+implementation, an unknown value is refused -- device runs of the route and of the auto
+default against the package, bit for bit, and
 the NVFP4 paged writer against the torch port the backend suite fills its caches with.
 It also holds the host's program rule on the CPU: which records a call launches for its
 form, architecture and grid class, and when a grid is wide (above one resident wave with
@@ -28,7 +30,9 @@ at least 16 tiles per CTA).
 """
 
 import contextlib
+import glob
 import inspect
+import re
 import warnings
 from pathlib import Path
 
@@ -96,7 +100,7 @@ def test_backend_is_a_keyword_with_a_default():
         "backend"
     ]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameter.default is not inspect.Parameter.empty
+    assert parameter.default == "auto"
 
 
 def test_unknown_backend_is_rejected(monkeypatch):
@@ -154,7 +158,61 @@ def test_cake_backend_reaches_the_package_with_every_operand(monkeypatch):
     assert received["k_scale"] == 0.5 and received["v_scale"] == 0.25
 
 
-def test_default_backend_keeps_the_existing_implementation(monkeypatch):
+def test_explicit_default_backend_keeps_the_existing_implementation(monkeypatch):
+    calls = _patch_both_backends(monkeypatch)
+    t = torch.empty(0)
+    with _quiet():
+        result = public_api.qsa_sparse_paged_attention(
+            t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t, backend="default"
+        )
+    assert result == "existing"
+    assert [tag for tag, _, _ in calls] == ["existing"]
+
+
+def test_auto_backend_resolves_by_capability(monkeypatch):
+    """``auto`` is the Cake route for every capability the package exports (major 8 or 9)
+    and the reference implementation for any other capability or a non-CUDA device; the
+    table below needs no GPU, the capability lookup is replaced."""
+    assert public_api._qsa_auto_backend(torch.device("cpu")) == "default"
+    device = torch.device("cuda", 0)
+    table = {}
+    monkeypatch.setattr(public_api, "get_compute_capability", lambda d: table[d])
+    for capability in sorted(cake_jit.ARCH_BY_CAPABILITY):
+        table[device] = capability
+        assert public_api._qsa_auto_backend(device) == "cake", capability
+    for capability in ((7, 5), (10, 0), (10, 3), (12, 0), (12, 1)):
+        table[device] = capability
+        assert public_api._qsa_auto_backend(device) == "default", capability
+
+
+def test_auto_rule_covers_every_exported_capability():
+    """The entry's major rule and the package's capability table agree: every exported
+    capability resolves to the Cake route, so ``auto`` never selects a route that refuses
+    the device."""
+    majors = {capability[0] for capability in cake_jit.ARCH_BY_CAPABILITY}
+    assert majors == set(public_api._QSA_CAKE_MAJORS)
+
+
+def test_omitted_backend_takes_the_auto_route(monkeypatch):
+    """On the device at hand an omitted ``backend`` reaches the package when the device is
+    SM80 through SM90 and the existing implementation otherwise (recorders stand in for
+    both, so this needs a CUDA device but no exported target)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    calls = _patch_both_backends(monkeypatch)
+    device = torch.device("cuda", torch.cuda.current_device())
+    major = torch.cuda.get_device_capability(device)[0]
+    t = torch.empty(0, device=device)
+    with _quiet():
+        result = public_api.qsa_sparse_paged_attention(
+            t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
+        )
+    want = "cake" if major in (8, 9) else "existing"
+    assert result == want
+    assert [tag for tag, _, _ in calls] == [want]
+
+
+def test_omitted_backend_on_a_cpu_tensor_takes_the_existing_implementation(monkeypatch):
     calls = _patch_both_backends(monkeypatch)
     t = torch.empty(0)
     with _quiet():
@@ -163,6 +221,35 @@ def test_default_backend_keeps_the_existing_implementation(monkeypatch):
         )
     assert result == "existing"
     assert [tag for tag, _, _ in calls] == ["existing"]
+
+
+def test_generated_sources_are_declared_as_package_data():
+    """A non-editable install carries what the loader resolves next to cake_jit.py: every
+    source under csrc/ (the generated kernels, bindings and headers; not the formatter's
+    dotfile) and build.json.  pyproject.toml sets include-package-data = false, so only
+    this package's package-data globs put them into a wheel; the auto default makes that
+    a requirement of every SM80 through SM90 install."""
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if not pyproject.is_file():
+        pytest.skip("pyproject.toml is only available in source-tree test runs")
+    key = '"flashinfer.experimental.cake_qsa_nvfp4" = ['
+    text = pyproject.read_text(encoding="utf-8")
+    assert key in text, "pyproject.toml has no package-data entry for the package"
+    globs = re.findall(r'"([^"]*)"', text.split(key, 1)[1].split("]", 1)[0])
+    shipped = {
+        path
+        for pattern in globs
+        for path in glob.glob(pattern, root_dir=PACKAGE_DIR, recursive=True)
+        if (PACKAGE_DIR / path).is_file()
+    }
+    needed = {
+        str(path.relative_to(PACKAGE_DIR))
+        for path in (PACKAGE_DIR / "csrc").rglob("*")
+        if path.is_file() and not path.name.startswith(".")
+    }
+    needed.add("build.json")
+    assert needed, "the package ships no generated sources"
+    assert needed <= shipped, sorted(needed - shipped)
 
 
 def test_program_rule_selects_the_records_of_a_call():
@@ -337,6 +424,19 @@ def test_cake_route_runs_the_package():
         )
     assert result is out
     assert torch.equal(out, want)
+
+
+def test_auto_route_is_the_cake_route():
+    """Without ``backend`` the public entry runs the package on SM80 through SM90: the result
+    is bitwise the explicit ``backend="cake"`` result."""
+    device = _device_or_skip()
+    operands = _operands(device)
+    with _quiet():
+        want = public_api.qsa_sparse_paged_attention(**operands, backend="cake")
+        got = public_api.qsa_sparse_paged_attention(**operands)
+    torch.cuda.synchronize()
+    assert torch.isfinite(got.float()).all() and got.any()
+    assert torch.equal(got, want)
 
 
 def test_writer_format_is_the_port_the_backend_suite_uses():
