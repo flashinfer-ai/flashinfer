@@ -3066,6 +3066,21 @@ class FrostLowLatencyConfig:
             w1, w1_scale, w2, w2_scale, SwiGLU() if activation is None else activation
         )
 
+    @staticmethod
+    def prepare_deepseek_fp8_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Preserve E4M3 weights and FP32 128x128 block scales without requantizing.
+
+        Canonical FC1 uses [up, gate] order for gated activation. H and I must
+        be divisible by 128. BF16 entry quantization and the E4M3 intermediate
+        use max(amax, 1e-4)/448 per 128 values; FC1 preactivation stays FP32.
+        Prepared E4M3 inputs instead retain their supplied FP32 [H/128,T] scales.
+        """
+        from .backends.frost_low_latency.prepare import prepare_deepseek_fp8_weights
+
+        return prepare_deepseek_fp8_weights(
+            w1, w1_scale, w2, w2_scale, SwiGLU() if activation is None else activation
+        )
+
     prepare_fp8_per_tensor_activations = staticmethod(
         TrtllmFp8PerTensorConfig.prepare_activations
     )

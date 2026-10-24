@@ -19,6 +19,10 @@ _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
+    if config.quant.weight is QuantFormat.DeepSeekFp8:
+        from .deepseek_fp8 import execute as execute_deepseek
+
+        return execute_deepseek(inputs, config, tile_k)
     if config.quant.weight is QuantFormat.FP8PerTensor:
         from .fp8_per_tensor import execute as execute_fp8
 
