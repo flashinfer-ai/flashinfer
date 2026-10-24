@@ -831,6 +831,7 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        enable_pdl: bool = False,
     ):
         """
         Parameters
@@ -878,6 +879,11 @@ class MlaDecodeTs:
         mask_type : MaskType or str, optional
             ``causal`` (default) for bottom-right speculative decoding or
             ``dense`` for full per-batch KV visibility.
+        enable_pdl : bool, optional
+            Launch with programmatic dependent launch (default: False). The
+            producer then waits on the preceding grid before reading its
+            inputs, and a non-persistent split-KV producer releases its
+            reducer early.
         """
         import cutlass as _cutlass
 
@@ -913,6 +919,7 @@ class MlaDecodeTs:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
+        self.enable_pdl = enable_pdl
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
         self.output_quant = None
@@ -977,6 +984,7 @@ class MlaDecodeTs:
             self.num_heads,
             self.seq_len_q,
             self.mask_type,
+            self.enable_pdl,
             self.reduction_split_capacity,
             self.query_tile_layout,
             self.num_q_tiles,
@@ -1448,7 +1456,9 @@ class MlaDecodeTs:
         # Nonpersistent producers signal near retirement. The native reducer
         # can overlap setup, then waits for the complete prerequisite grid
         # before reading partials. Persistent schedules retain stream ordering.
-        use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
+        use_one_wave_reducer_pdl = (
+            self.enable_pdl and acc_o is not None and not self.is_persistent
+        )
 
         self.split_kv_kernel(
             tma_desc_q_latent,
@@ -1479,7 +1489,7 @@ class MlaDecodeTs:
             cluster=cfg.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=use_one_wave_reducer_pdl,
+            use_pdl=self.enable_pdl,
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
@@ -1573,6 +1583,17 @@ class MlaDecodeTs:
         tma_desc_o: cutlass.GridConstant[cuda.TensorMap] = None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
+        # With PDL the preceding grid may still be running. Sparse index
+        # binding, the fused sparse reducer's neutral LSE slots and the
+        # persistent early-exit test all touch request metadata or the split
+        # workspace before setup, so those launches wait here. The remaining
+        # launches overlap barrier and TMEM setup and wait before the task
+        # graph runs.
+        pdl_wait_before_setup = self.enable_pdl and (
+            self.direct_sparse or self.fuse_sparse_reduction or self.is_persistent
+        )
+        if cutlass.const_expr(pdl_wait_before_setup):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
@@ -2082,6 +2103,8 @@ class MlaDecodeTs:
             )
             named_res["gmem_o"].split_kv = max_split_kv
 
+            if cutlass.const_expr(self.enable_pdl and not pdl_wait_before_setup):
+                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
             task_manager.run()
 
         # TMEM deallocation (MMA warp)
@@ -2102,7 +2125,9 @@ class MlaDecodeTs:
             )
             # Each producer CTA publishes completion only after its paired
             # TMEM lifetime and all scheduled output work have retired.
-            if cutlass.const_expr(acc_o is not None and not self.is_persistent):
+            if cutlass.const_expr(
+                self.enable_pdl and acc_o is not None and not self.is_persistent
+            ):
                 if prims.elect_sync():
                     prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
