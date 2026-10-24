@@ -421,7 +421,11 @@ named in the pull request.
 Tests: `tests/experimental/test_cake_lm_head_loss.py` and the public-API suite
 `tests/experimental/test_cake_lm_head_loss_api.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
-registered program or a compute capability 10.0 / 10.3 device).  Benchmark:
+registered program or a compute capability 10.0 / 10.3 device), and the
+CPU-only `tests/experimental/test_cake_lm_head_loss_standalone.py` (a copy of
+the package imports with `flashinfer` blocked and raises its host-side errors;
+`scripts/check_cake_build_manifests.py --vendored-gate` builds and loads the
+copy's libraries on a GPU node).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
 
 Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
