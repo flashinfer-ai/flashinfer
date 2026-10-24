@@ -42,9 +42,11 @@ collapsed histogram dropping the +inf).  FlashInfer-local changes: module
 rename, this note, the ``_persist`` hook that routes the four
 ``get_compiled*`` builders through FlashInfer's on-disk CuTe-DSL kernel
 cache, ``_base_compile_opts`` (explicit ``--gpu-arch`` for the current
-device), and the main-family varlen prologue clamping each row's length to
-the envelope in launch slot ``n`` instead of the row stride.  Keep future
-diffs against upstream mechanical.
+device), the main-family varlen prologue clamping each row's length to
+the envelope in launch slot ``n`` instead of the row stride, and the
+main family's in-kernel register path (``GvrMainKernel`` ``reg_vpt``, which
+calls ``GvrTopkRegKernel.row_topk``, the register kernel body split out of
+``kern``).  Keep future diffs against upstream mechanical.
 """
 
 import contextlib
@@ -255,6 +257,14 @@ def fmin_f32(a, b):
 def fmax_f32(a, b):
     """fmaxf -> max.f32."""
     return cute.arch.fmax(a, b)
+
+
+@dsl_user_op
+def fabs_f32(x, *, loc=None, ip=None):
+    """fabsf as math.absf (llvm.fabs), FlashInfer-local. ptxas folds it into a
+    compare's |x| operand, so `fabs_f32(v) != inf` is one FSETP; the sign-mask
+    spelling (_fabsf) costs a LOP3 per value on top."""
+    return cutlass.Float32(mlir_math.absf(x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
 
 # ---------------------------------------------------------------------------
@@ -1421,6 +1431,13 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _exit_thread(*, loc=None, ip=None):
+    """PTX ``exit``: CUDA's ``if (...) return;``, which the DSL has no runtime
+    form of (FlashInfer-local, the main family's register path)."""
+    nvvm.exit(loc=loc, ip=ip)
+
+
 def _pt_xf(pre_idx, req, v, ps: int):
     """Paged output: physical KV slot of a VALID (>= 0) column index ``v`` of request
     ``req`` — the paged compiles carry the page table [batch, max_pages] in the pre_idx
@@ -1456,6 +1473,7 @@ class GvrMainKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         pdl: bool = False,
+        reg_vpt: int = 0,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1543,6 +1561,57 @@ class GvrMainKernel:
         assert self.ck_off % 16 == 0, "ck64 must stay 16B aligned (ulonglong2)"
         self.dyn_bytes = self.ck_off + (self.cmpb + 1) * 8
         self.lb = self.nbs.bit_length() - 1  # log2(NBS)=8
+        # In-kernel register path (FlashInfer-local, decode, 512/1024 threads). Under
+        # a CUDA graph the launch is planned for the capacity, so this streaming
+        # kernel gets rows far shorter than that, which the register family ranks
+        # ~2x faster. With reg_vpt > 0, a row of at most BLK * reg_vpt * 4 columns
+        # (short rows included) runs that family's body (GvrTopkRegKernel.row_topk)
+        # on its own CTA instead of streaming: the narrowest of VPT 2 and VPT 4
+        # that holds it (the rungs route() picks for this CTA shape, NBH 2 * BLK), as
+        # SGLang's topk_v2 picks Register2 / Register4 per row. The kernel takes
+        # that branch as soon as it knows the row's length and then exits, so the
+        # smem window can start at the smem base and the streaming body never sees
+        # such a row.
+        self.reg_vpt = int(reg_vpt)
+        self.regs = []  # (row capacity, embedded body, smem window bytes), narrowest first
+        if self.reg_vpt:
+            assert self.varlen and not self.prefill and blk in (512, 1024) and self.reg_vpt in (2, 4)
+            nbh = 2 * blk
+            for vpt in (2, 4)[: self.reg_vpt // 2]:
+                cap = blk * vpt * 4
+                # page-table entries a register row can span (the reg family's rule)
+                reg_pt = 0
+                if self.paged:
+                    pages = (cap + (1 << self.page_shift) - 1) >> self.page_shift
+                    if pages <= 1024:
+                        reg_pt = 1 << max(pages - 1, 0).bit_length()
+                body = GvrTopkRegKernel(
+                    blk,
+                    vpt,
+                    minb,
+                    kpt,
+                    cur=True,
+                    deg=False,
+                    img=False,
+                    nbh=nbh,
+                    varlen=True,
+                    next_n=self.next_n,
+                    cr_shift=self.cr_shift,
+                    hint_free=self.hint_free,
+                    paged=self.paged,
+                    page_shift=self.page_shift,
+                    pt_smem=reg_pt,
+                    # staged emit for one-wave launches (_reg_stage_out): 1024-thread
+                    # main is one wave by construction (rows * R <= 148); 512-thread
+                    # main serves more rows than SMs
+                    stage_out=blk == 1024,
+                    embedded=True,
+                )
+                win = STATIC_BYTES + (nbh + 2 * REG_CMP) * 4 + 4 * reg_pt
+                # + k staged outputs (k <= KPT * BLK)
+                assert win + 4 * kpt * blk <= self.dyn_bytes, "register window must fit the smem"
+                self.regs.append((cap, body, win))
+            self.reg_cap = self.regs[-1][0]
 
     # ------------------------------------------------------------------
     # GVR_EMITC: classify+stage one survivor.
@@ -1640,6 +1709,43 @@ class GvrMainKernel:
                 v & cutlass.Int32((1 << ps) - 1)
             )
         return self._ox_g(pre_idx, v)
+
+    @cute.jit
+    def _reg_arm(self, logits, pre_idx, kv_lens, out, n_row, k, row, part, sbase):
+        """In-kernel register path (reg_vpt > 0, see the ctor). Only part 0 of a
+        SPLIT row ranks it; the other parts never touch the slab, so the row
+        owes no arrivals and its g_off / g_don stay zero."""
+        if part == cutlass.Int32(0):
+            if cutlass.const_expr(len(self.regs) == 1):
+                self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+            else:
+                if n_row <= cutlass.Int32(self.regs[0][0]):
+                    self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                else:
+                    self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+
+    @cute.jit
+    def _reg_rank(self, vi: cutlass.Constexpr, logits, pre_idx, kv_lens, out, n_row, k, row, sbase):
+        _, body, win = self.regs[vi]
+        smem_bytes = cutlass.Int32(win)
+        if cutlass.const_expr(body.stage_out):
+            smem_bytes = smem_bytes + k * cutlass.Int32(4)
+        # n = the row's own length: the body's prologue clamps to it and its
+        # envelope-bounded early load reads exactly the row. QC: the O(mc^2)
+        # rank gate route() gives these rungs (QUADC while one wave, 1024 above).
+        body.row_topk(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n_row,
+            cutlass.Int32(REG_CMP),
+            cutlass.Int32(QUADC if self.blk == 1024 else 1024),
+            smem_bytes,
+            row,
+            sbase,
+        )
+
     @cute.kernel
     def kern(
         self,
@@ -1677,6 +1783,30 @@ class GvrMainKernel:
 
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
+
+        if cutlass.const_expr(self.reg_vpt > 0):
+            # In-kernel register path (see the ctor): a row of at most reg_cap
+            # columns, short rows included, is ranked by part 0 with the register
+            # body, and every CTA of the row leaves before any other work, so the
+            # code below never sees such a row. Row length as in the varlen
+            # prologue below.
+            bx0, row0, _ = cute.arch.block_idx()
+            rr0 = row0 % cutlass.Int32(self.next_n)
+            kv0 = kv_lens[row0 // cutlass.Int32(self.next_n)]
+            nv0 = (kv0 - cutlass.Int32(self.next_n) + rr0 + cutlass.Int32(1)) >> cutlass.Int32(
+                self.cr_shift
+            )
+            if nv0 < cutlass.Int32(0):
+                nv0 = cutlass.Int32(0)
+            if nv0 > n:
+                nv0 = n
+            if nv0 <= cutlass.Int32(self.reg_cap):
+                part0 = cutlass.Int32(0)
+                if cutlass.const_expr(self.split):
+                    part0 = bx0
+                sbase0 = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()
+                self._reg_arm(logits, pre_idx, kv_lens, out, nv0, k, row0, part0, sbase0)
+                _exit_thread()
 
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # 2-D grid (part, row)
@@ -1966,11 +2096,11 @@ class GvrMainKernel:
         # the mirror chain (runtime divides + isqrt fixups) per thread costs
         # more instructions than the rest of the kernel on 1-row launches.
         # warp0 alone walks the chain and publishes the four derived scalars
-        # through s_lad; the other warps spend the wait issuing L2 prefetch
-        # hints for this CTA's own P3 slice (register-free, so zero pressure
-        # on the 64-register arms — the PRIME-LATE register loads below are
-        # untouched and simply hit L2).  Values are bit-identical to the
-        # per-thread derivation this replaces.
+        # through s_lad; in prefill the other warps spend the wait issuing L2
+        # prefetch hints for this CTA's own P3 slice (register-free, so zero
+        # pressure on the 64-register arms — the PRIME-LATE register loads
+        # below are untouched and simply hit L2).  Values are bit-identical to
+        # the per-thread derivation this replaces.
         if cutlass.const_expr(self.varlen):
             if tidx < cutlass.Int32(32):
                 if short == cutlass.Int32(0):
@@ -2006,15 +2136,17 @@ class GvrMainKernel:
                         aim = k
                     n4w = n >> cutlass.Int32(2)
                     # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
-                    # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
-                    # (k/big folded into the launch-constant sd_en flag).
+                    # small_dense = sd_en != 0 and max(2k, sd_en) < n <= SCAP
+                    # (the launch constant sd_en folds k, the regime and the
+                    # plan's break-even row length; 1 admits every row above 2k).
                     gate = cutlass.Int32(0)
                     if n > scap_c:
                         gate = cutlass.Int32(1)
                     if sd_en != cutlass.Int32(0):
                         if n <= scap_c:
                             if n > (k << cutlass.Int32(1)):
-                                gate = cutlass.Int32(1)
+                                if n > sd_en:
+                                    gate = cutlass.Int32(1)
                     if n4w < cutlass.Int32(4):
                         gate = cutlass.Int32(0)
                     if gate != cutlass.Int32(0):
@@ -2076,26 +2208,27 @@ class GvrMainKernel:
                         else:
                             s_ofs[0] = cutlass.Int32(0) - lead
             # Register-free L2 hints for the first U-batch of this CTA's own
-            # P3 slice (clamped in-row): the data P3 touches first starts
-            # flowing while warp0 walks the chain. Short rows clamp every
-            # hint to the row's last line — harmless.
-            # prefill: the base is shifted to col0, so clamp within the row's own
-            # window [col0, ke) — n4-1 is the last full in-window float4.
+            # P3 slice, prefill only: the data P3 touches first starts flowing
+            # while warp0 walks the chain. The base is shifted to col0, so
+            # clamp within the row's own window [col0, ke) — n4-1 is the last
+            # full in-window float4. Decode issues none: one hint per float4
+            # is eight per L2 line, and on a short row or a SPLIT part's small
+            # slice nearly every hint clamps to one line. Without them decode
+            # is faster on every main plan at the serving capacity (B200,
+            # 708 cells: SPLIT 0.87x, one CTA per row 0.97x geomean).
             if cutlass.const_expr(self.prefill):
                 plim4 = n4 - cutlass.Int32(1)
                 if plim4 < cutlass.Int32(0):
                     plim4 = cutlass.Int32(0)
-            else:
-                plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
-            for uu in cutlass.range_constexpr(U):
-                # NOTE: names must not collide with the PRIME-LATE block's
-                # i_/ic — the DSL kills inner-scope names at region exit and
-                # a later same-name assignment inside a dynamic `if` trips
-                # "is None prior to this if".
-                pic = c0 + tidx + cutlass.Int32(uu * BLK)
-                if pic >= c1:
-                    pic = plim4
-                C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
+                for uu in cutlass.range_constexpr(U):
+                    # NOTE: names must not collide with the PRIME-LATE block's
+                    # i_/ic — the DSL kills inner-scope names at region exit and
+                    # a later same-name assignment inside a dynamic `if` trips
+                    # "is None prior to this if".
+                    pic = c0 + tidx + cutlass.Int32(uu * BLK)
+                    if pic >= c1:
+                        pic = plim4
+                    C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
             cute.arch.barrier()  # publish s_lad (also covers the smem inits)
             SMP = s_lad[0]
             SS2 = s_lad[1]
@@ -2959,6 +3092,14 @@ class GvrMainKernel:
                                     nlo = cutlass.Uint32(rlo) + (cutlass.Uint32(sB) << sh2u)
                                     if sB != cutlass.Int32(NBS - 1):
                                         rhi = nlo + ((cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1))
+                                        # FlashInfer-local: the range starts at the
+                                        # least staged key, so a 2^24-key bin holding
+                                        # keys of scores above 2^127 (+inf) can end
+                                        # past 0xFFFFFFFF. Wrapped, rhi fell below
+                                        # rlo and the descent stopped under the
+                                        # crossing keys: nothing was emitted.
+                                        if cutlass.Uint32(rhi) < nlo:
+                                            rhi = cutlass.Uint32(0xFFFFFFFF)
                                     rlo = nlo
                                     lev = lev + cutlass.Int32(1)
                             if tidx == cutlass.Int32(0):
@@ -3369,6 +3510,7 @@ def get_compiled(
     page_shift: int = 0,
     pt_smem: int = 0,
     pdl: bool = False,
+    reg_vpt: int = 0,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3382,11 +3524,16 @@ def get_compiled(
     so it is part of the cache key and the persist name; the compile retypes
     the pre_idx ABI slot to a 1-D align-4 fake (it carries row_starts; the
     kv_lens slot carries the window lengths and ke = ks + len is formed on
-    device)."""
+    device).
+
+    ``reg_vpt`` (decode tuple only) compiles in the per-row register path for
+    rows of at most BLK * reg_vpt * 4 columns (``GvrMainKernel``); 0 = off."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
     paged = bool(paged)
     if paged and not (hint_free and len(tpl) == 10 and not prefill):
         raise RuntimeError("paged compile requires the hint-free varlen (decode) tuple")
+    if reg_vpt and (len(tpl) != 10 or prefill):
+        raise RuntimeError("the register path needs the varlen decode tuple")
     key = (
         tuple(tpl),
         options_extra,
@@ -3397,6 +3544,7 @@ def get_compiled(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(pdl),
+        int(reg_vpt),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3430,6 +3578,7 @@ def get_compiled(
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
             pdl=bool(pdl),
+            reg_vpt=int(reg_vpt),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3493,6 +3642,8 @@ def get_compiled(
             name += f"_pts{int(pt_smem)}"
     if pdl:
         name += "_pdl1"
+    if reg_vpt:
+        name += f"_rg{int(reg_vpt)}"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -3600,6 +3751,7 @@ __launch_bounds__ sets no carveout either); `.reqntid`/`.minnctapersm`
 NB__reg = 1024  # NBH default
 STATIC_WORDS = 128  # DSL smem prelude (static-__shared__ mirror)
 STATIC_BYTES = STATIC_WORDS * 4
+REG_CMP = 2560  # crossing-slot cap of the non-DEG rungs (route(): CMP = min(n, 2560))
 _NEG_INF__reg = float("-inf")
 _POS_INF = float("inf")
 
@@ -3789,10 +3941,17 @@ class GvrTopkRegKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         stage_out: bool = True,
+        embedded: bool = False,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
         assert nbh % blk == 0 or blk % nbh == 0
+        # embedded: `row_topk` runs inside another family's kernel (the main
+        # family's in-kernel register path, GvrMainKernel `reg_vpt`) instead of
+        # being launched as this kernel. That host kernel waits on PDL, owns the
+        # smem window, and its (part, row) grid carries the row on block_idx.y.
+        self.embedded = bool(embedded)
+        assert not (self.embedded and (pdl or prefill))
         self.blk = blk
         self.vpt = vpt
         self.minb = minb
@@ -3866,6 +4025,8 @@ class GvrTopkRegKernel:
     def _pt_req(self):
         # request of this CTA's row, re-derived from the block index (no live register)
         bx, by, _ = cute.arch.block_idx()
+        if self.embedded:
+            return by // cutlass.Int32(self.next_n)
         return bx // cutlass.Int32(self.next_n)
 
     def _ox_g(self, pre_idx, v):
@@ -3897,6 +4058,16 @@ class GvrTopkRegKernel:
         qc: cutlass.Int32,
         smem_bytes: cutlass.Int32,
     ):
+        row, _, _ = cute.arch.block_idx()
+        sbase = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()  # Int32 shared addr
+        self.row_topk(logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase)
+
+    @cute.jit
+    def row_topk(self, logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase):
+        """Register-resident top-K of row ``row``: the whole kernel body, with the
+        smem window (map in the family docstring) at byte address ``sbase``.
+        Separate from ``kern`` so the main family can call it for rows that fit
+        its CTA's registers."""
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
         KPT = cutlass.const_expr(self.kpt)
@@ -3909,7 +4080,6 @@ class GvrTopkRegKernel:
             cute.arch.griddepcontrol_wait()  # knob default off
 
         tid, _, _ = cute.arch.thread_idx()
-        row, _, _ = cute.arch.block_idx()
         lane = tid & cutlass.Int32(31)
 
         # ---- early row load (decode): the float4 batch is bounded by the launch
@@ -4131,10 +4301,7 @@ class GvrTopkRegKernel:
                 if tid == cutlass.Int32(0):
                     lmask = (cutlass.Int32(0xF) << lead) & cutlass.Int32(0xF)
 
-            # ---- shared-memory window (map in module docstring) ----
-            sptr = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
-            sbase = sptr.toint()  # Int32 shared addr
-
+            # ---- shared-memory window at sbase (map in module docstring) ----
             s_res = _smem_view(cutlass.Int32, sbase, 0, 6)
             s_cnt = _smem_view(cutlass.Int32, sbase, 6, 2)  # [0]=s_o1 [1]=s_oc
             s_kmm = _smem_view(cutlass.Uint32, sbase, 8, 2)  # [0]=s_kmin [1]=s_kmax
@@ -4271,11 +4438,13 @@ class GvrTopkRegKernel:
                 for t in cutlass.range_constexpr(KPT):
                     p = pvs[t]
                     if cutlass.Uint32(p) < cutlass.Uint32(n):
-                        uk = fkey(img_f[p])
-                        if uk < lmin:
-                            lmin = uk
-                        if uk > lmax:
-                            lmax = uk
+                        xi = img_f[p]
+                        if fabs_f32(xi) != cutlass.Float32(_POS_INF):  # finite bracket, see below
+                            uk = fkey(xi)
+                            if uk < lmin:
+                                lmin = uk
+                            if uk > lmax:
+                                lmax = uk
                 cute.arch.barrier()  # img dies
             elif cutlass.const_expr(self.use_bm):
                 nbw = (n + cutlass.Int32(31)) >> cutlass.Int32(5)
@@ -4303,15 +4472,18 @@ class GvrTopkRegKernel:
                         )
                     for cbit in cutlass.range_constexpr(4):
                         if (w & cutlass.Uint32(1 << cbit)) != cutlass.Uint32(0):
-                            lmn = fmin_f32(lmn, _val(frags, 4 * u + cbit))
-                            lmx = fmax_f32(lmx, _val(frags, 4 * u + cbit))
+                            v = _val(frags, 4 * u + cbit)
+                            if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
+                                lmn = fmin_f32(lmn, v)
+                                lmx = fmax_f32(lmx, v)
                 if tid < ntail:
                     wt = cutlass.Uint32(bm[tix >> cutlass.Int32(5)]) >> cutlass.Uint32(
                         tix & cutlass.Int32(31)
                     )
                     if (wt & cutlass.Uint32(1)) != cutlass.Uint32(0):
-                        lmn = fmin_f32(lmn, tval)
-                        lmx = fmax_f32(lmx, tval)
+                        if fabs_f32(tval) != cutlass.Float32(_POS_INF):
+                            lmn = fmin_f32(lmn, tval)
+                            lmx = fmax_f32(lmx, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)  # monotone
                 cute.arch.barrier()  # bm dies
@@ -4331,8 +4503,9 @@ class GvrTopkRegKernel:
                     if pos >= lead:
                         if pos < k + lead:
                             v = _val(frags, s)
-                            lmn = fmin_f32(lmn, v)
-                            lmx = fmax_f32(lmx, v)
+                            if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
+                                lmn = fmin_f32(lmn, v)
+                                lmx = fmax_f32(lmx, v)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             elif cutlass.const_expr(self.deg):
@@ -4344,12 +4517,13 @@ class GvrTopkRegKernel:
                     if cutlass.const_expr(self.prefill and s < 4):
                         okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
                     if okl != cutlass.Int32(0):
-                        if v > cutlass.Float32(_NEG_INF__reg):
+                        if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
                             lmn = fmin_f32(lmn, v)
                             lmx = fmax_f32(lmx, v)
                 if tid < ntail:
-                    lmn = fmin_f32(lmn, tval)
-                    lmx = fmax_f32(lmx, tval)
+                    if fabs_f32(tval) != cutlass.Float32(_POS_INF):
+                        lmn = fmin_f32(lmn, tval)
+                        lmx = fmax_f32(lmx, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             else:
@@ -4362,11 +4536,12 @@ class GvrTopkRegKernel:
                     xs.append(xv)
                 for t in cutlass.range_constexpr(KPT):
                     if cutlass.Uint32(pvs[t]) < cutlass.Uint32(n):
-                        uk = fkey(xs[t])
-                        if uk < lmin:
-                            lmin = uk
-                        if uk > lmax:
-                            lmax = uk
+                        if fabs_f32(xs[t]) != cutlass.Float32(_POS_INF):  # finite bracket
+                            uk = fkey(xs[t])
+                            if uk < lmin:
+                                lmin = uk
+                            if uk > lmax:
+                                lmax = uk
 
             # ---- block min/max in ONE barrier; publishes hist clear
             lmin = warp_min_u32(lmin)
@@ -4390,11 +4565,21 @@ class GvrTopkRegKernel:
             # and folds every value into bin 0, dropping the +inf; reject it
             # here (okc=0) and force the key-space escape below.
             # (upstream TensorRT-LLM PR #18625, ported verbatim.)
+            # FlashInfer-local: the bracket arms above fold only scores that
+            # are not +-inf, so an infinite score no longer makes the width
+            # infinite. Upstream sent every such row to the escape, which doubled
+            # this kernel on DeepSeek-V4.1 block top-k, whose newest key is
+            # always +inf (B200, K=2048, 4,101 keys, DEG rung: 7.6 vs 3.9 us).
+            # Infinite scores still rank exactly: the bin maps saturate +inf
+            # into the top bin and -inf into bin 0 (BRL) or below the histogram
+            # (non-BRL), and the escape tests below cover the crossings that
+            # this leaves to the histogram.
             okc = cutlass.Int32(0)
             if Tv < GMAX:
                 w_ = GMAX - Tv
-                # w_ < 3.5e38 (> FLT_MAX) rejects an infinite bracket width.
-                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
+                # w_ < +inf rejects an infinite bracket width (the former
+                # Float32(3.5e38) overflowed to the same +inf, with a DSL warning).
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(_POS_INF):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -4501,6 +4686,22 @@ class GvrTopkRegKernel:
             # (upstream TensorRT-LLM PR #18625, ported verbatim.)
             if okc == cutlass.Int32(0):
                 esc = cutlass.Int32(1)
+            # FlashInfer-local, with the finite bracket (see the collapse guard):
+            # two crossings the float histogram cannot rank take the escape too.
+            # (a) BRL bin 0 is a trash bin: it counts everything under the
+            # bracket (-inf, fill lanes, scores below Tv) while the emit stages
+            # only its q >= 0 part, so a crossing there (fewer than k scores at
+            # or above Tv) would refine over unstaged slots.
+            # (b) The ballot emit (CUR off) sends q >= HIf above the crossing,
+            # and HIf is +inf when the crossing is the top bin, which the q of a
+            # +inf score (counted in the top bin) would pass.
+            if cutlass.const_expr(self.brl):
+                if Bv == cutlass.Int32(0):
+                    esc = cutlass.Int32(1)
+            if cutlass.const_expr(not self.cur):
+                if whole == cutlass.Int32(0):
+                    if Bv == cutlass.Int32(self.nbh - 1):
+                        esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):
                     s_cnt[0] = cutlass.Int32(0)
@@ -6401,6 +6602,10 @@ class GvrClusKernel:
                                         rhi = nlo + (
                                             (cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1)
                                         )
+                                        # FlashInfer-local: saturate a wrapped rhi
+                                        # (as in gvr_main's P6 narrowing)
+                                        if cutlass.Uint32(rhi) < nlo:
+                                            rhi = cutlass.Uint32(0xFFFFFFFF)
                                     rlo = nlo
                                     lev = lev + cutlass.Int32(1)
                             if tidx == cutlass.Int32(0):
@@ -7219,7 +7424,7 @@ class GvrRegClusKernel:
             okc = cutlass.Int32(0)
             if Tv < GMAX:
                 w_ = GMAX - Tv
-                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(_POS_INF__regclus):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
