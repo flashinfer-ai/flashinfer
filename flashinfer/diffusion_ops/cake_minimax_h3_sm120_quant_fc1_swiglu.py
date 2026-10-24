@@ -209,7 +209,7 @@ def prepare_minimax_h3_fc1_weight_fp8(
     fc1_weight : torch.Tensor
         BF16 CUDA tensor with shape ``[28672, 5376]`` in gate-rows-then-up-rows order.
     chunk_rows : int
-        Number of weight rows quantized per temporary FP32 chunk.
+        Positive number of weight rows quantized per temporary FP32 chunk.
 
     Returns
     -------
@@ -217,14 +217,17 @@ def prepare_minimax_h3_fc1_weight_fp8(
         The prepacked E4M3 weight and its FP32 per-row scales.
     """
     _check_fc1_weight(fc1_weight)
+    chunk_rows = int(chunk_rows)
+    if chunk_rows <= 0:
+        raise ValueError(f"chunk_rows must be positive, got {chunk_rows}")
     weight_q = torch.empty(
         fc1_weight.shape, dtype=torch.float8_e4m3fn, device=fc1_weight.device
     )
     scale = torch.empty(
         (MINIMAX_H3_FC1_ROWS,), dtype=torch.float32, device=fc1_weight.device
     )
-    for start in range(0, MINIMAX_H3_FC1_ROWS, int(chunk_rows)):
-        stop = min(start + int(chunk_rows), MINIMAX_H3_FC1_ROWS)
+    for start in range(0, MINIMAX_H3_FC1_ROWS, chunk_rows):
+        stop = min(start + chunk_rows, MINIMAX_H3_FC1_ROWS)
         rows = fc1_weight[start:stop].float()
         row_scale = fp8_scale_from_amax(rows.abs().amax(dim=1).clamp_min(1e-12))
         scale[start:stop] = row_scale
