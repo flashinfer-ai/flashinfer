@@ -540,9 +540,8 @@ reports that gap).
   the stage names of both programs (`STAGES` / `NOPE_STAGES`, `PROGRAMS`) and
   the loader glue: `library_name(stage, arch, program)` is the `build.json`
   entry `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch,
-  program)` loads through `cake_build`; `specs_for_arch(arch)` lists the JIT
-  specs of an architecture for `flashinfer.jit.build_jit_specs`.  Stages of
-  the two programs that share a kernel name the same library stem.
+  program)` loads through `cake_build`.  Stages of the two programs that
+  share a kernel name the same library stem.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`, written by the export): one entry per `<library>_<arch>`
@@ -554,9 +553,9 @@ reports that gap).
   JIT-builds the entry through FlashInfer (`gen_jit_spec`, sources
   digest-verified first; `sm_107a` needs an nvcc that lists `compute_107`).
   `aot/` is never tracked (`.gitignore`).
-* `cake_launch.py` -- generated positional launchers and grid functions, one
-  per stage of either program, over the kernels' own argument names
-  (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
+* `cake_launch.py` -- generated positional launchers and grid functions over
+  the kernels' own argument names, one per distinct argument plan or grid
+  rule (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include

@@ -55,7 +55,6 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     NUM_HEADS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     KeyPassPolicy,
-    derive_topk_length,
     dsa_train_workspace_size,
     generated_program_available,
     offset_gather_kv_indices,
@@ -66,6 +65,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
 from tests.test_helpers import cake_dsa_train_reference as nope_ref
 from tests.test_helpers.cake_dsa_train_reference import (
     compact_rows,
+    derive_topk_length,
     globalize_gather_indices_loop,
     make_inputs,
     reference_fp64,

@@ -383,7 +383,6 @@ def key_pass_dq_mode(index: int, passes: int) -> int:
 # (``False``) it (``None``, the default, = the rule).  Without the natural
 # stages every ``dkv_acc`` call takes the cast's accumulate path.  Both paths
 # add the same FP32 contributions into the same rows (another summation order).
-DIRECT_STAGES = ("bwd_main_natural", "bwd_main_pass_natural")
 DKV_DIRECT_POLICY_FIELDS = ("min_keys_per_query",)
 
 
@@ -1223,7 +1222,7 @@ def offset_gather_kv_indices(
     position with ``causal``, itself ``< seqlen_k``, and ``seqlen_k - 1``
     otherwise) and one ``where`` over ``idx + key_base``.  With
     ``return_topk_length=True`` the per-row ``topk_length`` (last valid slot
-    + 1; bitwise what :func:`derive_topk_length` computes from the result) is
+    + 1 of the result row under the rule ``0 <= idx < num_kv``, 0 if none) is
     derived from the same mask with one ``where`` and one ``amax`` and the
     function returns ``(indices, topk_length)``.  Runs on device without a
     host synchronization, in int32 throughout.
@@ -1373,27 +1372,6 @@ def _slot_positions(topk: int, device: torch.device) -> torch.Tensor:
         pos = torch.arange(1, int(topk) + 1, device=device, dtype=torch.int32)
         _SLOT_POSITIONS[key] = pos
     return pos
-
-
-def derive_topk_length(indices: torch.Tensor, num_kv: int) -> torch.Tensor:
-    """``[T]`` int32: position of the last valid slot + 1 per row (0 for a fully masked row).
-
-    The public entries' default when the caller passes no ``topk_length``: a slot
-    is valid iff ``0 <= idx < num_kv`` (``idx == clamp(idx, 0, num_kv - 1)`` for
-    int32 ``idx``), every slot past the last valid one is invalid, so the kernels
-    may skip the trailing invalid key blocks while the masking semantics -- and
-    the results -- stay those of the full row.  Four small launches (clamp, eq,
-    where, amax) on device, no host synchronization.
-    """
-    if indices.ndim != 2 or indices.dtype != torch.int32:
-        raise ValueError("indices must be an int32 [T, topk] tensor")
-    T, topk = indices.shape
-    S = int(num_kv)
-    if S < 1:
-        return torch.zeros((T,), dtype=torch.int32, device=indices.device)
-    pos = _slot_positions(topk, indices.device)
-    valid = indices == indices.clamp(0, S - 1)
-    return torch.where(valid, pos, 0).amax(dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -3020,8 +2998,8 @@ def dsa_sparse_attention(
     is the packed segment count of the key row (``len(cu_seqlens_k) - 1`` for
     a packed batch; :func:`dsa_sparse_attention_varlen` passes it): the
     backward's whole-row key-range passes apply to one-segment rows only.
-    Without ``topk_length`` the per-row lengths (last valid slot + 1, what
-    :func:`derive_topk_length` computes) are derived once per step by the
+    Without ``topk_length`` the per-row lengths (last valid slot + 1 under
+    the rule ``0 <= idx < num_kv``, 0 if none) are derived once per step by the
     forward kernel itself while it runs -- no separate launch -- into a fresh
     ``[T]`` tensor that is saved for the backward, so both kernels skip the
     trailing invalid key blocks of short rows; the results are those of the
