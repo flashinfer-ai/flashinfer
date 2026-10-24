@@ -11,9 +11,9 @@ import tvm_ffi
 
 from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.gemm import gemm_base
-from flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention import (
+from flashinfer.jit.cake_minimax_h3_mxfp8 import (
     load_minimax_h3_mxfp8_route,
-    minimax_h3_mxfp8_route_record,
+    minimax_h3_mxfp8_require_route,
 )
 
 _HIDDEN = 5376
@@ -49,64 +49,6 @@ def _require_tensor(
     if not value.is_cuda or not value.is_contiguous():
         raise ValueError(f"{name} must be a contiguous CUDA tensor")
     return value
-
-
-def _stage_workspace(
-    value: Optional[torch.Tensor],
-    *,
-    name: str,
-    record: dict,
-    device: torch.device,
-) -> Optional[torch.Tensor]:
-    required = int(record["tma_workspace_bytes"])
-    if required == 0:
-        if value is not None:
-            raise ValueError(f"{name} must be None for a by-value descriptor route")
-        return None
-    if value is None:
-        raise ValueError(f"{name} must provide at least {required} caller-owned bytes")
-    if not isinstance(value, torch.Tensor) or value.ndim != 1:
-        raise TypeError(f"{name} must be a one-dimensional torch.Tensor")
-    if value.dtype != torch.uint8 or value.device != device:
-        raise ValueError(f"{name} must be a CUDA uint8 tensor on {device}")
-    if not value.is_cuda or not value.is_contiguous() or value.numel() < required:
-        raise ValueError(
-            f"{name} must be contiguous and contain at least {required} bytes"
-        )
-    if int(value.data_ptr()) % 128:
-        raise ValueError(f"{name} must be 128-byte aligned")
-    return value
-
-
-def _stage_call_args(
-    record: dict,
-    values: dict,
-    *,
-    workspace: Optional[torch.Tensor],
-    grid: tuple[int, ...],
-) -> tuple:
-    grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-    args = []
-    for raw_kind, raw_name in record["arg_plan"]:
-        kind = str(raw_kind)
-        name = str(raw_name)
-        if kind in {"buffer", "tma_buffer", "parameter"}:
-            if name not in values:
-                raise RuntimeError(
-                    f"generated stage requires unknown argument {name!r}"
-                )
-            args.append(values[name])
-        elif kind == "workspace" and name == "tma_descriptor_workspace":
-            if workspace is None:
-                raise RuntimeError("generated stage requires descriptor workspace")
-            args.append(workspace)
-        elif kind == "grid" and name in grid_values:
-            args.append(grid_values[name])
-        else:
-            raise RuntimeError(
-                f"generated stage has unsupported argument {(kind, name)!r}"
-            )
-    return tuple(args)
 
 
 class PreparedMiniMaxH3Mxfp8PreAttention:
@@ -193,12 +135,16 @@ def prepare_minimax_h3_mxfp8_pre_attention(
     M = int(x.shape[0])
     if M <= 0:
         raise ValueError("M must be positive")
+    # Both stages pass their tensor-map-free pointer ABI by value.
+    if norm_descriptor_workspace is not None or post_descriptor_workspace is not None:
+        raise ValueError(
+            "norm_descriptor_workspace and post_descriptor_workspace must be None"
+        )
     device = x.device
     heads_per_destination = _HEADS // P
     rows_per_destination = M * heads_per_destination * _KINDS
     activation_sf_len = _round_up(M, 128) * (_HIDDEN // 32)
     out_sf_stride = _round_up(rows_per_destination, 128) * (_HEAD_DIM // 32)
-
     tensors = {
         "x": (x, (M, _HIDDEN), torch.bfloat16),
         "x_norm_weight": (x_norm_weight, (_HIDDEN,), torch.bfloat16),
@@ -259,22 +205,7 @@ def prepare_minimax_h3_mxfp8_pre_attention(
             device=device,
         )
     assert debug_q_bf16 is not None and debug_k_bf16 is not None
-
-    route = minimax_h3_mxfp8_route_record(device, M, P)
-    norm_record = route["stages"]["norm_adaln_mxfp8_quantize"]
-    post_record = route["stages"]["qk_rope_destination_mxfp8_pack"]
-    norm_descriptor_workspace = _stage_workspace(
-        norm_descriptor_workspace,
-        name="norm_descriptor_workspace",
-        record=norm_record,
-        device=device,
-    )
-    post_descriptor_workspace = _stage_workspace(
-        post_descriptor_workspace,
-        name="post_descriptor_workspace",
-        record=post_record,
-        device=device,
-    )
+    minimax_h3_mxfp8_require_route(M, P)
     norm_module, post_module = load_minimax_h3_mxfp8_route(device, M, P)
     cutlass_module = gemm_base.get_cutlass_mxfp8_gemm_module(10)
     runner_factory = getattr(cutlass_module, "cutlass_mxfp8_gemm_runner", None)
@@ -291,38 +222,28 @@ def prepare_minimax_h3_mxfp8_pre_attention(
         qkv_bf16,
         gemm_workspace,
     ]
-    values = {
-        "x": x,
-        "x_norm_weight": x_norm_weight,
-        "adaln_scale": adaln_scale,
-        "adaln_shift": adaln_shift,
-        "adaln_index": adaln_index,
-        "activation_q": activation_q,
-        "activation_sf": activation_sf,
-        "qkv_bf16": qkv_bf16,
-        "q_norm_weight": q_norm_weight,
-        "k_norm_weight": k_norm_weight,
-        "rope_cos_sin": rope_cos_sin,
-        "out_q": out_q,
-        "out_sf": out_sf,
-        "debug_q_bf16": debug_q_bf16,
-        "debug_k_bf16": debug_k_bf16,
-        "write_debug": write_debug,
-        "eps": eps,
-    }
-    norm_args = _stage_call_args(
-        norm_record,
-        values,
-        workspace=norm_descriptor_workspace,
-        grid=tuple(int(value) for value in norm_record["launch_grid"]),
+    norm_args = (
+        x,
+        x_norm_weight,
+        adaln_scale,
+        adaln_shift,
+        adaln_index,
+        activation_q,
+        activation_sf,
+        eps,
     )
-    post_args = _stage_call_args(
-        post_record,
-        values,
-        workspace=post_descriptor_workspace,
-        grid=tuple(int(value) for value in post_record["launch_grid"]),
+    post_args = (
+        qkv_bf16,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos_sin,
+        out_q,
+        out_sf,
+        debug_q_bf16,
+        debug_k_bf16,
+        write_debug,
+        eps,
     )
-
     activation_sf.zero_()
     with tvm_ffi.use_torch_stream():
         norm_module.run(*norm_args)

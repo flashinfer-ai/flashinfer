@@ -11,6 +11,7 @@ from typing import Literal, Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from .kernels.native_bf16_fp4.support import check_native_bf16_fp4
 from ..trace.templates.gemm import mm_bf16_fp4_trace_dispatch
 from ..utils import (
     backend_requirement,
@@ -33,9 +34,11 @@ _CUDNN_BF16_FP4_MIN_BACKEND_VERSION = 92301
 _Bf16Fp4Backend = Literal[
     "cudnn",
     "cute-dsl",
+    "cute-dsl-native",
     "blackwell-native",
     "blackwell-tiled",
 ]
+_SourceBuiltBf16Fp4Backend = Literal["blackwell-native", "blackwell-tiled"]
 
 
 def _check_mm_bf16_fp4_problem_size(
@@ -67,7 +70,7 @@ def _check_mm_bf16_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -101,7 +104,12 @@ def _cudnn_bf16_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+def _cute_dsl_uses_sm100_layout(major: int, minor: int) -> bool:
+    """SM100-family cute-dsl keeps the canonical uint8 weight and a 6-D scale view."""
+    return (major, minor) in ((10, 0), (10, 3), (10, 7))
+
+
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cute_dsl_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -116,7 +124,9 @@ def _cute_dsl_bf16_fp4_requirement(
 ):
     major, minor = get_compute_capability(a.device)
     cc = major * 10 + minor
-    expected_dtype = torch.uint8 if cc in (100, 103) else torch.int32
+    expected_dtype = (
+        torch.uint8 if _cute_dsl_uses_sm100_layout(major, minor) else torch.int32
+    )
     if b.dtype != expected_dtype:
         raise ValueError(
             f"cute-dsl bf16 x fp4 on SM{cc} expects the {expected_dtype} weight "
@@ -128,121 +138,25 @@ def _cute_dsl_bf16_fp4_requirement(
 
 
 @supported_compute_capability([100, 103])
-def _blackwell_native_bf16_fp4_requirement(
+def _blackwell_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: _Bf16Fp4Backend,
+    backend: _SourceBuiltBf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     enable_pdl: bool = True,
 ):
-    del alpha, backend, enable_pdl
-    if int(a.shape[1]) % block_size != 0:
-        raise ValueError(
-            f"K={int(a.shape[1])} must be a multiple of block_size={block_size}"
-        )
-    if b.dim() != 2 or b.dtype != torch.uint8:
-        raise ValueError(
-            "blackwell-native expects the uint8 [N, K/2] weight returned by "
-            "prepare_bf16_fp4_weights(..., backend='blackwell-native')"
-        )
-    n = int(b.shape[0])
-    k = int(b.shape[1]) * 2
-    if int(a.shape[1]) != k:
-        raise ValueError(f"a.shape[1]={int(a.shape[1])} but prepared b encodes K={k}")
-    if b_descale.dtype != torch.float8_e4m3fn or tuple(b_descale.shape) != (
-        n,
-        k // block_size,
-    ):
-        raise ValueError(
-            "blackwell-native expects linear float8_e4m3fn scales with shape "
-            f"{(n, k // block_size)}; got dtype={b_descale.dtype}, "
-            f"shape={tuple(b_descale.shape)}"
-        )
-    requested_dtype = out_dtype or a.dtype
-    if requested_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(
-            "blackwell-native supports bfloat16 or float16 output; "
-            f"got {requested_dtype}"
-        )
-    if not b.is_contiguous() or not b_descale.is_contiguous():
-        raise ValueError("blackwell-native requires contiguous b and b_descale")
-    if b.device != a.device or b_descale.device != a.device:
-        raise ValueError("a, b, and b_descale must be on the same device")
-    if out is not None and (
-        tuple(out.shape) != (int(a.shape[0]), n)
-        or out.dtype != requested_dtype
-        or out.device != a.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError(
-            "out must be contiguous, on the same device, and have shape/dtype "
-            f"{(int(a.shape[0]), n)}/{requested_dtype}"
-        )
-    return True
+    """Source-built Blackwell backends: the checks the compute path runs itself."""
+    del enable_pdl
+    from .gemm_bf16_fp4_blackwell import _validate_blackwell_bf16_fp4
 
-
-@supported_compute_capability([100, 103])
-def _blackwell_tiled_bf16_fp4_requirement(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    *,
-    backend: _Bf16Fp4Backend,
-    out_dtype: Optional[torch.dtype] = None,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    enable_pdl: bool = True,
-):
-    del alpha, backend, enable_pdl
-    if int(a.shape[1]) % block_size != 0:
-        raise ValueError(
-            f"K={int(a.shape[1])} must be a multiple of block_size={block_size}"
-        )
-    if b.dim() != 2 or b.dtype != torch.int32 or int(b.shape[1]) % 2 != 0:
-        raise ValueError(
-            "blackwell-tiled expects the int32 [K/16, N*2] weight returned by "
-            "prepare_bf16_fp4_weights(..., backend='blackwell-tiled')"
-        )
-    k_tiles = int(b.shape[0])
-    n = int(b.shape[1]) // 2
-    k = k_tiles * block_size
-    if int(a.shape[1]) != k:
-        raise ValueError(f"a.shape[1]={int(a.shape[1])} but prepared b encodes K={k}")
-    if n % 64 != 0:
-        raise ValueError(
-            f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
-        )
-    if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != (k_tiles, n):
-        raise ValueError(
-            "blackwell-tiled expects S0E5M3 uint8 scales with shape "
-            f"{(k_tiles, n)}; got dtype={b_descale.dtype}, "
-            f"shape={tuple(b_descale.shape)}"
-        )
-    requested_dtype = out_dtype or a.dtype
-    if requested_dtype != torch.bfloat16:
-        raise ValueError(
-            f"blackwell-tiled requires bfloat16 output; got {requested_dtype}"
-        )
-    if not b.is_contiguous() or not b_descale.is_contiguous():
-        raise ValueError("blackwell-tiled requires contiguous b and b_descale")
-    if b.device != a.device or b_descale.device != a.device:
-        raise ValueError("a, b, and b_descale must be on the same device")
-    if out is not None and (
-        tuple(out.shape) != (int(a.shape[0]), n)
-        or out.dtype != requested_dtype
-        or out.device != a.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError(
-            "out must be contiguous, on the same device, and have shape/dtype "
-            f"{(int(a.shape[0]), n)}/{requested_dtype}"
-        )
+    _validate_blackwell_bf16_fp4(
+        a, b, b_descale, alpha, out_dtype or a.dtype, out, block_size, backend
+    )
     return True
 
 
@@ -285,7 +199,8 @@ def prepare_bf16_fp4_weights(
             forward the returned tuple to :func:`flashinfer.mm_bf16_fp4`.
         backend: Identifier of a supported backend: ``"cudnn"``,
             ``"cute-dsl"``, ``"blackwell-native"``, or
-            ``"blackwell-tiled"``.
+            ``"blackwell-tiled"``. The ``"cute-dsl-native"``
+            backend returns the original canonical buffers without preparation.
         block_size: SF block size.  Always 16 for FP4.
 
     Returns:
@@ -319,6 +234,11 @@ def prepare_bf16_fp4_weights(
             raise ValueError(f"alpha must be shape (1,); got {tuple(alpha.shape)}")
         if alpha.dtype != torch.float32:
             raise TypeError(f"alpha must be float32; got {alpha.dtype}")
+    if backend == "cute-dsl-native":
+        from .kernels.native_bf16_fp4.support import check_weights
+
+        check_weights(b, b_descale, alpha, block_size)
+        return b, b_descale, alpha
     if backend == "cudnn":
         from .gemm_bf16_fp4_cudnn import _prepare_cudnn
 
@@ -339,7 +259,7 @@ def prepare_bf16_fp4_weights(
         )
     raise ValueError(
         f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl', "
-        "'blackwell-native', 'blackwell-tiled'."
+        "'cute-dsl-native', 'blackwell-native', 'blackwell-tiled'."
     )
 
 
@@ -347,8 +267,9 @@ def prepare_bf16_fp4_weights(
     {
         "cudnn": _cudnn_bf16_fp4_requirement,
         "cute-dsl": _cute_dsl_bf16_fp4_requirement,
-        "blackwell-native": _blackwell_native_bf16_fp4_requirement,
-        "blackwell-tiled": _blackwell_tiled_bf16_fp4_requirement,
+        "cute-dsl-native": check_native_bf16_fp4,
+        "blackwell-native": _blackwell_bf16_fp4_requirement,
+        "blackwell-tiled": _blackwell_bf16_fp4_requirement,
     },
     common_check=_check_mm_bf16_fp4_problem_size,
 )
@@ -367,9 +288,10 @@ def mm_bf16_fp4(
 ) -> torch.Tensor:
     """BF16 x FP4 GEMM: ``out = (a @ dequant(b).T) * alpha``.
 
-    Intended to support **W4A16** workloads (4-bit weights, 16-bit activations)
-    nvfp4 weights must be prepared for ``backend`` by
-    :func:`prepare_bf16_fp4_weights`.  ``b``, ``b_descale``, and ``alpha``.
+    Supports **W4A16** workloads (4-bit weights, 16-bit activations).
+    Prepare weights for the selected backend with :func:`prepare_bf16_fp4_weights`.
+    The explicit ``cute-dsl-native`` backend needs no preparation: it accepts
+    canonical packed weights and 128x4-swizzled scales directly.
 
     Example:
         .. code-block:: python
@@ -393,6 +315,8 @@ def mm_bf16_fp4(
             whatever ``prepare_bf16_fp4_weights`` returned -- it may be
             ``None`` if the backend folded it into ``b_descale``.
         backend: Same identifier passed to ``prepare_bf16_fp4_weights``.
+            ``cute-dsl-native`` accepts canonical packed weights and 128x4
+            scales directly on SM120/121.
         out_dtype: Output dtype.  Defaults to ``a.dtype`` (``bfloat16``).
         out: Optional preallocated ``(M, N)`` output tensor.
         block_size: SF block size.  Always 16 for FP4.
@@ -402,6 +326,10 @@ def mm_bf16_fp4(
         ``(M, N)`` tensor of ``out_dtype``.
     """
     out_dtype = out_dtype or a.dtype
+    if backend == "cute-dsl-native":
+        from .kernels.native_bf16_fp4.runner import run
+
+        return run(a, b, b_descale, alpha, out_dtype, out, enable_pdl)
     if backend == "cudnn":
         from .gemm_bf16_fp4_cudnn import _compute_cudnn
 
@@ -428,7 +356,7 @@ def mm_bf16_fp4(
         )
     raise ValueError(
         f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl', "
-        "'blackwell-native', 'blackwell-tiled'."
+        "'cute-dsl-native', 'blackwell-native', 'blackwell-tiled'."
     )
 
 

@@ -18,6 +18,23 @@ import pytest
 import torch
 
 from flashinfer.fused_moe import hash_topk
+from flashinfer.utils import get_compute_capability
+
+
+def _hash_topk_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return hash_topk.is_compute_capability_supported(major * 10 + minor)
+
+
+# hash_topk rejects unsupported architectures at call time (for example SM75),
+# so gate the whole module on the op's own capability declaration instead of
+# duplicating the supported list here.
+pytestmark = pytest.mark.skipif(
+    not _hash_topk_supported(),
+    reason="hash_topk does not support this GPU's compute capability",
+)
 
 
 def _ref_hash_topk(

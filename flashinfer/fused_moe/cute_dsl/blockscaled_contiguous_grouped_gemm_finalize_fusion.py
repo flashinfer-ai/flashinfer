@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+
 import cuda.bindings.driver as cuda
 import torch
 
@@ -254,6 +255,8 @@ def _get_compiled_finalize_kernel(
         sf_dtype,
         out_dtype,
         final_scale_dtype,
+        # The persistent grid size is a compile-time constant.
+        max_active_clusters,
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
@@ -346,6 +349,8 @@ def _get_compiled_finalize_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            # Rubin strides must be runtime Int64s, not Python constexprs.
+            **({"c_stride_row": cutlass.Int64(0)} if is_rubin else {}),
         )
 
         _finalize_kernel_cache[cache_key] = compiled_gemm
@@ -376,6 +381,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    domain_id: int = -1,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
@@ -402,7 +408,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         token_final_scales: Router scaling factors, shape (seq_len, topk), float32/bf16/fp16
         out: Optional output tensor. Shape is ``(seq_len, n)`` in fused mode
              and ``(seq_len * topk, n)`` in deterministic mode. In fused mode,
-             a provided buffer must already be zero-initialized.
+             a provided buffer must already be zero-initialized. Caller-provided
+             buffers must be contiguous and on the same device as A.
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
              W4A4 quantizer instead of the fused GEMM1 epilogue.
@@ -415,6 +422,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        domain_id: Locality-domain index (0 or 1), or -1 for ordinary output.
+             Rubin localized execution writes this shard's hidden columns into
+             a caller-provided output with twice the shard's output width.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
 
@@ -576,6 +586,23 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
+    # Both domains write disjoint column ranges of one full-width output.
+    localized_half_gemm = domain_id >= 0
+    if localized_half_gemm:
+        if not is_rubin:
+            raise ValueError(
+                "locality-domain hidden-shard (domain_id >= 0) is Rubin (SM107) only"
+            )
+        if domain_id >= 2:
+            raise ValueError(f"domain_id must be 0 or 1, got {domain_id}")
+        if out is None:
+            raise ValueError(
+                "locality-domain hidden-shard requires a caller-provided full-width out. Both "
+                "dies write disjoint column halves of one shared buffer, which the "
+                "caller must also have zeroed before the fused atomic finalize."
+            )
+    expected_n = n * 2 if localized_half_gemm else n
+
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
         allocator = torch.zeros if use_fused_finalize else torch.empty
@@ -586,23 +613,39 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         )
     else:
         expected_out_dtype = cutlass_to_torch_dtype(out_dtype_cutlass)
-        if out.shape != (output_rows, n):
+        if out.shape != (output_rows, expected_n):
             raise ValueError(
-                f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
+                f"out must have shape ({output_rows}, {expected_n}), got {tuple(out.shape)}"
             )
         if out.dtype != expected_out_dtype:
             raise TypeError(
                 f"out must have dtype {expected_out_dtype}, got {out.dtype}"
             )
+        if out.device != a.device:
+            raise ValueError(f"out must be on {a.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
 
     # Get SM count
+    total_sm = get_num_sm(a.device)
     if sm_count is None:
-        sm_count = get_num_sm(a.device)
+        sm_count = total_sm
 
     # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
+    # Scale full-device occupancy to the green context's SM allocation.
+    if sm_count < total_sm:
+        max_active_clusters = max(1, max_active_clusters * sm_count // total_sm)
+
+    # Each domain writes its own columns with the full output row stride.
+    if localized_half_gemm:
+        c_stride_row_val = cutlass.Int64(n * 2)
+        c_data_ptr = out.data_ptr() + domain_id * n * out.element_size()
+    else:
+        c_stride_row_val = cutlass.Int64(0)
+        c_data_ptr = out.data_ptr()
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
@@ -619,8 +662,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     b_sf_ptr = make_ptr(
         sf_dtype_cutlass, b_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
     )
+    # c_data_ptr carries this die's column offset in locality-domain mode (== out.data_ptr()
+    # otherwise).
     c_ptr = make_ptr(
-        out_dtype_cutlass, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        out_dtype_cutlass, c_data_ptr, cute.AddressSpace.gmem, assumed_align=32
     )
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
@@ -722,6 +767,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         seq_len,
         topk,
         stream=stream,
+        # Match the runtime stride traced by the Rubin wrapper.
+        **({"c_stride_row": c_stride_row_val} if is_rubin else {}),
     )
 
     return out

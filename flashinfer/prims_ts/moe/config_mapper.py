@@ -28,7 +28,7 @@ from typing import Sequence
 
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 
-SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 256)
+SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 192, 256)
 SUPPORTED_NVFP4_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_FP8_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 192, 256)
@@ -48,6 +48,7 @@ _ACTIVATION_TO_ACT_KIND = {
 
 class _BatchMode(IntEnum):
     BATCH_N = 0
+    BATCH_M = 1
 
 
 class _RouteImpl(IntEnum):
@@ -675,9 +676,15 @@ def _json_config_matches_moe(
         return False
     if json_weight_layout != int(weight_layout):
         return False
-    if not _bool_value(options.get("transpose_mma_output", True)):
+    transposed = _bool_value(options.get("transpose_mma_output", True))
+    if not transposed and (dtype_a != int(_DType.BF16) or dtype_b != int(_DType.BF16)):
         return False
-    if int(options.get("tile_n", -1)) != int(tile_n):
+    token_tile = (
+        int(options.get("tile_n", -1))
+        if transposed
+        else int(options.get("tile_m", 128)) * int(options.get("cluster_m", 1))
+    )
+    if token_tile != int(tile_n):
         return False
 
     route_active = _json_route_value(options.get("route_act", False)) != int(
@@ -766,6 +773,18 @@ def _moe_json_passing_indices(
     )
 
 
+def _same_batch_mode(fc1_index: int, fc2_index: int) -> bool:
+    return _bool_value(
+        _json_config_by_global_index(fc1_index).options.get(
+            "transpose_mma_output", True
+        )
+    ) == _bool_value(
+        _json_config_by_global_index(fc2_index).options.get(
+            "transpose_mma_output", True
+        )
+    )
+
+
 def _resolve_moe_json_config_pair(
     tile_n: int,
     moe_config_index: int,
@@ -819,7 +838,10 @@ def _resolve_moe_json_config_pair(
             f"fc1_matches={len(fc1_indices)}, fc2_matches={len(fc2_indices)}"
         )
     config_pairs = [
-        (fc1_index, fc2_index) for fc1_index in fc1_indices for fc2_index in fc2_indices
+        (fc1_index, fc2_index)
+        for fc1_index in fc1_indices
+        for fc2_index in fc2_indices
+        if _same_batch_mode(fc1_index, fc2_index)
     ]
     if use_deepseek_fp8:
         # Persisted autotuner caches store this pair index. Keep all original
@@ -859,9 +881,16 @@ def _resolve_moe_json_config_pair(
         # pair index. Keep the complete original FC1 x FC2 product first and
         # place every pair involving a new scheduler variant afterward.
         config_pairs.sort(
-            key=lambda pair: int(
-                _json_config_by_global_index(pair[0]).is_scheduler_union_variant
-                or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
+            key=lambda pair: (
+                not _bool_value(
+                    _json_config_by_global_index(pair[0]).options.get(
+                        "transpose_mma_output", True
+                    )
+                ),
+                int(
+                    _json_config_by_global_index(pair[0]).is_scheduler_union_variant
+                    or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
+                ),
             )
         )
     total = len(config_pairs)
@@ -899,6 +928,8 @@ def _json_config_kwargs(
 ) -> dict[str, int]:
     _ensure_json_config_supported_by_ts(cfg)
     options = cfg.options
+    if has_bias and not _bool_value(options.get("transpose_mma_output", True)):
+        raise ValueError("Prims-TS BF16 BatchM MoE does not support per-expert bias")
     use_max_tmem_overlap = int(_bool_value(options.get("use_max_tmem_overlap", False)))
     tmem_acc_stages = 1 if use_max_tmem_overlap else int(options["num_stages_tmem_acc"])
     mma_regs = int(options.get("mma_regs", 48))
@@ -921,7 +952,11 @@ def _json_config_kwargs(
     if use_per_token_sf_b is None:
         use_per_token_sf_b = json_use_per_token_sf_b
     kwargs = {
-        "batch_mode": int(_BatchMode.BATCH_N),
+        "batch_mode": int(
+            _BatchMode.BATCH_N
+            if _bool_value(options.get("transpose_mma_output", True))
+            else _BatchMode.BATCH_M
+        ),
         "dtype_a": _json_dtype_value(
             options.get("dtype_a"), default=_dtype_json_name(default_dtype_a)
         ),
@@ -1451,7 +1486,26 @@ def _valid_json_moe_tactics(
             per_token_sf_dtype=per_token_sf_dtype,
             weight_layout=weight_layout,
         )
-        for moe_config_index in range(len(fc1_indices) * len(fc2_indices)):
+        pair_count = sum(
+            _same_batch_mode(a, b) for a in fc1_indices for b in fc2_indices
+        )
+        for moe_config_index in range(pair_count):
+            if dtype_label == "BF16" and (fc1_has_bias or fc2_has_bias):
+                pair = _resolve_moe_json_config_pair(
+                    tile_n,
+                    moe_config_index,
+                    activation_type=activation_type,
+                    dtype_a=dtype_a,
+                    dtype_b=dtype_b,
+                    fc1_dtype_c=fc1_dtype_c,
+                    fc2_dtype_c=fc2_dtype_c,
+                    dtype_label=dtype_label,
+                    weight_layout=weight_layout,
+                )
+                if pair is not None and not _bool_value(
+                    pair[0].options.get("transpose_mma_output", True)
+                ):
+                    continue
             tactics.append([tile_n, moe_config_index])
     return tactics
 

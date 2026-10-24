@@ -10,10 +10,14 @@ from flashinfer.jit import (
     gen_tinygemm2_module,
     gen_tinygemm2_sm100_module,
 )
+from flashinfer.jit.cake_router_gemm import (
+    gen_cake_router_gemm_module,
+    supported_capability as _cake_router_gemm_capability,
+)
 import functools
 import os
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 from flashinfer.utils import (
     get_compute_capability,
@@ -41,13 +45,19 @@ def _router_gemm_shape_checks(
     if out.dim() != 2:
         raise ValueError("out must be a 2D tensor")
 
-    # Stride checks (check these before dimension checks to give better error messages)
-    if mat_a.stride(1) != 1:
-        raise ValueError("mat_a must be row-major")
-    if out.stride(1) != 1:
-        raise ValueError("out must be row-major")
-    if mat_b.stride(0) != 1:
-        raise ValueError("mat_b must be column-major")
+    # Stride checks (check these before dimension checks to give better error messages).
+    # The kernels address mat_a[m * K + k], mat_b[e * K + k] and out[m * N + e], so every
+    # operand must be dense: a padded view would silently produce wrong results.
+    if mat_a.stride(1) != 1 or (
+        mat_a.shape[0] > 1 and mat_a.stride(0) != mat_a.shape[1]
+    ):
+        raise ValueError("mat_a must be a dense row-major tensor")
+    if out.stride(1) != 1 or (out.shape[0] > 1 and out.stride(0) != out.shape[1]):
+        raise ValueError("out must be a dense row-major tensor")
+    if mat_b.stride(0) != 1 or (
+        mat_b.shape[1] > 1 and mat_b.stride(1) != mat_b.shape[0]
+    ):
+        raise ValueError("mat_b must be a dense column-major tensor")
 
     if mat_a.shape[1] != mat_b.shape[0]:
         raise ValueError("mat_a.shape[1] must be equal to mat_b.shape[0]")
@@ -309,7 +319,7 @@ def get_dsv3_router_gemm_module():
 
 @functools.cache
 def get_cake_router_gemm_module():
-    from flashinfer.jit.cake_router_gemm import run
+    module = gen_cake_router_gemm_module().build_and_load()
 
     @register_custom_op(
         "flashinfer::cake_ml3_router_gemm_op",
@@ -321,7 +331,7 @@ def get_cake_router_gemm_module():
         out: torch.Tensor,
         launch_with_pdl: bool = True,
     ) -> None:
-        run(mat_a, mat_b, out, launch_with_pdl)
+        module.run(mat_a, mat_b, out, launch_with_pdl)
 
     @register_custom_op(
         "flashinfer::cake_dsv3_router_gemm_op",
@@ -333,7 +343,7 @@ def get_cake_router_gemm_module():
         out: torch.Tensor,
         launch_with_pdl: bool = True,
     ) -> None:
-        run(mat_a, mat_b, out, launch_with_pdl)
+        module.run(mat_a, mat_b, out, launch_with_pdl)
 
     @register_custom_op(
         "flashinfer::cake_glm_dsa_router_gemm_op",
@@ -345,7 +355,7 @@ def get_cake_router_gemm_module():
         out: torch.Tensor,
         launch_with_pdl: bool = True,
     ) -> None:
-        run(mat_a, mat_b, out, launch_with_pdl)
+        module.run(mat_a, mat_b, out, launch_with_pdl)
 
     return SimpleNamespace(
         mm_M1_16_K7168_N128=mm_M1_16_K7168_N128,
@@ -354,13 +364,21 @@ def get_cake_router_gemm_module():
     )
 
 
-def get_router_gemm_module(*, backend: str):
-    if backend != "cake":
-        raise ValueError(f"unsupported Router GEMM backend: {backend!r}")
-    major, minor = get_compute_capability(torch.device("cuda"))
-    if major == 10 and minor in (0, 3):
+@functools.cache
+def _router_gemm_module_for_device(device_index: int):
+    # The capability query runs once per device; the Cake kernel serves the validated
+    # SM100/SM103 build targets and every other device keeps the reference kernel.
+    capability = get_compute_capability(torch.device("cuda", device_index))
+    if _cake_router_gemm_capability(capability) is not None:
         return get_cake_router_gemm_module()
     return get_dsv3_router_gemm_module()
+
+
+def get_router_gemm_module(device: torch.device, *, backend: str):
+    if backend != "cake":
+        raise ValueError(f"unsupported Router GEMM backend: {backend!r}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _router_gemm_module_for_device(index)
 
 
 @backend_requirement({}, common_check=_mm_M1_16_K7168_N128_shape_checks)
@@ -404,7 +422,7 @@ def mm_M1_16_K7168_N128(
     dimensions, strides, or dtypes do not match the expected Mistral Large 3
     configuration.
     """
-    get_router_gemm_module(backend="cake").mm_M1_16_K7168_N128(
+    get_router_gemm_module(mat_a.device, backend="cake").mm_M1_16_K7168_N128(
         mat_a, mat_b, out, launch_with_pdl
     )
 
@@ -450,7 +468,7 @@ def mm_M1_16_K7168_N256(
     ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
     expected DeepSeek-V3 router configuration.
     """
-    get_router_gemm_module(backend="cake").mm_M1_16_K7168_N256(
+    get_router_gemm_module(mat_a.device, backend="cake").mm_M1_16_K7168_N256(
         mat_a, mat_b, out, launch_with_pdl
     )
 
@@ -496,7 +514,7 @@ def mm_M1_16_K6144_N256(
     ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
     expected GLM-MoE-DSA configuration.
     """
-    get_router_gemm_module(backend="cake").mm_M1_16_K6144_N256(
+    get_router_gemm_module(mat_a.device, backend="cake").mm_M1_16_K6144_N256(
         mat_a, mat_b, out, launch_with_pdl
     )
 
@@ -843,11 +861,10 @@ def get_tinygemm2_module():
     )
 
 
-# tinygemm2_sm100: generated SM100/SM103 variants of the same kernel. Loom
-# schedules exactly porting csrc/tinygemm2.cu with bit-identical outputs;
-# selected automatically for the bias path on B200/B300-class devices. Ring
-# depth (stage 4/8/16) is selected inside the binding, mirroring the
-# reference launcher convention.
+# tinygemm2_sm100: generated SM100/SM103 port of the same kernel with
+# bit-identical outputs (csrc/tinygemm2_sm100.cu); selected automatically for
+# the bias path on B200/B300-class devices. Ring depth (stage 4/8/16) is
+# selected inside the binding, mirroring the reference launcher convention.
 
 
 @functools.cache
@@ -876,15 +893,28 @@ def get_tinygemm2_sm100_module():
 _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
-def _use_tinygemm2_sm100(device: torch.device) -> bool:
-    if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
+@functools.cache
+def _tinygemm2_sm100_enabled(
+    disabled: str, compute_capability: Tuple[int, int]
+) -> bool:
+    # Evaluated once per (escape-hatch value, compute capability): the CUDA
+    # version parsing below is off the per-call path.
+    if disabled == "1":
         return False
-    compute_capability = get_compute_capability(device)
     if compute_capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES:
         return False
     if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
         return False
     return version_at_least(torch.version.cuda, "12.8")
+
+
+def _use_tinygemm2_sm100(device: torch.device) -> bool:
+    # Keyed by the current FLASHINFER_DISABLE_TINYGEMM2_SM100 value so a
+    # process that toggles the escape hatch at runtime sees the change.
+    return _tinygemm2_sm100_enabled(
+        os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0"),
+        get_compute_capability(device),
+    )
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)

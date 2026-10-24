@@ -27,9 +27,6 @@ logger = logging.getLogger(__name__)
 JIT_CACHE_PROVIDER_ENTRY_POINT_GROUP = "flashinfer.jit_cache.providers"
 JIT_CACHE_PROVIDER_SCHEMA_VERSION = 1
 
-# Get the path to the AOT modules directory within this package
-jit_cache_dir = Path(__file__).parent / "jit_cache"
-
 
 def _normalize_cuda_architecture(architecture: str) -> str:
     """Normalize CUDA architecture spellings to names such as ``sm90a``."""
@@ -126,11 +123,6 @@ def get_jit_cache_providers() -> Tuple[JitCacheProvider, ...]:
     return tuple(sorted(providers, key=lambda provider: provider.provider_id))
 
 
-def get_jit_cache_dir() -> str:
-    """Get the directory containing the AOT compiled modules."""
-    return str(jit_cache_dir)
-
-
 try:
     from ._build_meta import __version__ as __version__
     from ._build_meta import __git_version__ as __git_version__
@@ -143,6 +135,5 @@ __all__ = [
     "JIT_CACHE_PROVIDER_ENTRY_POINT_GROUP",
     "JIT_CACHE_PROVIDER_SCHEMA_VERSION",
     "JitCacheProvider",
-    "get_jit_cache_dir",
     "get_jit_cache_providers",
 ]

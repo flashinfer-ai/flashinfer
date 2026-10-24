@@ -249,7 +249,6 @@ def prims_ts_fp4_block_scale_moe(
             local_num_experts,
             num_experts,
             routing_method_type,
-            routing_replay_out,
         )
 
     if hidden_states.dtype == torch.uint8:

@@ -1,6 +1,13 @@
-"""Fleet — abstract Expert-Parallel transport endpoint.
+"""Fleet — transport endpoint of the NCCL-EP and NIXL-EP backends.
 
-Backends register themselves in :data:`_BACKEND_REGISTRY` at import time
+The Fleet/Handle pair mirrors those libraries' own object model: a long-lived
+group that owns the transport buffers, and a per-step handle carrying one
+dispatch's routing state. It is one of the two peer kinds of split-path comm
+backend; the other,
+:class:`~flashinfer.moe_ep.core.comm.communication.MoEEpCommunication`, is a
+self-contained dispatch/combine object used by the NVLink backends.
+
+Backends register themselves with :func:`register_fleet` at import time
 (see :mod:`flashinfer.moe_ep.backends.split.comm.nccl_ep` and
 :mod:`flashinfer.moe_ep.backends.split.comm.nixl_ep`).
 """
@@ -18,7 +25,7 @@ if TYPE_CHECKING:
     from .handle import Handle
 
 
-_BACKEND_REGISTRY: "dict[str, Callable[..., Fleet]]" = {}
+_FLEET_REGISTRY: "dict[str, Callable[..., Fleet]]" = {}
 
 
 class Fleet(ABC):
@@ -147,6 +154,16 @@ class Fleet(ABC):
         )
 
 
+def register_fleet(name: str) -> Callable[[type[Fleet]], type[Fleet]]:
+    """Class decorator registering a :class:`Fleet` backend under ``name``."""
+
+    def decorator(cls: type[Fleet]) -> type[Fleet]:
+        _FLEET_REGISTRY[name] = cls
+        return cls
+
+    return decorator
+
+
 def create_fleet(
     bootstrap: "BootstrapConfig",
     params: "FleetParams",
@@ -163,7 +180,13 @@ def create_fleet(
         raise TypeError(
             f"backend must be a string or have a .backend_name str attr; got {backend!r}"
         )
-    if name not in _BACKEND_REGISTRY:
-        available = sorted(_BACKEND_REGISTRY)
+    if name not in _FLEET_REGISTRY:
+        available = sorted(_FLEET_REGISTRY)
         raise KeyError(f"unknown backend {name!r}; available: {available}")
-    return _BACKEND_REGISTRY[name](bootstrap, params, algo_knobs)
+    return _FLEET_REGISTRY[name](bootstrap, params, algo_knobs)
+
+
+def is_fleet_backend(backend: str | object) -> bool:
+    """Whether ``backend`` (a name or config object) names a registered Fleet."""
+    name = getattr(backend, "backend_name", backend)
+    return isinstance(name, str) and name in _FLEET_REGISTRY

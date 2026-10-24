@@ -101,10 +101,11 @@ enum class Variant : int {
   // Copy-engine ring. Dispatched one level up, in csrc, not by all_reduce()
   // below -- see the guard at the top of that function.
   kCopyEngineRing = 4,
-  kCopyEngineIsland = 5,  // 4+4 decomposition; world_size 8 and rootcplx only
+  kCopyEngineIsland = 5,     // 4+4 decomposition; world_size 8 and rootcplx only
+  kCopyEngineRingMemop = 6,  // SM120 single-piece ring with CE publication
 };
 
-constexpr int kVariantCount = 6;
+constexpr int kVariantCount = 7;
 
 // Which staging area a kernel uses. The kernels come in two protocol families
 // and a region may hold only one of them.
@@ -2237,7 +2238,8 @@ cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews
   // routes it before reaching here. Refused explicitly because the
   // world_size == 2 branch below selects on `variant == kStaged` and would
   // otherwise silently run the TP2 SM kernel for any variant it does not know.
-  if (variant == Variant::kCopyEngineRing || variant == Variant::kCopyEngineIsland) {
+  if (variant == Variant::kCopyEngineRing || variant == Variant::kCopyEngineIsland ||
+      variant == Variant::kCopyEngineRingMemop) {
     return cudaErrorInvalidValue;
   }
 

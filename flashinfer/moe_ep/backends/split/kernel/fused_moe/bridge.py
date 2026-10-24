@@ -69,6 +69,57 @@ def pack_mxfp8_dispatch_payload(x: torch.Tensor) -> torch.Tensor:
     return packed.view(torch.bfloat16)
 
 
+def _mask_padding_rows_nonlocal(
+    selected_experts: torch.Tensor,
+    final_scales: torch.Tensor,
+    recv_count: torch.Tensor,
+    *,
+    num_local_experts: int,
+    cap: int,
+    local_expert_offset: int,
+    num_experts: Optional[int],
+):
+    """Mask padded rows by marking them as belonging to an expert this rank does not own.
+
+    Only the first recv_count[e] rows of each expert's block hold real tokens, the rest is padding. The
+    routing kernel behind moe_sort only counts an expert into its histogram when that expert is local, so pointing a padding row at
+    a remote expert drops it from the tile count, from ``permutedIdxSize``, and from
+    every stage bounded by them - the permute/gather, both GEMMs, the activation and
+    the finalize.
+
+    Returns the inputs unchanged when there is no remote expert to point at.
+    """
+    if num_experts is None or num_local_experts >= num_experts:
+        return selected_experts, final_scales
+
+    expected = (num_local_experts,)
+    if tuple(recv_count.shape) != expected:
+        raise ValueError(
+            f"recv_count must have shape {list(expected)}, got {list(recv_count.shape)}"
+        )
+
+    device = selected_experts.device
+    m = selected_experts.shape[0]
+    remote_id = (
+        local_expert_offset + num_local_experts
+    ) % num_experts  # First expert past this ranks block
+
+    if m != num_local_experts * cap:
+        raise ValueError(
+            f"EXPERT_MAJOR pack must be num_local_experts * cap rows "
+            f"({num_local_experts} * {cap} = {num_local_experts * cap}), got {m}"
+        )
+
+    # Mask padding rows by marking them as remote; efficient as broadcast compare.
+    recv_count = recv_count.to(device)
+    col = torch.arange(cap, device=device, dtype=recv_count.dtype)
+    is_real = (col.unsqueeze(0) < recv_count.unsqueeze(1)).reshape(m, 1)
+
+    selected_experts = torch.where(is_real, selected_experts, remote_id)
+    final_scales = torch.where(is_real, final_scales, 0.0)
+    return selected_experts, final_scales
+
+
 def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
@@ -78,6 +129,8 @@ def build_activation_pack(
     global_scale: Optional[torch.Tensor] = None,
     mxfp8_dispatch: bool = False,
     hidden_size: Optional[int] = None,
+    recv_count: Optional[torch.Tensor] = None,
+    num_experts: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D expert-major dispatch output into a token-major pack.
 
@@ -116,6 +169,17 @@ def build_activation_pack(
     )
     final_scales = torch.ones(m, 1, dtype=torch.float32, device=device)
 
+    if recv_count is not None:
+        selected_experts, final_scales = _mask_padding_rows_nonlocal(
+            selected_experts,
+            final_scales,
+            recv_count,
+            num_local_experts=num_local_experts,
+            cap=cap,
+            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
+        )
+
     return _quantize_and_pack(
         flat,
         selected_experts,
@@ -135,6 +199,7 @@ def build_activation_pack_rank_major(
     *,
     num_local_experts: int,
     local_expert_offset: int = 0,
+    num_experts: Optional[int] = None,
     quant: "QuantConfig",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
@@ -152,13 +217,10 @@ def build_activation_pack_rank_major(
     in its top-k, weighted and summed (the "pre-reduce across local experts" the
     layout contract calls for).
 
-    This is the **faithful** path: we drive the unified runner at the model's real
-    ``top_k`` with ``do_finalize=True`` (which does the per-token weighted sum), and
-    mask the non-local picks to weight 0 (pointing them at a valid local expert so
-    indexing stays in range).  ``combine`` then just sums across ranks — the real
-    weights are applied here, not on receive.  (The runner still evaluates all
-    ``top_k`` slots per token, so the masked picks cost compute they don't
-    contribute; an exact local-only gather is a future optimization.)
+    The runner applies the real ``top_k`` weights and sums local contributions;
+    ``combine`` sums across ranks. Masked picks use a valid remote expert ID
+    when ``num_experts`` provides a remote shard, so the runner excludes them
+    from expert compute. Otherwise they use a local ID with zero weight.
 
     Parameters
     ----------
@@ -174,6 +236,9 @@ def build_activation_pack_rank_major(
         Number of experts this rank owns (carried for API symmetry / validation).
     local_expert_offset : int
         Global id of this rank's first local expert (see EXPERT_MAJOR builder).
+    num_experts : int, optional
+        Global expert count. Enables exclusion of masked picks from local compute
+        when this rank owns fewer than all experts.
     quant, per_token_activation, global_scale :
         Same semantics as :func:`build_activation_pack`.
     """
@@ -199,19 +264,15 @@ def build_activation_pack_rank_major(
             f"{tuple(idx.shape)} / {tuple(weights.shape)}."
         )
 
-    # The RANK_MAJOR dispatch returns LOCAL expert indices (0-based within this
-    # rank's experts) for each token's picks, with -1 marking a pick routed to a
-    # NON-local expert (handled by another rank). Convert local->global
-    # (idx + local_expert_offset) for the runner, which expects global ids and
-    # filters by local_expert_offset. Only [0, num_local_experts) is local; -1 and
-    # any out-of-range id are masked to a valid local id with weight 0, so the
-    # weighted finalize sum drops them; combine then sums each token's per-rank
-    # partial reductions across ranks.
+    # Zero weight alone does not skip GEMMs; a remote ID excludes the route.
+    masked_expert = local_expert_offset
+    if num_experts is not None and num_local_experts < num_experts:
+        masked_expert = (local_expert_offset + num_local_experts) % num_experts
     is_local = (idx >= 0) & (idx < num_local_experts)
     selected_experts = torch.where(
         is_local,
         idx + local_expert_offset,
-        torch.full_like(idx, local_expert_offset),
+        torch.full_like(idx, masked_expert),
     ).to(torch.int32)
     final_scales = torch.where(is_local, weights, torch.zeros_like(weights))
 
@@ -270,15 +331,15 @@ def _quantize_and_pack(
         # the kernel index the scale tensor out of bounds → illegal memory access.
         if per_token_activation:
             from flashinfer.quantization.nvfp4_quantization_utils import (
-                current_nvfp4_4over6_config,
                 make_nvfp4_global_scale,
+                resolve_nvfp4_4over6,
             )
             from flashinfer.tllm_enums import SfLayout
 
             global_scale = make_nvfp4_global_scale(
                 flat,
                 per_token_activation=True,
-                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+                nvfp4_4over6_config=resolve_nvfp4_4over6(),
             )
             hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
                 flat,
@@ -324,6 +385,10 @@ def _quantize_and_pack(
             hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
                 flat.shape[0], flat.shape[1] // 32
             )
+        if pair[0] is QuantFormat.MXFP4:
+            # W4A8 packs carry UE8M0 bytes in float8 storage. CuTe reinterprets
+            # them as uint8; TRT-LLM requires the float8 view.
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
     elif activation is QuantFormat.BF16:
         # BF16 and both W4A16 encodings consume the dispatched activations.
         hidden_states_q = flat

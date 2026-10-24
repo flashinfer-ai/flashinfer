@@ -5,8 +5,8 @@ the function under test would make this vacuous, and nothing else in the suite
 notices a layout that is correct but wasteful -- an oversized copy-engine
 region still produces the right answer on every collective.
 
-Single process, one GPU: workspace_size() is a pure function and needs no
-collective.
+Single process, one GPU: workspace_size() accounts for the current device's
+optional memory-operation flags and needs no collective.
 """
 
 from __future__ import annotations
@@ -21,10 +21,17 @@ def _align128(n: int) -> int:
     return (n + 127) & ~127
 
 
+def _expected_binary_flag_bytes(world_size: int) -> int:
+    # SM120 TP4/TP8 append one cache-line-separated flag per flat-ring step.
+    if world_size in (4, 8) and torch.cuda.get_device_capability() == (12, 0):
+        return 2 * (world_size - 1) * 128
+    return 0
+
+
 def _expected_total(
     world_size: int, max_numel: int, elem_size: int, max_blocks: int
 ) -> int:
-    """Independent restatement of compute_workspace_layout()."""
+    """Independent restatement of the base layout and optional binary flags."""
     k_signal_phases, k_regions, k_ce_pieces, k_ce_stride = 8, 2, 4, 128
 
     signal_slots = (
@@ -50,6 +57,7 @@ def _expected_total(
         + ce_flag_bytes
         + ce_counter_bytes
         + ce_scratch_bytes
+        + _expected_binary_flag_bytes(world_size)
     )
 
 
@@ -88,11 +96,12 @@ def test_the_copy_engine_region_stays_proportional_to_the_payload(
     island = 7 * _align128(payload // 4) if world_size == 8 else 0
     ce_scratch = max(flat, island)
 
-    # The whole slab must equal the SM part plus exactly these three terms.
+    # The whole slab includes the SM part, CE regions, and optional binary flags.
+    binary_flag_bytes = _expected_binary_flag_bytes(world_size)
     signal_bytes = _align128(4 * (128 + 8 * 128 * world_size + 128 + 4))
     sm_bytes = signal_bytes + 2 * _align128(2 * world_size * payload)
     assert module.workspace_size(world_size, max_numel, 2, 128) == (
-        sm_bytes + ce_flag_bytes + ce_counter_bytes + ce_scratch
+        sm_bytes + ce_flag_bytes + ce_counter_bytes + ce_scratch + binary_flag_bytes
     )
 
     expected_ratio = 2 * (world_size - 1) / world_size
@@ -106,4 +115,4 @@ def test_the_copy_engine_region_stays_proportional_to_the_payload(
     # And the flags/counters must stay negligible next to it -- they are a few
     # KiB, and a layout that made them scale with the payload would be wrong in
     # a way the ratio check above cannot see.
-    assert ce_flag_bytes + ce_counter_bytes < 64 * 1024
+    assert ce_flag_bytes + ce_counter_bytes + binary_flag_bytes < 64 * 1024

@@ -10,7 +10,7 @@
 # (GIN/GDAKI) **cross-node** dispatch aborts at runtime with
 # `CUDA error nccl_ep.cc:2884 'an illegal memory access was encountered'`.
 #
-# Root cause (verified Pre-Nyx 2026-06-17): the *identical* pure-nccl.ep repro
+# Root cause (verified 2026-06-17): the *identical* pure-nccl.ep repro
 # (tests/moe_ep/repro_ht_crossnode.py) PASSES cross-node at 16 GPU when run in a
 # container based on nvcr.io/nvidia/pytorch:26.05-py3 (CUDA 13.2 + the matching
 # IB-RDMA-GDAKI / GPUDirect userspace stack) and FAILS 2884 in the CUDA-13.0
@@ -66,7 +66,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Use the base image's own python + torch (do NOT create a venv or reinstall
 # torch — the whole point of this image is a single, self-consistent CUDA/NCCL/
 # torch/IB stack). Pin the NCCL-EP runtime wheels to exactly what ep_bench's
-# known-good container uses (verified on Pre-Nyx). PIP_CONSTRAINT= overrides the
+# known-good container uses (verified on the B200 validation cluster).
+# PIP_CONSTRAINT= overrides the
 # NVIDIA base image's constraint file (which pins nvidia-nccl-cu13 to torch's
 # 2.30.4) so we get the 2.30.7 libnccl_ep.so expects. --no-deps on the NCCL wheels
 # keeps the base torch intact; nccl.ep also imports cuda.core / cuda.bindings,

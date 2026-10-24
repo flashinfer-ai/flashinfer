@@ -71,6 +71,8 @@ class TrtllmGenRoutingResult(NamedTuple):
     remaining fields are the permutation/bookkeeping tensors the fused MoE
     kernels consume; entries beyond the actual padded count (see
     ``total_num_padded_tokens``) are undefined.
+    Within that count, unused ``permuted_idx_to_token_idx`` entries are -1
+    so downstream TMA gathers do not load activations for padded rows.
 
     In from-logits mode the routing kernels never emit expert ids directly —
     expert identity lives in the permuted layout. ``topk_ids`` is therefore

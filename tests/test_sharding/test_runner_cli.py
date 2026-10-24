@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import select
 import shlex
 import subprocess
@@ -10,7 +9,6 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -30,58 +28,6 @@ from scripts.test_sharding.workers import BatchExecution
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "unit_test_runner.py"
-
-
-def _queue_test_unit(identifier: str) -> Unit:
-    return Unit(
-        id=identifier,
-        batches=(),
-        estimated_ms=1,
-        oversized=False,
-    )
-
-
-def test_worker_unit_selection_prefers_local_queue_before_stealing() -> None:
-    work_by_worker = [queue.Queue() for _ in range(2)]
-    work_by_worker[0].put(_queue_test_unit("donor"))
-    work_by_worker[1].put(_queue_test_unit("local"))
-
-    local_queue, local_unit = runner._next_worker_unit(work_by_worker, 1)
-
-    assert local_queue is work_by_worker[1]
-    assert local_unit.id == "local"
-
-    donor_queue, donor_unit = runner._next_worker_unit(work_by_worker, 1)
-
-    assert donor_queue is work_by_worker[0]
-    assert donor_unit.id == "donor"
-
-
-def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
-    work_by_worker = [queue.Queue() for _ in range(4)]
-    expected = [f"unit-{index}" for index in range(40)]
-    for index, identifier in enumerate(expected):
-        work_by_worker[index % 2].put(_queue_test_unit(identifier))
-
-    def drain(worker_index: int) -> list[str]:
-        completed = []
-        while True:
-            try:
-                work, unit = runner._next_worker_unit(work_by_worker, worker_index)
-            except queue.Empty:
-                return completed
-            completed.append(unit.id)
-            work.task_done()
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        completed = [
-            identifier
-            for worker_units in executor.map(drain, range(4))
-            for identifier in worker_units
-        ]
-
-    assert sorted(completed) == sorted(expected)
-    assert all(work.unfinished_tasks == 0 for work in work_by_worker)
 
 
 def test_compatibility_defaults_use_file_sized_units_with_failure_timeout(
@@ -139,7 +85,7 @@ def test_default_worker_count_matches_visible_gpu_count(
 
     args = unit_test_runner._parser().parse_args(["run"])
 
-    assert args.workers == gpu_count
+    assert unit_test_runner._worker_count(args) == gpu_count
 
 
 def test_explicit_zero_deadline_is_disabled(
@@ -316,6 +262,11 @@ def _run(
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
     env.update(env_override or {})
+    worker_args = (
+        []
+        if any(arg in {"--workers", "--workers-per-gpu"} for arg in extra)
+        else ["--workers", "1"]
+    )
     return subprocess.run(
         [
             sys.executable,
@@ -333,8 +284,7 @@ def _run(
             "1",
             "--target-unit-seconds",
             "1",
-            "--workers",
-            "1",
+            *worker_args,
             "--timeout-grace-seconds",
             "0",
             "--deadline-seconds",
@@ -1318,14 +1268,14 @@ def test_completed_node_progress_observes_finalized_batches_from_every_shard(
     assert runner._completed_node_count(tmp_path / "junit", plan) == 2
 
 
-def test_solo_source_runs_exclusively_with_full_gpu_visibility(
+def test_node_exclusive_source_runs_exclusively_with_full_gpu_visibility(
     tmp_path: Path,
 ) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
-    state = tmp_path / "solo-state"
+    state = tmp_path / "node_exclusive-state"
     state.mkdir()
-    (suite / "test_solo.py").write_text(
+    (suite / "test_node_exclusive.py").write_text(
         """\
 import os
 import time
@@ -1333,28 +1283,28 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.node_exclusive
 
 @pytest.fixture(scope="module", autouse=True)
 def exclusive_source():
-    state = Path(os.environ["SOLO_STATE"])
-    solo = state / "solo-active"
+    state = Path(os.environ["NODE_EXCLUSIVE_STATE"])
+    node_exclusive = state / "node_exclusive-active"
     regular = state / "regular-active"
-    assert not regular.exists(), "regular batch overlapped solo setup"
-    solo.write_text("active", encoding="utf-8")
-    (state / "solo-devices").write_text(
+    assert not regular.exists(), "regular batch overlapped node_exclusive setup"
+    node_exclusive.write_text("active", encoding="utf-8")
+    (state / "node_exclusive-devices").write_text(
         os.environ.get("CUDA_VISIBLE_DEVICES", ""), encoding="utf-8"
     )
     time.sleep(1)
     yield
     time.sleep(1)
-    assert not regular.exists(), "regular batch overlapped solo teardown"
-    solo.unlink()
+    assert not regular.exists(), "regular batch overlapped node_exclusive teardown"
+    node_exclusive.unlink()
 
-def test_solo_one():
+def test_node_exclusive_one():
     pass
 
-def test_solo_two():
+def test_node_exclusive_two():
     pass
 """,
         encoding="utf-8",
@@ -1366,17 +1316,17 @@ import time
 from pathlib import Path
 
 def test_regular():
-    state = Path(os.environ["SOLO_STATE"])
-    solo = state / "solo-active"
+    state = Path(os.environ["NODE_EXCLUSIVE_STATE"])
+    node_exclusive = state / "node_exclusive-active"
     regular = state / "regular-active"
-    assert not solo.exists(), "solo batch overlapped regular setup"
+    assert not node_exclusive.exists(), "node_exclusive batch overlapped regular setup"
     regular.write_text("active", encoding="utf-8")
     (state / "regular-devices").write_text(
         os.environ.get("CUDA_VISIBLE_DEVICES", ""), encoding="utf-8"
     )
     try:
         time.sleep(2)
-        assert not solo.exists(), "solo batch overlapped regular execution"
+        assert not node_exclusive.exists(), "node_exclusive batch overlapped regular execution"
     finally:
         regular.unlink()
 """,
@@ -1391,20 +1341,114 @@ def test_regular():
         "2",
         env_override={
             "CUDA_VISIBLE_DEVICES": "0,1",
-            "SOLO_STATE": str(state),
+            "NODE_EXCLUSIVE_STATE": str(state),
         },
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (state / "solo-devices").read_text(encoding="utf-8") == "0,1"
+    assert (state / "node_exclusive-devices").read_text(encoding="utf-8") == "0,1"
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
 
 
-@pytest.mark.parametrize("worker_count", [1, 2, 4, 8])
+def test_gpu_sharing_respects_gpu_host_and_runner_exclusivity(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    state = tmp_path / "gpu-state"
+    state.mkdir()
+    source = """\
+import fcntl
+import json
+import os
+import time
+from contextlib import ExitStack
+from pathlib import Path
+
+import pytest
+
+MODE = {mode!r}
+if MODE == "both":
+    pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.host_memory_heavy]
+elif MODE != "shared":
+    pytestmark = getattr(pytest.mark, MODE)
+
+@pytest.fixture(scope="module", autouse=True)
+def reserve_memory():
+    state = Path(os.environ["GPU_STATE"])
+    device = os.environ["CUDA_VISIBLE_DEVICES"]
+    with ExitStack() as stack:
+        host_lock = stack.enter_context((state / "runner.lock").open("a"))
+        host_mode = fcntl.LOCK_EX if MODE == "node_exclusive" else fcntl.LOCK_SH
+        fcntl.flock(host_lock, host_mode | fcntl.LOCK_NB)
+        if MODE in ("host_memory_heavy", "both"):
+            heavy_lock = stack.enter_context((state / "host-heavy.lock").open("a"))
+            fcntl.flock(heavy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with (state / (device + ".lock")).open("a") as gpu_lock:
+            gpu_mode = fcntl.LOCK_EX if MODE in ("node_exclusive", "gpu_exclusive", "both") else fcntl.LOCK_SH
+            fcntl.flock(gpu_lock, gpu_mode | fcntl.LOCK_NB)
+            start = time.time()
+            if MODE == "shared":
+                (state / "light-seen").touch()
+            if MODE in ("host_memory_heavy", "both"):
+                deadline = time.monotonic() + 10
+                while not (state / "light-seen").exists():
+                    assert time.monotonic() < deadline, "host-heavy work blocked light work"
+                    time.sleep(0.01)
+            time.sleep(0.05)
+            yield
+            time.sleep(0.05)
+            (state / (Path(__file__).stem + ".json")).write_text(
+                json.dumps([MODE, device, start, time.time()])
+            )
+
+def test_case():
+    time.sleep(0.1)
+"""
+    modes = (
+        ["host_memory_heavy"] * 3
+        + ["both"]
+        + ["gpu_exclusive"] * 4
+        + ["shared"] * 8
+        + ["node_exclusive"]
+    )
+    for index, mode in enumerate(modes):
+        (suite / f"test_{index}.py").write_text(source.format(mode=mode))
+    arguments = ("run", suite, "--workers-per-gpu", "2")
+    environment = {"CUDA_VISIBLE_DEVICES": "4,6", "GPU_STATE": str(state)}
+
+    result = _run(tmp_path, *arguments, env_override=environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = [json.loads(path.read_text()) for path in state.glob("*.json")]
+    assert len(records) == len(modes)
+    assert {record[1] for record in records if record[0] == "node_exclusive"} == {"4,6"}
+    assert {record[1] for record in records if record[0] != "node_exclusive"} == {
+        "4",
+        "6",
+    }
+    assert any(
+        left[1] != right[1] and max(left[2], right[2]) < min(left[3], right[3])
+        for left in records
+        for right in records
+        if left[0] == "gpu_exclusive" and right[0] != "node_exclusive"
+    ), "GPU-exclusive work blocked the other GPU"
+    assert any(
+        max(left[2], right[2]) < min(left[3], right[3])
+        for left in records
+        for right in records
+        if left[0] == "host_memory_heavy" and right[0] == "shared"
+    ), "Host-heavy work blocked light work"
+
+
+@pytest.mark.parametrize("gpu_count", [1, 2, 4])
+@pytest.mark.parametrize("workers_per_gpu", [1, 2])
 def test_workers_export_disjoint_master_port_blocks_for_visible_gpu_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_count: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gpu_count: int,
+    workers_per_gpu: int,
 ) -> None:
     monkeypatch.delenv("MASTER_PORT", raising=False)
+    worker_count = gpu_count * workers_per_gpu
     suite = tmp_path / "suite"
     suite.mkdir()
     state = tmp_path / "port-state"
@@ -1429,14 +1473,15 @@ def test_worker_port():
     for index in range(worker_count):
         (suite / f"test_{index}.py").write_text(source, encoding="utf-8")
 
-    visible_devices = ",".join(str(index) for index in range(worker_count))
+    devices = [4 + index * 2 for index in range(gpu_count)]
+    visible_devices = ",".join(map(str, devices))
 
     result = _run(
         tmp_path,
         "run",
         suite,
-        "--workers",
-        str(worker_count),
+        "--workers-per-gpu",
+        str(workers_per_gpu),
         env_override={
             "CUDA_VISIBLE_DEVICES": visible_devices,
             "EXPECTED_WORKERS": str(worker_count),
@@ -1450,7 +1495,7 @@ def test_worker_port():
         for path in state.glob("*.port")
     }
     assert assignments == {
-        (worker_index, 29500 + worker_index * 100)
+        (devices[worker_index % gpu_count], 29500 + worker_index * 100)
         for worker_index in range(worker_count)
     }
     for _, port in assignments:
@@ -1493,7 +1538,7 @@ def test_comm_conftest_validates_sibling_master_port(
         assert "MASTER_PORT must be between" in result.stdout + result.stderr
 
 
-def test_long_running_dispatches_first_and_solo_runs_after_non_solo_finalized(
+def test_long_running_dispatches_first_and_node_exclusive_runs_after_non_node_exclusive_finalized(
     tmp_path: Path,
 ) -> None:
     suite = tmp_path / "suite"
@@ -1531,15 +1576,15 @@ def test_normal():
 """,
         encoding="utf-8",
     )
-    (suite / "test_solo.py").write_text(
+    (suite / "test_node_exclusive.py").write_text(
         """\
 import os
 from pathlib import Path
 import pytest
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.node_exclusive
 
-def test_solo():
+def test_node_exclusive():
     state = Path(os.environ["PHASE_STATE"])
     assert (state / "long-a-done").exists()
     assert (state / "long-b-done").exists()
@@ -1568,23 +1613,25 @@ def test_solo():
     assert "PYTEST RUNNING" not in result.stdout
 
 
-def test_pending_non_solo_work_blocks_the_solo_phase(tmp_path: Path) -> None:
+def test_pending_non_node_exclusive_work_blocks_the_node_exclusive_phase(
+    tmp_path: Path,
+) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
-    solo_started = tmp_path / "solo-started"
+    node_exclusive_started = tmp_path / "node_exclusive-started"
     (suite / "test_regular.py").write_text(
         "import time\ndef test_regular(): time.sleep(5)\n",
         encoding="utf-8",
     )
-    (suite / "test_solo.py").write_text(
+    (suite / "test_node_exclusive.py").write_text(
         f"""\
 from pathlib import Path
 import pytest
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.node_exclusive
 
-def test_solo():
-    Path({str(solo_started)!r}).write_text("started", encoding="utf-8")
+def test_node_exclusive():
+    Path({str(node_exclusive_started)!r}).write_text("started", encoding="utf-8")
 """,
         encoding="utf-8",
     )
@@ -1602,8 +1649,8 @@ def test_solo():
     )
 
     assert result.returncode == 2, result.stdout
-    assert not solo_started.exists()
-    assert "WORKER TASK worker=solo-0" not in result.stdout
+    assert not node_exclusive_started.exists()
+    assert "WORKER TASK worker=node_exclusive-0" not in result.stdout
     assert "Pending: 2" in result.stdout
 
 

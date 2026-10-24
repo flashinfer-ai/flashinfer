@@ -98,3 +98,55 @@ def test_b12x_reference_uses_activation_precision_and_fc2_scale():
     assert fp4.shape == bf16.shape
     assert torch.equal(wrapper_bf16, bf16)
     assert not torch.equal(fp4, bf16)
+
+
+def test_b12x_reference_applies_expert_map():
+    from flashinfer.trace.templates.moe import b12x_fused_moe_trace
+
+    torch.manual_seed(0)
+    num_experts, top_k, num_tokens = 4, 2, 6
+    hidden, inter = 32, 32
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16) * 0.25
+    # Small scales keep outputs near 1 so atol stays meaningful in bf16.
+    w1 = torch.randint(0, 256, (num_experts, 2 * inter, hidden // 2), dtype=torch.uint8)
+    w1_sf = torch.full(
+        (num_experts, 2 * inter, hidden // 16), 0.0625, dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    w2 = torch.randint(0, 256, (num_experts, hidden, inter // 2), dtype=torch.uint8)
+    w2_sf = torch.full(
+        (num_experts, hidden, inter // 16), 0.0625, dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32)
+    topk_weights = torch.rand((num_tokens, top_k), dtype=torch.float32)
+    alpha = torch.ones((num_experts,), dtype=torch.float32)
+
+    def ref(local_ids, expert_map):
+        sel = torch.tensor(local_ids, dtype=torch.long)
+        return b12x_fused_moe_trace.reference(
+            x=x,
+            w1_weight=w1.index_select(0, sel),
+            w1_weight_sf=w1_sf.index_select(0, sel),
+            w2_weight=w2.index_select(0, sel),
+            w2_weight_sf=w2_sf.index_select(0, sel),
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+            num_experts=num_experts,
+            top_k=top_k,
+            w1_alpha=alpha.index_select(0, sel),
+            w2_alpha=alpha.index_select(0, sel),
+            quant_mode="w4a16",
+            expert_map=expert_map,
+        )
+
+    full = ref(range(num_experts), None)
+    identity = ref(
+        range(num_experts),
+        torch.arange(num_experts, dtype=torch.int32),
+    )
+    assert torch.equal(identity, full)
+
+    # Round-robin two-rank split: partials must sum to the full output.
+    even = ref([0, 2], torch.tensor([0, -1, 1, -1], dtype=torch.int32))
+    odd = ref([1, 3], torch.tensor([-1, 0, -1, 1], dtype=torch.int32))
+    assert torch.count_nonzero(full).item() > 0
+    torch.testing.assert_close(even + odd, full, rtol=0.02, atol=0.02)

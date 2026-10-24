@@ -2326,6 +2326,9 @@ def kda_wy_output_only(
     _total_ctas = HV * B
     _needed = math.ceil(_total_ctas / _num_sms)
     mbp = max(1, min(_needed + 1, 8))
+    if cc == (10, 7):
+        # mbp>1 makes the DSL auto-derive an SMEM carveout that faults (#4957).
+        mbp = 1
     _mbp_env = _os.environ.get("FLASHINFER_KDA_OO_MBP")
     if _mbp_env:
         mbp = int(_mbp_env)
@@ -2549,7 +2552,11 @@ def kda_recoverssm_verify(
     HV = H = num_heads
     t_disc = 4 if spec_query_len <= 4 else (8 if spec_query_len <= 8 else 16)
     _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    cc = torch.cuda.get_device_capability(device)
     mbp = max(1, min(math.ceil(HV * batch / _num_sms) + 1, 8))
+    if cc == (10, 7):
+        # mbp>1 makes the DSL auto-derive an SMEM carveout that faults (#4957).
+        mbp = 1
     # Gate modes mirror recurrent_kda: precomputed log-space gate, the
     # Kimi K3 lower-bound sigmoid gate, or the Kimi-Linear softplus gate.
     if use_gate_in_kernel:
@@ -2559,7 +2566,6 @@ def kda_recoverssm_verify(
     lb = float(lower_bound) if lower_bound is not None else 0.0
     q_scale = float(scale) if scale is not None else float(key_dim**-0.5)
 
-    cc = torch.cuda.get_device_capability(device)
     cache_key = (
         "dropin",
         str(device),

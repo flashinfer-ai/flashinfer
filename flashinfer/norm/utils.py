@@ -790,12 +790,19 @@ def cluster_reduce_multirow(
     mbar_ptr,
     cluster_n: cutlass.Constexpr[int],
     init_val: Float32,
+    phase: cutlass.Constexpr[int] = 0,
 ) -> Float32:
     """Cluster reduction across multiple CTAs using mbarrier.
 
     reduction_buffer has shape (rows_per_block, (warps_per_row, cluster_n)).
     Each warp sends its partial result to all CTAs in the cluster via
     st.async.shared::cluster, then every CTA reduces the collected values.
+
+    The mbarrier phase flips on each completion, so a kernel running two
+    reductions back to back can reuse one mbarrier by passing phase=0 for
+    the first and phase=1 for the second. The caller must place a cluster
+    barrier between the two so that no CTA issues round-2 stores while
+    another CTA is still waiting on round 1.
     """
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
     lane_idx = cute.arch.lane_idx()
@@ -821,7 +828,7 @@ def cluster_reduce_multirow(
             peer_cta_rank_in_cluster=lane_idx,
         )
 
-    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+    cute.arch.mbarrier_wait(mbar_ptr, phase=phase)
 
     num_total = warps_per_row * cluster_n
     num_iter = cute.ceil_div(num_total, 32)
@@ -842,6 +849,7 @@ def row_reduce_sum_multirow(
     reduction_buffer: cute.Tensor,
     mbar_ptr,
     cluster_n: cutlass.Constexpr[int],
+    phase: cutlass.Constexpr[int] = 0,
 ) -> Float32:
     """Row reduction for sum with optional cluster support.
 
@@ -872,6 +880,7 @@ def row_reduce_sum_multirow(
                 mbar_ptr,
                 cluster_n,
                 Float32(0.0),
+                phase,
             )
     else:
         return warp_val

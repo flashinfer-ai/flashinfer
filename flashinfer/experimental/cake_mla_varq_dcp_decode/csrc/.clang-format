@@ -1,0 +1,5 @@
+# Generated Cake device/binding sources: exporter output listed by path in the
+# JIT registry (cake_jit.py); the registry computes no digest (its record keys
+# embed the exporter digest). Never reformat them.
+DisableFormat: true
+SortIncludes: Never

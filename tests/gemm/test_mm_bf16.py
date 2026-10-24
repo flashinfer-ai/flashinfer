@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
+from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
@@ -144,6 +145,25 @@ def test_mm_bf16(
         torch.testing.assert_close(out, fp32_reference, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+@pytest.mark.parametrize("padded", [False, True])
+def test_mm_bf16_autotune_weight_layouts(monkeypatch, backend, padded):
+    """Autotuning stages dense and padded weights in the cold-chain arena."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("The cold-chain BF16 tuning config is used on SM100-family.")
+    if backend == "cudnn" and not CUDNN_AVAILABLE:
+        pytest.skip("cuDNN is not available on this system.")
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    torch.manual_seed(0)
+    a = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(256, 640 if padded else 512, device="cuda", dtype=torch.bfloat16)
+    b = w[:, :512].T
+    with autotune(True, tuning_buckets=[16]):
+        out = mm_bf16(a, b, backend=backend)
+    torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
+
+
 def test_mm_bf16_cutile_rejects_bias_and_pdl():
     """The v1 cuTile path is alpha=1/beta=0 and ignores bias / pdl — must raise.
 
@@ -236,8 +256,8 @@ def test_cublaslt_bf16_runner_zero_algos():
 @pytest.mark.parametrize("pdl", [False, True])
 def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
     """The no-autotune fallback uses direct in its measured crossover band."""
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
 
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
@@ -256,8 +276,8 @@ def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
 @pytest.mark.parametrize("enable_bias", [False, True])
 def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     """K=128 exercises the shallow one-stage tensor-core pipeline."""
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
 
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
