@@ -130,6 +130,29 @@ _TC_DECODE_MAX_M = 4
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
 
+def _direct_topk_route_m_cap(
+    element_dtype: str,
+    weight_layout: str,
+    scale_format: str,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+) -> int:
+    # Small FP16 packed NVFP4 experts benefit from direct routing through T=8.
+    # Keep the measured shape envelope: larger experts need packed-route weight
+    # reuse (H=7168/I=2048 shared routes regress with direct routing).
+    if (
+        element_dtype == "fp16"
+        and weight_layout == "packed"
+        and scale_format == "e4m3_k16"
+        and hidden_size <= 2048
+        and intermediate_size <= 512
+        and top_k <= 10
+    ):
+        return 8
+    return _MAX_DIRECT_TOPK_ROUTE_M
+
+
 @dsl_user_op
 def _materialize_w4a16_topk_route_f32(value, *, loc=None, ip=None):
     """Keep the BF16-to-F32 conversion outside the unrolled reduction add.
@@ -5281,7 +5304,16 @@ def compile_w4a16_fused_moe(
     # The TC-decode path validates M in {1,2,4,8} itself and uses direct-topk
     # routing for the whole {1,2,4,8} range, so it lifts the default decode cap.
     direct_topk_m_cap = (
-        _W4A16_SMALL_M_DIRECT_MAX_M if tc_decode_fused_sum else _MAX_DIRECT_TOPK_ROUTE_M
+        _W4A16_SMALL_M_DIRECT_MAX_M
+        if tc_decode_fused_sum
+        else _direct_topk_route_m_cap(
+            element_dtype,
+            weight_layout,
+            scale_format,
+            hidden_size,
+            intermediate_size,
+            top_k,
+        )
     )
     if direct_topk_routes and (
         int(size_m) > direct_topk_m_cap
@@ -6840,7 +6872,18 @@ def run_w4a16_moe(
 
     direct_topk_eligible = (
         (not collect_activation_amax)
-        and (m <= _MAX_DIRECT_TOPK_ROUTE_M or use_tc_decode)
+        and (
+            m
+            <= _direct_topk_route_m_cap(
+                element_dtype,
+                weight_layout,
+                scale_format,
+                int(a_input.shape[1]),
+                int(prepared.intermediate_size),
+                topk,
+            )
+            or use_tc_decode
+        )
         and weight_layout in ("packed", "nf3_2p1")
         and expert_map is None
     )
