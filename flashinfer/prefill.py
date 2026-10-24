@@ -2501,7 +2501,8 @@ def _build_block_tables_from_paged_kv_indices(
 # Measured on B200 (bf16, causal, 20 iters after 5 warmup, medians):
 #   d128 square    cuDNN 1.09-1.45x faster than CUTLASS -> cuDNN first
 #   d256 square    CUTLASS declines the shape entirely  -> cuDNN only
-#   d192/128       cuDNN >= 9.27 faster on every measured shape (table below)
+#   d192/128       cuDNN 9.27.0.42 / 9.29 dev faster on every measured shape
+#                  (table below)
 _BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
 
 # Per-shape overrides of the default order, keyed on
@@ -2511,8 +2512,9 @@ _BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
 # The d192/128 cell was first measured with cuDNN 9.26, where CUTLASS led
 # long-sequence MHA and cuDNN led short-sequence and GQA shapes, so no head-dim
 # order could be right for both. Re-measured on a full B200 against three cuDNN
-# libraries, same FlashInfer and frontend (benchmarks/flashinfer_benchmark.py,
-# bf16 causal, 30 iters after 10 warmup, median of two rounds; ms):
+# libraries (9.26.0.51, 9.27.0.42, a 9.29 dev build), same FlashInfer and
+# frontend (benchmarks/flashinfer_benchmark.py, bf16 causal, 30 iters after 10
+# warmup, median of two rounds; ms):
 #
 #   shape                   CUTLASS  cuDNN 9.26  cuDNN 9.27  CUTLASS / cuDNN
 #   b4  s1024    128x128      0.399       0.237       0.230   1.68x -> 1.73x
@@ -2526,10 +2528,10 @@ _BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
 #   b1  q8k/kv64k 128x128    33.940      43.517      31.398   0.78x -> 1.08x
 #
 # The 9.26 long-sequence loss was a cuDNN regression (cudnn-frontend issue
-# #1085), fixed in 9.27.0. With cuDNN >= 9.27, cuDNN leads all 15 measured
-# d192/128 shapes (1.07-1.73x; 9.29 matches 9.27), so the default order stands
-# and this table stays empty. On 9.26, callers with long-sequence MHA can pin
-# "cutlass,cudnn" with the environment variable below.
+# #1085), fixed in 9.27.0. With cuDNN 9.27.0.42, cuDNN leads all 15 measured
+# d192/128 shapes (1.07-1.73x; the 9.29 dev build matches it), so the
+# default order stands and this table stays empty. On 9.26, callers with
+# long-sequence MHA can pin "cutlass,cudnn" with the environment variable below.
 _BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM: Dict[
     Tuple[int, int], Tuple[str, ...]
 ] = {}
