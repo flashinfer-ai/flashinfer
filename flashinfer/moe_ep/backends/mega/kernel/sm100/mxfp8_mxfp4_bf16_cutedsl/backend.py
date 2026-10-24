@@ -248,6 +248,9 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # Bind the reducer to stable workspace storage. The public layer's
             # owned-output path allocates a new tensor on every invocation,
             # including graph capture; rebinding DLPack views there is unsafe.
+            # GB300 BF16 copy, H4096/T32..1024: 1.15-2.61 us warm L2,
+            # 1.94-4.83 us cold L2 (CUPTI activity measurements).
+            # Method and reproduction: benchmarks/moe_ep/MoE_benchmarks.md.
             None,
             transformed_weights[0],
             transformed_weights[1],

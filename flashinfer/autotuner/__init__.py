@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from flashinfer.autotuner.protocol import TuningContext, TuningProtocol, TuningResult
 from flashinfer.autotuner.initializers import (
     autotuner_initializer_empty,

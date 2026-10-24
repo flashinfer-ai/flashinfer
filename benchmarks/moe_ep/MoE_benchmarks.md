@@ -212,3 +212,69 @@ python benchmarks/bench_mxfp8_mxfp4.py \
 
 `benchmarks/profile_mxfp8_mxfp4_lean.py` provides focused FC1/FC2 profiling.
 Routing and attention are excluded from these measurements.
+
+### Review validation on GB300
+
+NVIDIA GB300, synthetic EP2 workload: hidden 4096, intermediate 6400, eight experts, top-2,
+seed 42, pre-staged input. CUDA-event timing follows a 256 MiB L2 flush and GPU
+rank synchronization. Each graph contains 50 consecutive samples; report the
+median of five round medians, with each sample reduced to the slowest rank.
+Before/after/before runs use the same GPU pair and default tactics. Exact
+before/after output comparisons pass. Routing and attention are excluded.
+
+| Tokens/rank | Before review (us) | After review (us) | Before repeat (us) |
+| --- | --- | --- | --- |
+| 32 | 69.568 | 69.008 | 67.936 |
+| 256 | 79.872 | 78.960 | 79.840 |
+| 512 | 121.136 | 121.136 | 121.152 |
+| 1024 | 151.440 | 151.360 | 151.552 |
+
+No regression was observed in these four cases. The baseline repeat shows
+short-case timing variation; the measurements do not establish a speedup.
+
+On the same synthetic geometry at 256 tokens/rank, the first 128-candidate
+sweep took 248.421 s and the bounded 32-candidate sweep took 65.757 s. Both
+selected the same tactic, measured at 77.824 us with cold-L2 graph timing.
+Repeating selection after clearing the profiling cache, while retaining
+compiled frontends, took 0.263 s and 0.081 s respectively. Sweep timing surrounds
+`autotune_mxfp8_mxfp4_mega_moe` after input creation and one default launch;
+use `warmup_iters=0`, `timed_iters=3`, and `candidate_tactics` for the workload.
+The full grid remains available through `exhaustive=True` or the offline CLI's
+`--mxfp8-mxfp4-exhaustive` option. Tuning results depend on workload and policy.
+
+### Caller-owned output copy
+
+The backend keeps a stable workspace output binding during CUDA graph capture
+and copies into the layer's caller-owned BF16 output. This preserves output
+ownership across forwards. On NVIDIA GB300, the standalone `[tokens, 4096]`
+copy has the following CUPTI activity durations (CUDA 13.2 / CUPTI 13.2.0,
+graph replay, 50 warmups, median of 100 samples):
+
+| Tokens | Bytes | Warm L2 copy (us) | Cold L2 copy (us) |
+| --- | --- | --- | --- |
+| 32 | 262144 | 1.152 | 1.936 |
+| 256 | 2097152 | 1.408 | 2.752 |
+| 512 | 4194304 | 1.984 | 3.616 |
+| 1024 | 8388608 | 2.609 | 4.832 |
+
+Cache residency determines the copy cost in a real forward. These activity
+durations isolate the copy; full MoE timings above use the workspace view.
+Add `--owned-output` to `benchmarks/bench_mxfp8_mxfp4.py` to include the copy
+in an end-to-end single-GPU measurement. Reproduce the isolated copy with:
+
+```python
+import statistics
+import torch
+from cupti import cupti  # Require CUPTI rather than an event fallback.
+from flashinfer.testing import bench_gpu_time
+
+for tokens in (32, 256, 512, 1024):
+    source = torch.ones((tokens, 4096), device="cuda", dtype=torch.bfloat16)
+    destination = torch.empty_like(source)
+    for cold in (False, True):
+        times = bench_gpu_time(
+            lambda: destination.copy_(source), dry_run_iters=50, repeat_iters=100,
+            enable_cupti=True, use_cuda_graph=True, cold_l2_cache=cold,
+        )
+        print(tokens, cold, statistics.median(times) * 1000)
+```
