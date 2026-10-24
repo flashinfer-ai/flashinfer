@@ -117,8 +117,12 @@ all padding).
   the program the host dispatches for a geometry (unit geometry, key-range
   split, CTA pair, tile-loop unroll, unit order, sampled first threshold) nor
   the partition knobs of the backend (`grid_ctas`, `candidate_multiplier`,
-  `check_period`, `sample_tiles_max`, `sample_shift_permille`,
-  `finalize_threads`) change a result (the tests compare bitwise).
+  `check_period`, `sample_tiles_max`, `sample_shift_permille`, `far_sample`,
+  `finalize_threads`) change a result (the tests compare bitwise).  `far_sample`
+  (`0` or `1`; the architecture's record sets the default) set to `1` makes the
+  sampled first threshold of the ascending-tile-order scan programs rank the far
+  sample tiles only, leaving out the sample tile nearest the diagonal (an
+  attention sink's local band); the descending-order and wide programs ignore it.
 
 ## Non-finite inputs
 

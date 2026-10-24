@@ -24,6 +24,9 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.BF16, QuantFormat.BF16),
         (QuantFormat.FP16, QuantFormat.FP16),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+        (QuantFormat.FP8PerTensor, QuantFormat.BF16),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
     )
     supported_output_formats = (QuantFormat.BF16, QuantFormat.FP16)
@@ -33,6 +36,9 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.MXFP8, QuantFormat.MXFP8): tuple(ACTIVATIONS),
         (QuantFormat.BF16, QuantFormat.BF16): tuple(ACTIVATIONS),
         (QuantFormat.FP16, QuantFormat.FP16): tuple(ACTIVATIONS),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): tuple(ACTIVATIONS),
+        (QuantFormat.FP8PerTensor, QuantFormat.BF16): tuple(ACTIVATIONS),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): tuple(ACTIVATIONS),
         (QuantFormat.NVFP4, QuantFormat.NVFP4): tuple(ACTIVATIONS),
     }
     supports_expert_parallelism = False
@@ -75,16 +81,37 @@ class FrostLowLatencyRunner(MoERunner):
 
         arch = get_compute_capability(self.device)
         self._supports_tc = arch in ((10, 0), (10, 3), (10, 7))
-        if not self._supports_tc and arch != (12, 0):
+        if not self._supports_tc and arch not in ((9, 0), (12, 0)):
             raise NotImplementedError(
-                "frost_low_latency requires SM100, SM103, SM107 or SM120"
+                "frost_low_latency requires SM90, SM100, SM103, SM107 or SM120"
             )
         if not self._supports_tc and self.config.routing.top_k > 32:
-            raise NotImplementedError("Frost SM120 FMA requires top_k <= 32")
+            raise NotImplementedError("Frost FMA requires top_k <= 32")
+        if arch == (9, 0) and self.config.quant.weight not in (
+            QuantFormat.BF16,
+            QuantFormat.FP16,
+            QuantFormat.FP8PerTensor,
+            QuantFormat.DeepSeekFp8,
+        ):
+            raise NotImplementedError(
+                "Frost SM90 supports BF16, FP16, per-tensor FP8 and DeepSeek FP8 FMA only"
+            )
         name, _ = lower_activation(self.config.activation)
-        if self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16):
+        if self.config.quant.weight in (
+            QuantFormat.BF16,
+            QuantFormat.FP16,
+            QuantFormat.FP8PerTensor,
+            QuantFormat.DeepSeekFp8,
+        ):
             if self.config.routing.top_k > 32:
-                raise NotImplementedError("Frost BF16/FP16 FMA requires top_k <= 32")
+                raise NotImplementedError(
+                    "Frost dense/per-tensor FMA requires top_k <= 32"
+                )
+        if (
+            self.config.quant.weight is QuantFormat.DeepSeekFp8
+            and self.config.experts.intermediate_size % 128
+        ):
+            raise NotImplementedError("DeepSeek Frost requires I divisible by 128")
         if self.config.quant.weight is QuantFormat.NVFP4:
             self._check_nvfp4_recipe()
             if (
@@ -149,7 +176,12 @@ class FrostLowLatencyRunner(MoERunner):
         self._require_built()
         if self.config.quant.weight is QuantFormat.NVFP4:
             return [("nvfp4_ffma", width) for width in (2, 4)]
-        if self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16):
+        if self.config.quant.weight in (
+            QuantFormat.BF16,
+            QuantFormat.FP16,
+            QuantFormat.FP8PerTensor,
+            QuantFormat.DeepSeekFp8,
+        ):
             return [
                 ("ffma", first, second)
                 for first in (1, 2, 4, 8)
@@ -179,6 +211,14 @@ class FrostLowLatencyRunner(MoERunner):
             allowed_weights_dtypes=(torch.float32, torch.bfloat16),
             require_contiguous=True,
         )
+        if self.config.quant.weight is QuantFormat.FP8PerTensor:
+            from .fp8_per_tensor import pack_inputs
+
+            return pack_inputs(act, weights, self.config, self.device)
+        if self.config.quant.weight is QuantFormat.DeepSeekFp8:
+            from .deepseek_fp8 import pack_inputs
+
+            return pack_inputs(act, weights, self.config, self.device)
         if self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16):
             return self._pack_float16(act, weights)
         if self.config.quant.weight is QuantFormat.NVFP4:
@@ -345,7 +385,13 @@ class FrostLowLatencyRunner(MoERunner):
             else:
                 tactic = (
                     ("ffma", 1)
-                    if self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16)
+                    if self.config.quant.weight
+                    in (
+                        QuantFormat.BF16,
+                        QuantFormat.FP16,
+                        QuantFormat.FP8PerTensor,
+                        QuantFormat.DeepSeekFp8,
+                    )
                     or not self._supports_tc
                     else 128
                 )

@@ -1,7 +1,9 @@
 # FROST low-latency routed MoE
 
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
-SM100/SM103/SM107, with FMA-only support on SM120. The MX Tensor Core path uses
+SM100/SM103/SM107, with FMA-only support on SM90 and SM120.
+SM90 admits BF16, FP16, ordinary per-tensor FP8 and DeepSeek block FP8; MX and NVFP4 remain
+unsupported on SM90. The MX Tensor Core path uses
 CuTe DSL and the existing FlashInfer low-latency blockscaled GEMM's TMA
 producers and epilogue. It does not depend on cuDNN.
 
@@ -15,7 +17,7 @@ implementation previously embedded in `cudnn_frost`. For MX, both tactics read
 the same prepared weights. Switching MX tactics needs no second
 weight copy, requantization, or per-call layout conversion. Autotuning compares
 the complete pipelines. The MX untuned default remains Tensor Core on SM100/103/107
-and uses FMA on SM120. BF16 and FP16 use
+and uses FMA on SM120. BF16, FP16 and ordinary per-tensor FP8 use
 shared FMA kernels and independently tune one, two, four or eight output
 columns per warp in FC1 and FC2.
 
@@ -252,18 +254,19 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
-| Input | E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
-| Weights | MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights |
+| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8 FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
+| Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
+| Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3 weights with per-expert FP32 scales and BF16 activation/output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
 | MX activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
 | BF16 activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
-| FP16 activation | Same ten activations and scalar restrictions as BF16 |
+| FP16 / per-tensor FP8 / DeepSeek block FP8 activation | Same ten activations and scalar restrictions as BF16 |
 | BF16 parameters | SwiGLU alpha/beta/limit and SwiGLUStep limit; other activations require their default parameters |
 | MX parameters | Same typed scalar restrictions as BF16; activation remains FP32 before MXFP8 quantization |
 | NVFP4 | NVFP4 weights and inputs, BF16 output; shared FMA, the same ten activations, H divisible by 512, I by 128, top-k <= 32; no 4over6 intermediate quantization |
-| BF16/FP16 FMA | top-k <= 32; FC1 and FC2 output columns 1/2/4/8 (16 combinations), default 1 and 4; GELU/GeGLU require compiler `erf` support |
-| MX/BF16/FP16 geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
+| BF16/FP16/per-tensor FP8/DeepSeek block FP8 FMA | top-k <= 32; FC1 and FC2 output columns 1/2/4/8 (16 combinations), default 1 and 4; GELU/GeGLU require compiler `erf` support |
+| MX/BF16/FP16/per-tensor FP8 geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
+| DeepSeek block FP8 | E4M3 weights, arbitrary FP32 128×128 scales; BF16 input or prequantized E4M3 with FP32 1×128 scales; H and I divisible by 128; FP32 preactivation, BF16 output |
 | Token rows | 1–2 by default; explicitly configurable up to 8 |
 | Routing | Packed or unpacked precomputed IDs; valid IDs in `[0, E)` |
 | Parallelism | Local expert computation, including TP weight slices; no EP shards or communication |
@@ -736,3 +739,368 @@ geometry without MX requantization; checkpoint integration still needs its own
 validation. The MX tables above measure quantized shape proxies and do not
 establish performance for the original checkpoints. Qwen3-Next's shared expert
 also remains outside this routed-only backend.
+
+## Hopper FMA coverage
+
+SM90 uses the shared BF16/FP16/per-tensor-FP8 FMA kernels and FFI binding.
+It does not admit integer Tensor Core tactics or the unqualified MX/NVFP4
+formats. The final consolidated H100 run passed 109 tests, with 111
+unsupported-format, Tensor-Core or native-fallback cases skipped across all
+seven Frost test files. This run includes the destination-device padding fix
+and final guard tests; it supersedes the earlier preliminary 103-pass run.
+Separate H100 measurements below use H=2048, I=512, E=512, top-k=10 and
+SwiGLU. CUPTI measures the full routed-expert GPU pipeline. Native CUTLASS
+search uses coordinate sweeps, top-two stage combinations and the default:
+45/81 advertised stage choices for FP16, 36/72 for FP8. This is not an
+exhaustive Cartesian search. Frost searches all 16 FMA tactics; four frozen
+ABBA rounds validate the winners. Warm event chains independently cross-check
+ranking. Host enqueue, routing-network evaluation, shared experts,
+communication and serving are outside the measurement.
+
+| Format / T / routes | Warm CUTLASS → Frost µs | Warm speedup | Cold CUTLASS → Frost µs | Cold speedup |
+|---|---:|---:|---:|---:|
+| FP16 / 1 / disjoint | 47.952 → 22.975 | 2.09× | 58.103 → 30.128 | 1.93× |
+| FP16 / 2 / disjoint | 67.127 → 39.735 | 1.69× | 77.495 → 49.200 | 1.58× |
+| FP16 / 4 / shared | 47.735 → 45.672 | 1.05× | 57.104 → 53.312 | 1.07× |
+| FP16 / 8 / shared | 46.696 → 76.751 | 0.61× | 57.512 → 83.663 | 0.69× |
+| FP8 / 1 / disjoint | 38.551 → 10.688 | 3.61× | 48.136 → 18.848 | 2.55× |
+| FP8 / 2 / disjoint | 49.064 → 25.744 | 1.91× | 57.815 → 32.952 | 1.75× |
+| FP8 / 4 / shared | 36.800 → 27.383 | 1.34× | 47.128 → 34.728 | 1.36× |
+| FP8 / 8 / shared | 36.792 → 46.736 | 0.79× | 47.119 → 55.175 | 0.85× |
+
+T8 with shared experts loses for both formats. These synthetic model-shape
+measurements do not establish model throughput. [H100 results and provenance](frost_low_latency_h100.json)
+retain all 28 warm/cold and route-reuse cases, absolute times, candidate counts,
+frozen validation medians and numerical errors. Reproduce with
+`benchmarks/bench_frost_low_latency_fp16.py` or
+`benchmarks/bench_frost_low_latency_fp8.py`; larger-expert Hopper controls are
+not included in this table.
+
+## Ordinary per-tensor FP8
+
+`QuantFormat.FP8PerTensor` activates a two-kernel FMA path using the shared
+dense FMA device bodies. Weights and inputs are E4M3; accumulation is FP32.
+FC1 dequantizes its dot products and rounds to BF16 before applying the typed
+activation, matching the CUTLASS per-tensor backbone boundary. It then applies
+the checkpoint's static intermediate multiplier and saturates to E4M3. FC2
+produces BF16 expert outputs and combines them with separate, ordered FP32
+multiply/add operations. Packed route weights retain BF16 rounding.
+
+TRT-LLM and PrimsTS instead retain FP32 FC1 preactivations until E4M3
+requantization. Identical checkpoint weights and scales do not imply bitwise
+equivalence between these numerical paths. Quantization-format support does
+not promise a universal cross-backend rounding contract.
+
+```python
+view = FrostLowLatencyConfig.prepare_fp8_per_tensor_weights(
+    w1_bf16, w2_bf16,
+    hidden_states_scale_global=input_multiplier,
+    intermediate_scale_global=intermediate_multiplier,
+    num_local_experts=E, hidden_size=H, intermediate_size=I,
+    activation=activation,
+)
+weights = MoEWeightPack()
+weights.prepare_for("frost_low_latency", view)
+xq, _ = FrostLowLatencyConfig.prepare_fp8_per_tensor_activations(
+    x_bf16, hidden_states_scale_global=input_multiplier,
+)
+layer = MoELayer(MoEConfig(
+    routing=RoutingConfig(num_experts=E, top_k=K),
+    quant=QuantConfig(weight=QuantFormat.FP8PerTensor,
+                      activation=QuantFormat.FP8PerTensor),
+    experts=ExpertConfig(intermediate_size=I),
+    activation=activation,
+    backend=BackendOptions((FrostLowLatencyConfig(max_num_tokens=8),)),
+))
+y = layer(MoEActivationPack(xq, None, topk_ids, topk_weights), weights)
+```
+
+The preparation helper uses the canonical CUTLASS quantizer, then pads logical
+I to 128 without changing quantized values. For already quantized checkpoints,
+register a prepared dictionary with E4M3 `fc1_expert_weights` in `[E, 2P, H]`
+`[up, gate]` order (or `[E, P, H]` for non-gated activation),
+`fc2_expert_weights` in `[E, H, P]`, FP32 `fc1_dequant_scale` and
+`fc2_dequant_scale` in `[E]`, and scalar FP32 `fc2_act_quant_scale`. Here
+P = ceil(I / 128) * 128; padding is zero. FC1 dequant includes the input
+scale; FC2 dequant includes the intermediate scale. This is the same retained
+weight view as CUTLASS for I divisible by 128. No weight requantization or
+activation-value inspection occurs during execution. Scale tensors are read
+on the device on every call and may change between graph replays.
+
+### SM120 FP8 kernel measurements
+
+RTX PRO 6000 Blackwell Workstation Edition, FP8 SwiGLU,
+H=2048/I=512/E=512/top-k=10. These are full routed-expert GPU pipeline times,
+including required adapters, activation and combine. Routing selection,
+shared experts, communication, host enqueue and serving are outside scope.
+Static input/intermediate multipliers are 32/128. All 21×21 advertised CUTLASS
+FC1/FC2 pairs plus the default were attempted; resource-incompatible pairs are
+recorded. All 16 Frost column combinations were ranked. Selection is followed
+by four independent frozen ABBA blocks, A/A controls, and correctness checks
+before and after replay. CUPTI reports each call's first-to-last activity span.
+
+| Tokens / routes | Warm CUTLASS µs | Warm Frost µs | Warm speedup | Cold speedup |
+|---|---:|---:|---:|---:|
+| 1 | 27.69 | 8.07 | 3.43× | 1.84× |
+| 2 / disjoint | 33.08 | 12.81 | 2.58× | 1.49× |
+| 2 / shared | 27.92 | 12.83 | 2.18× | 1.80× |
+| 4 / disjoint | 45.38 | 22.00 | 2.06× | 1.23× |
+| 4 / shared | 28.13 | 21.94 | 1.28× | 1.29× |
+| 8 / disjoint | 181.41 | 156.91 | 1.16× | 1.11× |
+| 8 / shared | 29.25 | 38.06 | 0.77× | 0.91× |
+
+The H=7168/I=2048/E=256/top-k=8 disjoint-route control gives much smaller
+speedups: T1 cold 1.08×, T1 warm 1.12×, T2 cold 1.03×, T2 warm 1.07×, T4 cold 1.02×, T4 warm 1.04×, T8 cold 1.02×, T8 warm 1.02×.
+See [FP8 results and controls](frost_low_latency_fp8_sm120.json) for all
+absolute times, selected tactics, A/A controls and numerical errors.
+
+Warm means repeated operands, not guaranteed L2 residency. Cold evicts L2
+outside the measurement interval. T8 with shared experts favors Tensor Core
+weight reuse; Frost remains an explicit candidate. These synthetic model-shape
+measurements do not establish checkpoint or model throughput.
+
+```bash
+python benchmarks/bench_frost_low_latency_fp8.py \
+  --tokens 1 --cache-mode warm --expert-reuse disjoint --output fp8-t1-warm.json
+```
+
+The benchmark requires `cupti-python >= 13`; `--timer globaltimer` explicitly
+selects graph intervals that include stamp-boundary overhead instead. It does
+not silently substitute CUDA events. Larger weights are prepared in per-expert
+chunks outside timing to bound transient preparation memory.
+
+
+#### Hopper FP8 accumulation boundary
+
+The native CUTLASS SM90 per-tensor FP8 path selects
+`KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum`. Its Tensor Core
+accumulation is not numerically identical to the Frost FP32 FMA reduction,
+even though both preserve the BF16 preactivation and E4M3 intermediate
+boundaries described above. The small-shape table passed the fixed reference
+tolerances for both implementations; it does not establish equivalence at
+arbitrary reduction lengths.
+
+A separate `T=1, H=7168, I=2048, E=256, top-k=8` control stopped before native
+timing: the native default exceeded the benchmark's unchanged relative-L2
+limit (`0.01608` versus `0.015`). All 16 Frost tactics passed. The native output
+was bitwise equal to an independent cuBLAS control with `use_fast_accum=True`
+in both GEMMs and the same quantization/activation boundaries. Disabling fast
+accumulation in that control reproduced the reference discrepancy. This
+identifies the source of the mismatch; it does not qualify a speedup for that
+case. No large-shape Hopper FP8 performance result is reported, and the
+benchmark still fails closed rather than relaxing the numerical gate.
+
+
+## E4M3 weight-only with BF16 activation
+
+Configure `weight=QuantFormat.FP8PerTensor`, `activation=QuantFormat.BF16`
+and BF16 output to use the same routed FMA schedule without quantizing
+activations. This mode preserves checkpoint E4M3 weight bytes and FP32
+per-expert weight scales. FC1 accumulates in FP32, applies the weight scale,
+rounds preactivation to BF16, applies the selected activation, then stores a
+BF16 intermediate. FC2 applies its weight scale, rounds each expert output to
+BF16, and combines using ordered FP32 multiply/add. Packed routing weights
+retain BF16 rounding. All ten typed activations and the existing FMA geometry,
+token and top-k limits apply. This mode is explicit opt-in.
+
+```mermaid
+flowchart LR
+  X[BF16 input] --> G1[FP32 FMA plus E4M3 weight scale]
+  G1 --> R1[BF16 preactivation]
+  R1 --> A[Typed activation]
+  A --> M[BF16 intermediate]
+  M --> G2[FP32 FMA plus E4M3 weight scale]
+  G2 --> R2[BF16 expert outputs]
+  R2 --> C[Ordered FP32 weighted combine]
+  C --> Y[BF16 output]
+```
+
+```python
+view = FrostLowLatencyConfig.prepare_fp8_weight_only_weights(
+    w1_e4m3, w1_dequant_scale, w2_e4m3, w2_dequant_scale,
+    activation=activation,
+)
+weights = MoEWeightPack()
+weights.prepare_for("frost_low_latency", view)
+config = MoEConfig(
+    routing=RoutingConfig(num_experts=E, top_k=K),
+    quant=QuantConfig(weight=QuantFormat.FP8PerTensor,
+                      activation=QuantFormat.BF16),
+    experts=ExpertConfig(intermediate_size=I),
+    activation=activation,
+    backend=BackendOptions((FrostLowLatencyConfig(max_num_tokens=8),)),
+)
+y = MoELayer(config)(MoEActivationPack(x_bf16, None, topk_ids, topk_weights), weights)
+```
+
+The helper accepts canonical `[E, 2*I, H]` weights in `[up, gate]` order (or
+`[E, I, H]` for non-gated activation), `[E, H, I]` down weights, and two
+FP32 `[E]` dequantization scales on the same CUDA device. It pads I to 128
+without requantizing weights. These are weight-only scales: do not pass the
+folded input/intermediate calibration scales of the W8A8 helper. The prepared
+view keeps the shared FP8 binding layout; its dummy `fc2_act_quant_scale` is
+unused by W8A16. Scales stay live across graph replay and fresh bindings.
+
+`benchmarks/bench_frost_low_latency_w8a16.py` compares the full routed-expert
+GPU pipelines with cuTile using the same weights, scales, BF16 rounding
+boundaries and reference. By default it searches all advertised GEMM stage
+pairs for all supported native block sizes and gather/sorted modes, then
+validates frozen winners with ABBA and independent warm CUDA-event chains.
+Native stage-ranking hooks receive private routing tensors; the benchmark
+verifies that the measured IDs and scores remain unchanged. Host enqueue,
+router-network evaluation, shared experts, communication and serving are
+outside its scope.
+
+### W8A16 qualification
+
+The following results use H=2048, I=512, E=512, top-k=10 and SwiGLU, with
+synthetic tensors at model geometry. Both pipelines receive identical E4M3
+weights, FP32 per-expert scales, BF16 inputs and precomputed routing, and share
+the BF16 preactivation/intermediate/expert boundaries described above.
+CUPTI measures each full routed-expert GPU span inside CUDA Graph replay.
+Cold L2 eviction is outside that interval. Warm means repeated operands and
+does not guarantee that all selected weights fit in cache.
+
+| GPU | T | Routes / cache | Best tested cuTile µs | Frost µs | Speedup |
+|---|---:|---|---:|---:|---:|
+| RTX PRO 6000 Blackwell / SM120 | 1 | warm | 18.912 | 8.608 | 2.20× |
+| RTX PRO 6000 Blackwell / SM120 | 1 | cold | 37.288 | 26.143 | 1.43× |
+| RTX PRO 6000 Blackwell / SM120 | 2 | disjoint / warm | 60.831 | 13.248 | 4.59× |
+| RTX PRO 6000 Blackwell / SM120 | 8 | shared / warm | 28.816 | 38.088 | 0.76× |
+| H100 / SM90 | 1 | warm | 33.600 | 11.920 | 2.82× |
+| H100 / SM90 | 1 | cold | 42.864 | 22.328 | 1.92× |
+| H100 / SM90 | 8 | shared / warm | 43.072 | 46.632 | 0.92× |
+
+The search tests 289 native candidates for SM120 T1/T2 and 337 for T8;
+H100 tests 301 for T1 and 351 for T8. It includes every advertised stage pair
+for all supported native blocks and gather/sorted modes, plus the default.
+Frost tests all 16 FC1/FC2 column pairs. Selected tactics are frozen before four
+ABBA validation blocks; separate warm CUDA-event graph chains confirm the
+ranking. A/A ratios in these records are within 0.9% of one. This is a full
+advertised search for these conditions, not a claim that all possible native
+kernel configurations have been searched.
+
+The T8/shared losses remain in the table: Tensor Core weight reuse can beat
+route-wise FMA as more tokens reuse experts. The large T2/disjoint gain is
+specific to that sparse routing and baseline pipeline; it is not a universal
+W8A16 speedup. Default backend selection is unchanged.
+
+Both GPUs used CuTe DSL 4.8.0 and TVM-FFI 0.1.14.post1. SM120 used
+PyTorch 2.14.1+cu130; H100 used PyTorch 2.14.0a0+b2c75dd062.nv26.09 with
+CUDA 13.4. See [results and controls](frost_low_latency_w8a16.json) for exact
+native/Frost source hashes, cuTile versions, actual routing, all selected
+tactics, correctness errors and frozen validation samples. This measures
+routed-expert kernel GPU time, not a model decode step or token throughput.
+
+```bash
+python benchmarks/bench_frost_low_latency_w8a16.py \
+  --tokens 1 --cache-mode warm --expert-reuse disjoint --output w8a16-t1-warm.json
+```
+
+
+## DeepSeek block-scaled FP8
+
+Set both quantization axes to `QuantFormat.DeepSeekFp8`. This FMA path uses
+canonical E4M3 expert weights and arbitrary FP32 128×128 weight scales; it does
+not reinterpret the scales as MX powers of two or requantize checkpoint weights.
+The same numerical contract applies on SM90, SM100, SM103, SM107 and SM120.
+H and I must be positive multiples of 128, top-k at most 32, and tokens at most
+the configured limit (up to eight). All ten typed activations are supported.
+
+```mermaid
+flowchart LR
+  B[BF16 input] --> Q[Per-token 128-value E4M3 quantization]
+  E[Prequantized E4M3 plus FP32 scales] --> G1
+  Q --> G1[Block-scaled FP32 FMA and typed activation]
+  G1 --> P[FP32 intermediate in global memory]
+  P --> M[Per-route 128-value E4M3 quantization]
+  M --> G2[Block-scaled FP32 FMA]
+  G2 --> C[BF16 expert values and ordered FP32 weighted combine]
+  C --> O[BF16 output]
+```
+
+BF16 entry takes four kernels; prequantized E4M3 entry takes three. FC1 keeps
+preactivation in FP32, applies the typed activation, then dynamically quantizes
+the intermediate to E4M3. Each group scale is `max(amax, 1e-4) / 448`, and
+conversion uses round-to-nearest division and saturated E4M3 conversion. FC2
+rounds each expert value to BF16 before slot-ordered FP32 multiply/add. Packed
+routing scores retain BF16 rounding; unpacked scores retain their input precision.
+Invalid expert IDs contribute zero.
+
+This fixed FP32 preactivation differs from the additional FP8 preactivation
+quantization used by some TRT-LLM/Prims-TS DeepSeek paths. They are not bitwise
+interchangeable. Similarly, callers supplying prequantized input retain their
+own quantizer's values and scales; Frost does not requantize that input. In
+particular, another helper's small-value scale floor may differ from the BF16
+entry's `1e-4` floor. Compare explicit numerical contracts when selecting a
+backend.
+
+```python
+view = FrostLowLatencyConfig.prepare_deepseek_fp8_weights(
+    w1_e4m3, w1_block_scales, w2_e4m3, w2_block_scales,
+    activation=activation,
+)
+weights = MoEWeightPack()
+weights.prepare_for("frost_low_latency", view)
+config = MoEConfig(
+    routing=RoutingConfig(num_experts=E, top_k=K),
+    quant=QuantConfig(weight=QuantFormat.DeepSeekFp8,
+                      activation=QuantFormat.DeepSeekFp8),
+    experts=ExpertConfig(intermediate_size=I),
+    activation=activation,
+    backend=BackendOptions((FrostLowLatencyConfig(max_num_tokens=8),)),
+)
+y = MoELayer(config)(MoEActivationPack(x_bf16, None, ids, scores), weights)
+# Alternatively: MoEActivationPack(x_e4m3, input_scales, ids, scores).
+```
+
+Canonical weights are `[E, branches*I, H]` and `[E, H, I]`, with `[up, gate]`
+order for gated activation (`branches=2`, otherwise one). Weight-scale shapes
+are `[E, branches*I/128, H/128]` and `[E, H/128, I/128]`. Prequantized input
+scales are contiguous FP32 `[H/128, T]`. Every tensor is on the runner's CUDA
+device. BF16 entry must not supply input scales. Weight scales, input scales,
+route IDs, scores and workspaces are live bindings; the compile cache retains
+only the executable and immutable metadata. Warm each specialization before
+CUDA Graph capture.
+
+### DeepSeek block-FP8 qualification on SM120
+
+RTX PRO 6000 Blackwell Workstation Edition, PyTorch 2.14.1+cu130, CUDA 13.0,
+CuTe DSL 4.8.0 and TVM-FFI 0.1.14.post1. CUPTI measures the full GPU span,
+including BF16 input quantization, FC1/activation, intermediate quantization,
+FC2 and combine. Host enqueue, preparation, router-network evaluation, shared
+experts, communication and cold-cache eviction are outside timing. These are
+synthetic tensors at model geometry, not checkpoint or serving measurements.
+
+The native SM12x FP8 pipeline is tested across all 48 advertised stage-pair,
+default and PDL on/off combinations; Frost tests 16 column pairs. Winners are
+frozen before four ABBA validation rounds. Both sides use identical E4M3
+payloads, FP32 block scales, BF16-rounded routing scores and FP32 preactivation.
+Native keeps FP32 expert values before atomic BF16 combine; Frost rounds each
+expert to BF16 before ordered FP32 combine. Independent references preserve
+these distinct final boundaries.
+
+| H / I / E / top-k | T / routes | Cache | Best tested native µs | Frost µs | Speedup |
+|---|---|---|---:|---:|---:|
+| 2048 / 512 / 512 / 10 | 1 | warm | 26.512 | 10.176 | 2.61× |
+| 2048 / 512 / 512 / 10 | 1 | cold | 34.792 | 27.984 | 1.24× |
+| 2048 / 512 / 512 / 10 | 8 / shared | warm | 24.016 | 39.096 | 0.61× |
+| 7168 / 2048 / 256 / 8 | 1 | warm | 229.070 | 219.958 | 1.04× |
+| 7168 / 2048 / 256 / 8 | 1 | cold | 251.126 | 234.662 | 1.07× |
+| 7168 / 2048 / 256 / 8 | 4 / shared | warm | 229.662 | 399.141 | 0.58× |
+| 7168 / 2048 / 256 / 8 | 4 / shared | cold | 253.742 | 462.933 | 0.55× |
+
+All measured candidates passed the unchanged numerical gates; the worst
+native large-shape relative L2 was approximately 1.37%, below the 1.5% gate.
+The large-expert and shared-route losses are retained. This extension is an
+explicit candidate, with no default `auto` selection change and no universal
+T≤8 FMA preference. See [results and controls](frost_low_latency_deepseek_fp8_sm120.json)
+for source hashes, exact routing, numerical errors, selected tactics and samples.
+
+```bash
+python benchmarks/bench_frost_low_latency_deepseek_fp8.py \
+  --tokens 1 --cache-mode warm --output deepseek-fp8-t1-warm.json
+```
+
+The reproducer requires SM120 and CUPTI; profiling errors remain errors.
+H100/SM90 correctness qualification does not establish a Hopper performance gain.

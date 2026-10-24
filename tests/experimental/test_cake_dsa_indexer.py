@@ -107,6 +107,7 @@ _COMMON = dict(
     sample_tiles_tiny_units=8,
     sample_dispatch_tiny_tiles_max=128,
     sample_shift_permille=250,
+    far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
     check_period_cap_divisor=512,
@@ -615,6 +616,9 @@ def test_policy_record_round_trip_and_validation():
         dict(rank_persist_max_k=-1),  # round 39: lever FRP-K fields
         dict(rank_persist_max_k=2048.5),
         dict(rank_persist_ctas_per_sm=0),
+        dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
+        dict(far_sample=-1),
+        dict(far_sample=True),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
@@ -1042,14 +1046,23 @@ def test_select_program_narrow_pair_policy():
         candidate_multiplier=2,
         check_period=1,
         sample_tiles_max=0,
+        far_sample=1,
         finalize_threads=512,
     )
-    assert (c.cand_cap, c.check_period, c.sample_tiles_max, c.finalize_key) == (
+    assert (
+        c.cand_cap,
+        c.check_period,
+        c.sample_tiles_max,
+        c.far_sample,
+        c.finalize_key,
+    ) == (
         4096,
         1,
         0,
+        1,
         "finalize_rank:t512:w16384",
     )
+    assert _select(p, 8192, 8192).far_sample == p.far_sample == 0  # record default
     assert (
         _select(p, 8192, 1048576, finalize_threads=512).finalize_key == "finalize:t512"
     )
@@ -1113,6 +1126,8 @@ def test_select_program_narrow_pair_policy():
         _select(p, 8192, 8192, finalize_threads=32)
     with pytest.raises(ValueError, match="grid_ctas"):
         _select(p, 8192, 8192, grid=0)
+    with pytest.raises(ValueError, match="far_sample"):
+        _select(p, 8192, 8192, far_sample=2)
 
 
 def test_select_program_snake_unroll_policy():
@@ -1966,12 +1981,36 @@ def test_repeatability_bitwise():
     assert ref.same_bits(a, b) and ref.same_bits(a, c)
 
 
+def test_far_sample_knob_is_validated_on_the_host():
+    """``far_sample`` is ``0`` or ``1`` and defaults to the architecture's record; the check reads no device."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch in cake_jit.ARCHES:
+        grid = _FROZEN_GRIDS[arch][0]
+        plan = plan_dsa_indexer_topk(1024, 4096, 1, top_k=256, arch=arch, num_sms=grid)
+        assert plan.far_sample in (0, 1)
+        assert plan.far_sample == policy_for(arch).far_sample
+        for value in (0, 1):
+            assert (
+                plan_dsa_indexer_topk(
+                    1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=value
+                ).far_sample
+                == value
+            )
+        for bad in (2, -1, True):
+            with pytest.raises(ValueError, match="far_sample"):
+                plan_dsa_indexer_topk(
+                    1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=bad
+                )
+
+
 PARTITION_KNOBS = (
     {"grid_ctas": 37},
     {"candidate_multiplier": 2},
     {"check_period": 1},
     {"sample_tiles_max": 0},
     {"sample_shift_permille": -500},
+    {"far_sample": 1},
     {
         "finalize_threads": 512
     },  # the 512-thread finalize program (the rank form where the policy admits the call)
@@ -1995,9 +2034,9 @@ def test_partition_knobs_do_not_change_results(knobs):
 # -- the attention-sink + local-band distribution (flashinfer-ai/flashinfer#7042) ----------------------------------
 # Small context-parallel geometries whose long units overflow the candidate buffer and run the sampled first
 # threshold (the issue's regime: the nearest key tile of every unit -- the diagonal -- holds a hot band of top-k
-# keys), judged like the random rows against the FP64 / FP32 reference and compared bitwise with the sampled
-# threshold switched off and with the forced re-stream.  Host plan, hand-evaluated from the registry policies
-# (the test asserts the host-visible parts): narrow units (l6 on sm_107a for ``cp16_16k``), ``cand_cap`` 8192,
+# keys), judged like the random rows against the FP64 / FP32 reference under both settings of the far-sample
+# switch and compared bitwise with the sampled threshold switched off and with the forced re-stream.  Host plan,
+# hand-evaluated from the registry policies (the test asserts the host-visible parts): narrow units (l6 on sm_107a for ``cp16_16k``), ``cand_cap`` 8192,
 # ``check_period`` 16; ``cp16_16k`` (mean unit tiles 64) samples 8 tiles at stride 16 on its 125-128-tile units,
 # ``tail_30848`` (mean 239) samples 16 tiles at stride 15 / 16 on its 238-241-tile units.  The 241-tile units of
 # ``tail_30848`` satisfy ``(n_tiles - 1) % stride == 0``, so both tile orders sample the same tiles, the diagonal
@@ -2018,15 +2057,17 @@ def _longest_unit_samples(inputs, plan) -> bool:
     return tiles * tile + tile > plan.cand_cap and max_tiles >= 2
 
 
+@pytest.mark.parametrize("far_sample", [0, 1])
 @pytest.mark.parametrize("name", list(SINK_GEOMETRIES))
-def test_sink_distribution_is_exact_and_knob_invariant(name):
+def test_sink_distribution_is_exact_and_knob_invariant(name, far_sample):
     _require_program()
     inputs = ref.make_sink_inputs(
         **SINK_GEOMETRIES[name], seed=ref.SINK_SEED, device="cuda", label=name
     )
-    plan = _plan(inputs)
+    plan = _plan(inputs, far_sample=far_sample)
     assert plan.sample_tiles_max > 0 and _longest_unit_samples(inputs, plan), plan
-    base = _run(inputs)
+    assert plan.far_sample == far_sample
+    base = _run(inputs, far_sample=far_sample)
     verdict = _judge_ok(base, ref.select_reference(inputs))
     assert (
         verdict.max_fp32_error_over_bound <= 1.0
@@ -2069,6 +2110,8 @@ def test_sink_issue_geometry_full():
     _judge_ok(base, ref.select_reference(inputs))
     nosample = _run(inputs, max_seqlen_k=262144, sample_tiles_max=0)
     assert ref.same_bits(base, nosample)
+    far = _run(inputs, max_seqlen_k=262144, far_sample=1)
+    assert ref.same_bits(base, far)
     unbounded = _run(inputs)
     assert ref.same_bits(base, unbounded)
 
