@@ -203,3 +203,38 @@ def prepare_fp8_weight_only_weights(w1, w1_scale, w2, w2_scale, activation):
         # Retain the common binding layout; W8A16 does not read this field.
         fc2_act_quant_scale=torch.ones((), device=w1.device, dtype=torch.float32),
     )
+
+
+def prepare_deepseek_fp8_weights(w1, s1, w2, s2, activation):
+    """Preserve canonical E4M3 payloads and FP32 128x128 block scales."""
+    from .fma.activation_config import lower_activation
+
+    lower_activation(activation)
+    if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not w1.dtype:
+        raise TypeError("DeepSeek Frost requires E4M3 weights")
+    if w1.ndim != 3 or w2.ndim != 3:
+        raise ValueError("weights must be 3-D")
+    e, h, i = w2.shape
+    branches = 2 if activation.is_gated else 1
+    if e < 1 or h < 128 or i < 128 or h % 128 or i % 128:
+        raise ValueError("DeepSeek Frost requires positive E and H/I divisible by 128")
+    if w1.shape != (e, branches * i, h):
+        raise ValueError(f"expected w1 shape {(e, branches * i, h)}")
+    if not w1.is_cuda or w2.device != w1.device:
+        raise ValueError("weights must be CUDA tensors on the same device")
+    for scale, shape in (
+        (s1, (e, branches * i // 128, h // 128)),
+        (s2, (e, h // 128, i // 128)),
+    ):
+        if (
+            scale.dtype is not torch.float32
+            or scale.shape != shape
+            or scale.device != w1.device
+        ):
+            raise ValueError(f"block scales must be FP32 {shape} on {w1.device}")
+    return dict(
+        fc1_expert_weights=w1.contiguous(),
+        fc1_block_scales=s1.contiguous(),
+        fc2_expert_weights=w2.contiguous(),
+        fc2_block_scales=s2.contiguous(),
+    )
