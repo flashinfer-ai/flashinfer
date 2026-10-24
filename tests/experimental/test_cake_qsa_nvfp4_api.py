@@ -19,8 +19,9 @@ flashinfer public-API tests of the Cake QSA NVFP4 sparse paged attention
 The backend suite ``test_cake_qsa_nvfp4.py`` exercises the package.  This file covers
 what needs flashinfer itself: the ``backend`` keyword of
 ``flashinfer.sparse.qsa_sparse_paged_attention`` -- ``backend="cake"`` reaches the
-package with every operand, the default ``"auto"`` is the package on SM80 through SM90
-and the existing implementation elsewhere, ``"default"`` keeps the existing
+package with every operand, the default ``"auto"`` is the package on every compute
+capability it exports a library for (8.x, 9.0, 10.0, 10.3: capability-exact) and the
+existing implementation elsewhere, ``"default"`` keeps the existing
 implementation, an unknown value is refused -- device runs of the route and of the auto
 default against the package, bit for bit, and
 the NVFP4 paged writer against the torch port the backend suite fills its caches with.
@@ -170,44 +171,64 @@ def test_explicit_default_backend_keeps_the_existing_implementation(monkeypatch)
 
 
 def test_auto_backend_resolves_by_capability(monkeypatch):
-    """``auto`` is the Cake route for every capability the package exports (major 8 or 9)
-    and the reference implementation for any other capability or a non-CUDA device; the
-    table below needs no GPU, the capability lookup is replaced."""
+    """``auto`` is the Cake route for every capability the package exports (8.0, 8.6, 8.7,
+    8.9, 9.0, 10.0, 10.3) and the reference implementation for any other capability or a
+    non-CUDA device: the rule is capability-exact, so 10.7 (no delivered library) and the
+    12.x devices stay on the reference until the package ships for them; the table below
+    needs no GPU, the capability lookup is replaced."""
     assert public_api._qsa_auto_backend(torch.device("cpu")) == "default"
     device = torch.device("cuda", 0)
     table = {}
     monkeypatch.setattr(public_api, "get_compute_capability", lambda d: table[d])
+    assert sorted(cake_jit.ARCH_BY_CAPABILITY) == [
+        (8, 0),
+        (8, 6),
+        (8, 7),
+        (8, 9),
+        (9, 0),
+        (10, 0),
+        (10, 3),
+    ]
     for capability in sorted(cake_jit.ARCH_BY_CAPABILITY):
         table[device] = capability
         assert public_api._qsa_auto_backend(device) == "cake", capability
-    for capability in ((7, 5), (10, 0), (10, 3), (12, 0), (12, 1)):
+    for capability in ((7, 5), (10, 7), (12, 0), (12, 1)):
         table[device] = capability
         assert public_api._qsa_auto_backend(device) == "default", capability
 
 
-def test_auto_rule_covers_every_exported_capability():
-    """The entry's major rule and the package's capability table agree: every exported
-    capability resolves to the Cake route, so ``auto`` never selects a route that refuses
-    the device."""
-    majors = {capability[0] for capability in cake_jit.ARCH_BY_CAPABILITY}
-    assert majors == set(public_api._QSA_CAKE_MAJORS)
+def test_auto_rule_covers_every_exported_capability(monkeypatch):
+    """The entry's rule is the package's capability table and nothing else: over every
+    capability of majors 7 through 12, exactly the exported ones resolve to the Cake route,
+    so ``auto`` never selects a route that refuses the device and never leaves an exported
+    device on the reference."""
+    device = torch.device("cuda", 0)
+    table = {}
+    monkeypatch.setattr(public_api, "get_compute_capability", lambda d: table[d])
+    routed = set()
+    for major in range(7, 13):
+        for minor in range(10):
+            table[device] = (major, minor)
+            if public_api._qsa_auto_backend(device) == "cake":
+                routed.add((major, minor))
+    assert routed == set(cake_jit.ARCH_BY_CAPABILITY)
 
 
 def test_omitted_backend_takes_the_auto_route(monkeypatch):
-    """On the device at hand an omitted ``backend`` reaches the package when the device is
-    SM80 through SM90 and the existing implementation otherwise (recorders stand in for
-    both, so this needs a CUDA device but no exported target)."""
+    """On the device at hand an omitted ``backend`` reaches the package when the device's
+    capability is an exported one and the existing implementation otherwise (recorders
+    stand in for both, so this needs a CUDA device but no exported target)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     calls = _patch_both_backends(monkeypatch)
     device = torch.device("cuda", torch.cuda.current_device())
-    major = torch.cuda.get_device_capability(device)[0]
+    capability = tuple(torch.cuda.get_device_capability(device))
     t = torch.empty(0, device=device)
     with _quiet():
         result = public_api.qsa_sparse_paged_attention(
             t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
         )
-    want = "cake" if major in (8, 9) else "existing"
+    want = "cake" if cake_jit.arch_for_capability(capability) is not None else "existing"
     assert result == want
     assert [tag for tag, _, _ in calls] == [want]
 
@@ -228,7 +249,7 @@ def test_generated_sources_are_declared_as_package_data():
     source under csrc/ (the generated kernels, bindings and headers; not the formatter's
     dotfile) and build.json.  pyproject.toml sets include-package-data = false, so only
     this package's package-data globs put them into a wheel; the auto default makes that
-    a requirement of every SM80 through SM90 install."""
+    a requirement of every install on an exported capability."""
     pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
     if not pyproject.is_file():
         pytest.skip("pyproject.toml is only available in source-tree test runs")
@@ -253,10 +274,13 @@ def test_generated_sources_are_declared_as_package_data():
 
 
 def test_program_rule_selects_the_records_of_a_call():
-    """On sm_80 a wide (multi-wave, long-stream) split-form call launches the whole-tile
-    decode, every other call the K-first decode; the merge follows above one split; the
-    fused form is the cooperative decode alone on either architecture; an unknown form,
-    architecture or split count is refused."""
+    """The records are filtered by the device's architecture first: the ``mma.sync`` decode's
+    on sm_80 / sm_90a, the tcgen05 decode's on sm_100a / sm_103a.  On sm_80 a wide
+    (multi-wave, long-stream) split-form call launches the whole-tile decode, every other
+    call the K-first decode; sm_100a / sm_103a launch the tcgen05 decode whatever the grid;
+    the merge follows above one split on every architecture; the fused form is the
+    architecture's cooperative decode alone; an unknown form, architecture or split count is
+    refused."""
     select = cake_jit.select_records
     assert select(form="split", splits=4, arch="sm_80", wide=True) == (
         "decode_whole_tile",
@@ -276,16 +300,35 @@ def test_program_rule_selects_the_records_of_a_call():
             "merge",
         )
         assert select(form="split", splits=1, arch="sm_90a", wide=wide) == ("decode",)
-        for arch in cake_jit.ARCHES:
+        for arch in ("sm_80", "sm_90a"):
             assert select(form="fused", splits=4, arch=arch, wide=wide) == (
                 "decode_coop",
             )
-    for name in ("decode", "decode_whole_tile", "decode_coop", "merge"):
+        for arch in ("sm_100a", "sm_103a"):
+            assert select(form="split", splits=4, arch=arch, wide=wide) == (
+                "decode_tcgen05",
+                "merge",
+            )
+            assert select(form="split", splits=1, arch=arch, wide=wide) == (
+                "decode_tcgen05",
+            )
+            assert select(form="fused", splits=4, arch=arch, wide=wide) == (
+                "decode_tcgen05_coop",
+            )
+    assert cake_jit.ARCHES == ("sm_80", "sm_90a", "sm_100a", "sm_103a")
+    for name in cake_jit.MODULES:
         assert cake_jit.MODULES[name]["stage"] in cake_jit.STAGES
+        assert set(cake_jit.MODULES[name]["arches"]) <= set(cake_jit.ARCHES)
+    # Every (form, architecture) selects exactly one decode record; the merge is one record on every architecture.
+    for arch in cake_jit.ARCHES:
+        for form in cake_jit.FORMS:
+            for wide in (False, True):
+                cake_jit.select_record("decode", form=form, arch=arch, wide=wide)
+        assert cake_jit.select_record("merge", form="split", arch=arch, wide=False) == "merge"
     with pytest.raises(ValueError, match="form"):
         select(form="other", splits=1, arch="sm_80", wide=False)
     with pytest.raises(ValueError, match="arch"):
-        select(form="split", splits=1, arch="sm_100a", wide=False)
+        select(form="split", splits=1, arch="sm_120a", wide=False)
     with pytest.raises(ValueError, match="splits"):
         select(form="split", splits=0, arch="sm_80", wide=False)
     with pytest.raises(ValueError, match="merge"):
@@ -293,53 +336,67 @@ def test_program_rule_selects_the_records_of_a_call():
 
 
 def test_wide_grid_is_multi_wave_with_long_streams():
-    """``select_wide`` at 108 SMs (216 resident CTAs) over the owner's rows at two KV heads
-    with the host's split counts and the 33 tiles of a 2051-token selection: rows 128
-    (2 splits, 512 CTAs, 17 tiles per CTA) are wide; rows 64 (4 splits, 512 CTAs, 9 tiles
-    per CTA) and rows 1-32 (at most one wave) are not; the 2048-row single split (33 tiles
-    per CTA) is; the fused form never is.  The grid bound is strict and the stream bound
-    inclusive: 16 tiles per CTA (1024 selected tokens) above one wave is wide, 15 is not."""
-    sm_count = 108
+    """``select_wide`` on sm_80 at 108 SMs (216 resident CTAs) over the owner's rows at two
+    KV heads with the host's split counts and the 33 tiles of a 2051-token selection: rows
+    128 (2 splits, 512 CTAs, 17 tiles per CTA) are wide; rows 64 (4 splits, 512 CTAs, 9
+    tiles per CTA) and rows 1-32 (at most one wave) are not; the 2048-row single split (33
+    tiles per CTA) is; the fused form never is.  The grid bound is strict and the stream
+    bound inclusive: 16 tiles per CTA (1024 selected tokens) above one wave is wide, 15 is
+    not.  The wave is the architecture's: on sm_100a at 148 SMs (one CTA per SM) the rows
+    128 single-split grid of 256 CTAs is wide too, which selects nothing there (the tcgen05
+    decode has one split-form record)."""
+    sm_count, arch = 108, "sm_80"
     tiles = cake_backend.num_tiles(2051)
     assert tiles == 33
     assert cake_jit.DECODE_LONG_STREAM_TILES == 16
     assert cake_backend.LONG_STREAM_TILES == cake_jit.DECODE_LONG_STREAM_TILES
+    assert cake_backend.CTAS_PER_SM == {"sm_80": 2, "sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
     rows_to_splits = {
-        rows: cake_backend.num_splits(rows, 2, 2051, sm_count)
+        rows: cake_backend.num_splits(rows, 2, 2051, sm_count, arch)
         for rows in (1, 2, 4, 8, 16, 32, 64, 128)
     }
     assert rows_to_splits[64] == 4 and rows_to_splits[128] == 2
     wide = cake_backend.select_wide
-    assert wide(128, 2, rows_to_splits[128], tiles, "split", sm_count)
-    assert not wide(128, 2, rows_to_splits[128], tiles, "fused", sm_count)
+    assert wide(128, 2, rows_to_splits[128], tiles, "split", sm_count, arch)
+    assert not wide(128, 2, rows_to_splits[128], tiles, "fused", sm_count, arch)
     # Rows 64: 512 CTAs exceed one wave, but ceil(33 / 4) = 9 tiles per CTA is a short stream.
-    assert not wide(64, 2, rows_to_splits[64], tiles, "split", sm_count)
+    assert not wide(64, 2, rows_to_splits[64], tiles, "split", sm_count, arch)
     for rows in (1, 2, 4, 8, 16, 32):
         splits = rows_to_splits[rows]
-        assert rows * 2 * splits <= cake_backend.CTAS_PER_SM * sm_count, rows
-        assert not wide(rows, 2, splits, tiles, "split", sm_count), rows
-    assert wide(2048, 2, 1, tiles, "split", sm_count)
-    assert not wide(2048, 2, 1, tiles, "fused", sm_count)
+        assert rows * 2 * splits <= cake_backend.CTAS_PER_SM[arch] * sm_count, rows
+        assert not wide(rows, 2, splits, tiles, "split", sm_count, arch), rows
+    assert wide(2048, 2, 1, tiles, "split", sm_count, arch)
+    assert not wide(2048, 2, 1, tiles, "fused", sm_count, arch)
     # The grid bound is strict: one full wave of long streams is not wide.
-    capacity = cake_backend.CTAS_PER_SM * sm_count
-    assert not wide(capacity, 1, 1, 16, "split", sm_count)
-    assert wide(capacity + 1, 1, 1, 16, "split", sm_count)
+    capacity = cake_backend.CTAS_PER_SM[arch] * sm_count
+    assert not wide(capacity, 1, 1, 16, "split", sm_count, arch)
+    assert wide(capacity + 1, 1, 1, 16, "split", sm_count, arch)
     # The stream bound is inclusive and counts ceil(tiles / splits).
-    assert wide(512, 1, 1, 16, "split", sm_count)
-    assert not wide(512, 1, 1, 15, "split", sm_count)
-    assert wide(128, 2, 2, 31, "split", sm_count)  # ceil(31 / 2) = 16
-    assert not wide(128, 2, 2, 30, "split", sm_count)  # 15
+    assert wide(512, 1, 1, 16, "split", sm_count, arch)
+    assert not wide(512, 1, 1, 15, "split", sm_count, arch)
+    assert wide(128, 2, 2, 31, "split", sm_count, arch)  # ceil(31 / 2) = 16
+    assert not wide(128, 2, 2, 30, "split", sm_count, arch)  # 15
     # On 132 SMs (264 CTAs) the owner's rows 1-128 never exceed one wave in the split form.
     for rows in (1, 2, 4, 8, 16, 32, 64, 128):
-        splits = cake_backend.num_splits(rows, 2, 2051, 132)
-        assert not wide(rows, 2, splits, tiles, "split", 132), rows
+        splits = cake_backend.num_splits(rows, 2, 2051, 132, "sm_90a")
+        assert not wide(rows, 2, splits, tiles, "split", 132, "sm_90a"), rows
+    # sm_100a at 148 SMs: the wave is 148 CTAs; rows 128 at one split (256 CTAs, 33 tiles) is wide, rows 1-64 are not.
+    for rows in (1, 2, 4, 8, 16, 32, 64):
+        splits = cake_backend.num_splits(rows, 2, 2051, 148, "sm_100a")
+        assert not wide(rows, 2, splits, tiles, "split", 148, "sm_100a"), rows
+    assert cake_backend.num_splits(128, 2, 2051, 148, "sm_100a") == 1
+    assert wide(128, 2, 1, tiles, "split", 148, "sm_100a")
+    assert cake_jit.select_records(form="split", splits=1, arch="sm_100a", wide=True) == (
+        "decode_tcgen05",
+    )
     for bad in (
-        (0, 2, 1, tiles, "split", sm_count),
-        (1, 0, 1, tiles, "split", sm_count),
-        (1, 2, 0, tiles, "split", sm_count),
-        (1, 2, 1, 0, "split", sm_count),
-        (1, 2, 1, tiles, "split", 0),
-        (1, 2, 1, tiles, "other", sm_count),
+        (0, 2, 1, tiles, "split", sm_count, arch),
+        (1, 0, 1, tiles, "split", sm_count, arch),
+        (1, 2, 0, tiles, "split", sm_count, arch),
+        (1, 2, 1, 0, "split", sm_count, arch),
+        (1, 2, 1, tiles, "split", 0, arch),
+        (1, 2, 1, tiles, "other", sm_count, arch),
+        (1, 2, 1, tiles, "split", sm_count, "sm_120a"),
     ):
         with pytest.raises(ValueError):
             wide(*bad)
@@ -427,7 +484,7 @@ def test_cake_route_runs_the_package():
 
 
 def test_auto_route_is_the_cake_route():
-    """Without ``backend`` the public entry runs the package on SM80 through SM90: the result
+    """Without ``backend`` the public entry runs the package on an exported capability: the result
     is bitwise the explicit ``backend="cake"`` result."""
     device = _device_or_skip()
     operands = _operands(device)

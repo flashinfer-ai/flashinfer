@@ -15,11 +15,13 @@ limitations under the License.
 """
 
 # Experimental Cake backend: QSA sparse paged GQA decode over an NVFP4 KV
-# cache on SM80 through SM90 (the split-KV decode, its whole-tile build for
-# the wide grids of SM80, its cooperative build that merges the splits in the
-# same launch, and the separate split-KV merge with the sigmoid output gate).
-# The public entry point is ``flashinfer.sparse.qsa_sparse_paged_attention``:
-# its default ``backend="auto"`` selects this package on SM80 through SM90 and
+# cache on SM80, SM90, SM100 and SM103 (the mma.sync split-KV decode of SM80 /
+# SM90 with its whole-tile build for the wide grids of SM80 and its cooperative
+# build that merges the splits in the same launch, the tcgen05 decode of SM100 /
+# SM103 in the same two forms, and the separate split-KV merge with the sigmoid
+# output gate).  The public entry point is
+# ``flashinfer.sparse.qsa_sparse_paged_attention``: its default
+# ``backend="auto"`` selects this package on every exported capability and
 # ``backend="cake"`` selects it explicitly; the host plan, workspace, launch
 # sequence, registry and generated sources live here.  The host module is imported on first attribute access, so importing
 # the package loads neither torch nor the libraries.
