@@ -125,48 +125,6 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "20fd2cdfb3f25c137383598de1953018d78c94a7457388357bc64a9ce509057e",
-      "entry": "run",
-      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
-      "name": "cake_gdp_266d24496704b9063e28_sm_100a",
-      "nvcc_flags": [
-        "--use_fast_math"
-      ],
-      "nvcc_flags_if": [],
-      "path": "aot/cake_gdp_266d24496704b9063e28_sm_100a.so",
-      "sha256": {
-        "csrc/cake_gdp_266d24496704b9063e28_kernel.cu": "f68d05fea0f45b0f74d13723bc73cfa65f09fb69d7b739c4c9ee5af8974cdc8f",
-        "csrc/cake_gdp_266d24496704b9063e28_binding.cu": "db80faf99e70b818b10f5a61a84eaf6d5a53dbcfe83db4ed3469470475a80ea7"
-      },
-      "sources": [
-        "csrc/cake_gdp_266d24496704b9063e28_kernel.cu",
-        "csrc/cake_gdp_266d24496704b9063e28_binding.cu"
-      ]
-    },
-    {
-      "arch": "sm_103a",
-      "closure_sha256": "3eff3515a5865857dbd905f09436ef7d4eff414ae3ebf25110e9efd0fc3a8cda",
-      "entry": "run",
-      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
-      "min_cuda": "12.9",
-      "name": "cake_gdp_266d24496704b9063e28_sm_103a",
-      "nvcc_flags": [
-        "--use_fast_math"
-      ],
-      "nvcc_flags_if": [],
-      "path": "aot/cake_gdp_266d24496704b9063e28_sm_103a.so",
-      "sha256": {
-        "csrc/cake_gdp_266d24496704b9063e28_kernel.cu": "f68d05fea0f45b0f74d13723bc73cfa65f09fb69d7b739c4c9ee5af8974cdc8f",
-        "csrc/cake_gdp_266d24496704b9063e28_binding.cu": "db80faf99e70b818b10f5a61a84eaf6d5a53dbcfe83db4ed3469470475a80ea7"
-      },
-      "sources": [
-        "csrc/cake_gdp_266d24496704b9063e28_kernel.cu",
-        "csrc/cake_gdp_266d24496704b9063e28_binding.cu"
-      ]
-    },
-    {
-      "arch": "sm_100a",
       "closure_sha256": "954298c2cc271bed6ca6f929c9b67ad11d7fde3b51f5cd1fe73adde673cdf78f",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
@@ -440,7 +398,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "2ad6036e1f701a47a13558a421cb5cd4523065a5e5006f1bb19799751a835fe7",
+      "closure_sha256": "a247fd27f8b92932be4102cdd7e5c0edf03061e501b0c5dff749c036ea1b837b",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -451,8 +409,8 @@
       "nvcc_flags_if": [],
       "path": "aot/cake_gdp_4d40c98af90453032200_sm_100a.so",
       "sha256": {
-        "csrc/cake_gdp_4d40c98af90453032200_kernel.cu": "e0faf04e0220f070a9b2e0ccdbe0397cbe36ed26496d74810677eb4faaee6a12",
-        "csrc/cake_gdp_4d40c98af90453032200_binding.cu": "974269b41268e32053790d6ed0b23cea2e8ea9e5096109e0084ac2daa6d781b5"
+        "csrc/cake_gdp_4d40c98af90453032200_kernel.cu": "fe1ee6f5910662b9fd0f55563ad8dab02c5ca08606a72053ab82528b2ddd8808",
+        "csrc/cake_gdp_4d40c98af90453032200_binding.cu": "314c3622801ce3825a4205a5ca016739be518e769d36475be68c0067332ab92b"
       },
       "sources": [
         "csrc/cake_gdp_4d40c98af90453032200_kernel.cu",
@@ -461,7 +419,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "4ba23b738586f4ac9b322485c992fa9a3e4f793a4c59d7799b18846c9f9218bb",
+      "closure_sha256": "ffa9f01a756cadf9997322d75898f9cf1d7c335bae9e90e46c925c555df77b3e",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -472,8 +430,8 @@
       "nvcc_flags_if": [],
       "path": "aot/cake_gdp_4d40c98af90453032200_sm_103a.so",
       "sha256": {
-        "csrc/cake_gdp_4d40c98af90453032200_kernel.cu": "e0faf04e0220f070a9b2e0ccdbe0397cbe36ed26496d74810677eb4faaee6a12",
-        "csrc/cake_gdp_4d40c98af90453032200_binding.cu": "974269b41268e32053790d6ed0b23cea2e8ea9e5096109e0084ac2daa6d781b5"
+        "csrc/cake_gdp_4d40c98af90453032200_kernel.cu": "fe1ee6f5910662b9fd0f55563ad8dab02c5ca08606a72053ab82528b2ddd8808",
+        "csrc/cake_gdp_4d40c98af90453032200_binding.cu": "314c3622801ce3825a4205a5ca016739be518e769d36475be68c0067332ab92b"
       },
       "sources": [
         "csrc/cake_gdp_4d40c98af90453032200_kernel.cu",
