@@ -3190,6 +3190,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage(const __grid_constant__ CUtensorMa
                 DELTA[d_stage * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2)] = d_tmp[4];
                 DELTA[d_stage * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2) + 1] = d_tmp[5];
             }
+            __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(delta_ready_addr + (d_stage) * 8);
             }
@@ -3760,6 +3761,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage(const __grid_constant__ CUtensorMa
                     : "+f"(s_acc[60]), "+f"(s_acc[(60) + 1]), "+f"(s_acc[(60) + 2]), "+f"(s_acc[(60) + 3])
                     : "r"(q_frags[4]), "r"(q_frags[(4) + 1]), "r"(q_frags[(4) + 2]), "r"(q_frags[(4) + 3]), "r"(k_frag[6]), "r"(k_frag[(6) + 1]), "r"((uint32_t)(qsf[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(_KSF_stage_reg_48[1])), "h"((uint16_t)0), "h"((uint16_t)0));
                 asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+                __syncwarp();
                 if (elect_sync()) {
                     mbarrier_arrive(k_empty_addr + (kv_stage) * 8);
                 }
@@ -3806,6 +3808,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage(const __grid_constant__ CUtensorMa
                         DELTA[((d_stage + 1 < 2) ? d_stage + 1 : (unsigned int)0) * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2)] = d_tmp[4];
                         DELTA[((d_stage + 1 < 2) ? d_stage + 1 : (unsigned int)0) * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2) + 1] = d_tmp[5];
                     }
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(delta_ready_addr + (((d_stage + 1 < 2) ? d_stage + 1 : (unsigned int)0)) * 8);
                     }
@@ -4659,6 +4662,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage(const __grid_constant__ CUtensorMa
                     : "+f"(o_acc[60]), "+f"(o_acc[(60) + 1]), "+f"(o_acc[(60) + 2]), "+f"(o_acc[(60) + 3])
                     : "r"(p_frag[4]), "r"(p_frag[(4) + 1]), "r"(p_frag[(4) + 2]), "r"(p_frag[(4) + 3]), "r"(v_frag[6]), "r"(v_frag[(6) + 1]), "r"((uint32_t)(psf[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(_VSF_stage_reg_47[1])), "h"((uint16_t)0), "h"((uint16_t)0));
                 asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+                __syncwarp();
                 if (elect_sync()) {
                     mbarrier_arrive(v_empty_addr + (kv_stage) * 8);
                 }
@@ -5451,6 +5455,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage_ws12_v2(const __grid_constant__ CU
                         DELTA[d_stage * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2)] = d_tmp[4];
                         DELTA[d_stage * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2) + 1] = d_tmp[5];
                     }
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(delta_ready_addr + (d_stage) * 8);
                     }
@@ -6020,6 +6025,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage_ws12_v2(const __grid_constant__ CU
                         : "+f"(s_acc[60]), "+f"(s_acc[(60) + 1]), "+f"(s_acc[(60) + 2]), "+f"(s_acc[(60) + 3])
                         : "r"(q_frags[4]), "r"(q_frags[(4) + 1]), "r"(q_frags[(4) + 2]), "r"(q_frags[(4) + 3]), "r"(k_frag[6]), "r"(k_frag[(6) + 1]), "r"((uint32_t)(qsf[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(_KSF_stage_reg_17[1])), "h"((uint16_t)0), "h"((uint16_t)0));
                     asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(k_empty_addr + (kv_stage) * 8);
                     }
@@ -6066,6 +6072,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage_ws12_v2(const __grid_constant__ CU
                             DELTA[((d_stage + 1 < 2) ? d_stage + 1 : (unsigned int)0) * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2)] = d_tmp[4];
                             DELTA[((d_stage + 1 < 2) ? d_stage + 1 : (unsigned int)0) * 128 + (unsigned int)((2 * warp + 1) * 8) + (unsigned int)((lane & 3) * 2) + 1] = d_tmp[5];
                         }
+                        __syncwarp();
                         if (elect_sync()) {
                             mbarrier_arrive(delta_ready_addr + (((d_stage + 1 < 2) ? d_stage + 1 : (unsigned int)0)) * 8);
                         }
@@ -6557,6 +6564,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage_ws12_v2(const __grid_constant__ CU
                     PREC[(p_slot * 8 + (unsigned int)warp) * 512 + (unsigned int)lane + 384] = mv_out[0];
                     PREC[(p_slot * 8 + (unsigned int)warp) * 512 + (unsigned int)lane + 416] = __as_u32(l_state[0]);
                     PREC[(p_slot * 8 + (unsigned int)warp) * 512 + (unsigned int)lane + 448] = __as_u32(l_state[1]);
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(p_full_addr + (p_slot * 8 + (unsigned int)warp) * 8);
                     }
@@ -6812,6 +6820,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage_ws12_v2(const __grid_constant__ CU
                     sc0[1] = __uint_as_float(PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 512 + (unsigned int)lane + 352]);
                     lsum0[0] = __uint_as_float(PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 512 + (unsigned int)lane + 416]);
                     lsum0[1] = __uint_as_float(PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 512 + (unsigned int)lane + 448]);
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(p_empty_addr + (p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 8);
                     }
@@ -6936,6 +6945,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage_ws12_v2(const __grid_constant__ CU
                     sc1[1] = __uint_as_float(PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 512 + (unsigned int)lane + 352]);
                     lsum1[0] = __uint_as_float(PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 512 + (unsigned int)lane + 416]);
                     lsum1[1] = __uint_as_float(PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 512 + (unsigned int)lane + 448]);
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(p_empty_addr + (p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 8);
                     }
@@ -7589,6 +7599,7 @@ kernel_minimax_h3_sm120_varlen_attention_sage_ws12_v2(const __grid_constant__ CU
                     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                         : "+f"(o_acc1[60]), "+f"(o_acc1[(60) + 1]), "+f"(o_acc1[(60) + 2]), "+f"(o_acc1[(60) + 3])
                         : "r"(pf1[4]), "r"(pf1[(4) + 1]), "r"(pf1[(4) + 2]), "r"(pf1[(4) + 3]), "r"(v_frag[6]), "r"(v_frag[(6) + 1]), "r"((uint32_t)(psf1[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(_VSF_stage_reg_31[1])), "h"((uint16_t)0), "h"((uint16_t)0));
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(v_empty_addr + (kv_stage_1) * 8);
                     }
