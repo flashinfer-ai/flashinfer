@@ -15,8 +15,10 @@ limitations under the License.
 """
 
 """Cake SM90 VSA (``backend="cake"`` on Hopper): planning, numerics, lifetime, package contract,
-and the Sage FP8 route (E4M3 q/k/v with scales bound at plan time; the FP8 stages are twins of the
-BF16 stages on the same planner bytes, plus the two quantizer stages).
+the Sage FP8 route (E4M3 q/k/v with scales bound at plan time; the FP8 stages are twins of the
+BF16 stages on the same planner bytes, plus the two quantizer stages) and the grouped-query route
+(``num_qo_heads = g x num_kv_heads``, ``g`` in {2, 4, 8}: the GQA stages on the GQA planner's bytes,
+checked against the MHA route on replicated inputs -- bit for bit on the static programs).
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
@@ -566,8 +568,9 @@ def test_stage_table_builds_every_stage_from_the_shared_launcher():
     assert manifest["package"] == pkg.__name__ == "flashinfer.cake_vsa_sm90_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
-    # 4 + 15 BF16 stages, their 19 FP8 twins, 2 quantizers
-    assert len(loader.STAGES) == 40 and set(loader.STAGES) == set(loader.MODULES)
+    # 4 + 15 BF16 stages, their 19 FP8 twins, 2 quantizers, then the 19 + 19 GQA stages and
+    # the two round-2 FP8 GQA programs (attention_fp8_gqa_xs_queue, small_fp8_gqa_k4p2)
+    assert len(loader.STAGES) == 80 and set(loader.STAGES) == set(loader.MODULES)
     referenced = set()
     for stage in loader.STAGES:
         record = loader.stage_record(stage)
@@ -625,8 +628,10 @@ def test_stage_table_geometry_matches_the_stage_names():
     a cluster of the name's size, and only the split and split-cluster variants carry the FP32
     workspace buffers.  An FP8 stage (``route["dtype"] == "e4m3"``) is the twin of the BF16 stage of
     the same name with the three scale descriptors ``Qs`` / ``Ks`` / ``Vs`` and the ``k_scale_groups``
-    scalar added; the two quantizer stages carry the SM100 Sage package's argument plan and a
-    ``batch_heads_chunks`` grid rule the plan loader refuses (they are launched with an explicit grid)."""
+    scalar added; a GQA stage (``route["gqa"]``) is the twin of the MHA stage of the same name with
+    the small stages taking the ``g_shift`` scalar; the two quantizer stages carry the SM100 Sage
+    package's argument plan and a ``batch_heads_chunks`` grid rule the plan loader refuses (they are
+    launched with an explicit grid)."""
     scale_logical = {
         "Qs": "q_scale",
         "Ks": "k_scale",
@@ -658,6 +663,8 @@ def test_stage_table_geometry_matches_the_stage_names():
                 loader.launch_grid(stage, {"num_ctas": 1, "num_items": 1})
             continue
         fp8 = dtype == "e4m3"
+        gqa = loader.stage_gqa(stage)
+        assert route.get("gqa", False) is gqa and (("gqa" in route) is gqa)
         assert (("parameter", "k_scale_groups") in plan) is fp8
         for parameter, logical in scale_logical.items():
             assert (record["logical"].get(parameter) == logical) is fp8, (
@@ -667,18 +674,45 @@ def test_stage_table_geometry_matches_the_stage_names():
         scale_buffers = ["Qs", "Ks", "Vs"] if fp8 else []
         if route["kind"] == "persistent":
             base = "attention_fp8" if fp8 else "attention"
+            if gqa:
+                base += "_gqa"
             assert stage.startswith(base)
+            # the shared-transposer program is a queue program of the FP8 GQA family (round 2); it states xshare
+            xshare = stage == f"{base}_xs_queue"
             expected_route = {
                 "compact": stage == f"{base}_compact",
                 "kind": "persistent",
-                "queue": stage == f"{base}_queue",
+                "queue": stage == f"{base}_queue" or xshare,
                 "tagged": stage == f"{base}_tagged",
             }
             if fp8:
                 expected_route["dtype"] = "e4m3"
+            if gqa:
+                expected_route["gqa"] = True
+            if xshare:
+                assert fp8 and gqa
+                expected_route["xshare"] = True
             assert route == expected_route
             assert stage == loader.persistent_stage(
-                route["queue"], route["compact"], route["tagged"], fp8=fp8
+                route["queue"],
+                route["compact"],
+                route["tagged"],
+                fp8=fp8,
+                gqa=gqa,
+                xshare=route.get("xshare", False),
+            )
+            assert ("parameter", "g_shift") not in plan and "g_shift" not in record[
+                "logical"
+            ]
+            # O1 head-pair tiles add no shared memory: the GQA programs state the MHA twins' values
+            assert (
+                launch["dynamic_smem_bytes"]
+                == {
+                    (False, False): 232064,
+                    (False, True): 232192,
+                    (True, False): 185216,
+                    (True, True): 185344,
+                }[(fp8, route["queue"])]
             )
             assert (tuple(launch["block"]), tuple(launch["cluster"])) == (
                 (384, 1, 1),
@@ -709,10 +743,20 @@ def test_stage_table_geometry_matches_the_stage_names():
             ], stage
         else:
             assert route["kind"] == "small"
+            # the depth-2 k4 program states its prefetch depth (round 2); every other small stage states none
             assert stage == loader.small_stage(
-                route["kmax"], route["split"], route["cluster"], fp8=fp8
+                route["kmax"],
+                route["split"],
+                route["cluster"],
+                fp8=fp8,
+                gqa=gqa,
+                prefetch=route.get("prefetch"),
             )
+            assert ("prefetch" in route) is (stage == "small_fp8_gqa_k4p2")
             assert route.get("dtype") == ("e4m3" if fp8 else None)
+            # the small GQA stages take the group as the ``g_shift`` scalar (``kv_head = head >> g_shift``)
+            assert (("parameter", "g_shift") in plan) is gqa
+            assert (record["logical"].get("g_shift") == "g_shift") is gqa
             assert tuple(launch["cluster"]) == (route["cluster"] or 1, 1, 1)
             assert tuple(launch["block"]) == (128 if route["kmax"] == 1 else 256, 1, 1)
             assert record["grid_rule"] == {"count": "num_items", "kind": "plan_count"}
@@ -722,7 +766,7 @@ def test_stage_table_geometry_matches_the_stage_names():
                     assert (route["kmax"], route["cluster"]) in SPLIT_CLUSTER_VARIANTS
                     assert (
                         stage
-                        == f"small_{'fp8_' if fp8 else ''}k{route['kmax']}sc{route['cluster']}"
+                        == f"small_{'fp8_' if fp8 else ''}{'gqa_' if gqa else ''}k{route['kmax']}sc{route['cluster']}"
                     )
                 else:
                     assert route["kmax"] in SPLIT_KMAX_VARIANTS
@@ -799,15 +843,64 @@ def test_stage_table_geometry_matches_the_stage_names():
         stage.replace("small_", "small_fp8_") for stage in loader.SMALL_STAGES
     }
     assert loader.QUANTIZE_STAGES == ("quantize_qk_vamax", "quantize_v")
+    # The GQA stages: one per MHA attention stage of each data type, named by the same rule with ``gqa``.
+    assert set(loader.GQA_PERSISTENT_STAGES) == {
+        "attention_gqa",
+        "attention_gqa_queue",
+        "attention_gqa_compact",
+        "attention_gqa_tagged",
+    }
+    assert set(loader.GQA_SMALL_STAGES) == {
+        stage.replace("small_", "small_gqa_") for stage in loader.SMALL_STAGES
+    }
+    # ... plus the shared-transposer queue stage and the depth-2 grouped-query FP8 k4 stage,
+    # the two GQA stages without an MHA twin of their own keywords (round 2).
+    assert set(loader.FP8_GQA_PERSISTENT_STAGES) == {
+        "attention_fp8_gqa",
+        "attention_fp8_gqa_queue",
+        "attention_fp8_gqa_compact",
+        "attention_fp8_gqa_tagged",
+        "attention_fp8_gqa_xs_queue",
+    }
+    assert set(loader.FP8_GQA_SMALL_STAGES) == {
+        stage.replace("small_", "small_fp8_gqa_") for stage in loader.SMALL_STAGES
+    } | {"small_fp8_gqa_k4p2"}
     assert len(loader.PERSISTENT_STAGES) + len(loader.SMALL_STAGES) == 19
     assert len(loader.FP8_PERSISTENT_STAGES) + len(loader.FP8_SMALL_STAGES) == 19
+    assert len(loader.GQA_PERSISTENT_STAGES) + len(loader.GQA_SMALL_STAGES) == 19
+    assert (
+        len(loader.FP8_GQA_PERSISTENT_STAGES) + len(loader.FP8_GQA_SMALL_STAGES) == 21
+    )
     assert set(loader.STAGES) == (
         set(loader.PERSISTENT_STAGES)
         | set(loader.SMALL_STAGES)
         | set(loader.FP8_PERSISTENT_STAGES)
         | set(loader.FP8_SMALL_STAGES)
+        | set(loader.GQA_PERSISTENT_STAGES)
+        | set(loader.GQA_SMALL_STAGES)
+        | set(loader.FP8_GQA_PERSISTENT_STAGES)
+        | set(loader.FP8_GQA_SMALL_STAGES)
         | set(loader.QUANTIZE_STAGES)
     )
+    # registry order: the 40 MHA records and quantizers first, the GQA records appended after them
+    assert loader.STAGES[:40] == tuple(
+        loader.PERSISTENT_STAGES
+        + loader.SMALL_STAGES
+        + loader.FP8_PERSISTENT_STAGES
+        + loader.FP8_SMALL_STAGES
+        + loader.QUANTIZE_STAGES
+    )
+    # (the two round-2 programs appended after the 38 GQA records, in this order)
+    round2 = ("attention_fp8_gqa_xs_queue", "small_fp8_gqa_k4p2")
+    assert loader.STAGES[40:78] == tuple(
+        stage
+        for stage in loader.GQA_PERSISTENT_STAGES
+        + loader.GQA_SMALL_STAGES
+        + loader.FP8_GQA_PERSISTENT_STAGES
+        + loader.FP8_GQA_SMALL_STAGES
+        if stage not in round2
+    )
+    assert loader.STAGES[78:] == round2
     for bf16 in loader.PERSISTENT_STAGES + loader.SMALL_STAGES:
         fp8 = (
             bf16.replace("attention", "attention_fp8")
@@ -828,6 +921,93 @@ def test_stage_table_geometry_matches_the_stage_names():
             and a["launch"]["cluster"] == b["launch"]["cluster"]
         )
         assert a["library"] != b["library"], "an FP8 program is another program"
+    for mha in (
+        loader.PERSISTENT_STAGES
+        + loader.SMALL_STAGES
+        + loader.FP8_PERSISTENT_STAGES
+        + loader.FP8_SMALL_STAGES
+    ):
+        gqa = _gqa_stage_of(mha)
+        assert not loader.stage_gqa(mha) and loader.stage_gqa(gqa), (mha, gqa)
+        assert loader.stage_dtype(gqa) == loader.stage_dtype(mha)
+        a, b = loader.stage_record(mha), loader.stage_record(gqa)
+        assert b["route"] == {**a["route"], "gqa": True}
+        assert (
+            a["workspace_rule"] == b["workspace_rule"]
+            and a["grid_rule"] == b["grid_rule"]
+        )
+        assert (
+            a["launch"]["block"] == b["launch"]["block"]
+            and a["launch"]["cluster"] == b["launch"]["cluster"]
+        )
+        assert a["library"] != b["library"], "a GQA program is another program"
+        if a["route"]["kind"] == "small":
+            # the same kernel parameters plus the g_shift scalar
+            assert [
+                tuple(x) for x in b["arg_plan"] if tuple(x) != ("parameter", "g_shift")
+            ] == [tuple(x) for x in a["arg_plan"]]
+            assert {k: v for k, v in b["logical"].items() if k != "g_shift"} == a[
+                "logical"
+            ]
+            assert (
+                b["launch"]["dynamic_smem_bytes"] == a["launch"]["dynamic_smem_bytes"]
+            )
+        else:
+            assert b["arg_plan"] == a["arg_plan"] and b["logical"] == a["logical"]
+    assert "g_shift" in loader.LOGICAL_SCALARS
+    # The depth-2 grouped-query FP8 k4 stage: the ``small_fp8_gqa_k4`` record with ``prefetch`` in its route and
+    # its own program (the depth only changes when blocks 2 / 3 are loaded; same parameters, same footprint).
+    a, b = (
+        loader.stage_record("small_fp8_gqa_k4"),
+        loader.stage_record("small_fp8_gqa_k4p2"),
+    )
+    assert b["route"] == {**a["route"], "prefetch": 2} and loader.stage_gqa(
+        "small_fp8_gqa_k4p2"
+    )
+    assert loader.stage_dtype("small_fp8_gqa_k4p2") == "e4m3"
+    assert b["arg_plan"] == a["arg_plan"] and b["logical"] == a["logical"]
+    assert b["launch"] == a["launch"] and b["grid_rule"] == a["grid_rule"]
+    assert b["workspace_rule"] is None and b["library"] != a["library"]
+    assert loader.STAGES[-1] == "small_fp8_gqa_k4p2"
+    assert loader.small_stage(4, fp8=True, gqa=True, prefetch=2) == "small_fp8_gqa_k4p2"
+    assert loader.small_stage(4, fp8=True, gqa=True) == "small_fp8_gqa_k4"
+    with pytest.raises(ValueError, match="unknown Cake SM90 VSA stage"):
+        loader.small_stage(4, fp8=True, prefetch=2)  # no MHA stage at depth 2
+    with pytest.raises(ValueError, match="unknown Cake SM90 VSA stage"):
+        loader.small_stage(4, gqa=True, prefetch=2)  # no BF16 stage at depth 2
+    # The shared-transposer queue stage: the ``attention_fp8_gqa_queue`` record with ``xshare`` in
+    # its route and its own program (the V^T transposition is dealt to three producer warps; same
+    # parameters, same footprint).
+    a, b = (
+        loader.stage_record("attention_fp8_gqa_queue"),
+        loader.stage_record("attention_fp8_gqa_xs_queue"),
+    )
+    assert b["route"] == {**a["route"], "xshare": True} and loader.stage_gqa(
+        "attention_fp8_gqa_xs_queue"
+    )
+    assert loader.stage_dtype("attention_fp8_gqa_xs_queue") == "e4m3"
+    assert b["arg_plan"] == a["arg_plan"] and b["logical"] == a["logical"]
+    assert b["launch"] == a["launch"] and b["grid_rule"] == a["grid_rule"]
+    assert b["workspace_rule"] == a["workspace_rule"] and b["library"] != a["library"]
+    assert (
+        loader.persistent_stage(True, fp8=True, gqa=True, xshare=True)
+        == "attention_fp8_gqa_xs_queue"
+    )
+    assert (
+        loader.persistent_stage(True, fp8=True, gqa=True) == "attention_fp8_gqa_queue"
+    )
+
+
+def _gqa_stage_of(stage):
+    """The GQA stage serving the route of MHA stage ``stage`` (``attention`` -> ``attention_gqa``,
+    ``small_fp8_k4s`` -> ``small_fp8_gqa_k4s``)."""
+    if stage.startswith("attention_fp8"):
+        return stage.replace("attention_fp8", "attention_fp8_gqa", 1)
+    if stage.startswith("attention"):
+        return stage.replace("attention", "attention_gqa", 1)
+    if stage.startswith("small_fp8_"):
+        return stage.replace("small_fp8_", "small_fp8_gqa_", 1)
+    return stage.replace("small_", "small_gqa_", 1)
 
 
 def test_build_manifest_pins_the_numerics_flags():
@@ -851,7 +1031,7 @@ def test_build_manifest_pins_the_numerics_flags():
     assert not any(
         flag.startswith(numerics) for flag in manifest["common"]["nvcc_flags"]
     )
-    assert len(manifest["libraries"]) == 40
+    assert len(manifest["libraries"]) == 80
     for entry in manifest["libraries"]:
         assert entry["nvcc_flags"] == ["--use_fast_math"], entry["name"]
         assert entry["nvcc_flags_if"] == [], entry["name"]
@@ -1190,6 +1370,310 @@ def test_plan_rejects_unsupported_masks():
         plan_vsa_sm90(torch.ones((1, 1, 65), dtype=torch.bool), sms=132)
     with pytest.raises(ValueError, match="boolean"):
         plan_vsa_sm90(torch.ones((1, 1, 2), dtype=torch.int32), sms=132)
+
+
+# --------------------------------------------------------------------------- GQA plans (CPU)
+
+GQA_GROUPS = planner.GQA_GROUPS
+MODE_HEAD_PAIR = planner.MODE_HEAD_PAIR
+MODE_HEAD_PAIR_SPLIT = planner.MODE_HEAD_PAIR_SPLIT
+HDR_WORDS = planner.HDR_WORDS
+
+
+def _replicated(tensor, g, dim=0):
+    """The kv-head tensor replicated per group: what the MHA route sees on a GQA problem."""
+    return tensor.repeat_interleave(g, dim=dim)
+
+
+def _gqa_tile_count(g, h_kv, mb, mode, repaired=False):
+    """Tiles of a GQA persistent plan: ``h_kv * mb * g / 2`` head-pair tiles (pair mode) or re-paired split tiles
+    (split mode under ``repair_split``), ``h_kv * mb * g`` per-head split tiles (split mode, mode-1 replay)."""
+    return h_kv * mb * (g // 2 if (mode == "pair" or repaired) else g)
+
+
+def _chains_of_mha_plan(plan):
+    """``(head, qb)`` -> what the MHA plan does for that query block: ``("chain", positions, has_second)`` of
+    the warpgroup that serves it in a pair / lone tile (own-list order), ``("split", positions, owns)`` for a
+    split tile (both warpgroups, the tile verbatim)."""
+    chains = {}
+    for head, qb0, qb1, mode, positions, owns in _decode_tiles(plan):
+        if mode == 1:
+            chains[(head, qb0)] = ("split", positions, owns)
+            continue
+        blocks = [qb0, qb1] if mode == 0 else [qb0]
+        for block, entries in zip(blocks, owns[: len(blocks)], strict=True):
+            chain = [positions[e >> 3] for e in entries]
+            has2 = [(e >> 2) & 1 for e in entries]
+            chains[(head, block)] = ("chain", chain, has2)
+    return chains
+
+
+@pytest.mark.parametrize("g", [2, 4, 8])
+@pytest.mark.parametrize(
+    "h_kv,mb,nb,capacity,ragged",
+    [
+        (1, 1, 1, 1, False),  # MQA, one tile
+        (2, 3, 5, 2, True),  # tails, odd block counts
+        (3, 7, 64, 64, False),  # full 64-block lists: MAX_OWN chains
+        (2, 33, 64, 64, True),  # odd query-block count: the lone block of a pair plan
+        (4, 16, 8, 4, True),
+        (2, 129, 16, 8, True),
+        (
+            2,
+            528,
+            64,
+            8,
+            False,
+        ),  # 2112 x g / 2 ... tiles per data type: the queue layout
+    ],
+)
+def test_gqa_plan_replays_the_mha_plan_of_the_replicated_mask(
+    g, h_kv, mb, nb, capacity, ragged
+):
+    """A GQA plan is the MHA plan of the mask replicated per group, replayed: a pair-mode plan as head-pair
+    tiles (mode 3; warpgroup ``w`` computes query head ``head + w`` at ``qb0``; both own lists hold every
+    position with use bits 3 in the order of the MHA warpgroup's own list for that block), a split-mode plan
+    as per-head mode-1 tiles (the MHA tile verbatim) -- or, when the planner of record re-pairs it
+    (``repair_split`` "auto": a uniform plan whose mode-1 tiles need more than one wave), as re-paired tiles
+    (mode 4; warpgroup ``w`` computes query head ``head + w`` over the MHA split tile's WHOLE position list).
+    Plan word 2 (the MHA ``qb1`` slot) and header halfword 2 carry the kv head; the mode is the replicated
+    plan's; ``H`` is the query head count."""
+    mask = _random_mask(h_kv, mb, nb, capacity, seed=h_kv * 100 + mb, ragged=ragged)
+    gqa = plan_vsa_sm90(mask, sms=132, gqa=g)
+    mha = plan_vsa_sm90(_replicated(mask, g), sms=132)
+    assert (gqa["gqa"], gqa["H_kv"], gqa["H"]) == (g, h_kv, g * h_kv)
+    assert gqa["mode"] == mha["mode"] and (gqa["MB"], gqa["NB"]) == (mb, nb)
+    repaired = bool(gqa["repair_split"])
+    assert repaired == (gqa["mode"] == "split" and not ragged and g * h_kv * mb > 132)
+    assert (gqa["repair_rule"], mha["repair_split"]) == ("auto", False)
+    # one head-pair tile per (kv head, query block, head pair) in pair mode -- a lone block of the MHA
+    # plan is a chain like any other, so the count is not the replicated plan's g x (pairs + lone) --
+    # one tile per (query head, query block) in split mode, one per (head pair, query block) re-paired
+    assert gqa["num_tiles"] == _gqa_tile_count(g, h_kv, mb, gqa["mode"], repaired)
+    assert gqa["meta"].shape[1] == META_WORDS and gqa["hdr"].shape == mha["hdr"].shape
+    chains = _chains_of_mha_plan(mha)
+    seen = {}
+    for head, qb0, word2, mode, positions, owns in _decode_tiles(gqa):
+        assert word2 == head // g, "plan word 2 is the kv head"
+        if gqa["mode"] == "pair":
+            assert mode == MODE_HEAD_PAIR and head % 2 == 0
+            assert owns[0] == owns[1] and all(e & 3 == 3 for e in owns[0])
+            assert [e >> 3 for e in owns[0]] == list(range(len(positions)))
+            assert 0 < len(positions) <= MAX_OWN
+            for w in range(2):
+                kind, chain, has2 = chains[(head + w, qb0)]
+                assert kind == "chain", (head + w, qb0)
+                assert positions == chain, (head + w, qb0)
+                assert [(e >> 2) & 1 for e in owns[0]] == has2
+                seen[(head + w, qb0)] = seen.get((head + w, qb0), 0) + 1
+        elif repaired:
+            assert mode == MODE_HEAD_PAIR_SPLIT and head % 2 == 0
+            assert owns[0] == owns[1] and all(e & 3 == 3 for e in owns[0])
+            assert [e >> 3 for e in owns[0]] == list(range(len(positions)))
+            assert [(e >> 2) & 1 for e in owns[0]] == [
+                int(b >= 0) for _, b in positions
+            ]
+            kind, mha_positions, _mha_owns = chains[(head, qb0)]
+            assert kind == "split" and positions == mha_positions, (head, qb0)
+            for w in range(2):
+                seen[(head + w, qb0)] = seen.get((head + w, qb0), 0) + 1
+        else:
+            assert mode == 1
+            kind, mha_positions, mha_owns = chains[(head, qb0)]
+            assert kind == "split" and positions == mha_positions and owns == mha_owns
+            seen[(head, qb0)] = seen.get((head, qb0), 0) + 1
+    assert seen == {(head, qb): 1 for head in range(g * h_kv) for qb in range(mb)}
+    # the by-value header of every CTA: [head, qb0, kv head, mode, ...] of its first tile
+    hdr = gqa["hdr"].tolist()
+    meta = gqa["meta"]
+    for c in range(gqa["num_ctas"]):
+        first = meta[c * gqa["tile_stride"]].tolist()
+        assert hdr[c * HDR_WORDS : c * HDR_WORDS + 4] == first[:4], c
+        assert hdr[c * HDR_WORDS + 2] == first[0] // g, c
+    assert 1 <= gqa["num_ctas"] <= min(gqa["num_tiles"], 132)
+
+
+@pytest.mark.parametrize("rule", [False, True, "auto"], ids=["off", "on", "auto"])
+def test_gqa_split_plans_re_pair_uniform_multi_wave_plans_by_default(rule):
+    """``GQA_REPAIR_SPLIT = "auto"``: a uniform split-mode GQA plan whose mode-1 tiles need more than one wave of
+    the SMs (``H x MB > sms``) is re-paired by default -- byte for byte the ``repair_split=True`` plan, mode-4
+    tiles only, half the tiles, each tile's position list the MHA split tile's whole list -- while
+    ``repair_split=False`` keeps the mode-1 replay.  One-wave uniform plans, ragged plans and pair plans are not
+    re-paired under "auto" (their plan equals the ``False`` plan byte for byte); other values are rejected."""
+    assert planner.GQA_REPAIR_SPLIT == "auto"
+    multi = _random_mask(
+        2, 32, 32, 8, seed=11, ragged=False
+    )  # h8-m2048-n2048-k8 at g = 4: 256 mode-1 tiles
+    one_wave = _random_mask(
+        2, 16, 16, 12, seed=12, ragged=False
+    )  # h8-m1024-n1024-k12 at g = 4: 128 tiles
+    ragged = _random_mask(2, 32, 32, 8, seed=13, ragged=True)
+    for mask, expect_auto in ((multi, True), (one_wave, False), (ragged, False)):
+        plan = plan_vsa_sm90(mask, sms=132, gqa=4, mode="split", repair_split=rule)
+        off = plan_vsa_sm90(mask, sms=132, gqa=4, mode="split", repair_split=False)
+        expect = rule is True or (rule == "auto" and expect_auto)
+        assert (plan["repair_split"], plan["repair_rule"], plan["mode"]) == (
+            expect,
+            rule,
+            "split",
+        )
+        assert plan["num_tiles"] == _gqa_tile_count(
+            4, 2, mask.shape[1], "split", expect
+        )
+        modes = {mode for _, _, _, mode, _, _ in _decode_tiles(plan)}
+        assert modes == ({MODE_HEAD_PAIR_SPLIT} if expect else {planner.MODE_SPLIT})
+        if rule == "auto":
+            default = plan_vsa_sm90(mask, sms=132, gqa=4, mode="split")
+            assert torch.equal(default["meta"], plan["meta"]) and torch.equal(
+                default["hdr"], plan["hdr"]
+            )
+            assert default["repair_split"] == expect
+        if not expect:
+            assert torch.equal(plan["meta"], off["meta"]) and torch.equal(
+                plan["hdr"], off["hdr"]
+            )
+        else:
+            forced = plan_vsa_sm90(
+                mask, sms=132, gqa=4, mode="split", repair_split=True
+            )
+            assert torch.equal(plan["meta"], forced["meta"]) and torch.equal(
+                plan["hdr"], forced["hdr"]
+            )
+            assert not torch.equal(plan["meta"], off["meta"])
+    pair = plan_vsa_sm90(
+        _random_mask(2, 160, 16, 12, seed=14), sms=132, gqa=4, repair_split=rule
+    )
+    assert (
+        pair["mode"] == "pair"
+        and not pair["repair_split"]
+        and pair["repair_rule"] == rule
+    )
+    mha = plan_vsa_sm90(_replicated(multi, 4), sms=132, mode="split", repair_split=rule)
+    assert not mha["repair_split"] and mha["num_tiles"] == 8 * 32
+    with pytest.raises(ValueError, match="repair_split"):
+        plan_vsa_sm90(multi, sms=132, gqa=4, repair_split="always")
+
+
+@pytest.mark.parametrize("g", [2, 4, 8])
+def test_gqa_small_plan_is_the_replicated_masks_rows_plus_g_shift(g):
+    """``plan_small(mask_kv, gqa=g)`` is byte for byte ``plan_small(mask_rep)`` (one row per query head and
+    query block, the kernel's ``tile = head * MB + qb`` decode) plus the ``g_shift`` scalar; ``small_route``
+    applies the MHA thresholds to the replicated mask."""
+    for h_kv, mb, nb, capacity, kwargs in (
+        (1, 4, 8, 3, {"kmax": 3}),
+        (2, 4, 8, 4, {"kmax": 4}),
+        (1, 4, 64, 6, {"kmax": 6, "split": True}),
+        (1, 4, 16, 8, {"kmax": 4, "cluster": 2}),
+        (1, 2, 64, 18, {"kmax": 6, "split": True, "cluster": 3}),
+    ):
+        mask = _random_mask(h_kv, mb, nb, capacity, seed=mb + nb, ragged=True)
+        gqa = plan_small(mask, gqa=g, **kwargs)
+        mha = plan_small(_replicated(mask, g), **kwargs)
+        assert (
+            torch.equal(gqa["plan"], mha["plan"]) and gqa["plan"].dtype == torch.int16
+        )
+        assert (gqa["gqa"], gqa["g_shift"], gqa["H_kv"], gqa["H"]) == (
+            g,
+            g.bit_length() - 1,
+            h_kv,
+            g * h_kv,
+        )
+        for key in ("num_tiles", "num_items", "kmax", "split", "cluster", "MB", "NB"):
+            assert gqa[key] == mha[key], key
+        assert (mha["gqa"], mha["g_shift"], mha["H_kv"]) == (1, 0, g * h_kv)
+    for h_kv, mb, nb, capacity in (
+        (1, 4, 8, 3),
+        (2, 16, 16, 4),
+        (4, 17, 16, 4),  # 68 x g tiles: over one wave for g >= 2
+        (8, 4, 4, 1),
+        (2, 32, 32, 8),  # 8 blocks > KMAX 6
+        (1, 8, 64, 6),
+    ):
+        mask = _random_mask(h_kv, mb, nb, capacity, seed=7, ragged=False)
+        assert small_route(mask, sms=132, cluster_capacity=CAP, gqa=g) == small_route(
+            _replicated(mask, g), sms=132, cluster_capacity=CAP
+        )
+
+
+def test_gqa_small_k4_prefetch_rule(monkeypatch):
+    """``small_prefetch``: 2 for the unsplit, non-cluster FP8 grouped-query kmax-4 plan of at least
+    ``K4_PREFETCH2_MIN_GRID_GQA`` CTAs while the switch is on (the stage ``small_fp8_gqa_k4p2``), None
+    below it, at switch 0, on the BF16 route, on the MHA route (g = 1) and on every other small
+    configuration."""
+    grids = (1, 32, 64, 127, 128, 132, 256, 1750)
+    on = planner.K4_PREFETCH2_MIN_GRID_GQA
+    assert [
+        planner.small_prefetch(4, False, 0, num_items=n, fp8=True, gqa=4) for n in grids
+    ] == [2 if on and n >= on else None for n in grids]
+    monkeypatch.setattr(planner, "K4_PREFETCH2_MIN_GRID_GQA", 128)
+    for g in (2, 4, 8):
+        assert [
+            planner.small_prefetch(4, False, 0, num_items=n, fp8=True, gqa=g)
+            for n in grids
+        ] == [None, None, None, None, 2, 2, 2, 2]
+        assert all(
+            planner.small_prefetch(4, False, 0, num_items=n, fp8=False, gqa=g) is None
+            for n in grids
+        )
+    assert all(
+        planner.small_prefetch(4, False, 0, num_items=n, fp8=True, gqa=1) is None
+        for n in grids
+    )
+    for kmax, split, cluster in (
+        (1, False, 0),
+        (3, False, 0),
+        (6, False, 0),
+        (4, True, 0),
+        (6, True, 0),
+        (4, False, 2),
+        (4, False, 4),
+        (6, True, 4),
+    ):
+        assert all(
+            planner.small_prefetch(kmax, split, cluster, num_items=n, fp8=True, gqa=4)
+            is None
+            for n in grids
+        ), (kmax, split, cluster)
+    monkeypatch.setattr(planner, "K4_PREFETCH2_MIN_GRID_GQA", 0)
+    assert all(
+        planner.small_prefetch(4, False, 0, num_items=n, fp8=True, gqa=4) is None
+        for n in grids
+    )
+    for g in (0, 3, 5):
+        with pytest.raises(ValueError, match=r"g in \(2, 4, 8\)"):
+            planner.small_prefetch(4, False, 0, num_items=128, fp8=True, gqa=g)
+
+
+def test_gqa_group_is_validated_and_g_1_is_the_mha_planner():
+    """``gqa`` must be 1 (the MHA plan, bit for bit) or 2 / 4 / 8; every planner entry refuses other values
+    with the backend's message."""
+    assert GQA_GROUPS == (1, 2, 4, 8)
+    for g in GQA_GROUPS:
+        assert planner.gqa_group(g) == g
+    mask = _random_mask(2, 4, 8, 3, seed=1)
+    for g in (0, 3, 5, 6, 16, -4):
+        for call in (
+            lambda g=g: planner.gqa_group(g),
+            lambda g=g: plan_vsa_sm90(mask, sms=132, gqa=g),
+            lambda g=g: plan_small(mask, kmax=3, gqa=g),
+            lambda g=g: small_route(mask, sms=132, cluster_capacity=CAP, gqa=g),
+        ):
+            with pytest.raises(ValueError, match=r"g in \(2, 4, 8\)"):
+                call()
+    one = plan_vsa_sm90(mask, sms=132, gqa=1)
+    base = plan_vsa_sm90(mask, sms=132)
+    assert torch.equal(one["meta"], base["meta"]) and torch.equal(
+        one["hdr"], base["hdr"]
+    )
+    assert (one["gqa"], one["H_kv"], one["H"]) == (1, 2, 2)
+    assert torch.equal(
+        plan_small(mask, kmax=3, gqa=1)["plan"], plan_small(mask, kmax=3)["plan"]
+    )
+    # an empty query block of a kv head is refused like the MHA plan's
+    empty = mask.clone()
+    empty[1, 2] = False
+    with pytest.raises(ValueError, match="empty"):
+        plan_vsa_sm90(empty, sms=132, gqa=4)
 
 
 def _cta_tiles(plan):
@@ -2026,21 +2510,22 @@ def test_plan_odd_block_of_a_pair_plan_runs_alone_on_warpgroup_0():
 # --------------------------------------------------------------------------- Sage FP8 (E4M3) route
 #
 # The FP8 stages consume E4M3 q/k/v with per-token / per-16-token / per-channel FP32 scales bound at plan
-# time on exactly the BF16 planner's bytes.  Two references (contract §2): (b) the exact FP32 softmax of
+# time on exactly the BF16 planner's bytes.  Two references: (b) the exact FP32 softmax of
 # the dequantized inputs (``_fp8_reference_exact``, atol = rtol = 5e-2) and (a) a replay of the kernel's
 # own precision boundary on the plan's schedule (``_fp8_reference_replay``, atol = rtol = 1e-2): per
 # warpgroup chain the lazy-max rule (a running maximum that only grows by more than ``FP8_MAX_GROWTH_LOG2``
-# triggers a rescale), ``P = exp2(s - m + FP8_P_QUANT_LOG2)`` rounded to E4M3 before the P.V product,
-# FP32 row sums of the unrounded P, chains folded with flash-decoding weights in the kernel's fixed order,
+# triggers a rescale), ``P = exp2(fma(s, qk_sc, FP8_P_QUANT_LOG2 - m))`` formed as the kernels form it (one
+# rounding of the argument, the device ``ex2.approx`` exponent; ``_fp8_sage_p``) rounded to E4M3 before the
+# P.V product, FP32 row sums of the unrounded P, chains folded with flash-decoding weights in the kernel's
+# fixed order,
 # ``acc * v_scale / l`` last, rounded to BF16.  The scores of every step and the P.V product of every
 # position are accumulated through the sm_90a FP8 WGMMA's own arithmetic (``_fp8_wgmma_scores`` /
 # ``_fp8_wgmma_pv``: 13 fractional bits below the step's largest term, truncation toward zero, a
-# 14-significant-bit step result; the P.V chain carries the FP32 O accumulator through the alignment set),
-# the same model as the kernel-tests reference ``fp8_wgmma_scores`` / ``fp8_wgmma_pv``, bitwise.  The
-# epilogue (the kernel's ``rcp.approx`` normalisation, the ``v_scale`` multiplies and the BF16 pack) is not
-# modelled: the kernel and this replay differ by one BF16 ulp on about 1e-4 of the elements, far inside the
-# 1e-2 gate.  The two constants mirror the kernel modules' ``P_QUANT_LOG2`` / ``MAX_GROWTH_LOG2`` (the SM100
-# Sage values; pinned against ``vsa_sm90_fp8.py`` at M7).
+# 14-significant-bit step result; the P.V chain carries the FP32 O accumulator through the alignment set).
+# The epilogue (the kernel's ``rcp.approx`` normalisation, the ``v_scale`` multiplies and the BF16 pack) is
+# not modelled: the kernel and this replay differ by one BF16 ulp on about 1e-4 of the elements, far inside
+# the 1e-2 gate.  The two constants are the kernels' ``P_QUANT_LOG2`` / ``MAX_GROWTH_LOG2`` (the Sage FP8
+# values the SM100 kernels use as well).
 
 FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -2058,9 +2543,9 @@ SCORE_ACCUMULATE_MODES = ("fp8_wgmma", "fp32")
 # The P.V accumulate of reference (a): the same model on the carried O accumulator (the default) or
 # ``acc + P.V`` in float32 (the opt-out).
 PV_ACCUMULATE_MODES = ("fp8_wgmma", "fp32")
-# The scale variants of the kernel-tests plan (its ``scale_variants``): one key per head, in the middle of the
-# sequence, two octaves above the rest (the growth branch mid-chain while the other keys' P stay representable),
-# and per-channel V magnitudes over three decades below unit scale.
+# The scale variants: one key per head, in the middle of the sequence, two octaves above the rest (the growth
+# branch mid-chain while the other keys' P stay representable), and per-channel V magnitudes over three
+# decades below unit scale.
 SPIKE_LOG2 = 2.0
 V_DYNAMIC_LOG10 = (-3.0, 0.0)
 
@@ -2092,7 +2577,7 @@ def _fp8_wgmma_accumulate(acc, a, b, *, floor_log2):
     """``acc (+) a b^T`` (``acc`` ``[M, N]`` float32, ``a`` ``[M, K]``, ``b`` ``[N, K]`` exact E4M3 values in
     float32, K a multiple of 32) as the sm_90a FP8 WGMMA accumulates it, one ``m64nNk32`` e4m3 instruction per
     k32 step in K order, the result of each step the incoming accumulator of the next; modelled in float32
-    exactly (the kernel-tests reference's ``_fp8_wgmma_accumulate``).  Per output element and per k32 step:
+    exactly.  Per output element and per k32 step:
     the 32 products are exact and anchored at ``ea + eb`` of the two E4M3 encodings (``floor(log2 |x|)`` for a
     normal, -6 for a subnormal; zero products take no part); the step exponent ``E`` is the largest anchor or
     the incoming accumulator's true exponent (a zero accumulator takes no part); every product and the
@@ -2127,7 +2612,7 @@ def _fp8_wgmma_scores(q, k):
     """``S = q k^T`` (``q`` ``[M, K]``, ``k`` ``[N, K]``, exact E4M3 values in float32, K a multiple of 32) as
     the sm_90a FP8 WGMMA accumulates it from a zero accumulator (the kernels issue K = 128 as four ``m64nNk32``
     e4m3 WGMMAs, scale-d 0 on the first); every term is a multiple of the product unit ``2^-18``, where the
-    granularity is floored.  The same model as the kernel-tests reference ``fp8_wgmma_scores``."""
+    granularity is floored."""
     acc = torch.zeros((q.shape[0], k.shape[0]), dtype=torch.float32, device=q.device)
     return _fp8_wgmma_accumulate(acc, q, k, floor_log2=-2 * E4M3_UNIT_LOG2)
 
@@ -2138,15 +2623,16 @@ def _fp8_wgmma_pv(acc, p, v):
     multiple of 32): the k32 steps in key order with the carried accumulator in every step's alignment set, no
     granularity floor.  A k32 step without a product (the persistent kernel's zero P half of a single-block
     position) leaves an accumulator of at most 14 significant bits unchanged, so the empty steps are not
-    replayed.  The same model as the kernel-tests reference ``fp8_wgmma_pv``."""
+    replayed."""
     return _fp8_wgmma_accumulate(acc, p, v.transpose(0, 1), floor_log2=-126)
 
 
 def _torch_sage_quantize_hnd(q, k, v):
     """Torch Sage recipe on HND tensors (the SM100 recipe with ``batch := H`` and one head): E4M3 q/k/v and the
-    FP32 scales in the plan's shapes ``(1, H, Sq)``, ``(1, H, ceil(Sk / 16))``, ``(H, 128)``."""
-    h, sq, dim = q.shape
-    sk = k.shape[1]
+    FP32 scales in the plan's shapes ``(1, H, Sq)``, ``(1, H_kv, ceil(Sk / 16))``, ``(H_kv, 128)`` (``k`` / ``v``
+    carry the kv heads of a GQA problem; every tensor is quantized per its own head)."""
+    _h, sq, dim = q.shape
+    h, sk = k.shape[0], k.shape[1]
     q32, k32, v32 = (t.float() for t in (q, k, v))
     q_scale = q32.abs().amax(dim=-1).clamp_min(1e-12) / FP8_MAX
     q8 = (q32 / q_scale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX).to(FP8)
@@ -2178,8 +2664,9 @@ def _fp8_inputs(
     vscale_mode="unit",
     quantize=None,
 ):
-    """BF16 inputs of ``_inputs`` under the scale variants of the kernel-tests plan (DESIGN §E.1), quantized
-    with ``quantize`` (the torch recipe by default; the package quantizer for the kernel-vs-kernel checks)."""
+    """BF16 inputs of ``_inputs`` under the scale variants (peaked query rows, one key spike per head,
+    per-channel V magnitudes), quantized with ``quantize`` (the torch recipe by default; the package quantizer
+    for the kernel-vs-kernel checks)."""
     q, k, v = (t.clone() for t in _inputs(h, mb, nb, seed))
     if qscale_mode == "x3":  # peaked softmax: three times larger query rows
         q.mul_(3.0)
@@ -2211,6 +2698,42 @@ def _fp8_reference_exact(q8, k8, v8, scales, mask, scale):
     return _reference(*_dequantize(q8, k8, v8, *scales), mask, scale)
 
 
+def _fp8_fma_rn(s, c, b):
+    """``fma(s, c, b)`` of float32 tensors rounded once to float32, exactly, through float64: the product is
+    exact in float64 (two 24-bit significands), the float64 sum ``hi`` carries its exact error ``lo`` (two-sum),
+    and ``hi`` rounds to float32 as the exact sum does unless ``hi`` is exactly a float32 midpoint, where the
+    sign of ``lo`` picks the side (ties to even only when ``lo == 0``)."""
+    p = s.double() * c.double()
+    bd = b.double()
+    hi = p + bd
+    bv = hi - p
+    lo = (p - (hi - bv)) + (bd - bv)
+    f = hi.float()
+    back = f.double()
+    toward = torch.where(
+        hi > back, torch.full_like(f, float("inf")), torch.full_like(f, float("-inf"))
+    )
+    other = torch.nextafter(f, toward)
+    midpoint = (back != hi) & (hi == (back + other.double()) / 2)
+    beyond = midpoint & (lo != 0) & (torch.sign(lo) == torch.sign(hi - back))
+    return torch.where(beyond, other, f)
+
+
+def _fp8_sage_p(scores, qk_scale, m):
+    """P x 2^FP8_P_QUANT_LOG2 of a step as the kernels form it: the argument ``fma(s, qk_sc, 8 - m)`` rounded
+    once (PTX ``fma.rn.ftz.f32``; :func:`_fp8_fma_rn`) and its exponent by the device ``ex2.approx.ftz.f32``
+    (``MUFU.EX2``), which ``torch.exp2`` of a CUDA float32 tensor reproduces bit for bit over the kernels'
+    argument range (measured: 0 of 1.1e6 replayed arguments and 0 of 4.2e6 sweep points in [-30, 8.81]
+    differ), its subnormal results flushed to zero as the instruction flushes them.  Three separate roundings
+    of ``s qk_sc - m + 8`` move the argument by a few float32 ulps and P by up to about ten ulps, which
+    crosses an E4M3 rounding boundary on a few elements per million."""
+    bias = (FP8_P_QUANT_LOG2 - m)[:, None]
+    s, c, b = torch.broadcast_tensors(scores.float(), qk_scale.float(), bias.float())
+    x = _fp8_fma_rn(s, c, b)
+    p = torch.exp2(x)
+    return torch.where(x < -126.0, torch.zeros_like(p), p)
+
+
 def _fp8_chain(
     qf_head,
     q_log2,
@@ -2228,7 +2751,7 @@ def _fp8_chain(
     scores of a step are accumulated: ``"fp8_wgmma"`` (the default, :func:`_fp8_wgmma_scores`) or ``"fp32"``
     (a float32 matmul, the opt-out); ``pv_accumulate`` how a step's P.V joins the chain's O accumulator:
     ``"fp8_wgmma"`` (the default, :func:`_fp8_wgmma_pv` after the rescale) or ``"fp32"`` (``acc + P.V`` in
-    float32, the opt-out).  The same arithmetic, step by step, as the kernel-tests reference's chain."""
+    float32, the opt-out)."""
     if score_accumulate not in SCORE_ACCUMULATE_MODES:
         raise ValueError(
             f"score_accumulate must be one of {SCORE_ACCUMULATE_MODES}, got {score_accumulate!r}"
@@ -2261,7 +2784,7 @@ def _fp8_chain(
             grow & ~first, torch.exp2(m - new_max), torch.ones_like(m)
         )
         m = torch.where(grow, new_max, m)
-        p = torch.exp2(s_log2 - m[:, None] + FP8_P_QUANT_LOG2)
+        p = _fp8_sage_p(scores, qk_scale, m)
         p8 = p.to(FP8).float()
         if pv_accumulate == "fp8_wgmma":
             acc = _fp8_wgmma_pv(acc * rescale[:, None], p8, vf_head[tok])
@@ -2340,14 +2863,18 @@ def _fp8_reference_replay(
         tag = TAG if plan_dict["tagged"] else 0
         for head, qb0, qb1, mode, positions, owns in _decode_tiles(plan_dict):
             for wg, entries in enumerate(owns):
-                qb = qb0 if (mode or wg == 0) else qb1
+                if mode in (MODE_HEAD_PAIR, MODE_HEAD_PAIR_SPLIT):
+                    # a grouped-query plan's head-pair / re-paired tile: warpgroup w serves head + w at qb0
+                    key = (head + wg, qb0)
+                else:
+                    key = (head, qb0 if (mode or wg == 0) else qb1)
                 steps = []
                 for entry in entries:
                     a, b = positions[entry >> 3]
                     steps.append([a & ~tag] if b < 0 else [a & ~tag, b & ~tag])
                 if not steps:
                     continue
-                folded.setdefault((head, qb), []).append(chain(head, qb, steps))
+                folded.setdefault(key, []).append(chain(*key, steps))
     else:
         kmax = plan_dict["kmax"]
         split_cluster = bool(plan_dict["split"] and plan_dict["cluster"])
@@ -2390,10 +2917,16 @@ def _fp8_reference_replay(
     return out
 
 
-def _fp8_plan_dict(plan, mask):
-    """The planner dict of the route the plan object took (same planner, same bytes)."""
+def _fp8_plan_dict(plan, mask, mask_kv=None):
+    """The planner dict of the route the plan object took (same planner, same bytes).  ``mask_kv`` (the
+    kv-head mask of a grouped-query plan) selects the GQA planner's own tiles -- head-pair and re-paired
+    tiles included -- instead of the MHA plan of the replicated ``mask``."""
     if plan.small_kmax is None:
         sms = torch.cuda.get_device_properties(plan.device).multi_processor_count
+        if mask_kv is not None and plan.gqa > 1:
+            return "persistent", plan_vsa_sm90(
+                mask_kv.cpu(), sms=sms, gqa=plan.gqa, split_tile_order="group"
+            )
         return "persistent", plan_vsa_sm90(mask.cpu(), sms=sms)
     return "small", plan_small(
         mask.cpu(),
@@ -2414,9 +2947,12 @@ def _fp8_check(
     scale,
     score_accumulate="fp8_wgmma",
     pv_accumulate="fp8_wgmma",
+    mask_kv=None,
 ):
-    """Both references of contract §2 on one output: (a) at 1e-2, (b) at 5e-2, no element outside."""
-    kind, plan_dict = _fp8_plan_dict(plan, mask)
+    """Both references on one output: (a) the plan-faithful replay at atol = rtol = 1e-2, (b) the exact softmax
+    of the dequantized inputs at atol = rtol = 5e-2, no element outside.  ``mask_kv``: replay the grouped-query
+    plan's own tiles (see :func:`_fp8_plan_dict`)."""
+    kind, plan_dict = _fp8_plan_dict(plan, mask, mask_kv)
     replay = _fp8_reference_replay(
         plan_dict,
         kind,
@@ -2455,24 +2991,70 @@ def _fp8_plan_for(mask, scales, scale=None, route=None):
     )
 
 
-def _cuda_kernel_names(fn) -> list[str]:
-    """CUDA kernel names of one call of ``fn`` (memcpy / memset activities excluded); the profiler's warm-up
-    step runs one call whose records are discarded."""
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-    ) as profile:
+def _profiled_kernel_names(fn, scheduled: bool) -> list[str]:
+    """CUDA kernel names of one call of ``fn`` from a ``torch.profiler`` session (memcpy / memset activities
+    excluded); the scheduled form runs one warm-up call whose records are discarded."""
+    kwargs = {"activities": [torch.profiler.ProfilerActivity.CUDA]}
+    if scheduled:
+        kwargs["schedule"] = torch.profiler.schedule(
+            wait=0, warmup=1, active=1, repeat=1
+        )
+    with torch.profiler.profile(**kwargs) as profile:
         fn()
         torch.cuda.synchronize()
-        profile.step()
-        fn()
-        torch.cuda.synchronize()
+        if scheduled:
+            profile.step()
+            fn()
+            torch.cuda.synchronize()
     return [
         event.name
         for event in profile.events()
         if event.device_type == torch.autograd.DeviceType.CUDA
         and not event.name.startswith(("Memcpy", "Memset"))
     ]
+
+
+def _graph_kernel_names(fn) -> list[str]:
+    """Kernel names of one call of ``fn`` read from a CUDA graph capture of it through cuda-python (memset /
+    memcpy nodes excluded): a CUPTI-free route for a process whose profiler no longer records device activity."""
+    from cuda.bindings import driver
+
+    def check(result):
+        err, *rest = result
+        assert err == driver.CUresult.CUDA_SUCCESS, err
+        return rest[0] if len(rest) == 1 else rest
+
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        fn()
+    torch.cuda.synchronize()
+    handle = driver.CUgraph(graph.raw_cuda_graph())
+    _, count = check(driver.cuGraphGetNodes(handle, 0))
+    nodes, count = check(driver.cuGraphGetNodes(handle, count))
+    names = []
+    for node in nodes[:count]:
+        kind = check(driver.cuGraphNodeGetType(node))
+        if kind != driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            continue
+        params = check(driver.cuGraphKernelNodeGetParams(node))
+        func = params.func
+        if int(func) == 0 and int(params.kern) != 0:
+            func = check(driver.cuKernelGetFunction(params.kern))
+        names.append(check(driver.cuFuncGetName(func)).decode())
+    return names
+
+
+def _cuda_kernel_names(fn) -> list[str]:
+    """CUDA kernel names of one call of ``fn``, read from a CUDA graph capture of it (every kernel node, in launch
+    order; memset / memcpy nodes excluded).  The capture route does not depend on CUPTI: in a long test process
+    Kineto drops device records whose GPU timestamps fall outside the profiler's capture window, so a
+    ``torch.profiler`` session can come back empty or partial.  The profiler route is kept only for a torch
+    without ``CUDAGraph.raw_cuda_graph``."""
+    if hasattr(torch.cuda.CUDAGraph, "raw_cuda_graph"):
+        return _graph_kernel_names(fn)
+    return _profiled_kernel_names(fn, scheduled=True)
 
 
 @requires_hopper
@@ -2586,7 +3168,7 @@ def test_fp8_cluster_routes_against_persistent(
 @requires_hopper
 @pytest.mark.parametrize("variant", ["x3", "spike", "dynamic", "zero_scale"])
 def test_fp8_scale_variants(variant):
-    """The scale variants of the kernel-tests plan on a ragged pair plan: peaked softmax (Q rows x3), one key
+    """The scale variants on a ragged pair plan: peaked softmax (Q rows x3), one key
     per head two octaves above the rest (the growth branch of the lazy maximum mid-chain), per-channel V
     magnitudes over three decades (the ``v_scale`` path), and ``sm_scale = 0`` (uniform softmax)."""
     h, mb, nb = 4, 16, 16
@@ -2607,8 +3189,8 @@ def test_fp8_scale_variants(variant):
 
 @requires_hopper
 def test_fp8_empty_rows_raise_the_bf16_error():
-    """An empty query block is refused with the same ValueError text as the BF16 plan (ruling R1), on the
-    automatic route and on the forced persistent route (``plan_vsa_sm90``'s message)."""
+    """An empty query block is refused with the same ValueError text as the BF16 plan, on the automatic
+    route and on the forced persistent route (``plan_vsa_sm90``'s message)."""
     mask = _random_mask(2, 4, 8, 3, seed=3, ragged=True, device="cuda")
     mask[1, 2] = False
     q8, k8, v8, *scales = _fp8_inputs(2, 4, 8)
@@ -2760,11 +3342,18 @@ def test_fp8_queue_kernel_matches_the_static_kernel_bit_exact(monkeypatch):
             r"k_scale must have shape \(1, 2, 32\) and dtype float32, got \(1, 2, 32\) bfloat16",
         ),
         ("q_strided", r"q_scale must be contiguous on the planned device"),
-        ("gqa", r"equal, positive query/KV head counts"),
+        # GQA: the K scale is per kv head (a query-head-shaped one is refused by its shape) and the head ratio
+        # must be in {2, 4, 8}
+        (
+            "gqa_k_scale_at_query_heads",
+            r"k_scale must have shape \(1, 1, 32\) and dtype float32, got \(1, 2, 32\) float32",
+        ),
+        ("gqa_ratio_3", r"g in \(2, 4, 8\)"),
     ],
 )
 def test_fp8_plan_rejects_invalid_scales(mutation, match):
-    """The plan object's own validation of the Sage FP8 inputs (exact messages the wrapper forwards)."""
+    """The plan object's own validation of the Sage FP8 inputs (exact messages the wrapper forwards); a GQA
+    request is validated against the kv-head-shaped mask and scales."""
     h, mb, nb = 2, 4, 8  # Sq 256, Sk 512 -> 32 groups
     mask = _random_mask(h, mb, nb, 3, seed=3, ragged=True, device="cuda")
     rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
@@ -2777,6 +3366,7 @@ def test_fp8_plan_rejects_invalid_scales(mutation, match):
         "v_scale": v_scale,
     }
     kv_h = h
+    valid = (mask, rows, cols)
     if mutation == "missing_k":
         del kwargs["k_scale"]
     elif mutation == "missing_all":
@@ -2795,10 +3385,19 @@ def test_fp8_plan_rejects_invalid_scales(mutation, match):
         kwargs["k_scale"] = k_scale.bfloat16()
     elif mutation == "q_strided":
         kwargs["q_scale"] = torch.ones((1, 2, 512), device="cuda")[..., ::2]
-    else:
+    elif mutation == "gqa_k_scale_at_query_heads":
+        # two query heads over one kv head: the mask and the K / V scales are per kv head
+        mask, rows, cols = mask[:1], rows[:1], cols[:1]
         kv_h = 1
+        kwargs["v_scale"] = v_scale[:1]
+    else:
+        # six query heads over two kv heads
+        kwargs["q_scale"] = torch.ones((1, 6, 256), device="cuda")
+        h = 6
     with pytest.raises(ValueError, match=match):
         CakeVsaSm90Plan("cuda", mask, rows, cols, h, kv_h, 128, **kwargs)
+    h = 2
+    mask, rows, cols = valid
     # the valid request plans
     plan = CakeVsaSm90Plan(
         "cuda",
@@ -2831,8 +3430,8 @@ def test_fp8_plan_rejects_invalid_scales(mutation, match):
     "shape", [(1, 256, 256), (4, 1000, 1500), (3, 65, 4000), (8, 4096, 4096)]
 )
 def test_sage_fp8_quantize_sm90_matches_torch(shape, record_property):
-    """The package quantizer against the torch Sage recipe on HND tensors: the SM100 criterion (ruling R2;
-    scales within 1e-5 relative -- the kernel multiplies by ``1/448`` where torch divides -- and values within
+    """The package quantizer against the torch Sage recipe on HND tensors: the SM100 quantizer's criterion
+    (scales within 1e-5 relative -- the kernel multiplies by ``1/448`` where torch divides -- and values within
     one E4M3 step with zero violations), the exact output shapes ``plan()`` takes, exactly two kernels behind
     one fill, and the bitwise mismatch counts reported (bitwise identity is not required: the kernel floors
     ``amax`` at 1e-6 and uses the reciprocal)."""
@@ -2887,8 +3486,13 @@ def test_sage_fp8_quantize_sm90_rejects_other_layouts():
         ValueError, match=r"v must have shape \(2, 96, 128\) and dtype bfloat16"
     ):
         pkg.sage_fp8_quantize_sm90(q, k, k.float())
-    with pytest.raises(ValueError, match="k must have shape"):
-        pkg.sage_fp8_quantize_sm90(q, k[:1], k[:1])
+    # k / v with the kv heads of a GQA problem are accepted (g in {2, 4, 8}); other head counts are refused
+    with pytest.raises(ValueError, match=r"v must have shape \(2, 96, 128\)"):
+        pkg.sage_fp8_quantize_sm90(q, k, k[:1])
+    with pytest.raises(ValueError, match=r"g in \(2, 4, 8\)"):
+        pkg.sage_fp8_quantize_sm90(torch.cat([q, q[:1]]), k[:1], k[:1])
+    with pytest.raises(ValueError, match="multiple of H_kv"):
+        pkg.sage_fp8_quantize_sm90(torch.cat([q, q[:1]]), k, k)
     with pytest.raises(ValueError, match="q must be contiguous"):
         pkg.sage_fp8_quantize_sm90(q.transpose(0, 1).contiguous().transpose(0, 1), k, k)
 
@@ -2902,3 +3506,861 @@ def test_fp8_kernel_quantizer_feeds_the_fp8_route():
     q8, k8, v8, *scales = _fp8_inputs(h, mb, nb, quantize=pkg.sage_fp8_quantize_sm90)
     plan = _fp8_plan_for(mask, scales)
     _fp8_check(plan, plan.run(q8, k8, v8), q8, k8, v8, scales, mask, 128**-0.5)
+
+
+# --------------------------------------------------------------------------- GQA route (H100; the GQA stages)
+
+
+def _gqa_inputs(h, h_kv, mb, nb, seed=7):
+    """BF16 ``q`` over the ``h`` query heads and ``k`` / ``v`` over the ``h_kv`` kv heads: ``q`` is ``_inputs``'
+    at ``h`` heads, ``k`` / ``v`` are ``_inputs``' at ``h_kv`` heads (the draw an ``h_kv``-head MHA problem
+    gets, so the MHA route on ``k.repeat_interleave(g, 0)`` is the replicated-input baseline)."""
+    q = _inputs(h, mb, nb, seed)[0]
+    _, k, v = _inputs(h_kv, mb, nb, seed)
+    return q, k, v
+
+
+def _descriptors_of(mask):
+    h, mb, nb = mask.shape
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device=mask.device)
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device=mask.device)
+    return rows, cols
+
+
+def _hot_and_private_mask(h, mb, hot, private):
+    """Every query block of a head selects the head's first ``hot`` blocks (read by every tile of the head)
+    and ``private`` blocks of its own (read by one tile only): ``nb = hot + mb x private`` blocks, ``hot +
+    private`` per row.  At g = 2 the pair plan's K / V^T footprint exceeds the L2 budget while the re-read
+    (hot) blocks fit it, so the planner tags the single-reader blocks and takes the tagged program."""
+    nb = hot + mb * private
+    mask = torch.zeros((h, mb, nb), dtype=torch.bool)
+    mask[:, :, :hot] = True
+    for qb in range(mb):
+        mask[:, qb, hot + qb * private : hot + (qb + 1) * private] = True
+    return mask
+
+
+def _static_route(plan):
+    """Whether the plan's program is one whose GQA output must equal the MHA route's bit for bit on
+    replicated inputs: every persistent program (static tile lists; split-mode tiles stay MHA-shaped unless
+    the planner re-paired them; the queue program equals the static one) and the unsplit small programs.  The
+    split / cluster small programs merge partials and are held to the route gate (their error against the
+    reference may not exceed the MHA route's); their bitwise mismatch count is recorded.  A re-paired
+    persistent plan (``repair_split``: one chain over the whole KV list per query head instead of the fold of
+    two parity chains) is held to the route's absolute gates only; its ratios to the MHA route are recorded."""
+    if plan.small_kmax is None:
+        return not plan.repair_split
+    return not (plan.small_split or plan.small_cluster)
+
+
+def _error_stats(out, reference):
+    """RMS and max-abs error of a BF16 output against the FP32 reference."""
+    err = out.float() - reference
+    return float(err.square().mean().sqrt()), float(err.abs().max())
+
+
+def _check_gqa_against_mha(
+    gqa_plan, gqa_out, mha_out, reference, record_property, label
+):
+    """The GQA output against the MHA route's on replicated inputs.  Recorded for every route: the bitwise
+    mismatch count and both outputs' RMS / max-abs error against the FP32 reference.  Asserted: the route
+    gate -- the GQA program's error may not exceed the MHA route's (RMS within 1.05x, max-abs within
+    max(1.10x, 1e-3)) -- and, on the static programs, bitwise identity.  A re-paired persistent plan
+    (``repair_split``, the planner of record's "auto" on uniform multi-wave split plans) is exempt from both:
+    its ratios are recorded and the caller's absolute gates (the references at their tolerances) decide."""
+    mismatch = int((gqa_out.view(torch.int16) != mha_out.view(torch.int16)).sum())
+    rms_gqa, max_gqa = _error_stats(gqa_out, reference)
+    rms_mha, max_mha = _error_stats(mha_out, reference)
+    repaired = bool(getattr(gqa_plan, "repair_split", False))
+    record_property(f"gqa_repair_split_{label}", repaired)
+    record_property(f"gqa_vs_mha_bitwise_mismatch_{label}", mismatch)
+    record_property(f"gqa_rms_{label}", f"{rms_gqa:.4e}")
+    record_property(f"mha_rms_{label}", f"{rms_mha:.4e}")
+    record_property(
+        f"gqa_vs_mha_rms_ratio_{label}",
+        f"{rms_gqa / rms_mha:.4f}" if rms_mha > 0 else "n/a",
+    )
+    record_property(f"gqa_max_abs_{label}", f"{max_gqa:.4e}")
+    record_property(f"mha_max_abs_{label}", f"{max_mha:.4e}")
+    if repaired:
+        record_property(
+            f"gqa_vs_mha_max_abs_ratio_{label}",
+            f"{max_gqa / max_mha:.4f}" if max_mha > 0 else "n/a",
+        )
+        return
+    assert rms_gqa <= 1.05 * rms_mha, (
+        f"{label}: RMS error {rms_gqa:.4e} exceeds 1.05 x the MHA route's {rms_mha:.4e}"
+    )
+    assert max_gqa <= max(1.10 * max_mha, 1e-3), (
+        f"{label}: max-abs error {max_gqa:.4e} exceeds max(1.10 x the MHA route's "
+        f"{max_mha:.4e}, 1e-3)"
+    )
+    if _static_route(gqa_plan):
+        assert mismatch == 0, (
+            f"{label}: {mismatch} output elements differ from the MHA route on replicated inputs"
+        )
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "g,h_kv,mb,nb,capacity,ragged,scale,route",
+    [
+        (2, 3, 4, 8, 3, True, None, None),  # small_gqa_k3, odd kv-head count
+        (4, 2, 4, 8, 3, True, -0.125, "small"),
+        (
+            8,
+            1,
+            4,
+            4,
+            1,
+            False,
+            None,
+            "small",
+        ),  # MQA, one block per query block (small_gqa_k1)
+        (8, 1, 8, 64, 6, True, None, "smallsplit"),  # MQA split-KV
+        (4, 1, 16, 16, 16, False, 0.5, "smallcluster"),  # the h1-m1024-k16 row at g = 4
+        (4, 1, 16, 64, 18, False, None, "smallsplitcluster"),  # small_gqa_k6sc3
+        (4, 2, 160, 16, 12, True, None, "persistent"),  # pair plan: head-pair tiles
+        (
+            2,
+            2,
+            33,
+            64,
+            64,
+            True,
+            None,
+            "persistent",
+        ),  # full lists, odd query-block count (lone block)
+        (8, 1, 8, 64, 64, False, 0.0, "persistent"),  # MQA, 32 query blocks: split mode
+        (4, 4, 64, 64, 32, False, None, None),  # auto: uniform persistent plan
+        # a uniform multi-wave split plan (256 mode-1 tiles > 132 SMs): re-paired (mode 4) by the planner of
+        # record's ``repair_split`` "auto"; held to the absolute gates, the ratios to the MHA route recorded
+        (4, 2, 32, 32, 8, False, None, "persistent"),
+    ],
+)
+def test_gqa_routes_match_the_mha_route_on_replicated_inputs(
+    g, h_kv, mb, nb, capacity, ragged, scale, route, record_property
+):
+    """``num_qo_heads = g x num_kv_heads`` plans the GQA stage of the route the MHA plan of the replicated
+    mask takes, on the kv-head-shaped mask and ``k`` / ``v``; its output equals the MHA route's on replicated
+    inputs (bit for bit on the static programs), matches the FP32 reference, is written completely into a
+    NaN-prefilled buffer and is bit-identical across three launches."""
+    h = g * h_kv
+    mask = _random_mask(
+        h_kv, mb, nb, capacity, seed=h_kv * 1000 + mb, ragged=ragged, device="cuda"
+    )
+    mask_rep = _replicated(mask, g)
+    q, k, v = _gqa_inputs(h, h_kv, mb, nb)
+    k_rep, v_rep = _replicated(k, g), _replicated(v, g)
+    gqa = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, sm_scale=scale, route=route
+    )
+    mha = CakeVsaSm90Plan(
+        "cuda",
+        mask_rep,
+        *_descriptors_of(mask_rep),
+        h,
+        h,
+        128,
+        sm_scale=scale,
+        route=route,
+    )
+    assert (gqa.gqa, gqa.g_shift, gqa.num_qo_heads, gqa.num_kv_heads) == (
+        g,
+        g.bit_length() - 1,
+        h,
+        h_kv,
+    )
+    assert (mha.gqa, mha.g_shift, mha.num_kv_heads) == (1, 0, h)
+    assert gqa.stage == _gqa_stage_of(mha.stage) and loader.stage_gqa(gqa.stage)
+    assert gqa.mode == mha.mode and gqa.num_heads == mha.num_heads == h
+    assert not mha.repair_split
+    record_property(f"repair_split_g{g}", gqa.repair_split)
+    if gqa.small_kmax is None:
+        assert gqa.repair_split == (gqa.mode == "split" and not ragged and h * mb > 132)
+        assert gqa.num_tiles == _gqa_tile_count(g, h_kv, mb, gqa.mode, gqa.repair_split)
+        # header halfword 2 and plan word 2 carry the kv head
+        assert int(gqa.hdr[2]) == int(gqa.hdr[0]) // g
+        assert int(gqa.meta[0, 2]) == int(gqa.meta[0, 0]) // g
+    else:
+        assert torch.equal(gqa.plan_param, mha.plan_param)
+        assert (gqa.num_tiles, gqa.num_items) == (mha.num_tiles, mha.num_items)
+        assert gqa._bound["g_shift"] == gqa.g_shift
+        assert "g_shift" not in mha._bound
+    out = torch.full(
+        (h * mb * 64, 1, 128), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    first = gqa.run(q, k, v, out=out).clone()
+    assert first.shape == q.shape and bool(torch.isfinite(first).all()), (
+        "an output row was never written or holds NaN"
+    )
+    for _ in range(2):
+        later = gqa.run(q, k, v)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(later, first, atol=0, rtol=0)
+    if gqa.small_split:
+        assert int(gqa.counters.abs().sum()) == 0
+    expected = mha.run(q, k_rep, v_rep)
+    reference = _reference(
+        q, k_rep, v_rep, mask_rep, 128**-0.5 if scale is None else scale
+    )
+    _check_gqa_against_mha(
+        gqa, first, expected, reference, record_property, f"g{g}_{gqa.stage}"
+    )
+    torch.testing.assert_close(first.float(), reference, atol=1e-2, rtol=1e-2)
+    assert float((first.float() - reference).abs().max()) <= 0.03
+    # k / v are checked against the kv heads, q and out against the query heads
+    with pytest.raises(
+        ValueError, match=rf"k must have shape \({h_kv}, {nb * 64}, 128\)"
+    ):
+        gqa.run(q, k_rep, v)
+    with pytest.raises(ValueError, match=rf"q must have shape \({h}, {mb * 64}, 128\)"):
+        gqa.run(q[:h_kv], k, v)
+
+
+@requires_hopper
+def test_gqa_queue_kernel_matches_the_static_kernel_bit_exact(
+    monkeypatch, record_property
+):
+    """The GQA queue program only moves head-pair tiles between CTAs: bit-identical to the compact and the
+    plain static GQA programs on the same plan, which are bit-identical to the static MHA program on
+    replicated inputs; the queue words return to zero after every launch and a captured graph replays it."""
+    g, h_kv, mb, nb = (
+        4,
+        2,
+        528,
+        64,
+    )  # 2112 tiles per data type: >= POOL_MIN_TILES per CTA on 132 SMs
+    h = g * h_kv
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    mask = _topk_mask(h_kv, mb, nb, 8).cuda()
+    mask_rep = _replicated(mask, g)
+    q, k, v = _gqa_inputs(h, h_kv, mb, nb)
+    queued = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route="persistent"
+    )
+    if not queued.queue:
+        pytest.skip(f"{sms} SMs: fewer than {POOL_MIN_TILES} tiles per CTA")
+    assert queued.stage == "attention_gqa_queue"
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    first = queued.run(q, k, v, out=out).clone()
+    torch.cuda.synchronize()
+    assert int(queued.dbg[62:64].abs().sum()) == 0
+    # without the queue the planner picks the compact static program for these short head-pair
+    # chains (<= 4 ring positions, >= 4 tiles per CTA); the plain static program is forced next
+    monkeypatch.setattr(planner, "POOL_MIN_TILES", 10**9)
+    compact = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route="persistent"
+    )
+    assert not compact.queue and compact.stage == "attention_gqa_compact"
+    assert compact.num_ctas == queued.num_ctas
+    torch.testing.assert_close(compact.run(q, k, v), first, atol=0, rtol=0)
+    monkeypatch.setattr(planner, "COMPACT_MIN_TILES", 10**9)
+    static = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route="persistent"
+    )
+    assert not static.queue and static.stage == "attention_gqa"
+    assert static.num_ctas == queued.num_ctas
+    torch.testing.assert_close(static.run(q, k, v), first, atol=0, rtol=0)
+    mha = CakeVsaSm90Plan(
+        "cuda", mask_rep, *_descriptors_of(mask_rep), h, h, 128, route="persistent"
+    )
+    assert not mha.queue and mha.stage == "attention"
+    mha_out = mha.run(q, _replicated(k, g), _replicated(v, g))
+    reference = _reference(q, _replicated(k, g), _replicated(v, g), mask_rep, 128**-0.5)
+    _check_gqa_against_mha(
+        static, first, mha_out, reference, record_property, "queue_vs_static_mha"
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        queued.run(q, k, v, out=out)
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.view_as(q), first, atol=0, rtol=0)
+        assert int(queued.dbg[62:64].abs().sum()) == 0
+    torch.testing.assert_close(first.float(), reference, atol=1e-2, rtol=1e-2)
+
+
+@requires_hopper
+def test_gqa_tagged_kernel_matches_the_untagged_and_mha_programs(
+    monkeypatch, record_property
+):
+    """A g = 2 pair plan whose K / V^T footprint exceeds the L2 budget while its re-read blocks fit it (16 hot
+    blocks per kv head, 16 private blocks per query block): the planner tags the single-reader blocks, keyed by
+    kv head, and launches the tagged GQA program.  Tags only steer L2 residency: the output is bit-identical
+    to the untagged static GQA program on the same plan and to the MHA route on replicated inputs, and matches
+    the FP32 reference."""
+    g, h_kv, mb, hot, private = 2, 8, 16, 16, 16
+    h = g * h_kv
+    mask = _hot_and_private_mask(h_kv, mb, hot, private).cuda()
+    nb = mask.shape[2]
+    mask_rep = _replicated(mask, g)
+    q, k, v = _gqa_inputs(h, h_kv, mb, nb)
+    k_rep, v_rep = _replicated(k, g), _replicated(v, g)
+    tagged = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route="persistent"
+    )
+    assert tagged.mode == "pair" and not tagged.queue and not tagged.compact
+    assert tagged.tagged and tagged.stage == "attention_gqa_tagged"
+    symbol = loader.MODULES["attention_gqa_tagged"]["kernel_symbol"]
+    scratch = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    names = _cuda_kernel_names(lambda: tagged.run(q, k, v, out=scratch))
+    assert [name for name in names if name.startswith("kernel_")] == [symbol], names
+    record_property("gqa_tagged_stage", tagged.stage)
+    record_property("gqa_tagged_kernel", symbol)
+    first = tagged.run(q, k, v).clone()
+    mha = CakeVsaSm90Plan(
+        "cuda", mask_rep, *_descriptors_of(mask_rep), h, h, 128, route="persistent"
+    )
+    assert mha.stage in ("attention", "attention_tagged")  # a static MHA program
+    record_property("mha_stage_on_replicated_inputs", mha.stage)
+    reference = _reference(q, k_rep, v_rep, mask_rep, 128**-0.5)
+    _check_gqa_against_mha(
+        tagged,
+        first,
+        mha.run(q, k_rep, v_rep),
+        reference,
+        record_property,
+        f"g{g}_{tagged.stage}",
+    )
+    monkeypatch.setattr(planner, "KV_TAG_SINGLE_READER", False)
+    plain = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route="persistent"
+    )
+    assert not plain.tagged and plain.stage == "attention_gqa"
+    assert (plain.num_ctas, plain.num_tiles) == (tagged.num_ctas, tagged.num_tiles)
+    torch.testing.assert_close(plain.run(q, k, v), first, atol=0, rtol=0)
+    torch.testing.assert_close(first.float(), reference, atol=1e-2, rtol=1e-2)
+    assert float((first.float() - reference).abs().max()) <= 0.03
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "route", ["small", "smallsplit", "smallcluster", "smallsplitcluster", "persistent"]
+)
+def test_gqa_plan_stream_and_graph_lifetime(route):
+    """A GQA plan (MQA, g = 4) built on another stream is captured and replayed bit-exactly into a
+    NaN-prefilled output, its split counters return to zero, and a captured plan refuses re-planning."""
+    g, h_kv = 4, 1
+    h = g * h_kv
+    mb, nb = 16, 64 if "split" in route else 16
+    capacity = {
+        "small": 4,
+        "persistent": 16,
+        "smallsplit": 16,
+        "smallcluster": 16,
+        "smallsplitcluster": 24,
+    }[route]
+    mask = _random_mask(h_kv, mb, nb, capacity, seed=17, ragged=False, device="cuda")
+    q, k, v = _gqa_inputs(h, h_kv, mb, nb)
+    producer = torch.cuda.Stream()
+    with torch.cuda.stream(producer):
+        plan = CakeVsaSm90Plan(
+            "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route=route
+        )
+    assert loader.stage_gqa(plan.stage) and plan.gqa == g
+    assert (plan.mode == route) if route != "persistent" else plan.small_kmax is None
+    expected = plan.run(q, k, v).clone()
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    plan.run(q, k, v, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(q, k, v, out=out)
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.view_as(expected), expected, atol=0, rtol=0)
+        if plan.small_split:
+            assert int(plan.counters.abs().sum()) == 0
+    with pytest.raises(RuntimeError, match="captured"):
+        plan.check_replan()
+    reference = _reference(
+        q, _replicated(k, g), _replicated(v, g), _replicated(mask, g), 128**-0.5
+    )
+    torch.testing.assert_close(expected.float(), reference, atol=1e-2, rtol=1e-2)
+
+
+@requires_hopper
+def test_gqa_plan_validates_head_counts_descriptors_and_run_shapes():
+    """The plan object: ``g`` in {2, 4, 8} (other multiples and non-multiples refused by name), the mask and
+    the descriptors per kv head, an empty query block refused with the MHA message, and ``run`` checking
+    ``q`` / ``out`` by the query heads and ``k`` / ``v`` by the kv heads."""
+    mask = _random_mask(2, 4, 8, 3, seed=5, ragged=True, device="cuda")
+    rows, cols = _descriptors_of(mask)
+    for h, kv_h, match in (
+        (6, 2, r"g in \(2, 4, 8\)"),
+        (10, 2, r"g in \(2, 4, 8\)"),
+        (12, 2, r"g in \(2, 4, 8\)"),
+        (32, 2, r"g in \(2, 4, 8\)"),
+        (5, 2, r"num_qo_heads \(5\) must be a multiple of num_kv_heads \(2\)"),
+        (0, 2, "positive"),
+        (4, 0, "positive"),
+        (8, 4, r"block_mask_map.shape\[0\] \(2\) must equal num_kv_heads \(4\)"),
+        (2, 1, r"block_mask_map.shape\[0\] \(2\) must equal num_kv_heads \(1\)"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            CakeVsaSm90Plan("cuda", mask, rows, cols, h, kv_h, 128)
+    with pytest.raises(ValueError, match=r"block_row_sz must have shape \(2, 4\)"):
+        CakeVsaSm90Plan("cuda", mask, _replicated(rows, 4), cols, 8, 2, 128)
+    with pytest.raises(ValueError, match=r"block_col_sz must have shape \(2, 8\)"):
+        CakeVsaSm90Plan("cuda", mask, rows, _replicated(cols, 4), 8, 2, 128)
+    empty = mask.clone()
+    empty[1, 2] = False
+    messages = {}
+    for h in (2, 8):
+        with pytest.raises(
+            ValueError, match="empty sparse rows|at least one KV block"
+        ) as info:
+            CakeVsaSm90Plan("cuda", empty, rows, cols, h, 2, 128)
+        messages[h] = str(info.value)
+    assert messages[2] == messages[8]
+    plan = CakeVsaSm90Plan("cuda", mask, rows, cols, 8, 2, 128)
+    assert plan.gqa == 4 and loader.stage_gqa(plan.stage)
+    q, k, v = _gqa_inputs(8, 2, 4, 8)
+    with pytest.raises(ValueError, match=r"q must have shape \(8, 256, 128\)"):
+        plan.run(q[:2], k, v)
+    with pytest.raises(ValueError, match=r"k must have shape \(2, 512, 128\)"):
+        plan.run(q, _replicated(k, 4), v)
+    with pytest.raises(ValueError, match=r"v must have shape \(2, 512, 128\)"):
+        plan.run(q, k, _replicated(v, 4))
+    with pytest.raises(ValueError, match=r"out must have shape \(2048, 1, 128\)"):
+        plan.run(q, k, v, out=torch.empty((512, 1, 128), device="cuda", dtype=q.dtype))
+    assert plan.run(q, k, v).shape == (8, 256, 128)
+
+
+# --------------------------------------------------------------------------- GQA on the Sage FP8 route
+
+
+def _fp8_gqa_inputs(
+    h,
+    h_kv,
+    mb,
+    nb,
+    seed=7,
+    qscale_mode="unit",
+    kscale_mode="unit",
+    vscale_mode="unit",
+    quantize=None,
+):
+    """``_fp8_inputs`` for a GQA problem: ``q`` over the query heads, ``k`` / ``v`` over the kv heads (the
+    spike lands on one key per kv head), quantized per tensor."""
+    q, k, v = (t.clone() for t in _gqa_inputs(h, h_kv, mb, nb, seed))
+    if qscale_mode == "x3":
+        q.mul_(3.0)
+    if kscale_mode == "spike":
+        n = k.shape[1]
+        for head in range(h_kv):
+            key = (n // 2 + 64 * head + 7) % n
+            k[head, key] = (k[head, key].float() * 2.0**SPIKE_LOG2).bfloat16()
+    if vscale_mode == "dynamic":
+        magnitudes = torch.logspace(*V_DYNAMIC_LOG10, 128, device="cuda")
+        v = (v.float() * magnitudes).bfloat16()
+    return (quantize or _torch_sage_quantize_hnd)(q, k, v)
+
+
+def _replicated_fp8(k8, v8, scales, g):
+    """The FP8 K / V and the K / V scales replicated per group (``k_scale`` along its head dim 1)."""
+    q_scale, k_scale, v_scale = scales
+    return (
+        _replicated(k8, g),
+        _replicated(v8, g),
+        [q_scale, _replicated(k_scale, g, dim=1), _replicated(v_scale, g)],
+    )
+
+
+def _fp8_gqa_plan_for(mask, h, scales, scale=None, route=None):
+    rows, cols = _descriptors_of(mask)
+    return CakeVsaSm90Plan(
+        "cuda",
+        mask,
+        rows,
+        cols,
+        h,
+        mask.shape[0],
+        128,
+        sm_scale=scale,
+        q_data_type=FP8,
+        q_scale=scales[0],
+        k_scale=scales[1],
+        v_scale=scales[2],
+        route=route,
+    )
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "g,h_kv,mb,nb,capacity,scale,route,ragged",
+    [
+        (2, 2, 4, 8, 3, None, None, True),  # small
+        (4, 1, 4, 4, 1, 0.5, "small", True),  # MQA, small_fp8_gqa_k1
+        (8, 1, 8, 64, 6, None, "smallsplit", True),
+        (4, 1, 16, 16, 16, -0.125, "smallcluster", True),
+        (4, 1, 16, 64, 18, None, "smallsplitcluster", True),
+        (4, 2, 160, 16, 12, None, "persistent", True),  # pair plan
+        (8, 1, 8, 64, 64, 0.0, "persistent", True),  # MQA, split mode
+        # a uniform multi-wave split plan (256 mode-1 tiles > 132 SMs): re-paired (mode 4) by the planner of
+        # record's ``repair_split`` "auto"; held to references (a) and (b) at their tolerances, the ratios
+        # to the MHA route recorded; reference (a) replays the re-paired plan's own chains
+        (4, 2, 32, 32, 8, None, "persistent", False),
+    ],
+)
+def test_fp8_gqa_routes_match_the_fp8_mha_route_on_replicated_inputs(
+    g, h_kv, mb, nb, capacity, scale, route, ragged, record_property
+):
+    """The FP8 GQA stages (``Qs`` per query head, ``Ks`` / ``Vs`` per kv head) on the BF16 GQA planner's
+    bytes: three launches bit-identical, both FP8 references on replicated inputs (reference (a) replayed
+    from the GQA plan's own tiles), equal to the FP8 MHA route on replicated inputs (bit for bit on the
+    static programs; the route gate and the bitwise mismatch count recorded on every program; a re-paired
+    plan is held to the two references only)."""
+    h = g * h_kv
+    mask = _random_mask(
+        h_kv, mb, nb, capacity, seed=h_kv * 1000 + mb, ragged=ragged, device="cuda"
+    )
+    mask_rep = _replicated(mask, g)
+    q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, mb, nb)
+    k8_rep, v8_rep, scales_rep = _replicated_fp8(k8, v8, scales, g)
+    sm_scale = 128**-0.5 if scale is None else scale
+    gqa = _fp8_gqa_plan_for(mask, h, scales, scale, route)
+    mha = _fp8_plan_for(mask_rep, scales_rep, scale, route)
+    assert gqa.fp8 and gqa.gqa == g and loader.stage_dtype(gqa.stage) == "e4m3"
+    assert gqa.stage == _gqa_stage_of(mha.stage) and loader.stage_gqa(gqa.stage)
+    assert gqa.mode == mha.mode
+    record_property(f"fp8_repair_split_g{g}", gqa.repair_split)
+    if gqa.small_kmax is None:
+        assert gqa.repair_split == (gqa.mode == "split" and not ragged and h * mb > 132)
+    assert gqa.k_scale_groups == mha.k_scale_groups == -(-(nb * 64) // 16)
+    # the FP8 GQA plan consumes exactly the BF16 GQA plan's bytes
+    bf16 = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, sm_scale=scale, route=route
+    )
+    if gqa.small_kmax is None:
+        assert torch.equal(gqa.meta, bf16.meta) and torch.equal(gqa.hdr, bf16.hdr)
+    else:
+        assert torch.equal(gqa.plan_param, bf16.plan_param)
+    outs = [gqa.run(q8, k8, v8).clone() for _ in range(3)]
+    assert outs[0].dtype == torch.bfloat16 and outs[0].shape == (h, mb * 64, 128)
+    for later in outs[1:]:
+        torch.testing.assert_close(later, outs[0], atol=0, rtol=0)
+    exact = _fp8_reference_exact(q8, k8_rep, v8_rep, scales_rep, mask_rep, sm_scale)
+    _check_gqa_against_mha(
+        gqa,
+        outs[0],
+        mha.run(q8, k8_rep, v8_rep),
+        exact,
+        record_property,
+        f"fp8_g{g}_{gqa.stage}",
+    )
+    # (a) the plan-faithful replay of the GQA plan's own tiles (the MHA tiles' chains unless re-paired)
+    # and (b) the exact softmax of the dequantized inputs
+    _fp8_check(
+        gqa, outs[0], q8, k8_rep, v8_rep, scales_rep, mask_rep, sm_scale, mask_kv=mask
+    )
+
+
+@requires_hopper
+def test_fp8_gqa_queue_route_takes_the_shared_transposer_for_head_pair_plans():
+    """The Sage-FP8 route runs grouped-query queue plans of head-pair tiles on the
+    shared-transposer queue program (``attention_fp8_gqa_xs_queue``); split-mode queue
+    plans keep ``attention_fp8_gqa_queue``, the static grouped-query plans and the MHA
+    plans their programs (``planner.fp8_gqa_xshare`` and ``loader.persistent_stage``;
+    host rules, no GPU).  The split-tile queue launch is the mode-1 replay
+    (``repair_split=False``); under the planner default ``"auto"`` the same uniform
+    multi-wave shape is re-paired, and that plan never takes the shared transposer
+    either."""
+    sms = 132
+    g = 4
+    pair = planner.plan_vsa_sm90(_topk_mask(2, 528, 64, 8), sms=sms, gqa=g)
+    assert (pair["mode"], bool(pair["queue"])) == ("pair", True)
+    assert planner.fp8_gqa_xshare(pair) is True
+    assert (
+        loader.persistent_stage(True, fp8=True, gqa=True, xshare=True)
+        == "attention_fp8_gqa_xs_queue"
+    )
+    split_mask = _topk_mask(2, 128, 128, 2)
+    split = planner.plan_vsa_sm90(split_mask, sms=sms, gqa=g, repair_split=False)
+    assert (split["mode"], bool(split["queue"]), split["repair_split"]) == (
+        "split",
+        True,
+        False,
+    )
+    assert planner.fp8_gqa_xshare(split) is False
+    repaired = planner.plan_vsa_sm90(split_mask, sms=sms, gqa=g)
+    assert (repaired["mode"], repaired["repair_split"]) == ("split", True)
+    assert planner.fp8_gqa_xshare(repaired) is False
+    static = planner.plan_vsa_sm90(_topk_mask(2, 16, 16, 8), sms=sms, gqa=g)
+    assert not static["queue"] and planner.fp8_gqa_xshare(static) is False
+    mha = planner.plan_vsa_sm90(_replicated(_topk_mask(2, 528, 64, 8), g), sms=sms)
+    assert mha["queue"] and mha["gqa"] == 1 and planner.fp8_gqa_xshare(mha) is False
+    for plan in (pair, split, repaired, static, mha):
+        stage = loader.persistent_stage(
+            bool(plan["queue"]),
+            bool(plan["compact"]),
+            bool(plan["tagged"]),
+            fp8=True,
+            gqa=plan["gqa"] > 1,
+            xshare=planner.fp8_gqa_xshare(plan),
+        )
+        assert stage.endswith("_xs_queue") is (plan is pair), stage
+        assert loader.persistent_stage(
+            bool(plan["queue"]),
+            bool(plan["compact"]),
+            bool(plan["tagged"]),
+            gqa=plan["gqa"] > 1,
+        ).startswith("attention")
+    # the rejected forms: no static form, no BF16 twin, no MHA twin
+    with pytest.raises(ValueError, match="shared-transposer"):
+        loader.persistent_stage(False, fp8=True, gqa=True, xshare=True)
+    with pytest.raises(ValueError, match="shared-transposer"):
+        loader.persistent_stage(True, fp8=False, gqa=True, xshare=True)
+    with pytest.raises(ValueError, match="shared-transposer"):
+        loader.persistent_stage(True, fp8=True, gqa=False, xshare=True)
+    with pytest.raises(ValueError, match="shared-transposer"):
+        loader.persistent_stage(True, compact=True, fp8=True, gqa=True, xshare=True)
+
+
+def test_fp8_gqa_queue_kernel_matches_the_static_kernel_bit_exact(
+    monkeypatch, record_property
+):
+    """The FP8 GQA shared-transposer queue program (the program of head-pair queue plans) only moves
+    head-pair tiles between CTAs and the V^T transposition between producer warps: bit-identical to the
+    compact and the plain static FP8 GQA programs on the same plan, which are bit-identical to the static
+    FP8 MHA program on replicated inputs; the queue words return to zero after every launch and a captured
+    graph replays it."""
+    g, h_kv, mb, nb = (
+        4,
+        2,
+        528,
+        64,
+    )  # 2112 head-pair tiles: >= POOL_MIN_TILES per CTA on 132 SMs
+    h = g * h_kv
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    mask = _topk_mask(h_kv, mb, nb, 8).cuda()
+    mask_rep = _replicated(mask, g)
+    q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, mb, nb)
+    k8_rep, v8_rep, scales_rep = _replicated_fp8(k8, v8, scales, g)
+    queued = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
+    if not queued.queue:
+        pytest.skip(f"{sms} SMs: fewer than {POOL_MIN_TILES} tiles per CTA")
+    assert queued.stage == "attention_fp8_gqa_xs_queue"
+    record_property("fp8_gqa_queue_stage", queued.stage)
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    first = queued.run(q8, k8, v8, out=out).clone()
+    torch.cuda.synchronize()
+    assert int(queued.dbg[62:64].abs().sum()) == 0
+    # without the queue the planner picks the compact static program for these short head-pair
+    # chains (<= 4 ring positions, >= 4 tiles per CTA); the plain static program is forced next
+    monkeypatch.setattr(planner, "POOL_MIN_TILES", 10**9)
+    compact = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
+    assert not compact.queue and compact.stage == "attention_fp8_gqa_compact"
+    assert compact.num_ctas == queued.num_ctas
+    torch.testing.assert_close(compact.run(q8, k8, v8), first, atol=0, rtol=0)
+    monkeypatch.setattr(planner, "COMPACT_MIN_TILES", 10**9)
+    static = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
+    assert not static.queue and static.stage == "attention_fp8_gqa"
+    assert static.num_ctas == queued.num_ctas
+    torch.testing.assert_close(static.run(q8, k8, v8), first, atol=0, rtol=0)
+    mha = _fp8_plan_for(mask_rep, scales_rep, route="persistent")
+    assert not mha.queue and mha.stage == "attention_fp8"
+    exact = _fp8_reference_exact(q8, k8_rep, v8_rep, scales_rep, mask_rep, 128**-0.5)
+    _check_gqa_against_mha(
+        static,
+        first,
+        mha.run(q8, k8_rep, v8_rep),
+        exact,
+        record_property,
+        "fp8_queue_vs_static_mha",
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        queued.run(q8, k8, v8, out=out)
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.view_as(first), first, atol=0, rtol=0)
+        assert int(queued.dbg[62:64].abs().sum()) == 0
+    torch.testing.assert_close(first.float(), exact, atol=5e-2, rtol=5e-2)
+
+
+@requires_hopper
+def test_fp8_gqa_tagged_kernel_matches_the_untagged_and_mha_programs(
+    monkeypatch, record_property
+):
+    """The FP8 twin of the tagged GQA case on the same plan bytes: the tagged FP8 GQA program launches, its
+    output is bit-identical to the untagged static FP8 GQA program and to the FP8 MHA route on replicated
+    inputs, and both FP8 references hold."""
+    g, h_kv, mb, hot, private = 2, 8, 16, 16, 16
+    h = g * h_kv
+    mask = _hot_and_private_mask(h_kv, mb, hot, private).cuda()
+    nb = mask.shape[2]
+    mask_rep = _replicated(mask, g)
+    q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, mb, nb)
+    k8_rep, v8_rep, scales_rep = _replicated_fp8(k8, v8, scales, g)
+    tagged = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
+    assert tagged.mode == "pair" and not tagged.queue and not tagged.compact
+    assert tagged.tagged and tagged.stage == "attention_fp8_gqa_tagged"
+    symbol = loader.MODULES["attention_fp8_gqa_tagged"]["kernel_symbol"]
+    scratch = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    names = _cuda_kernel_names(lambda: tagged.run(q8, k8, v8, out=scratch))
+    assert [name for name in names if name.startswith("kernel_")] == [symbol], names
+    record_property("fp8_gqa_tagged_stage", tagged.stage)
+    record_property("fp8_gqa_tagged_kernel", symbol)
+    first = tagged.run(q8, k8, v8).clone()
+    mha = _fp8_plan_for(mask_rep, scales_rep, route="persistent")
+    assert mha.stage in ("attention_fp8", "attention_fp8_tagged")
+    record_property("fp8_mha_stage_on_replicated_inputs", mha.stage)
+    exact = _fp8_reference_exact(q8, k8_rep, v8_rep, scales_rep, mask_rep, 128**-0.5)
+    _check_gqa_against_mha(
+        tagged,
+        first,
+        mha.run(q8, k8_rep, v8_rep),
+        exact,
+        record_property,
+        f"fp8_g{g}_{tagged.stage}",
+    )
+    _fp8_check(tagged, first, q8, k8_rep, v8_rep, scales_rep, mask_rep, 128**-0.5)
+    monkeypatch.setattr(planner, "KV_TAG_SINGLE_READER", False)
+    plain = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
+    assert not plain.tagged and plain.stage == "attention_fp8_gqa"
+    torch.testing.assert_close(plain.run(q8, k8, v8), first, atol=0, rtol=0)
+
+
+@requires_hopper
+@pytest.mark.parametrize("variant", ["x3", "spike", "dynamic", "zero_scale"])
+def test_fp8_gqa_scale_variants(variant):
+    """Scale addressing by query head (``q_scale``) versus kv head (``k_scale`` / ``v_scale``) on a ragged
+    pair plan at g = 4 with two kv heads: the scale variants of the FP8 MHA tests, both references, bit for
+    bit the MHA route on replicated inputs."""
+    g, h_kv, mb, nb = 4, 2, 16, 16
+    h = g * h_kv
+    mask = _random_mask(h_kv, mb, nb, 8, seed=23, ragged=True, device="cuda")
+    mask_rep = _replicated(mask, g)
+    modes = {
+        "x3": {"qscale_mode": "x3"},
+        "spike": {"kscale_mode": "spike"},
+        "dynamic": {"vscale_mode": "dynamic"},
+        "zero_scale": {},
+    }[variant]
+    scale = 0.0 if variant == "zero_scale" else None
+    q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, mb, nb, **modes)
+    k8_rep, v8_rep, scales_rep = _replicated_fp8(k8, v8, scales, g)
+    sm_scale = 128**-0.5 if scale is None else scale
+    for route in ("persistent", None):
+        plan = _fp8_gqa_plan_for(mask, h, scales, scale, route=route)
+        out = plan.run(q8, k8, v8)
+        _fp8_check(plan, out, q8, k8_rep, v8_rep, scales_rep, mask_rep, sm_scale)
+        mha = _fp8_plan_for(mask_rep, scales_rep, scale, route=route)
+        assert plan.stage == _gqa_stage_of(mha.stage)
+        if _static_route(plan):
+            torch.testing.assert_close(out, mha.run(q8, k8_rep, v8_rep), atol=0, rtol=0)
+
+
+@requires_hopper
+@pytest.mark.parametrize("route", ["small", "persistent"])
+def test_fp8_gqa_plan_stream_and_graph_lifetime(route):
+    """An FP8 GQA plan built on another stream is captured and replayed bit-exactly into a NaN-prefilled
+    output; re-quantizing new inputs into the captured tensors (the package quantizer on GQA shapes) is what
+    the replay computes."""
+    g, h_kv, mb, nb = 4, 1, 16, 16
+    h = g * h_kv
+    capacity = {"small": 4, "persistent": 16}[route]
+    mask = _random_mask(h_kv, mb, nb, capacity, seed=17, ragged=False, device="cuda")
+    q, k, v = (t.clone() for t in _gqa_inputs(h, h_kv, mb, nb))
+    producer = torch.cuda.Stream()
+    with torch.cuda.stream(producer):
+        q8, k8, v8, q_scale, k_scale, v_scale = pkg.sage_fp8_quantize_sm90(q, k, v)
+        plan = _fp8_gqa_plan_for(mask, h, (q_scale, k_scale, v_scale), route=route)
+    assert plan.fp8 and plan.gqa == g and loader.stage_gqa(plan.stage)
+    expected = plan.run(q8, k8, v8).clone()
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    plan.run(q8, k8, v8, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(q8, k8, v8, out=out)
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.view_as(expected), expected, atol=0, rtol=0)
+    q.normal_()
+    v.mul_(3.0)
+    new = pkg.sage_fp8_quantize_sm90(q, k, v)
+    for captured, fresh in zip(
+        (q8, k8, v8, q_scale, k_scale, v_scale), new, strict=True
+    ):
+        captured.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    k8_rep, v8_rep, scales_rep = _replicated_fp8(k8, v8, (q_scale, k_scale, v_scale), g)
+    exact = _fp8_reference_exact(
+        q8, k8_rep, v8_rep, scales_rep, _replicated(mask, g), 128**-0.5
+    )
+    torch.testing.assert_close(
+        out.view_as(expected).float(), exact, atol=5e-2, rtol=5e-2
+    )
+    with pytest.raises(RuntimeError, match="captured"):
+        plan.check_replan()
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "shape",
+    [(2, 1, 256, 256), (8, 2, 1000, 1500), (4, 1, 65, 4000), (16, 2, 4096, 4096)],
+)
+def test_sage_fp8_quantize_sm90_gqa_matches_torch(shape, record_property):
+    """The package quantizer on GQA shapes (``k`` / ``v`` over the kv heads): the SM100 criterion against the
+    torch recipe applied per tensor, the plan's scale shapes, the same bits as the MHA path on replicated
+    inputs, and exactly three kernels (the qk / V-amax kernel over the query heads, then over the kv heads,
+    then the V kernel) behind one fill."""
+    h, h_kv, sq, sk = shape
+    g = h // h_kv
+    gen = torch.Generator(device="cuda").manual_seed(sq * 7 + sk)
+    q = torch.randn((h, sq, 128), device="cuda", generator=gen).bfloat16()
+    k = torch.randn((h_kv, sk, 128), device="cuda", generator=gen).bfloat16()
+    v = torch.randn((h_kv, sk, 128), device="cuda", generator=gen).bfloat16()
+    got = pkg.sage_fp8_quantize_sm90(q, k, v)
+    torch.cuda.synchronize()
+    ref = _torch_sage_quantize_hnd(q, k, v)
+    groups = -(-sk // 16)
+    assert [tuple(t.shape) for t in got[3:]] == [
+        (1, h, sq),
+        (1, h_kv, groups),
+        (h_kv, 128),
+    ]
+    assert all(t.dtype == torch.float32 and t.is_contiguous() for t in got[3:])
+    for name, a, b in zip(
+        ("q_scale", "k_scale", "v_scale"), got[3:], ref[3:], strict=True
+    ):
+        assert a.shape == b.shape, name
+        rel = float((a - b).abs().max() / b.abs().max())
+        assert rel < 1e-5, f"{name}: max relative scale error {rel:.3e}"
+        record_property(f"gqa_bitwise_mismatch_{name}", int((a != b).sum()))
+    for name, a, b in zip(("q8", "k8", "v8"), got[:3], ref[:3], strict=True):
+        assert a.dtype == FP8 and a.shape == b.shape, name
+        af, bf = a.float(), b.float()
+        step = torch.maximum(af.abs(), bf.abs()).clamp_min(1.0) * 0.125
+        mismatch = int(((af - bf).abs() > step).sum())
+        assert mismatch == 0, (
+            f"{name}: {mismatch} elements differ by more than one E4M3 step"
+        )
+    # the MHA path on replicated k / v yields the same bits per head
+    rep = pkg.sage_fp8_quantize_sm90(q, _replicated(k, g), _replicated(v, g))
+    torch.cuda.synchronize()
+    assert torch.equal(rep[0].view(torch.uint8), got[0].view(torch.uint8))
+    assert torch.equal(
+        rep[1].view(torch.uint8), _replicated(got[1], g).view(torch.uint8)
+    )
+    assert torch.equal(
+        rep[2].view(torch.uint8), _replicated(got[2], g).view(torch.uint8)
+    )
+    assert torch.equal(rep[3], got[3])
+    assert torch.equal(rep[4], _replicated(got[4], g, dim=1))
+    assert torch.equal(rep[5], _replicated(got[5], g))
+    names = _cuda_kernel_names(lambda: pkg.sage_fp8_quantize_sm90(q, k, v))
+    kernels = [name for name in names if name.startswith("kernel_")]
+    qk = loader.MODULES["quantize_qk_vamax"]["kernel_symbol"]
+    assert kernels == [qk, qk, loader.MODULES["quantize_v"]["kernel_symbol"]], names
+    assert len(names) == len(kernels) + 1 and "Fill" in names[0], names
