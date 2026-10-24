@@ -2,7 +2,8 @@
 
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
 SM100/SM103/SM107, with FMA-only support on SM90 and SM120.
-SM90 admits BF16, FP16, ordinary per-tensor FP8 and DeepSeek block FP8; MX and NVFP4 remain
+SM90 admits BF16, FP16, ordinary per-tensor FP8, DeepSeek block FP8 and
+NVFP4/MXFP4/MXINT4 weights with BF16 activations. MXFP8 inputs and NVFP4 activations remain
 unsupported on SM90. The MX Tensor Core path uses
 CuTe DSL and the existing FlashInfer low-latency blockscaled GEMM's TMA
 producers and epilogue. It does not depend on cuDNN.
@@ -254,7 +255,7 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8 FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
+| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16-activation FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
 | Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3 weights with per-expert FP32 scales and BF16 activation/output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
@@ -1104,6 +1105,251 @@ python benchmarks/bench_frost_low_latency_deepseek_fp8.py \
 
 The reproducer requires SM120 and CUPTI; profiling errors remain errors.
 H100/SM90 correctness qualification does not establish a Hopper performance gain.
+
+## FP4 weights with BF16 activations
+
+`QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16)` adds an
+explicit weight-only candidate on SM90/100/103/107/120. The two shared FMA kernels
+consume canonical packed E2M1 weights directly. They decode E4M3 scales for each
+16-value K block and apply live per-expert FP32 global scales. Inputs, FC1
+preactivation, intermediate activations and expert outputs use BF16; the final
+weighted sum uses slot-ordered FP32 multiplication and addition. No activation
+quantization is performed.
+
+```mermaid
+flowchart LR
+  W[Checkpoint E2M1 bytes + E4M3 block scales] --> D[Weight decode inside FMA]
+  X[BF16 input + precomputed routes] --> FC1[FC1 + typed activation]
+  D --> FC1
+  FC1 --> M[BF16 intermediate]
+  M --> FC2[FC2 + ordered weighted combine]
+  D --> FC2
+  FC2 --> Y[BF16 output]
+```
+
+Hopper decodes E2M1 with integer bit operations; newer architectures reuse the
+native FP4 conversion. Every finite E2M1 × E4M3 product is exactly representable
+in FP16; the dot product still accumulates in FP32. The scheduling, ten typed
+activation classes, route validation and ordered combine are shared with the
+existing FMA implementations.
+
+```python
+options = FrostLowLatencyConfig(max_num_tokens=8)
+config = MoEConfig(
+    routing=RoutingConfig(num_experts=E, top_k=K),
+    quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+    experts=ExpertConfig(intermediate_size=I),
+    backend=BackendOptions((options,)),
+)
+weights = MoEWeightPack()
+weights.prepare_for(
+    "frost_low_latency",
+    options.prepare_nvfp4_weight_only_weights(
+        w1, w1_block_scale, w1_global_scale,
+        w2, w2_block_scale, w2_global_scale,
+        activation=config.activation,
+    ),
+)
+output = MoELayer(config)(MoEActivationPack(x, None, topk_ids, topk_weights), weights)
+```
+
+The preparation helper accepts CUDA uint8 payloads `[E, branches*I, H/2]` and
+`[E, H, I/2]`, linear E4M3 scales `[E, branches*I, H/16]` and `[E, H, I/16]`,
+and FP32 global scales `[E]` (or `[E, branches]` for FC1). Gated FC1 rows are
+semantic `[up, gate]`; non-gated activations have one branch. H is a multiple of
+128 and logical I a multiple of 32, padded to 128 internally. Supplied checkpoint
+bytes are preserved; the helper does not quantize weights or reinterpret an
+activation-quantization recipe. Legacy `FLASHINFER_NVFP4_4OVER6` settings therefore
+do not alter this BF16-input calculation. Packed/unpacked routing, raw/final
+outputs, changing scales, invalid routes and fresh tensor bindings are covered.
+Top-k is at most 32; the default token cap remains 2, with explicit opt-in up to 8.
+No EP communication or default-auto change is introduced.
+
+For MXFP4 checkpoints, use
+`QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)` and
+`prepare_mxfp4_weight_only_weights(w1, s1, w2, s2, activation=activation)`.
+The packed E2M1 shapes and activation boundaries are the same. Scales are
+linear E8M0 bytes with K-block size 32: `[E, branches*I, H/32]` and
+`[E, H, I/32]`. There is no separate global scale. Preparation preserves
+the supplied bytes, including through padding; it does not quantize the checkpoint.
+
+Both formats share the FC1/FC2 FMA implementation and binding. MXFP4 weight
+scaling uses FP32 because E8M0 exponents can exceed FP16's finite range.
+Scale byte 0 is the finite value 2^-127, not zero; byte 255 represents NaN.
+Tests exercise the smallest and largest finite scale bytes with inverse-scaled
+inputs as well as changing scales between graph replays. NVFP4 retains its
+exact FP16 E2M1 × E4M3 product before FP32 accumulation.
+
+## MXINT4 weights with BF16 activations
+
+`QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16)`
+extends the shared two-kernel FMA path to signed INT4 checkpoints. Prepare
+canonical weights with
+`FrostLowLatencyConfig.prepare_mxint4_weight_only_weights(w1, s1, w2, s2, activation=...)`.
+Each uint8 stores two two's-complement values in [-8, 7], with even K in the
+low nibble. FC1 is `[E, branches*I, H/2]` in `[up, gate]` order; FC2 is
+`[E, H, I/2]`. Scales are BF16 in linear K32 layout. Preparation copies the
+checkpoint payloads and scales without requantization, padding logical I to
+a multiple of 128. H must be divisible by 128 and logical I by 32.
+
+Unlike FP4-weight modes, MXINT4 retains FP32 FC1 preactivation. The typed
+activation and expert outputs round to BF16, and combine uses ordered FP32
+multiplication and addition. Packed routing scores retain BF16 rounding.
+All ten typed activations, packed/unpacked precomputed routes, and raw/final
+outputs use the existing scheduling and binding infrastructure. There is no
+activation quantizer or additional kernel launch.
+
+Four INT4 values are decoded together using a packed half2 conversion adapted
+from the existing TRT-LLM/CUTLASS
+`FastInterleavedAndBiasedNumericArrayConverter`. The signed integer results
+are exact in FP16, then widened before multiplication by arbitrary BF16
+scales in FP32. This preserves BF16's exponent range. The decoder regression
+checks all 65,536 packed words and changed-scale CUDA-graph replay, including
+scales well outside FP16's finite range.
+
+## Four-bit execution and tuning
+
+The three weight-only formats use the same two FMA bodies, typed activations,
+route validation, ordered combine and pointer-safe compiled metadata. NVFP4
+uses E4M3 K16 scales and optional live global multipliers; MXFP4 uses E8M0
+K32 scales; MXINT4 uses BF16 K32 scales. No checkpoint is requantized during
+preparation. The format determines decoding and rounding, not a separate
+copy of the pipeline.
+
+Each stage can consume four or eight adjacent values per lane. Eight-value
+loads are split into two explicit uint16 words before native FP4 conversion.
+SM103/SM120 expose 64 column/load-width combinations. Hopper NVFP4/MXFP4
+also expose these 64 choices; for T>=2 they retain 24 additional FC1
+route-group choices. Hopper MXINT4 and SM100/SM107 retain the original 16
+column pairs pending wider-load performance qualification. Default backend
+and default tactic selection are unchanged: use autotuning to select a
+measured candidate, and prepare other backend views for fallback.
+
+### Hopper software conversion and route reuse
+
+A packed byte-permutation lookup decodes four E2M1 values at once. The
+magnitude table is exact in FP16; sign insertion preserves negative zero.
+Tests enumerate all 65,536 packed words and validate NVFP4 and MXFP4 scale
+ranges. Blackwell/Rubin retain native FP4 conversion; signed INT4 retains
+its separate packed decoder.
+
+For multiple tokens, FC1 can dynamically group two or four flattened route
+slots that select the same expert, even if they appear in different top-k
+positions. The first slot owns the group and computes separate accumulators
+for every member. Singleton groups use the original body. Invalid routes
+write zero, and FC2/combine use the shared implementation.
+
+```mermaid
+flowchart LR
+ subgraph Original
+  W1[Load and decode expert weights] --> A1[Route A dot products]
+  W2[Load and decode same weights] --> A2[Route B dot products]
+ end
+ subgraph Grouped
+  W[Load and decode once] --> R1[Route A accumulators]
+  W --> R2[Route B accumulators]
+ end
+```
+
+Grouping reduces duplicated weight traffic and conversion work at the cost
+of additional accumulators and route matching. It can lose with unrelated
+experts or larger token groups. Wider ordinary loads and route grouping are
+independent alternatives in the current candidate set; the tuner must
+measure the actual shape and routing pattern.
+
+### Cumulative four-bit qualification
+
+The following are cumulative results for the complete implementation in this
+section, measured with the checked-in
+[benchmark](../benchmarks/bench_frost_low_latency_w4a16.py). The
+[compact record](../benchmarks/data/frost_four_bit_cumulative_20261024.json)
+includes source fingerprints, software versions, selected tactics, correctness
+and replay controls. All rows use H=2048, I=512, E=512, top-k=10, T=1 and SwiGLU.
+Times are microseconds; speedup is baseline time divided by Frost time.
+
+| GPU / weights | Best measured comparator | Warm baseline → Frost | Speedup | Cold baseline → Frost | Speedup |
+|---|---|---:|---:|---:|---:|
+| H100 / NVFP4 | CUTLASS with exact offline BF16 expansion | 49.840 → 16.128 | 3.090× | 57.440 → 19.600 | 2.931× |
+| H100 / MXFP4 | Native CUTLASS W4A16 | 43.216 → 16.928 | 2.553× | 51.655 → 20.104 | 2.569× |
+| B300 / NVFP4 | Native CuTe DSL | 20.120 → 15.392 | 1.307× | 25.208 → 18.176 | 1.387× |
+| B300 / MXFP4 | Native Prims-TS | 83.360 → 17.728 | 4.702× | 86.624 → 21.360 | 4.055× |
+| B300 / MXINT4 | Native TRT-LLM | 22.688 → 18.272 | 1.242× | 25.568 → 22.496 | 1.137× |
+| RTX PRO 6000 Blackwell / NVFP4 | SM12x warm; fused TC cold | 9.568 → 8.256 | 1.159× | 20.024 → 19.632 | 1.020× |
+| RTX PRO 6000 Blackwell / MXFP4 | Native cuTile | 21.679 → 8.576 | 2.528× | 35.447 → 18.912 | 1.874× |
+
+The H100 NVFP4 comparator reconstructs the same quantized weights exactly in
+BF16 before timing and uses **4× packed-weight storage**. It is a stronger
+measured control than native cuTile for this shape; it is not a four-bit
+execution path. Native cuTile gives 132.207→15.904 µs warm and
+145.751→19.296 µs cold, but those larger ratios are not the headline. Global
+scales are one in this storage control. Preparation and expansion are excluded.
+
+The B300 warm NVFP4 row revalidates a previously faster native 128×32 tile.
+A short search instead selected a 128×16 tile whose frozen validation was
+22.032 µs; the table uses the stronger 20.120 µs result. The SM120 NVFP4 cold
+result is near parity, not a broad performance win.
+
+Token count alone is insufficient to choose this path:
+
+| Boundary | Native → Frost, µs | Speedup |
+|---|---:|---:|
+| H100 MXFP4, same shape, T=2, shared experts, warm | 43.680 → 27.968 | 1.562× |
+| H100 MXFP4, same shape, T=2, shared experts, cold | 51.776 → 31.040 | 1.668× |
+| H100 MXFP4, same shape, T=8, shared experts, warm | 45.056 → 78.528 | **0.574×** |
+| B300 MXINT4, H=4096/I=1536/E=128/K=8/T=1, warm | 58.688 → 77.040 | **0.762×** |
+| B300 MXINT4, same larger shape, cold | 60.720 → 82.832 | **0.733×** |
+
+The final twelve-file regression suite passes on H100 (402 passed, 17 skipped),
+B300 (412 passed, 7 skipped), and SM120 (398 passed, 21 skipped). Skips are
+architecture-specific tests and are not counted as device validation. Independent
+SM107 CI passed 413 tests with 6 skips at `bc167c0a5`. Fresh SM100 four-bit
+device qualification remains pending; its current CI environment skips
+the GPU cases because its CuTe DSL is older than 4.8.
+
+The benchmark compares identical checkpoint payloads and routes. It searches
+advertised Frost and applicable native candidates, freezes winners and runs
+ABBA validation. It retains the output created during CUDA Graph capture
+and checks that output after timed replay. H100/SM120 use CUPTI activity spans
+with independent warm CUDA-event controls. B300 uses explicit graph globaltimer
+intervals with empty-interval and A/A controls (`--timer globaltimer`); these
+records do not include an independent CUDA-event control.
+
+The GPU interval includes required route packing, FC1, activation, FC2 and
+combine. It excludes preparation, the routing network, shared experts,
+communication and host submission. Model-shaped synthetic tensors are not
+model throughput measurements. Warm operands do not guarantee L2 residency;
+cold-cache flushing occurs outside the measured interval.
+
+Native rounding boundaries are recorded separately. In particular, native
+Blackwell NVFP4 and B300 MXFP4 can retain FP32 preactivation where Frost
+rounds to BF16; SM12x and SM120 fused TC also differ in partial/expert
+accumulation. Passing each independent reference does not make the paths
+bitwise interchangeable. MXINT4 preserves FP32 preactivation in both paths.
+
+```bash
+# Hopper NVFP4 headline comparator: exact offline BF16 expansion.
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format nvfp4 --native-backend expanded-bf16 \
+  --tokens 1 --cache-mode warm --output nvfp4-expanded-warm.json
+
+# Secondary native four-bit cuTile comparator; use cutlass for MXFP4.
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format nvfp4 --native-backend cutile \
+  --tokens 1 --cache-mode warm --output nvfp4-warm.json
+
+# B300 MXINT4 versus TRT-LLM; include cold and larger-I cases as well.
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format mxint4 --native-backend trtllm-mxint4 \
+  --tokens 1 --cache-mode cold --timer globaltimer --output mxint4-cold.json
+
+# SM120 NVFP4 has multiple native routes; audit both rather than assuming one.
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format nvfp4 --native-backend sm12x \
+  --tokens 1 --cache-mode warm --output nvfp4-sm12x.json
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format nvfp4 --native-backend sm120-tc \
+  --tokens 1 --cache-mode cold --output nvfp4-sm120-tc.json
+```
 
 
 ## FP16 weight-only activation and output coverage
