@@ -3,6 +3,11 @@
 This directory contains reusable FlashInfer PyTorch building blocks and model
 examples that use them.
 
+| Example | Description |
+|---------|-------------|
+| [`llm/`](llm/) | Self-contained Llama/Qwen decoder over FlashInfer's paged-KV prefill/decode path, with an end-to-end smoke test (JIT-cache reuse, determinism) |
+| [`wan/`](wan/) | WAN text-to-video diffusion transformer using the shared modules below |
+
 ## Shared Modules
 
 `flashinfer_modules.py` contains model-independent components that can be reused
