@@ -24,7 +24,7 @@ backend="cake")`` (:func:`cake_gated_residual_rmsnorm`; hidden size 8192) and
 the per-head RMSNorm times the sigmoid gate behind
 ``flashinfer.norm.rmsnorm_sigmoid_gate(..., backend="cake")``
 (:func:`cake_rmsnorm_sigmoid_gate`; head dimension 64, in place); SM100 /
-SM103.  The stable, ``@flashinfer_api``-decorated entry points and the
+SM103 / SM107.  The stable, ``@flashinfer_api``-decorated entry points and the
 user-facing documentation live in :mod:`flashinfer.norm`; import it.
 
 The two-norm kernels ship in three variants of their optional inputs:

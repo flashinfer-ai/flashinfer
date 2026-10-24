@@ -7917,9 +7917,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# One verified build per architecture: B200 / GB200 (``sm_100a``) and B300 /
-# GB300 (``sm_103a``); ``sm_107a`` is an exported target of the family with no
-# routed program yet.  Every architecture is compiled with its exact
+# One verified build per architecture: B200 / GB200 (``sm_100a``), B300 /
+# GB300 (``sm_103a``) and R200 (``sm_107a``).  Every architecture is compiled
+# with its exact
 # ``-gencode`` flag set (``build.json`` ``arch_flags``); there is no family
 # fallback.
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
