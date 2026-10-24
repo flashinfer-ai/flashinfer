@@ -255,9 +255,35 @@ class UIDs(Enum):
 
     S_AMAX_UID = 160  # Scale amax tensor
     O_AMAX_UID = 161  # Output amax tensor
+    SINK_UID = 300
 
 
-def _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type):
+def _prefill_sink_layout(sinks):
+    return (
+        None
+        if sinks is None
+        else (tuple(sinks.shape), tuple(sinks.stride()), sinks.dtype)
+    )
+
+
+def _validate_prefill_sinks(q, sinks):
+    if sinks is None:
+        return
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise NotImplementedError("cuDNN prefill sinks require FP16 or BF16 queries")
+    if (
+        sinks.shape != (q.shape[1],)
+        or sinks.dtype != torch.float32
+        or sinks.device != q.device
+        or not sinks.is_contiguous()
+    ):
+        raise ValueError(
+            "sinks must be a contiguous float32 tensor of shape (num_heads_qo,) "
+            "on the same device as q"
+        )
+
+
+def _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type, sinks=None):
     # Only execute-time tensors belong here. Plan metadata is keyed once by
     # _prefill_descriptor_key; pointer values never select a graph.
     return (
@@ -274,6 +300,7 @@ def _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type):
         k_cache.stride(),
         v_cache.stride(),
         scale,
+        _prefill_sink_layout(sinks),
     )
 
 
@@ -374,10 +401,11 @@ def _sdpa_prefill_key_fn(
     o_data_type=None,
     stats_head_stride=0,
     stats_use_log2=False,
+    sinks=None,
     **metadata,
 ):
     return (
-        _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type),
+        _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type, sinks),
         _prefill_descriptor_key(**metadata),
         bool(stats_head_stride)
         if metadata.get("override_cache") is not None and _CUDNN_NATIVE_HN_SUPPORTED
@@ -421,6 +449,7 @@ if CUDNN_AVAILABLE:
         override_cache: Optional[tuple[int, int, int]] = None,
         stats_head_stride: int = 0,
         stats_use_log2: bool = False,
+        sinks: Optional[torch.Tensor] = None,
     ):
         global _prefill_graph_builds
         _prefill_graph_builds += 1
@@ -694,11 +723,14 @@ if CUDNN_AVAILABLE:
                 # to it, which _cudnn_supports_direct_seqlens guards.
                 seq_len_kwargs = {
                     "cu_seq_len_q": cudnn_cu_seq_lens_q,
-                    # cu_seq_lens are unified-engine-only; pin the
-                    # implementation so an unsupported config fails with the
-                    # unified engine's specific error instead of
-                    # auto-selection's generic failure.
-                    "implementation": cudnn.attention_implementation.UNIFIED,
+                    # Preserve the native direct-length route without sinks.
+                    # Sink graphs use FE's common selection, which can serve
+                    # packed paged queries through FROST on qualifying stacks.
+                    **(
+                        {"implementation": cudnn.attention_implementation.UNIFIED}
+                        if sinks is None
+                        else {}
+                    ),
                 }
                 # KV side, independent form. Both tensors take the shared
                 # ACTUAL_SEQ_LENS_KV UID; the execute var_map binds cu_seq_lens_kv
@@ -747,12 +779,23 @@ if CUDNN_AVAILABLE:
                 cudnn_q_data_type == cudnn.data_type.BFLOAT16
                 or cudnn_q_data_type == cudnn.data_type.HALF
             ):
+                sink_kwargs = {}
+                if sinks is not None:
+                    # One extra softmax column per query head, with a zero value.
+                    sink = g.tensor(
+                        dim=(1, h_qo, 1, 1),
+                        stride=(h_qo, 1, 1, 1),
+                        data_type=cudnn.data_type.FLOAT,
+                    )
+                    sink.set_uid(UIDs.SINK_UID.value)
+                    sink_kwargs["sink_token"] = sink
                 O, Stats = g.sdpa(
                     name="sdpa",
                     q=cudnn_q,
                     k=cudnn_k_cache,
                     v=cudnn_v_cache,
                     **seq_len_kwargs,
+                    **sink_kwargs,
                     use_padding_mask=padding_mask,
                     attn_scale=scale,
                     generate_stats=return_lse,
@@ -849,6 +892,8 @@ if CUDNN_AVAILABLE:
                 )
 
             tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
+            if sinks is not None:
+                tensors_to_return.append(sink)
             if return_lse:
                 tensors_to_return.append(Stats)
 
@@ -1389,6 +1434,7 @@ class CudnnPrefillGraph:
         "requested_stats_head_stride",
         "lse_base",
         "stats_use_log2",
+        "sink_layout",
     )
 
     def __init__(
@@ -1401,6 +1447,7 @@ class CudnnPrefillGraph:
         stats_head_stride=0,
         requested_stats_head_stride=0,
         lse_base="log2",
+        sink_layout=None,
     ):
         self.key = key
         self.graph = graph
@@ -1410,6 +1457,7 @@ class CudnnPrefillGraph:
         self.stats_head_stride = stats_head_stride
         self.requested_stats_head_stride = requested_stats_head_stride
         self.lse_base = lse_base
+        self.sink_layout = sink_layout
         self.stats_use_log2 = return_lse and getattr(
             graph, "_flashinfer_stats_use_log2", False
         )
@@ -1424,6 +1472,7 @@ class CudnnPrefillGraph:
         return_lse,
         stats_head_stride=0,
         lse_base="log2",
+        sinks=None,
     ):
         if return_lse and lse_base != self.lse_base:
             return False
@@ -1440,12 +1489,23 @@ class CudnnPrefillGraph:
         else:
             key = plan.exact_keys[return_lse]
         return self.key[1] == key and self.key[0] == _prefill_runtime_key(
-            q, k_cache, v_cache, scale, metadata.o_data_type
+            q, k_cache, v_cache, scale, metadata.o_data_type, sinks
         )
 
     def run_planned(
-        self, q, k_cache, v_cache, out, lse, workspace_buffer, *, plan, lse_base="log2"
+        self,
+        q,
+        k_cache,
+        v_cache,
+        out,
+        lse,
+        workspace_buffer,
+        *,
+        plan,
+        lse_base="log2",
+        sinks=None,
     ):
+        self._check_sinks(q, sinks)
         device = plan.device
         if any(
             t.device != device for t in (q, k_cache, v_cache, out, workspace_buffer)
@@ -1485,6 +1545,9 @@ class CudnnPrefillGraph:
             buffers[:4] = q, k_cache, v_cache, out
             if self.return_lse:
                 buffers[4] = lse
+            if sinks is not None:
+                uids = uids + (UIDs.SINK_UID.value,)
+                buffers.append(sinks)
             return self._execute(
                 q,
                 out,
@@ -1506,6 +1569,8 @@ class CudnnPrefillGraph:
         )
         if self.return_lse:
             var_map[UIDs.STATS_UID.value] = lse
+        if sinks is not None:
+            var_map[UIDs.SINK_UID.value] = sinks
         return self._execute(
             q,
             out,
@@ -1527,8 +1592,10 @@ class CudnnPrefillGraph:
         *,
         metadata: _PrefillMetadata,
         lse_base: str = "log2",
+        sinks: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         device = q.device
+        self._check_sinks(q, sinks)
         var_map = _prefill_plan_bindings(metadata, q.dtype, device)
         var_map.update(
             {
@@ -1540,6 +1607,8 @@ class CudnnPrefillGraph:
         )
         if self.return_lse:
             var_map[UIDs.STATS_UID.value] = lse
+        if sinks is not None:
+            var_map[UIDs.SINK_UID.value] = sinks
         for tensor in (k_cache, v_cache, out, workspace_buffer):
             if tensor.device != device:
                 raise ValueError(
@@ -1568,6 +1637,13 @@ class CudnnPrefillGraph:
         return self._execute(
             q, out, lse, workspace_buffer, var_map, execute_kwargs, lse_base
         )
+
+    def _check_sinks(self, q, sinks):
+        _validate_prefill_sinks(q, sinks)
+        if _prefill_sink_layout(sinks) != self.sink_layout:
+            raise ValueError(
+                "sink layout changed; prepare the cuDNN prefill graph again"
+            )
 
     def _execute(
         self,
@@ -1618,6 +1694,7 @@ def prepare_cudnn_batch_prefill(
     metadata: _PrefillMetadata,
     stats_head_stride: int = 0,
     lse_base: str = "log2",
+    sinks: Optional[torch.Tensor] = None,
 ) -> CudnnPrefillGraph:
     """Fetch (or build into the graph cache) the prefill graph for this call's
     signature and wrap it for execution.
@@ -1631,6 +1708,7 @@ def prepare_cudnn_batch_prefill(
     The public low-level entry point instead calls :meth:`CudnnPrefillGraph.run`
     with metadata resolved for that call.
     """
+    _validate_prefill_sinks(q, sinks)
     override_cache = metadata.override_shape(q, k_cache)
 
     stats_use_log2 = (
@@ -1648,6 +1726,7 @@ def prepare_cudnn_batch_prefill(
             scale=scale,
             stats_use_log2=stats_use_log2,
             stats_head_stride=stats_head_stride,
+            sinks=sinks,
             **metadata.graph_kwargs(override_cache),
         )
         if stats_head_stride and override_cache is not None:
@@ -1675,6 +1754,7 @@ def prepare_cudnn_batch_prefill(
             v_cache=v_cache,
             scale=scale,
             stats_use_log2=stats_use_log2,
+            sinks=sinks,
             **metadata.graph_kwargs(override_cache),
         )
     key = _sdpa_prefill_key_fn(
@@ -1684,6 +1764,7 @@ def prepare_cudnn_batch_prefill(
         scale,
         stats_head_stride=stats_head_stride,
         stats_use_log2=stats_use_log2,
+        sinks=sinks,
         **metadata.graph_kwargs(override_cache),
     )
     if override_cache is not None:
@@ -1700,6 +1781,7 @@ def prepare_cudnn_batch_prefill(
                 scale=scale,
                 stats_head_stride=stats_head_stride,
                 stats_use_log2=stats_use_log2,
+                sinks=sinks,
                 **metadata.graph_kwargs(None),
             )
             key = _sdpa_prefill_key_fn(
@@ -1709,6 +1791,7 @@ def prepare_cudnn_batch_prefill(
                 scale,
                 stats_head_stride=stats_head_stride,
                 stats_use_log2=stats_use_log2,
+                sinks=sinks,
                 **metadata.graph_kwargs(None),
             )
     return CudnnPrefillGraph(
@@ -1719,6 +1802,7 @@ def prepare_cudnn_batch_prefill(
         stats_head_stride=stats_head_stride,
         requested_stats_head_stride=requested_stats_head_stride,
         lse_base=lse_base,
+        sink_layout=_prefill_sink_layout(sinks),
     )
 
 
@@ -1752,6 +1836,7 @@ def cudnn_batch_prefill_with_kv_cache(
     backend: Optional[str] = None,
     o_data_type: Optional[torch.dtype] = None,
     lse_base: str = "log2",
+    sinks: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Batched prefill attention with paged KV cache, backed by cuDNN SDPA.
 
@@ -1867,6 +1952,10 @@ def cudnn_batch_prefill_with_kv_cache(
         ``"log2"`` (default): return the LSE in base 2 like every other FlashInfer
         backend. ``"ln"``: return cuDNN's native natural-log stats, skipping the
         conversion kernel.
+    sinks : Optional[torch.Tensor]
+        Contiguous FP32 logits of shape ``(num_heads_qo,)`` on the query device.
+        Each head contributes one extra softmax column with a zero value.
+        Requires FP16/BF16 and a supporting cuDNN Graph API installation.
 
     Returns
     -------
@@ -1885,6 +1974,9 @@ def cudnn_batch_prefill_with_kv_cache(
     and ``head_dim_vo`` must be 128.
     """
     check_lse_base(lse_base)
+    _validate_prefill_sinks(q, sinks)
+    if sinks is not None and (not CUDNN_AVAILABLE or backend == "cubin"):
+        raise NotImplementedError("cuDNN prefill sinks require the cuDNN graph backend")
 
     num_tokens = q.shape[0]
 
@@ -2061,6 +2153,7 @@ def cudnn_batch_prefill_with_kv_cache(
             workspace_buffer,
             metadata=metadata,
             lse_base=lse_base,
+            sinks=sinks,
         )
         return prepared.run(
             q,
@@ -2071,6 +2164,7 @@ def cudnn_batch_prefill_with_kv_cache(
             workspace_buffer,
             metadata=metadata,
             lse_base=lse_base,
+            sinks=sinks,
         )
     else:
         if actual_seq_lens_q is None or actual_seq_lens_kv is None:

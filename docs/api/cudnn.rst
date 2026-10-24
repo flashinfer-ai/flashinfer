@@ -55,6 +55,33 @@ unchanged. Prefill callers requesting ``lse_base="ln"`` still receive the
 natural-log output directly. Each requested LSE base/layout is a graph
 specialization: warm it before CUDA graph capture.
 
+Paged prefill and target verification with sinks
+------------------------------------------------
+
+``BatchPrefillWithPagedKVCacheWrapper(backend="cudnn")`` forwards ``run(sinks=)``
+to ``graph.sdpa(sink_token=)`` for FP16/BF16. Sinks are contiguous FP32 logits
+of shape ``[num_qo_heads]`` on the query device, with one zero-value softmax
+column per head. The installed FE selects a supporting engine or declines the
+graph. Rubin paged sinks require a build containing cudnn-frontend PR #1479;
+the existing package dependency floor is unchanged.
+
+Use token-unit ``qo_indptr`` and GPU ``block_tables``, ``seq_lens`` and
+``seq_lens_q`` with explicit ``max_token_per_sequence`` / ``max_sequence_kv``
+bounds. NHD and HND pools, including interleaved K/V views, keep their declared
+strides. No cache gather or query padding is needed. With ``causal=True``,
+query row ``i`` sees keys through ``kv_len - q_len + i``: this is the
+bottom-right mask needed for speculative target verification, including mixed
+per-request query lengths.
+
+Warm ``plan`` and ``run`` before capture with the required sink presence,
+strides, mask and LSE base/layout. Repeated runs rebind current Q/K/V, output
+and sink pointers; sink values do not specialize the graph. After capture,
+update the captured metadata buffers through ``plan`` and mutate sink contents
+in place. A captured graph retains its tensor addresses. Changes to declared
+bounds, tensor layouts or sink presence can require another prepared graph.
+Windowed/custom masks, soft-cap, NVFP4 and MXFP8 attention are outside this
+paged-prefill extension.
+
 .. currentmodule:: flashinfer.cudnn
 
 .. autosummary::
