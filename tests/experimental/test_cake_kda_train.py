@@ -78,13 +78,15 @@ PDL_RECORDS = (
 )
 # the saving forward's token-row records: where one runs, no program of the path reads the internal Aqk / Akk copies;
 # the forward without a saved set launches their internal-row twins instead (the paired serial rows -- the 32-column
-# form below the fused threshold -- launch wy_fwd_rows and fwdh_o_v2_rows; the 64-column form keeps the internal rows)
+# form below the fused threshold, and on sm_107a the 64-column form too -- launch wy_fwd_rows and fwdh_o_v2_rows /
+# fwdh_o_v1_rows; the 64-column form keeps the internal rows on the other architectures)
 TOKEN_ROW_RECORDS = (
     "fwdh_wy_rows",
     "wy_fwd_rows",
     "fwdh_p3_o_ov_rows",
     "fwdh_p3_o_ov_id_rows",
     "fwdh_o_v2_rows",
+    "fwdh_o_v1_rows",
 )
 INTERNAL_ROW_TWIN = {
     "fwdh_wy_rows": "fwdh_wy",
@@ -92,8 +94,14 @@ INTERNAL_ROW_TWIN = {
     "fwdh_p3_o_ov_rows": "fwdh_p3_o_ov",
     "fwdh_p3_o_ov_id_rows": "fwdh_p3_o_ov_id",
     "fwdh_o_v2_rows": "fwdh_o_v2",
+    "fwdh_o_v1_rows": "fwdh_o_v1",
 }
+# the architectures whose saving forward reads the saved token rows on the 64-column serial rows too (fwdh_o_v1_rows)
+PAIRED_V1_ARCHES = ("sm_107a",)
 DAVQ_MIN_H = 16  # the fused gradient hosts dAqk on the serial route from 16 heads
+# from this many heads the fused gradient runs with its L2 prefetch / evict-first hints off (the `_nohint` records:
+# the same kernel built with the hint thresholds beyond any head count); the other architectures keep the hints
+DQKG_NOHINT_MIN_H_BY_ARCH = {"sm_107a": 16}
 FEW_CHAINS = 4  # at most four (document, head) chains: the few-chain segmented rows
 # the saved-state pass 2 forms the WY representation itself (no WY launch) up to 32 (document, head) chains; on
 # every segmented row the adjoint recurrence accumulates dv and the fused gradient hosts dAqk (no dav launch)
@@ -283,8 +291,8 @@ TWO_PASS_RECORDS = (
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.MODULES) == 59
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 57
+    assert len(cake_jit.MODULES) == 62
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 60
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert cake_jit.SEGMENTS == {
@@ -516,8 +524,12 @@ def _expected_records(
     # the saving forward reads the saved token rows where a program for them ships
     save = path == "fwd"
     # the paired serial rows: the 32-column form below the fused threshold reads the saved token rows on the saving
-    # forward (wy_fwd_rows + fwdh_o_v2_rows); the 64-column form keeps the internal-row pair on both paths
+    # forward (wy_fwd_rows + fwdh_o_v2_rows); the 64-column form does so on sm_107a alone (wy_fwd_rows +
+    # fwdh_o_v1_rows) and keeps the internal-row pair on both paths elsewhere
     paired = save and not seg and v2 and not fused_fwd
+    paired_v1 = (
+        save and not seg and not v2 and not fused_fwd and arch in PAIRED_V1_ARCHES
+    )
     walk = nseg * h
     prefetch = walk < DHU_PREFETCH_WAVES_BY_ARCH.get(arch, 0.0) * sm
     tma = walk < DHU_TMA_WAVES * sm or (h <= 4 and walk <= DHU_TMA_WAVES * sm)
@@ -543,7 +555,7 @@ def _expected_records(
         "fwd_intra": "fwd_intra_v14" if intra_tables else "fwd_intra",
         "wy_fwd": None
         if fused_fwd
-        else ("wy_fwd_rows" if (ov1 and save) or paired else "wy_fwd"),
+        else ("wy_fwd_rows" if (ov1 and save) or paired or paired_v1 else "wy_fwd"),
         "seg_carry": None if not seg else ("seg_carry_ov" if ov1 else "seg_carry"),
         "glm_intra": "glm_intra",
         "gate_epilogue": "gate_epilogue",
@@ -566,7 +578,7 @@ def _expected_records(
         elif v2:
             out["fwdh"] = "fwdh_o_v2_rows" if paired else "fwdh_o_v2"
         else:
-            out["fwdh"] = "fwdh_o_v1"
+            out["fwdh"] = "fwdh_o_v1_rows" if paired_v1 else "fwdh_o_v1"
     elif path in ("light", "replay"):
         if seg:
             out["fwdh"] = "fwdh_v3"
@@ -617,7 +629,12 @@ def _expected_records(
         out["dhu"] = "dhu_v1_wt_replay" if replay else "dhu_v1_wt"
     else:
         out["dhu"] = "dhu_v1_replay" if replay else "dhu_v1"
-    out["dqkg"] = ("dqkg_int" if replay else "dqkg") + ("_davq" if davq else "")
+    nohint = davq and not seg and h >= DQKG_NOHINT_MIN_H_BY_ARCH.get(arch, h + 1)
+    out["dqkg"] = (
+        ("dqkg_int" if replay else "dqkg")
+        + ("_davq" if davq else "")
+        + ("_nohint" if nohint else "")
+    )
     return {stage: out[stage] for stage in PATH_STAGES[path]}
 
 
@@ -736,7 +753,13 @@ def test_the_saving_forward_reads_the_token_rows_where_a_program_ships() -> None
                         and not fused
                         and n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
                     )
-                    assert bool(token) == (fused or ov1 or paired), (
+                    paired_v1 = (
+                        not seg
+                        and not fused
+                        and n * h * RECUR_SLICES["v2"] > sm * RECUR_CTAS_PER_SM
+                        and arch in PAIRED_V1_ARCHES
+                    )
+                    assert bool(token) == (fused or ov1 or paired or paired_v1), (
                         n,
                         h,
                         sm,
@@ -749,6 +772,8 @@ def test_the_saving_forward_reads_the_token_rows_where_a_program_ships() -> None
                         assert "wy_fwd_rows" in token and len(token) == 2
                     if paired:
                         assert token == {"wy_fwd_rows", "fwdh_o_v2_rows"}
+                    if paired_v1:
+                        assert token == {"wy_fwd_rows", "fwdh_o_v1_rows"}
                     assert p.internal_rows("fwd") is (not token), (n, h, sm, arch)
                     assert p.internal_rows("fwd_nosave") is True
                     assert p.internal_rows("replay") is True
@@ -905,7 +930,14 @@ def test_pair_kernels_walk_the_pairs_on_a_persistent_grid() -> None:
 def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None:
     # The fused gradient and the GLM intra kernel read q / k / v where they are (TMA boxes on the token rows), so
     # the backward prep ships its copy-free forms alone and the backward layouts hold no slot for such copies.
-    for name in ("dqkg", "dqkg_int", "dqkg_davq", "dqkg_int_davq"):
+    for name in (
+        "dqkg",
+        "dqkg_int",
+        "dqkg_davq",
+        "dqkg_int_davq",
+        "dqkg_davq_nohint",
+        "dqkg_int_davq_nohint",
+    ):
         logical = cake_jit.MODULES[name]["logical"]
         assert (logical["v_tma"], logical["k_tma"], logical["q_tma"]) == ("v", "k", "q")
     logical = cake_jit.MODULES["glm_intra"]["logical"]
@@ -928,6 +960,47 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
         assert ("akk_int" in names) == (mode.startswith(("fwd", "replay"))), mode
 
 
+def test_the_fused_gradient_turns_its_l2_hints_off_on_the_large_sm107a_rows() -> None:
+    # The fused gradient's L2 prefetch and evict-first hints cost about 6 % on the sm_107a rows from 16 heads, so
+    # its dAqk-hosting forms ship a second build there with the hints off (the `_nohint` records: the same kernel,
+    # launch and operands; the hint thresholds beyond any head count).  The registry dispatches them on sm_107a
+    # from 16 heads alone; the segmented rows and the other architectures keep the hinted builds.
+    for name in ("dqkg_davq_nohint", "dqkg_int_davq_nohint"):
+        record = cake_jit.MODULES[name]
+        hinted = cake_jit.MODULES[name[: -len("_nohint")]]
+        assert record["stage"] == hinted["stage"] == "dqkg"
+        assert record["library"] != hinted["library"]
+        assert record["arches"] == hinted["arches"] == list(ARCHES)
+        assert record["logical"] == hinted["logical"]
+        assert record["arg_plan"] == hinted["arg_plan"]
+        assert record["launch"] == hinted["launch"]
+        assert record["grid_rule"] == hinted["grid_rule"]
+    for path, base in (
+        ("light", "dqkg"),
+        ("light_states", "dqkg"),
+        ("tape", "dqkg"),
+        ("replay", "dqkg_int"),
+    ):
+        for arch in ARCHES:
+            for h in (1, 4, 8, 12, 16, 24, 32, 64, 128):
+                seg = h <= SEG_MAX_H
+                davq = seg or h >= DAVQ_MIN_H
+                nohint = (
+                    davq and not seg and h >= DQKG_NOHINT_MIN_H_BY_ARCH.get(arch, h + 1)
+                )
+                want = base + ("_davq" if davq else "") + ("_nohint" if nohint else "")
+                got = cake_jit.select_record(
+                    "dqkg",
+                    num_chunks_pad=64,
+                    num_seqs=1,
+                    num_heads=h,
+                    sm_count=148,
+                    arch=arch,
+                    path=path,
+                )
+                assert got == want, (path, arch, h)
+
+
 def test_the_saved_set_paths_read_the_token_rows_and_the_replay_the_internal_rows() -> (
     None
 ):
@@ -946,6 +1019,7 @@ def test_the_saved_set_paths_read_the_token_rows_and_the_replay_the_internal_row
         "dhu_v3s_f": "dhu_v3s_f_replay",
         "dqkg": "dqkg_int",
         "dqkg_davq": "dqkg_int_davq",
+        "dqkg_davq_nohint": "dqkg_int_davq_nohint",
     }
     token = {"aqk_src", "akk_src", "dout"}
     internal = {"aqk_int", "akk_int", "do_int"}
@@ -1054,6 +1128,7 @@ def test_the_serial_walk_orders_the_documents_and_the_carry_splits_the_chain() -
         "fwdh_v2",
         "fwdh_v2h",
         "fwdh_o_v1",
+        "fwdh_o_v1_rows",
         "fwdh_o_v2",
         "fwdh_o_v2_rows",
         "fwdh_wy",
@@ -1932,10 +2007,10 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 57 programs of cake_jit.MODULES plus the KCP programs of cake_kcp_jit.MODULES (its test-only
+    # The 60 programs of cake_jit.MODULES plus the KCP programs of cake_kcp_jit.MODULES (its test-only
     # TEST_MODULES live in build.test.json, never here).
     kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
-    assert len(names) == len(set(names)) == (57 + len(kcp_libraries)) * len(ARCHES)
+    assert len(names) == len(set(names)) == (60 + len(kcp_libraries)) * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -4304,8 +4379,15 @@ def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
     the groups follow the whole problem's rule, the forward scatters their blocks into the saved states by chain
     rank, the backward gathers them (``light_states`` as pass 2 alone), everything bit for bit."""
     lengths, heads = (40000, 20000, 20000, 1000), 4
-    S, N = sum(lengths), len(lengths)
     sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    # The size rule is S >= SEG_SAVE_MIN_TOKENS_PER_SEG * NSEG with NSEG = the SM count here, so on a device
+    # with more SMs than this pack covers (216 on some sm_107a boards) the first document grows until the
+    # plan saves the states; the last document alone stays below the rule.
+    for _ in range(64):
+        if cake_backend.plan(sum(lengths), len(lengths), heads, sm, arch).seg_save:
+            break
+        lengths = (lengths[0] + 4096, *lengths[1:])
+    S, N = sum(lengths), len(lengths)
     p = cake_backend.plan(S, N, heads, sm, arch)
     assert p.recur == "seg" and p.seg_save and p.light_path == "light_states"
     assert not cake_backend.plan(1000, 1, heads, sm, arch).seg_save
