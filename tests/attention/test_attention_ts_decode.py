@@ -1779,6 +1779,8 @@ def _assert_case_correct(output, case):
             f"match ratio {match_ratio} is below {threshold}"
         )
         return
+    elif case.q.dtype == _FP8 and case.k_cache.dtype == torch.uint8:
+        rtol, atol = 1e-2, 0.125
     elif case.output_dtype == _FP8:
         rtol, atol = 5e-2, 2e-3
     elif case.q.dtype == _FP8 and case.output_dtype == torch.bfloat16:
@@ -4304,11 +4306,11 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_separate_stats(
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
-@pytest.mark.parametrize("headdim", (128, 256))
+@pytest.mark.parametrize("headdim", (128, 256, 512))
 def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
     headdim: int,
 ) -> None:
-    """FP8-Q/NVFP4 decode stores dequantized values in TMEM when H128/H256."""
+    """FP8-Q/NVFP4 decode stores dequantized values in TMEM for staged heads."""
 
     cfg = make_decode_config(
         headdim=headdim,
@@ -4328,6 +4330,8 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
 
     assert cfg.store_transformed_kv_in_tmem
     assert cfg.head_dim_kv_stage == 128
+    assert cfg.smem_kv_sf_bytes_per_token == headdim // 16
+    assert cfg.smem_kv_sf_tile_bytes == cfg.tile_size_kv * headdim // 16
     assert cfg.smem_kv_storage_tile_bytes == 2 * cfg.smem_kv_tile_bytes
     assert "tmemTransformedKv" in resources
     assert "smemTransformedKv" not in resources
@@ -4345,6 +4349,7 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
         (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
         (torch.bfloat16, torch.uint8, torch.bfloat16),
         (torch.float8_e4m3fn, torch.uint8, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.uint8, torch.bfloat16),
     ),
 )
 def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, output_dtype):
@@ -4470,19 +4475,102 @@ def test_attention_ts_nvfp4_cache_contract():
         logical_head_dim=64,
     )
     assert normalized[5] == 64
-    k_sf, v_sf = decode_module._normalize_paged_kv_scale_factors(
-        (scales, scales),
-        k_cache=packed,
-        logical_head_dim=64,
+    k_sf, v_sf, k_sf_page_stride, v_sf_page_stride = (
+        decode_module._normalize_paged_kv_scale_factors(
+            (scales, scales),
+            k_cache=packed,
+            logical_head_dim=64,
+        )
     )
     assert k_sf is scales
     assert v_sf is scales
+    assert k_sf_page_stride == scales.stride(0)
+    assert v_sf_page_stride == scales.stride(0)
     with pytest.raises(ValueError, match="requires kv_scale_factors"):
         decode_module._normalize_paged_kv_scale_factors(
             None,
             k_cache=packed,
             logical_head_dim=64,
         )
+
+
+def _check_workspace_and_graph(
+    case, kv_scale_factors, *, seq_len_kv, seq_len_q, page_size
+):
+    """Exercise caller-owned scratch and prepared/one-shot graph launches."""
+    seq_lens = _seq_lens_from_csr(
+        case.paged_kv_indptr, case.paged_kv_last_page_len, page_size
+    )
+    workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+        case.q.shape[0],
+        case.q.shape[-2],
+        case.k_cache.shape[1],
+        case.q.shape[-1],
+        page_size,
+        seq_len_kv,
+        seq_len_q=seq_len_q,
+        q_dtype=case.q.dtype,
+        k_dtype=case.k_cache.dtype,
+        v_dtype=case.v_cache.dtype,
+        out_dtype=case.output_dtype,
+        device=case.q.device,
+    )
+    workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=case.q.device)
+    explicit_out = torch.empty_like(case.q, dtype=case.output_dtype)
+
+    def run_with_workspace(validate):
+        return batch_decode_with_paged_kv_cache(
+            case.q,
+            case.paged_kv_cache,
+            case.block_tables,
+            seq_lens,
+            kv_scale_factors=kv_scale_factors,
+            seq_len_q=seq_len_q,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+            out=explicit_out,
+            workspace_buffer=workspace,
+            max_kv_len=seq_len_kv,
+            validate=validate,
+        )
+
+    for validate in (True, False):
+        assert run_with_workspace(validate) is explicit_out
+        _assert_case_correct(explicit_out, case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_with_workspace(False)
+    graph.replay()
+    _assert_case_correct(explicit_out, case)
+
+    plan = prepare_prims_ts_batch_decode_with_kv_cache(
+        case.q,
+        case.paged_kv_cache,
+        workspace,
+        case.block_tables,
+        seq_lens,
+        seq_len_kv,
+        kv_scale_factors=kv_scale_factors,
+        seq_len_q=seq_len_q,
+        out=explicit_out,
+        out_dtype=case.output_dtype,
+    )
+
+    def run_plan():
+        return plan.run(
+            case.q,
+            out=explicit_out,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+        )
+
+    assert run_plan() is explicit_out
+    _assert_case_correct(explicit_out, case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_plan()
+    graph.replay()
+    _assert_case_correct(explicit_out, case)
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -4497,7 +4585,7 @@ def test_attention_ts_nvfp4_cache_contract():
     [1, 4, 8],
     ids=lambda value: f"q{value}",
 )
-@pytest.mark.parametrize("head_dim", [64, 128, 256], ids=lambda value: f"d{value}")
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512], ids=lambda value: f"d{value}")
 @pytest.mark.parametrize(
     ("num_qo_heads", "num_kv_heads"),
     [(32, 4)],
@@ -4554,6 +4642,8 @@ def test_attention_ts_decode_mixed_precision(
             False,
             -1,
         ).config
+    if head_dim == 512 and q_dtype != _FP8:
+        pytest.skip("H512 is qualified only for FP8 Q with NVFP4 K/V")
     case, kv_scale_factors = _make_mixed_precision_decode_case(
         batch_size=batch_size,
         seq_len_kv=seq_len_kv,
@@ -4603,51 +4693,78 @@ def test_attention_ts_decode_mixed_precision(
     )
     _assert_case_correct(one_shot, case)
 
-    # The unified API also serves caller-owned scratch and trusted graph calls.
-    seq_lens = _seq_lens_from_csr(
-        case.paged_kv_indptr, case.paged_kv_last_page_len, page_size
-    )
-    workspace_bytes = get_prims_ts_batch_decode_workspace_size(
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        seq_len_kv,
+    _check_workspace_and_graph(
+        case,
+        kv_scale_factors,
+        seq_len_kv=seq_len_kv,
         seq_len_q=seq_len_q,
-        q_dtype=q_dtype,
-        k_dtype=kv_dtype,
-        v_dtype=kv_dtype,
-        out_dtype=output_dtype,
-        device=case.q.device,
+        page_size=page_size,
     )
-    workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=case.q.device)
-    explicit_out = torch.empty_like(case.q, dtype=output_dtype)
 
-    def run_with_workspace(validate):
-        return batch_decode_with_paged_kv_cache(
-            case.q,
-            case.paged_kv_cache,
-            case.block_tables,
-            seq_lens,
-            kv_scale_factors=kv_scale_factors,
-            seq_len_q=seq_len_q,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
-            out=explicit_out,
-            workspace_buffer=workspace,
-            max_kv_len=seq_len_kv,
-            validate=validate,
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("output_dtype", (torch.bfloat16, torch.float16))
+def test_attention_ts_decode_nvfp4_padded_scale_page_stride(output_dtype):
+    """Consume zero-copy scale views embedded in a larger physical page."""
+    batch_size = 2
+    seq_len_kv = 1024
+    num_qo_heads = 32
+    num_kv_heads = 4
+    head_dim = 512
+    seq_len_q = 1
+    page_size = 64
+    q_dtype = _FP8
+    kv_dtype = torch.uint8
+
+    case, kv_scale_factors = _make_mixed_precision_decode_case(
+        batch_size=batch_size,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        output_dtype=output_dtype,
+        device="cuda",
+        seed=20260806,
+    )
+    assert kv_scale_factors is not None
+
+    def with_padded_outer_stride(scale: torch.Tensor) -> torch.Tensor:
+        compact_page_elements = scale[0].numel()
+        padded_page_stride = compact_page_elements + 16
+        storage = scale.new_empty((scale.shape[0] * padded_page_stride,))
+        padded = storage.as_strided(
+            scale.shape,
+            (padded_page_stride, *scale.stride()[1:]),
         )
+        padded.copy_(scale)
+        return padded
 
-    for validate in (True, False):
-        assert run_with_workspace(validate) is explicit_out
-        _assert_case_correct(explicit_out, case)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_with_workspace(False)
-    graph.replay()
-    _assert_case_correct(explicit_out, case)
+    padded_scales = tuple(with_padded_outer_stride(sf) for sf in kv_scale_factors)
+    assert padded_scales[0].stride(0) > padded_scales[0][0].numel()
+
+    wrapper = _plan_case(case, max_kv_len=1024)
+    output = wrapper.run(
+        case.q,
+        case.paged_kv_cache,
+        None,
+        case.block_tables,
+        kv_scale_factors=padded_scales,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+    )
+    _assert_case_correct(output, case)
+
+    _check_workspace_and_graph(
+        case,
+        padded_scales,
+        seq_len_kv=seq_len_kv,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+    )
 
 
 @_REQUIRES_PRIMTS_GPU

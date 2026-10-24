@@ -1170,7 +1170,10 @@ def _make_attention_ts_decode_trace(
             description="Semantic fragment size addressed by encoded locators.",
         )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
@@ -1397,7 +1400,10 @@ def _make_prims_ts_decode_wrapper_trace(
         }
     )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",

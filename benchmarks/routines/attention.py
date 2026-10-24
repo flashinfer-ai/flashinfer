@@ -129,6 +129,13 @@ def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype):
     )
 
 
+def _prims_ts_decode_supports_head_dim(head_dim, q_dtype, kv_dtype):
+    """PrimTS decode supports H64/128/192/256, and H512 only for FP8 Q + NVFP4 KV."""
+    return head_dim in (64, 128, 192, 256) or (
+        head_dim == 512 and q_dtype == torch.float8_e4m3fn and kv_dtype == torch.uint8
+    )
+
+
 def _select_reference_output(outputs, priority):
     """Return the first available reference backend and output."""
     for backend in priority:
@@ -850,11 +857,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires matching K/V dtypes, except QK-BF16/PV-FP8",
             )
-        elif head_dim_qk != head_dim_vo or head_dim_qk not in (64, 128, 192, 256):
+        elif head_dim_qk != head_dim_vo or not _prims_ts_decode_supports_head_dim(
+            head_dim_qk, q_dtype, kv_dtype
+        ):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires equal QK/VO head dimensions in {64, 128, 192, 256}",
+                "requires equal QK/VO head dimensions in {64, 128, 192, 256}, "
+                "or 512 with FP8 Q and NVFP4 K/V",
             )
         elif page_size not in (4, 16, 32, 64, 128):
             _drop_backend(
