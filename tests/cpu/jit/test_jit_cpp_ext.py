@@ -503,3 +503,35 @@ def test_trusted_stamp_rehashes_source_contents(monkeypatch, tmp_path):
     source.write_text("__global__ void k() { /* changed */ }\n")
     spec.build()
     assert runs == [1, 1]  # content change re-runs ninja
+
+
+def test_trusted_stamp_rehashes_embedded_cubins(monkeypatch, tmp_path):
+    """A cubin regenerated in place under the same path must invalidate the
+    stamp even though the generated build.ninja is byte-identical."""
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(
+        core,
+        "generate_ninja_build_for_op",
+        lambda **kw: "ninja_required_version = 1.3\n",
+    )
+    runs = []
+    monkeypatch.setattr(core, "run_ninja", lambda *a, **k: runs.append(1))
+    monkeypatch.setenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", "1")
+
+    cubin = tmp_path / "kernel.cubin"
+    cubin.write_bytes(b"cubin-v1")
+    spec = core.gen_jit_spec(
+        name="stamp_cubin_module",
+        sources=[],
+        embedded_cubin_factory=lambda build_dir: {"kernel_cubin": cubin},
+    )
+    spec.build()
+    spec.jit_library_path.parent.mkdir(parents=True, exist_ok=True)
+    spec.jit_library_path.touch()
+    spec.build()
+    assert runs == [1]  # stamp trusted, ninja skipped
+
+    cubin.write_bytes(b"cubin-v2")
+    spec.build()
+    assert runs == [1, 1]  # cubin content change re-runs ninja

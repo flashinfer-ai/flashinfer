@@ -497,6 +497,10 @@ class JitSpecNvcc(JitSpec):
     post_load_adapter: Optional[Callable[[Any], Any]] = None
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None
     extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None
+    # Cubins the last write_ninja() embedded; hashed into the trusted stamp.
+    _embedded_cubin_paths: List[Path] = dataclasses.field(
+        default_factory=list, init=False, repr=False, compare=False
+    )
 
     @property
     def ninja_path(self) -> Path:
@@ -559,6 +563,9 @@ class JitSpecNvcc(JitSpec):
             if self.embedded_cubin_factory is not None
             else None
         )
+        self._embedded_cubin_paths = sorted(
+            Path(path) for path in (embedded_cubins or {}).values()
+        )
         content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -584,19 +591,25 @@ class JitSpecNvcc(JitSpec):
         """Digest of the build inputs the stamp vouches for.
 
         Covers the exact ``build.ninja`` contents (toolkit path, flags,
-        absolute source list) plus the contents of every listed source file,
-        so editing a source in place invalidates the stamp even though the
-        ninja file is unchanged. Transitively included headers are NOT
-        hashed — that residual risk is why the stamp is opt-in and aimed at
-        restored caches of released packages, not editable checkouts.
+        absolute source list) plus the contents of every listed source file
+        and every embedded cubin, so editing one of them in place invalidates
+        the stamp even though the ninja file is unchanged. Transitively
+        included headers are NOT hashed — that residual risk is why the stamp
+        is opt-in and aimed at restored caches of released packages, not
+        editable checkouts.
         """
         h = hashlib.sha256(self.ninja_path.read_bytes())
-        for src in sorted(Path(s) for s in self.sources):
-            h.update(str(src).encode())
-            try:
-                h.update(src.read_bytes())
-            except OSError:
-                h.update(b"<unreadable>")
+        inputs = (
+            ("source", sorted(Path(s) for s in self.sources)),
+            ("cubin", self._embedded_cubin_paths),
+        )
+        for kind, paths in inputs:
+            for path in paths:
+                h.update(f"{kind}:{path}".encode())
+                try:
+                    h.update(path.read_bytes())
+                except OSError:
+                    h.update(b"<unreadable>")
         return h.hexdigest()
 
     def _stamp_is_current(self) -> bool:
@@ -607,9 +620,10 @@ class JitSpecNvcc(JitSpec):
         freshly installed package always rebuilds from scratch: the reinstalled
         sources are newer than the restored objects even though every input is
         byte-identical (#4884). When ``FLASHINFER_JIT_TRUST_CACHE_STAMP=1``,
-        trust a stamp of the exact ``build.ninja`` contents instead — the ninja
-        file embeds the toolkit path, all flags and the absolute source list,
-        so any real change to the build inputs changes the digest. Off by
+        trust a stamp of the exact ``build.ninja`` contents and its listed
+        inputs instead — the ninja file embeds the toolkit path, all flags and
+        the absolute source list, so any real change to the build inputs
+        other than an included header changes the digest. Off by
         default: mtime scanning stays authoritative for editable checkouts
         where sources legitimately change within one version.
         """
