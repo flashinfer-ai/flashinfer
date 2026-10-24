@@ -2514,8 +2514,10 @@ def test_plan_odd_block_of_a_pair_plan_runs_alone_on_warpgroup_0():
 # the dequantized inputs (``_fp8_reference_exact``, atol = rtol = 5e-2) and (a) a replay of the kernel's
 # own precision boundary on the plan's schedule (``_fp8_reference_replay``, atol = rtol = 1e-2): per
 # warpgroup chain the lazy-max rule (a running maximum that only grows by more than ``FP8_MAX_GROWTH_LOG2``
-# triggers a rescale), ``P = exp2(s - m + FP8_P_QUANT_LOG2)`` rounded to E4M3 before the P.V product,
-# FP32 row sums of the unrounded P, chains folded with flash-decoding weights in the kernel's fixed order,
+# triggers a rescale), ``P = exp2(fma(s, qk_sc, FP8_P_QUANT_LOG2 - m))`` formed as the kernels form it (one
+# rounding of the argument, the device ``ex2.approx`` exponent; ``_fp8_sage_p``) rounded to E4M3 before the
+# P.V product, FP32 row sums of the unrounded P, chains folded with flash-decoding weights in the kernel's
+# fixed order,
 # ``acc * v_scale / l`` last, rounded to BF16.  The scores of every step and the P.V product of every
 # position are accumulated through the sm_90a FP8 WGMMA's own arithmetic (``_fp8_wgmma_scores`` /
 # ``_fp8_wgmma_pv``: 13 fractional bits below the step's largest term, truncation toward zero, a
@@ -2696,6 +2698,42 @@ def _fp8_reference_exact(q8, k8, v8, scales, mask, scale):
     return _reference(*_dequantize(q8, k8, v8, *scales), mask, scale)
 
 
+def _fp8_fma_rn(s, c, b):
+    """``fma(s, c, b)`` of float32 tensors rounded once to float32, exactly, through float64: the product is
+    exact in float64 (two 24-bit significands), the float64 sum ``hi`` carries its exact error ``lo`` (two-sum),
+    and ``hi`` rounds to float32 as the exact sum does unless ``hi`` is exactly a float32 midpoint, where the
+    sign of ``lo`` picks the side (ties to even only when ``lo == 0``)."""
+    p = s.double() * c.double()
+    bd = b.double()
+    hi = p + bd
+    bv = hi - p
+    lo = (p - (hi - bv)) + (bd - bv)
+    f = hi.float()
+    back = f.double()
+    toward = torch.where(
+        hi > back, torch.full_like(f, float("inf")), torch.full_like(f, float("-inf"))
+    )
+    other = torch.nextafter(f, toward)
+    midpoint = (back != hi) & (hi == (back + other.double()) / 2)
+    beyond = midpoint & (lo != 0) & (torch.sign(lo) == torch.sign(hi - back))
+    return torch.where(beyond, other, f)
+
+
+def _fp8_sage_p(scores, qk_scale, m):
+    """P x 2^FP8_P_QUANT_LOG2 of a step as the kernels form it: the argument ``fma(s, qk_sc, 8 - m)`` rounded
+    once (PTX ``fma.rn.ftz.f32``; :func:`_fp8_fma_rn`) and its exponent by the device ``ex2.approx.ftz.f32``
+    (``MUFU.EX2``), which ``torch.exp2`` of a CUDA float32 tensor reproduces bit for bit over the kernels'
+    argument range (measured: 0 of 1.1e6 replayed arguments and 0 of 4.2e6 sweep points in [-30, 8.81]
+    differ), its subnormal results flushed to zero as the instruction flushes them.  Three separate roundings
+    of ``s qk_sc - m + 8`` move the argument by a few float32 ulps and P by up to about ten ulps, which
+    crosses an E4M3 rounding boundary on a few elements per million."""
+    bias = (FP8_P_QUANT_LOG2 - m)[:, None]
+    s, c, b = torch.broadcast_tensors(scores.float(), qk_scale.float(), bias.float())
+    x = _fp8_fma_rn(s, c, b)
+    p = torch.exp2(x)
+    return torch.where(x < -126.0, torch.zeros_like(p), p)
+
+
 def _fp8_chain(
     qf_head,
     q_log2,
@@ -2746,7 +2784,7 @@ def _fp8_chain(
             grow & ~first, torch.exp2(m - new_max), torch.ones_like(m)
         )
         m = torch.where(grow, new_max, m)
-        p = torch.exp2(s_log2 - m[:, None] + FP8_P_QUANT_LOG2)
+        p = _fp8_sage_p(scores, qk_scale, m)
         p8 = p.to(FP8).float()
         if pv_accumulate == "fp8_wgmma":
             acc = _fp8_wgmma_pv(acc * rescale[:, None], p8, vf_head[tok])
