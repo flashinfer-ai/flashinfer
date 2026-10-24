@@ -251,6 +251,14 @@ the median of two independent frozen-winner validation processes.
 | B300 | 4 | 96.520 → 74.052 | 1.303× | 105.348 → 84.360 | 1.249× |
 | B300 | 8 | 161.608 → 143.004 | 1.130× | 170.176 → 153.292 | 1.110× |
 
+Larger experts reduce the margin even at T=1. With H7168/I2048/E256/K8,
+the same selection and validation procedure gives:
+
+| GPU | Warm CUTLASS → Frost µs | Speedup | Cold CUTLASS → Frost µs | Speedup |
+|---|---:|---:|---:|---:|
+| H100 | 228.776 → 201.276 | 1.137× | 238.188 → 211.036 | 1.129× |
+| B300 | 213.428 → 200.792 | 1.063× | 222.368 → 211.500 | 1.051× |
+
 Both backends pass the independent FP64-dot reference with BF16 intermediate
 and expert-output boundaries, packed BF16 routing scores, and FP32 combine
 (1% relative L2 / 3% normalized maximum; not bitwise equality). The complete
@@ -775,7 +783,7 @@ The same route-wise schedule supports MXFP8 weights without changing the
 pipeline. Hidden size, expert count, top-k and logical intermediate size are
 parameters; they are not tied to one checkpoint. A model can use it only when
 its activation and quantization semantics match the selected dtype contract.
-MX now shares all ten activation epilogues; NVFP4 uses its own group-16 E4M3
+MX now shares all eleven activation epilogues; NVFP4 uses its own group-16 E4M3
 quantizer and FMA bindings. They are not dtype aliases for the MX path.
 
 | Extension | What carries over | Remaining work |
@@ -964,7 +972,7 @@ per-expert weight scales. FC1 accumulates in FP32, applies the weight scale,
 rounds preactivation to BF16, applies the selected activation, then stores a
 BF16 intermediate. FC2 applies its weight scale, rounds each expert output to
 BF16, and combines using ordered FP32 multiply/add. Packed routing weights
-retain BF16 rounding. All ten typed activations and the existing FMA geometry,
+retain BF16 rounding. All eleven typed activations and the existing FMA geometry,
 token and top-k limits apply. This mode is explicit opt-in.
 
 ```mermaid
@@ -1124,7 +1132,7 @@ canonical E4M3 expert weights and arbitrary FP32 128×128 weight scales; it does
 not reinterpret the scales as MX powers of two or requantize checkpoint weights.
 The same numerical contract applies on SM90, SM100, SM103, SM107 and SM120.
 H and I must be positive multiples of 128, top-k at most 32, and tokens at most
-the configured limit (up to eight). All ten typed activations are supported.
+the configured limit (up to eight). All eleven typed activations are supported.
 
 ```mermaid
 flowchart LR
@@ -1247,7 +1255,7 @@ flowchart LR
 
 Hopper decodes E2M1 with integer bit operations; newer architectures reuse the
 native FP4 conversion. Every finite E2M1 × E4M3 product is exactly representable
-in FP16; the dot product still accumulates in FP32. The scheduling, ten typed
+in FP16; the dot product still accumulates in FP32. The scheduling, eleven typed
 activation classes, route validation and ordered combine are shared with the
 existing FMA implementations.
 
@@ -1313,7 +1321,7 @@ a multiple of 128. H must be divisible by 128 and logical I by 32.
 Unlike FP4-weight modes, MXINT4 retains FP32 FC1 preactivation. The typed
 activation and expert outputs round to BF16, and combine uses ordered FP32
 multiplication and addition. Packed routing scores retain BF16 rounding.
-All ten typed activations, packed/unpacked precomputed routes, and raw/final
+All eleven typed activations, packed/unpacked precomputed routes, and raw/final
 outputs use the existing scheduling and binding infrastructure. There is no
 activation quantizer or additional kernel launch.
 
