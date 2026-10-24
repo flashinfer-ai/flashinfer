@@ -310,7 +310,7 @@ kernel_cake_gdn_train_7c591421af4c01babb73(const __grid_constant__ CUtensorMap k
             int warp_in_wg = warp % 4;
             int lane_v = warp_in_wg * 32 + lane;
             int row_base = warp_in_wg * 32 << 16;
-            uint32_t warp_group_idx = static_cast<uint32_t>(tid) / 128u;
+            unsigned int warp_group_idx = ((unsigned int)tid - 0) / 128;
             int ch = warp_group_idx;
             int kc0 = ch * 64;
             int tc0 = ch * 32;
