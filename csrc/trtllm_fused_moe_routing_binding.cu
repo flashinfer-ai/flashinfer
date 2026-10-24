@@ -84,7 +84,8 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
   TVM_FFI_ICHECK(tile_tokens_dim >= 1 && (tile_tokens_dim & (tile_tokens_dim - 1)) == 0)
       << "tile_tokens_dim must be a positive power of two, got " << tile_tokens_dim;
   TVM_FFI_ICHECK(routing_method_type >= 0 &&
-                 routing_method_type < static_cast<int64_t>(RoutingMethodType::Unspecified))
+                 routing_method_type <= static_cast<int64_t>(RoutingMethodType::SqrtSoftplus) &&
+                 routing_method_type != static_cast<int64_t>(RoutingMethodType::Unspecified))
       << "invalid routing_method_type " << routing_method_type;
 
   // Expert-group validation. This is a public FFI entry point, so mirror the
