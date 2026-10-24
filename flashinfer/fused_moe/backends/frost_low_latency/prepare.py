@@ -160,3 +160,46 @@ def prepare_fp8_per_tensor_weights(w1_bf16, w2_bf16, **kwargs):
             fc2_expert_weights=second,
         )
     return view
+
+
+def prepare_fp8_weight_only_weights(w1, w1_scale, w2, w2_scale, activation):
+    """Preserve canonical E4M3 bytes and per-expert dequantization scales.
+
+    Unlike W8A8 preparation, these scales contain weight calibration only.
+    BF16 inputs and intermediates do not have quantization multipliers.
+    """
+    from .fma.activation_config import lower_activation
+
+    lower_activation(activation)
+    if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not w1.dtype:
+        raise TypeError("W8A16 requires two E4M3 weight tensors")
+    if w1.ndim != 3 or w2.ndim != 3:
+        raise ValueError("weights must be 3-D")
+    e, h, i = w2.shape
+    branches = 2 if activation.is_gated else 1
+    if e < 1 or h < 128 or h % 128 or i < 32 or i % 32:
+        raise ValueError("require positive E, H divisible by 128 and I divisible by 32")
+    if w1.shape != (e, branches * i, h):
+        raise ValueError(f"expected w1 shape {(e, branches * i, h)}")
+    if not w1.is_cuda or w2.device != w1.device:
+        raise ValueError("weights must be CUDA tensors on the same device")
+    for scale in (w1_scale, w2_scale):
+        if (
+            scale.dtype is not torch.float32
+            or scale.device != w1.device
+            or scale.shape != (e,)
+        ):
+            raise ValueError(f"weight scales must be FP32 [{e}] on {w1.device}")
+    physical = (i + 127) // 128 * 128
+    first = torch.zeros((e, branches, physical, h), dtype=torch.uint8, device=w1.device)
+    first[:, :, :i].copy_(w1.view(torch.uint8).reshape(e, branches, i, h))
+    second = torch.zeros((e, h, physical), dtype=torch.uint8, device=w2.device)
+    second[:, :, :i].copy_(w2.view(torch.uint8))
+    return dict(
+        fc1_expert_weights=first.view(e, branches * physical, h).view(w1.dtype),
+        fc2_expert_weights=second.view(w2.dtype),
+        fc1_dequant_scale=w1_scale.contiguous(),
+        fc2_dequant_scale=w2_scale.contiguous(),
+        # Retain the common binding layout; W8A16 does not read this field.
+        fc2_act_quant_scale=torch.ones((), device=w1.device, dtype=torch.float32),
+    )

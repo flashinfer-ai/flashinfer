@@ -2973,6 +2973,10 @@ class FrostLowLatencyConfig:
     The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
     contract differs even with identical quantized weights and scales.
 
+    E4M3 weight-only mode uses BF16 inputs and intermediates, with per-expert
+    FP32 weight scales. It shares the same FMA bodies, BF16 FC1 preactivation
+    and ordered output combine; no activation quantization is required.
+
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
     and top-k at most 32. It retains BF16 activation/expert rounding and
     separate FP32 multiply/add combine; the 4over6 recipe is not supported.
@@ -3045,6 +3049,21 @@ class FrostLowLatencyConfig:
             intermediate_size=intermediate_size,
             activation=activation,
             device=device,
+        )
+
+    @staticmethod
+    def prepare_fp8_weight_only_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Prepare E4M3 weights for BF16 inputs without requantizing the payload.
+
+        Canonical weights are [E, 2*I, H] in [up, gate] order, or [E, I, H]
+        for non-gated activation, and [E, H, I]. Each FP32 scale is [E] and
+        dequantizes that expert's weight matrix. Logical I is padded to 128.
+        Configure FP8PerTensor weights with BF16 activations and BF16 output.
+        """
+        from .backends.frost_low_latency.prepare import prepare_fp8_weight_only_weights
+
+        return prepare_fp8_weight_only_weights(
+            w1, w1_scale, w2, w2_scale, SwiGLU() if activation is None else activation
         )
 
     prepare_fp8_per_tensor_activations = staticmethod(

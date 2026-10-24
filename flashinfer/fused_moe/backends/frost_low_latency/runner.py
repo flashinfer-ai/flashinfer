@@ -25,6 +25,7 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.BF16, QuantFormat.BF16),
         (QuantFormat.FP16, QuantFormat.FP16),
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+        (QuantFormat.FP8PerTensor, QuantFormat.BF16),
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
     )
     supported_output_formats = (QuantFormat.BF16, QuantFormat.FP16)
@@ -35,6 +36,7 @@ class FrostLowLatencyRunner(MoERunner):
         (QuantFormat.BF16, QuantFormat.BF16): tuple(ACTIVATIONS),
         (QuantFormat.FP16, QuantFormat.FP16): tuple(ACTIVATIONS),
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): tuple(ACTIVATIONS),
+        (QuantFormat.FP8PerTensor, QuantFormat.BF16): tuple(ACTIVATIONS),
         (QuantFormat.NVFP4, QuantFormat.NVFP4): tuple(ACTIVATIONS),
     }
     supports_expert_parallelism = False

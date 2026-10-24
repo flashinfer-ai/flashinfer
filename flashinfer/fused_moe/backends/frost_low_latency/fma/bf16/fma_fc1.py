@@ -61,7 +61,12 @@ def _kernel(
             cutlass.Uint32 if x.element_type == cutlass.Float8E4M3FN else cutlass.Uint64
         )
         xp = cute.recast_ptr(x.iterator, dtype=word_type)
-        wp = cute.recast_ptr(weights.iterator, dtype=word_type)
+        weight_word_type = (
+            cutlass.Uint32
+            if weights.element_type == cutlass.Float8E4M3FN
+            else cutlass.Uint64
+        )
+        wp = cute.recast_ptr(weights.iterator, dtype=weight_word_type)
         # Four adjacent values per lane give coalesced word loads.
         # Accumulate in FP32; each format's rounding boundary is applied below.
         for group in range(h // 128):
@@ -84,7 +89,7 @@ def _kernel(
                 gate[0, o] + gate[1, o] + gate[2, o] + gate[3, o]
             )
         if lane == 0:
-            if cutlass.const_expr(x.element_type == cutlass.Float8E4M3FN):
+            if cutlass.const_expr(weights.element_type == cutlass.Float8E4M3FN):
                 if expert >= 0 and expert < cute.size(weights, mode=[0]):
                     u = u * dequant[expert]
                     g = g * dequant[expert]
