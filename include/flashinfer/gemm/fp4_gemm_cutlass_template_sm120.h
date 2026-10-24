@@ -217,6 +217,19 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
                                                  EpilogueScheduleType::AUTO, clusterShape, false,
                                                  true));
   }
+  // Append scheduler variants so persisted integer tactics retain their meaning.
+  // Limit the extra search to DP, where swizzle-8 raster choices are useful.
+  auto const legacyConfigCount = candidateConfigs.size();
+  for (size_t i = 0; i < legacyConfigCount; ++i) {
+    if (candidateConfigs[i].use_stream_k) continue;
+    for (auto raster :
+         {CutlassGemmConfig::RasterOrder::AlongM, CutlassGemmConfig::RasterOrder::AlongN}) {
+      auto config = candidateConfigs[i];
+      config.max_swizzle_size = 8;
+      config.raster_order = raster;
+      candidateConfigs.push_back(config);
+    }
+  }
   return candidateConfigs;
 }
 
