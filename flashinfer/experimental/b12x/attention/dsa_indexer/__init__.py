@@ -16,6 +16,13 @@ The production paged DSA lifecycle is ``plan(Caps(...), invocation=...)`` →
 ``PreparationSession.prepare`` → ``bind(Plan, ...)`` → ``run``.
 Declarations carry no executable layout, CUDA allocation, or policy result.
 Lower-level scorer and selector stages are private implementation facets.
+Prepared FP8 execution is opaque to ``torch.compile`` with explicit input,
+output and scratch operands. Fused selection resets merge counters each call
+so caller-owned scratch can be reused by serialized operators. Its unused
+score output occupies planned scratch without a per-call allocation.
+FP8 bindings may omit ``active_width`` to use the page-table extent directly.
+Dynamic width caps are caller-owned device inputs; scratch holds no initialized
+width parameter that must survive reuse or package export.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal, Sequence
 
 import torch
@@ -50,6 +51,8 @@ def infer_dense_mla_mode(
     return "decode" if all(length == 1 for length in q_lens) else "extend"
 
 
+# Planning revisits the same capacities for every layer and candidate config; the search is pure.
+@lru_cache(maxsize=None)
 def _wave_balanced_splits(
     *,
     num_chunks: int,

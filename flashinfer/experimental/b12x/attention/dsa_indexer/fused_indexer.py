@@ -51,11 +51,8 @@ from b12x.attention.dsa_indexer._tuning import (
     FUSED_MERGE_COOPERATIVE,
     FUSED_MERGE_SERIAL,
 )
-from b12x.attention.dsa_indexer.persistent_topk import (
-    _RADIX,
-    _RADIX_THRESHOLD,
-)
 from b12x.attention.dsa_indexer.tiled_topk import (
+    _RADIX,
     _SCAN_UNROLL,
     _SUPPORTED_TOPK,
     _THREADS_PER_CTA as _RADIX_THREADS,
@@ -105,12 +102,12 @@ from b12x._lib.intrinsics.memory import (
     st_shared_u8,
     st_shared_v4_u32,
 )
-from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
 from b12x._lib.intrinsics.sync import (
     ld_global_acquire_i32,
     spin_wait_global_ge_i32,
     threadfence,
 )
+from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
 
 # Triage kill-switch: B12X_INDEXER_DIRECT_K=0 forces every variant back to
 # the staged pipeline (which also restores the v2 cache keys), so serving can
@@ -123,9 +120,7 @@ _DIRECT_K_SCORE_ENABLED = os.environ.get("B12X_INDEXER_DIRECT_K", "1").lower() n
 }
 
 _THREADS_PER_CTA = 1024
-# Per-CTA K-slice cap (cooperative split granularity). Matches persistent_topk's
-# chunking knob; the fused kernel streams this slice through MMA sub-tiles rather
-# than materializing it.
+# Per-CTA K-slice cap; each CTA streams its slice through MMA sub-tiles.
 _MAX_CHUNK_ELEMENTS = 8192
 
 # Constexpr K/V-layout specialization (the ONLY contiguous-vs-paged divergence in the
@@ -296,7 +291,7 @@ def _align_up(value: int, multiple: int) -> int:
 def _resolve_fused_launch_config(
     num_rows: int, width: int, device: torch.device
 ) -> _FusedLaunchConfig:
-    """Row-cooperative split — cloned from persistent_topk._resolve_launch_config.
+    """Split query rows across cooperative CTA groups.
 
     One group owns one query row; ``ctas_per_group`` CTAs split the row's K of
     ``width`` tokens; groups persist grid-stride over rows.
@@ -382,6 +377,9 @@ def _fused_group_barrier(
 ) -> Int32:
     """Grid barrier over the group's CTAs on the arrival counter; returns the next phase."""
     arrival_ptr = _fused_state_ptr(state, group_id, Int32(_FUSED_STATE_ARRIVAL))
+    # Every warp publishes histogram bins. Thread zero may announce this
+    # CTA's arrival only after those writes precede its release operation.
+    cute.arch.sync_threads()
     if tx == Int32(0):
         red_add_global_release_i32(arrival_ptr, Int32(1))
         spin_wait_global_ge_i32(arrival_ptr, (phase + Int32(1)) * ctas_per_group)

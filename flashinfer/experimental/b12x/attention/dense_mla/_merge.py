@@ -12,13 +12,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled, pack_f32x2_to_bfloat2
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v2_u32,
     ld_global_v4_f32,
     st_global_v2_u32,
 )
-from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled, pack_f32x2_to_bfloat2
 
 from ._math import exp2_approx, log2_approx
 

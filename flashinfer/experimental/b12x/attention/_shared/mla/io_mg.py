@@ -12,13 +12,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32, Uint64
 
-from b12x._lib.intrinsics.atomics import st_shared_u32
 from b12x._lib.intrinsics.memory import (
     cp_async_bulk_g2s_mbar_l2hint,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
     shared_ptr_to_u32,
 )
+from b12x._lib.intrinsics.atomics import st_shared_u32
 from .io import stage_dsv41_fp8_scales
 
 _DSV4_IO_STRIDE = 576

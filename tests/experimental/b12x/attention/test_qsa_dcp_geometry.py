@@ -122,7 +122,7 @@ def _boundary_binding(dcp_size: int) -> contract.Binding:
     )
     programs = object.__new__(contract.QsaPrograms)
     for field in fields(contract.QsaPrograms):
-        object.__setattr__(programs, field.name, None if field.name == "score" else {})
+        object.__setattr__(programs, field.name, {})
     values = {field.name: None for field in fields(contract.Binding)}
     values.update(
         state=SimpleNamespace(

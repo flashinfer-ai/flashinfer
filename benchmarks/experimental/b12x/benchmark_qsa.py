@@ -857,7 +857,6 @@ def _prepare_case(
 ) -> PreparedCase:
     kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
     caps = _make_caps(case, device, kv_dtype=kv_dtype)
-    declaration = qsa.plan(caps)
     generator = torch.Generator(device=device).manual_seed(seed)
 
     main_cache_shape = (
@@ -1065,6 +1064,19 @@ def _prepare_case(
         ),
     }
 
+    operands = {
+        name: value
+        for name, value in binding_args.items()
+        if name not in {"k_descale", "v_descale", "output", "selected_positions"}
+    }
+    operands.update(
+        (name, dynamic[name])
+        for name in ("request_ids", "rope_positions", "index_query", "raw_index_key")
+    )
+    declaration = qsa.plan(
+        caps, invocation=qsa.invocation_from_tensors(caps, **operands)
+    )
+
     prepared_selector_query = gemma_rmsnorm_reference(
         index_query,
         q_weight,
@@ -1125,7 +1137,7 @@ def _prepare_case(
                 value.copy_(original)
 
         return PreparedCall(
-            run=lambda: qsa.run(binding, **dynamic),
+            run=lambda: state.run_for_preparation(binding, **dynamic),
             reset=restore,
             restore=restore,
             owners=(binding,),

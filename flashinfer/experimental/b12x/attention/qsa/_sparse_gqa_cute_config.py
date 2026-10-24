@@ -11,7 +11,12 @@ from ..paged._selected_forward_config import (
 )
 
 BLOCK_N = 16
-MAX_SPLIT_ROWS = 64
+MAX_SPLIT_ROWS = 128
+
+
+def split_row_limit(kv_heads: int) -> int:
+    # Single-head shards need more rows to fill the GPU without splitting.
+    return MAX_SPLIT_ROWS if int(kv_heads) == 1 else 64
 
 
 def _is_page_token_head_layout(tensor: torch.Tensor) -> bool:
@@ -47,7 +52,7 @@ def is_qwen_geometry(
         int(q_heads) > 0
         and int(kv_heads) > 0
         and int(q_heads) % int(kv_heads) == 0
-        and int(head_dim) == HEAD_DIM
+        and int(head_dim) in (192, HEAD_DIM)
         and int(selection_width) >= SELECTION_WIDTH
         and int(block_n) == BLOCK_N
         and splits > 0
@@ -77,7 +82,7 @@ def is_candidate(
         or value_cache.ndim != 4
         or block_table.ndim != 2
         or request_ids.ndim != 1
-        or selected_positions.ndim != 2
+        or selected_positions.ndim not in (2, 3)
         or query_positions.ndim != 1
         or partial_output.ndim != 4
         or partial_lse.ndim != 3
@@ -91,12 +96,12 @@ def is_candidate(
             q_heads=q_heads,
             kv_heads=head_layout[1],
             head_dim=head_dim,
-            selection_width=int(selected_positions.shape[1]),
+            selection_width=int(selected_positions.shape[-1]),
             block_n=block_n,
             splits=splits,
         )
         and int(key_cache.shape[0]) > 0
-        and int(key_cache.shape[3]) == HEAD_DIM
+        and int(key_cache.shape[3]) == head_dim
         and int(selected_positions.shape[0]) >= rows
     ):
         return False
@@ -137,7 +142,7 @@ def is_candidate(
         and tuple(request_ids.shape) == (rows,)
         and tuple(query_positions.shape) == (rows,)
         and int(partial_output.shape[0]) >= rows
-        and tuple(partial_output.shape[1:]) == (int(splits), q_heads, HEAD_DIM)
+        and tuple(partial_output.shape[1:]) == (int(splits), q_heads, head_dim)
         and int(partial_lse.shape[0]) >= rows
         and tuple(partial_lse.shape[1:]) == (int(splits), q_heads)
     )
@@ -147,6 +152,7 @@ __all__ = [
     "BLOCK_N",
     "HEAD_DIM",
     "MAX_SPLIT_ROWS",
+    "split_row_limit",
     "NUM_SPLITS",
     "SELECTION_WIDTH",
     "is_candidate",

@@ -45,14 +45,15 @@ from b12x._lib.compile_plan import (
     program_keys,
     record_program,
 )
+from b12x._lib.intrinsics.packed import fp8x4_e4m3_to_bfloat2x2_native_sm120
 from b12x._lib.intrinsics.memory import (
     ld_global_nc_v4_u32,
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
-from b12x._lib.intrinsics.packed import fp8x4_e4m3_to_bfloat2x2_native_sm120
 from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
+from b12x._lib.program_cache import register_program_cache
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
@@ -69,6 +70,8 @@ _KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: dict[tuple[object, ...], Callable[..., None]] = {}
 _MERGE_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _MERGE_WARMED: dict[tuple[object, ...], Callable[..., None]] = {}
+register_program_cache(_KERNEL_CACHE, mirrors=(_WARMED,), lock=_LOCK)
+register_program_cache(_MERGE_CACHE, mirrors=(_MERGE_WARMED,), lock=_LOCK)
 
 
 def _add(left: Float32, right: Float32) -> Float32:
@@ -90,6 +93,43 @@ def _exp2_approx(value: Float32, *, loc=None, ip=None) -> Float32:
             ip=ip,
         )
     )
+
+
+def _output_gate_stride(gate: torch.Tensor | None, output: torch.Tensor) -> int:
+    if gate is None:
+        return -1
+    if (
+        gate.ndim != 2
+        or gate.shape[0] < output.shape[0]
+        or gate.shape[1] != output.shape[1]
+        or gate.dtype != torch.bfloat16
+        or gate.device != output.device
+        or gate.stride(1) != 1
+        or gate.stride(0) < gate.shape[1]
+    ):
+        raise ValueError(
+            "output_gate must be BF16 [rows, q_heads] with unit head stride on the output device"
+        )
+    return int(gate.stride(0))
+
+
+@cute.jit
+def _gated_output(
+    value: Float32,
+    gate: cute.Pointer,
+    row: Int64,
+    head: Int64,
+    gate_stride: cutlass.Constexpr[int],
+) -> BFloat16:
+    # Preserve BF16 attention and sigmoid rounding before the gated product.
+    rounded = BFloat16(value)
+    if const_expr(gate_stride >= 0):
+        logit = Float32(gate[row * Int64(gate_stride) + head])
+        scale = BFloat16(
+            Float32(1.0) / (Float32(1.0) + cute.math.exp(-logit, fastmath=True))
+        )
+        rounded = BFloat16(Float32(rounded) * Float32(scale))
+    return rounded
 
 
 @dsl_user_op
@@ -140,10 +180,23 @@ class _SelectedPositionPagedForwardKernel:
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
         selection_width: int = _SELECTION_WIDTH,
+        head_dim: int = _HEAD_DIM,
+        selection_groups: int = 1,
+        first_position: int = -1,
+        gate_stride: int = -1,
     ) -> None:
         self.q_heads = int(q_heads)
+        self.head_dim = int(head_dim)
+        self.gate_stride = int(gate_stride)
+        if self.head_dim not in (192, 256):
+            raise ValueError("selected-position attention requires head_dim 192 or 256")
+        self.selection_groups = int(selection_groups)
+        if self.selection_groups not in (1, int(kv_heads)):
+            raise ValueError("selection groups must be one or the number of KV heads")
+        self.first_position = int(first_position)
+        self.circular = self.first_position >= 0
         self.selection_width = int(selection_width)
-        if self.selection_width < _SELECTION_WIDTH:
+        if self.selection_width < _SELECTION_WIDTH and not self.circular:
             raise ValueError("selected-position capacity must cover the QSA selection")
         self.kv_heads = int(kv_heads)
         self.heads_per_kv = self.q_heads // self.kv_heads
@@ -169,9 +222,9 @@ class _SelectedPositionPagedForwardKernel:
             self.value_token_stride,
             self.value_head_stride,
         ) = map(int, value_strides)
-        self.shared_cache_strides = tuple(map(int, key_strides)) == tuple(
-            map(int, value_strides)
-        )
+        self.shared_cache_strides = not self.circular and tuple(
+            map(int, key_strides)
+        ) == tuple(map(int, value_strides))
         self.qk_warps = 1 if self.heads_per_kv <= 16 else 2
         self.pv_warps = self.qk_warps * 4
         self.tile_m = self.qk_warps * 16
@@ -205,9 +258,13 @@ class _SelectedPositionPagedForwardKernel:
         x2 = Uint32(0)
         x3 = Uint32(0)
         if source_base >= Int64(0):
-            x0, x1, x2, x3 = ld_global_nc_v4_u32(
-                _pointer_as_int64(source, source_base + dimension_base.to(Int64))
-            )
+            if const_expr(self.circular):
+                address = source_base + dimension_base.to(Int64)
+            else:
+                address = _pointer_as_int64(
+                    source, source_base + dimension_base.to(Int64)
+                )
+            x0, x1, x2, x3 = ld_global_nc_v4_u32(address)
         y00, y01 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x0)
         y10, y11 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x1)
         y20, y21 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x2)
@@ -287,6 +344,8 @@ class _SelectedPositionPagedForwardKernel:
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        output_gate: cute.Pointer,
+        continuation: tuple,
         num_cache_pages: Int64,
         table_batch: Int64,
         table_width: Int64,
@@ -313,6 +372,8 @@ class _SelectedPositionPagedForwardKernel:
             partial_output,
             partial_lse,
             output,
+            output_gate,
+            continuation,
             num_cache_pages,
             table_batch,
             table_width,
@@ -344,6 +405,7 @@ class _SelectedPositionPagedForwardKernel:
         value_cache: cute.Pointer,
         block_table: cute.Pointer,
         selected_positions: cute.Pointer,
+        continuation: tuple,
         key_bases: cute.Tensor,
         value_bases: cute.Tensor,
         shared_query: cute.Tensor,
@@ -376,45 +438,90 @@ class _SelectedPositionPagedForwardKernel:
         if column < Int32(self.tile_n):
             selected_column = tile * Int32(self.tile_n) + column
             valid = request_valid & (selected_column < Int32(self.selection_width))
-            logical_position = Int64(-1)
-            if valid:
-                selected_offset = row.to(Int64) * Int64(
-                    self.selection_width
-                ) + selected_column.to(Int64)
-                logical_position = selected_positions[selected_offset].to(Int64)
-                valid = (logical_position >= Int64(0)) & (
-                    logical_position <= query_position
-                )
-
-            physical_page = Int64(-1)
-            page_offset = Int64(0)
-            if valid:
-                logical_page = logical_position // Int64(self.page_size)
-                valid = logical_page < table_width
-                if valid:
-                    table_offset = request_id * table_width + logical_page
-                    physical_page = block_table[table_offset].to(Int64)
-                    valid = (physical_page >= Int64(0)) & (
-                        physical_page < num_cache_pages
-                    )
-                    page_offset = logical_position % Int64(self.page_size)
-
             key_base = Int64(-1)
             value_base = Int64(-1)
-            if valid:
-                key_base = (
-                    physical_page * Int64(self.key_page_stride)
-                    + page_offset * Int64(self.key_token_stride)
-                    + kv_head.to(Int64) * Int64(self.key_head_stride)
-                )
-                if const_expr(self.shared_cache_strides):
-                    value_base = key_base
-                else:
-                    value_base = (
-                        physical_page * Int64(self.value_page_stride)
-                        + page_offset * Int64(self.value_token_stride)
-                        + kv_head.to(Int64) * Int64(self.value_head_stride)
+            if const_expr(self.circular):
+                candidate_key, candidate_value, starts, begins, states = continuation
+                if valid:
+                    logical_position = (
+                        query_position
+                        - Int64(self.selection_width - 1)
+                        + selected_column.to(Int64)
                     )
+                    valid = (logical_position >= Int64(self.first_position)) & (
+                        query_position >= Int64(self.first_position)
+                    )
+                    start = starts[request_id].to(Int64)
+                    state = states[request_id].to(Int64)
+                    valid = valid & (state > Int64(0)) & (state < num_cache_pages)
+                    if valid:
+                        if logical_position < start:
+                            offset = (
+                                state * Int64(self.key_page_stride)
+                                + (logical_position % Int64(self.page_size))
+                                * Int64(self.key_token_stride)
+                                + kv_head.to(Int64) * Int64(self.key_head_stride)
+                            )
+                            key_base = _pointer_as_int64(key_cache, offset)
+                            offset = (
+                                state * Int64(self.value_page_stride)
+                                + (logical_position % Int64(self.page_size))
+                                * Int64(self.value_token_stride)
+                                + kv_head.to(Int64) * Int64(self.value_head_stride)
+                            )
+                            value_base = _pointer_as_int64(value_cache, offset)
+                        else:
+                            token = (
+                                begins[request_id].to(Int64) + logical_position - start
+                            )
+                            offset = (
+                                token * Int64(self.kv_heads) + kv_head.to(Int64)
+                            ) * Int64(self.head_dim)
+                            key_base = _pointer_as_int64(candidate_key, offset)
+                            value_base = _pointer_as_int64(candidate_value, offset)
+            else:
+                logical_position = Int64(-1)
+                if valid:
+                    selection_row = row.to(Int64) * Int64(self.selection_groups)
+                    if const_expr(self.selection_groups > 1):
+                        selection_row += kv_head.to(Int64)
+                    selected_offset = selection_row * Int64(
+                        self.selection_width
+                    ) + selected_column.to(Int64)
+                    logical_position = selected_positions[selected_offset].to(Int64)
+                    valid = (logical_position >= Int64(0)) & (
+                        logical_position <= query_position
+                    )
+
+                physical_page = Int64(-1)
+                page_offset = Int64(0)
+                if valid:
+                    logical_page = logical_position // Int64(self.page_size)
+                    valid = logical_page < table_width
+                    if valid:
+                        table_offset = request_id * table_width + logical_page
+                        physical_page = block_table[table_offset].to(Int64)
+                        valid = (physical_page >= Int64(0)) & (
+                            physical_page < num_cache_pages
+                        )
+                        page_offset = logical_position % Int64(self.page_size)
+
+                key_base = Int64(-1)
+                value_base = Int64(-1)
+                if valid:
+                    key_base = (
+                        physical_page * Int64(self.key_page_stride)
+                        + page_offset * Int64(self.key_token_stride)
+                        + kv_head.to(Int64) * Int64(self.key_head_stride)
+                    )
+                    if const_expr(self.shared_cache_strides):
+                        value_base = key_base
+                    else:
+                        value_base = (
+                            physical_page * Int64(self.value_page_stride)
+                            + page_offset * Int64(self.value_token_stride)
+                            + kv_head.to(Int64) * Int64(self.value_head_stride)
+                        )
             key_bases[column] = key_base
             if const_expr(not self.shared_cache_strides):
                 value_bases[column] = value_base
@@ -433,8 +540,12 @@ class _SelectedPositionPagedForwardKernel:
                 value_base = key_base
                 if const_expr(not self.shared_cache_strides):
                     value_base = Int64(value_bases[token])
-                key_valid = key_base >= Int64(0)
-                value_valid = value_base >= Int64(0)
+                key_valid = (key_base >= Int64(0)) & (
+                    dimension_base < Int32(self.head_dim)
+                )
+                value_valid = (value_base >= Int64(0)) & (
+                    dimension_base < Int32(self.head_dim)
+                )
                 safe_key_base = Int64(cutlass.select_(key_valid, key_base, Int64(0)))
                 safe_value_base = Int64(
                     cutlass.select_(value_valid, value_base, Int64(0))
@@ -453,20 +564,28 @@ class _SelectedPositionPagedForwardKernel:
                         shared_value.layout,
                     )
                 )
+                key_address = Int64(0)
+                value_address = Int64(0)
+                if const_expr(self.circular):
+                    key_address = safe_key_base + dimension_base.to(Int64) * Int64(2)
+                    value_address = safe_value_base + dimension_base.to(Int64) * Int64(
+                        2
+                    )
+                else:
+                    key_address = _pointer_as_int64(
+                        key_cache, safe_key_base + dimension_base.to(Int64)
+                    )
+                    value_address = _pointer_as_int64(
+                        value_cache, safe_value_base + dimension_base.to(Int64)
+                    )
                 _cp_async_load_128b_zfill(
                     key_destination,
-                    _pointer_as_int64(
-                        key_cache,
-                        safe_key_base + dimension_base.to(Int64),
-                    ),
+                    key_address,
                     cutlass.select_(key_valid, Int32(16), Int32(0)),
                 )
                 _cp_async_load_128b_zfill(
                     value_destination,
-                    _pointer_as_int64(
-                        value_cache,
-                        safe_value_base + dimension_base.to(Int64),
-                    ),
+                    value_address,
                     cutlass.select_(value_valid, Int32(16), Int32(0)),
                 )
             cute.arch.cp_async_commit_group()
@@ -483,20 +602,51 @@ class _SelectedPositionPagedForwardKernel:
                 value_base = key_base
                 if const_expr(not self.shared_cache_strides):
                     value_base = Int64(value_bases[token])
-                self._load_fp8_vector_to_bf16_shared(
-                    key_cache,
-                    key_base,
-                    shared_key,
-                    token,
-                    dimension_base,
-                )
-                self._load_fp8_vector_to_bf16_shared(
-                    value_cache,
-                    value_base,
-                    shared_value,
-                    token,
-                    dimension_base,
-                )
+                if dimension_base >= Int32(self.head_dim):
+                    key_base = value_base = Int64(-1)
+                candidate = False
+                if const_expr(self.circular):
+                    if key_base >= Int64(0):
+                        position = (
+                            query_position
+                            - Int64(self.selection_width - 1)
+                            + tile.to(Int64) * Int64(self.tile_n)
+                            + token.to(Int64)
+                        )
+                        candidate = position >= continuation[2][request_id].to(Int64)
+                if candidate:
+                    # Circular candidates retain BF16 until accepted into FP8 history.
+                    for half in cutlass.range_constexpr(2):
+                        dimension = dimension_base + Int32(half * 8)
+                        key_address = key_base + dimension.to(Int64) * Int64(2)
+                        value_address = value_base + dimension.to(Int64) * Int64(2)
+                        key_words = ld_global_nc_v4_u32(key_address)
+                        value_words = ld_global_nc_v4_u32(value_address)
+                        key_destination = shared_ptr_to_u32(
+                            shared_key.iterator
+                            + cute.crd2idx((token, dimension), shared_key.layout)
+                        )
+                        value_destination = shared_ptr_to_u32(
+                            shared_value.iterator
+                            + cute.crd2idx((token, dimension), shared_value.layout)
+                        )
+                        st_shared_v4_u32(key_destination, *key_words)
+                        st_shared_v4_u32(value_destination, *value_words)
+                else:
+                    self._load_fp8_vector_to_bf16_shared(
+                        key_cache,
+                        key_base,
+                        shared_key,
+                        token,
+                        dimension_base,
+                    )
+                    self._load_fp8_vector_to_bf16_shared(
+                        value_cache,
+                        value_base,
+                        shared_value,
+                        token,
+                        dimension_base,
+                    )
         cute.arch.sync_threads()
 
         if thread < Int32(self.qk_warps * 32):
@@ -585,6 +735,8 @@ class _SelectedPositionPagedForwardKernel:
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        output_gate: cute.Pointer,
+        continuation: tuple,
         num_cache_pages: Int64,
         table_batch: Int64,
         table_width: Int64,
@@ -656,11 +808,13 @@ class _SelectedPositionPagedForwardKernel:
             local_head = query_element // Int32(_HEAD_DIM)
             dimension = query_element - local_head * Int32(_HEAD_DIM)
             query_value = Float32(0.0)
-            if local_head < Int32(self.heads_per_kv):
+            if (local_head < Int32(self.heads_per_kv)) & (
+                dimension < Int32(self.head_dim)
+            ):
                 query_head = first_query_head + local_head
                 query_offset = (
                     row.to(Int64) * Int64(self.q_heads) + query_head.to(Int64)
-                ) * Int64(_HEAD_DIM) + dimension.to(Int64)
+                ) * Int64(self.head_dim) + dimension.to(Int64)
                 query_value = Float32(query[query_offset])
             shared_query[local_head, dimension] = BFloat16(query_value)
             query_element += Int32(self.threads)
@@ -738,6 +892,7 @@ class _SelectedPositionPagedForwardKernel:
             value_cache,
             block_table,
             selected_positions,
+            continuation,
             key_bases,
             value_bases,
             shared_query,
@@ -779,6 +934,7 @@ class _SelectedPositionPagedForwardKernel:
                 value_cache,
                 block_table,
                 selected_positions,
+                continuation,
                 key_bases,
                 value_bases,
                 shared_query,
@@ -843,21 +999,29 @@ class _SelectedPositionPagedForwardKernel:
             if const_expr(self.direct_output)
             else (row.to(Int64) * splits.to(Int64) + split.to(Int64))
             * Int64(self.q_heads)
-        ) * Int64(_HEAD_DIM)
+        ) * Int64(self.head_dim)
         for m in cutlass.range_constexpr(cute.size(output_mn.shape[0])):
             scale = Float32(shared_row_scale[output_coordinates[m, 0][0]])
             output_mn[m, None].store(output_mn[m, None].load() * scale)
             for n in cutlass.range_constexpr(cute.size(output_mn.shape[1])):
                 coordinate = output_coordinates[m, n]
-                if coordinate[0] < Int32(self.heads_per_kv):
+                if (coordinate[0] < Int32(self.heads_per_kv)) & (
+                    coordinate[1] < Int32(self.head_dim)
+                ):
                     query_head = first_query_head + coordinate[0]
                     offset = (
                         output_base
-                        + query_head.to(Int64) * Int64(_HEAD_DIM)
+                        + query_head.to(Int64) * Int64(self.head_dim)
                         + coordinate[1].to(Int64)
                     )
                     if const_expr(self.direct_output):
-                        output[offset] = BFloat16(output_mn[m, n])
+                        output[offset] = _gated_output(
+                            output_mn[m, n],
+                            output_gate,
+                            row.to(Int64),
+                            query_head.to(Int64),
+                            self.gate_stride,
+                        )
                     else:
                         partial_output[offset] = Float32(output_mn[m, n])
 
@@ -865,9 +1029,18 @@ class _SelectedPositionPagedForwardKernel:
 class _SparseGqaMergeKernel:
     """Merge FP32 split-softmax partials into caller-owned BF16 output."""
 
-    def __init__(self, *, q_heads: int, return_lse: bool) -> None:
+    def __init__(
+        self,
+        *,
+        q_heads: int,
+        return_lse: bool,
+        head_dim: int = _HEAD_DIM,
+        gate_stride: int = -1,
+    ) -> None:
         self.q_heads = int(q_heads)
         self.return_lse = bool(return_lse)
+        self.head_dim = int(head_dim)
+        self.gate_stride = int(gate_stride)
 
     @cute.jit
     def __call__(
@@ -876,11 +1049,14 @@ class _SparseGqaMergeKernel:
         partial_lse: cute.Pointer,
         output: cute.Pointer,
         output_lse: cute.Pointer,
+        output_gate: cute.Pointer,
         rows: Int32,
         splits: Int32,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(partial_output, partial_lse, output, output_lse, splits).launch(
+        self.kernel(
+            partial_output, partial_lse, output, output_lse, output_gate, splits
+        ).launch(
             grid=(self.q_heads, rows, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -893,6 +1069,7 @@ class _SparseGqaMergeKernel:
         partial_lse: cute.Pointer,
         output: cute.Pointer,
         output_lse: cute.Pointer,
+        output_gate: cute.Pointer,
         splits: Int32,
     ) -> None:
         query_head, row, _ = cute.arch.block_idx()
@@ -950,19 +1127,19 @@ class _SparseGqaMergeKernel:
 
         # Adjacent lanes load adjacent head dimensions. Preserve the original
         # split-pair accumulation and ascending butterfly reduction order.
-        for tile in cutlass.range_constexpr(_HEAD_DIM // _THREADS):
+        for tile in cutlass.range_constexpr((self.head_dim + _THREADS - 1) // _THREADS):
             dimension = thread_i + Int32(tile * _THREADS)
             partials = cute.make_rmem_tensor((32,), Float32)
             for split_lane in cutlass.range_constexpr(32):
                 total = Float32(0.0)
                 for slot in cutlass.range_constexpr(_NUM_SPLITS // 32):
                     split = Int32(split_lane + slot * 32)
-                    if split < splits:
+                    if (split < splits) & (dimension < Int32(self.head_dim)):
                         offset = (
                             (row_i * splits.to(Int64) + split.to(Int64))
                             * Int64(self.q_heads)
                             + head_i
-                        ) * Int64(_HEAD_DIM) + dimension.to(Int64)
+                        ) * Int64(self.head_dim) + dimension.to(Int64)
                         total += Float32(partial_output[offset]) * Float32(
                             shared_weights[split]
                         )
@@ -973,9 +1150,16 @@ class _SparseGqaMergeKernel:
                     right = left + (1 << stage)
                     partials[left] = Float32(partials[left]) + Float32(partials[right])
             output_offset = (row_i * Int64(self.q_heads) + head_i) * Int64(
-                _HEAD_DIM
+                self.head_dim
             ) + dimension.to(Int64)
-            output[output_offset] = BFloat16(Float32(partials[0]) * inverse)
+            if dimension < Int32(self.head_dim):
+                output[output_offset] = _gated_output(
+                    Float32(partials[0]) * inverse,
+                    output_gate,
+                    row_i,
+                    head_i,
+                    self.gate_stride,
+                )
 
 
 class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
@@ -988,12 +1172,15 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
         partial_lse: cute.Pointer,
         output: cute.Pointer,
         output_lse: cute.Pointer,
+        output_gate: cute.Pointer,
         rows: Int32,
         splits: Int32,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(partial_output, partial_lse, output, output_lse, splits).launch(
-            grid=(self.q_heads, rows, _HEAD_DIM // 32),
+        self.kernel(
+            partial_output, partial_lse, output, output_lse, output_gate, splits
+        ).launch(
+            grid=(self.q_heads, rows, self.head_dim // 32),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -1005,6 +1192,7 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
         partial_lse: cute.Pointer,
         output: cute.Pointer,
         output_lse: cute.Pointer,
+        output_gate: cute.Pointer,
         splits: Int32,
     ) -> None:
         query_head, row, tile = cute.arch.block_idx()
@@ -1073,7 +1261,7 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
                         (row_i * splits.to(Int64) + split.to(Int64))
                         * Int64(self.q_heads)
                         + head_i
-                    ) * Int64(_HEAD_DIM) + dimension
+                    ) * Int64(self.head_dim) + dimension
                     total += Float32(partial_output[offset]) * Float32(
                         shared_weights[split]
                     )
@@ -1098,20 +1286,39 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
             )
             dimension = Int64(tile) * Int64(32) + column.to(Int64)
             offset = (row_i * Int64(self.q_heads) + head_i) * Int64(
-                _HEAD_DIM
+                self.head_dim
             ) + dimension
-            output[offset] = BFloat16((low + high) * inverse)
+            output[offset] = _gated_output(
+                (low + high) * inverse, output_gate, row_i, head_i, self.gate_stride
+            )
 
 
 class _ShapeAdaptiveSparseGqaMergeKernel:
     """Trade split parallelism for independent query rows in one compiled callable."""
 
-    def __init__(self, *, q_heads: int, return_lse: bool) -> None:
+    def __init__(
+        self,
+        *,
+        q_heads: int,
+        return_lse: bool,
+        head_dim: int = _HEAD_DIM,
+        gate_stride: int = -1,
+    ) -> None:
         self.q_heads = q_heads
         self.return_lse = bool(return_lse)
-        self.serial = _SparseGqaMergeKernel(q_heads=q_heads, return_lse=return_lse)
+        self.head_dim = int(head_dim)
+        self.gate_stride = int(gate_stride)
+        self.serial = _SparseGqaMergeKernel(
+            q_heads=q_heads,
+            return_lse=return_lse,
+            head_dim=head_dim,
+            gate_stride=gate_stride,
+        )
         self.cooperative = _CooperativeSparseGqaMergeKernel(
-            q_heads=q_heads, return_lse=return_lse
+            q_heads=q_heads,
+            return_lse=return_lse,
+            head_dim=head_dim,
+            gate_stride=gate_stride,
         )
 
     @cute.jit
@@ -1121,6 +1328,7 @@ class _ShapeAdaptiveSparseGqaMergeKernel:
         partial_lse: cute.Pointer,
         output: cute.Pointer,
         output_lse: cute.Pointer,
+        output_gate: cute.Pointer,
         rows: Int32,
         splits: Int32,
         stream: cuda.CUstream,
@@ -1129,7 +1337,7 @@ class _ShapeAdaptiveSparseGqaMergeKernel:
         # across head dimensions. Both branches preserve the same reduction tree.
         if rows > splits:
             self.serial.kernel(
-                partial_output, partial_lse, output, output_lse, splits
+                partial_output, partial_lse, output, output_lse, output_gate, splits
             ).launch(
                 grid=(self.q_heads, rows, 1),
                 block=(_THREADS, 1, 1),
@@ -1137,9 +1345,9 @@ class _ShapeAdaptiveSparseGqaMergeKernel:
             )
         else:
             self.cooperative.kernel(
-                partial_output, partial_lse, output, output_lse, splits
+                partial_output, partial_lse, output, output_lse, output_gate, splits
             ).launch(
-                grid=(self.q_heads, rows, _HEAD_DIM // 32),
+                grid=(self.q_heads, rows, self.head_dim // 32),
                 block=(_THREADS, 1, 1),
                 stream=stream,
             )
@@ -1158,6 +1366,9 @@ def _cache_key(
     return_lse: bool,
     kv_warps: int,
     selection_width: int = _SELECTION_WIDTH,
+    selection_groups: int = 1,
+    first_position: int = -1,
+    gate_stride: int = -1,
 ) -> tuple[object, ...]:
     device_index = query.device.index
     if device_index is None:
@@ -1175,6 +1386,10 @@ def _cache_key(
         bool(return_lse) if direct_output else True,
         int(kv_warps),
         int(selection_width),
+        int(query.shape[-1]),
+        int(selection_groups),
+        int(first_position),
+        int(gate_stride) if direct_output else -1,
     )
 
 
@@ -1209,6 +1424,9 @@ def _compile(
     return_lse: bool,
     kv_warps: int,
     selection_width: int = _SELECTION_WIDTH,
+    selection_groups: int = 1,
+    first_position: int = -1,
+    output_gate: torch.Tensor | None = None,
 ) -> tuple[tuple[object, ...], Callable[..., None]]:
     key = _cache_key(
         query,
@@ -1219,6 +1437,9 @@ def _compile(
         return_lse=return_lse,
         kv_warps=kv_warps,
         selection_width=selection_width,
+        selection_groups=selection_groups,
+        first_position=first_position,
+        gate_stride=_output_gate_stride(output_gate, query),
     )
     with _LOCK:
         cached = _KERNEL_CACHE.get(key)
@@ -1237,6 +1458,10 @@ def _compile(
             return_lse,
             kv_warps,
             selection_width,
+            head_dim,
+            selection_groups,
+            first_position,
+            gate_stride,
         ) = key
         request_id_type = Int32 if request_id_bits == 32 else Int64
         kv_type = Float8E4M3FN if kv_dtype == torch.float8_e4m3fn else BFloat16
@@ -1251,6 +1476,10 @@ def _compile(
             key_strides=key_strides,
             value_strides=value_strides,
             selection_width=selection_width,
+            head_dim=head_dim,
+            selection_groups=selection_groups,
+            first_position=first_position,
+            gate_stride=gate_stride,
         )
         with torch.cuda.device(key[0]):
             raise_if_kernel_resolution_frozen(
@@ -1272,6 +1501,12 @@ def _compile(
                 _fake_pointer(Float32),
                 _fake_pointer(Float32),
                 _fake_pointer(BFloat16),
+                _fake_pointer(BFloat16),
+                tuple(
+                    _fake_pointer(t) for t in (BFloat16, BFloat16, Int64, Int32, Int64)
+                )
+                if first_position >= 0
+                else (),
                 Int64(1),
                 Int64(1),
                 Int64(1),
@@ -1281,7 +1516,7 @@ def _compile(
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.paged.selected_forward",
-                    4,
+                    7,
                     (
                         q_heads,
                         kv_heads,
@@ -1294,6 +1529,10 @@ def _compile(
                         return_lse,
                         kv_warps,
                         selection_width,
+                        head_dim,
+                        selection_groups,
+                        first_position,
+                        gate_stride,
                     ),
                     labels=(
                         "q_heads",
@@ -1307,6 +1546,10 @@ def _compile(
                         "return_lse",
                         "kv_warps",
                         "selection_width",
+                        "head_dim",
+                        "selection_groups",
+                        "first_position",
+                        "gate_stride",
                     ),
                 ),
             )
@@ -1365,7 +1608,10 @@ def launch_sparse_gqa_split(
         direct_output=False,
         return_lse=True,
         kv_warps=2,
-        selection_width=int(selected_positions.shape[1]),
+        selection_width=int(selected_positions.shape[-1]),
+        selection_groups=int(selected_positions.shape[1])
+        if selected_positions.ndim == 3
+        else 1,
     )
     with torch.cuda.device(query.device):
         capturing = torch.cuda.is_current_stream_capturing()
@@ -1386,7 +1632,10 @@ def launch_sparse_gqa_split(
                 direct_output=False,
                 return_lse=True,
                 kv_warps=2,
-                selection_width=int(selected_positions.shape[1]),
+                selection_width=int(selected_positions.shape[-1]),
+                selection_groups=int(selected_positions.shape[1])
+                if selected_positions.ndim == 3
+                else 1,
             )
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
         kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
@@ -1409,6 +1658,8 @@ def launch_sparse_gqa_split(
                 _pointer(partial_output, Float32),
                 _pointer(partial_lse, Float32),
                 _fake_pointer(BFloat16),
+                _fake_pointer(BFloat16),
+                (),
                 int(key_cache.shape[0]),
                 int(block_table.shape[0]),
                 int(block_table.shape[1]),
@@ -1439,9 +1690,11 @@ def launch_selected_paged_gqa_direct(
     output_lse: torch.Tensor | None,
     softmax_scale: float,
     kv_warps: int,
+    output_gate: torch.Tensor | None = None,
 ) -> None:
-    """Launch direct selected-position paged attention without split scratch."""
+    """Launch direct attention, optionally gated by BF16 per-head sigmoid logits."""
     kv_warps = int(kv_warps)
+    gate_stride = _output_gate_stride(output_gate, query)
     key = _cache_key(
         query,
         key_cache,
@@ -1450,7 +1703,11 @@ def launch_selected_paged_gqa_direct(
         direct_output=True,
         return_lse=output_lse is not None,
         kv_warps=kv_warps,
-        selection_width=int(selected_positions.shape[1]),
+        gate_stride=gate_stride,
+        selection_width=int(selected_positions.shape[-1]),
+        selection_groups=int(selected_positions.shape[1])
+        if selected_positions.ndim == 3
+        else 1,
     )
     with torch.cuda.device(query.device):
         capturing = torch.cuda.is_current_stream_capturing()
@@ -1471,7 +1728,11 @@ def launch_selected_paged_gqa_direct(
                 direct_output=True,
                 return_lse=output_lse is not None,
                 kv_warps=kv_warps,
-                selection_width=int(selected_positions.shape[1]),
+                output_gate=output_gate,
+                selection_width=int(selected_positions.shape[-1]),
+                selection_groups=int(selected_positions.shape[1])
+                if selected_positions.ndim == 3
+                else 1,
             )
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
         kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
@@ -1496,6 +1757,10 @@ def launch_selected_paged_gqa_direct(
                 if output_lse is not None
                 else _fake_pointer(Float32),
                 _pointer(output, BFloat16),
+                _pointer(output_gate, BFloat16)
+                if output_gate is not None
+                else _fake_pointer(BFloat16),
+                (),
                 int(key_cache.shape[0]),
                 int(block_table.shape[0]),
                 int(block_table.shape[1]),
@@ -1519,8 +1784,10 @@ def launch_sparse_gqa_merge(
     output_lse: torch.Tensor | None,
     rows: int,
     splits: int,
+    output_gate: torch.Tensor | None = None,
 ) -> None:
-    """Merge the Qwen split layout without allocation or fallback."""
+    """Merge split attention, optionally gated by BF16 per-head sigmoid logits."""
+    gate_stride = _output_gate_stride(output_gate, output[:rows])
     device_index = partial_output.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -1529,9 +1796,10 @@ def launch_sparse_gqa_merge(
     key = (
         int(device_index),
         q_heads,
-        _HEAD_DIM,
+        int(output.shape[-1]),
         _MERGE_KERNEL.__name__,
         return_lse,
+        gate_stride,
     )
     with torch.cuda.device(device_index):
         capturing = torch.cuda.is_current_stream_capturing()
@@ -1544,7 +1812,12 @@ def launch_sparse_gqa_merge(
                 "CUDA graph capture"
             )
         if raw is None:
-            kernel = _MERGE_KERNEL(q_heads=q_heads, return_lse=return_lse)
+            kernel = _MERGE_KERNEL(
+                q_heads=q_heads,
+                return_lse=return_lse,
+                head_dim=int(output.shape[-1]),
+                gate_stride=gate_stride,
+            )
             raise_if_kernel_resolution_frozen(
                 "cute.compile",
                 target=kernel,
@@ -1556,12 +1829,13 @@ def launch_sparse_gqa_merge(
                 _fake_pointer(Float32),
                 _fake_pointer(BFloat16),
                 _fake_pointer(Float32),
+                _fake_pointer(BFloat16),
                 Int32(1),
                 Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.qsa.sparse_gqa_merge",
-                    11,
+                    13,
                     key[1:],
                 ),
             )
@@ -1580,6 +1854,9 @@ def launch_sparse_gqa_merge(
                 _pointer(output_lse, Float32)
                 if output_lse is not None
                 else _fake_pointer(Float32),
+                _pointer(output_gate, BFloat16)
+                if output_gate is not None
+                else _fake_pointer(BFloat16),
                 int(rows),
                 int(splits),
                 current_cuda_stream(),

@@ -447,6 +447,83 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
                     st_global_u64(dst + Int64(_ROPE_OFFSET + 8 * w), q8)
 
 
+class DeepSeekV4CacheWriter:
+    """Write FP8 noPE, BF16 RoPE, and the page-local UE8M0 footer."""
+
+    def __init__(self, page_size: int):
+        self.page_size = int(page_size)
+
+    @cute.jit
+    def __call__(
+        self,
+        values: cute.Tensor,
+        cache: cute.Tensor,
+        slots: cute.Tensor,
+        value_stride: Int64,
+        page_stride: Int64,
+        entry_stride: Int64,
+        capacity: Int64,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(values, cache, slots, value_stride, page_stride, capacity).launch(
+            grid=(rows, 1, 1), block=(128, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        values: cute.Tensor,
+        cache: cute.Tensor,
+        slots: cute.Tensor,
+        value_stride: Int64,
+        page_stride: Int64,
+        capacity: Int64,
+    ):
+        token, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        slot = Int64(slots[token])
+        if slot >= Int64(0) and slot < capacity:
+            group, lane = Int32(thread) // 16, Int32(thread) % 16
+            column = Int64(group * 64 + lane * 4)
+            source = get_ptr_as_int64(values, Int64(token) * value_stride + column)
+            pair01, pair23 = _ld_global_u32(source), _ld_global_u32(source + 4)
+            page = get_ptr_as_int64(cache, 0) + (slot // self.page_size) * page_stride
+            offset = slot % self.page_size
+            payload = page + offset * 576
+            scales = page + Int64(self.page_size * 576) + offset * 8
+            if group < 7:
+                v0, v1 = _bf16x2_to_f32x2(pair01)
+                v2, v3 = _bf16x2_to_f32x2(pair23)
+                maximum = fmax_f32(
+                    fmax_f32(fabs_f32(v0), fabs_f32(v1)),
+                    fmax_f32(fabs_f32(v2), fabs_f32(v3)),
+                )
+                for distance in cutlass.range_constexpr(4):
+                    maximum = fmax_f32(
+                        maximum,
+                        cute.arch.shuffle_sync_bfly(maximum, offset=1 << distance),
+                    )
+                scale, encoded = pow2_ceil_ue8m0(
+                    fmax_f32(maximum, Float32(1e-4)) * Float32(_E4M3_MAX_RCP)
+                )
+                inverse = rcp_approx_ftz(scale)
+                packed = cvt_f32x4_to_e4m3x4(
+                    v0 * inverse, v1 * inverse, v2 * inverse, v3 * inverse
+                )
+                st_global_u32(payload + column, packed)
+                if lane == 0:
+                    st_global_u8(
+                        scales + Int64(group), cutlass.Uint8(encoded & Uint32(0xFF))
+                    )
+            else:
+                destination = payload + Int64(448) + Int64(lane) * 8
+                st_global_u32(destination, pair01)
+                st_global_u32(destination + 4, pair23)
+                if lane == 0:
+                    st_global_u8(scales + 7, cutlass.Uint8(0))
+
+
 class ConcatAndCacheGlmNextMlaKernel:
     """BF16 to GLM_NEXT FP8 or V4.1 SWA E4M3-plus-UE8M0 cache writer.
 
@@ -1241,7 +1318,9 @@ def page_nbytes(
 
 
 @lru_cache(maxsize=None)
-def _build_compressed_cache_writer(page_size: int, cache_kind: str):
+def _build_compressed_cache_writer(page_size: int, cache_kind: str, cache_format: str):
+    if cache_format == "deepseek_v4":
+        return DeepSeekV4CacheWriter(page_size)
     if cache_kind == "swa":
         return ConcatAndCacheGlmNextMlaKernel(page_size, dsv41=True)
     return ConcatAndCacheNvfp4MlaFp8RopeKernel(
@@ -1260,8 +1339,6 @@ def _validate_compressed_cache_writer(
     payload_bytes = page_nbytes(
         page_size, cache_format=cache_format, cache_kind=cache_kind
     )
-    if cache_format != "deepseek_v41":
-        raise ValueError("write_cache supports only cache_format='deepseek_v41'")
     if kv.ndim != 2 or int(kv.shape[1]) != 512:
         raise ValueError("kv must have shape [rows, 512]")
     if kv.dtype != torch.bfloat16:
@@ -1303,7 +1380,9 @@ def _validate_compressed_cache_writer(
         raise ValueError("all tensors must be on the same device")
 
 
-def _compressed_cache_writer_args(kv, cache, slot_mapping, page_size, cache_kind):
+def _compressed_cache_writer_args(
+    kv, cache, slot_mapping, page_size, cache_kind, cache_format
+):
     kv_arg = _to_kernel_tensor(kv, assumed_align=4, leading_dim=1)
     cache_arg = _to_kernel_tensor(cache, assumed_align=16, leading_dim=1)
     slots_arg = _to_kernel_tensor(
@@ -1319,7 +1398,7 @@ def _compressed_cache_writer_args(kv, cache, slot_mapping, page_size, cache_kind
         Int32(int(slot_mapping.shape[0])),
         current_cuda_stream(),
     )
-    if cache_kind == "swa":
+    if cache_kind == "swa" or cache_format == "deepseek_v4":
         args = (kv_arg, cache_arg, slots_arg, Int64(int(kv.stride(0))), *tail_args)
     else:
         args = (
@@ -1334,9 +1413,13 @@ def _compressed_cache_writer_args(kv, cache, slot_mapping, page_size, cache_kind
     return args
 
 
-def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_kind):
-    kernel = _build_compressed_cache_writer(page_size, cache_kind)
-    args = _compressed_cache_writer_args(kv, cache, slot_mapping, page_size, cache_kind)
+def _compressed_cache_writer_launch(
+    kv, cache, slot_mapping, page_size, cache_kind, cache_format
+):
+    kernel = _build_compressed_cache_writer(page_size, cache_kind, cache_format)
+    args = _compressed_cache_writer_args(
+        kv, cache, slot_mapping, page_size, cache_kind, cache_format
+    )
     spec = KernelCompileSpec.from_key(
         "attention.compressed_sparse_mla.kv_cache",
         1,
@@ -1348,7 +1431,7 @@ def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_ki
             tensor_compile_fact("slot_mapping", slot_mapping, dynamic_dims=(0,)),
             page_size,
             cache_kind,
-            "deepseek_v41",
+            cache_format,
         ),
         labels=(
             "kv",

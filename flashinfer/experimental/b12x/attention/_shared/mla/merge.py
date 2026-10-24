@@ -13,12 +13,12 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.intrinsics.atomics import ld_shared_f32, st_shared_f32, store_v4_bf16x2
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v4_u32,
     shared_ptr_to_u32,
 )
+from b12x._lib.intrinsics.atomics import ld_shared_f32, st_shared_f32, store_v4_bf16x2
 
 from b12x.attention._shared.cute import ops as attention_ops
 from b12x.attention._shared.workspace import _SPLIT_MAX_CHUNKS

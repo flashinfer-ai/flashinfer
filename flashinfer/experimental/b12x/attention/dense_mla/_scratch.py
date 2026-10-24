@@ -53,7 +53,13 @@ def _max_attended_tokens(caps: Caps) -> int:
     if caps.window_size is None:
         return caps.max_cache_tokens
     # A local interval can begin and end in partial physical pages.
-    return min(caps.max_cache_tokens, caps.window_size + caps.page_size - 1)
+    return min(
+        caps.max_cache_tokens,
+        caps.window_size
+        + caps.page_size
+        - 1
+        + (0 if caps.causal else caps.max_total_q),
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -74,6 +80,7 @@ class Caps:
     v_head_dim: int = K3_VALUE_DIM
     physical_record_width: int = K3_ABSORBED_DIM
     window_size: int | None = None
+    causal: bool = True
     use_cuda_graph: bool = False
     budget: Budget | None = None
     # FP32 storage avoids BF16 rounding of normalized split partials before
@@ -82,6 +89,8 @@ class Caps:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
+        if type(self.causal) is not bool:
+            raise TypeError("dense MLA causal must be a bool")
         if self.partial_dtype not in (torch.bfloat16, torch.float32):
             raise TypeError(
                 "dense MLA partial_dtype must be torch.bfloat16 or torch.float32"
@@ -272,6 +281,7 @@ class Scratch:
     head_dim: int
     v_head_dim: int
     window_size: int | None
+    causal: bool
     num_splits: int
     chunks_per_split: int
     query_tile: int
@@ -598,6 +608,7 @@ def _materialize(
         head_dim=caps.head_dim,
         v_head_dim=caps.v_head_dim,
         window_size=caps.window_size,
+        causal=caps.causal,
         num_splits=layout.num_splits,
         chunks_per_split=layout.chunks_per_split,
         query_tile=query_tile,

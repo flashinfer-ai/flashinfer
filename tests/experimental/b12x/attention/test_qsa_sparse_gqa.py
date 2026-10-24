@@ -606,6 +606,7 @@ def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
 
 def test_qwen_split_policy_uses_unsplit_large_rows() -> None:
     caps = SimpleNamespace(
+        attention_splits=0,
         q_heads=12,
         kv_heads=1,
         head_dim=256,
@@ -617,7 +618,9 @@ def test_qwen_split_policy_uses_unsplit_large_rows() -> None:
     assert _target_splits(caps, 4) == (16, 32)
     assert _target_splits(caps, 32) == (16, 16)
     assert _target_splits(caps, 64) == (16, 16)
-    assert _target_splits(caps, 65) == (16, 1)
+    assert _target_splits(caps, 65) == (16, 16)
+    assert _target_splits(caps, 128) == (16, 16)
+    assert _target_splits(caps, 129) == (16, 1)
 
     with pytest.raises(NotImplementedError, match="requires the CuTe Qwen"):
         _target_splits(
@@ -714,7 +717,7 @@ def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
 
 def test_large_prefill_rejects_layouts_not_supported_by_selected_abi() -> None:
     device = require_sm120()
-    rows, q_heads, kv_heads, head_dim = 65, 6, 1, 256
+    rows, q_heads, kv_heads, head_dim = 129, 6, 1, 256
     query = torch.empty(
         (q_heads, rows, head_dim), dtype=torch.bfloat16, device=device
     ).transpose(0, 1)
@@ -1521,7 +1524,7 @@ def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
     selected_impl.clear_caches()
     monkeypatch.setattr(selected_impl, "b12x_compile", traced_compile)
     try:
-        assert torch.count_nonzero(launch(65)).item() == 0
+        assert torch.count_nonzero(launch(129)).item() == 0
         compiled_after_first_launch = tuple(compile_targets)
         assert (
             compiled_after_first_launch.count("_SelectedPositionPagedForwardKernel")
@@ -1529,7 +1532,7 @@ def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
         )
 
         with kernel_resolution_guard("QSA runtime-row cache reuse test"):
-            for rows in (128, 1_024):
+            for rows in (256, 1_024):
                 assert torch.count_nonzero(launch(rows)).item() == 0
                 assert tuple(compile_targets) == compiled_after_first_launch
     finally:
@@ -1538,7 +1541,7 @@ def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
 
 def test_large_prefill_direct_path_does_not_touch_split_scratch() -> None:
     device = require_sm120()
-    rows, q_heads, kv_heads, head_dim = 65, 6, 1, 256
+    rows, q_heads, kv_heads, head_dim = 129, 6, 1, 256
     query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
     key_cache = torch.randn(
         (1, 16, kv_heads, head_dim), dtype=torch.bfloat16, device=device
