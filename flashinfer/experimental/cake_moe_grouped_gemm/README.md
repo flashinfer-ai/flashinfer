@@ -1,9 +1,12 @@
 # Experimental ragged BF16 MoE grouped GEMM (Cake backend)
 
 Both this API and its Cake backend are experimental and may change or be
-removed without compatibility guarantees. Calling one of the helpers is the
-explicit opt-in and emits FlashInfer's experimental API warning once. There is no automatic
-backend selection. Tracking: FlashInfer issue #5678.
+removed without compatibility guarantees. The entry points are the core
+functions `flashinfer.grouped_mm.grouped_gemm_fwd`, `grouped_gemm_dgrad`,
+`grouped_gemm_wgrad` and `cake_grouped_mm`, and the stable API
+`flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`; calling one of
+them is the explicit opt-in and emits FlashInfer's `ExperimentalWarning` once.
+There is no automatic backend selection. Tracking: FlashInfer issue #5678.
 
 Three operations over `E` groups of rows, described by an int32 **device**
 tensor `offs[E]` of cumulative end offsets (`offs[-1] == sum_m`; groups may be
@@ -17,7 +20,7 @@ synchronises on them.
 | --- | --- | --- | --- |
 | `grouped_gemm_fwd(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
 | `grouped_gemm_dgrad(g, w, offs, out=None)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `g [sum_m, N]`, `w [E, N, K]` bf16 | `dX [sum_m, K]` bf16 |
-| `grouped_gemm_wgrad(g, x, offs, out=None, out_dtype=None)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]` | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
+| `grouped_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]` | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
 
 Alignment: `fwd` needs `N % 256 == 0` and `K % 64 == 0`; `dgrad` needs
 `K % 256 == 0` and `N % 64 == 0`; `wgrad` needs `N % 256 == 0` and `K` a
@@ -34,10 +37,13 @@ order); `dW[e] == 0` exactly for empty groups.
 
 ```python
 import torch
-from flashinfer.experimental.cake_moe_grouped_gemm import (
+from flashinfer.grouped_mm import (
+    cake_grouped_mm,
+    grouped_gemm_dgrad,
     grouped_gemm_fwd,
-    prepare_grouped_gemm_wgrad,
+    grouped_gemm_wgrad,
 )
+from flashinfer.experimental.cake_moe_grouped_gemm import prepare_grouped_gemm_wgrad
 
 E, N, K = 4, 4096, 6144
 sizes = [28128, 28128, 28128, 28192]
@@ -48,6 +54,9 @@ w = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
 g = torch.randn(sum_m, N, dtype=torch.bfloat16, device="cuda")
 
 y = grouped_gemm_fwd(x, w, offs)  # one-shot: prepares and launches
+dx = grouped_gemm_dgrad(g, w, offs)
+dw = grouped_gemm_wgrad(g, x, offs, out_dtype=torch.float32)
+y = cake_grouped_mm(x, w, offs)  # autograd wrapper: dX and dW in backward
 
 # Prepare once, launch many (CUDA-graph capturable; new offs / values may be
 # written into the bound tensors between launches):
@@ -55,6 +64,15 @@ dw_launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=torch.float32)
 dw = dw_launch.launch()
 print(dw_launch.record_name, dw_launch.plan)
 ```
+
+The one-shot functions and `cake_grouped_mm` are imported from
+`flashinfer.grouped_mm`: those core entry points carry the experimental-API
+marking and the once-only `ExperimentalWarning` and hand off to the plain
+functions of the same names in this package (`grouped_gemm_fwd`,
+`grouped_gemm_dgrad` and `grouped_gemm_wgrad` in the package root,
+`cake_grouped_mm` in `cake_autograd`). A build that vendors the package calls
+those plain functions directly; they emit no warning. The prepared-launch
+surface below is reached from the package itself.
 
 `prepare_grouped_gemm_*` validates, allocates the output (when not given) and
 the weight-gradient workspaces, resolves the route and binds the generated
@@ -69,12 +87,10 @@ changes; the one-shot helpers prepare on every call.
 The forward projection is also reachable from the stable grouped GEMM API:
 `flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")`
 (bfloat16 outputs only, no tactic index, `N % 256 == 0`, `K % 64 == 0`; rows
-of `a` past `m_indptr[-1]` are left untouched). Naming the backend is the
-opt-in and emits the experimental-backend warning once (FlashInfer's
-`ExperimentalWarning`). A copy of the package running without FlashInfer cannot
-reach this stable API; a direct `cake_backend.grouped_mm_bf16_cake` call there
-warns with the package's own `ExperimentalWarning` class instead (see
-"Standalone import" below).
+of `a` past `m_indptr[-1]` are left untouched). Naming `backend="cake"` is the
+opt-in and emits FlashInfer's `ExperimentalWarning` once, from the core API;
+it then hands off to `cake_backend.grouped_mm_bf16_cake`, which rejects the
+options the backend does not take and emits no warning itself.
 
 `cake_grouped_mm(x, w, offs, deterministic=True)` is a `torch.autograd.Function`
 wrapper (`CakeGroupedMm`): `backward` produces `x.grad` with the `dgrad`
@@ -164,22 +180,15 @@ performance summary is in the delivery pull requests.
 
 ## Standalone import
 
-The package imports without a FlashInfer installation. Its experimental-API
-helpers (the once-per-function warning decorator and the once-per-(API, backend)
-warning) come from `flashinfer.api_logging` when that module is importable --
-a copy of the package loaded next to an importable FlashInfer binds to that
-installation and imports `flashinfer` when the copy is imported -- and
-otherwise (no FlashInfer in the process, `sys.modules["flashinfer"] = None` as
-a vendoring gate sets it, or a FlashInfer without these helpers) from the
-stand-ins in the package's `_experimental.py`. The stand-ins emit the same
-warning text, once per function and once per (API, backend) pair, with three
-differences: the category is the package's own `ExperimentalWarning` (a
-`UserWarning`; a filter on `flashinfer.experimental.ExperimentalWarning` does
-not match it), there is no API logging (`FLASHINFER_LOGLEVEL` is not read),
-and the set of warned (API, backend) pairs is package-local. Inside FlashInfer
-the bound helpers are FlashInfer's own and nothing changes. Only the loader's
-JIT fallback (`cake_build.py`) reaches FlashInfer after import, when a library
-is not prebuilt under `aot/`.
+The package imports only itself, `torch` and `tvm_ffi`; it imports nothing
+from the rest of FlashInfer, so a copy of it loads without a FlashInfer
+installation (under another top-level name, or with
+`sys.modules["flashinfer"] = None` as a vendoring gate sets it). The only
+`flashinfer` import in the package is the loader's JIT fallback in
+`cake_build.py`, inside `try/except ImportError`, reached after import when a
+library is not prebuilt under `aot/`. The experimental warnings and the API
+logging belong to the core entry points (`flashinfer.grouped_mm`), so a direct
+call of the package's functions emits none of them.
 
 ## Tests and benchmark
 
@@ -188,11 +197,17 @@ pytest tests/experimental/test_cake_moe_grouped_gemm.py tests/experimental/test_
 python benchmarks/bench_cake_moe_grouped_gemm.py --help
 ```
 
-The tests compare against a per-group fp64 reference (including an empty
-group, a one-row group, padded outputs, determinism and the fp32 output) and
-skip when no supported device or no registered program is present. The
-standalone test copies the package under another name into a subprocess with
-`flashinfer` blocked and runs on CPU. The benchmark times the prepared
+`test_cake_moe_grouped_gemm.py` (the backend suite, which imports the package
+through `tests.test_helpers.cake_package`) compares against a per-group fp64
+reference (including an empty group, a one-row group, padded outputs,
+determinism and the fp32 output) and skips when no supported device or no
+registered program is present. `test_cake_moe_grouped_gemm_api.py` covers the
+core entry points of `flashinfer.grouped_mm` (the experimental marking, the
+once-only warnings and the `backend="cake"` route of `grouped_mm_bf16`).
+`test_cake_moe_grouped_gemm_standalone.py` copies the package under another
+name into a CPU subprocess with `flashinfer` blocked and checks that it
+imports, raises its host-side errors without any warning and has its only
+`flashinfer` import in the JIT fallback. The benchmark times the prepared
 launches against `torch._grouped_mm`, a per-group cuBLAS loop and
 `flashinfer.grouped_mm.grouped_mm_bf16` on the MoE projection rows of the
 design (E = 4 ragged distributions, E = 8 / 16 / 32 balanced, fp32 weight
