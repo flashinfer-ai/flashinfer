@@ -225,6 +225,12 @@ def _b12x_gemm_mxfp8_runner(
                 use_tma_store,
             ) = tactic
 
+            # TMA requires a 16-byte row stride. Tail-N outputs use predicated
+            # stores; keep the epilogue choice in the compilation key.
+            use_tma_store = (
+                use_tma_store is not False and n % (128 // c_cutlass_dtype.width) == 0
+            )
+
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale
 
@@ -253,6 +259,7 @@ def _b12x_gemm_mxfp8_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
+                use_tma_store=use_tma_store,
             )
 
             # swap_ab is applied inside the kernel, so the public C tensor
