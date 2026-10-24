@@ -208,10 +208,10 @@ def _workspace_bytes(kind: str, rows: int, device: torch.device) -> int:
     rows = int(rows)
     if rows < 0:
         raise ValueError("T must be non-negative")
-    _device_arch(device)
+    arch = _device_arch(device)
     return int(
         _loader.workspace_bytes_upto(
-            kind, rows, _loader.sm_count(_device_index(device))
+            kind, rows, _loader.sm_count(_device_index(device)), arch
         )
     )
 
@@ -353,7 +353,8 @@ def _run_route(
     arch: str, kind: str, values: dict[str, Any], *, rows: int, device: torch.device
 ) -> None:
     device_index = _device_index(device)
-    for name in selected_modules(arch, HIDDEN, kind, rows=rows):
+    sm_count = _loader.sm_count(device_index)
+    for name in selected_modules(arch, HIDDEN, kind, rows=rows, sm_count=sm_count):
         _loader.run_module(name, values, rows=rows, device_index=device_index)
 
 
@@ -372,7 +373,9 @@ def _forward_values(
     rows: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    plan = _loader.host_plan(rows, _loader.sm_count(_device_index(device)))
+    plan = _loader.host_plan(
+        rows, _loader.sm_count(_device_index(device)), _device_arch(device)
+    )
     # The fn split writes the forward operand layout only (``want_t = 0`` is the
     # record's own scalar); its transposed-layout pointer is bound to the same
     # region, exactly like the source launcher binds an unused parameter.
@@ -740,7 +743,9 @@ def cake_mhc_train_backward_finish(
             dbase.zero_()
         return dX, dfn, dscale, dbase
     ws = _workspace_for(workspace, "bwd", rows, device)
-    plan = _loader.host_plan(rows, _loader.sm_count(_device_index(device)))
+    plan = _loader.host_plan(
+        rows, _loader.sm_count(_device_index(device)), _device_arch(device)
+    )
     # The fn split writes the transposed operand layout only (``want_t = 1`` is
     # the record's own scalar); its forward-layout pointer is bound to the same
     # region.  The column-slab pass describes the ``[T, 4, 4096]`` tensors as
