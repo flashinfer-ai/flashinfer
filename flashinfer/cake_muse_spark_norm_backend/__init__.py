@@ -15,28 +15,43 @@ limitations under the License.
 
 Backend of the Cake single-GPU norm kernels of the Muse Spark family as one
 self-contained package (the host bodies, the ``cake_jit`` registry and loader
-glue and the generated CUDA sources under ``csrc/``): today the gated residual
-with the next RMSNorm fused behind
+glue and the generated CUDA sources under ``csrc/``): the gated residual with
+the next RMSNorm fused behind
 ``flashinfer.norm.gated_residual_next_rmsnorm(..., backend="cake")``
-(:func:`cake_gated_residual_next_rmsnorm`; hidden size 8192, SM100 / SM103).
-The stable, ``@flashinfer_api``-decorated entry point and the user-facing
-documentation live in :mod:`flashinfer.norm`; import it.
+(:func:`cake_gated_residual_next_rmsnorm`; hidden size 8192), the gated
+residual RMSNorm behind ``flashinfer.norm.gated_residual_rmsnorm(...,
+backend="cake")`` (:func:`cake_gated_residual_rmsnorm`; hidden size 8192) and
+the per-head RMSNorm times the sigmoid gate behind
+``flashinfer.norm.rmsnorm_sigmoid_gate(..., backend="cake")``
+(:func:`cake_rmsnorm_sigmoid_gate`; head dimension 64, in place); SM100 /
+SM103 / SM107.  The stable, ``@flashinfer_api``-decorated entry points and the
+user-facing documentation live in :mod:`flashinfer.norm`; import it.
 
-The kernels ship in three variants of their optional inputs: ``alpha`` a
-tensor or a scalar, ``post_weight`` present or not (``alpha_tensor_pw``,
-``alpha_scalar_nopw``, ``alpha_scalar_pw``).  A call with a tensor ``alpha``
-and no ``post_weight`` runs the ``alpha_tensor_pw`` programs with a zero
-``post_weight`` vector and ``post_gain_center = 1.0``: ``branch * (0 + 1)`` is
-``branch`` exactly, so the result is the one a dedicated program would give.
-The zero vector is allocated once per device on first use (never inside CUDA
-graph capture: :func:`warm_up` prepares a device before a capture).
+The two-norm kernels ship in three variants of their optional inputs:
+``alpha`` a tensor or a scalar, ``post_weight`` present or not
+(``alpha_tensor_pw``, ``alpha_scalar_nopw``, ``alpha_scalar_pw``).  A call with
+a tensor ``alpha`` and no ``post_weight`` runs the ``alpha_tensor_pw`` programs
+with a zero ``post_weight`` vector and ``post_gain_center = 1.0``: ``branch *
+(0 + 1)`` is ``branch`` exactly, so the result is the one a dedicated program
+would give.  The zero vector is allocated once per device on first use (never
+inside CUDA graph capture: :func:`warm_up` prepares a device before a capture).
+
+The gated residual RMSNorm ships per mode (``weight`` absent: ``mode0``;
+``weight`` applied before the norm: ``mode1``) in a plain and a programmatic
+dependent launch build (``_pdl``); the sigmoid gate ships one BF16 route whose
+programs are selected on the head count and the token count together.  Each
+route's windows may leave gaps where the kernel lane measured the FlashInfer
+kernel ahead: the ``is_cake_*_supported`` predicates answer per call so that
+the facade's ``"auto"`` keeps the CuTe DSL kernel there.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import operator
+from typing import Any, Callable, Optional, cast
 
 import torch
+import tvm_ffi
 
 from . import cake_jit as _loader
 from .cake_jit import (
@@ -50,8 +65,14 @@ from .cake_jit import (
 )
 
 GATED_RESIDUAL_NEXT_RMSNORM = "gated_residual_next_rmsnorm"
-#: The kernels load every operand in 256-bit accesses: rows and vectors are 32-byte aligned.
+GATED_RESIDUAL_RMSNORM = "gated_residual_rmsnorm"
+RMSNORM_SIGMOID_GATE = "rmsnorm_sigmoid_gate"
+#: The two-norm kernels load every operand in 256-bit accesses: rows and vectors are 32-byte aligned.
 ALIGNMENT_BYTES = 32
+#: The gated residual RMSNorm and the sigmoid gate load in 128-bit accesses: 16-byte aligned storage.
+ROW_ALIGNMENT_BYTES = 16
+#: The head dimension of the sigmoid gate's rows.
+HEAD_DIM = 64
 
 _zero_post_weights: dict[int, torch.Tensor] = {}
 
@@ -60,11 +81,27 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+_CAPABILITIES: dict[tuple[int, int], tuple[Any, tuple[int, int]]] = {}
+
+
+def _capability(device: torch.device) -> tuple[int, int]:
+    """``torch.cuda.get_device_capability(device)``, asked once per device and per probe function.  The entry keeps
+    the probe it came from, so a test that replaces ``torch.cuda.get_device_capability`` gets an entry of its own and
+    the probe's id cannot be reused while the entry lives."""
+    probe = torch.cuda.get_device_capability
+    key = (_device_index(device), id(probe))
+    entry = _CAPABILITIES.get(key)
+    if entry is None or entry[0] is not probe:
+        major, minor = probe(device)
+        entry = _CAPABILITIES[key] = (probe, (int(major), int(minor)))
+    return entry[1]
+
+
 def _arch(device: torch.device) -> Optional[str]:
     """The exported architecture of ``device``, or ``None`` for a device the package has no build for."""
     if device.type != "cuda":
         return None
-    return arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
+    return arch_for_capability(_capability(device))
 
 
 def gated_residual_next_rmsnorm_variant(
@@ -90,14 +127,23 @@ def is_cake_gated_residual_next_rmsnorm_supported(
     *,
     tensor_alpha: bool = True,
     has_post_weight: bool = True,
+    rows: Optional[int] = None,
 ) -> bool:
     """Whether this package ships a program for ``device`` and the call's variant (tensor or scalar ``alpha``,
-    with or without ``post_weight``); the tensor contract is :mod:`flashinfer.norm`'s."""
+    with or without ``post_weight``) -- and, with ``rows``, one whose window admits that row count: a route's
+    windows may leave gaps where the kernel lane measured the FlashInfer kernel ahead, and no program is shipped
+    for those row counts.  The tensor contract is :mod:`flashinfer.norm`'s."""
     arch = _arch(device)
     if arch is None:
         return False
-    return _loader.route_available(
-        arch, gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight)
+    route = gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight)
+    if not _loader.route_available(arch, route):
+        return False
+    if rows is None:
+        return True
+    return any(
+        _loader.admits(_loader.MODULES[name].get("select_rule"), int(rows), arch)
+        for name in _loader.route_modules(arch, route)
     )
 
 
@@ -246,6 +292,14 @@ def cake_gated_residual_next_rmsnorm(
         )
     if rows == 0:
         return
+    if not is_cake_gated_residual_next_rmsnorm_supported(
+        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight, rows=rows
+    ):
+        # a declared gap of the route: the facade's "auto" runs the CuTe DSL kernel there
+        raise ValueError(
+            f"cake_gated_residual_next_rmsnorm: no exported program of route {route!r} on {arch} admits "
+            f"{rows} rows"
+        )
     name = _loader.selected_module(arch, route, rows)
     values = {
         "branch": branch,
@@ -270,18 +324,539 @@ def cake_gated_residual_next_rmsnorm(
         _loader.run_module(name, values, rows=rows, device_index=_device_index(device))
 
 
+def gated_residual_rmsnorm_variant(weight_before_norm: bool, enable_pdl: bool) -> str:
+    """The variant a gated residual RMSNorm call maps onto: ``mode0`` (no ``weight``) or ``mode1`` (``weight +
+    gain_center`` applied to ``branch`` before its norm), with ``_pdl`` for a programmatic dependent launch."""
+    return f"mode{int(bool(weight_before_norm))}{'_pdl' if enable_pdl else ''}"
+
+
+def gated_residual_rmsnorm_route(weight_before_norm: bool, enable_pdl: bool) -> str:
+    """The route a gated residual RMSNorm call launches from (its variant's)."""
+    return route_key(
+        GATED_RESIDUAL_RMSNORM,
+        gated_residual_rmsnorm_variant(weight_before_norm, enable_pdl),
+    )
+
+
+def is_cake_gated_residual_rmsnorm_supported(
+    device: torch.device,
+    *,
+    weight_before_norm: bool = False,
+    enable_pdl: bool = False,
+    rows: Optional[int] = None,
+) -> bool:
+    """Whether this package ships a program for ``device`` and the call's variant (``weight`` applied before the norm
+    or absent, programmatic dependent launch or not) -- and, with ``rows``, one whose window admits that row count
+    (a route's windows may leave gaps where the kernel lane measured the FlashInfer kernel ahead).  The tensor
+    contract is :mod:`flashinfer.norm`'s."""
+    arch = _arch(device)
+    if arch is None:
+        return False
+    route = gated_residual_rmsnorm_route(weight_before_norm, enable_pdl)
+    if not _loader.route_available(arch, route):
+        return False
+    if rows is None:
+        return True
+    return any(
+        _loader.admits(_loader.MODULES[name].get("select_rule"), int(rows), arch)
+        for name in _loader.route_modules(arch, route)
+    )
+
+
+def _check_row(
+    tensor: torch.Tensor,
+    name: str,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    if (
+        tensor.shape != shape
+        or tensor.dtype != dtype
+        or tensor.device != device
+        or not tensor.is_contiguous()
+        or tensor.data_ptr() % ROW_ALIGNMENT_BYTES != 0
+    ):
+        raise ValueError(
+            f"cake_gated_residual_rmsnorm: {name} must be a contiguous {dtype} tensor of shape "
+            f"{tuple(shape)} on {device} with {ROW_ALIGNMENT_BYTES}-byte aligned storage"
+        )
+
+
+# ----------------------------------------------------------------------------- launch plans
+#
+# A public call resolves to one record of its route (the loader's ``selected_module``), one launch grid and one
+# positional argument order of the record's tvm-ffi entry.  None of that depends on the tensors' storage, so a plan
+# keyed by the call signature (device, row / token / head counts, strides, variant) is prepared once and a repeated
+# call only checks its tensors' contract and launches: no device-capability query, no window scan, no attribute
+# lookup of the module, no torch stream object (the raw current-stream handle of the tensors' device drives the
+# tvm-ffi stream context; the binding itself guards the device).  The slow path keeps every check and message.
+
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_STREAM_CONTEXT = getattr(tvm_ffi, "StreamContext", None)
+_FFI_DEVICES: dict[int, Any] = {}
+_LAUNCH_PLANS: dict[tuple[Any, ...], "_LaunchPlan"] = {}
+_VECTOR = (HIDDEN_SIZE,)
+
+
+def _ffi_device(index: int) -> Any:
+    device = _FFI_DEVICES.get(index)
+    if device is None:
+        device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return device
+
+
+class _LaunchPlan:
+    """One record bound to one call signature: the loaded entry, its grid and its argument order, resolved once."""
+
+    __slots__ = (
+        "name",
+        "rows",
+        "device_index",
+        "entry",
+        "grid",
+        "order",
+        "ffi_device",
+        "constants",
+        "pack",
+    )
+
+    def __init__(
+        self, name: str, arch: str, device_index: int, values: dict[str, Any], rows: int
+    ) -> None:
+        record = _loader.MODULES[name]
+        self.name, self.rows, self.device_index = name, rows, device_index
+        self.grid = _loader.launch_grid(
+            record, rows, device_index=device_index, values=values
+        )
+        _loader.launch_args(
+            record, values, self.grid
+        )  # the plan's values name every argument
+        grid_values = {
+            "grid_x": self.grid[0],
+            "grid_y": self.grid[1],
+            "grid_z": self.grid[2],
+        }
+        logical = record["logical"]
+        self.order = tuple(
+            grid_values[key] if kind == "grid" else logical[key]
+            for kind, key in record["arg_plan"]
+        )
+        self.entry = getattr(_loader.load(name, arch), record["ffi_entry"])
+        self.ffi_device = _ffi_device(device_index)
+        # ``pack`` turns one positional row -- the call's values in the order ``values`` lists them, followed by
+        # ``constants`` -- into the entry's argument tuple without a dict or a comprehension per call.
+        names = tuple(values)
+        constants: list[Any] = []
+        indices: list[int] = []
+        for source in self.order:
+            if type(source) is str:
+                indices.append(names.index(source))
+            else:
+                indices.append(len(names) + len(constants))
+                constants.append(source)
+        self.constants = tuple(constants)
+        if len(indices) == 1:
+            only = indices[0]
+
+            def pack(row: tuple[Any, ...], index: int = only) -> tuple[Any, ...]:
+                return (row[index],)
+
+            self.pack: Callable[[tuple[Any, ...]], tuple[Any, ...]] = pack
+        else:
+            self.pack = cast(
+                Callable[[tuple[Any, ...]], tuple[Any, ...]],
+                operator.itemgetter(*indices),
+            )
+
+    def args(self, values: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(
+            values[source] if type(source) is str else source for source in self.order
+        )
+
+
+def _launch(plan: _LaunchPlan, args: tuple[Any, ...]) -> None:
+    """Call the plan's entry on the current torch stream of its device (a CUDA-graph capture stream included)."""
+    if _RAW_STREAM is None or _STREAM_CONTEXT is None:
+        with torch.cuda.device(plan.device_index), tvm_ffi.use_torch_stream():
+            plan.entry(*args)
+        return
+    with _STREAM_CONTEXT(plan.ffi_device, _RAW_STREAM(plan.device_index)):
+        plan.entry(*args)
+
+
+def clear_launch_plans() -> None:
+    """Forget the prepared launch plans (after the registry or the routes change under test)."""
+    _LAUNCH_PLANS.clear()
+
+
+def _prepare_gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    enable_pdl: bool,
+) -> Optional[_LaunchPlan]:
+    """The full contract check of one call and its launch plan (``None`` for an empty batch, which launches nothing)."""
+    device = branch.device
+    arch = _arch(device)
+    if arch is None:
+        raise ValueError(
+            "cake_gated_residual_rmsnorm supports compute capability "
+            f"{sorted(ARCH_BY_CAPABILITY)} only, got {device}"
+        )
+    if branch.ndim != 2 or branch.shape[1] != HIDDEN_SIZE:
+        raise ValueError(
+            f"cake_gated_residual_rmsnorm: branch must be [rows, {HIDDEN_SIZE}], got {tuple(branch.shape)}"
+        )
+    rows = int(branch.shape[0])
+    matrix = (rows, HIDDEN_SIZE)
+    _check_row(branch, "branch", shape=matrix, dtype=torch.bfloat16, device=device)
+    _check_row(residual, "residual", shape=matrix, dtype=torch.float32, device=device)
+    _check_row(alpha, "alpha", shape=_VECTOR, dtype=torch.float32, device=device)
+    _check_row(beta, "beta", shape=_VECTOR, dtype=torch.float32, device=device)
+    _check_row(out, "out", shape=matrix, dtype=torch.float32, device=device)
+    weight_before_norm = weight is not None
+    if weight is not None:
+        _check_row(weight, "weight", shape=_VECTOR, dtype=torch.bfloat16, device=device)
+    route = gated_residual_rmsnorm_route(weight_before_norm, enable_pdl)
+    if not _loader.route_available(arch, route):
+        raise ValueError(
+            f"cake_gated_residual_rmsnorm: no exported program of route {route!r} on {arch}"
+        )
+    if rows == 0:
+        return None
+    if not is_cake_gated_residual_rmsnorm_supported(
+        device, weight_before_norm=weight_before_norm, enable_pdl=enable_pdl, rows=rows
+    ):
+        # a declared gap of the route: the facade's "auto" runs the CuTe DSL kernel there
+        raise ValueError(
+            f"cake_gated_residual_rmsnorm: no exported program of route {route!r} on {arch} admits "
+            f"{rows} rows"
+        )
+    name = _loader.selected_module(arch, route, rows)
+    values = {
+        "branch": branch,
+        "residual": residual,
+        # The mode-0 programs never read the weight slot; branch itself keeps the BF16 tensor ABI.
+        "weight": weight if weight is not None else branch,
+        "alpha": alpha,
+        "beta": beta,
+        "out": out,
+        "rows": rows,
+        "eps": 0.0,
+        "gain_center": 0.0,
+    }
+    key = (
+        GATED_RESIDUAL_RMSNORM,
+        branch.get_device(),
+        rows,
+        weight_before_norm,
+        bool(enable_pdl),
+    )
+    plan = _LAUNCH_PLANS[key] = _LaunchPlan(
+        name, arch, _device_index(device), values, rows
+    )
+    return plan
+
+
+def cake_gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    eps: float,
+    gain_center: float = 0.0,
+    enable_pdl: bool = False,
+) -> None:
+    """``out = alpha * residual + beta * RMSNorm(branch * (weight + gain_center))`` in FP32 (``weight`` ``None``
+    drops the multiply), one launch of the exported program of the call's variant whose window admits the row
+    count; ``enable_pdl`` selects the programmatic dependent launch build.  ``out`` may alias ``residual``.  An
+    empty batch launches nothing.
+    """
+    shape = branch.shape
+    index = branch.get_device()
+    weight_before_norm = weight is not None
+    plan = None
+    if len(shape) == 2:
+        plan = _LAUNCH_PLANS.get(
+            (
+                GATED_RESIDUAL_RMSNORM,
+                index,
+                shape[0],
+                weight_before_norm,
+                bool(enable_pdl),
+            )
+        )
+    # The plan's key fixes the device, the row count, the variant and the launch mode; the rest of the contract
+    # is one flat check per call (dtypes, shapes, same device, contiguous, 16-byte aligned storage).
+    f32, bf16, align = torch.float32, torch.bfloat16, ROW_ALIGNMENT_BYTES
+    if plan is None or not (
+        shape[1] == HIDDEN_SIZE
+        and branch.dtype is bf16
+        and residual.dtype is f32
+        and out.dtype is f32
+        and alpha.dtype is f32
+        and beta.dtype is f32
+        and residual.shape == shape
+        and out.shape == shape
+        and alpha.shape == _VECTOR
+        and beta.shape == _VECTOR
+        and residual.get_device() == index
+        and out.get_device() == index
+        and alpha.get_device() == index
+        and beta.get_device() == index
+        and branch.is_contiguous()
+        and residual.is_contiguous()
+        and out.is_contiguous()
+        and alpha.is_contiguous()
+        and beta.is_contiguous()
+        and (
+            branch.data_ptr()
+            | residual.data_ptr()
+            | out.data_ptr()
+            | alpha.data_ptr()
+            | beta.data_ptr()
+        )
+        % align
+        == 0
+        and (
+            weight is None
+            or (
+                weight.dtype is bf16
+                and weight.shape == _VECTOR
+                and weight.get_device() == index
+                and weight.is_contiguous()
+                and weight.data_ptr() % align == 0
+            )
+        )
+    ):
+        plan = _prepare_gated_residual_rmsnorm(
+            branch, residual, weight, alpha, beta, out, enable_pdl=enable_pdl
+        )
+        if plan is None:
+            return
+    _launch(
+        plan,
+        plan.pack(
+            (
+                branch,
+                residual,
+                weight if weight is not None else branch,
+                alpha,
+                beta,
+                out,
+                plan.rows,
+                float(eps),
+                float(gain_center),
+            )
+            + plan.constants
+        ),
+    )
+
+
+def rmsnorm_sigmoid_gate_route() -> str:
+    """The one route of the sigmoid gate (BF16 rows of 64)."""
+    return route_key(RMSNORM_SIGMOID_GATE, "bf16")
+
+
+def is_cake_rmsnorm_sigmoid_gate_supported(
+    device: torch.device,
+    *,
+    heads: Optional[int] = None,
+    tokens: Optional[int] = None,
+) -> bool:
+    """Whether this package ships a program for ``device`` -- and, with ``heads``, one whose windows name that head
+    count (a 2-D ``(rows, 64)`` call is one head), with ``tokens`` too, one whose window admits that token count.
+    The tensor contract is :mod:`flashinfer.norm`'s."""
+    arch = _arch(device)
+    if arch is None:
+        return False
+    route = rmsnorm_sigmoid_gate_route()
+    if not _loader.route_available(arch, route):
+        return False
+    if heads is None:
+        return True
+    for name in _loader.route_modules(arch, route):
+        windows = _loader.MODULES[name]["select_rule"]["windows"].get(arch, ())
+        for count, above, at_most in windows:
+            if int(count) != int(heads):
+                continue
+            if tokens is None or (
+                tokens > int(above) and (at_most is None or tokens <= int(at_most))
+            ):
+                return True
+    return False
+
+
+def _gate_layout(tensor: torch.Tensor, name: str, device: torch.device) -> int:
+    """The token stride of ``tensor`` after the layout checks of the contract: BF16 on the call's device, 2-D
+    ``(tokens, 64)`` or 3-D ``(tokens, heads, 64)``, unit stride along the row, packed heads, a token stride that is a
+    multiple of eight elements and 16-byte aligned storage."""
+    if tensor.dtype != torch.bfloat16 or tensor.device != device:
+        raise ValueError(
+            f"cake_rmsnorm_sigmoid_gate: {name} must be a bfloat16 tensor on {device}"
+        )
+    if tensor.ndim not in (2, 3) or tensor.shape[-1] != HEAD_DIM:
+        raise ValueError(
+            f"cake_rmsnorm_sigmoid_gate: {name} must be [tokens, {HEAD_DIM}] or [tokens, heads, {HEAD_DIM}], "
+            f"got {tuple(tensor.shape)}"
+        )
+    if (
+        tensor.stride(-1) != 1
+        or (tensor.ndim == 3 and tensor.stride(1) != HEAD_DIM)
+        or tensor.stride(0) % 8 != 0
+        or tensor.data_ptr() % ROW_ALIGNMENT_BYTES != 0
+    ):
+        raise ValueError(
+            f"cake_rmsnorm_sigmoid_gate: {name} must hold contiguous rows of {HEAD_DIM} with packed heads, a token "
+            f"stride that is a multiple of 8 elements and {ROW_ALIGNMENT_BYTES}-byte aligned storage"
+        )
+    return int(tensor.stride(0))
+
+
+def _prepare_rmsnorm_sigmoid_gate(
+    input: torch.Tensor, gate: torch.Tensor
+) -> Optional[_LaunchPlan]:
+    """The full contract check of one call and its launch plan (``None`` for an empty batch, which launches nothing)."""
+    device = input.device
+    arch = _arch(device)
+    if arch is None:
+        raise ValueError(
+            "cake_rmsnorm_sigmoid_gate supports compute capability "
+            f"{sorted(ARCH_BY_CAPABILITY)} only, got {device}"
+        )
+    if gate.shape != input.shape or gate.device != device:
+        raise ValueError(
+            "cake_rmsnorm_sigmoid_gate: gate must have the shape and device of input, got "
+            f"{tuple(gate.shape)} on {gate.device} for {tuple(input.shape)} on {device}"
+        )
+    input_stride = _gate_layout(input, "input", device)
+    gate_stride = _gate_layout(gate, "gate", device)
+    tokens = int(input.shape[0])
+    heads = int(input.shape[1]) if input.ndim == 3 else 1
+    route = rmsnorm_sigmoid_gate_route()
+    if not _loader.route_available(arch, route):
+        raise ValueError(
+            f"cake_rmsnorm_sigmoid_gate: no exported program of route {route!r} on {arch}"
+        )
+    if tokens == 0:
+        return None
+    if not is_cake_rmsnorm_sigmoid_gate_supported(device, heads=heads, tokens=tokens):
+        # a head count or a token count outside the route's windows: the facade's "auto" runs the CuTe DSL kernel
+        raise ValueError(
+            f"cake_rmsnorm_sigmoid_gate: no exported program of route {route!r} on {arch} admits "
+            f"{tokens} tokens of {heads} heads"
+        )
+    name = _loader.selected_module(arch, route, tokens, heads)
+    values = {
+        "input": input,
+        "gate": gate,
+        "tokens": tokens,
+        "heads": heads,
+        "input_stride": input_stride,
+        "gate_stride": gate_stride,
+        "eps": 0.0,
+    }
+    key = (
+        RMSNORM_SIGMOID_GATE,
+        device.index,
+        input.ndim,
+        tokens,
+        heads,
+        input_stride,
+        gate_stride,
+    )
+    plan = _LAUNCH_PLANS[key] = _LaunchPlan(
+        name, arch, _device_index(device), values, tokens
+    )
+    return plan
+
+
+def cake_rmsnorm_sigmoid_gate(
+    input: torch.Tensor, gate: torch.Tensor, *, eps: float
+) -> None:
+    """``input = bf16(RMSNorm(input) * sigmoid(gate))`` per row of 64, in place, one launch of the exported program
+    whose window admits the head count and the token count.  ``input`` and ``gate`` are ``(tokens, 64)`` or
+    ``(tokens, heads, 64)`` with the same shape; their token strides may differ (``gate`` is typically a view of a
+    wider projection).  An empty batch launches nothing.
+    """
+    device = input.device
+    shape = input.shape
+    ndim = len(shape)
+    plan = None
+    if ndim in (2, 3):
+        heads = shape[1] if ndim == 3 else 1
+        input_stride, gate_stride = input.stride(0), gate.stride(0)
+        plan = _LAUNCH_PLANS.get(
+            (
+                RMSNORM_SIGMOID_GATE,
+                device.index,
+                ndim,
+                shape[0],
+                heads,
+                input_stride,
+                gate_stride,
+            )
+        )
+    bf16, align = torch.bfloat16, ROW_ALIGNMENT_BYTES
+    if plan is None or not (
+        shape[-1] == HEAD_DIM
+        and gate.shape == shape
+        and input.dtype is bf16
+        and gate.dtype is bf16
+        and gate.device == device
+        and input.stride(-1) == 1
+        and gate.stride(-1) == 1
+        and (ndim == 2 or (input.stride(1) == HEAD_DIM and gate.stride(1) == HEAD_DIM))
+        and input.data_ptr() % align == 0
+        and gate.data_ptr() % align == 0
+    ):
+        plan = _prepare_rmsnorm_sigmoid_gate(input, gate)
+        if plan is None:
+            return
+        heads = shape[1] if ndim == 3 else 1
+        input_stride, gate_stride = input.stride(0), gate.stride(0)
+    _launch(
+        plan,
+        plan.pack(
+            (input, gate, plan.rows, heads, input_stride, gate_stride, float(eps))
+            + plan.constants
+        ),
+    )
+
+
 __all__ = [
     "ALIGNMENT_BYTES",
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "GATED_RESIDUAL_NEXT_RMSNORM",
+    "GATED_RESIDUAL_RMSNORM",
+    "HEAD_DIM",
     "HIDDEN_SIZE",
     "OPS",
+    "RMSNORM_SIGMOID_GATE",
+    "ROW_ALIGNMENT_BYTES",
     "VARIANTS",
     "cake_gated_residual_next_rmsnorm",
+    "cake_gated_residual_rmsnorm",
+    "cake_rmsnorm_sigmoid_gate",
+    "clear_launch_plans",
     "gated_residual_next_rmsnorm_route",
     "gated_residual_next_rmsnorm_variant",
+    "gated_residual_rmsnorm_route",
+    "gated_residual_rmsnorm_variant",
     "is_cake_gated_residual_next_rmsnorm_supported",
+    "is_cake_gated_residual_rmsnorm_supported",
+    "is_cake_rmsnorm_sigmoid_gate_supported",
+    "rmsnorm_sigmoid_gate_route",
     "warm_up",
     "zero_post_weight",
 ]
