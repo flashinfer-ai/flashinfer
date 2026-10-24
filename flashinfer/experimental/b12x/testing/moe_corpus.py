@@ -192,15 +192,6 @@ class MoeSweepCase:
 
 MOE_RECIPES = (
     MoeRecipe(
-        recipe_id="modelopt-nvfp4-auto",
-        family_id="modelopt-nvfp4",
-        quant_mode="nvfp4_auto",
-        source_format="modelopt_nvfp4",
-        intermediate_alignment=16,
-        minimum_intermediate_size=16,
-        compatible_activations=("silu",),
-    ),
-    MoeRecipe(
         recipe_id="modelopt-nvfp4",
         family_id="modelopt-nvfp4",
         quant_mode="nvfp4",

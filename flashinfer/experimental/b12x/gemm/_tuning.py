@@ -1,5 +1,14 @@
 """Native three-dimensional dense GEMM host launch contract."""
 
+import b12x._lib.utils.dtypes as _module__lib_utils_dtypes
+
+
+import b12x._lib.dense_gemm.compile as _module__lib_dense_gemm_compile
+import b12x._lib.dense_gemm.config as _module__lib_dense_gemm_config
+import b12x._lib.dense_gemm.kernel as _module__lib_dense_gemm_kernel
+import b12x._lib.dense_gemm.policy as _module__lib_dense_gemm_policy
+
+
 from dataclasses import asdict, dataclass, field, fields
 
 from b12x.preparation._efficiency import capture_exhaustive_search
@@ -59,12 +68,10 @@ class DenseGemmQuery:
 
 
 def _codegen_snapshot():
-    from b12x._lib import dense_gemm as dense
-
     return FrozenMapping(
         {
-            "split_k_atomic": dense._B12X_DENSE_SPLITK_TURBO,
-            "fused_fp6_quant": dense._DENSE_FUSED_QUANT,
+            "split_k_atomic": _module__lib_dense_gemm_config._B12X_DENSE_SPLITK_TURBO,
+            "fused_fp6_quant": _module__lib_dense_gemm_config._DENSE_FUSED_QUANT,
         }
     )
 
@@ -440,11 +447,11 @@ def validate_config(query, config, device):
                 f"dense configuration conflicts with caller constraint {name}"
             )
     options = operand_options(query)
-    if not dense.DenseGemmKernel.can_implement(
-        dense.get_cutlass_dtype(options["ab_dtype"]),
-        dense.get_cutlass_dtype(options["sf_dtype"]),
+    if not _module__lib_dense_gemm_kernel.DenseGemmKernel.can_implement(
+        _module__lib_utils_dtypes.get_cutlass_dtype(options["ab_dtype"]),
+        _module__lib_utils_dtypes.get_cutlass_dtype(options["sf_dtype"]),
         options["sf_vec_size"],
-        dense.get_cutlass_dtype(query.output_dtype),
+        _module__lib_utils_dtypes.get_cutlass_dtype(query.output_dtype),
         (config.tile_m, config.tile_n),
         (1, 1),
         query.out_features,
@@ -480,7 +487,7 @@ def validate_config(query, config, device):
         tile_k = (
             128
             if config.swap_ab
-            else dense._select_mxfp8_tile_k(
+            else _module__lib_dense_gemm_policy._select_mxfp8_tile_k(
                 query.max_rows,
                 query.out_features,
                 query.in_features,
@@ -493,7 +500,7 @@ def validate_config(query, config, device):
                 "tensor-FP8 tile K must match the production-derived value"
             )
     if query.recipe in ("mxfp8", "tensor_fp8"):
-        dense._validate_mxfp8_bk64_plan(
+        _module__lib_dense_gemm_policy._validate_mxfp8_bk64_plan(
             config.tile_k, (config.tile_m, config.tile_n), config.swap_ab
         )
     if config.split_k_slices is not None and config.split_k_slices > 1:
@@ -506,11 +513,17 @@ def validate_config(query, config, device):
             raise ValueError(
                 "dense GEMM split-K requires unswapped single-batch decode and divisible K"
             )
-        if config.split_k_slices == 4 and not dense._B12X_DENSE_SPLITK_TURBO:
+        if (
+            config.split_k_slices == 4
+            and not _module__lib_dense_gemm_config._B12X_DENSE_SPLITK_TURBO
+        ):
             raise ValueError(
                 "four-way split-K requires the production atomic reduction path"
             )
-        if query.output_dtype != "bfloat16" and dense._B12X_DENSE_SPLITK_TURBO:
+        if (
+            query.output_dtype != "bfloat16"
+            and _module__lib_dense_gemm_config._B12X_DENSE_SPLITK_TURBO
+        ):
             raise ValueError("atomic BF16 split-K requires BF16 output")
     from ._preparation import _configured_lowering
 
@@ -528,7 +541,6 @@ def validate_config(query, config, device):
 
 
 def default_config(query, device):
-    from b12x._lib import dense_gemm as dense
     from ._preparation import _default_lowering
 
     p = _default_lowering(query, device)
@@ -538,12 +550,12 @@ def default_config(query, device):
     if fp4 and query.output_mode == "provided":
         occupancy = p.target_occupancy_override
         if occupancy is None:
-            occupancy = dense._dense_gemm_target_occupancy(
+            occupancy = _module__lib_dense_gemm_compile._dense_gemm_target_occupancy(
                 n=p.n,
                 k=p.k,
                 l=p.l,
-                ab_dtype=dense.get_cutlass_dtype(p.ab_dtype),
-                c_dtype=dense.get_cutlass_dtype(p.c_dtype),
+                ab_dtype=_module__lib_utils_dtypes.get_cutlass_dtype(p.ab_dtype),
+                c_dtype=_module__lib_utils_dtypes.get_cutlass_dtype(p.c_dtype),
                 tile_k=p.tile_k,
                 mma_tiler_mn=p.mma_tiler_mn,
                 cluster_shape_mn=p.cluster_shape_mn,

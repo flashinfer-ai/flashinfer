@@ -35,6 +35,7 @@ from b12x._lib.intrinsics.atomics import (
     st_shared_v4_f32,
     st_shared_u32,
 )
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.intrinsics.memory import (
     cp_async_bulk_g2s_mbar,
     ld_shared_v4_u32,
@@ -43,7 +44,6 @@ from b12x._lib.intrinsics.memory import (
     shared_ptr_to_u32,
     st_global_v4_u32,
 )
-from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
 from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen

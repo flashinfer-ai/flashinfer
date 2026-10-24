@@ -42,6 +42,8 @@ class GdnPrefillQuery:
     checkpoint_export: bool
     max_tokens: int
     max_seqs: int
+    intermediate_dtype: str = "bfloat16"
+    recurrence_policy: str = "auto"
     max_state_slots: int = 1
     null_state_index: int | None = None
     a_log_dtype: str = "float32"
@@ -60,6 +62,8 @@ class GdnPrefillQuery:
             "head_dim": int(self.head_dim),
             "model_dtype": str(self.model_dtype),
             "state_dtype": str(self.state_dtype),
+            "intermediate_dtype": str(self.intermediate_dtype),
+            "recurrence_policy": self.recurrence_policy,
             "qk_l2norm": bool(self.qk_l2norm),
             "checkpoint_export": bool(self.checkpoint_export),
             "max_tokens": int(self.max_tokens),
@@ -123,6 +127,8 @@ def _validate_query(query: GdnPrefillQuery, device) -> None:
     if not isinstance(query, GdnPrefillQuery):
         raise TypeError("query must be GdnPrefillQuery")
     validate_metadata_query(query)
+    if query.recurrence_policy not in ("auto", "sequential_k1"):
+        raise ValueError("recurrence_policy must be 'auto' or 'sequential_k1'")
     if query.key_heads <= 0 or query.value_heads != 3 * query.key_heads:
         raise ValueError("GDN prefill requires three value heads per key head")
     if query.head_dim != 128:
@@ -134,9 +140,23 @@ def _validate_query(query: GdnPrefillQuery, device) -> None:
             "sequence.gdn_prefill requires bfloat16 activations and float32 state, "
             f"got {query.model_dtype}/{query.state_dtype}"
         )
+    if query.intermediate_dtype not in ("bfloat16", "float32"):
+        raise ValueError("GDN prefill intermediates require bfloat16 or float32")
 
 
 def _validate_config(query: GdnPrefillQuery, config: GdnPrefillConfig, device) -> None:
+    if query.recurrence_policy == "sequential_k1" and (
+        config.algorithm != "sequential" or config.k_split != 1
+    ):
+        raise ValueError(
+            "recurrence_policy='sequential_k1' requires sequential algorithm and k_split=1"
+        )
+    if query.intermediate_dtype == "float32" and config != _default_config(
+        query, device
+    ):
+        raise ValueError(
+            "FP32 GDN prefill uses the fixed sequential recurrence configuration"
+        )
     del device
     if config.backend != BACKEND:
         raise ValueError(f"unsupported sequence.gdn_prefill backend {config.backend!r}")
@@ -190,6 +210,15 @@ def _validate_config(query: GdnPrefillQuery, config: GdnPrefillConfig, device) -
 
 
 def _tuning_parameters(query: GdnPrefillQuery, device):
+    if query.intermediate_dtype == "float32":
+        return ParameterSpace.create(
+            TUNING.knobs,
+            values={
+                name: (value,)
+                for name, value in _default_config(query, device).to_dict().items()
+            },
+            exhaustive=query.exhaustive,
+        )
     del device
     capacity = tiles_capacity(query.max_tokens, query.max_seqs)
     # A window is the tile band the pipeline keeps prepared in L2; one, two and
@@ -220,10 +249,15 @@ def _tuning_parameters(query: GdnPrefillQuery, device):
             "segment_tokens": SEGMENT_CHOICES,
         },
         exhaustive=query.exhaustive,
+        predicates=(
+            lambda p: query.recurrence_policy != "sequential_k1"
+            or (p["algorithm"] == "sequential" and p["k_split"] == 1),
+        ),
         efficiency_predicates=(
             lambda p: p["algorithm"] != "sequential" or p["window_tiles"] in windows,
-            lambda p: p["algorithm"] != "chunk_parallel"
-            or p["segment_tokens"] in segments,
+            lambda p: (
+                p["algorithm"] != "chunk_parallel" or p["segment_tokens"] in segments
+            ),
             # One segment per sequence leaves chunk-parallel no chunk-level
             # parallelism: it runs the sequential schedule plus summary and combine.
             lambda parameters: (
@@ -257,7 +291,7 @@ def _encode_query(query: GdnPrefillQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="sequence.gdn_prefill",
-    query_schema_version=22,
+    query_schema_version=24,
     config_schema_version=22,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset(
@@ -301,7 +335,7 @@ TUNING = TuningContract(
             when=FrozenMapping({"algorithm": "sequential"}),
         ),
     ),
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     parameters=_tuning_parameters,
     materialize=_materialize_tuning,
 )

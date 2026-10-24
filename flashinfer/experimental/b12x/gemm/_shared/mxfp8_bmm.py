@@ -31,7 +31,7 @@ performs.  The FP4-path dequant primitives in ``b12x._lib.intrinsics``
 embed sign in the scale and compensate a 2^7 bias in the epilogue, so this
 specialization uses unbiased conversions to preserve the bitwise contract.
 
-The backend accepts BF16 A/C, ``1 <= M <= 32``, and the two geometries
+The backend accepts BF16 A/C, ``1 <= M <= 4096``, and the geometries
 declared in ``_QUALIFIED_GEOMETRIES``.  The launch is deterministic, K-unsplit,
 workspace free, allocation free, and CUDA-graph safe after explicit
 prewarming.  A JIT miss during capture raises instead of recording a corrupt
@@ -59,6 +59,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.intrinsics.packed import bfloat2_mul
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
@@ -72,8 +74,6 @@ from b12x._lib.intrinsics.memory import (
     st_shared_u16,
     st_shared_v4_u32,
 )
-from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
-from b12x._lib.intrinsics.packed import bfloat2_mul
 from b12x.preparation.types import plan_from_handle, require_prepared
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
@@ -87,11 +87,11 @@ _TILE_N = 128
 _TILE_K = 64
 _STAGES = 3
 _CTA_THREADS = 128  # 4 warps; each warp owns a 32-wide N slice of the tile.
-_MAX_M = 32
+_MAX_M = 4096
 _KERNEL_ID = "gemm.bmm.mxfp8"
-_KERNEL_VERSION = 1
+_KERNEL_VERSION = 2
 _MLA_QUERY_KERNEL_ID = "gemm.mla_query_projection.mxfp8"
-_MLA_QUERY_KERNEL_VERSION = 1
+_MLA_QUERY_KERNEL_VERSION = 2
 _MLA_QUERY_ROPE_DIM = 64
 
 
@@ -613,7 +613,7 @@ class _Mxfp8Kernel:
             c_stride_g,
             c_stride_m,
         ).launch(
-            grid=(self.grid_x, 1, 1),
+            grid=(self.grid_x, (self.m + self.tile_m - 1) // self.tile_m, 1),
             block=[self.cta_threads, 1, 1],
             stream=stream,
         )
@@ -745,6 +745,8 @@ class _Mxfp8Kernel:
         group64 = Int64(group)
         jt64 = Int64(jt)
         kt64 = Int64(kt)
+        _, row_tile, _ = cute.arch.block_idx()
+        row_start = Int32(row_tile) * Int32(self.tile_m)
 
         # ---- B tile: 512 int4 units, 4 per thread. ----
         for i in cutlass.range_constexpr(self.b_units // self.cta_threads):
@@ -788,11 +790,12 @@ class _Mxfp8Kernel:
                 + Int32(self.a_off)
                 + (row * Int32(self.a_units_per_row) + col_sw) * Int32(16)
             )
-            if cutlass.const_expr(self.m < self.tile_m):
-                if row < Int32(self.m):
+            global_row = row_start + row
+            if cutlass.const_expr(self.m % self.tile_m != 0):
+                if global_row < Int32(self.m):
                     src = (
                         group64 * a_stride_g
-                        + Int64(row) * a_stride_m
+                        + Int64(global_row) * a_stride_m
                         + kt64 * Int64(self.tile_k)
                         + Int64(col) * Int64(8)
                     )
@@ -802,7 +805,7 @@ class _Mxfp8Kernel:
             else:
                 src = (
                     group64 * a_stride_g
-                    + Int64(row) * a_stride_m
+                    + Int64(global_row) * a_stride_m
                     + kt64 * Int64(self.tile_k)
                     + Int64(col) * Int64(8)
                 )
@@ -1006,9 +1009,11 @@ class _Mxfp8Kernel:
         t = lane - g * Int32(4)
         col0 = jt * Int32(self.tile_n) + warp * Int32(32) + t * Int32(2)
         c_group = Int64(group) * c_stride_g
+        _, row_tile, _ = cute.arch.block_idx()
+        row_start = Int32(row_tile) * Int32(self.tile_m)
 
         for mb in cutlass.range_constexpr(self.m_blocks):
-            row0 = Int32(16 * mb) + g
+            row0 = row_start + Int32(16 * mb) + g
             row1 = row0 + Int32(8)
             for jj in cutlass.range_constexpr(4):
                 col = col0 + Int32(8 * jj)
@@ -1037,6 +1042,10 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
 
     def __init__(self, *, output_fp8: bool, **kwargs):
         super().__init__(**kwargs)
+        if self.m > 32:
+            raise ValueError(
+                "fused MXFP8 MLA query projection supports at most 32 rows"
+            )
         self.output_fp8 = bool(output_fp8)
 
     @property
@@ -1343,10 +1352,10 @@ _LAUNCH_CACHE: dict[tuple[object, ...], _Mxfp8Launch] = {}
 _MLA_QUERY_LAUNCH_CACHE: dict[tuple[object, ...], _Mxfp8Launch] = {}
 register_program_cache(_LAUNCH_CACHE)
 register_program_cache(_MLA_QUERY_LAUNCH_CACHE)
-_QUALIFIED_BATCHES = frozenset((8, 16))
+_QUALIFIED_BATCHES = frozenset((8, 16, 32))
 _QUALIFIED_GEOMETRIES = {
-    _BMajor.N: (192, 512),
-    _BMajor.K: (512, 256),
+    _BMajor.N: frozenset(((192, 512), (256, 512))),
+    _BMajor.K: frozenset(((512, 256),)),
 }
 
 
@@ -1657,7 +1666,7 @@ def _geometry_is_qualified(
     return (
         1 <= int(m) <= _MAX_M
         and int(groups) in _QUALIFIED_BATCHES
-        and (int(k), int(n)) == _QUALIFIED_GEOMETRIES[b_major]
+        and (int(k), int(n)) in _QUALIFIED_GEOMETRIES[b_major]
     )
 
 
@@ -1742,9 +1751,9 @@ def _validate_launch(
         raise ValueError("BMM operands must be on the same CUDA device")
     if not _geometry_is_qualified(b_major=major, groups=groups, m=m, n=n, k=k):
         raise NotImplementedError(
-            "the BMM MXFP8 specialization is qualified for b_major='n' "
-            "[B,K,N]=[16,192,512] or b_major='k' "
-            "[B,N,K]=[16,256,512], with 1<=M<=32; "
+            "the BMM MXFP8 specialization requires B in {8,16,32}, "
+            "b_major='n' [K,N]=[192,512] or [256,512], or b_major='k' "
+            "[N,K]=[256,512], with 1<=M<=4096; "
             f"got b_major={major.name.lower()!r}, B={groups}, M={m}, "
             f"N={n}, K={k}"
         )
@@ -2305,6 +2314,9 @@ def can_implement_mla_query_projection(
         major is _BMajor.N
         and isinstance(sf_axis, str)
         and sf_axis.lower() == "n"
+        and int(batch) in (8, 16)
+        and 1 <= int(max_m) <= 32
+        and int(k) == 192
         and int(n) == 512
         and output_dtype in (torch.bfloat16, torch.float8_e4m3fn)
         and _geometry_is_qualified(

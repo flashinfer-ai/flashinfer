@@ -1,22 +1,16 @@
-"""Graph-replay evidence for shared-storage NVFP4/MXFP8 activation precision.
+"""Compare prepared GPU execution for NVFP4/MXFP8 activation precision.
 
-Invoked by ``benchmark_dense_gemm.py --dtype fp4-a16|fp8-a16 --evidence FILE``.
-Each record preserves paired raw measurements. A run cannot promote dispatch:
-an independent confirmation and review of clock/correctness evidence are required.
+Invoked by ``benchmark_dense_gemm.py --dtype fp4-a16|fp8-a16``. Numerical
+references and changed-output replay checks precede timing. Measurements,
+including individual stream-gated CUDA event samples in microseconds, are
+printed to stdout.
 """
 
 from __future__ import annotations
 
-import hashlib
-import importlib.metadata
 import itertools
 import json
-import pathlib
-import random
 import statistics
-import subprocess
-import sys
-import time
 from dataclasses import replace
 
 import torch
@@ -25,7 +19,7 @@ from b12x.gemm import blockscaled
 from b12x.gemm.blockscaled import _a16
 from b12x.gemm.blockscaled._preparation import _workspace_bytes
 from b12x.preparation import PreparationSession, PreparedCall
-from b12x._lib.dense_gemm import dense_gemm, dense_gemm_fused_quant_a
+from b12x._lib.dense_gemm.execution import dense_gemm, dense_gemm_fused_quant_a
 from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm._shared.wo_mxfp8 import (
@@ -36,28 +30,6 @@ from benchmarks.experimental.b12x.common import make_l2_flush_fn
 
 COUNTS = (*range(1, 17), 24, 32, 64, 128, 256, 512, 1024, 2048)
 CONFIGS = tuple(itertools.product((64, 128), (64, 128), (1, 2, 4, 8)))
-
-
-def _git(*args):
-    return subprocess.check_output(["git", *args], text=True).strip()
-
-
-def _snapshot():
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    fields = "uuid,name,pstate,clocks.sm,clocks.mem,power.draw,power.limit,clocks_event_reasons.active"
-    raw = subprocess.check_output(
-        ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
-        text=True,
-    )
-    uuid = str(props.uuid)
-    if not uuid.startswith("GPU-"):
-        uuid = "GPU-" + uuid
-    rows = [line for line in raw.splitlines() if line.startswith(uuid)]
-    if len(rows) != 1:
-        raise RuntimeError(f"could not identify physical GPU {uuid} in nvidia-smi")
-    return dict(
-        fields=fields.split(","), values=[v.strip() for v in rows[0].split(",")]
-    )
 
 
 def _reference_weight(recipe, n, k):
@@ -220,144 +192,43 @@ def _paired(graphs, iters, flush):
     return [dict(zip(raw, row, strict=True)) for row in zip(*raw.values(), strict=True)]
 
 
-def _ratio_interval(pairs, candidate, baseline):
-    rng = random.Random(42)
-    ratios = []
-    for _ in range(1000):
-        selected = rng.choices(pairs, k=len(pairs))
-        ratios.append(
-            statistics.median(p[candidate] for p in selected)
-            / statistics.median(p[baseline] for p in selected)
-        )
-    ratios.sort()
-    return [ratios[25], ratios[974]]
-
-
-def _clock_checks(before, after):
-    a, b = (
-        dict(zip(row["fields"], row["values"], strict=True)) for row in (before, after)
-    )
-    if a["name"] == b["name"] == "NVIDIA GB10":
-        checks = {
-            "physical_identity": a["uuid"] == b["uuid"],
-            "p0": a["pstate"] == b["pstate"] == "P0",
-            "sm_clock_delta_le_30mhz": abs(
-                float(a["clocks.sm"]) - float(b["clocks.sm"])
-            )
-            <= 30,
-            "throttle_mask_zero": all(
-                int(row["clocks_event_reasons.active"], 16) == 0 for row in (a, b)
-            ),
-            "memory_clock": a["clocks.mem"] == b["clocks.mem"],
-        }
-        return dict(
-            checks=checks,
-            valid=all(checks.values()),
-            memory_clock_reported=a["clocks.mem"] != "[N/A]",
-            throttle_contract="GB10 diagnostic; zero throttle mask, P0, SM delta <=30MHz; NVML may not report memory clocks",
-        )
-    checks = {
-        "physical_identity": a["uuid"] == b["uuid"],
-        "p1": a["pstate"] == b["pstate"] == "P1",
-        "memory_clock": a["clocks.mem"] == b["clocks.mem"],
-        "sm_clock_delta_le_30mhz": abs(float(a["clocks.sm"]) - float(b["clocks.sm"]))
-        <= 30,
-        "throttle_mask_0_or_4": all(
-            int(row["clocks_event_reasons.active"], 16) in (0, 4) for row in (a, b)
-        ),
-    }
-    return dict(
-        checks=checks,
-        valid=all(checks.values()),
-        throttle_contract="targeted Max-Q diagnostic; allow only 0x0/0x4, P1, stable memory clock, SM delta <=30MHz",
-    )
-
-
-def _compile_state():
-    from b12x._lib.compiler import compile_cache_info
-    from b12x._lib.dense_gemm import _get_compiled_dense_gemm
-
-    return dict(
-        implementation="DenseGemmKernel",
-        compiler=compile_cache_info(),
-        dense_resolver=_get_compiled_dense_gemm.cache_info()._asdict(),
-    )
-
-
 def run(args, specs):
-    if args.evidence is None or not args.check:
-        raise ValueError(
-            "A16 evidence requires --evidence FILE and enabled correctness checks"
-        )
+    if not args.check:
+        raise ValueError("A16 benchmarks require correctness checks")
     if args.iters < 20 or args.warmup < 3:
-        raise ValueError("A16 evidence requires at least 20 trials and 3 warmups")
+        raise ValueError("A16 benchmarks require at least 20 trials and 3 warmups")
     if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
-        raise ValueError("A16 evidence requires SM120/SM121")
+        raise ValueError("A16 benchmarks require SM120/SM121")
     recipe = "nvfp4" if args.dtype == "fp4-a16" else "mxfp8"
     counts = args.batch_sizes or COUNTS
     if any(m <= 0 for m in counts):
         raise ValueError("benchmark M must be positive")
-    root = pathlib.Path(__file__).resolve().parents[3]
-    paths = [
-        *sorted((root / "flashinfer/experimental/b12x/gemm/blockscaled").glob("*.py")),
-        root / "benchmarks/experimental/b12x/benchmark_dense_gemm.py",
-        root / "flashinfer/experimental/b12x/_lib/dense_gemm.py",
-        root / "flashinfer/experimental/b12x/_lib/intrinsics.py",
-        pathlib.Path(__file__).resolve(),
-    ]
-    manifest = {
-        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in paths
-    }
-    args.evidence.parent.mkdir(parents=True, exist_ok=True)
-    with args.evidence.open("x") as evidence:
-
-        def record(row):
-            evidence.write(json.dumps(row) + "\n")
-            evidence.flush()
-
-        record(
-            dict(
-                kind="manifest",
-                command=sys.argv,
-                cwd=str(pathlib.Path.cwd()),
-                revision=_git("rev-parse", "HEAD"),
-                dirty=_git("status", "--porcelain"),
-                source_sha256=manifest,
-                timestamp=time.time(),
-                recipe=recipe,
-                profile=args.profile,
-                specs=specs,
-                torch=torch.__version__,
-                triton=importlib.metadata.version("triton"),
-                cutlass=importlib.metadata.version("nvidia-cutlass-dsl"),
-                device=_snapshot(),
-                ratio="a16_us / baseline_us; lower is faster for b12x A16",
-                status="research-only",
-            )
-        )
-        flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
-        for name, k, n, _ in specs:
-            torch.manual_seed(42)
-            weight, local_weight, multiplier = _reference_weight(recipe, n, k)
-            for m in counts:
-                with PreparationSession(
-                    device="cuda", autotune=False, compile_workers=2
-                ) as session:
-                    _run_case(
-                        args,
-                        name,
-                        recipe,
-                        m,
-                        n,
-                        k,
-                        weight,
-                        local_weight,
-                        multiplier,
-                        session,
-                        flush,
-                        record,
-                    )
+    print(
+        f"{torch.cuda.get_device_name()} {recipe}: warmup={args.warmup} "
+        f"samples={args.iters} L2={'flushed' if args.flush_l2 else 'warm'}",
+        flush=True,
+    )
+    flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
+    for name, k, n, _ in specs:
+        torch.manual_seed(42)
+        weight, local_weight, multiplier = _reference_weight(recipe, n, k)
+        for m in counts:
+            with PreparationSession(
+                device="cuda", autotune=False, compile_workers=2
+            ) as session:
+                _run_case(
+                    args,
+                    name,
+                    recipe,
+                    m,
+                    n,
+                    k,
+                    weight,
+                    local_weight,
+                    multiplier,
+                    session,
+                    flush,
+                )
 
 
 def _run_case(
@@ -372,7 +243,6 @@ def _run_case(
     multiplier,
     session,
     flush,
-    record,
 ):
     source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.25
     options = (
@@ -414,13 +284,10 @@ def _run_case(
         aq = quantize_mxfp8_rows_torch(source)
         adeq = dequantize_mxfp8_rows_torch(aq.values, aq.scale_rows).float()
         qref = adeq @ local_weight.T
-    graphs, correctness, outputs = {}, {}, [qscratch]
+    calls, graphs, correctness, outputs = {}, {}, {}, [qscratch]
 
     def add(label, call, oracle):
-        graph, check, output = _checked_graph(call, oracle, label)
-        graphs[label] = graph
-        correctness[label] = check
-        outputs.append(output)
+        calls[label] = (call, oracle)
 
     add("quantized", qcall, qref)
     from b12x._lib.intrinsics.reference import (
@@ -505,39 +372,39 @@ def _run_case(
         add(label, call, reference)
         outputs.extend((output, scratch))
         a16_names.append(label)
+    # Capture after plan preparation, which can reclaim direct-control programs.
+    for label, (call, oracle) in calls.items():
+        graph, check, output = _checked_graph(call, oracle, label)
+        graphs[label] = graph
+        correctness[label] = check
+        outputs.append(output)
     session.freeze()
     _warmup(graphs, args.warmup, flush)
-    before = _snapshot()
     pairs = _paired(graphs, args.iters, flush)
-    after = _snapshot()
     medians = {key: statistics.median(p[key] for p in pairs) for key in graphs}
     winner = min(a16_names, key=medians.get)
     baselines = [
         key for key in graphs if key not in a16_names and key != "quantized_gemm_only"
     ]
     ratios = {key: medians[winner] / medians[key] for key in baselines}
-    intervals = {key: _ratio_interval(pairs, winner, key) for key in baselines}
-    record(
-        dict(
-            kind="measurement",
-            name=name,
-            m=m,
-            n=n,
-            k=k,
-            recipe=recipe,
-            l2="flushed" if args.flush_l2 else "warm",
-            correctness=correctness,
-            snapshot_before=before,
-            snapshot_after=after,
-            samples_us=pairs,
-            medians_us=medians,
-            winning_candidate=winner,
-            ratios=ratios,
-            ratio_ci95=intervals,
-            clock_validation=_clock_checks(before, after),
-            compile_state=_compile_state(),
-            requires_independent_confirmation=True,
-        )
+    print(
+        json.dumps(
+            dict(
+                name=name,
+                m=m,
+                n=n,
+                k=k,
+                recipe=recipe,
+                l2="flushed" if args.flush_l2 else "warm",
+                timing="stream-gated CUDA events",
+                correctness=correctness,
+                samples_us=pairs,
+                medians_us=medians,
+                winning_candidate=winner,
+                ratios=ratios,
+            )
+        ),
+        flush=True,
     )
     print(
         f"{recipe} {name} M={m}: {winner} {medians[winner]:.3f} us; ratios={ratios}",

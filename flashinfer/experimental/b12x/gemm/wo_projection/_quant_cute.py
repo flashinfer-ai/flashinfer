@@ -14,6 +14,7 @@ from b12x._lib.compiler import (
     compile as b12x_compile,
 )
 from b12x._lib.intrinsics.constants import FLOAT8_E4M3_MAX
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
 from b12x._lib.intrinsics.conversion import (
     cvt_f32x4_to_e4m3x4,
     pow2_ceil_ue8m0,
@@ -21,7 +22,6 @@ from b12x._lib.intrinsics.conversion import (
 )
 from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
 from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_u32
-from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )

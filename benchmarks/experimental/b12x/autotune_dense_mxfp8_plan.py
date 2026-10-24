@@ -30,11 +30,9 @@ from benchmarks.experimental.b12x.dense_autotune_common import (
     cosine_similarity,
     make_mxfp8_operand,
 )
-from b12x._lib.dense_gemm import (
-    DenseGemmKernel,
-    _select_default_dense_gemm_plan,
-    dense_gemm,
-)
+from b12x._lib.dense_gemm.kernel import DenseGemmKernel
+from b12x._lib.dense_gemm.policy import _select_default_dense_gemm_plan
+from b12x._lib.dense_gemm.execution import dense_gemm
 from b12x._lib.utils.device import get_num_sm
 
 

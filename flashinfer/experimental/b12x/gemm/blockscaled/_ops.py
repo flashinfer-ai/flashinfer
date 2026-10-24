@@ -30,7 +30,11 @@ def _execute(
 
         declaration = heuristic_plan(
             BlockscaledQuery(
-                recipe="mxfp8" if values.dtype == torch.float8_e4m3fn else "nvfp4",
+                recipe="mxfp8"
+                if values.dtype == torch.float8_e4m3fn
+                else "mxfp4"
+                if global_scale_kind == "none"
+                else "nvfp4",
                 num_tokens=source.numel() // source.shape[-1],
                 in_features=source.shape[-1],
                 padded_in_features=values.shape[-1]
@@ -56,7 +60,7 @@ def _execute(
         raise ValueError("this entry point requires an A16 prepared plan")
     if global_scale_kind != state.query.global_scale_kind:
         raise ValueError("weight scale semantics differ from prepared invocation")
-    if state.query.recipe == "mxfp8" and scales.dtype == torch.uint8:
+    if state.query.recipe in ("mxfp8", "mxfp4") and scales.dtype == torch.uint8:
         scales = scales.view(torch.float8_e8m0fnu)
     return state.run(
         source,

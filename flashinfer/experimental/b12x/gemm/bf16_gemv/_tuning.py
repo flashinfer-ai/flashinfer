@@ -26,6 +26,7 @@ class GemvQuery:
 class GemvConfig:
     backend: str
     rows_per_tile: int = 8
+    block_threads: int = 128
 
 
 def validate_query(query):
@@ -67,10 +68,33 @@ def _mma_eligible(query):
     )
 
 
-def _torch_eligible(query):
+def _tc_eligible(query):
+    from ._tensor_core import TC_K_MULTIPLE, TC_MAX_ROWS
+
     return (
         query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
-        and query.bias_dtype in (None, "bfloat16")
+        and query.bias_dtype is None
+        and query.max_rows <= TC_MAX_ROWS
+        and query.in_features % TC_K_MULTIPLE == 0
+        and query.source_contiguous
+        and query.source_aligned
+        and query.weight_contiguous
+        and query.weight_aligned
+        and query.output_contiguous
+    )
+
+
+def _torch_eligible(query):
+    if query.source_dtype != "bfloat16" or query.weight_dtype != "bfloat16":
+        return False
+    if query.output_dtype == "bfloat16":
+        return query.bias_dtype in (None, "bfloat16")
+    import torch
+
+    return (
+        query.output_dtype == "float32"
+        and query.bias_dtype is None
+        and hasattr(torch.ops.aten.mm, "dtype_out")
     )
 
 
@@ -129,10 +153,19 @@ def validate_config(query, config, device):
             8,
         ):
             raise ValueError("SIMT projection rows_per_tile must be 1, 2, 4 or 8")
+        if type(config.block_threads) is not int or config.block_threads not in (
+            128,
+            256,
+        ):
+            raise ValueError("SIMT projection block_threads must be 128 or 256")
         return
     if config.rows_per_tile != 8:
         raise ValueError("rows_per_tile only configures SIMT projection")
+    if config.block_threads != 128:
+        raise ValueError("block_threads only configures SIMT projection")
     if config.backend == "mma" and _mma_eligible(query):
+        return
+    if config.backend == "tc" and _tc_eligible(query):
         return
     if config.backend == "torch" and _torch_eligible(query):
         return
@@ -147,6 +180,8 @@ def _parameters(query, device):
     backends = ["simt"]
     if _mma_eligible(query):
         backends.append("mma")
+    if _tc_eligible(query):
+        backends.append("tc")
     if _prefill_eligible(query):
         backends.append("prefill")
     if _torch_eligible(query):
@@ -159,13 +194,15 @@ def _parameters(query, device):
 
 
 def _eligible(choice):
-    return choice["backend"] == "simt" or choice["rows_per_tile"] == 8
+    return choice["backend"] == "simt" or (
+        choice["rows_per_tile"] == 8 and choice["block_threads"] == 128
+    )
 
 
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
     query_schema_version=22,
-    config_schema_version=22,
+    config_schema_version=23,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
     encode_query=asdict,
@@ -179,8 +216,9 @@ TUNING = TuningContract(
         Knob(
             name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE
         ),
+        Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=7,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

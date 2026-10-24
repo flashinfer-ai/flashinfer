@@ -17,8 +17,12 @@ coefficients to ``pre_out``.
 ``plan(Caps(...), invocation=...)`` is allocation-free. ``PreparationSession``
 selects and primes the complete plan before ``bind`` builds scratch views.
 Functional operations carry the same opaque prepared reference through eager,
-torch.compile and graph capture. Bindings carry their own prepared plan;
-there is no implicit runtime configuration path.
+torch.compile and graph capture. Fully bound operations expose scratch and
+output mutations to compilation without allocating buffers. Bind partials,
+residual, normalized output, post and comb storage, plus ``pre_out`` for lagged
+mixing. ``run_post`` also supports a caller-owned ``out`` through compilation.
+Bindings carry their own prepared plan; there is no implicit runtime
+configuration path.
 """
 
 from __future__ import annotations

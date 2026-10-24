@@ -16,100 +16,12 @@ if TYPE_CHECKING:
 _CHANNEL_BLOCK = 128
 
 
-@triton.jit
-def _request_ids_kernel(
-    query_start_loc_ptr,
-    num_seqs_ptr,
-    num_tokens_ptr,
-    request_ids_ptr,
-    MAX_TOKENS: tl.constexpr,
-):
-    token = tl.program_id(0)
-    num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
-    live = token < num_tokens
-
-    low = tl.zeros((), tl.int32)
-    high = tl.maximum(num_seqs, 1)
-    while low + 1 < high:
-        middle = (low + high) // 2
-        start = tl.load(query_start_loc_ptr + middle, mask=live, other=0).to(tl.int32)
-        low = tl.where(start <= token, middle, low)
-        high = tl.where(start <= token, high, middle)
-    request = tl.where(live & (num_seqs > 0), low, -1)
-    tl.store(request_ids_ptr + token, request)
-
-
-@triton.jit
-def _prepare_history_kernel(
-    conv_state_ptr,
-    state_slot_ids_ptr,
-    state_is_fresh_ptr,
-    num_accepted_tokens_ptr,
-    request_is_prefill_ptr,
-    num_seqs_ptr,
-    gathered_state_ptr,
-    CHANNELS: tl.constexpr,
-    STATE_LENGTH: tl.constexpr,
-    STATE_CAPACITY: tl.constexpr,
-    stride_state_slot: tl.constexpr,
-    stride_state_channel: tl.constexpr,
-    stride_state_position: tl.constexpr,
-    MAX_SPECULATIVE: tl.constexpr,
-    DECODE: tl.constexpr,
-    MIXED: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    request = tl.program_id(0)
-    channel_block = tl.program_id(1)
-    channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
-    channel_mask = channels < CHANNELS
-    num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
-    request_live = request < num_seqs
-    slot = tl.load(state_slot_ids_ptr + request, mask=request_live, other=-1).to(
-        tl.int64
-    )
-    fresh = tl.load(state_is_fresh_ptr + request, mask=request_live, other=True).to(
-        tl.int1
-    )
-    live = request_live & (slot >= 0)
-    if MIXED:
-        request_decode = request_live & ~tl.load(
-            request_is_prefill_ptr + request,
-            mask=request_live,
-            other=True,
-        ).to(tl.int1)
-    else:
-        request_decode = request_live & DECODE
-    if DECODE or MIXED:
-        accepted = tl.load(
-            num_accepted_tokens_ptr + request, mask=request_live, other=0
-        ).to(tl.int32)
-        rollback = tl.minimum(accepted - 1, MAX_SPECULATIVE)
-        rollback = tl.where(request_decode, rollback, 0)
-    else:
-        rollback = tl.zeros((), tl.int32)
-
-    for position in tl.static_range(0, STATE_LENGTH):
-        source_position = position + rollback
-        source_offsets = (
-            slot.to(tl.int64) * stride_state_slot
-            + channels.to(tl.int64) * stride_state_channel
-            + source_position.to(tl.int64) * stride_state_position
-        )
-        value = tl.load(
-            conv_state_ptr + source_offsets,
-            mask=live & channel_mask & ~fresh & (source_position < STATE_CAPACITY),
-            other=0.0,
-        )
-        gathered_offsets = (
-            request.to(tl.int64) * CHANNELS + channels.to(tl.int64)
-        ) * STATE_LENGTH + position
-        tl.store(
-            gathered_state_ptr + gathered_offsets,
-            value,
-            mask=channel_mask,
-        )
+from .._short_conv import (
+    _prepare_history_kernel,
+    _request_ids_kernel,
+    _short_conv_kernel,
+    _update_state_kernel,
+)
 
 
 @triton.jit
@@ -218,194 +130,22 @@ def _dilated_conv_kernel(
     DILATION: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    token = tl.program_id(0)
-    channel_block = tl.program_id(1)
-    channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
-    channel_mask = channels < CHANNELS
-    num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    token_live = token < num_tokens
-    request = tl.load(request_ids_ptr + token).to(tl.int32)
-    slot = tl.load(
-        state_slot_ids_ptr + request,
-        mask=token_live & (request >= 0),
-        other=-1,
-    ).to(tl.int64)
-    live = token_live & (request >= 0) & (slot >= 0)
-    query_start = tl.load(
-        query_start_loc_ptr + request,
-        mask=live,
-        other=0,
-    ).to(tl.int32)
-    query_relative = token - query_start
-
-    accumulator = tl.zeros((BLOCK_C,), tl.float32)
-    for tap in tl.static_range(0, KERNEL_SIZE):
-        history_distance = (KERNEL_SIZE - 1 - tap) * DILATION
-        source_relative = query_relative - history_distance
-        from_query = source_relative >= 0
-        query_token = query_start + source_relative
-        query_offsets = query_token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
-        query_value = tl.load(
-            normalized_u_ptr + query_offsets,
-            mask=live & channel_mask & from_query,
-            other=0.0,
-        ).to(tl.float32)
-        history_position = STATE_LENGTH + source_relative
-        history_offsets = (
-            request.to(tl.int64) * CHANNELS + channels.to(tl.int64)
-        ) * STATE_LENGTH + history_position
-        history_value = tl.load(
-            gathered_state_ptr + history_offsets,
-            mask=(
-                live
-                & channel_mask
-                & ~from_query
-                & (history_position >= 0)
-                & (history_position < STATE_LENGTH)
-            ),
-            other=0.0,
-        ).to(tl.float32)
-        source = tl.where(from_query, query_value, history_value)
-        weight = tl.load(
-            conv_weight_ptr + channels.to(tl.int64) * KERNEL_SIZE + tap,
-            mask=channel_mask,
-            other=0.0,
-        ).to(tl.float32)
-        accumulator += source * weight
-
-    conv_bf16 = accumulator.to(tl.bfloat16)
-    conv_float = conv_bf16.to(tl.float32)
-    activated = (conv_float * tl.sigmoid(conv_float)).to(tl.bfloat16)
-    output_offsets = token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
-    u = tl.load(out_ptr + output_offsets, mask=channel_mask, other=0.0).to(tl.bfloat16)
-    contribution = (u + activated).to(tl.bfloat16)
-    tl.store(
-        out_ptr + output_offsets,
-        tl.where(live, contribution, 0.0),
-        mask=channel_mask,
+    _short_conv_kernel(
+        normalized_u_ptr,
+        gathered_state_ptr,
+        conv_weight_ptr,
+        query_start_loc_ptr,
+        request_ids_ptr,
+        state_slot_ids_ptr,
+        num_tokens_ptr,
+        out_ptr,
+        CHANNELS,
+        STATE_LENGTH,
+        KERNEL_SIZE,
+        DILATION,
+        BLOCK_C,
+        ADD_RESIDUAL=True,
     )
-
-
-@triton.jit
-def _update_state_kernel(
-    normalized_u_ptr,
-    gathered_state_ptr,
-    query_start_loc_ptr,
-    state_slot_ids_ptr,
-    request_is_prefill_ptr,
-    num_seqs_ptr,
-    conv_state_ptr,
-    CHANNELS: tl.constexpr,
-    STATE_LENGTH: tl.constexpr,
-    STATE_CAPACITY: tl.constexpr,
-    stride_state_slot: tl.constexpr,
-    stride_state_channel: tl.constexpr,
-    stride_state_position: tl.constexpr,
-    MAX_SPECULATIVE: tl.constexpr,
-    DECODE: tl.constexpr,
-    MIXED: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    request = tl.program_id(0)
-    channel_block = tl.program_id(1)
-    channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
-    channel_mask = channels < CHANNELS
-    num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
-    request_live = request < num_seqs
-    slot = tl.load(state_slot_ids_ptr + request, mask=request_live, other=-1).to(
-        tl.int64
-    )
-    live = request_live & (slot >= 0)
-    query_start = tl.load(query_start_loc_ptr + request, mask=request_live, other=0).to(
-        tl.int32
-    )
-    query_end = tl.load(
-        query_start_loc_ptr + request + 1, mask=request_live, other=0
-    ).to(tl.int32)
-    query_length = query_end - query_start
-    if MIXED:
-        request_decode = request_live & ~tl.load(
-            request_is_prefill_ptr + request,
-            mask=request_live,
-            other=True,
-        ).to(tl.int1)
-    else:
-        request_decode = request_live & DECODE
-
-    for position in tl.static_range(0, STATE_LENGTH):
-        if DECODE or MIXED:
-            commit_current = tl.where(query_length > 0, 1, 0)
-            decode_source_position = position + commit_current
-            prefill_source_position = position + query_length
-            source_position = tl.where(
-                request_decode,
-                decode_source_position,
-                prefill_source_position,
-            )
-        else:
-            source_position = position + query_length
-        from_query = source_position >= STATE_LENGTH
-        query_relative = source_position - STATE_LENGTH
-        query_token = query_start + query_relative
-        query_offsets = query_token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
-        query_value = tl.load(
-            normalized_u_ptr + query_offsets,
-            mask=(
-                live
-                & channel_mask
-                & from_query
-                & (query_relative >= 0)
-                & (query_relative < query_length)
-            ),
-            other=0.0,
-        )
-        history_offsets = (
-            request.to(tl.int64) * CHANNELS + channels.to(tl.int64)
-        ) * STATE_LENGTH + source_position
-        history_value = tl.load(
-            gathered_state_ptr + history_offsets,
-            mask=live & channel_mask & ~from_query,
-            other=0.0,
-        )
-        value = tl.where(from_query, query_value, history_value)
-        destination_offsets = (
-            slot.to(tl.int64) * stride_state_slot
-            + channels.to(tl.int64) * stride_state_channel
-            + position * stride_state_position
-        )
-        tl.store(
-            conv_state_ptr + destination_offsets,
-            value,
-            mask=live & channel_mask & (query_length > 0),
-        )
-
-    for candidate in tl.static_range(0, MAX_SPECULATIVE):
-        if DECODE or MIXED:
-            query_relative = candidate + 1
-            query_token = query_start + query_relative
-            query_offsets = query_token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
-            candidate_value = tl.load(
-                normalized_u_ptr + query_offsets,
-                mask=(
-                    live
-                    & request_decode
-                    & channel_mask
-                    & (query_relative < query_length)
-                ),
-                other=0.0,
-            )
-        else:
-            candidate_value = tl.zeros((BLOCK_C,), tl.float32)
-        destination_offsets = (
-            slot.to(tl.int64) * stride_state_slot
-            + channels.to(tl.int64) * stride_state_channel
-            + (STATE_LENGTH + candidate) * stride_state_position
-        )
-        tl.store(
-            conv_state_ptr + destination_offsets,
-            candidate_value,
-            mask=live & channel_mask & (query_length > 0),
-        )
 
 
 @torch.library.custom_op(

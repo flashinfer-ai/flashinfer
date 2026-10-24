@@ -8,21 +8,14 @@ types specialize both implementations; live rows and strides never do.
 
 from __future__ import annotations
 
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
-from cutlass.cute.nvgpu import warp, warpgroup
-from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-
+import torch
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.program_cache import program_cache
-from b12x._lib.compiler import KernelCompileSpec
+from b12x._lib.compiler import KernelCompileSpec, run_compiled
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.compiler import run_compiled
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v4_u32,
@@ -30,10 +23,14 @@ from b12x._lib.intrinsics.memory import (
     st_shared_v4_u32,
     u32_as_f32,
 )
-from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
+from b12x._lib.intrinsics.reduction import warp_reduce
+from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass.cute.nvgpu import warp, warpgroup
+from cutlass.utils import LayoutEnum
 
 _THREADS = 128
 SMALL_M_MAX = 8  # Rows sharing a weight load, not a live-row support limit.
@@ -70,25 +67,6 @@ def _dot_bf16x8(
     return result
 
 
-@cute.jit
-def _reduce_store(
-    value: Float32,
-    reduction: cute.Tensor,
-    output: cute.Tensor,
-    offset: Int64,
-    bias: cute.Tensor,
-    column: Int32,
-    has_bias: cutlass.Constexpr,
-):
-    total = block_reduce(warp_reduce(value, _fadd), _fadd, reduction, Float32(0.0))
-    thread, _, _ = cute.arch.thread_idx()
-    if Int32(thread) == Int32(0):
-        if cutlass.const_expr(has_bias):
-            total += Float32(bias[column])
-        output[offset] = total.to(output.element_type)
-    cute.arch.barrier()
-
-
 class SmallNGemvKernel:
     """One CTA per output column and fixed tile of up to eight live rows."""
 
@@ -99,6 +77,7 @@ class SmallNGemvKernel:
         bf16_operands: bool,
         has_bias: bool,
         rows_per_tile: int = SMALL_M_MAX,
+        block_threads: int = _THREADS,
     ):
         self.n, self.k = int(n), int(k)
         self.bf16_operands = bool(bf16_operands)
@@ -106,6 +85,9 @@ class SmallNGemvKernel:
         if rows_per_tile not in (1, 2, 4, 8):
             raise ValueError("SIMT projection supports 1, 2, 4, or 8 rows per tile")
         self.rows_per_tile = int(rows_per_tile)
+        if block_threads not in (128, 256):
+            raise ValueError("SIMT projection supports 128 or 256 threads per block")
+        self.block_threads = int(block_threads)
 
     @cute.jit
     def __call__(
@@ -123,6 +105,11 @@ class SmallNGemvKernel:
         vector_loads: Int32,
         stream: cuda.CUstream,
     ):
+        row_tiles = (Int64(rows) + Int64(self.rows_per_tile - 1)) // Int64(
+            self.rows_per_tile
+        )
+        grid_z = (row_tiles + Int64(65534)) // Int64(65535)
+        grid_y = (row_tiles + grid_z - Int64(1)) // grid_z
         self.kernel(
             _flat(x),
             _flat(weight),
@@ -138,10 +125,10 @@ class SmallNGemvKernel:
         ).launch(
             grid=(
                 self.n,
-                (rows + Int32(self.rows_per_tile - 1)) // Int32(self.rows_per_tile),
-                1,
+                Int32(grid_y),
+                Int32(grid_z),
             ),
-            block=(_THREADS, 1, 1),
+            block=(self.block_threads, 1, 1),
             stream=stream,
         )
 
@@ -161,9 +148,12 @@ class SmallNGemvKernel:
         vector_loads: Int32,
     ):
         thread, _, _ = cute.arch.thread_idx()
-        column, row_tile, _ = cute.arch.block_idx()
+        column, row_tile, row_plane = cute.arch.block_idx()
+        _, tiles_per_plane, _ = cute.arch.grid_dim()
         tid = Int32(thread)
-        first_row = Int64(row_tile) * Int64(self.rows_per_tile)
+        first_row = (
+            Int64(row_plane) * Int64(tiles_per_plane) + Int64(row_tile)
+        ) * Int64(self.rows_per_tile)
         w_base = Int64(column) * weight_stride
         acc = cute.make_rmem_tensor((self.rows_per_tile,), Float32)
         for r in cutlass.range_constexpr(self.rows_per_tile):
@@ -182,7 +172,7 @@ class SmallNGemvKernel:
                             acc[r] = _dot_bf16x8(
                                 source, row * x_stride + offset, w0, w1, w2, w3, acc[r]
                             )
-                    index += Int32(_THREADS)
+                    index += Int32(self.block_threads)
             else:
                 self.scalar_dot(
                     source,
@@ -210,21 +200,31 @@ class SmallNGemvKernel:
                 tid,
             )
         allocator = cutlass.utils.SmemAllocator()
+        warps = self.block_threads // 32
         reduction = allocator.allocate_tensor(
-            Float32, cute.make_layout((1, _THREADS // 32)), byte_alignment=16
+            Float32, cute.make_layout((self.rows_per_tile, warps)), byte_alignment=16
         )
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
         for r in cutlass.range_constexpr(self.rows_per_tile):
-            row = first_row + Int64(r)
-            if row < Int64(rows):
-                _reduce_store(
-                    acc[r],
-                    reduction,
-                    output,
-                    row * output_stride + Int64(column),
-                    bias,
-                    Int32(column),
-                    self.has_bias,
-                )
+            total = warp_reduce(acc[r], _fadd)
+            if lane == 0:
+                reduction[r, warp] = total
+        cute.arch.barrier()
+        if warp == 0:
+            for r in cutlass.range_constexpr(self.rows_per_tile):
+                row = first_row + Int64(r)
+                if row < Int64(rows):
+                    partial = Float32(0.0)
+                    if lane < warps:
+                        partial = reduction[r, lane]
+                    total = warp_reduce(partial, _fadd)
+                    if lane == 0:
+                        if cutlass.const_expr(self.has_bias):
+                            total += Float32(bias[Int32(column)])
+                        output[row * output_stride + Int64(column)] = total.to(
+                            output.element_type
+                        )
 
     @cute.jit
     def scalar_dot(
@@ -250,7 +250,7 @@ class SmallNGemvKernel:
                         Float32(source[row * x_stride + Int64(index) * x_column_stride])
                         * value
                     )
-            index += Int32(_THREADS)
+            index += Int32(self.block_threads)
 
 
 class Bf16GemmKernel:
@@ -549,6 +549,7 @@ def compile_projection(
     weight_dtype: str,
     output_dtype: str,
     bias_dtype: str | None,
+    block_threads: int,
 ):
     """Compile one selected concrete kernel from immutable operand metadata."""
     x_type, w_type, y_type = (
@@ -559,19 +560,25 @@ def compile_projection(
             output_dtype,
         )
     )
-    kernel = (
-        SmallNGemvKernel(
+    if backend not in ("simt", "mma", "tc"):
+        raise ValueError(
+            "projection compiler requires a selected SIMT, MMA or TC backend"
+        )
+    if backend == "simt":
+        kernel = SmallNGemvKernel(
             n,
             k,
             x_type == w_type == torch.bfloat16,
             bias_dtype is not None,
             rows_per_tile,
+            block_threads,
         )
-        if backend == "simt"
-        else Bf16GemmKernel(n, k, bias_dtype is not None)
-    )
-    if backend not in ("simt", "mma"):
-        raise ValueError("projection compiler requires a selected SIMT or MMA backend")
+    elif backend == "tc":
+        from ._tensor_core import TensorCoreGemvKernel
+
+        kernel = TensorCoreGemvKernel(n, k)
+    else:
+        kernel = Bf16GemmKernel(n, k, bias_dtype is not None)
     types = (
         x_type,
         w_type,
@@ -579,9 +586,9 @@ def compile_projection(
         y_type,
     )
     key = (
-        ordinal,
         backend,
         rows_per_tile if backend == "simt" else None,
+        block_threads if backend == "simt" else None,
         n,
         k,
         source_dtype,
@@ -608,7 +615,7 @@ def compile_projection(
             Int32(0),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.selected", 1, key
+                "gemm.bf16_projection.selected", 3, key
             ),
         )
 

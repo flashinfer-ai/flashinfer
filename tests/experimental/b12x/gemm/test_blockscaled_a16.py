@@ -258,7 +258,16 @@ def test_a16_aot_compile_functionalizes_workspace(recipe, allocated, functionali
             assert_close(compiled(source), source.float() @ decoded.T)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "recipe,tile_n,mma_warps",
+    [
+        ("nvfp4", 64, None),
+        ("mxfp8", 64, 2),
+        ("mxfp8", 64, 4),
+        ("mxfp8", 128, 2),
+        ("mxfp8", 128, 4),
+    ],
+)
 @pytest.mark.parametrize(
     "m,n,k",
     [
@@ -271,12 +280,14 @@ def test_a16_aot_compile_functionalizes_workspace(recipe, allocated, functionali
     ],
 )
 @pytest.mark.parametrize("split", [1, 2, 4, 8])
-def test_a16_reference(recipe, m, n, k, split):
+def test_a16_reference(recipe, tile_n, mma_warps, m, n, k, split):
     require_b12x()
     weight, decoded, _ = make_weight(recipe, n, k)
     source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     output = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
-    config = BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=split)
+    config = BlockscaledConfig(
+        mode="a16", tile_n=tile_n, tile_k=64, split_k=split, mma_warps=mma_warps
+    )
     provisional = blockscaled.query_from_call(
         source, weight, activation_mode="a16", out=output, expected_m=m
     )
@@ -302,6 +313,69 @@ def test_a16_reference(recipe, m, n, k, split):
         assert actual.data_ptr() == output.data_ptr()
         assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
         assert_close(actual, source.float() @ decoded.T)
+
+
+@pytest.mark.parametrize(
+    "recipe,tile_n,mma_warps",
+    [
+        ("nvfp4", 64, None),
+        ("mxfp8", 64, 2),
+        ("mxfp8", 64, 4),
+        ("mxfp8", 128, 2),
+        ("mxfp8", 128, 4),
+    ],
+)
+@pytest.mark.parametrize("split", [1, 4])
+def test_a16_graph_replay_with_concurrent_memory_traffic(
+    recipe, tile_n, mma_warps, split
+):
+    require_b12x()
+    source = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
+    weight, decoded, _ = make_weight(recipe, 2048, 4096)
+    output = torch.empty(8, 2048, device="cuda", dtype=torch.bfloat16)
+    config = BlockscaledConfig(
+        mode="a16",
+        tile_m=16,
+        tile_n=tile_n,
+        tile_k=64,
+        split_k=split,
+        mma_warps=mma_warps,
+    )
+    workspace = make_workspace(
+        source, weight, activation_mode="a16", out=output, config=config
+    )
+    traffic = torch.zeros(256 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    destination = torch.empty_like(traffic)
+    auxiliary = torch.cuda.Stream()
+
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode="a16",
+        out=output,
+        workspace=workspace,
+        config=config,
+    ) as (_, plan):
+        blockscaled.mm(source, weight, out=output, workspace=workspace, plan=plan)
+        assert_close(output, source.float() @ decoded.T)
+        expected = output.clone()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            capture_stream = torch.cuda.current_stream()
+            auxiliary.wait_stream(capture_stream)
+            with torch.cuda.stream(auxiliary):
+                blockscaled.mm(
+                    source, weight, out=output, workspace=workspace, plan=plan
+                )
+            destination.copy_(traffic)
+            capture_stream.wait_stream(auxiliary)
+        try:
+            for _ in range(128):
+                graph.replay()
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        finally:
+            graph.reset()
 
 
 @pytest.mark.parametrize("kind", ["multiplier", "reciprocal"])
@@ -413,7 +487,7 @@ def test_a16_frozen_callable_and_graph_replay(recipe, tile_m, monkeypatch):
 def test_quantized_nvfp4_activation_contract():
     require_b12x()
     from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
-    from b12x._lib.dense_gemm import dense_gemm
+    from b12x._lib.dense_gemm.execution import dense_gemm
 
     weight, _, _ = make_weight("nvfp4", 128, 256)
     source = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
@@ -628,6 +702,82 @@ def test_mxfp8_prepared_functional_and_provided_forms_match():
         graph.reset()
 
 
+def test_mxfp8_a16_large_m_expands_weight_into_caller_scratch():
+    """Long A16 MXFP8 calls run a BF16 GEMM over the weight expanded in scratch.
+
+    The expansion is exact, so those rows match BF16 weights bitwise; shorter rows
+    in the same capacity plan keep the warp-MMA kernel. Owned scratch and short
+    capacities do not reserve the expanded weight.
+    """
+    from b12x.gemm.blockscaled import _tuning
+
+    require_b12x()
+    capacity, n, k = 256, 384, 512
+    weight, decoded, _ = make_weight("mxfp8", n, k)
+    dense = decoded.to(torch.bfloat16)
+    source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+    workspace = make_workspace(source, weight, activation_mode="a16")
+    assert workspace.numel() == n * k * 2
+    query = blockscaled.query_from_call(source, weight, activation_mode="a16")
+    config = _preparation.TUNING.default_config(
+        query, detect_device(source.device).identity
+    )
+    assert _preparation._workspace_bytes(query, config) == 0
+    short = blockscaled.query_from_call(
+        source[: _tuning.MXFP8_A16_DEQUANT_MIN_ROWS - 1],
+        weight,
+        activation_mode="a16",
+        workspace=workspace,
+    )
+    assert not _tuning.mxfp8_a16_dequant(short, config)
+    huge = replace(
+        short,
+        num_tokens=capacity,
+        out_features=_tuning.MXFP8_A16_DEQUANT_MAX_BYTES // (2 * 8192) + 8,
+        in_features=8192,
+        padded_in_features=8192,
+        workspace_nbytes=None,
+    )
+    assert not _tuning.mxfp8_a16_dequant(huge, config)
+    assert _tuning.mxfp8_a16_dequant(replace(huge, out_features=8), config)
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode="a16",
+        workspace=workspace,
+        name="a16-expanded",
+    ) as (_, plan):
+        assert "dequant" in plan.prepared.state.programs
+        for rows in (16, _tuning.MXFP8_A16_DEQUANT_MIN_ROWS - 1, 128, capacity):
+            workspace.fill_(255)
+            actual = blockscaled.mm(
+                source[:rows], weight, plan=plan, workspace=workspace
+            )
+            if rows >= _tuning.MXFP8_A16_DEQUANT_MIN_ROWS:
+                torch.testing.assert_close(
+                    actual, source[:rows] @ dense.T, atol=0, rtol=0
+                )
+            else:
+                assert_close(actual, source[:rows].float() @ decoded.T)
+        output = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with kernel_resolution_guard("A16 MXFP8 expanded-weight capture"):
+                with torch.cuda.graph(graph):
+                    captured = blockscaled.mm(
+                        source, weight, plan=plan, workspace=workspace
+                    )
+                    output.copy_(captured)
+                source.normal_()
+                workspace.fill_(255)
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+            torch.testing.assert_close(output, source @ dense.T, atol=0, rtol=0)
+        finally:
+            graph.reset()
+
+
 def test_mxfp8_prefill_capacity_owned_and_provided_match():
     """Both scratch contracts retain short and long programs under frozen capture."""
     require_b12x()
@@ -798,8 +948,8 @@ def test_native_weight_pairs_exhaustive(fp4):
         nvfp4_pair_to_bf16x2_sm120,
         mxfp8_pair_to_bf16x2_sm120,
     )
-    from b12x._lib.utils.device import current_cuda_stream
     from b12x._lib.utils.pointers import make_ptr
+    from b12x._lib.utils.device import current_cuda_stream
 
     class Decode:
         def __init__(self, fp4):

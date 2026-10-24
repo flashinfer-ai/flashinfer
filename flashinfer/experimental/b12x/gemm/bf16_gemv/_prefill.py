@@ -366,6 +366,9 @@ class Bf16PrefillKernel:
             )
             for k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                 load_pipeline.producer_acquire(producer_state)
+                # Consumers read a stage with ldmatrix (generic proxy) before
+                # releasing it; order those reads before the TMA refill.
+                cute.arch.fence_view_async_shared()
                 cute.copy(
                     tma_atom_A,
                     tAgA[(None, m_tile, k_tile)],
