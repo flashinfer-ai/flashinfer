@@ -8,8 +8,9 @@ that `nvfp4_quantize_append_paged_kv_cache_with_slot_mapping` writes, on
 compute capability 8.x (the `sm_80` libraries) and 9.0 (`sm_90a`).
 
 Both the API and the backend are experimental: no compatibility guarantee.
-The feature does not participate in automatic backend selection, autotuning
-or trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
+The public entry's `backend="auto"` (its default) selects this package on
+SM80 through SM90; the feature does not participate in autotuning or
+trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
 ships them and JIT-built by FlashInfer from `build.json` otherwise (see
 "Layout of this package"). Toolkit requirement: CUDA 12.8 or newer
 (`build.json` `min_cuda`; FlashInfer's supported toolkits apply).
@@ -23,12 +24,16 @@ from flashinfer.sparse import qsa_sparse_paged_attention
 out = qsa_sparse_paged_attention(
     q, k_cache, v_cache, logical_indices, block_table, token_to_req, False,
     out, k_scale, v_scale, output_gate=gate, k_sf=k_sf, v_sf=v_sf,
-    backend="cake",
 )
 ```
 
-`backend="default"` (the default) runs the existing implementation; `"cake"`
-runs this package; any other value raises `ValueError`. The arguments, their
+`backend="auto"` (the default) runs this package on SM80 through SM90 and the
+existing implementation on any other device, which then reports it as
+unsupported; `"cake"` selects this package and `"default"` the existing
+implementation explicitly; any other value raises `ValueError`. This package's
+results agree with the existing implementation within the test suites'
+tolerances but are not bit-identical to it: callers that need the existing
+numerics pass `backend="default"`. The arguments, their
 checks and the result contract are the public entry's (its docstring). The
 package's own entry, `flashinfer.experimental.cake_qsa_nvfp4.qsa_sparse_paged_attention`,
 takes the same arguments plus the keyword `workspace_buffer` (below).
@@ -100,15 +105,23 @@ capturable with a replay-stable layout. The counters are zeroed once, the
 first time a buffer's storage is seen for a `rows * num_kv_heads` (a new
 buffer at a freed buffer's address is a new storage and is zeroed again), and
 reset themselves after every launch; `reset_workspace(buffer)` forgets a
-buffer whose bytes another use overwrote. Without a workspace the partials are
-allocated per call, as the default implementation does, and the fused form's
-counters come from a module buffer per (device, stream): zeroed when it is
-allocated, left idle by every launch, grown on demand; a capturing stream
-allocates its counters per call instead (the graph's private pool). That path
-is outside the zero-allocation guarantee.
+buffer whose bytes another use overwrote. Without a workspace the partials
+come from a module scratch per (device, stream) -- one float32 buffer, grown
+when a call needs more, its views kept per call shape -- and the fused form's
+counters from a module buffer per (device, stream): zeroed when it is
+allocated, left idle by every launch, grown on demand. Calls on one stream are
+ordered, so no two launches share live partials or counters; a module lock
+orders two Python threads enqueuing on one stream from the carve through the
+call's last launch. A capturing stream allocates its partials and counters per
+call instead (the graph's private pool) and leaves both caches untouched. That
+path is outside the zero-allocation guarantee.
 
 Nothing on the host reads tensor contents; every dispatch is on host scalars
-and tensor metadata.
+and tensor metadata. The launch plan of a call shape -- split count, form,
+program, loaded FFI entries, argument order and grids -- is resolved once per
+shape and device (`cake_jit.resolved_launches`); a call checks its arguments,
+binds them in one flat sequence and issues its launches under one
+environment-stream context.
 
 ## Kernel structure of one call
 
@@ -140,7 +153,7 @@ Every kernel is compiled with `--use_fast_math` (recorded on every
 
 | File | Role |
 | --- | --- |
-| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves; a record lists the architectures it ships for), the rules as data (`select_records`, `launch_grid`), `run_module` |
+| `cake_jit.py` | registry (`MODULES`: one record per program, host plan + derived leaves; a record lists the architectures it ships for), the rules as data (`select_records`, `launch_grid`), the launch plan resolved once per shape (`resolved_launches`), `run_module` |
 | `cake_backend.py` | the host plan: checks, split rule, form rule, program rule, workspace rule, launch sequence |
 | `build.json` | the manifest: one library per (program, architecture), sources with digests, nvcc flags |
 | `cake_build.py` | the loader: `aot/` prebuilt libraries first, else FlashInfer's JIT from `build.json` |

@@ -271,6 +271,40 @@ def _forward_backward(
     return (out, lse, o_lo), grads
 
 
+def _require_nope_mask_route():
+    """The NoPE forward of this checkout converts per-document rows position-preserving under ``convert = 2`` (the
+    small-table route): one probe launch below a raised limit returns the rows as given and the last valid slot + 1
+    as lengths; skips until the render lands (a forward that still compacts under the new value)."""
+    if not cake_backend.nope_fwd_converts_indices():
+        pytest.skip("the registered NoPE forward program has no conversion operands")
+    local = torch.tensor(
+        [[-1, 1, -1, 2], [0, -1, -1, -1]], dtype=torch.int32, device="cuda"
+    )
+    cu_q = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    q = torch.zeros(2, NUM_HEADS, D_LATENT, dtype=torch.bfloat16, device="cuda")
+    kv = torch.zeros(8, D_LATENT, dtype=torch.bfloat16, device="cuda")
+    old = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    cake_backend.NOPE_CONVERT_SLOT_LIMIT = 1 << 40
+    try:
+        _, _, _, rows, lengths = cake_backend.forward_nope_varlen(
+            q, kv, local, cu_q, cu_k
+        )
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 -- the shipped kernel predates the mode
+        pytest.skip(
+            f"the NoPE forward of this checkout cannot convert position-preserving: {exc}"
+        )
+    finally:
+        cake_backend.NOPE_CONVERT_SLOT_LIMIT = old
+    if not (
+        torch.equal(rows, local) and torch.equal(lengths, local.new_tensor([4, 1]))
+    ):
+        pytest.skip(
+            "the NoPE forward of this checkout compacts under convert = 2 (the render has not landed)"
+        )
+
+
 def _require_compacting_stage():
     """The NoPE record's index-preparation stage of this checkout compacts (the K2 interface in its launch
     arguments); the varlen entries route hole rows through it.  Skips until the render lands."""
@@ -1556,15 +1590,25 @@ def test_nope_varlen_multi_document_matches_flat_and_reference():
     _check_nope_grads(dq, dkv, ref)
 
 
-def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
+@pytest.mark.parametrize("route", ["shipped", "stage"])
+def test_nope_varlen_causal_tail_of_prefix_drops_future_keys(route, monkeypatch):
     """``causal=True`` on a query segment that is the tail of its key prefix: a selected key after the query's own
-    position is invalid; the varlen entry compacts the masked rows, so it is bitwise the flat call over the
-    explicitly masked global indices (which compacts them the same way through the stage's flat mode) and the flat
-    call over their stable compaction with the counts as caller lengths; the floor of the FP64 gate is evaluated
-    on the compacted order."""
+    position is invalid.  Below the slot limit (the shipped route for this 384 x 96 table) the varlen entry keeps
+    the masked slots in place, so it is bitwise the flat call over the explicitly masked global indices (one
+    launch, the lengths derived) and the flat call over those indices with the last valid slot + 1 as caller
+    lengths; the FP64 floor is evaluated on the raw order.  On the stage route (the limit set to 0) the varlen
+    entry compacts the masked rows, so it is bitwise the flat call over the masked indices (the stage's flat mode)
+    and the flat call over their stable compaction with the counts as caller lengths; the floor on the compacted
+    order."""
     _require_nope_program()
     _require_compacting_stage()
+    if route == "stage":
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 0)
+    else:
+        _require_nope_mask_route()
     inp = _nope_inputs([256, 128], [512, 512], seed=NOPE_SEED + 3, topk=96)
+    mode = cake_backend.nope_varlen_index_mode(inp.total_q, inp.topk)
+    assert mode == ("index_prep" if route == "stage" else "mask")
     gen = torch.Generator(device="cuda").manual_seed(NOPE_SEED + 3)
     local = torch.full_like(inp.idx_local, -1)
     for d, (lq, lk) in enumerate(zip(inp.seq_q, inp.seq_k, strict=True)):
@@ -1591,6 +1635,10 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
     assert torch.equal(offset, masked)
     rows, counts = compact_rows(masked, inp.total_k)
     assert not torch.equal(rows, masked), "the case must carry holes before valid slots"
+    if (
+        mode == "mask"
+    ):  # the twin with caller lengths: the masked rows as given, last valid slot + 1
+        rows, counts = masked, nope_ref.last_valid_plus_one(masked, inp.total_k)
     with _quiet_experimental():
         out_f, lse_f = dsa_sparse_attention_nope(inp.q, inp.kv, masked, return_lse=True)
         out_s, lse_s = dsa_sparse_attention_nope(
@@ -1599,7 +1647,9 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
     torch.cuda.synchronize()
     assert torch.equal(out_c, out_f) and torch.equal(lse_c, lse_f)
     assert torch.equal(out_c, out_s) and torch.equal(lse_c, lse_s)
-    ref = nope_ref.reference_fp64_nope(inp.q, inp.kv, masked, compact=True)
+    ref = nope_ref.reference_fp64_nope(
+        inp.q, inp.kv, masked, compact=mode == "index_prep"
+    )
     assert rel_l2(out_c, ref["out"]) <= _nope_floor_gate(ref)
 
 
@@ -1671,16 +1721,25 @@ def _cuda_kernel_names(fn) -> list[str]:
     ]
 
 
-def test_nope_public_packed_forward_launch_count_follows_the_table_size(monkeypatch):
-    """The public packed entry's forward is two launches at every table size -- the index-preparation stage
-    (compacting), then the forward kernel -- while ``NOPE_CONVERT_SLOT_LIMIT`` is 0, also with caller lengths; the
-    torch glue it replaces is at least ten launches.  The flat entry without lengths is the same two launches (the
-    stage's flat mode compacts the caller's rows); with caller lengths it launches the forward kernel alone.  A
-    monkeypatched limit above zero (the measurement route) re-enables the converting forward below it: one launch."""
+@pytest.mark.parametrize(
+    "limit", ["shipped", 0, 1 << 20], ids=["shipped", "stage", "1<<20"]
+)
+def test_nope_public_packed_forward_launch_count_follows_the_table_size(
+    monkeypatch, limit
+):
+    """The public packed entry's forward is one launch -- the forward kernel converting the rows itself -- below
+    ``NOPE_CONVERT_SLOT_LIMIT`` slots and two launches -- the index-preparation stage (compacting), then the
+    forward kernel -- at or above it and always with caller lengths; the torch glue it replaces is at least ten
+    launches.  The flat entry without lengths follows the same size rule (one launch deriving the lengths below
+    the limit, the stage's flat mode then the forward at or above it); with caller lengths it launches the forward
+    kernel alone.  Checked at the shipped limit, at 0 (the stage at every size) and at the baseline's ``1 << 20``
+    (368,200 slots below it, 1,179,648 above)."""
     _require_nope_program()
     _require_compacting_stage()
     if not _cuda_kernel_names(lambda: torch.ones(8, device="cuda").add_(1)):
         pytest.skip("the torch profiler records no CUDA kernels in this environment")
+    if limit != "shipped":
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", limit)
     cases = [
         _nope_inputs(
             [300, 517, 0, 1024], [400, 517, 64, 2048], seed=NOPE_SEED + 7, topk=200
@@ -1691,8 +1750,14 @@ def test_nope_public_packed_forward_launch_count_follows_the_table_size(monkeypa
     ]
     for inp in cases:
         T, K = (int(d) for d in inp.idx_local.shape)
-        assert cake_backend.nope_varlen_index_mode(T, K) == "index_prep"
-        assert cake_backend.varlen_index_mode(inp.idx_local) == "index_prep"
+        small = T * K < cake_backend.NOPE_CONVERT_SLOT_LIMIT
+        mode = "mask" if small else "index_prep"
+        assert cake_backend.nope_varlen_index_mode(T, K) == mode
+        assert cake_backend.nope_flat_index_mode(T, K) == mode
+        assert cake_backend.varlen_index_mode(inp.idx_local) == mode
+        assert cake_backend.nope_varlen_index_mode(T, K, caller_lengths=True) == (
+            "index_prep"
+        )
         lengths = inp.topk_length
 
         def packed(inp=inp, **kw):
@@ -1702,6 +1767,8 @@ def test_nope_public_packed_forward_launch_count_follows_the_table_size(monkeypa
 
         with _quiet_experimental():
             packed()  # plan and module load
+            packed(topk_length=lengths)
+            dsa_sparse_attention_nope(inp.q, inp.kv, inp.idx_global)
             names = _cuda_kernel_names(packed)
             with_cut = _cuda_kernel_names(lambda: packed(topk_length=lengths))
             flat = _cuda_kernel_names(
@@ -1712,10 +1779,15 @@ def test_nope_public_packed_forward_launch_count_follows_the_table_size(monkeypa
                     inp.q, inp.kv, inp.idx_global, topk_length=lengths
                 )
             )
-        assert len(names) == 2 and len(with_cut) == 2, (names, with_cut)
-        assert names == flat, (names, flat)
-        assert len(flat_cut) == 1 and flat_cut[0] == names[-1], (flat_cut, names)
-        assert names[0] != names[1]
+        want = 1 if small else 2
+        assert len(names) == want and len(with_cut) == 2, (mode, names, with_cut)
+        assert names == flat, (mode, names, flat)
+        assert len(flat_cut) == 1 and flat_cut[0] == names[-1] == with_cut[-1], (
+            flat_cut,
+            names,
+            with_cut,
+        )
+        assert with_cut[0] != with_cut[1]
     inp = cases[0]
     glue = _cuda_kernel_names(
         lambda: offset_gather_kv_indices(
@@ -1723,19 +1795,6 @@ def test_nope_public_packed_forward_launch_count_follows_the_table_size(monkeypa
         )
     )
     assert len(glue) >= 10
-    # the measurement route: the converting forward alone below a limit above zero
-    monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", 1 << 20)
-    assert cake_backend.varlen_index_mode(inp.idx_local) == "kernel"
-    with _quiet_experimental():
-        dsa_sparse_attention_nope_varlen(
-            inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
-        )
-        kernel = _cuda_kernel_names(
-            lambda: dsa_sparse_attention_nope_varlen(
-                inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
-            )
-        )
-    assert len(kernel) == 1
 
 
 def test_rope_varlen_launch_count_is_the_stage_and_the_forward():

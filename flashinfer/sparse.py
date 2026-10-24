@@ -2274,6 +2274,18 @@ class VariableBlockSparseAttentionWrapper:
         return (out, lse) if return_lse else out
 
 
+_QSA_CAKE_MAJORS = (8, 9)
+
+
+def _qsa_auto_backend(device: torch.device) -> str:
+    """The route ``backend="auto"`` takes: ``"cake"`` on SM80 through SM90, where the Cake
+    kernels run; ``"default"`` anywhere else, so the reference implementation reports the
+    device the way it always has."""
+    if device.type == "cuda" and get_compute_capability(device)[0] in _QSA_CAKE_MAJORS:
+        return "cake"
+    return "default"
+
+
 @flashinfer_experimental_api(feature="QSA NVFP4 sparse paged attention")
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
@@ -2290,7 +2302,7 @@ def qsa_sparse_paged_attention(
     output_gate: torch.Tensor,
     k_sf: torch.Tensor,
     v_sf: torch.Tensor,
-    backend: str = "default",
+    backend: str = "auto",
 ) -> torch.Tensor:
     r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM90.
 
@@ -2323,15 +2335,23 @@ def qsa_sparse_paged_attention(
     k_sf, v_sf : torch.Tensor
         E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16 dims.
     backend : str
-        ``"default"`` runs the reference implementation; ``"cake"`` runs the Cake
-        kernels of :mod:`flashinfer.experimental.cake_qsa_nvfp4` (the same contract,
-        its own split and merge plan). Any other value raises ``ValueError``.
+        ``"auto"`` (the default) runs the Cake kernels of
+        :mod:`flashinfer.experimental.cake_qsa_nvfp4` on SM80 through SM90, the
+        architectures this attention supports, and the reference implementation
+        anywhere else, which then reports the unsupported device. ``"cake"`` selects
+        the Cake kernels (the same contract, their own split and merge plan) and
+        ``"default"`` the reference implementation explicitly. The Cake kernels'
+        results agree with the reference implementation within the test tolerances
+        but are not bit-identical to it; pass ``"default"`` to keep the reference
+        numerics. Any other value raises ``ValueError``.
 
     Returns
     -------
     torch.Tensor
         ``out`` when given, otherwise a new tensor.
     """
+    if backend == "auto":
+        backend = _qsa_auto_backend(q.device)
     if backend == "cake":
         from .experimental.cake_qsa_nvfp4.cake_backend import (
             qsa_sparse_paged_attention as run_cake,
