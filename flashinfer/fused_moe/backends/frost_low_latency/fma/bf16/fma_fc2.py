@@ -62,7 +62,12 @@ def _kernel(
             else cutlass.Uint64
         )
         xp = cute.recast_ptr(mid.iterator, dtype=word_type)
-        wp = cute.recast_ptr(weights.iterator, dtype=word_type)
+        weight_word_type = (
+            cutlass.Uint32
+            if weights.element_type == cutlass.Float8E4M3FN
+            else cutlass.Uint64
+        )
+        wp = cute.recast_ptr(weights.iterator, dtype=weight_word_type)
         for group in range(i // 128):
             col = group * 32 + lane
             xv = _quad(xp[route * (i // 4) + col], mid.element_type)
@@ -77,7 +82,7 @@ def _kernel(
             acc[0, o] + acc[1, o] + acc[2, o] + acc[3, o]
         )
         if lane == 0:
-            if cutlass.const_expr(mid.element_type == cutlass.Float8E4M3FN):
+            if cutlass.const_expr(weights.element_type == cutlass.Float8E4M3FN):
                 if expert >= 0 and expert < cute.size(weights, mode=[0]):
                     value = _mul(value, dequant[expert])
             if cutlass.const_expr(finalize):

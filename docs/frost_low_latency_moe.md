@@ -256,7 +256,7 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 |---|---|
 | Architecture | SM90: BF16/FP16/per-tensor FP8 FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
-| Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights |
+| Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3 weights with per-expert FP32 scales and BF16 activation/output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
 | MX activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
 | BF16 activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
@@ -888,3 +888,64 @@ accumulation in that control reproduced the reference discrepancy. This
 identifies the source of the mismatch; it does not qualify a speedup for that
 case. No large-shape Hopper FP8 performance result is reported, and the
 benchmark still fails closed rather than relaxing the numerical gate.
+
+
+## E4M3 weight-only with BF16 activation
+
+Configure `weight=QuantFormat.FP8PerTensor`, `activation=QuantFormat.BF16`
+and BF16 output to use the same routed FMA schedule without quantizing
+activations. This mode preserves checkpoint E4M3 weight bytes and FP32
+per-expert weight scales. FC1 accumulates in FP32, applies the weight scale,
+rounds preactivation to BF16, applies the selected activation, then stores a
+BF16 intermediate. FC2 applies its weight scale, rounds each expert output to
+BF16, and combines using ordered FP32 multiply/add. Packed routing weights
+retain BF16 rounding. All ten typed activations and the existing FMA geometry,
+token and top-k limits apply. This mode is explicit opt-in.
+
+```mermaid
+flowchart LR
+  X[BF16 input] --> G1[FP32 FMA plus E4M3 weight scale]
+  G1 --> R1[BF16 preactivation]
+  R1 --> A[Typed activation]
+  A --> M[BF16 intermediate]
+  M --> G2[FP32 FMA plus E4M3 weight scale]
+  G2 --> R2[BF16 expert outputs]
+  R2 --> C[Ordered FP32 weighted combine]
+  C --> Y[BF16 output]
+```
+
+```python
+view = FrostLowLatencyConfig.prepare_fp8_weight_only_weights(
+    w1_e4m3, w1_dequant_scale, w2_e4m3, w2_dequant_scale,
+    activation=activation,
+)
+weights = MoEWeightPack()
+weights.prepare_for("frost_low_latency", view)
+config = MoEConfig(
+    routing=RoutingConfig(num_experts=E, top_k=K),
+    quant=QuantConfig(weight=QuantFormat.FP8PerTensor,
+                      activation=QuantFormat.BF16),
+    experts=ExpertConfig(intermediate_size=I),
+    activation=activation,
+    backend=BackendOptions((FrostLowLatencyConfig(max_num_tokens=8),)),
+)
+y = MoELayer(config)(MoEActivationPack(x_bf16, None, topk_ids, topk_weights), weights)
+```
+
+The helper accepts canonical `[E, 2*I, H]` weights in `[up, gate]` order (or
+`[E, I, H]` for non-gated activation), `[E, H, I]` down weights, and two
+FP32 `[E]` dequantization scales on the same CUDA device. It pads I to 128
+without requantizing weights. These are weight-only scales: do not pass the
+folded input/intermediate calibration scales of the W8A8 helper. The prepared
+view keeps the shared FP8 binding layout; its dummy `fc2_act_quant_scale` is
+unused by W8A16. Scales stay live across graph replay and fresh bindings.
+
+`benchmarks/bench_frost_low_latency_w8a16.py` compares the full routed-expert
+GPU pipelines with cuTile using the same weights, scales, BF16 rounding
+boundaries and reference. By default it searches all advertised GEMM stage
+pairs for all supported native block sizes and gather/sorted modes, then
+validates frozen winners with ABBA and independent warm CUDA-event chains.
+Native stage-ranking hooks receive private routing tensors; the benchmark
+verifies that the measured IDs and scores remain unchanged. Host enqueue,
+router-network evaluation, shared experts, communication and serving are
+outside its scope.

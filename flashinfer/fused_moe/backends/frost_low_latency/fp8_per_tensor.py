@@ -6,9 +6,11 @@ import torch
 
 
 def pack_inputs(act, weights, config, device):
-    from ...api import RoutingInputMode
+    from ...api import QuantFormat, RoutingInputMode
 
     x, ids, scores = act.hidden_states_q, act.topk_ids, act.topk_weights
+    weight_only = config.quant.activation is QuantFormat.BF16
+    activation_dtype = torch.bfloat16 if weight_only else torch.float8_e4m3fn
     t, h = x.shape
     e, k = config.routing.num_experts, config.routing.top_k
     p = (config.experts.intermediate_size + 127) // 128 * 128
@@ -18,13 +20,13 @@ def pack_inputs(act, weights, config, device):
             "Frost per-tensor FP8 folds the input scale into prepared weights"
         )
     if (
-        x.dtype is not torch.float8_e4m3fn
+        x.dtype is not activation_dtype
         or x.device != device
         or not x.is_contiguous()
         or x.data_ptr() % 16
     ):
         raise ValueError(
-            "Frost per-tensor FP8 input must be aligned contiguous E4M3 on the runner device"
+            f"Frost per-tensor input must be aligned contiguous {activation_dtype} on the runner device"
         )
     view = weights.get_view("frost_low_latency")
     for name, shape, dtype in (
@@ -54,7 +56,7 @@ def pack_inputs(act, weights, config, device):
         scores,
         view["fc1_expert_weights"],
         view["fc2_expert_weights"],
-        torch.empty((t * k, p), device=device, dtype=torch.float8_e4m3fn),
+        torch.empty((t * k, p), device=device, dtype=activation_dtype),
         torch.empty((t * k, h), device=device, dtype=torch.bfloat16),
         torch.empty((t, h), device=device, dtype=torch.bfloat16),
         narrow,
